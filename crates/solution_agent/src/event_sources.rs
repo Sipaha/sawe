@@ -183,6 +183,7 @@ pub(crate) fn build_message_appended_payload(
                 acp_thread::AgentThreadEntry::AssistantMessage(_) => "assistant",
                 acp_thread::AgentThreadEntry::ToolCall(_) => "tool_call",
                 acp_thread::AgentThreadEntry::CompletedPlan(_) => "plan",
+                acp_thread::AgentThreadEntry::ContextCompaction(_) => "context_compaction",
             };
             let preview = truncate_preview(&entry.to_markdown(cx), 200);
             // Only user messages can carry originating-client send ids

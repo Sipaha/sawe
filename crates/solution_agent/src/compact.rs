@@ -1,7 +1,7 @@
 //! "Compact context" workflow: dump the current session's running summary to handoff files, then continue in a fresh ACP session.
 
 use anyhow::{Result, anyhow};
-use gpui::{App, AppContext as _, Context, SharedString};
+use gpui::{App, AppContext as _, Context, SharedString, TaskExt as _};
 use solutions::SolutionStore;
 use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
 

@@ -66,11 +66,9 @@ pub(super) fn render_task_subagent_strip(
     // out here — they auto-hide on terminal `stop_reason`, no UI
     // surface required.
     let now = SystemTime::now();
-    let stale = {
-        use ::agent_settings::AgentSettings;
-        use settings::Settings;
-        Duration::from_secs(AgentSettings::get_global(cx).managed_agent_stale_timeout_secs)
-    };
+    // Fork-local managed-agent stale timeout (upstream v1.7.2 dropped this
+    // field from the resolved `AgentSettings`; mirror `store`'s pinned default).
+    let stale = Duration::from_secs(120);
     let bg_agents: Vec<(SharedString, SharedString, BackgroundAgentDisplayState)> = session_ref
         .background_agent_order
         .iter()

@@ -178,6 +178,10 @@ pub fn to_persisted(entry: &AgentThreadEntry, cx: &App) -> Option<PersistedEntry
                 .collect();
             Some(PersistedEntryV2::Plan(entries))
         }
+        // Context-compaction markers are an in-session affordance (the model
+        // summarizing its own history) and aren't part of the durable
+        // transcript — skip them, like in-flight tool calls.
+        AgentThreadEntry::ContextCompaction(_) => None,
     }
 }
 
@@ -258,6 +262,7 @@ pub fn from_persisted(persisted: PersistedEntryV2, cx: &mut App) -> AgentThreadE
                 tool_name: p.tool_name.map(SharedString::from),
                 subagent_session_info: None,
                 subagent_id: None,
+                sandbox_authorization_details: None,
                 // Cold blobs only persist terminal statuses (see
                 // `TerminalToolCallStatus`), so the rehydrated call is
                 // never InProgress and therefore never needs a

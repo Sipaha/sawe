@@ -141,6 +141,13 @@ pub(crate) fn entry_text_spans(entry: &AgentThreadEntry, cx: &App) -> Vec<String
             }
             spans
         }
+        AgentThreadEntry::ContextCompaction(compaction) => match &compaction.summary {
+            Some(summary) => vec![format!(
+                "Context compaction: {}",
+                summary.read(cx).source()
+            )],
+            None => vec!["Context compaction".to_string()],
+        },
     }
 }
 
@@ -349,6 +356,13 @@ pub(crate) fn render_entry(
         AgentThreadEntry::CompletedPlan(entries) => {
             render_plan(entry_idx, entries, markdown_for, style, cx)
         }
+        // Context compaction is a lightweight divider marking where the model
+        // summarized its own history; render it as a muted single-line label.
+        AgentThreadEntry::ContextCompaction(_) => gpui::div()
+            .px_2()
+            .py_1()
+            .child(ui::Label::new("Context compacted").color(ui::Color::Muted))
+            .into_any_element(),
     };
 
     // Always wrap each entry in a right-click menu. Copy / Copy-as-

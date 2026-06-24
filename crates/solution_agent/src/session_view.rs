@@ -408,7 +408,8 @@ impl SolutionSessionView {
             e.set_placeholder_text("Send a message…", window, cx);
             e.set_show_gutter(false, cx);
             e.set_show_line_numbers(false, cx);
-            e.set_show_scrollbars(false, cx);
+            e.set_show_vertical_scrollbar(false, cx);
+            e.set_show_horizontal_scrollbar(false, cx);
             // Disable current-line highlight — for a chat input it shows
             // up as a stripe across the whole editor under the cursor row,
             // visually splitting the compose area in half.
@@ -3082,7 +3083,7 @@ impl Render for SolutionSessionView {
                         ),
                     )
                     .with_sizing_behavior(ListSizingBehavior::Auto)
-                    .flex_grow()
+                    .flex_grow(1.)
                     .into_any_element()
                 };
 

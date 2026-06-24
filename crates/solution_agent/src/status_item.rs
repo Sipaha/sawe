@@ -1,6 +1,6 @@
-use gpui::{Context, IntoElement, ParentElement, Render, Styled, Subscription, Window, div};
+use gpui::{App, Context, IntoElement, ParentElement, Render, Styled, Subscription, Window, div};
 use ui::Label;
-use workspace::StatusItemView;
+use workspace::{HideStatusItem, StatusItemView};
 use workspace::item::ItemHandle;
 
 use crate::model::SessionState;
@@ -27,6 +27,10 @@ impl StatusItemView for SolutionAgentStatusItem {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        None
     }
 }
 

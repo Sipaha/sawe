@@ -495,6 +495,7 @@ fn jsonl_assistant_to_entries(
                     tool_name: Some(name),
                     subagent_session_info: None,
                     subagent_id: None,
+                    sandbox_authorization_details: None,
                     status_started_at: None,
                 }));
             }

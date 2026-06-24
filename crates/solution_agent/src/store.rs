@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, Global, SharedString, Subscription,
-    Task,
+    Task, TaskExt as _,
 };
 use solutions::{Solution, SolutionId, SolutionStore, SolutionStoreEvent};
 use util::ResultExt;
@@ -30,6 +30,14 @@ mod queue;
 pub(crate) mod tests;
 
 pub(crate) use queue::{QUEUE_HINT_LINE, TS_PREFIX_CLOSE, TS_PREFIX_OPEN};
+
+// Fork-local managed-agent lifecycle tunables. Upstream v1.7.2's resolved
+// `AgentSettings` dropped these fields (they live only in `settings_content`
+// as `Option<u64>`); since this crate may not edit those crates, we pin the
+// historical defaults here. Stale = a session with no recent activity is a
+// candidate for tear-down; dead-linger = grace period before reaping.
+const MANAGED_AGENT_STALE_TIMEOUT_SECS: u64 = 120;
+const MANAGED_AGENT_DEAD_LINGER_SECS: u64 = 300;
 
 pub struct SolutionAgentStore {
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
@@ -760,6 +768,10 @@ fn persisted_role_for(entry: &acp_thread::AgentThreadEntry) -> PersistedRole {
         acp_thread::AgentThreadEntry::AssistantMessage(_) => PersistedRole::Assistant,
         acp_thread::AgentThreadEntry::ToolCall(_) => PersistedRole::Tool,
         acp_thread::AgentThreadEntry::CompletedPlan(_) => PersistedRole::Plan,
+        // Compaction markers never persist (`to_persisted` returns `None`), so
+        // this arm is unreachable in practice; classify as Assistant for
+        // completeness since the summary is model-emitted.
+        acp_thread::AgentThreadEntry::ContextCompaction(_) => PersistedRole::Assistant,
     }
 }
 
@@ -4127,18 +4139,10 @@ impl SolutionAgentStore {
     /// the tick just drops the entries that have fully expired.
     pub fn tick_background_agents(&mut self, cx: &mut Context<Self>) {
         use ::agent_settings::AgentSettings;
-        use settings::Settings;
-        // `try_get` keeps tests that don't register `AgentSettings` (the bare
-        // pool tests) usable — they have no background agents anyway, so the
-        // fallback values are never observed.
-        let (stale_secs, linger_secs) = AgentSettings::try_get(cx)
-            .map(|s| {
-                (
-                    s.managed_agent_stale_timeout_secs,
-                    s.managed_agent_dead_linger_secs,
-                )
-            })
-            .unwrap_or((120, 300));
+        let (stale_secs, linger_secs) = (
+            MANAGED_AGENT_STALE_TIMEOUT_SECS,
+            MANAGED_AGENT_DEAD_LINGER_SECS,
+        );
         let expiry = std::time::Duration::from_secs(stale_secs + linger_secs);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =
@@ -4315,17 +4319,10 @@ impl SolutionAgentStore {
     /// still age out).
     pub fn tick_background_shells(&mut self, cx: &mut Context<Self>) {
         use ::agent_settings::AgentSettings;
-        use settings::Settings;
-        // `try_get` keeps tests that don't register `AgentSettings` usable —
-        // mirrors `tick_background_agents`.
-        let (stale_secs, linger_secs) = AgentSettings::try_get(cx)
-            .map(|s| {
-                (
-                    s.managed_agent_stale_timeout_secs,
-                    s.managed_agent_dead_linger_secs,
-                )
-            })
-            .unwrap_or((120, 300));
+        let (stale_secs, linger_secs) = (
+            MANAGED_AGENT_STALE_TIMEOUT_SECS,
+            MANAGED_AGENT_DEAD_LINGER_SECS,
+        );
         let expiry = std::time::Duration::from_secs(stale_secs + linger_secs);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =

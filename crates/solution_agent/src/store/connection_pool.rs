@@ -81,7 +81,7 @@ impl SolutionAgentStore {
         // get one from the project. This is the same coupling documented on
         // `create_session`.
         let agent_server_store = project.read(cx).agent_server_store().clone();
-        let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None);
+        let delegate = agent_servers::AgentServerDelegate::new(agent_server_store, None, None);
         let project_for_connect = project;
         let server_for_connect = server;
 

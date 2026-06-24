@@ -1038,6 +1038,7 @@ pub enum EntryRoleDto {
     Assistant,
     ToolCall,
     Plan,
+    ContextCompaction,
 }
 
 /// Structured wire status for a tool call. Mirrors the
@@ -1453,6 +1454,7 @@ fn entry_role(entry: &acp_thread::AgentThreadEntry) -> EntryRoleDto {
         acp_thread::AgentThreadEntry::AssistantMessage(_) => EntryRoleDto::Assistant,
         acp_thread::AgentThreadEntry::ToolCall(_) => EntryRoleDto::ToolCall,
         acp_thread::AgentThreadEntry::CompletedPlan(_) => EntryRoleDto::Plan,
+        acp_thread::AgentThreadEntry::ContextCompaction(_) => EntryRoleDto::ContextCompaction,
     }
 }
 
@@ -1612,6 +1614,7 @@ fn count_images_in_entry(entry: &acp_thread::AgentThreadEntry) -> usize {
             .filter(|content| matches!(content, acp_thread::ToolCallContent::ContentBlock(block) if matches!(block, acp_thread::ContentBlock::Image { .. })))
             .count(),
         acp_thread::AgentThreadEntry::CompletedPlan(_) => 0,
+        acp_thread::AgentThreadEntry::ContextCompaction(_) => 0,
     }
 }
 
@@ -1648,7 +1651,7 @@ fn extract_images_for_entry(
                     acp_thread::AssistantMessageChunk::Message { block } => block,
                     acp_thread::AssistantMessageChunk::Thought { block } => block,
                 };
-                if let acp_thread::ContentBlock::Image { image } = block {
+                if let acp_thread::ContentBlock::Image { image, .. } = block {
                     out.push(EntryImage {
                         index: *image_cursor,
                         mime_type: image.format.mime_type().to_string(),
@@ -1661,7 +1664,7 @@ fn extract_images_for_entry(
         acp_thread::AgentThreadEntry::ToolCall(call) => {
             for content in &call.content {
                 if let acp_thread::ToolCallContent::ContentBlock(
-                    acp_thread::ContentBlock::Image { image },
+                    acp_thread::ContentBlock::Image { image, .. },
                 ) = content
                 {
                     out.push(EntryImage {
@@ -1674,6 +1677,7 @@ fn extract_images_for_entry(
             }
         }
         acp_thread::AgentThreadEntry::CompletedPlan(_) => {}
+        acp_thread::AgentThreadEntry::ContextCompaction(_) => {}
     }
     out
 }
