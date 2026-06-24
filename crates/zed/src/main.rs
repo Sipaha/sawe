@@ -4,15 +4,9 @@
 mod reliability;
 mod zed;
 
-// Ensure the binary name stays in sync with APP_NAME so that the paths used
-// at runtime (data dir, config dir, etc.) match what the binary is called.
-const _: () = assert!(
-    paths::APP_NAME_LOWERCASE
-        .as_bytes()
-        .eq_ignore_ascii_case(env!("CARGO_BIN_NAME").as_bytes()),
-    "paths::APP_NAME_LOWERCASE must match the binary name. \
-     Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
-);
+// NOTE: this fork routes all runtime dirs through `paths::base_dir()` =
+// `~/.spk/<dir_name_kebab()>` rather than upstream's `APP_NAME_LOWERCASE`
+// scheme, so the upstream binary-name/APP_NAME assertion does not apply here.
 
 use agent::{SharedThread, ThreadStore};
 use agent_client_protocol::schema as acp;

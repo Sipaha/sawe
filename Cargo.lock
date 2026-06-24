@@ -24067,6 +24067,7 @@ dependencies = [
  "migrator",
  "mimalloc",
  "miniprofiler_ui",
+ "nc",
  "node_runtime",
  "notifications",
  "onboarding",
