@@ -301,7 +301,7 @@ pub struct ShowAffectedPathsInLog {
 }
 
 /// View-level mode for the [`GitGraph`] surface. Derived from `log_source` —
-/// `LogSource::File(_)` projects to [`GraphMode::FileHistory`], everything
+/// `LogSource::Path(_)` projects to [`GraphMode::FileHistory`], everything
 /// else projects to [`GraphMode::Full`]. Code that needs to switch behavior
 /// based on the preset (e.g. toolbar toggle visibility) calls
 /// [`GitGraph::mode`] instead of pattern-matching `log_source` directly.
@@ -836,7 +836,7 @@ pub fn init(cx: &mut App) {
 
                     div.on_action({
                         let workspace = workspace.clone();
-                        move |_: &git_ui::git_panel::Open, window, cx| {
+                        move |_: &git_ui::git_graph::Open, window, cx| {
                             workspace
                                 .update(cx, |workspace, cx| {
                                     let Some(repo) =
@@ -862,7 +862,7 @@ pub fn init(cx: &mut App) {
                         }
                     })
                     .on_action(
-                        move |action: &git_ui::git_panel::OpenAtCommit, window, cx| {
+                        move |action: &git_ui::git_graph::OpenAtCommit, window, cx| {
                             let sha = action.sha.clone();
                             workspace
                                 .update(cx, |workspace, cx| {
@@ -908,14 +908,14 @@ fn resolve_file_history_target(
         let (repo, repo_path) = git_store
             .read(cx)
             .repository_and_path_for_project_path(&project_path, cx)?;
-        return Some((repo.read(cx).id, LogSource::File(repo_path)));
+        return Some((repo.read(cx).id, LogSource::Path(repo_path)));
     }
 
     if let Some(panel) = workspace.panel::<git_ui::git_panel::GitPanel>(cx)
         && panel.read(cx).focus_handle(cx).contains_focused(window, cx)
         && let Some((repository, repo_path)) = panel.read(cx).selected_file_history_target()
     {
-        return Some((repository.read(cx).id, LogSource::File(repo_path)));
+        return Some((repository.read(cx).id, LogSource::Path(repo_path)));
     }
 
     let editor = workspace.active_item_as::<Editor>(cx)?;
@@ -932,7 +932,7 @@ fn resolve_file_history_target(
     let (repo, repo_path) = git_store
         .read(cx)
         .repository_and_path_for_project_path(&project_path, cx)?;
-    Some((repo.read(cx).id, LogSource::File(repo_path)))
+    Some((repo.read(cx).id, LogSource::Path(repo_path)))
 }
 
 fn open_or_reuse_graph(
@@ -1229,7 +1229,7 @@ impl GitGraph {
     /// View-level mode derived from [`Self::log_source`]. See [`GraphMode`].
     pub fn mode(&self) -> GraphMode {
         match self.log_source {
-            LogSource::File(_) => GraphMode::FileHistory,
+            LogSource::Path(_) => GraphMode::FileHistory,
             _ => GraphMode::Full,
         }
     }
@@ -1239,7 +1239,7 @@ impl GitGraph {
     }
 
     /// File-history preset constructor. Equivalent to
-    /// [`Self::new`] with `LogSource::File(repo_path)` plus the implicit
+    /// [`Self::new`] with `LogSource::Path(repo_path)` plus the implicit
     /// file-history rendering preset (no graph column; per-file diff in the
     /// detail panel). The caller resolves the `RepoPath` from a
     /// `ProjectPath` via `git_store.repository_and_path_for_project_path`.
@@ -1255,7 +1255,7 @@ impl GitGraph {
             repo_id,
             git_store,
             workspace,
-            Some(LogSource::File(repo_path)),
+            Some(LogSource::Path(repo_path)),
             window,
             cx,
         )
@@ -1636,7 +1636,7 @@ impl GitGraph {
     /// match, and any other code that has to thread args back through.
     fn combined_extra_args(&self) -> Vec<String> {
         let mut args = self.filters.to_git_args();
-        if matches!(self.log_source, LogSource::File(_)) {
+        if matches!(self.log_source, LogSource::Path(_)) {
             args.extend(self.file_history_options.extra_git_args());
         }
         args
@@ -3211,7 +3211,7 @@ impl Render for GitGraph {
                     this.child(self.render_loading_spinner(cx))
                 })
         } else {
-            let is_file_history = matches!(self.log_source, LogSource::File(_));
+            let is_file_history = matches!(self.log_source, LogSource::Path(_));
             let header_resize_info =
                 HeaderResizeInfo::from_redistributable(&self.column_widths, cx);
             let header_context = TableRenderContext::for_column_widths(
@@ -3521,7 +3521,7 @@ impl Item for GitGraph {
                 .map(|name| name.to_string_lossy().to_string())
         });
         let file_history_path = match &self.log_source {
-            LogSource::File(path) => Some(path.as_unix_str().to_string()),
+            LogSource::Path(path) => Some(path.as_unix_str().to_string()),
             _ => None,
         };
 
@@ -3545,7 +3545,7 @@ impl Item for GitGraph {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        if let LogSource::File(path) = &self.log_source {
+        if let LogSource::Path(path) = &self.log_source {
             return path
                 .as_ref()
                 .file_name()
@@ -3933,7 +3933,7 @@ mod persistence {
             LogSource::All => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
-            LogSource::File(_) => LOG_SOURCE_FILE,
+            LogSource::Path(_) => LOG_SOURCE_FILE,
         }
     }
 
@@ -3942,7 +3942,7 @@ mod persistence {
             LogSource::All => None,
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
-            LogSource::File(path) => Some(path.as_unix_str().to_string()),
+            LogSource::Path(path) => Some(path.as_unix_str().to_string()),
         }
     }
 
@@ -3973,7 +3973,7 @@ mod persistence {
                 .log_source_value
                 .as_ref()
                 .and_then(|v| RepoPath::new(v).ok())
-                .map(LogSource::File)
+                .map(LogSource::Path)
                 .unwrap_or_default(),
             None | Some(_) => LogSource::default(),
         }
@@ -5559,7 +5559,7 @@ mod tests {
             assert_eq!(graphs.len(), 1);
             assert_eq!(
                 graphs[0].read(cx).log_source,
-                LogSource::File(tracked1_repo_path.clone())
+                LogSource::Path(tracked1_repo_path.clone())
             );
         });
 
@@ -5587,7 +5587,7 @@ mod tests {
             assert_eq!(graphs.len(), 1);
             assert_eq!(
                 graphs[0].read(cx).log_source,
-                LogSource::File(tracked1_repo_path.clone())
+                LogSource::Path(tracked1_repo_path.clone())
             );
         });
 
@@ -5667,7 +5667,7 @@ mod tests {
                 .expect("expected a git graph");
             assert_eq!(
                 latest.read(cx).log_source,
-                LogSource::File(tracked2_repo_path)
+                LogSource::Path(tracked2_repo_path)
             );
         });
     }
@@ -5691,7 +5691,7 @@ mod tests {
 
         assert_eq!(
             persistence::deserialize_log_source(&state),
-            LogSource::File(file_path)
+            LogSource::Path(file_path)
         );
         assert!(matches!(
             persistence::deserialize_log_order(&state),
@@ -6415,7 +6415,7 @@ mod tests {
             .expect("graph should construct");
 
         graph.read_with(cx, |graph, _| {
-            assert_eq!(graph.log_source, LogSource::File(repo_path.clone()));
+            assert_eq!(graph.log_source, LogSource::Path(repo_path.clone()));
             assert_eq!(graph.mode(), GraphMode::FileHistory);
             assert!(graph.file_history_options().follow_renames);
             // Default-off: view_row_count == commits.len() (no synthetic
