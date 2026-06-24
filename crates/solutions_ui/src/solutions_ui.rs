@@ -29,7 +29,7 @@ pub use switch::switch_active_solution_in_place;
 
 pub use actions::{DeleteSolution, NewSolution, OpenSolution, RefreshCacheForCurrent};
 
-use gpui::{App, AppContext as _, Window};
+use gpui::{App, AppContext as _, TaskExt as _, Window};
 use solutions::{SolutionId, SolutionStore, SolutionStoreEvent};
 use std::path::PathBuf;
 use ui::SharedString;

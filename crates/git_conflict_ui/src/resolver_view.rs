@@ -887,7 +887,7 @@ impl ConflictResolverView {
     fn pane(editor: Entity<Editor>, flex: f32, label: &'static str, cx: &App) -> AnyElement {
         v_flex()
             .h_full()
-            .flex_shrink()
+            .flex_shrink(1.)
             .min_w_0()
             .flex_basis(gpui::DefiniteLength::Fraction(flex))
             .overflow_hidden()

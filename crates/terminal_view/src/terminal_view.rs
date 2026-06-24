@@ -1037,7 +1037,7 @@ impl TerminalView {
         dispatch_context
     }
 
-    fn set_terminal(
+    pub fn set_terminal(
         &mut self,
         terminal: Entity<Terminal>,
         window: &mut Window,

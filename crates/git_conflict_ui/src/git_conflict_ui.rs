@@ -25,7 +25,7 @@ mod toolbar;
 pub use conflict_parser::{ConflictedFile, InProgressOp, ThreeWayContent, detect_in_progress_op};
 pub use resolver_view::{ConflictResolverView, ResolverPane, ThreeWaySplitState};
 
-use gpui::App;
+use gpui::{App, TaskExt as _};
 use std::sync::Arc;
 use workspace::Workspace;
 

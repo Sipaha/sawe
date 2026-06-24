@@ -1,7 +1,7 @@
 use gpui::{Render, Subscription, WeakEntity};
 use solutions::{SolutionStore, SolutionStoreEvent};
 use ui::prelude::*;
-use workspace::{StatusItemView, Workspace, item::ItemHandle};
+use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
 use crate::actions::OpenSolution;
 
@@ -67,5 +67,9 @@ impl StatusItemView for SolutionsStatusItem {
         cx: &mut gpui::Context<Self>,
     ) {
         cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        None
     }
 }

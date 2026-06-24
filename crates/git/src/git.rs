@@ -1,10 +1,14 @@
+pub mod backup;
 pub mod blame;
 pub mod commit;
 mod hosting_provider;
+pub mod operations;
 mod remote;
+pub mod repo_lock;
 pub mod repository;
 pub mod stash;
 pub mod status;
+pub mod undo_registry;
 
 pub use crate::hosting_provider::*;
 pub use crate::remote::*;

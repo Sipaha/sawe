@@ -809,7 +809,7 @@ impl ConsolePanel {
         if center_pane_has_focus && active_center_item_is_terminal {
             let working_directory = terminal_view::default_working_directory(workspace, cx);
             let local = action.local;
-            terminal_view::add_center_terminal(workspace, window, cx, move |project, cx| {
+            terminal_view::terminal_panel::TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
                 if local {
                     project.create_local_terminal(cx)
                 } else {
@@ -982,7 +982,7 @@ impl ConsolePanel {
             RevealTarget::Center => self
                 .workspace
                 .update(cx, |workspace, cx| {
-                    terminal_view::add_center_terminal(workspace, window, cx, |project, cx| {
+                    terminal_view::terminal_panel::TerminalPanel::add_center_terminal(workspace, window, cx, |project, cx| {
                         project.create_terminal_task(spawn_task, cx)
                     })
                 })

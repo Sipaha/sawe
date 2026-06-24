@@ -4,7 +4,9 @@
 //! against the resolver entity — no separate Action types are introduced
 //! at this stage; toolbar buttons drive resolver methods directly.
 
-use gpui::{App, Context, InteractiveElement, IntoElement, ParentElement, Styled, Window, div};
+use gpui::{
+    App, Context, InteractiveElement, IntoElement, ParentElement, Styled, TaskExt as _, Window, div,
+};
 use theme::ActiveTheme as _;
 use ui::{
     Button, ButtonCommon, Clickable, Color, Disableable, Icon, IconButton, IconName, IconSize,
