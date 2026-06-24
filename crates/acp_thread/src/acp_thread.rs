@@ -454,7 +454,7 @@ impl AgentThreadEntry {
         match self {
             Self::AssistantMessage(message) => message.subagent_id.as_ref(),
             Self::ToolCall(call) => call.subagent_id.as_ref(),
-            Self::UserMessage(_) | Self::CompletedPlan(_) => None,
+            Self::UserMessage(_) | Self::CompletedPlan(_) | Self::ContextCompaction(_) => None,
         }
     }
 
@@ -2889,21 +2889,6 @@ impl AcpThread {
                         }),
                         cx,
                     );
-                })
-                .ok();
-
-                let old_checkpoint = git_store
-                    .update(cx, |git, cx| git.checkpoint(cx))
-                    .await
-                    .context("failed to get old checkpoint")
-                    .log_err();
-                this.update(cx, |this, _cx| {
-                    if let Some((_ix, message)) = this.last_user_message() {
-                        message.checkpoint = old_checkpoint.map(|git_checkpoint| Checkpoint {
-                            git_checkpoint,
-                            show: false,
-                        });
-                    }
                 })
                 .ok();
             }

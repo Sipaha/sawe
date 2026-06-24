@@ -239,6 +239,12 @@ pub fn settings_file() -> &'static PathBuf {
     SETTINGS_FILE.get_or_init(|| config_dir().join("settings.json"))
 }
 
+/// Returns the path to the global `AGENTS.md` instructions file.
+pub fn agents_file() -> &'static PathBuf {
+    static AGENTS_FILE: OnceLock<PathBuf> = OnceLock::new();
+    AGENTS_FILE.get_or_init(|| config_dir().join("AGENTS.md"))
+}
+
 /// Returns the path to the global settings file.
 pub fn global_settings_file() -> &'static PathBuf {
     static GLOBAL_SETTINGS_FILE: OnceLock<PathBuf> = OnceLock::new();
