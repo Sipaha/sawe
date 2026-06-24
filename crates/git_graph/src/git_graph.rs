@@ -836,7 +836,7 @@ pub fn init(cx: &mut App) {
 
                     div.on_action({
                         let workspace = workspace.clone();
-                        move |_: &git_ui::git_graph::Open, window, cx| {
+                        move |_: &git_ui::git_panel::Open, window, cx| {
                             workspace
                                 .update(cx, |workspace, cx| {
                                     let Some(repo) =
@@ -862,7 +862,7 @@ pub fn init(cx: &mut App) {
                         }
                     })
                     .on_action(
-                        move |action: &git_ui::git_graph::OpenAtCommit, window, cx| {
+                        move |action: &git_ui::git_panel::OpenAtCommit, window, cx| {
                             let sha = action.sha.clone();
                             workspace
                                 .update(cx, |workspace, cx| {

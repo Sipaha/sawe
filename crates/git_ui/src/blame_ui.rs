@@ -2,7 +2,7 @@ use crate::{
     commit_context_menu::{CommitContext, build_commit_context_menu},
     commit_tooltip::{CommitAvatar, CommitTooltip},
     commit_view::CommitView,
-    git_graph::OpenAtCommit,
+    git_panel::OpenAtCommit,
 };
 use editor::{
     BlameRenderer, Editor,

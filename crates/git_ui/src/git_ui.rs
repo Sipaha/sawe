@@ -50,7 +50,6 @@ pub mod commit_tooltip;
 pub mod commit_view;
 mod conflict_view;
 pub mod file_diff_view;
-pub mod git_graph;
 pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
@@ -88,7 +87,6 @@ pub fn get_provider_icon(name: &str) -> IconName {
 pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
-    git_graph::init(cx);
     backup_mcp::register(cx);
     handlers_mcp::register(cx);
     push_dialog_mcp::register(cx);

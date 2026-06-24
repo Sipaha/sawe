@@ -1940,6 +1940,10 @@
     //
     // Default: true
     "flexible": true,
+    // Which dock position the (upstream) terminal panel uses. This fork hosts
+    // terminals in the bottom ConsolePanel, but the upstream terminal settings
+    // schema still requires a value.
+    "dock": "bottom",
     // Default width when the terminal is docked to the left or right.
     "default_width": 640,
     // Default height when the terminal is docked to the bottom.
