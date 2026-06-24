@@ -5612,6 +5612,7 @@ impl ThreadView {
                 chunks,
                 indented: _,
                 is_subagent_output: _,
+                subagent_id: _,
             }) => {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;

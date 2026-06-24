@@ -7599,24 +7599,6 @@ impl ProjectPanel {
     }
 }
 
-impl ProjectPanel {
-    pub fn select_path_for_test(&mut self, project_path: ProjectPath, cx: &App) {
-        let Some(worktree) = self
-            .project
-            .read(cx)
-            .worktree_for_id(project_path.worktree_id, cx)
-        else {
-            return;
-        };
-        let Some(entry) = worktree.read(cx).entry_for_path(project_path.path.as_ref()) else {
-            return;
-        };
-        self.selection = Some(SelectedEntry {
-            worktree_id: project_path.worktree_id,
-            entry_id: entry.id,
-        });
-    }
-}
 
 impl Focusable for ProjectPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

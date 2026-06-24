@@ -1443,7 +1443,7 @@ impl Render for SolutionStatusDashboard {
             .child(
                 v_flex()
                     .id("dsh-rows")
-                    .flex_grow()
+                    .flex_grow(1.)
                     .overflow_y_scroll()
                     .children(
                         self.rows

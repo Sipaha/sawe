@@ -591,7 +591,7 @@ impl SolutionPushDialog {
         let sections = self.sections.clone();
         let mut list = v_flex()
             .id("solution-push-sections")
-            .flex_grow()
+            .flex_grow(1.)
             .overflow_y_scroll();
         for (ix, section) in sections.iter().enumerate() {
             list = list.child(self.render_section(ix, section, cx).into_any_element());
@@ -820,7 +820,7 @@ impl SolutionPushDialog {
     fn render_outcomes(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = v_flex()
             .id("solution-push-outcomes")
-            .flex_grow()
+            .flex_grow(1.)
             .overflow_y_scroll()
             .px_3()
             .py_2()
