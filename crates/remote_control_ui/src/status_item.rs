@@ -1,7 +1,8 @@
 use gpui::{Render, Subscription, WeakEntity};
 use remote_control::{RemoteControlStore, RemoteControlStoreEvent};
 use ui::{Button, ButtonStyle, Color, Icon, IconName, IconSize, LabelSize, prelude::*};
-use workspace::{StatusItemView, Workspace, item::ItemHandle};
+use gpui::App;
+use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
 use crate::modal::RemoteControlModal;
 
@@ -74,6 +75,10 @@ impl StatusItemView for RemoteControlStatusItem {
         cx: &mut gpui::Context<Self>,
     ) {
         cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        None
     }
 }
 
