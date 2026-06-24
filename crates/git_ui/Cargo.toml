@@ -55,11 +55,8 @@ project.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
 rand.workspace = true
-<<<<<<< ours
-release_channel.workspace = true
-=======
 regex.workspace = true
->>>>>>> theirs
+release_channel.workspace = true
 remote_connection.workspace = true
 remote.workspace = true
 schemars.workspace = true
@@ -68,18 +65,13 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 smallvec.workspace = true
-<<<<<<< ours
-strum.workspace = true
-sysinfo.workspace = true
-task.workspace = true
-=======
 solution_agent.workspace = true
 solutions.workspace = true
 solutions_ui.workspace = true
 strum.workspace = true
+sysinfo.workspace = true
 task.workspace = true
 tempfile.workspace = true
->>>>>>> theirs
 telemetry.workspace = true
 terminal.workspace = true
 theme.workspace = true
@@ -95,22 +87,15 @@ zed_actions.workspace = true
 zeroize.workspace = true
 ztracing.workspace = true
 tracing.workspace = true
-<<<<<<< ours
-
-=======
 uuid.workspace = true
->>>>>>> theirs
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
 [dev-dependencies]
 ctor.workspace = true
 db = { workspace = true, features = ["test-support"] }
-<<<<<<< ours
-=======
 git_hosting_providers.workspace = true
 tempfile.workspace = true
->>>>>>> theirs
 editor = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 git = { workspace = true, features = ["test-support"] }
@@ -120,11 +105,8 @@ pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
 rand.workspace = true
 settings = { workspace = true, features = ["test-support"] }
-<<<<<<< ours
-task.workspace = true
-=======
 smol.workspace = true
->>>>>>> theirs
+task.workspace = true
 unindent.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
 zlog.workspace = true

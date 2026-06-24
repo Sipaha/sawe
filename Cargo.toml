@@ -54,6 +54,7 @@ members = [
     "crates/debugger_tools",
     "crates/debugger_ui",
     "crates/deepseek",
+    "crates/denoise",
     "crates/dev_container",
     "crates/diagnostics",
     "crates/docs_preprocessor",
@@ -64,11 +65,8 @@ members = [
     "crates/edit_prediction_types",
     "crates/edit_prediction_ui",
     "crates/editor",
-<<<<<<< ours
     "crates/editor_benchmarks",
-=======
     "crates/editor_mcp",
->>>>>>> theirs
     "crates/encoding_selector",
     "crates/env_var",
     "crates/etw_tracing",
@@ -90,11 +88,8 @@ members = [
     "crates/fuzzy",
     "crates/fuzzy_nucleo",
     "crates/git",
-<<<<<<< ours
-=======
     "crates/git_conflict_ui",
     "crates/git_graph",
->>>>>>> theirs
     "crates/git_hosting_providers",
     "crates/git_ui",
     "crates/go_to_line",
@@ -147,6 +142,7 @@ members = [
     "crates/miniprofiler_ui",
     "crates/mistral",
     "crates/multi_buffer",
+    "crates/nc",
     "crates/net",
     "crates/node_runtime",
     "crates/notifications",
@@ -183,13 +179,10 @@ members = [
     "crates/reqwest_client",
     "crates/rope",
     "crates/rpc",
-<<<<<<< ours
-    "crates/sandbox",
-=======
     "crates/rules_library",
     "crates/run_config",
     "crates/run_config_ui",
->>>>>>> theirs
+    "crates/sandbox",
     "crates/scheduler",
     "crates/schema_generator",
     "crates/search",
@@ -238,6 +231,7 @@ members = [
     "crates/ui_prompt",
     "crates/util",
     "crates/util_macros",
+    "crates/vercel",
     "crates/vim",
     "crates/vim_mode_setting",
     "crates/watch",
@@ -344,6 +338,7 @@ debugger_tools = { path = "crates/debugger_tools" }
 debugger_ui = { path = "crates/debugger_ui" }
 deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
+denoise = { path = "crates/denoise" }
 dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
 dialoguer = { version = "0.12", default-features = false }
@@ -365,11 +360,8 @@ fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
 git = { path = "crates/git" }
-<<<<<<< ours
-=======
 git_conflict_ui = { path = "crates/git_conflict_ui" }
 git_graph = { path = "crates/git_graph" }
->>>>>>> theirs
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
 go_to_line = { path = "crates/go_to_line" }
@@ -427,6 +419,7 @@ mistral = { path = "crates/mistral" }
 multi_buffer = { path = "crates/multi_buffer" }
 miniprofiler_ui = { path = "crates/miniprofiler_ui" }
 net = { path = "crates/net" }
+nc = { path = "crates/nc" }
 node_runtime = { path = "crates/node_runtime" }
 notifications = { path = "crates/notifications" }
 oauth_callback_server = { path = "crates/oauth_callback_server" }
@@ -462,12 +455,9 @@ reqwest_client = { path = "crates/reqwest_client" }
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", features = ["wav", "playback", "wav_output", "recording"] }
 rope = { path = "crates/rope" }
 rpc = { path = "crates/rpc" }
-<<<<<<< ours
-=======
 rules_library = { path = "crates/rules_library" }
 run_config = { path = "crates/run_config" }
 run_config_ui = { path = "crates/run_config_ui" }
->>>>>>> theirs
 scheduler = { path = "crates/scheduler" }
 sandbox = { path = "crates/sandbox" }
 search = { path = "crates/search" }
@@ -515,6 +505,7 @@ ui_macros = { path = "crates/ui_macros" }
 ui_prompt = { path = "crates/ui_prompt" }
 util = { path = "crates/util" }
 util_macros = { path = "crates/util_macros" }
+vercel = { path = "crates/vercel" }
 vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
 which_key = { path = "crates/which_key" }
@@ -542,15 +533,11 @@ ztracing_macro = { path = "crates/ztracing_macro" }
 # External crates
 #
 
-<<<<<<< ours
 accesskit = "0.24.0"
 accesskit_macos = "0.26.0"
 accesskit_unix = "0.21.0"
 accesskit_windows = "0.32.1"
 agent-client-protocol = { version = "=0.14.0", features = ["unstable"] }
-=======
-agent-client-protocol = { version = "=0.11.1", features = ["unstable"] }
->>>>>>> theirs
 aho-corasick = "1.1"
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
 any_vec = "0.14"
@@ -744,11 +731,8 @@ prost-build = "0.9"
 prost-types = "0.9"
 pollster = "0.4.0"
 pulldown-cmark = { version = "0.13.0", default-features = false }
-<<<<<<< ours
-quick-xml = "0.38"
-=======
 qrcodegen = "1.8"
->>>>>>> theirs
+quick-xml = "0.38"
 quote = "1.0.9"
 rand = "0.9"
 rayon = "1.8"

@@ -115,11 +115,8 @@ file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
 git.workspace = true
-<<<<<<< ours
-=======
 git_conflict_ui.workspace = true
 git_graph.workspace = true
->>>>>>> theirs
 git_hosting_providers.workspace = true
 git_ui = { workspace = true, features = ["call"] }
 go_to_line.workspace = true

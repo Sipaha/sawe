@@ -41,11 +41,7 @@ client.workspace = true
 cloud_api_types.workspace = true
 command_palette_hooks.workspace = true
 db.workspace = true
-<<<<<<< ours
-
-=======
 git.workspace = true
->>>>>>> theirs
 git_ui.workspace = true
 gpui = { workspace = true, features = ["screen-capture"] }
 icons.workspace = true

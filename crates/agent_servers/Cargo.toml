@@ -6,7 +6,6 @@ publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [features]
-<<<<<<< ours
 test-support = [
     "acp_thread/test-support",
     "gpui/test-support",
@@ -16,9 +15,6 @@ test-support = [
     "dep:gpui_tokio",
     "reqwest_client/test-support",
 ]
-=======
-test-support = ["acp_thread/test-support", "gpui/test-support", "project/test-support", "dep:env_logger", "client/test-support", "dep:gpui_tokio", "reqwest_client/test-support"]
->>>>>>> theirs
 e2e = []
 
 [lints]
