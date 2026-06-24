@@ -305,16 +305,21 @@ pub fn init(cx: &mut App) {
     });
 }
 
-/// True once no main editor window (a `MultiWorkspace`-rooted window) is
-/// left open. Auxiliary windows — the image preview, the detached compose
-/// editor, the About box — are `Normal` windows too, so the old
-/// `cx.windows().is_empty()` check let them keep the app alive after the
+/// True once no main editor window is left open. A "main" window is either a
+/// `MultiWorkspace`-rooted editor window or the `WelcomeWindow` launcher —
+/// closing the last solution opens the launcher instead of quitting, so it
+/// must keep the app alive. Auxiliary windows — the image preview, the
+/// detached compose editor, the About box — are `Normal` windows too, so the
+/// old `cx.windows().is_empty()` check let them keep the app alive after the
 /// last editor window closed. Closing the editor should quit regardless of
 /// those; `cx.quit()` tears them down.
 fn no_main_windows_left(cx: &App) -> bool {
-    !cx.windows()
-        .iter()
-        .any(|window| window.downcast::<MultiWorkspace>().is_some())
+    !cx.windows().iter().any(|window| {
+        window.downcast::<MultiWorkspace>().is_some()
+            || window
+                .downcast::<workspace::welcome::WelcomeWindow>()
+                .is_some()
+    })
 }
 
 fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {

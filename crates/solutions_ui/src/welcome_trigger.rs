@@ -13,16 +13,24 @@
 
 use gpui::{App, Context, Window};
 use solutions::SolutionStore;
-use workspace::{MultiWorkspace, welcome::ShowWelcome};
+use util::ResultExt as _;
+use workspace::{AppState, MultiWorkspace, welcome::WelcomeWindow};
 
 /// Call after a successful `close_solution` once the in-flight close
 /// tasks have completed. If the window's `MultiWorkspace` no longer
-/// hosts any solution, opens the launcher (`WelcomeWindow`) via the
-/// `ShowWelcome` action — the same primitive used by the menu and by
-/// the onboarding entry point — and retires the now-empty `MultiWorkspace`
-/// window. The fallback workspace MW spawns to keep the window alive
-/// has no solution and no path list, so leaving it on screen alongside
-/// the launcher just shows the user two windows when one would do.
+/// hosts any solution, opens the launcher (`WelcomeWindow`) and retires
+/// the now-empty `MultiWorkspace` window. The fallback workspace MW spawns
+/// to keep the window alive has no solution and no path list, so leaving it
+/// on screen alongside the launcher just shows the user two windows when
+/// one would do.
+///
+/// The launcher is opened **synchronously and directly** (not via the
+/// deferred `ShowWelcome` action) BEFORE removing this window. Two reasons:
+/// (1) `cx.dispatch_action` would queue the action on *this* window, which
+/// is about to be removed — the queued action could be dropped with it; and
+/// (2) the quit-on-last-window guard (`zed::no_main_windows_left`) fires from
+/// `on_window_closed` the instant the MW is removed, so the `WelcomeWindow`
+/// must already exist by then or the app quits instead of showing it.
 pub fn open_welcome_if_window_empty(
     multi_workspace: &MultiWorkspace,
     window: &mut Window,
@@ -31,7 +39,7 @@ pub fn open_welcome_if_window_empty(
     if has_any_solution(multi_workspace, cx) {
         return;
     }
-    cx.dispatch_action(&ShowWelcome);
+    WelcomeWindow::open(AppState::global(cx), cx).log_err();
     window.remove_window();
 }
 
