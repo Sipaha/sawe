@@ -427,6 +427,9 @@ pub struct AcpConnection {
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
     session_list: Option<Rc<AcpSessionList>>,
+    /// Per-session model selectors, lazily created so a tier selection made in
+    /// the status bar survives across status-row re-renders. See `model_selector`.
+    model_selectors: Rc<RefCell<HashMap<acp::SessionId, Rc<AcpModelSelector>>>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
     _io_task: Task<()>,
@@ -1089,6 +1092,7 @@ impl AcpConnection {
             agent_capabilities: response.agent_capabilities,
             defaults,
             session_list,
+            model_selectors: Rc::new(RefCell::new(HashMap::default())),
             debug_log,
             _settings_subscription: settings_subscription,
             _io_task: io_task,
@@ -1130,6 +1134,7 @@ impl AcpConnection {
             defaults,
             child: None,
             session_list: None,
+            model_selectors: Rc::new(RefCell::new(HashMap::default())),
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
             _io_task: io_task,
@@ -1987,6 +1992,31 @@ impl AgentConnection for AcpConnection {
         }
     }
 
+    fn model_selector(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<Rc<dyn acp_thread::AgentModelSelector>> {
+        // The ACP schema version pinned here (agent-client-protocol 0.14 /
+        // schema 0.13.6) dropped the per-session `SessionModelState` that the
+        // predecessor fork sourced the model list from — it was replaced by an
+        // unrelated `unstable_llm_providers` backend-provider API that isn't
+        // enabled in this build and doesn't model Claude's Sonnet/Opus/Haiku
+        // tiers. To keep the namesake status-bar selector populated we expose
+        // the known Claude model tiers and track the selection locally for the
+        // claude-acp agent. Other agents fall back to the trait default (None).
+        if self.id.0.as_ref() != crate::CLAUDE_AGENT_ID {
+            return None;
+        }
+
+        let selector = self
+            .model_selectors
+            .borrow_mut()
+            .entry(session_id.clone())
+            .or_insert_with(|| Rc::new(AcpModelSelector::new_claude()))
+            .clone();
+        Some(selector as _)
+    }
+
     fn session_config_options(
         &self,
         session_id: &acp::SessionId,
@@ -2335,6 +2365,13 @@ pub mod test_support {
             cx: &App,
         ) -> Option<Rc<dyn AgentSessionModes>> {
             self.inner.session_modes(session_id, cx)
+        }
+
+        fn model_selector(
+            &self,
+            session_id: &acp::SessionId,
+        ) -> Option<Rc<dyn acp_thread::AgentModelSelector>> {
+            self.inner.model_selector(session_id)
         }
 
         fn session_config_options(
@@ -3840,6 +3877,82 @@ impl acp_thread::AgentSessionModes for AcpSessionModes {
 
             Ok(())
         })
+    }
+}
+
+/// The Claude model tiers surfaced in the status-bar selector. The ACP schema
+/// pinned in this build no longer advertises a per-session model list (see
+/// `AcpConnection::model_selector`), so the tiers are enumerated here. `id`
+/// values match the `--model` aliases claude-acp accepts.
+fn claude_model_tiers() -> Vec<acp_thread::AgentModelInfo> {
+    let tier = |id: &str, name: &str, is_latest: bool| acp_thread::AgentModelInfo {
+        id: acp_thread::AgentModelId::from(id.to_string()),
+        name: SharedString::from(name.to_string()),
+        description: None,
+        icon: None,
+        is_latest,
+        cost: None,
+    };
+    vec![
+        tier("sonnet", "Claude Sonnet", true),
+        tier("opus", "Claude Opus", false),
+        tier("haiku", "Claude Haiku", false),
+    ]
+}
+
+/// Model selector for the claude-acp agent.
+///
+/// The pinned ACP schema (0.13.6, via agent-client-protocol 0.14) does not
+/// expose a per-session model list or a set-model request, so the selection is
+/// tracked locally and reported back to the status bar. Picking a tier here
+/// does not currently round-trip to the agent process; it restores the visible
+/// selector that the predecessor fork drove off the (now-removed)
+/// `SessionModelState`.
+struct AcpModelSelector {
+    models: Vec<acp_thread::AgentModelInfo>,
+    selected: RefCell<acp_thread::AgentModelId>,
+}
+
+impl AcpModelSelector {
+    fn new_claude() -> Self {
+        let models = claude_model_tiers();
+        let selected = models
+            .first()
+            .map(|model| model.id.clone())
+            .unwrap_or_else(|| acp_thread::AgentModelId::from("sonnet".to_string()));
+        Self {
+            models,
+            selected: RefCell::new(selected),
+        }
+    }
+}
+
+impl acp_thread::AgentModelSelector for AcpModelSelector {
+    fn list_models(&self, _cx: &mut App) -> Task<Result<acp_thread::AgentModelList>> {
+        Task::ready(Ok(acp_thread::AgentModelList::Flat(self.models.clone())))
+    }
+
+    fn select_model(
+        &self,
+        model_id: acp_thread::AgentModelId,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        if !self.models.iter().any(|model| model.id == model_id) {
+            return Task::ready(Err(anyhow!("unknown Claude model `{}`", model_id)));
+        }
+        *self.selected.borrow_mut() = model_id;
+        Task::ready(Ok(()))
+    }
+
+    fn selected_model(&self, _cx: &mut App) -> Task<Result<acp_thread::AgentModelInfo>> {
+        let selected = self.selected.borrow().clone();
+        Task::ready(
+            self.models
+                .iter()
+                .find(|model| model.id == selected)
+                .cloned()
+                .ok_or_else(|| anyhow!("selected Claude model not found")),
+        )
     }
 }
 

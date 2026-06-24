@@ -2162,12 +2162,20 @@ fn find_window_for_solution(solution_id: &str, cx: &mut App) -> Option<gpui::Any
 // workspace.screenshot
 // =====================================================================
 
-/// Capture a screenshot of the editor window for a Solution. Returns the
-/// image as base64-encoded data, with default JPEG quality 80 for token
-/// efficiency. Use `format: "png"` for pixel-perfect captures.
+/// Capture a screenshot of an editor window. Identify the window either by
+/// `solution_id` (a Solution's main window) OR by `window_id` (from
+/// `windows.list` — needed for non-Solution top-level windows like the Welcome
+/// launcher). Exactly one of the two must be supplied. Returns the image as
+/// base64-encoded data, with default JPEG quality 80 for token efficiency. Use
+/// `format: "png"` for pixel-perfect captures.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ScreenshotParams {
-    pub solution_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<String>,
+    /// A `window:N` id from `windows.list`. Use this to screenshot a window
+    /// that isn't a Solution workspace (e.g. the Welcome launcher).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<String>,
     /// Image format: "jpeg" (default), "png", or "webp".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
@@ -2185,7 +2193,8 @@ impl<'de> Deserialize<'de> for ScreenshotParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: Option<String>,
+            window_id: Option<String>,
             format: Option<String>,
             quality: Option<u8>,
             max_dimension: Option<u32>,
@@ -2193,6 +2202,7 @@ impl<'de> Deserialize<'de> for ScreenshotParams {
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             solution_id: inner.solution_id,
+            window_id: inner.window_id,
             format: inner.format,
             quality: inner.quality,
             max_dimension: inner.max_dimension,
@@ -2222,9 +2232,11 @@ impl McpServerTool for ScreenshotTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        let solution_id = input.solution_id.clone().filter(|s| !s.is_empty());
+        let window_id = input.window_id.clone().filter(|s| !s.is_empty());
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
-            "invalid_params: solution_id is required"
+            solution_id.is_some() != window_id.is_some(),
+            "invalid_params: provide exactly one of solution_id or window_id"
         );
         let format = input
             .format
@@ -2234,8 +2246,16 @@ impl McpServerTool for ScreenshotTool {
         let quality = input.quality.unwrap_or(80).clamp(1, 100);
 
         let rgba = cx.update(|cx| -> anyhow::Result<image::RgbaImage> {
-            let handle = find_window_for_solution(&input.solution_id, cx)
-                .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
+            let handle = if let Some(solution_id) = solution_id.as_deref() {
+                find_window_for_solution(solution_id, cx)
+                    .ok_or_else(|| anyhow::anyhow!("solution_not_open: {solution_id}"))?
+            } else {
+                let window_id = window_id.as_deref().unwrap_or_default();
+                cx.windows()
+                    .into_iter()
+                    .find(|h| editor_mcp::format_window_id(h.window_id()) == window_id)
+                    .ok_or_else(|| anyhow::anyhow!("window_not_found: {window_id}"))?
+            };
             render_window_to_image(handle, cx)
         })?;
 
@@ -5250,16 +5270,29 @@ mod tests {
             "max_dimension": 1280
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id.as_deref(), Some("demo"));
         assert_eq!(p.format.as_deref(), Some("jpeg"));
         assert_eq!(p.quality, Some(75));
         assert_eq!(p.max_dimension, Some(1280));
     }
 
     #[test]
+    fn screenshot_params_by_window_id() {
+        let p: ScreenshotParams = serde_json::from_value(serde_json::json!({
+            "window_id": "window:3",
+            "format": "png"
+        }))
+        .expect("parse");
+        assert!(p.solution_id.is_none());
+        assert_eq!(p.window_id.as_deref(), Some("window:3"));
+        assert_eq!(p.format.as_deref(), Some("png"));
+    }
+
+    #[test]
     fn screenshot_params_accepts_null() {
         let p: ScreenshotParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert!(p.solution_id.is_none());
+        assert!(p.window_id.is_none());
         assert!(p.format.is_none());
         assert!(p.quality.is_none());
         assert!(p.max_dimension.is_none());

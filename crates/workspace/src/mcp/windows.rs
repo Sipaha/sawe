@@ -27,7 +27,7 @@ impl<'de> Deserialize<'de> for ListWindowsParams {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct WindowInfo {
     pub window_id: String,
-    pub kind: String, // "folder" | "welcome"
+    pub kind: String, // "folder" | "welcome" | "other"
     pub root_paths: Vec<String>,
     pub focused: bool,
     pub bounds: [i32; 4],
@@ -79,18 +79,53 @@ fn collect_windows(cx: &mut App) -> Vec<WindowInfo> {
         .unwrap_or_else(|| cx.windows());
     let mut out = Vec::new();
     for handle in handles {
-        let Some(window_handle) = handle.downcast::<crate::MultiWorkspace>() else {
-            continue;
-        };
         let window_id = handle.window_id();
-        let info = window_handle.update(cx, |multi, window, cx| {
-            build_window_info(window_id, active_window_id, multi, window, cx)
-        });
-        if let Ok(info) = info {
-            out.push(info);
+        if let Some(window_handle) = handle.downcast::<crate::MultiWorkspace>() {
+            let info = window_handle.update(cx, |multi, window, cx| {
+                build_window_info(window_id, active_window_id, multi, window, cx)
+            });
+            if let Ok(info) = info {
+                out.push(info);
+            }
+        } else {
+            // Top-level windows that are not Solution workspaces — e.g. the
+            // Welcome launcher (`WelcomeWindow`). The harness still needs to
+            // see and screenshot these, so emit a minimal `WindowInfo` with no
+            // root paths. `AnyWindowHandle::update` works for any root view
+            // type, so we read bounds/focus without knowing the concrete view.
+            let info = handle.update(cx, |_root, window, _cx| {
+                build_other_window_info(window_id, active_window_id, window)
+            });
+            if let Ok(info) = info {
+                out.push(info);
+            }
         }
     }
     out
+}
+
+/// Minimal `WindowInfo` for a non-`MultiWorkspace` top-level window (currently
+/// only the Welcome launcher). No root paths; `kind` is `"other"`.
+fn build_other_window_info(
+    window_id: gpui::WindowId,
+    active_window_id: Option<gpui::WindowId>,
+    window: &mut gpui::Window,
+) -> WindowInfo {
+    let bounds = window.bounds();
+    let bounds_arr = [
+        f32::from(bounds.origin.x) as i32,
+        f32::from(bounds.origin.y) as i32,
+        f32::from(bounds.size.width) as i32,
+        f32::from(bounds.size.height) as i32,
+    ];
+    WindowInfo {
+        window_id: editor_mcp::format_window_id(window_id),
+        kind: "other".to_string(),
+        root_paths: Vec::new(),
+        focused: active_window_id == Some(window_id),
+        bounds: bounds_arr,
+        title: String::from("Sawe"),
+    }
 }
 
 fn build_window_info(
