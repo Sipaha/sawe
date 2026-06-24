@@ -151,6 +151,12 @@ pub struct SolutionSummary {
     pub open: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub main_window_id: Option<String>,
+    /// Path of this Solution's per-solution MCP socket. Present only while the
+    /// Solution is open. A subagent scoped to this Solution connects here
+    /// (`sawe --nc <mcp_socket>`); the socket serves only the solution-scoped
+    /// tool subset with `solution_id` force-injected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_socket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -198,6 +204,11 @@ pub fn build_summary(sol: &Solution, cx: &App) -> SolutionSummary {
     let open = SolutionStore::try_global(cx)
         .map(|store| store.read(cx).is_open(&sol.id))
         .unwrap_or(false);
+    let mcp_socket = open.then(|| {
+        editor_mcp::solution_socket_path(sol.id.as_str())
+            .to_string_lossy()
+            .into_owned()
+    });
     SolutionSummary {
         id: sol.id.as_str().to_string(),
         name: sol.name.clone(),
@@ -206,6 +217,7 @@ pub fn build_summary(sol: &Solution, cx: &App) -> SolutionSummary {
         last_opened_at: sol.last_opened_at.map(|t| t.to_rfc3339()),
         open,
         main_window_id,
+        mcp_socket,
     }
 }
 

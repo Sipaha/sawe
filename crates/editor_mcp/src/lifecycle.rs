@@ -1,12 +1,15 @@
 //! MCP server lifecycle: lock acquisition, server bind, graceful shutdown.
 use anyhow::{Context as _, Result};
-use context_server::listener::McpServer;
+use context_server::listener::{ExportedTool, McpServer};
 use fs2::FileExt;
 use gpui::{App, AppContext as _, Entity, Global, TaskExt as _};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 use util::ResultExt as _;
 
 /// Overrides the directory containing `mcp.lock` and `mcp.sock`. Set by
@@ -108,9 +111,92 @@ pub fn socket_path() -> PathBuf {
 struct ActiveServer {
     _lock: SingleInstanceLock,
     server: Entity<McpServer>,
+    /// Solution-scoped tools split off the global catalog at startup. Cloned
+    /// into each per-solution server created by [`open_solution_socket`].
+    scoped_template: Vec<ExportedTool>,
+    /// Live per-solution sockets, keyed by `SolutionId` string.
+    solution_sockets: Rc<RefCell<HashMap<String, SolutionSocket>>>,
 }
 
 impl Global for ActiveServer {}
+
+/// One open Solution's MCP socket. The record is reserved synchronously on
+/// [`open_solution_socket`] (so the deterministic path is discoverable
+/// immediately); `server` is filled once the listener has bound and the
+/// scoped tools are installed.
+struct SolutionSocket {
+    socket: PathBuf,
+    root: PathBuf,
+    server: Option<Entity<McpServer>>,
+}
+
+/// Tools that remain on the editor-global socket. Everything else is
+/// solution-scoped: split off the global catalog and served only from
+/// per-solution sockets (with `solution_id` force-injected). A brand-new
+/// tool defaults to solution-scoped — fail-safe, since the worst case is it
+/// being absent from the global socket (a visible functional gap) rather
+/// than leaking unscoped to a per-solution subagent.
+const GLOBAL_TOOLS: &[&str] = &[
+    // Probe / control plane.
+    "editor.capabilities",
+    "editor.get_operation",
+    "editor.cancel_operation",
+    "editor.subscribe",
+    "editor.unsubscribe",
+    "editor.list_subscriptions",
+    // Solution lifecycle + discovery (a scoped subagent never
+    // creates/opens/closes/deletes/reorders Solutions).
+    "solutions.list",
+    "solutions.create",
+    "solutions.delete",
+    "solutions.open",
+    "solutions.close",
+    "solutions.rename",
+    "solutions.reorder_members",
+    "solutions.find_for_path",
+    // Member management + inspection: shared (see SHARED_TOOLS) — kept on the
+    // global socket (the operator addresses any Solution by id, and a member
+    // must be addable before the Solution can open) and also cloned into each
+    // per-solution socket (a scoped subagent manages its own membership).
+    "solutions.get",
+    "solutions.add_member",
+    "solutions.add_empty_member",
+    "solutions.remove_member",
+    // Catalog (registry of cloneable projects) is global state.
+    "catalog.list",
+    "catalog.add_project",
+    "catalog.remove_project",
+    "catalog.edit_project",
+    "catalog.refresh_cache",
+    "catalog.clear_cache",
+    // Cross-solution window enumeration.
+    "windows.list",
+];
+
+fn is_global_tool(name: &str) -> bool {
+    GLOBAL_TOOLS.contains(&name)
+}
+
+/// Tools that stay on the global socket (so they are in [`GLOBAL_TOOLS`]) but
+/// are ALSO served from every per-solution socket. On a per-solution socket
+/// their `solution_id` is force-injected to the bound Solution.
+const SHARED_TOOLS: &[&str] = &[
+    "solutions.get",
+    "solutions.add_member",
+    "solutions.add_empty_member",
+    "solutions.remove_member",
+];
+
+fn is_shared_tool(name: &str) -> bool {
+    SHARED_TOOLS.contains(&name)
+}
+
+/// Deterministic path of a Solution's per-solution MCP socket. Pure — the
+/// socket only exists between [`open_solution_socket`] and
+/// [`close_solution_socket`].
+pub fn solution_socket_path(solution_id: &str) -> PathBuf {
+    runtime_dir().join("solutions").join(solution_id).join("mcp.sock")
+}
 
 pub fn start_server(cx: &mut App) -> Result<()> {
     // S-BAK: derive process-global caller capabilities from the
@@ -165,11 +251,20 @@ pub fn start_server(cx: &mut App) -> Result<()> {
             }
         }
 
+        // Split the solution-scoped tools off the global catalog: the global
+        // socket keeps only `GLOBAL_TOOLS`; the rest become a template cloned
+        // into each per-solution socket. SHARED_TOOLS stay on the global socket
+        // too but are additionally cloned into the template.
+        let mut scoped_template = server.split_off_tools(is_global_tool);
+        scoped_template.extend(server.export_tools(is_shared_tool));
+
         cx.update(|cx| {
             let server_entity = cx.new(|_| server);
             cx.set_global(ActiveServer {
                 _lock: lock,
                 server: server_entity,
+                scoped_template,
+                solution_sockets: Rc::new(RefCell::new(HashMap::new())),
             });
         });
         anyhow::Ok(())
@@ -177,6 +272,99 @@ pub fn start_server(cx: &mut App) -> Result<()> {
     .detach_and_log_err(cx);
 
     Ok(())
+}
+
+/// Open a per-solution MCP socket bound to `solution_id`, serving the
+/// solution-scoped tool subset with `solution_id` force-injected. Idempotent:
+/// a repeat call for an already-open Solution is a no-op. No-op when the
+/// global server never started (tests / failed bind).
+pub fn open_solution_socket(cx: &mut App, solution_id: &str, root: PathBuf) {
+    let Some(active) = cx.try_global::<ActiveServer>() else {
+        return;
+    };
+    if active.solution_sockets.borrow().contains_key(solution_id) {
+        return;
+    }
+    let template = active.scoped_template.clone();
+    let sockets = active.solution_sockets.clone();
+    let socket = solution_socket_path(solution_id);
+    let solution_id: Arc<str> = Arc::from(solution_id);
+
+    // Reserve the record synchronously so the deterministic path is
+    // discoverable immediately; `server` is filled once the listener binds.
+    sockets.borrow_mut().insert(
+        solution_id.to_string(),
+        SolutionSocket {
+            socket: socket.clone(),
+            root,
+            server: None,
+        },
+    );
+
+    let async_cx = cx.to_async();
+    let server_task = McpServer::new(&async_cx);
+    cx.spawn(async move |cx| {
+        let server = server_task.await.context("creating per-solution MCP server")?;
+        server.install_tools(template);
+        server.set_bound_solution(solution_id.clone());
+
+        let actual_socket = server.socket_path().to_path_buf();
+        if let Some(parent) = socket.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        if actual_socket != socket {
+            std::fs::remove_file(&socket).log_err();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&actual_socket, &socket).with_context(|| {
+                format!("linking {} to {}", actual_socket.display(), socket.display())
+            })?;
+        }
+
+        cx.update(|cx| {
+            let entity = cx.new(|_| server);
+            if let Some(active) = cx.try_global::<ActiveServer>() {
+                if let Some(record) =
+                    active.solution_sockets.borrow_mut().get_mut(solution_id.as_ref())
+                {
+                    record.server = Some(entity);
+                } // else: closed before it finished binding — let the entity drop.
+            }
+        });
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+/// Tear down a Solution's per-solution socket. Dropping the stored server
+/// entity closes its listener; the symlink and the `solutions/<id>` dir are
+/// removed.
+pub fn close_solution_socket(cx: &mut App, solution_id: &str) {
+    let Some(active) = cx.try_global::<ActiveServer>() else {
+        return;
+    };
+    let removed = active.solution_sockets.borrow_mut().remove(solution_id);
+    if let Some(record) = removed {
+        std::fs::remove_file(&record.socket).log_err();
+        if let Some(parent) = record.socket.parent() {
+            std::fs::remove_dir_all(parent).log_err();
+        }
+    }
+}
+
+/// Socket of the open Solution whose `root` is an ancestor of (or equal to)
+/// `path`, if its listener is bound. Used by the `--nc` bridge to point a
+/// subagent at its own Solution's socket. The most specific (longest) root
+/// wins when Solutions nest.
+pub fn solution_socket_for_path(cx: &App, path: &Path) -> Option<PathBuf> {
+    let active = cx.try_global::<ActiveServer>()?;
+    active
+        .solution_sockets
+        .borrow()
+        .values()
+        .filter(|record| record.server.is_some() && path.starts_with(&record.root))
+        .max_by_key(|record| record.root.as_os_str().len())
+        .map(|record| record.socket.clone())
 }
 
 pub fn server(cx: &App) -> Option<Entity<McpServer>> {

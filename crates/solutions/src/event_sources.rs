@@ -209,11 +209,24 @@ pub fn install(cx: &mut App) {
                     // Mark the newly-opened solutions as open.
                     if !open_ids.is_empty() {
                         if let Some(store) = SolutionStore::try_global(cx) {
+                            // Capture roots before the mutable update so each
+                            // Solution's per-solution MCP socket can be opened
+                            // (a scoped subagent talks to its own socket only).
+                            let roots: Vec<(crate::SolutionId, std::path::PathBuf)> = store
+                                .read(cx)
+                                .solutions()
+                                .iter()
+                                .filter(|sol| open_ids.contains(&sol.id))
+                                .map(|sol| (sol.id.clone(), sol.root.clone()))
+                                .collect();
                             store.update(cx, |s, cx| {
                                 for id in &open_ids {
                                     s.mark_open(id.clone(), cx);
                                 }
                             });
+                            for (id, root) in roots {
+                                editor_mcp::open_solution_socket(cx, id.as_str(), root);
+                            }
                         }
                         // Register a release observer on the coordinator's entity
                         // so when the MultiWorkspace is dropped (window closed) we
@@ -230,6 +243,9 @@ pub fn install(cx: &mut App) {
                                             s.mark_closed(id, cx);
                                         }
                                     });
+                                }
+                                for id in &close_ids {
+                                    editor_mcp::close_solution_socket(cx, id.as_str());
                                 }
                             });
                         this.subscriptions.push(release_sub);

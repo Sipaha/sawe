@@ -3736,7 +3736,19 @@ mod tests {
 pub fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
-    let mut servers: Vec<acp::McpServer> = sawe_mcp_bridge_server().into_iter().collect();
+    // Sawe: route the `--nc` bridge at this project's own Solution socket when
+    // one is open, so the subagent is physically scoped to that Solution.
+    // Falls back to the global socket when the project isn't under an open
+    // Solution (e.g. standalone window, tests).
+    let solution_socket = project
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .and_then(|worktree| {
+            editor_mcp::solution_socket_for_path(cx, worktree.read(cx).abs_path().as_ref())
+        });
+    let mut servers: Vec<acp::McpServer> =
+        sawe_mcp_bridge_server(solution_socket).into_iter().collect();
     servers.extend(
         context_server_store
             .configured_server_ids()
@@ -3793,8 +3805,11 @@ pub fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::
 /// when the socket file is missing (test harnesses, headless runs that
 /// failed to start the server) or when `current_exe` cannot be resolved
 /// (CI sandbox, etc.). See FORK.md decision 14.
-fn sawe_mcp_bridge_server() -> Option<acp::McpServer> {
-    let socket = editor_mcp::socket_path();
+fn sawe_mcp_bridge_server(solution_socket: Option<PathBuf>) -> Option<acp::McpServer> {
+    // A per-solution socket (when the project belongs to an open Solution)
+    // physically scopes the subagent to that Solution; otherwise fall back to
+    // the editor-global socket.
+    let socket = solution_socket.unwrap_or_else(editor_mcp::socket_path);
     if !socket.exists() {
         return None;
     }

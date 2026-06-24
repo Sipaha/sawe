@@ -19,6 +19,7 @@ use std::{
     cell::RefCell,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 use util::ResultExt;
 
@@ -37,17 +38,37 @@ pub struct McpServer {
     tools: Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
     handlers: Rc<RefCell<HashMap<&'static str, RequestHandler>>>,
     connections: Rc<RefCell<HashMap<u64, UnboundedSender<String>>>>,
+    /// When `Some`, this server is bound to a single Solution: every
+    /// `tools/call` whose tool declares a `solution_id` input has that id
+    /// force-injected (Sawe per-solution MCP sockets — see editor_mcp). The
+    /// global server leaves this `None` and trusts the caller's `solution_id`.
+    bound_solution_id: Rc<RefCell<Option<Arc<str>>>>,
     #[allow(dead_code)]
     next_connection_id: Rc<RefCell<u64>>,
     _server_task: Task<()>,
 }
 
+#[derive(Clone)]
 struct RegisteredTool {
     tool: Tool,
     handler: ToolHandler,
+    /// True when the tool's input schema declares a `solution_id` property.
+    /// A solution-bound server injects its bound id into such tools' params.
+    wants_solution_id: bool,
 }
 
-type ToolHandler = Box<
+/// An opaque, cheaply-cloneable handle to a registered tool (metadata +
+/// shared handler). Produced by [`McpServer::split_off_tools`] and consumed
+/// by [`McpServer::install_tools`] so the same tool implementation can be
+/// served from several sockets (one per Solution) without re-running the
+/// registration closures.
+#[derive(Clone)]
+pub struct ExportedTool {
+    name: &'static str,
+    inner: RegisteredTool,
+}
+
+type ToolHandler = Rc<
     dyn Fn(
         Option<serde_json::Value>,
         &mut AsyncApp,
@@ -71,11 +92,13 @@ impl McpServer {
             let handlers = Rc::new(RefCell::new(HashMap::default()));
             let connections = Rc::new(RefCell::new(HashMap::default()));
             let next_connection_id = Rc::new(RefCell::new(0u64));
+            let bound_solution_id: Rc<RefCell<Option<Arc<str>>>> = Rc::new(RefCell::new(None));
             let server_task = cx.spawn({
                 let tools = tools.clone();
                 let handlers = handlers.clone();
                 let connections = connections.clone();
                 let next_connection_id = next_connection_id.clone();
+                let bound_solution_id = bound_solution_id.clone();
                 async move |cx| {
                     while let Ok((stream, _)) = listener.accept().await {
                         Self::serve_connection(
@@ -84,6 +107,7 @@ impl McpServer {
                             handlers.clone(),
                             connections.clone(),
                             next_connection_id.clone(),
+                            bound_solution_id.clone(),
                             cx,
                         );
                     }
@@ -96,6 +120,7 @@ impl McpServer {
                 tools,
                 handlers,
                 connections,
+                bound_solution_id,
                 next_connection_id,
             })
         })
@@ -117,7 +142,13 @@ impl McpServer {
             "Input schema struct must include a doc comment for the tool description"
         );
 
+        let wants_solution_id = input_schema
+            .get("properties")
+            .and_then(|props| props.get("solution_id"))
+            .is_some();
+
         let registered_tool = RegisteredTool {
+            wants_solution_id,
             tool: Tool {
                 name: T::NAME.into(),
                 title: None,
@@ -130,7 +161,7 @@ impl McpServer {
                 },
                 annotations: Some(tool.annotations()),
             },
-            handler: Box::new({
+            handler: Rc::new({
                 move |input_value, cx| {
                     let input = match input_value {
                         Some(input) => serde_json::from_value(input),
@@ -214,12 +245,66 @@ impl McpServer {
         &self.socket_path
     }
 
+    /// Bind this server to a single Solution. Every subsequent `tools/call`
+    /// whose tool declares a `solution_id` input has that field overwritten
+    /// with `id`, so a connected subagent is physically scoped to one
+    /// Solution and cannot reach another by passing a different id.
+    pub fn set_bound_solution(&self, id: Arc<str>) {
+        *self.bound_solution_id.borrow_mut() = Some(id);
+    }
+
+    /// Remove every tool whose name does NOT satisfy `keep`, returning the
+    /// removed tools so they can be installed onto another server via
+    /// [`install_tools`]. Used to split the global catalog into the
+    /// global-only subset (kept here) and the solution-scoped subset
+    /// (exported to per-solution servers).
+    pub fn split_off_tools(&mut self, keep: impl Fn(&str) -> bool) -> Vec<ExportedTool> {
+        let mut removed = Vec::new();
+        let mut tools = self.tools.borrow_mut();
+        let names: Vec<&'static str> = tools.keys().copied().collect();
+        for name in names {
+            if !keep(name) {
+                if let Some(inner) = tools.remove(name) {
+                    removed.push(ExportedTool { name, inner });
+                }
+            }
+        }
+        removed
+    }
+
+    /// Clone (without removing) every tool whose name satisfies `pick`. Used
+    /// for tools that must appear on BOTH the global socket and per-solution
+    /// sockets (e.g. member management: the operator uses them globally with
+    /// an explicit `solution_id`, a scoped subagent uses them on its own
+    /// socket with the id injected).
+    pub fn export_tools(&self, pick: impl Fn(&str) -> bool) -> Vec<ExportedTool> {
+        self.tools
+            .borrow()
+            .iter()
+            .filter(|(name, _)| pick(name))
+            .map(|(name, inner)| ExportedTool {
+                name,
+                inner: inner.clone(),
+            })
+            .collect()
+    }
+
+    /// Install tools previously exported by [`split_off_tools`]. Handlers are
+    /// shared (`Rc`), so the same implementation serves several sockets.
+    pub fn install_tools(&self, tools: impl IntoIterator<Item = ExportedTool>) {
+        let mut map = self.tools.borrow_mut();
+        for ExportedTool { name, inner } in tools {
+            map.insert(name, inner);
+        }
+    }
+
     fn serve_connection(
         stream: UnixStream,
         tools: Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
         handlers: Rc<RefCell<HashMap<&'static str, RequestHandler>>>,
         connections: Rc<RefCell<HashMap<u64, UnboundedSender<String>>>>,
         next_connection_id: Rc<RefCell<u64>>,
+        bound_solution_id: Rc<RefCell<Option<Arc<str>>>>,
         cx: &mut AsyncApp,
     ) {
         let (read, write) = stream.split();
@@ -244,8 +329,15 @@ impl McpServer {
                 };
 
                 if request.method == CallTool::METHOD {
-                    Self::handle_call_tool(request_id, request.params, &tools, &outgoing_tx, cx)
-                        .await;
+                    Self::handle_call_tool(
+                        request_id,
+                        request.params,
+                        &tools,
+                        &bound_solution_id,
+                        &outgoing_tx,
+                        cx,
+                    )
+                    .await;
                 } else if request.method == ListTools::METHOD {
                     Self::handle_list_tools(request.id.unwrap(), &tools, &outgoing_tx);
                 } else if request.method == Initialize::METHOD {
@@ -376,6 +468,7 @@ impl McpServer {
         request_id: RequestId,
         params: Option<Box<RawValue>>,
         tools: &Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
+        bound_solution_id: &Rc<RefCell<Option<Arc<str>>>>,
         outgoing_tx: &UnboundedSender<String>,
         cx: &mut AsyncApp,
     ) {
@@ -389,7 +482,25 @@ impl McpServer {
                 if let Some(tool) = tools.borrow().get(&params.name.as_ref()) {
                     let outgoing_tx = outgoing_tx.clone();
 
-                    let task = (tool.handler)(params.arguments, cx);
+                    // Per-solution socket: force the bound `solution_id` into
+                    // every solution-scoped tool's params so a scoped subagent
+                    // cannot target another Solution by passing a different id.
+                    let mut arguments = params.arguments;
+                    if tool.wants_solution_id
+                        && let Some(id) = bound_solution_id.borrow().as_ref()
+                    {
+                        let obj = arguments.get_or_insert_with(|| {
+                            serde_json::Value::Object(serde_json::Map::new())
+                        });
+                        if let Some(map) = obj.as_object_mut() {
+                            map.insert(
+                                "solution_id".to_string(),
+                                serde_json::Value::String(id.to_string()),
+                            );
+                        }
+                    }
+
+                    let task = (tool.handler)(arguments, cx);
                     cx.spawn(async move |_| {
                         let response = match task.await {
                             Ok(result) => CallToolResponse {
