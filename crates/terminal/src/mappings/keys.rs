@@ -61,7 +61,6 @@ pub(crate) fn to_esc_str(
         ("enter", TerminalModifiers::Alt) => Some("\x1b\x0d"),
         ("backspace", TerminalModifiers::None) => Some("\x7f"),
         //Interesting escape codes
-<<<<<<< ours
         ("tab", TerminalModifiers::Shift) => Some("\x1b[Z"),
         ("backspace", TerminalModifiers::Ctrl) => Some("\x08"),
         ("backspace", TerminalModifiers::Alt) => Some("\x1b\x7f"),
@@ -104,50 +103,6 @@ pub(crate) fn to_esc_str(
         ("f18", TerminalModifiers::None) => Some("\x1b[32~"),
         ("f19", TerminalModifiers::None) => Some("\x1b[33~"),
         ("f20", TerminalModifiers::None) => Some("\x1b[34~"),
-=======
-        ("tab", AlacModifiers::Shift) => Some("\x1b[Z"),
-        ("backspace", AlacModifiers::Ctrl) => Some("\x08"),
-        ("backspace", AlacModifiers::Alt) => Some("\x1b\x7f"),
-        ("backspace", AlacModifiers::Shift) => Some("\x7f"),
-        ("space", AlacModifiers::Ctrl) => Some("\x00"),
-        ("home", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOH"),
-        ("home", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[H"),
-        ("end", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOF"),
-        ("end", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[F"),
-        ("up", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOA"),
-        ("up", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[A"),
-        ("down", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOB"),
-        ("down", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[B"),
-        ("right", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOC"),
-        ("right", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[C"),
-        ("left", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOD"),
-        ("left", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[D"),
-        ("back", AlacModifiers::None) => Some("\x7f"),
-        ("insert", AlacModifiers::None) => Some("\x1b[2~"),
-        ("delete", AlacModifiers::None) => Some("\x1b[3~"),
-        ("pageup", AlacModifiers::None) => Some("\x1b[5~"),
-        ("pagedown", AlacModifiers::None) => Some("\x1b[6~"),
-        ("f1", AlacModifiers::None) => Some("\x1bOP"),
-        ("f2", AlacModifiers::None) => Some("\x1bOQ"),
-        ("f3", AlacModifiers::None) => Some("\x1bOR"),
-        ("f4", AlacModifiers::None) => Some("\x1bOS"),
-        ("f5", AlacModifiers::None) => Some("\x1b[15~"),
-        ("f6", AlacModifiers::None) => Some("\x1b[17~"),
-        ("f7", AlacModifiers::None) => Some("\x1b[18~"),
-        ("f8", AlacModifiers::None) => Some("\x1b[19~"),
-        ("f9", AlacModifiers::None) => Some("\x1b[20~"),
-        ("f10", AlacModifiers::None) => Some("\x1b[21~"),
-        ("f11", AlacModifiers::None) => Some("\x1b[23~"),
-        ("f12", AlacModifiers::None) => Some("\x1b[24~"),
-        ("f13", AlacModifiers::None) => Some("\x1b[25~"),
-        ("f14", AlacModifiers::None) => Some("\x1b[26~"),
-        ("f15", AlacModifiers::None) => Some("\x1b[28~"),
-        ("f16", AlacModifiers::None) => Some("\x1b[29~"),
-        ("f17", AlacModifiers::None) => Some("\x1b[31~"),
-        ("f18", AlacModifiers::None) => Some("\x1b[32~"),
-        ("f19", AlacModifiers::None) => Some("\x1b[33~"),
-        ("f20", AlacModifiers::None) => Some("\x1b[34~"),
->>>>>>> theirs
         // NumpadEnter, Action::Esc("\n".into());
         //Mappings for caret notation keys
         ("a", TerminalModifiers::Ctrl) => Some("\x01"), //1
@@ -364,28 +319,6 @@ mod test {
             to_esc_str(&shift_end, none, false),
             Some("\x1b[1;2F".into())
         );
-<<<<<<< ours
-=======
-        assert_eq!(to_esc_str(&left, &app_cursor, false), Some("\x1bOD".into()));
-
-        let home = Keystroke::parse("home").unwrap();
-        let end = Keystroke::parse("end").unwrap();
-        assert_eq!(to_esc_str(&home, &none, false), Some("\x1b[H".into()));
-        assert_eq!(to_esc_str(&end, &none, false), Some("\x1b[F".into()));
-        assert_eq!(to_esc_str(&home, &app_cursor, false), Some("\x1bOH".into()));
-        assert_eq!(to_esc_str(&end, &app_cursor, false), Some("\x1bOF".into()));
-
-        let shift_home = Keystroke::parse("shift-home").unwrap();
-        let shift_end = Keystroke::parse("shift-end").unwrap();
-        assert_eq!(
-            to_esc_str(&shift_home, &none, false),
-            Some("\x1b[1;2H".into())
-        );
-        assert_eq!(
-            to_esc_str(&shift_end, &none, false),
-            Some("\x1b[1;2F".into())
-        );
->>>>>>> theirs
     }
 
     #[test]

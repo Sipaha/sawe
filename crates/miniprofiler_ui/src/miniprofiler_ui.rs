@@ -10,14 +10,9 @@ use gpui::{
     App, AppContext, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement,
     ParentElement as _, ProfilingCollector, Render, SerializedLocation, SerializedTaskTiming,
     SerializedThreadTaskTimings, SharedString, StatefulInteractiveElement, Styled, Task,
-<<<<<<< ours
     TasksIncluded, ThreadTimingsDelta, TitlebarOptions, UniformListScrollHandle, WeakEntity,
     WindowBounds, WindowOptions, div, prelude::FluentBuilder, profiler, px, relative, size,
     uniform_list,
-=======
-    ThreadTimingsDelta, TitlebarOptions, UniformListScrollHandle, WeakEntity, WindowBounds,
-    WindowOptions, div, prelude::FluentBuilder, profiler, px, relative, size, uniform_list,
->>>>>>> theirs
 };
 use rpc::{AnyProtoClient, proto};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
@@ -87,11 +82,7 @@ impl Settings for PerformanceProfilerSettings {
 
 pub fn init(startup_time: Instant, cx: &mut App) {
     let initial_enabled = PerformanceProfilerSettings::get_global(cx).enabled;
-<<<<<<< ours
     profiler::set_trace_enabled(initial_enabled);
-=======
-    profiler::set_enabled(initial_enabled);
->>>>>>> theirs
     update_command_palette_filter(initial_enabled, cx);
 
     cx.observe_global::<SettingsStore>(|cx| {
@@ -99,11 +90,7 @@ pub fn init(startup_time: Instant, cx: &mut App) {
         // `set_enabled` reports whether the value actually changed, so skip the
         // filter update and window cleanup on the common no-op path — the
         // settings observer fires for every settings change.
-<<<<<<< ours
         if !profiler::set_trace_enabled(enabled) {
-=======
-        if !profiler::set_enabled(enabled) {
->>>>>>> theirs
             return;
         }
         update_command_palette_filter(enabled, cx);

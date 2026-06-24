@@ -35453,7 +35453,7 @@ async fn test_local_worktree_trust(cx: &mut TestAppContext) {
     fs.insert_tree(
         path!("/project"),
         json!({
-            ".spke": {
+            ".zed": {
                 "settings.json": r#"{"languages":{"Rust":{"language_servers":["override-rust-analyzer"]}}}"#
             },
             "main.rs": "fn main() {}"
@@ -35550,7 +35550,7 @@ async fn test_local_worktree_trust(cx: &mut TestAppContext) {
             )
             .language_servers,
             ["...".to_string()],
-            "local .spke/settings.json must not apply before trust approval"
+            "local .zed/settings.json must not apply before trust approval"
         )
     });
 
@@ -35583,7 +35583,7 @@ async fn test_local_worktree_trust(cx: &mut TestAppContext) {
             )
             .language_servers,
             ["override-rust-analyzer".to_string()],
-            "local .spke/settings.json should apply after trust approval"
+            "local .zed/settings.json should apply after trust approval"
         )
     });
     let _fake_language_server = fake_language_server.await.unwrap();
@@ -37914,7 +37914,6 @@ fn setup_syntax_highlighting_with_theme(
             cx,
         );
     });
-<<<<<<< ours
 }
 
 #[gpui::test]
@@ -38052,6 +38051,4 @@ async fn test_toggle_markdown_block_quote(cx: &mut TestAppContext) {
         third
         fourthˇ»
     "});
-=======
->>>>>>> theirs
 }

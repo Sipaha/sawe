@@ -28,11 +28,7 @@ use editor::Editor;
 use editor::{Anchor, SelectionEffects};
 use editor::{Bias, ToPoint};
 use editor::{display_map::ToDisplayPoint, movement};
-<<<<<<< ours
 use gpui::{Context, TaskExt, Window, actions};
-=======
-use gpui::{Context, Window, actions};
->>>>>>> theirs
 use language::{AutoIndentMode, Point, SelectionGoal};
 use log::error;
 use multi_buffer::MultiBufferRow;

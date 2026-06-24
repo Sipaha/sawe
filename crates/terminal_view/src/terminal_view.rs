@@ -19,13 +19,9 @@ use persistence::TerminalDb;
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
-<<<<<<< ours
 use settings::{
     SeedQuerySetting, Settings, SettingsStore, TerminalBell, TerminalBlink, WorkingDirectory,
 };
-=======
-use settings::{Settings, SettingsStore, TerminalBell, TerminalBlink, WorkingDirectory};
->>>>>>> theirs
 use std::{
     any::Any,
     cmp,
@@ -221,7 +217,7 @@ impl TerminalView {
     ) {
         let local = action.local;
         let working_directory = default_working_directory(workspace, cx);
-        add_center_terminal(workspace, window, cx, move |project, cx| {
+        TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
             if local {
                 project.create_local_terminal(cx)
             } else {
@@ -499,11 +495,7 @@ impl TerminalView {
 
     pub fn deploy_context_menu(
         &mut self,
-<<<<<<< ours
         position: GpuiPoint<Pixels>,
-=======
-        position: Point<Pixels>,
->>>>>>> theirs
         has_selection: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1045,7 +1037,7 @@ impl TerminalView {
         dispatch_context
     }
 
-    pub fn set_terminal(
+    fn set_terminal(
         &mut self,
         terminal: Entity<Terminal>,
         window: &mut Window,
@@ -2082,52 +2074,6 @@ impl SearchableItem for TerminalView {
     ) {
         // Replacement is not supported in terminal view, so this is a no-op.
     }
-}
-
-/// Spawn a new terminal in the workspace's center pane.
-///
-/// The callback constructs the `Terminal` entity (typically via
-/// `Project::create_terminal_*`). The resulting `TerminalView` is added to the
-/// workspace's active pane, not to any dock panel.
-///
-/// This used to live as `TerminalPanel::add_center_terminal` but the panel was
-/// never actually accessed -- it was a static factory in disguise. Now it lives
-/// here so center-pane terminal creation is independent of which dock panel
-/// (TerminalPanel / ConsolePanel) is loaded.
-pub fn add_center_terminal(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut gpui::Context<Workspace>,
-    create_terminal: impl FnOnce(
-        &mut Project,
-        &mut gpui::Context<Project>,
-    ) -> Task<anyhow::Result<gpui::Entity<terminal::Terminal>>>
-    + 'static,
-) -> Task<anyhow::Result<gpui::WeakEntity<terminal::Terminal>>> {
-    if !workspace.project().read(cx).supports_terminal(cx) {
-        return Task::ready(Err(anyhow::anyhow!(
-            "terminal not yet supported for remote projects"
-        )));
-    }
-    let project = workspace.project().downgrade();
-    cx.spawn_in(window, async move |workspace, cx| {
-        let terminal = project.update(cx, create_terminal)?.await?;
-
-        workspace.update_in(cx, |workspace, window, cx| {
-            let terminal_view = cx.new(|cx| {
-                TerminalView::new(
-                    terminal.clone(),
-                    workspace.weak_handle(),
-                    workspace.database_id(),
-                    workspace.project().downgrade(),
-                    window,
-                    cx,
-                )
-            });
-            workspace.add_item_to_active_pane(Box::new(terminal_view), None, true, window, cx);
-        })?;
-        Ok(terminal.downgrade())
-    })
 }
 
 /// Gets the working directory for the given workspace, respecting the user's settings.

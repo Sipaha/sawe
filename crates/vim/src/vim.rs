@@ -22,13 +22,8 @@ mod visual;
 use crate::normal::paste::Paste as VimPaste;
 use collections::HashMap;
 use editor::{
-<<<<<<< ours
     Anchor, Bias, Editor, EditorEvent, EditorSettings, MultiBufferOffset, NavigationOverlayKey,
     NavigationTargetOverlay, SelectionEffects,
-=======
-    Anchor, Bias, Editor, EditorEvent, EditorSettings, HideMouseCursorOrigin, MultiBufferOffset,
-    NavigationOverlayKey, NavigationTargetOverlay, SelectionEffects,
->>>>>>> theirs
     actions::Paste,
     display_map::ToDisplayPoint,
     movement::{self, FindRange},
@@ -1837,7 +1832,6 @@ impl Vim {
                     s.select_anchor_ranges([candidate.range.clone()])
                 });
             }
-<<<<<<< ours
             HelixJumpBehaviour::MoveToWordStart => {
                 editor.change_selections(Default::default(), window, cx, |s| {
                     // Vim users expect jump labels to behave like motions, leaving
@@ -1860,8 +1854,6 @@ impl Vim {
                     });
                 });
             }
-=======
->>>>>>> theirs
             HelixJumpBehaviour::Extend => {
                 editor.change_selections(Default::default(), window, cx, |s| {
                     s.move_with(&mut |map, selection| {

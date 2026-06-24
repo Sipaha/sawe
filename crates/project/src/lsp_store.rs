@@ -5687,11 +5687,7 @@ impl LspStore {
                     .unwrap_or_default();
 
                 if !available_commands.contains(&command.command) {
-<<<<<<< ours
                     log::debug!(
-=======
-                    log::warn!(
->>>>>>> theirs
                         "Skipping executeCommand for {}, not listed in language server capabilities",
                         command.command
                     );

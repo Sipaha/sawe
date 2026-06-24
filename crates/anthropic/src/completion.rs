@@ -12,13 +12,8 @@ use std::str::FromStr;
 
 use crate::{
     AdaptiveThinkingDisplay, AnthropicError, AnthropicModelMode, CacheControl, CacheControlType,
-<<<<<<< ours
     CacheTtl, ContentDelta, Event, ImageSource, Message, RequestContent, ResponseContent,
     StringOrContents, Thinking, Tool, ToolChoice, ToolResultContent, ToolResultPart, Usage,
-=======
-    ContentDelta, Event, ImageSource, Message, RequestContent, ResponseContent, StringOrContents,
-    Thinking, Tool, ToolChoice, ToolResultContent, ToolResultPart, Usage,
->>>>>>> theirs
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

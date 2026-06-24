@@ -39,11 +39,7 @@ pub trait TaskExt<T, E> {
 impl<T, E> TaskExt<T, E> for Task<Result<T, E>>
 where
     T: 'static,
-<<<<<<< ours
     E: 'static + std::fmt::Display + std::fmt::Debug,
-=======
-    E: 'static + std::fmt::Display,
->>>>>>> theirs
 {
     #[track_caller]
     fn detach_and_log_err(self, cx: &App) {
@@ -52,29 +48,6 @@ where
             .spawn(self.log_tracked_err(*location))
             .detach();
     }
-<<<<<<< ours
-=======
-}
-
-impl<T, E> Task<Result<T, E>>
-where
-    T: 'static,
-    E: 'static + std::fmt::Debug,
-{
-    /// Like [`Self::detach_and_log_err`], but uses `{:?}` formatting on failure so `anyhow::Error`
-    /// values emit their full backtrace. Prefer `detach_and_log_err` unless a backtrace is wanted.
-    #[track_caller]
-    pub fn detach_and_log_err_with_backtrace(self, cx: &App) {
-        let location = *core::panic::Location::caller();
-        cx.foreground_executor()
-            .spawn(self.log_tracked_err_with_backtrace(location))
-            .detach();
-    }
-}
-
-impl<T> std::future::Future for Task<T> {
-    type Output = T;
->>>>>>> theirs
 
     #[track_caller]
     fn detach_and_log_err_with_backtrace(self, cx: &App) {

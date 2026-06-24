@@ -28,7 +28,6 @@ pub use crate::schema::{
 };
 use crate::settings::adjust_buffer_font_size;
 pub use crate::settings::{
-<<<<<<< ours
     AgentBufferFontSize, AgentUiFontSize, BufferLineHeight, FontFamilyName,
     GitCommitBufferFontSize, IconThemeName, IconThemeSelection, ThemeAppearanceMode, ThemeName,
     ThemeSelection, ThemeSettings, adjust_agent_buffer_font_size, adjust_agent_ui_font_size,
@@ -37,14 +36,6 @@ pub use crate::settings::{
     reset_agent_buffer_font_size, reset_agent_ui_font_size, reset_buffer_font_size,
     reset_git_commit_buffer_font_size, reset_ui_font_size, set_icon_theme, set_mode, set_theme,
     setup_ui_font,
-=======
-    AgentBufferFontSize, AgentUiFontSize, BufferLineHeight, FontFamilyName, IconThemeName,
-    IconThemeSelection, ThemeAppearanceMode, ThemeName, ThemeSelection, ThemeSettings,
-    adjust_agent_buffer_font_size, adjust_agent_ui_font_size, adjust_ui_font_size,
-    adjusted_font_size, appearance_to_mode, clamp_font_size, default_theme,
-    observe_buffer_font_size_adjustment, reset_agent_buffer_font_size, reset_agent_ui_font_size,
-    reset_buffer_font_size, reset_ui_font_size, set_icon_theme, set_mode, set_theme, setup_ui_font,
->>>>>>> theirs
 };
 pub use theme::UiDensity;
 
@@ -212,33 +203,6 @@ pub fn reload_icon_theme(cx: &mut App) {
     let icon_theme = configured_icon_theme(cx);
     GlobalTheme::update_icon_theme(cx, icon_theme);
     cx.refresh_windows();
-}
-
-/// Pushes the window's current OS appearance (light/dark) into the
-/// global `SystemAppearance` and reloads the theme + icon theme so a
-/// `theme.mode = "system"` setting immediately resolves to the right
-/// variant. Use this when constructing a top-level window root view
-/// — without it, windows that paint before any subscribed window
-/// reads the appearance see the default Light value and pick the
-/// wrong theme on a dark system.
-pub fn apply_window_appearance(window: &gpui::Window, cx: &mut App) {
-    *theme::SystemAppearance::global_mut(cx) = theme::SystemAppearance(window.appearance().into());
-    reload_theme(cx);
-    reload_icon_theme(cx);
-}
-
-/// Same as `apply_window_appearance` but additionally subscribes to
-/// the window's appearance change signal — when the OS flips
-/// light↔dark the global `SystemAppearance` is kept in sync. Returns
-/// the subscription; drop it to unsubscribe.
-pub fn track_window_appearance<V: 'static>(
-    window: &mut gpui::Window,
-    cx: &mut gpui::Context<V>,
-) -> gpui::Subscription {
-    apply_window_appearance(window, cx);
-    cx.observe_window_appearance(window, |_, window, cx| {
-        apply_window_appearance(window, cx);
-    })
 }
 
 /// Loads the themes bundled with the Zed binary into the registry.

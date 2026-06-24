@@ -791,10 +791,7 @@ impl Database {
                             branch_summary,
                             head_commit_details,
                             branch_list: Vec::new(),
-<<<<<<< ours
                             branch_list_error: None,
-=======
->>>>>>> theirs
                             project_id: project_id.to_proto(),
                             id: db_repository.id as u64,
                             abs_path: db_repository.abs_path.clone(),

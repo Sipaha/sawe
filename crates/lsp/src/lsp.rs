@@ -1235,7 +1235,7 @@ impl LanguageServer {
             method,
             Box::new(move |id, params, cx| {
                 if let Some(id) = id {
-                    match deserialize_request_params(params) {
+                    match serde_json::from_value(params) {
                         Ok(params) => {
                             let response = f(params, cx);
                             let task = cx.foreground_executor().spawn({
@@ -2077,49 +2077,13 @@ impl FakeLanguageServer {
     }
 }
 
-/// Deserialize an incoming LSP request's params, tolerating servers that send
-/// `{}` for a request whose params type is unit (e.g.
-/// `workspace/diagnostic/refresh`). serde rejects an object — even an empty
-/// one — for `()` ("invalid type: map, expected unit"), so on failure for an
-/// empty object we retry as `null`. Real param-shape errors and structs that
-/// already accept `{}` are unaffected — the first attempt handles them.
-fn deserialize_request_params<P: DeserializeOwned>(params: Value) -> Result<P, serde_json::Error> {
-    if matches!(&params, Value::Object(map) if map.is_empty()) {
-        serde_json::from_value(params)
-            .or_else(|err| serde_json::from_value(Value::Null).map_err(|_| err))
-    } else {
-        serde_json::from_value(params)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestAppContext;
     use std::str::FromStr;
 
-<<<<<<< ours
     #[ctor::ctor(unsafe)]
-=======
-    #[test]
-    fn request_params_tolerate_empty_object_for_unit() {
-        // Servers (e.g. gopls) send `params: {}` for unit-param requests like
-        // workspace/diagnostic/refresh; it must deserialize as `()`.
-        assert!(deserialize_request_params::<()>(serde_json::json!({})).is_ok());
-        assert!(deserialize_request_params::<()>(serde_json::Value::Null).is_ok());
-
-        // The empty-object fallback must NOT mask a genuinely missing field.
-        #[derive(serde::Deserialize)]
-        struct Req {
-            #[allow(dead_code)]
-            x: i32,
-        }
-        assert!(deserialize_request_params::<Req>(serde_json::json!({})).is_err());
-        assert!(deserialize_request_params::<Req>(serde_json::json!({ "x": 1 })).is_ok());
-    }
-
-    #[ctor::ctor]
->>>>>>> theirs
     fn init_logger() {
         zlog::init_test();
     }

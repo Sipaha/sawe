@@ -129,7 +129,6 @@ fn developer_page(cx: &App) -> SettingsPage {
 
     SettingsPage {
         title: "Developer",
-<<<<<<< ours
         items: items.into_boxed_slice(),
     }
 }
@@ -139,53 +138,6 @@ fn general_page(cx: &App) -> SettingsPage {
         vec![
             SettingsPageItem::SectionHeader("General Settings"),
             SettingsPageItem::SettingItem(SettingItem {
-=======
-        items: Box::new([
-            SettingsPageItem::SectionHeader("Feature Flags"),
-            SettingsPageItem::SubPageLink(SubPageLink {
-                title: "Feature Flags".into(),
-                r#type: Default::default(),
-                description: None,
-                json_path: Some("feature_flags"),
-                in_json: true,
-                files: USER,
-                render: crate::pages::render_feature_flags_page,
-            }),
-            SettingsPageItem::SectionHeader("Instrumentation"),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Performance Profiler",
-                description: "Collect timing data for foreground and background executor tasks so they can be inspected via `zed: open performance profiler`. May lead to increased memory usage.",
-                field: Box::new(SettingField {
-                    json_path: Some("instrumentation.performance_profiler.enabled"),
-                    pick: |settings_content| {
-                        settings_content
-                            .instrumentation
-                            .as_ref()
-                            .and_then(|i| i.performance_profiler.as_ref())
-                            .and_then(|p| p.enabled.as_ref())
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content
-                            .instrumentation
-                            .get_or_insert_default()
-                            .performance_profiler
-                            .get_or_insert_default()
-                            .enabled = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-        ]),
-    }
-}
-
-fn general_page(cx: &App) -> SettingsPage {
-    fn general_settings_section(_cx: &App) -> Vec<SettingsPageItem> {
-        vec![
-            SettingsPageItem::SectionHeader("General Settings"),
-            SettingsPageItem::SettingItem(SettingItem {
->>>>>>> theirs
                 title: "When Closing With No Tabs",
                 description: "What to do when using the 'close active item' action with no tabs.",
                 field: Box::new(SettingField {
@@ -735,11 +687,7 @@ fn appearance_page() -> SettingsPage {
                                     .as_ref()?
                                     .discriminant() as usize])
                         },
-<<<<<<< ours
                         write: |settings_content, value, app| {
-=======
-                        write: |settings_content, value, _| {
->>>>>>> theirs
                             let Some(value) = value else {
                                 settings_content.theme.icon_theme = None;
                                 return;
@@ -1285,15 +1233,9 @@ fn appearance_page() -> SettingsPage {
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("hide_mouse"),
-<<<<<<< ours
                     pick: |settings_content| settings_content.hide_mouse.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.hide_mouse = value;
-=======
-                    pick: |settings_content| settings_content.editor.hide_mouse.as_ref(),
-                    write: |settings_content, value, _| {
-                        settings_content.editor.hide_mouse = value;
->>>>>>> theirs
                     },
                 }),
                 metadata: None,
@@ -4651,11 +4593,10 @@ fn window_and_layout_page() -> SettingsPage {
         ]
     }
 
-    fn layout_section() -> [SettingsPageItem; 5] {
+    fn layout_section() -> [SettingsPageItem; 6] {
         [
             SettingsPageItem::SectionHeader("Layout"),
             SettingsPageItem::SettingItem(SettingItem {
-<<<<<<< ours
                 title: "Bottom Dock Layout",
                 description: "Layout mode for the bottom dock.",
                 field: Box::new(SettingField {
@@ -4670,8 +4611,6 @@ fn window_and_layout_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-=======
->>>>>>> theirs
                 files: USER,
                 title: "Centered Layout Left Padding",
                 description: "Left padding for centered layout.",
@@ -5583,11 +5522,10 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn terminal_panel_section() -> [SettingsPageItem; 3] {
+    fn terminal_panel_section() -> [SettingsPageItem; 4] {
         [
             SettingsPageItem::SectionHeader("Terminal Panel"),
             SettingsPageItem::SettingItem(SettingItem {
-<<<<<<< ours
                 title: "Terminal Dock",
                 description: "Where to dock the terminal panel.",
                 field: Box::new(SettingField {
@@ -5602,8 +5540,6 @@ fn panels_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-=======
->>>>>>> theirs
                 title: "Terminal Panel Flexible Sizing",
                 description: "Whether the terminal panel should use flexible (proportional) sizing when docked to the left or right.",
                 field: Box::new(SettingField {
@@ -6096,10 +6032,7 @@ fn panels_page() -> SettingsPage {
                 title: "Commit Title Max Length",
                 description: "Maximum length of the commit message title before a warning is shown. Set to 0 to disable.",
                 field: Box::new(SettingField {
-<<<<<<< ours
                     organization_override: None,
-=======
->>>>>>> theirs
                     json_path: Some("git_panel.commit_title_max_length"),
                     pick: |settings_content| {
                         settings_content
@@ -7176,10 +7109,7 @@ fn terminal_page() -> SettingsPage {
                 title: "Audible Bell",
                 description: "Whether to play a sound when the BEL character (`\\a`, `0x07`) is printed",
                 field: Box::new(SettingField {
-<<<<<<< ours
                     organization_override: None,
-=======
->>>>>>> theirs
                     json_path: Some("terminal.bell"),
                     pick: |settings_content| settings_content.terminal.as_ref()?.bell.as_ref(),
                     write: |settings_content, value, _| {
@@ -7953,32 +7883,6 @@ fn ai_page() -> SettingsPage {
             }),
         ];
 
-<<<<<<< ours
-=======
-        items.push(SettingsPageItem::SettingItem(SettingItem {
-            title: "New Thread Location",
-            description: "Whether to start a new thread in the current local project or in a new Git worktree.",
-            field: Box::new(SettingField {
-                json_path: Some("agent.new_thread_location"),
-                pick: |settings_content| {
-                    settings_content
-                        .agent
-                        .as_ref()?
-                        .new_thread_location
-                        .as_ref()
-                },
-                write: |settings_content, value, _| {
-                    settings_content
-                        .agent
-                        .get_or_insert_default()
-                        .new_thread_location = value;
-                },
-            }),
-            metadata: None,
-            files: USER,
-        }));
-
->>>>>>> theirs
         items.extend([
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Single File Review",
@@ -8851,10 +8755,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
                 title: "Line Ending",
                 description: "How line endings should be handled for new files and during format and save operations.",
                 field: Box::new(SettingField {
-<<<<<<< ours
                     organization_override: None,
-=======
->>>>>>> theirs
                     json_path: Some("languages.$(language).line_ending"),
                     pick: |settings_content| {
                         language_settings_field(settings_content, |language| {
@@ -9733,10 +9634,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
         title: "Code Lens",
         description: "Whether and how to display code lenses from language servers.",
         field: Box::new(SettingField {
-<<<<<<< ours
             organization_override: None,
-=======
->>>>>>> theirs
             json_path: Some("code_lens"),
             pick: |settings_content| settings_content.editor.code_lens.as_ref(),
             write: |settings_content, value, _| {
@@ -9888,10 +9786,7 @@ fn non_editor_language_settings_data() -> Box<[SettingsPageItem]> {
                 title: "Go To Definition Scroll Strategy",
                 description: "How to scroll the target into view when navigating to a definition or reference.",
                 field: Box::new(SettingField {
-<<<<<<< ours
                     organization_override: None,
-=======
->>>>>>> theirs
                     json_path: Some("go_to_definition_scroll_strategy"),
                     pick: |settings_content| {
                         settings_content
@@ -10211,7 +10106,6 @@ fn edit_prediction_language_settings_section() -> [SettingsPageItem; 5] {
             title: "Data Collection",
             description: "Controls whether Zed may collect training data when using Zed's Edit Predictions. Data is only collected for files in projects detected as open source. The default value uses the preference previously set via the status-bar toggle, or false if no preference has been stored.",
             field: Box::new(SettingField {
-<<<<<<< ours
                 organization_override: Some(|org_settings| {
                     const DATA_COLLECTION_DISABLED: EditPredictionDataCollectionChoice = EditPredictionDataCollectionChoice::No;
 
@@ -10221,8 +10115,6 @@ fn edit_prediction_language_settings_section() -> [SettingsPageItem; 5] {
                         None
                     }
                 }),
-=======
->>>>>>> theirs
                 json_path: Some("edit_predictions.allow_data_collection"),
                 pick: |settings_content| {
                     settings_content

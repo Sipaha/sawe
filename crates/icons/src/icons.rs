@@ -73,11 +73,7 @@ pub enum IconName {
     Code,
     Codeberg,
     Command,
-<<<<<<< ours
     Compact,
-=======
-    Console,
->>>>>>> theirs
     Control,
     Copilot,
     CopilotDisabled,
@@ -310,33 +306,5 @@ impl IconName {
     pub fn path(&self) -> Arc<str> {
         let file_stem: &'static str = self.into();
         format!("icons/{file_stem}.svg").into()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn console_icon_asset_exists() {
-        let bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/icons/console.svg"
-        ))
-        .expect("console.svg should be readable");
-        assert!(
-            bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml"),
-            "console.svg should start with SVG declaration"
-        );
-    }
-
-    #[test]
-    fn console_variant_converts_to_snake_case() {
-        let icon = IconName::Console;
-        let path: &'static str = icon.into();
-        assert_eq!(
-            path, "console",
-            "Console variant should convert to 'console'"
-        );
     }
 }

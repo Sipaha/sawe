@@ -1,10 +1,6 @@
 ---
 title: Project Panel - Zed
-<<<<<<< ours
 description: Navigate workspace files and directories with Zed's project panel. Create, rename, trash and delete files and directories.
-=======
-description: Navigate workspace files and directories with Zed's project panel. Create, rename, trash and delete file and directories.
->>>>>>> theirs
 ---
 
 # Project Panel

@@ -10,11 +10,7 @@ on:
         default: all
 jobs:
   resolve_versions:
-<<<<<<< ours
     if: github.repository_owner == 'zed-industries'
-=======
-    if: false # spk-editor: not applicable
->>>>>>> theirs
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:
     - id: generate-token
@@ -88,11 +84,7 @@ jobs:
   bump_main:
     needs:
     - resolve_versions
-<<<<<<< ours
     if: inputs.target == 'all' || inputs.target == 'main'
-=======
-    if: false # spk-editor: not applicable
->>>>>>> theirs
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:
     - id: generate-token
@@ -133,11 +125,7 @@ jobs:
   create_preview_branch:
     needs:
     - resolve_versions
-<<<<<<< ours
     if: inputs.target == 'all' || inputs.target == 'preview'
-=======
-    if: false # spk-editor: not applicable
->>>>>>> theirs
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:
     - id: generate-token
@@ -190,11 +178,7 @@ jobs:
   promote_to_stable:
     needs:
     - resolve_versions
-<<<<<<< ours
     if: inputs.target == 'all' || inputs.target == 'stable'
-=======
-    if: false # spk-editor: not applicable
->>>>>>> theirs
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:
     - id: generate-token

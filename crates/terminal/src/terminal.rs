@@ -4,32 +4,9 @@ mod alacritty;
 mod pty_info;
 pub mod terminal_settings;
 
-<<<<<<< ours
 #[cfg(not(windows))]
 use anyhow::Context as _;
 use anyhow::{Result, bail};
-=======
-use alacritty_terminal::{
-    Term,
-    event::{Event as AlacTermEvent, EventListener, Notify, WindowSize},
-    event_loop::{EventLoop, Msg, Notifier},
-    grid::{Dimensions, Grid, Row, Scroll as AlacScroll},
-    index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
-    selection::{Selection, SelectionRange, SelectionType},
-    sync::FairMutex,
-    term::{
-        Config, RenderableCursor, TermMode,
-        cell::{Cell, Flags},
-        search::{Match, RegexIter, RegexSearch},
-    },
-    tty::{self},
-    vi_mode::{ViModeCursor, ViMotion},
-    vte::ansi::{
-        ClearMode, CursorStyle as AlacCursorStyle, Handler, NamedPrivateMode, PrivateMode,
-    },
-};
-use anyhow::{Context as _, Result, bail};
->>>>>>> theirs
 use futures_lite::future::yield_now;
 use log::trace;
 
@@ -2911,13 +2888,6 @@ mod tests {
         Cell, Content, IndexedCell, TerminalBounds, TerminalBuilder, content_index_for_mouse,
         rgb_for_index,
     };
-<<<<<<< ours
-=======
-    use alacritty_terminal::{
-        index::{Column, Line, Point as AlacPoint},
-        term::cell::Cell,
-    };
->>>>>>> theirs
     use async_channel::Receiver;
     use collections::HashMap;
     use gpui::MouseMoveEvent;
@@ -2993,10 +2963,6 @@ mod tests {
         command: &str,
         args: &[&str],
     ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
-<<<<<<< ours
-=======
-        let (completion_tx, completion_rx) = async_channel::unbounded();
->>>>>>> theirs
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let (program, args) =
             ShellBuilder::new(&Shell::System, false).build(Some(command.to_owned()), &args);

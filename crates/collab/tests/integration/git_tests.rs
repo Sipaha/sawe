@@ -8,31 +8,20 @@ use client::RECEIVE_TIMEOUT;
 use collections::HashMap;
 use git::{
     Oid,
-<<<<<<< ours
     repository::{CommitData, InitialGraphCommitData, RepoPath, Worktree as GitWorktree},
-=======
-    repository::{CommitData, RepoPath, Worktree as GitWorktree},
->>>>>>> theirs
     status::{DiffStat, FileStatus, StatusCode, TrackedStatus},
 };
 use git_ui::git_graph::GitGraph;
 use git_ui::{git_panel::GitPanel, project_diff::ProjectDiff};
-<<<<<<< ours
 use gpui::{
     AppContext as _, BackgroundExecutor, Entity, IntoElement as _, SharedString, TestAppContext,
     VisualContext as _, VisualTestContext, point, px, size,
 };
-=======
-use gpui::{AppContext as _, BackgroundExecutor, SharedString, TestAppContext, VisualTestContext};
->>>>>>> theirs
 use project::{
     ProjectPath,
     git_store::{CommitDataState, Repository},
 };
-<<<<<<< ours
 use rand::{SeedableRng, rngs::StdRng};
-=======
->>>>>>> theirs
 use serde_json::json;
 
 use util::{path, rel_path::rel_path};
@@ -173,7 +162,6 @@ fn branch_list_snapshot(
     })
 }
 
-<<<<<<< ours
 fn build_git_graph(
     project: &Entity<project::Project>,
     workspace: &Entity<Workspace>,
@@ -220,8 +208,6 @@ fn assert_initial_graph_commits_eq(
     }
 }
 
-=======
->>>>>>> theirs
 fn assert_remote_cache_matches_local_cache(
     local_repository: &gpui::Entity<Repository>,
     remote_repository: &gpui::Entity<Repository>,
@@ -764,7 +750,6 @@ async fn test_remote_git_commit_data_batches(
 }
 
 #[gpui::test]
-<<<<<<< ours
 async fn test_remote_git_graph_data_and_search(
     executor: BackgroundExecutor,
     cx_a: &mut TestAppContext,
@@ -861,8 +846,6 @@ async fn test_remote_git_graph_data_and_search(
 }
 
 #[gpui::test]
-=======
->>>>>>> theirs
 async fn test_branch_list_sync(
     executor: BackgroundExecutor,
     cx_a: &mut TestAppContext,

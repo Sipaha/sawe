@@ -231,7 +231,6 @@ impl Model {
             Self::Custom {
                 reasoning_effort, ..
             } => reasoning_effort.to_owned(),
-<<<<<<< ours
             Self::FivePointOne
             | Self::FivePointTwo
             | Self::FivePointFour
@@ -245,11 +244,6 @@ impl Model {
             | Self::FivePointFourPro
             | Self::FivePointFive
             | Self::FivePointFivePro => Some(ReasoningEffort::Medium),
-=======
-            Self::FivePointThreeCodex | Self::FivePointFourPro | Self::FivePointFivePro => {
-                Some(ReasoningEffort::Medium)
-            }
->>>>>>> theirs
             _ => None,
         }
     }
@@ -315,16 +309,7 @@ impl Model {
             Self::Custom {
                 supports_chat_completions,
                 ..
-<<<<<<< ours
             } => !*supports_chat_completions,
-=======
-            } => *supports_chat_completions,
-            Self::FiveCodex
-            | Self::FivePointTwoCodex
-            | Self::FivePointThreeCodex
-            | Self::FivePointFourPro
-            | Self::FivePointFivePro => false,
->>>>>>> theirs
             _ => true,
         }
     }

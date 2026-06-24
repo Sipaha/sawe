@@ -909,7 +909,6 @@ fn try_parse_color(color: &str) -> anyhow::Result<Hsla> {
 
 #[cfg(test)]
 mod tests {
-<<<<<<< ours
     use theme::StatusColorsRefinement;
 
     use super::{
@@ -1069,9 +1068,6 @@ mod tests {
             Err(error) => panic!("failed to parse color {color}: {error}"),
         }
     }
-=======
-    use super::*;
->>>>>>> theirs
 
     #[test]
     fn helix_jump_label_color_uses_theme_color_or_status_error() {
@@ -1082,16 +1078,11 @@ mod tests {
             ..Default::default()
         };
 
-<<<<<<< ours
         let fallback_refinement = theme_colors_refinement(
             &ThemeColorsContent::default(),
             &status_colors,
             Default::default(),
         );
-=======
-        let fallback_refinement =
-            theme_colors_refinement(&ThemeColorsContent::default(), &status_colors);
->>>>>>> theirs
 
         assert_eq!(
             fallback_refinement.vim_helix_jump_label_foreground,
@@ -1104,10 +1095,7 @@ mod tests {
                 ..Default::default()
             },
             &status_colors,
-<<<<<<< ours
             Default::default(),
-=======
->>>>>>> theirs
         );
 
         assert_eq!(

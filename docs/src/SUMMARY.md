@@ -8,29 +8,6 @@
   - [Uninstall](./uninstall.md)
 - [Troubleshooting](./troubleshooting.md)
 
-<<<<<<< ours
-=======
-# AI
-
-- [Overview](./ai/overview.md)
-- [Agent Panel](./ai/agent-panel.md)
-  - [Tools](./ai/tools.md)
-  - [Tool Permissions](./ai/tool-permissions.md)
-  - [External Agents](./ai/external-agents.md)
-- [Parallel Agents](./ai/parallel-agents.md)
-- [Inline Assistant](./ai/inline-assistant.md)
-- [Edit Prediction](./ai/edit-prediction.md)
-- [Rules](./ai/rules.md)
-- [Model Context Protocol](./ai/mcp.md)
-- [Configuration](./ai/configuration.md)
-  - [LLM Providers](./ai/llm-providers.md)
-  - [Agent Settings](./ai/agent-settings.md)
-- [Subscription](./ai/subscription.md)
-  - [Models](./ai/models.md)
-  - [Plans and Usage](./ai/plans-and-usage.md)
-  - [Billing](./ai/billing.md)
-
->>>>>>> theirs
 # Working with Code
 
 - [Windows & Projects](./windows-and-projects.md)

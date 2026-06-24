@@ -321,24 +321,13 @@ impl Render for EditPredictionButton {
                         .with_handle(self.popover_menu_handle.clone()),
                 )
             }
-<<<<<<< ours
             provider @ (EditPredictionProvider::Zed | EditPredictionProvider::Mercury) => {
-=======
-            // Edit prediction (Zeta / Zed cloud) disabled in spk-editor (requires Zed account).
-            EditPredictionProvider::Zed => div().hidden(),
-            provider @ (EditPredictionProvider::Experimental(_)
-            | EditPredictionProvider::Mercury) => {
->>>>>>> theirs
                 let enabled = self.editor_enabled.unwrap_or(true);
                 let file = self.file.clone();
                 let language = self.language.clone();
                 let project = self.project.clone();
                 let provider_name: &'static str = match provider {
-<<<<<<< ours
                     EditPredictionProvider::Zed => "zed",
-=======
-                    EditPredictionProvider::Experimental(name) => name,
->>>>>>> theirs
                     _ => "unknown",
                 };
                 let icons = self
@@ -372,7 +361,7 @@ impl Render for EditPredictionButton {
                     }
                     _ => {
                         ep_icon = if enabled { icons.base } else { icons.disabled };
-                        tooltip_meta = "Edit Prediction"
+                        tooltip_meta = "Powered by Zeta"
                     }
                 };
 
@@ -1083,10 +1072,11 @@ impl EditPredictionButton {
         ContextMenu::build(window, cx, |mut menu, window, cx| {
             let user = self.user_store.read(cx).current_user();
 
-            // Edit prediction (Zeta) disabled in spk-editor; the upsell only ran when the
-            // active provider was Zed (now hidden) so the sign-in branch is now unreachable
-            // in practice. Keep the structure so future provider work is easy to re-enable.
-            let needs_sign_in = user.is_none() && matches!(provider, EditPredictionProvider::Zed);
+            let needs_sign_in = user.is_none()
+                && matches!(
+                    provider,
+                    EditPredictionProvider::None | EditPredictionProvider::Zed
+                );
 
             if needs_sign_in {
                 menu = menu
@@ -1457,8 +1447,7 @@ pub fn set_completion_provider(fs: Arc<dyn Fs>, cx: &mut App, provider: EditPred
 pub fn get_available_providers(cx: &mut App) -> Vec<EditPredictionProvider> {
     let mut providers = Vec::new();
 
-    // Edit prediction (Zeta / Zed cloud) disabled in spk-editor (requires Zed account).
-    // providers.push(EditPredictionProvider::Zed);
+    providers.push(EditPredictionProvider::Zed);
 
     let app_state = workspace::AppState::global(cx);
     if copilot::GlobalCopilotAuth::try_get_or_init(app_state, cx)

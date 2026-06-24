@@ -181,13 +181,9 @@ pub struct HelixJumpLabel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelixJumpBehaviour {
     Move,
-<<<<<<< ours
     MoveToWordStart,
     Extend,
     ExtendToWordStart,
-=======
-    Extend,
->>>>>>> theirs
 }
 
 #[derive(Default, Clone, Debug)]

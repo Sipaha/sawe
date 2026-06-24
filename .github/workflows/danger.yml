@@ -2,7 +2,6 @@
 # Rebuild with `cargo xtask workflows`.
 name: danger
 on:
-<<<<<<< ours
   merge_group: {}
   pull_request:
     types:
@@ -12,12 +11,9 @@ on:
     - edited
     branches:
     - main
-=======
-  workflow_dispatch:
->>>>>>> theirs
 jobs:
   danger:
-    if: false # spk-editor: not applicable
+    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::checkout_repo

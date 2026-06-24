@@ -18,7 +18,7 @@ pub enum VectorName {
     ProTrialStamp,
     ProUserStamp,
     StudentStamp,
-    SpkLogo,
+    ZedLogo,
     ZedXCopilot,
 }
 
@@ -113,7 +113,6 @@ impl Component for Vector {
     fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
         let size = rems_from_px(60.);
 
-<<<<<<< ours
         v_flex()
             .gap_6()
             .children(vec![
@@ -134,55 +133,6 @@ impl Component for Vector {
                                     rems_from_px(120.),
                                     rems_from_px(200.),
                                 ))
-=======
-        Some(
-            v_flex()
-                .gap_6()
-                .children(vec![
-                    example_group_with_title(
-                        "Basic Usage",
-                        vec![
-                            single_example(
-                                "Default",
-                                Vector::square(VectorName::SpkLogo, size).into_any_element(),
-                            ),
-                            single_example(
-                                "Custom Size",
-                                h_flex()
-                                    .h(rems_from_px(120.))
-                                    .justify_center()
-                                    .child(Vector::new(
-                                        VectorName::SpkLogo,
-                                        rems_from_px(120.),
-                                        rems_from_px(200.),
-                                    ))
-                                    .into_any_element(),
-                            ),
-                        ],
-                    ),
-                    example_group_with_title(
-                        "Colored",
-                        vec![
-                            single_example(
-                                "Accent Color",
-                                Vector::square(VectorName::SpkLogo, size)
-                                    .color(Color::Accent)
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "Error Color",
-                                Vector::square(VectorName::SpkLogo, size)
-                                    .color(Color::Error)
-                                    .into_any_element(),
-                            ),
-                        ],
-                    ),
-                    example_group_with_title(
-                        "Different Vectors",
-                        vec![single_example(
-                            "Zed X Copilot",
-                            Vector::square(VectorName::ZedXCopilot, rems_from_px(100.))
->>>>>>> theirs
                                 .into_any_element(),
                         ),
                     ],
@@ -223,6 +173,6 @@ mod tests {
 
     #[test]
     fn vector_path() {
-        assert_eq!(VectorName::SpkLogo.path().as_ref(), "images/spk_logo.svg");
+        assert_eq!(VectorName::ZedLogo.path().as_ref(), "images/zed_logo.svg");
     }
 }

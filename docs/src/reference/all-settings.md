@@ -2515,7 +2515,6 @@ Example:
 }
 ```
 
-<<<<<<< ours
 4. Preserve the cursor's vertical position within the viewport, falling back to
    `center` when the cursor is offscreen.
 
@@ -2525,8 +2524,6 @@ Example:
 }
 ```
 
-=======
->>>>>>> theirs
 ## Hard Tabs
 
 - Description: Whether to indent lines using tab characters or multiple spaces.
@@ -3220,11 +3217,7 @@ If you wish to exclude certain hosts from using the proxy, set the `NO_PROXY` en
 
 ### Performance Profiler
 
-<<<<<<< ours
 - Description: Collects timing data for foreground and background executor tasks so they can be inspected via the {#action zed::OpenPerformanceProfiler} action. Enabling this may lead to increased memory usage, hence it's disabled by default for regular builds.
-=======
-- Description: Collects timing data for foreground and background executor tasks so they can be inspected via the `zed: open performance profiler` action. Enabling this may lead to increased memory usage, hence it's disabled by default for regular builds.
->>>>>>> theirs
 - Setting: `instrumentation.performance_profiler.enabled`
 - Default: `false`
 

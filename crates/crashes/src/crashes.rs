@@ -5,11 +5,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{panic::Location, pin::Pin};
 
-<<<<<<< ours
-=======
-#[cfg(not(target_os = "windows"))]
-use async_process::Command;
->>>>>>> theirs
 use system_specs::GpuSpecs;
 
 use std::{
@@ -49,7 +44,6 @@ pub fn force_backtrace() {
 /// The synchronous portion (signal handlers, panic hook) runs inline.
 /// The async keepalive task is passed to `spawn` so the caller decides
 /// which executor to schedule it on.
-<<<<<<< ours
 pub fn init<F, S, C, P>(
     crash_init: InitCrashHandler,
     spawn: S,
@@ -63,65 +57,10 @@ where
     P: FnOnce(u32) -> PathBuf,
 {
     connect_and_keepalive(crash_init, socket_path, wait_timer, spawn)
-=======
-pub fn init<F: Future<Output = ()> + Send + Sync + 'static>(
-    crash_init: InitCrashHandler,
-    spawn: impl FnOnce(BoxFuture<'static, ()>),
-    wait_timer: impl (Fn(Duration) -> F) + Send + Sync + 'static,
-) {
-    if !should_install_crash_handler() {
-        let old_hook = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            unsafe { env::set_var("RUST_BACKTRACE", "1") };
-            old_hook(info);
-            // prevent the macOS crash dialog from popping up
-            if cfg!(target_os = "macos") {
-                std::process::exit(1);
-            }
-        }));
-        return;
-    }
-
-    panic::set_hook(Box::new(panic_hook));
-
-    let handler = CrashHandler::attach(unsafe {
-        crash_handler::make_crash_event(move |crash_context: &crash_handler::CrashContext| {
-            let Some(client) = CRASH_HANDLER.get() else {
-                return CrashEventResult::Handled(false);
-            };
-
-            // only request a minidump once
-            let res = if REQUESTED_MINIDUMP
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                #[cfg(target_os = "macos")]
-                suspend_all_other_threads();
-
-                // on macos this "ping" is needed to ensure that all our
-                // `client.send_message` calls have been processed before we trigger the
-                // minidump request.
-                client.ping().ok();
-                client.request_dump(crash_context).is_ok()
-            } else {
-                true
-            };
-            CrashEventResult::Handled(res)
-        })
-    })
-    .expect("failed to attach signal handler");
-
-    info!("crash signal handlers installed");
-
-    spawn(Box::pin(connect_and_keepalive(
-        crash_init, handler, wait_timer,
-    )));
->>>>>>> theirs
 }
 
 /// Spawn the crash-handler subprocess, connect the IPC client, and run the
 /// keepalive ping loop. Called on a background executor by [`init`].
-<<<<<<< ours
 fn connect_and_keepalive<F, C, S, P>(
     crash_init: InitCrashHandler,
     socket_path: P,
@@ -134,18 +73,10 @@ where
     S: FnOnce(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
     P: FnOnce(u32) -> PathBuf,
 {
-=======
-async fn connect_and_keepalive<F: Future<Output = ()> + Send + Sync + 'static>(
-    crash_init: InitCrashHandler,
-    handler: CrashHandler,
-    wait_timer: impl (Fn(Duration) -> F) + Send + Sync + 'static,
-) {
->>>>>>> theirs
     let exe = env::current_exe().expect("unable to find ourselves");
     let socket_path = socket_path(process::id());
     let mut _crash_handler = spawn_crash_handler(&exe, &socket_path);
     info!("spawning crash handler process");
-<<<<<<< ours
     async move {
         let mut elapsed = Duration::ZERO;
         let retry_frequency = Duration::from_millis(100);
@@ -232,60 +163,6 @@ async fn connect_and_keepalive<F: Future<Output = ()> + Send + Sync + 'static>(
             }
         }));
         client
-=======
-    send_crash_server_message(CrashServerMessage::Init(crash_init));
-
-    let mut elapsed = Duration::ZERO;
-    let retry_frequency = Duration::from_millis(100);
-    let mut maybe_client = None;
-    while maybe_client.is_none() {
-        if let Ok(client) = Client::with_name(SocketName::Path(&socket_name)) {
-            maybe_client = Some(client);
-            info!("connected to crash handler process after {elapsed:?}");
-            break;
-        }
-        elapsed += retry_frequency;
-        wait_timer(retry_frequency).await;
-    }
-    let client = maybe_client.unwrap();
-    let client = Arc::new(client);
-
-    #[cfg(target_os = "linux")]
-    handler.set_ptracer(Some(_crash_handler.id()));
-
-    // Publishing the client to the OnceLock makes it visible to the signal
-    // handler callback installed earlier.
-    CRASH_HANDLER.set(client.clone()).ok();
-    let messages: Vec<_> = mem::take(PENDING_CRASH_SERVER_MESSAGES.lock().as_mut());
-    for message in messages.into_iter() {
-        send_crash_server_message(message);
-    }
-    // mem::forget so that the drop is not called
-    mem::forget(handler);
-    info!("crash handler registered");
-
-    loop {
-        client.ping().ok();
-        wait_timer(Duration::from_secs(10)).await;
-    }
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn suspend_all_other_threads() {
-    let task = unsafe { mach2::traps::current_task() };
-    let mut threads: mach2::mach_types::thread_act_array_t = std::ptr::null_mut();
-    let mut count = 0;
-    unsafe {
-        mach2::task::task_threads(task, &raw mut threads, &raw mut count);
-    }
-    let current = unsafe { mach2::mach_init::mach_thread_self() };
-    let panic_thread = PANIC_THREAD_ID.load(Ordering::SeqCst);
-    for i in 0..count {
-        let t = unsafe { *threads.add(i as usize) };
-        if t != current && t != panic_thread {
-            unsafe { mach2::thread_act::thread_suspend(t) };
-        }
->>>>>>> theirs
     }
 }
 

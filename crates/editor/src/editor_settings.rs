@@ -4,15 +4,9 @@ use gpui::App;
 use language::CursorShape;
 use project::project_settings::DiagnosticSeverity;
 pub use settings::{
-<<<<<<< ours
     CodeLens, CompletionDetailAlignment, CompletionMenuItemKind, CurrentLineHighlight, DelayMs,
     DiffViewStyle, DisplayIn, DocumentColorsRenderMode, DoubleClickInMultibuffer,
     GoToDefinitionFallback, GoToDefinitionScrollStrategy, MinimapThumb, MinimapThumbBorder,
-=======
-    CodeLens, CompletionDetailAlignment, CurrentLineHighlight, DelayMs, DiffViewStyle, DisplayIn,
-    DocumentColorsRenderMode, DoubleClickInMultibuffer, GoToDefinitionFallback,
-    GoToDefinitionScrollStrategy, HideMouseMode, MinimapThumb, MinimapThumbBorder,
->>>>>>> theirs
     MultiCursorModifier, ScrollBeyondLastLine, ScrollbarDiagnostics, SeedQuerySetting, ShowMinimap,
     SnippetSortOrder,
 };

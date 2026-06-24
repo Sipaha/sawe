@@ -3,13 +3,8 @@ use collections::BTreeMap;
 use credentials_provider::CredentialsProvider;
 use fs::Fs;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
-<<<<<<< ours
 use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, TaskExt, Window};
 use http_client::{AsyncBody, CustomHeaders, HttpClient, http};
-=======
-use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, Window};
-use http_client::{AsyncBody, HttpClient, http};
->>>>>>> theirs
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
@@ -69,10 +64,7 @@ pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &["x-opencode-session"];
 pub struct OpenCodeSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
-<<<<<<< ours
     pub custom_headers: CustomHeaders,
-=======
->>>>>>> theirs
     pub show_zen_models: bool,
     pub show_go_models: bool,
     pub show_free_models: bool,
@@ -288,13 +280,9 @@ impl LanguageModelProvider for OpenCodeLanguageModelProvider {
                 max_tokens: model.max_tokens,
                 max_output_tokens: model.max_output_tokens,
                 protocol,
-<<<<<<< ours
                 reasoning_effort_levels: model.reasoning_effort_levels.clone(),
                 custom_model_api_url: model.custom_model_api_url.clone(),
                 interleaved_reasoning: model.interleaved_reasoning,
-=======
-                custom_model_api_url: model.custom_model_api_url.clone(),
->>>>>>> theirs
             };
             let key = format!("{}/{}", subscription.id_prefix(), model.name);
             models.insert(key, (custom_model, subscription));
@@ -404,10 +392,7 @@ impl OpenCodeLanguageModel {
         &self,
         request: anthropic::Request,
         http_client: Arc<dyn HttpClient>,
-<<<<<<< ours
         extra_headers: CustomHeaders,
-=======
->>>>>>> theirs
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -448,10 +433,7 @@ impl OpenCodeLanguageModel {
         &self,
         request: open_ai::Request,
         http_client: Arc<dyn HttpClient>,
-<<<<<<< ours
         extra_headers: CustomHeaders,
-=======
->>>>>>> theirs
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -488,10 +470,7 @@ impl OpenCodeLanguageModel {
         &self,
         request: open_ai::responses::Request,
         http_client: Arc<dyn HttpClient>,
-<<<<<<< ours
         extra_headers: CustomHeaders,
-=======
->>>>>>> theirs
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -528,10 +507,7 @@ impl OpenCodeLanguageModel {
         &self,
         request: google_ai::GenerateContentRequest,
         http_client: Arc<dyn HttpClient>,
-<<<<<<< ours
         extra_headers: CustomHeaders,
-=======
->>>>>>> theirs
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -675,10 +651,7 @@ impl LanguageModel for OpenCodeLanguageModel {
         } else {
             self.http_client.clone()
         };
-<<<<<<< ours
         let extra_headers = self.custom_headers(cx);
-=======
->>>>>>> theirs
 
         match self.model.protocol(self.subscription) {
             ApiProtocol::Anthropic => {
@@ -697,12 +670,8 @@ impl LanguageModel for OpenCodeLanguageModel {
                     mode,
                     anthropic::completion::AnthropicPromptCacheMode::Automatic,
                 );
-<<<<<<< ours
                 let stream =
                     self.stream_anthropic(anthropic_request, http_client, extra_headers, cx);
-=======
-                let stream = self.stream_anthropic(anthropic_request, http_client, cx);
->>>>>>> theirs
                 async move {
                     let mapper = AnthropicEventMapper::new();
                     Ok(mapper.map_stream(stream.await?).boxed())
@@ -727,12 +696,8 @@ impl LanguageModel for OpenCodeLanguageModel {
                     reasoning_effort,
                     self.model.interleaved_reasoning(),
                 );
-<<<<<<< ours
                 let stream =
                     self.stream_openai_chat(openai_request, http_client, extra_headers, cx);
-=======
-                let stream = self.stream_openai_chat(openai_request, http_client, cx);
->>>>>>> theirs
                 async move {
                     let mapper = OpenAiEventMapper::new();
                     Ok(mapper.map_stream(stream.await?).boxed())
@@ -753,12 +718,8 @@ impl LanguageModel for OpenCodeLanguageModel {
                     None,
                     supports_none_reasoning_effort,
                 );
-<<<<<<< ours
                 let stream =
                     self.stream_openai_response(response_request, http_client, extra_headers, cx);
-=======
-                let stream = self.stream_openai_response(response_request, http_client, cx);
->>>>>>> theirs
                 async move {
                     let mapper = OpenAiResponseEventMapper::new();
                     Ok(mapper.map_stream(stream.await?).boxed())
@@ -771,11 +732,7 @@ impl LanguageModel for OpenCodeLanguageModel {
                     self.model.id().to_string(),
                     google_ai::GoogleModelMode::Default,
                 );
-<<<<<<< ours
                 let stream = self.stream_google(google_request, http_client, extra_headers, cx);
-=======
-                let stream = self.stream_google(google_request, http_client, cx);
->>>>>>> theirs
                 async move {
                     let mapper = GoogleEventMapper::new();
                     Ok(mapper.map_stream(stream.await?.boxed()).boxed())

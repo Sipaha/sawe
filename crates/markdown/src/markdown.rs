@@ -184,16 +184,11 @@ impl MarkdownStyle {
         } else {
             theme_settings.ui_font.family.clone()
         };
-<<<<<<< ours
         let code_font_family = if is_preview {
             theme_settings.markdown_preview_code_font_family().clone()
         } else {
             theme_settings.buffer_font.family.clone()
         };
-=======
-
-        let text_color = colors.text;
->>>>>>> theirs
 
         let mut text_style = window.text_style();
         let line_height = buffer_font_size * 1.75;
@@ -314,7 +309,6 @@ impl MarkdownStyle {
         }
     }
 
-<<<<<<< ours
     fn with_preview_overrides(mut self, ui_font_size: Pixels, colors: &theme::ThemeColors) -> Self {
         let body_font_size = ui_font_size * 0.92;
         self.base_text_style.font_size = body_font_size.into();
@@ -356,8 +350,6 @@ impl MarkdownStyle {
         self
     }
 
-=======
->>>>>>> theirs
     pub fn with_buffer_font(mut self, cx: &App) -> Self {
         let theme_settings = ThemeSettings::get_global(cx);
         self.base_text_style.font_family = theme_settings.buffer_font.family.clone();
@@ -845,20 +837,7 @@ impl Markdown {
         self.active_search_highlight
     }
 
-    fn copy(&mut self, text: &RenderedText, _: &mut Window, cx: &mut Context<Self>) {
-        // Right-click → menu → "Copy" path: `capture_for_context_menu`
-        // (fired during MouseDown-Right capture) stashed the live
-        // selection here. By the time the menu's `Copy` action
-        // dispatches the inline `self.selection` may already have been
-        // collapsed (the popup steals focus / a stray click outside the
-        // hitbox lands as a fresh left-down). Mirror `copy_as_markdown`
-        // and consume the stashed value first; without this fallback,
-        // right-click → Copy was a silent no-op while Ctrl+C kept
-        // working through `self.selection` directly.
-        if let Some(text) = self.context_menu_selected_text.take() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            return;
-        }
+    fn copy(&self, text: &RenderedText, _: &mut Window, cx: &mut Context<Self>) {
         if self.selection.end <= self.selection.start {
             return;
         }
@@ -1483,7 +1462,6 @@ impl MarkdownElement {
         builder.push_text_style(self.style.block_quote.clone());
         builder.push_div(block_div, range, markdown_end);
     }
-<<<<<<< ours
 
     fn pop_markdown_block_quote(&self, builder: &mut MarkdownElementBuilder) {
         builder.pop_div();
@@ -1582,8 +1560,6 @@ impl MarkdownElement {
             block_range,
             markdown_end,
         );
-=======
->>>>>>> theirs
 
         let text_style = if cell_style.is_key {
             TextStyleRefinement {
@@ -2735,7 +2711,6 @@ impl Element for MarkdownElement {
         rendered_markdown.element.paint(window, cx);
         self.paint_search_highlights(&rendered_markdown.text, window, cx);
         self.paint_selection(&rendered_markdown.text, window, cx);
-<<<<<<< ours
     }
 }
 
@@ -2755,8 +2730,6 @@ fn collect_image_alt_text(
         None
     } else {
         Some(alt_text.into())
-=======
->>>>>>> theirs
     }
 }
 
@@ -3303,11 +3276,7 @@ impl MarkdownElementBuilder {
         )
         .fill();
 
-<<<<<<< ours
         let checkbox = if let Some(on_toggle) = on_toggle {
-=======
-        let element = if let Some(on_toggle) = on_toggle {
->>>>>>> theirs
             checkbox
                 .on_click(move |_state, window, cx| {
                     on_toggle(marker_source.clone(), !checked, window, cx);
@@ -3316,7 +3285,6 @@ impl MarkdownElementBuilder {
         } else {
             checkbox.visualization_only(true).into_any_element()
         };
-<<<<<<< ours
 
         let mut checkbox_container = h_flex().w_full();
         checkbox_container = match self.text_style().text_align {
@@ -3329,9 +3297,6 @@ impl MarkdownElementBuilder {
             .last_mut()
             .unwrap()
             .extend([checkbox_container.child(checkbox).into_any_element()]);
-=======
-        self.div_stack.last_mut().unwrap().extend([element]);
->>>>>>> theirs
     }
 
     fn source_range_for_rendered(&self, rendered: &Range<usize>) -> Option<Range<usize>> {
@@ -3652,7 +3617,6 @@ impl RenderedText {
                     let selection_end = rendered_end.min(row_end);
 
                     if selection_start < selection_end {
-<<<<<<< ours
                         let alignment_offset = line.alignment_offset_for_segment(
                             line_bounds.size.width,
                             row_start_x,
@@ -3661,10 +3625,6 @@ impl RenderedText {
                         let x_for_index = |index| {
                             line_bounds.left()
                                 + alignment_offset
-=======
-                        let x_for_index = |index| {
-                            line_bounds.left()
->>>>>>> theirs
                                 + unwrapped_layout.x_for_index(index - wrapped_line_start)
                                 - row_start_x
                         };
@@ -4293,11 +4253,7 @@ mod tests {
     #[test]
     fn test_table_checkbox_marker_source_range() {
         let md = "| Done |\n|------|\n|  [x]  |\n| [ ] |";
-<<<<<<< ours
         let events = crate::parser::parse_markdown_with_options(md, false, false, false).events;
-=======
-        let events = crate::parser::parse_markdown_with_options(md, false, false).events;
->>>>>>> theirs
 
         let mut in_cell = false;
         let mut pending_text = String::new();

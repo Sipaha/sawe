@@ -14,7 +14,6 @@ use prompt_store::rules_to_skills_migration;
 use release_channel::{AppVersion, ReleaseChannel};
 use semver::Version;
 use serde::Deserialize;
-use settings::Settings as _;
 use smol::io::AsyncReadExt;
 use ui::{AnnouncementToast, ListBulletItem, SkillsIllustration, prelude::*};
 use util::{ResultExt as _, maybe};
@@ -215,7 +214,6 @@ fn announcement_for_version(version: &Version, cx: &App) -> Option<AnnouncementC
         }
     };
 
-<<<<<<< ours
     if *version >= version_with_skills && !SkillsAnnouncement::dismissed(cx) {
         // Only mention the Rules → Skills migration if the user actually
         // had Rules that got migrated. New users (and existing users who
@@ -234,13 +232,6 @@ fn announcement_for_version(version: &Version, cx: &App) -> Option<AnnouncementC
             );
         }
 
-=======
-    if *version >= version_with_parallel_agents
-        && !ParallelAgentAnnouncement::dismissed(cx)
-        && !project::DisableAiSettings::get_global(cx).disable_ai
-    {
-        let fs = <dyn Fs>::global(cx);
->>>>>>> theirs
         Some(AnnouncementContent {
             heading: "Introducing Skills Support".into(),
             description: "Extend the agent with focused instructions and domain knowledge.".into(),

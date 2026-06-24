@@ -1,9 +1,6 @@
 use crate::multibuffer_hint::MultibufferHint;
-<<<<<<< ours
 use client::{Client, UserStore, zed_urls};
 use cloud_api_types::Plan;
-=======
->>>>>>> theirs
 use db::kvp::KeyValueStore;
 use fs::Fs;
 use gpui::{
@@ -23,11 +20,13 @@ use ui::{
 };
 
 pub use workspace::welcome::ShowWelcome;
-use workspace::welcome::WelcomeWindow;
+use workspace::welcome::WelcomePage;
 use workspace::{
     AppState, Workspace, WorkspaceId,
+    dock::DockPosition,
     item::{Item, ItemEvent},
-    register_serializable_item, with_active_or_new_workspace,
+    notifications::NotifyResultExt as _,
+    open_new, register_serializable_item, with_active_or_new_workspace,
 };
 use zed_actions::OpenOnboarding;
 
@@ -77,24 +76,59 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 
-    // SPK fork: `OpenOnboarding` redirects to Welcome — the multi-step
-    // Onboarding view was overkill for a personal fork, so any code
-    // path or keybind still firing `OpenOnboarding` opens the Welcome
-    // launcher instead. The Onboarding view itself is retained below
-    // only so its serialized items (left over from older builds) can
-    // still deserialize without errors.
     cx.on_action(|_: &OpenOnboarding, cx| {
-        cx.dispatch_action(&ShowWelcome);
+        with_active_or_new_workspace(cx, |workspace, window, cx| {
+            workspace
+                .with_local_workspace(window, cx, |workspace, window, cx| {
+                    let existing = workspace
+                        .active_pane()
+                        .read(cx)
+                        .items()
+                        .find_map(|item| item.downcast::<Onboarding>());
+
+                    if let Some(existing) = existing {
+                        workspace.activate_item(&existing, true, true, window, cx);
+                    } else {
+                        let settings_page = Onboarding::new(workspace, cx);
+                        workspace.add_item_to_active_pane(
+                            Box::new(settings_page),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        )
+                    }
+                })
+                .detach();
+        });
     });
 
     cx.on_action(|_: &ShowWelcome, cx| {
-        // Welcome lives in its own dedicated launcher window. If one
-        // is already open, just bring it forward; otherwise spawn a
-        // fresh window with `WelcomeWindow` as its root view.
-        let app_state = AppState::global(cx);
-        if let Err(err) = WelcomeWindow::open(app_state, cx) {
-            zlog::warn!("ShowWelcome: failed to open welcome window: {err:#}");
-        }
+        with_active_or_new_workspace(cx, |workspace, window, cx| {
+            workspace
+                .with_local_workspace(window, cx, |workspace, window, cx| {
+                    let existing = workspace
+                        .active_pane()
+                        .read(cx)
+                        .items()
+                        .find_map(|item| item.downcast::<WelcomePage>());
+
+                    if let Some(existing) = existing {
+                        workspace.activate_item(&existing, true, true, window, cx);
+                    } else {
+                        let settings_page = cx
+                            .new(|cx| WelcomePage::new(workspace.weak_handle(), false, window, cx));
+                        workspace.add_item_to_active_pane(
+                            Box::new(settings_page),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        )
+                    }
+                })
+                .detach();
+        });
     });
 
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
@@ -143,29 +177,38 @@ pub fn init(cx: &mut App) {
     base_keymap_picker::init(cx);
 
     register_serializable_item::<Onboarding>(cx);
+    register_serializable_item::<WelcomePage>(cx);
 }
 
-/// First-launch entry point. Opens the SPK Editor launcher window
-/// (`WelcomeWindow`) — a dedicated, chrome-less top-level window, NOT
-/// a workspace tab. Sets the historical `FIRST_OPEN` flag so future
-/// code paths that test it see the post-onboarding state.
 pub fn show_onboarding_view(app_state: Arc<AppState>, cx: &mut App) -> Task<anyhow::Result<()>> {
-    telemetry::event!("Welcome Page Opened (first launch)");
-    if let Err(err) = WelcomeWindow::open(app_state, cx) {
-        zlog::error!("show_onboarding_view: failed to open welcome window: {err:#}");
-        return Task::ready(Err(err));
-    }
-    let kvp = KeyValueStore::global(cx);
-    db::write_and_log(cx, move || async move {
-        kvp.write_kvp(FIRST_OPEN.to_string(), "false".to_string())
-            .await
-    });
-    Task::ready(Ok(()))
+    telemetry::event!("Onboarding Page Opened");
+    open_new(
+        Default::default(),
+        app_state,
+        cx,
+        |workspace, window, cx| {
+            {
+                workspace.toggle_dock(DockPosition::Left, window, cx);
+                let onboarding_page = Onboarding::new(workspace, cx);
+                workspace.add_item_to_center(Box::new(onboarding_page.clone()), window, cx);
+
+                window.focus(&onboarding_page.focus_handle(cx), cx);
+
+                cx.notify();
+            };
+            let kvp = KeyValueStore::global(cx);
+            db::write_and_log(cx, move || async move {
+                kvp.write_kvp(FIRST_OPEN.to_string(), "false".to_string())
+                    .await
+            });
+        },
+    )
 }
 
 struct Onboarding {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
+    user_store: Entity<UserStore>,
     scroll_handle: ScrollHandle,
     _settings_subscription: Subscription,
 }
@@ -222,6 +265,7 @@ impl Onboarding {
                 workspace: workspace.weak_handle(),
                 focus_handle: cx.focus_handle(),
                 scroll_handle: ScrollHandle::new(),
+                user_store: workspace.user_store().clone(),
                 _settings_subscription: cx
                     .observe_global::<SettingsStore>(move |_, cx| cx.notify()),
             }
@@ -233,12 +277,26 @@ impl Onboarding {
         go_to_welcome_page(cx);
     }
 
-    fn handle_sign_in(&mut self, _: &SignIn, _window: &mut Window, _cx: &mut Context<Self>) {
-        // Sign-in UI is hidden in spk-editor — Zed accounts are not used.
+    fn handle_sign_in(&mut self, _: &SignIn, window: &mut Window, cx: &mut Context<Self>) {
+        let client = Client::global(cx);
+        let workspace = self.workspace.clone();
+
+        window
+            .spawn(cx, async move |mut cx| {
+                client
+                    .sign_in_with_optional_connect(true, &cx)
+                    .await
+                    .notify_workspace_async_err(workspace, &mut cx);
+            })
+            .detach();
+    }
+
+    fn handle_open_account(_: &OpenAccount, _: &mut Window, cx: &mut App) {
+        cx.open_url(&zed_urls::account_url(cx))
     }
 
     fn render_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        crate::basics_page::render_basics_page(cx).into_any_element()
+        crate::basics_page::render_basics_page(&self.user_store, cx).into_any_element()
     }
 }
 
@@ -257,6 +315,7 @@ impl Render for Onboarding {
             .bg(cx.theme().colors().editor_background)
             .on_action(Self::on_finish)
             .on_action(cx.listener(Self::handle_sign_in))
+            .on_action(Self::handle_open_account)
             .on_action(cx.listener(|_, _: &menu::SelectNext, window, cx| {
                 window.focus_next(cx);
                 cx.notify();
@@ -287,11 +346,11 @@ impl Render for Onboarding {
                                     .child(
                                         h_flex()
                                             .gap_4()
-                                            .child(Vector::square(VectorName::SpkLogo, rems(2.5)))
+                                            .child(Vector::square(VectorName::ZedLogo, rems(2.5)))
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to SPK Editor")
+                                                        Headline::new("Welcome to Zed")
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
@@ -360,6 +419,7 @@ impl Item for Onboarding {
     ) -> Task<Option<Entity<Self>>> {
         Task::ready(Some(cx.new(|cx| Onboarding {
             workspace: self.workspace.clone(),
+            user_store: self.user_store.clone(),
             scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _settings_subscription: cx.observe_global::<SettingsStore>(move |_, cx| cx.notify()),
@@ -372,24 +432,39 @@ impl Item for Onboarding {
 }
 
 fn go_to_welcome_page(cx: &mut App) {
-    // The legacy Onboarding view used this helper to swap itself out
-    // for `WelcomePage` inside the same pane. With Welcome moved to a
-    // dedicated top-level window, just close the Onboarding tab in
-    // the current workspace (if any) and dispatch the standard
-    // `ShowWelcome` action — that opens the launcher window.
     with_active_or_new_workspace(cx, |workspace, window, cx| {
-        let onboarding_id = workspace
+        let Some((onboarding_id, onboarding_idx)) = workspace
             .active_pane()
             .read(cx)
             .items()
-            .find_map(|item| item.downcast::<Onboarding>().map(|_| item.item_id()));
-        if let Some(id) = onboarding_id {
-            workspace.active_pane().update(cx, |pane, cx| {
-                pane.remove_item(id, false, false, window, cx);
+            .enumerate()
+            .find_map(|(idx, item)| {
+                let _ = item.downcast::<Onboarding>()?;
+                Some((item.item_id(), idx))
+            })
+        else {
+            return;
+        };
+
+        workspace.active_pane().update(cx, |pane, cx| {
+            // Get the index here to get around the borrow checker
+            let idx = pane.items().enumerate().find_map(|(idx, item)| {
+                let _ = item.downcast::<WelcomePage>()?;
+                Some(idx)
             });
-        }
+
+            if let Some(idx) = idx {
+                pane.activate_item(idx, true, true, window, cx);
+            } else {
+                let item = Box::new(
+                    cx.new(|cx| WelcomePage::new(workspace.weak_handle(), false, window, cx)),
+                );
+                pane.add_item(item, true, true, Some(onboarding_idx), window, cx);
+            }
+
+            pane.remove_item(onboarding_id, false, false, window, cx);
+        });
     });
-    cx.dispatch_action(&ShowWelcome);
 }
 
 pub async fn handle_import_vscode_settings(

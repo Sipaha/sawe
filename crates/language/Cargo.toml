@@ -36,11 +36,7 @@ encoding_rs.workspace = true
 fs.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
-<<<<<<< ours
 fuzzy_nucleo.workspace = true
-=======
-fuzzy.workspace = true
->>>>>>> theirs
 globset.workspace = true
 gpui.workspace = true
 http_client.workspace = true

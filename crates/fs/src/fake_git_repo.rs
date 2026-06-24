@@ -11,17 +11,10 @@ use git::{
     Oid, RunHook,
     blame::Blame,
     repository::{
-<<<<<<< ours
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
         CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
         GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
         PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
-=======
-        AskPassDelegate, AuthorHistoryEntry, Branch, CommitData, CommitDataReader, CommitDetails,
-        CommitOptions, CreateWorktreeTarget, FetchOptions, GRAPH_CHUNK_SIZE, GitRepository,
-        GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource, PushOptions, RefEdit,
-        Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
->>>>>>> theirs
     },
     stash::GitStash,
     status::{
@@ -1419,10 +1412,6 @@ impl GitRepository for FakeGitRepository {
         .boxed()
     }
 
-    fn author_history(&self) -> BoxFuture<'_, Result<Vec<AuthorHistoryEntry>>> {
-        async move { Ok(Vec::new()) }.boxed()
-    }
-
     fn create_remote(&self, name: String, url: String) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
             state.remotes.insert(name, url);
@@ -1446,8 +1435,6 @@ impl GitRepository for FakeGitRepository {
         &self,
         _log_source: LogSource,
         _log_order: LogOrder,
-        _extra_args: Vec<String>,
-        _extra_paths: Vec<String>,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
         let fs = self.fs.clone();
