@@ -13,10 +13,7 @@ use dev_container::{
 };
 use editor::{Editor, EditorEvent};
 use extension_host::ExtensionStore;
-<<<<<<< ours
 use filter::{FilterData, FilteredServer};
-=======
->>>>>>> theirs
 use futures::{FutureExt, StreamExt as _, channel::oneshot, future::Shared};
 use gpui::{
     Action, AnyElement, App, ClickEvent, ClipboardItem, Context, DismissEvent, Entity,

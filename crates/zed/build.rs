@@ -207,26 +207,10 @@ fn main() {
 
         #[cfg(windows)]
         {
-<<<<<<< ours
+            // spk-editor: the `windows_resources` helper carries the "SPK Editor"
+            // brand strings (FileDescription / ProductName) — see that crate's
+            // `compile()`; the icon selection / RC toolkit handling lives there too.
             windows_resources::compile(false).expect("failed to compile Windows resources");
-=======
-            let mut res = winresource::WindowsResource::new();
-
-            // Depending on the security applied to the computer, winresource might fail
-            // fetching the RC path. Therefore, we add a way to explicitly specify the
-            // toolkit path, allowing winresource to use a valid RC path.
-            if let Some(explicit_rc_toolkit_path) = std::env::var("ZED_RC_TOOLKIT_PATH").ok() {
-                res.set_toolkit_path(explicit_rc_toolkit_path.as_str());
-            }
-            res.set_icon(icon.to_str().unwrap());
-            res.set("FileDescription", "SPK Editor");
-            res.set("ProductName", "SPK Editor");
-
-            if let Err(e) = res.compile() {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
->>>>>>> theirs
         }
     }
 

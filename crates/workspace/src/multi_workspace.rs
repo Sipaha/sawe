@@ -1545,9 +1545,6 @@ impl MultiWorkspace {
             group.last_active_workspace = Some(self.active_workspace.downgrade());
         }
 
-<<<<<<< ours
-        if !should_retain_workspaces && !old_active_was_retained {
-=======
         let active = self.active_workspace.clone();
         active.update(cx, |ws, cx| {
             // Force a window-title re-set for the entering workspace.
@@ -1559,8 +1556,7 @@ impl MultiWorkspace {
             ws.refresh_window_title(window, cx);
         });
 
-        if !self.sidebar_open && !old_active_was_retained {
->>>>>>> theirs
+        if !should_retain_workspaces && !old_active_was_retained {
             self.detach_workspace(&old_active_workspace, cx);
         }
 

@@ -1040,11 +1040,10 @@ impl Domain for WorkspaceDb {
                 ON UPDATE CASCADE
             );
         ),
-<<<<<<< ours
         sql!(
             ALTER TABLE workspaces ADD COLUMN identity_paths TEXT;
             ALTER TABLE workspaces ADD COLUMN identity_paths_order TEXT;
-=======
+        ),
         // fork-local: ConsolePanel tab persistence (terminal + chat tabs).
         // SQL string literals use double quotes because Rust's `sql!` macro
         // tokenises single-quoted characters as char literals (one codepoint
@@ -1062,7 +1061,6 @@ impl Domain for WorkspaceDb {
                 ON DELETE CASCADE
                 ON UPDATE CASCADE
             );
->>>>>>> theirs
         ),
     ];
 

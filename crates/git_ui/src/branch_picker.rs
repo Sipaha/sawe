@@ -6,15 +6,9 @@ use collections::HashSet;
 use git::repository::{Branch, delete_branch_flag};
 use gpui::http_client::Url;
 use gpui::{
-<<<<<<< ours
-    Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, PromptLevel,
     Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
-=======
-    Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, Render,
-    SharedString, Styled, Subscription, Task, WeakEntity, Window, actions, rems,
->>>>>>> theirs
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::git_store::{Repository, RepositoryEvent};
@@ -1105,15 +1099,12 @@ impl PickerDelegate for BranchListDelegate {
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         match self.state {
             PickerState::List | PickerState::NewRemote | PickerState::NewBranch => {
-<<<<<<< ours
                 if self.is_select_only() {
                     "Select branch…"
                 } else {
-                    "Switch branch…"
-=======
-                match self.branch_filter {
-                    BranchFilter::All | BranchFilter::Remote => "Switch branch…",
->>>>>>> theirs
+                    match self.branch_filter {
+                        BranchFilter::All | BranchFilter::Remote => "Switch branch…",
+                    }
                 }
             }
             PickerState::CreateRemote(_) => "Enter a name for this remote…",

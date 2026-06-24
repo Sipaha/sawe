@@ -837,37 +837,6 @@ pub enum GoToDefinitionFallback {
 }
 
 /// How to scroll the target into view when navigating to a definition or reference.
-<<<<<<< ours
-=======
-///
-/// Default: center
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Default,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-    JsonSchema,
-    MergeFrom,
-    strum::VariantArray,
-    strum::VariantNames,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum GoToDefinitionScrollStrategy {
-    /// Vertically center the target in the viewport.
-    #[default]
-    Center,
-    /// Scroll the minimum amount needed to make the target visible.
-    Minimum,
-    /// Scroll so the target appears near the top of the viewport.
-    Top,
-}
-
-/// Determines when the mouse cursor should be hidden in an editor or input box.
->>>>>>> theirs
 ///
 /// Default: center
 #[derive(

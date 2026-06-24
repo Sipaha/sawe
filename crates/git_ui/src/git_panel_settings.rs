@@ -61,14 +61,11 @@ pub struct GitPanelSettings {
     pub show_count_badge: bool,
     pub starts_open: bool,
     pub commit_title_max_length: usize,
-<<<<<<< ours
-=======
     pub commit_view: CommitViewSettings,
     pub interactive_rebase: InteractiveRebaseSettings,
     pub show_at_revision: ShowAtRevisionSettings,
     pub run_pre_commit_hooks_in_panel: bool,
     pub commit_explanations: CommitExplanationsSettings,
->>>>>>> theirs
 }
 
 #[derive(Default)]
@@ -116,8 +113,6 @@ impl Settings for GitPanelSettings {
             show_count_badge: git_panel.show_count_badge.unwrap(),
             starts_open: git_panel.starts_open.unwrap(),
             commit_title_max_length: git_panel.commit_title_max_length.unwrap(),
-<<<<<<< ours
-=======
             commit_view: {
                 let raw = git_panel.commit_view.unwrap();
                 CommitViewSettings {
@@ -149,7 +144,6 @@ impl Settings for GitPanelSettings {
                         .unwrap_or(crate::commit_view::ai_explain::DEFAULT_CACHE_TTL_DAYS),
                 }
             },
->>>>>>> theirs
         }
     }
 }

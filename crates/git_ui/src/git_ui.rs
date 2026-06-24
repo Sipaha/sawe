@@ -29,11 +29,7 @@ use git::{
 };
 use gpui::{
     App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-<<<<<<< ours
     SharedString, Subscription, Task, TaskExt, Window,
-=======
-    SharedString, Subscription, Task, Window,
->>>>>>> theirs
 };
 use menu::{Cancel, Confirm};
 use project::git_store::Repository;
@@ -52,10 +48,7 @@ pub mod commit_tooltip;
 pub mod commit_view;
 mod conflict_view;
 pub mod file_diff_view;
-<<<<<<< ours
 pub mod git_graph;
-=======
->>>>>>> theirs
 pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
@@ -65,11 +58,8 @@ pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
-<<<<<<< ours
-pub mod solo_diff_view;
-=======
 pub mod shelf;
->>>>>>> theirs
+pub mod solo_diff_view;
 pub mod stash_picker;
 pub mod stashes;
 pub mod text_diff_view;
@@ -96,9 +86,7 @@ pub fn get_provider_icon(name: &str) -> IconName {
 pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
-<<<<<<< ours
     git_graph::init(cx);
-=======
     backup_mcp::register(cx);
     handlers_mcp::register(cx);
     push_dialog_mcp::register(cx);
@@ -112,7 +100,6 @@ pub fn init(cx: &mut App) {
     editor_mcp::set_repo_path_resolver(Some(Box::new(|repo_id, cx| {
         handlers_mcp::resolve_repo_path_by_id(repo_id, cx)
     })));
->>>>>>> theirs
 
     cx.observe_new(|editor: &mut Editor, _, cx| {
         conflict_view::register_editor(editor, editor.buffer().clone(), cx);
@@ -357,8 +344,6 @@ pub fn init(cx: &mut App) {
                 };
             },
         );
-<<<<<<< ours
-=======
     })
     .detach();
 }
@@ -402,7 +387,6 @@ fn interactive_rebase_action(
             .detach_and_log_err(cx);
         })?;
         anyhow::Ok(())
->>>>>>> theirs
     })
     .detach_and_log_err(cx);
 }

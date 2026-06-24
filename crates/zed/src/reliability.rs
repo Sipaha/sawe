@@ -134,18 +134,11 @@ async fn upload_minidump(
     minidump: Vec<u8>,
     metadata: &crashes::CrashInfo,
 ) -> Result<()> {
-<<<<<<< ours
-    if metadata.init.commit_sha == "no sha" {
-        log::warn!("No commit sha set, skipping minidump upload");
-        return Ok(());
-    }
-=======
     // spk-editor: crash uploads are disabled. Panics are still written to disk for the user to inspect.
     let _ = (&client, endpoint, &minidump, metadata);
     return Ok(());
 
     #[allow(unreachable_code)]
->>>>>>> theirs
     let mut form = Form::new()
         .part(
             "upload_file_minidump",

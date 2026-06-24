@@ -4403,11 +4403,8 @@ impl BackgroundScanner {
             events = Self::normalized_events_for_worktree(&state, &root_canonical_path, events);
         }
 
-<<<<<<< ours
         log::debug!("raw events for process_events: {events:?}");
 
-=======
->>>>>>> theirs
         fn skip_ix(ranges: &mut SmallVec<[Range<usize>; 4]>, ix: usize) {
             if let Some(last_range) = ranges.last_mut()
                 && last_range.end == ix
@@ -4452,7 +4449,6 @@ impl BackgroundScanner {
                 }
 
                 if let Some((dot_git_abs_path, path_in_git_dir)) = dot_git_paths {
-<<<<<<< ours
                     let is_ignored = skipped_file_names_in_dot_git.iter().any(|skipped| {
                         path_in_git_dir
                             .file_name()
@@ -4464,16 +4460,6 @@ impl BackgroundScanner {
                         && matches!(event.kind, Some(PathEventKind::Changed))
                         && self.fs.is_dir(&dot_git_abs_path).await;
                     if is_ignored {
-=======
-                    let skip = skipped_files_in_dot_git.iter().any(|skipped| {
-                        OsStr::new(skipped) == path_in_git_dir.as_path().as_os_str()
-                    }) || skipped_dirs_in_dot_git
-                        .iter()
-                        .any(|skipped_git_subdir| path_in_git_dir.starts_with(skipped_git_subdir))
-                        || path_in_git_dir == Path::new("")
-                            && self.fs.is_dir(&dot_git_abs_path).await;
-                    if skip {
->>>>>>> theirs
                         log::debug!(
                             "ignoring event {abs_path:?} as it's in the .git directory among skipped files or directories"
                         );
@@ -4497,16 +4483,10 @@ impl BackgroundScanner {
                     }
                 }
 
-<<<<<<< ours
                 if self.track_git_repositories
                     && abs_path
                         .as_path()
                         .ends_with(Path::new(DOT_GIT).join(REPO_EXCLUDE))
-=======
-                if abs_path
-                    .as_path()
-                    .ends_with(Path::new(DOT_GIT).join(REPO_EXCLUDE))
->>>>>>> theirs
                 {
                     if let Some(repository) = snapshot.git_repositories.values().find(|repo| {
                         repo.common_dir_abs_path.join(REPO_EXCLUDE) == abs_path.as_path()
@@ -4579,13 +4559,9 @@ impl BackgroundScanner {
                     continue;
                 };
 
-<<<<<<< ours
                 if self.track_git_repositories
                     && abs_path.file_name() == Some(OsStr::new(GITIGNORE))
                 {
-=======
-                if abs_path.file_name() == Some(OsStr::new(GITIGNORE)) {
->>>>>>> theirs
                     for (_, repo) in snapshot
                         .git_repositories
                         .iter()
@@ -4646,7 +4622,6 @@ impl BackgroundScanner {
         self.state.lock().await.snapshot.scan_id += 1;
 
         let (scan_job_tx, scan_job_rx) = async_channel::unbounded();
-<<<<<<< ours
         if !relative_paths.is_empty() {
             log::debug!(
                 "will update project paths {:?}",
@@ -4656,15 +4631,6 @@ impl BackgroundScanner {
                     .collect::<Vec<_>>()
             );
         }
-=======
-        log::debug!(
-            "received fs events {:?}",
-            relative_paths
-                .iter()
-                .map(|event_root| &event_root.path)
-                .collect::<Vec<_>>()
-        );
->>>>>>> theirs
         self.reload_entries_for_paths(
             &root_path,
             &root_canonical_path,

@@ -752,17 +752,12 @@ pub enum LogSource {
     All,
     Branch(SharedString),
     Sha(Oid),
-<<<<<<< ours
     Path(RepoPath),
-=======
-    File(RepoPath),
->>>>>>> theirs
 }
 
 impl LogSource {
     fn get_args(&self) -> Result<Vec<&str>> {
         match self {
-<<<<<<< ours
             LogSource::All => Ok(vec![
                 "--ignore-missing", // needed in case of unborn HEAD
                 "--branches",
@@ -775,14 +770,6 @@ impl LogSource {
                 str::from_utf8(oid.as_bytes()).context("Failed to build str from sha")?,
             ]),
             LogSource::Path(path) => Ok(vec!["--follow", "--", path.as_unix_str()]),
-=======
-            LogSource::All => Ok("--all"),
-            LogSource::Branch(branch) => Ok(branch.as_str()),
-            LogSource::Sha(oid) => {
-                str::from_utf8(oid.as_bytes()).context("Failed to build str from sha")
-            }
-            LogSource::File(_) => Ok("--follow"),
->>>>>>> theirs
         }
     }
 }
@@ -1257,8 +1244,8 @@ pub trait GitRepository: Send + Sync {
     /// `extra_paths` is appended *after* a `--` separator. Used by the chip-Path
     /// filter (S-FLT) so `git log` restricts traversal to commits touching one
     /// of the listed paths. Pass an empty `Vec` for the pre-S-FLT default
-    /// behavior. When `LogSource::File(_)` is used (file-history mode) the
-    /// implementation appends its file path on the same `--` block.
+    /// behavior. When `LogSource::Path(_)` is used (file-history mode) the
+    /// source already contributes its own `--`/path arguments via `get_args`.
     fn initial_graph_data(
         &self,
         log_source: LogSource,
@@ -1812,15 +1799,9 @@ impl GitRepository for RealGitRepository {
 
         self.executor
             .spawn(async move {
-<<<<<<< ours
                 let working_directory = working_directory?;
                 let git_binary = git_binary?;
-                let output = git_binary
-=======
-                let (working_directory, git_binary) = working_directory_and_git_binary?;
-
                 let output = match git_binary
->>>>>>> theirs
                     .build_command(&["config", "--get", "commit.template"])
                     .output()
                     .await
@@ -2385,18 +2366,6 @@ impl GitRepository for RealGitRepository {
 
     fn tag_at_sha(
         &self,
-<<<<<<< ours
-        path: RepoPath,
-        content: Rope,
-        line_ending: LineEnding,
-    ) -> BoxFuture<'_, Result<crate::blame::Blame>> {
-        let git = self.git_binary_in_worktree();
-
-        self.executor
-            .spawn(async move {
-                let git = git?;
-                crate::blame::Blame::for_path(&git, &path, &content, line_ending).await
-=======
         name: String,
         sha: String,
         message: Option<String>,
@@ -2583,12 +2552,12 @@ impl GitRepository for RealGitRepository {
         content: Rope,
         line_ending: LineEnding,
     ) -> BoxFuture<'_, Result<crate::blame::Blame>> {
-        let git = self.git_binary();
+        let git = self.git_binary_in_worktree();
 
         self.executor
             .spawn(async move {
-                crate::blame::Blame::for_path(&git?, &path, &content, line_ending).await
->>>>>>> theirs
+                let git = git?;
+                crate::blame::Blame::for_path(&git, &path, &content, line_ending).await
             })
             .boxed()
     }
@@ -2814,9 +2783,6 @@ impl GitRepository for RealGitRepository {
         keep_index: bool,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
-<<<<<<< ours
-        let git = self.git_binary_in_worktree();
-=======
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
@@ -2947,17 +2913,12 @@ impl GitRepository for RealGitRepository {
         ask_pass: AskPassDelegate,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
-        let git_binary = self.git_binary();
->>>>>>> theirs
+        let git = self.git_binary_in_worktree();
         let executor = self.executor.clone();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-<<<<<<< ours
             let git = git?;
-=======
-            let git = git_binary?;
->>>>>>> theirs
             let mut cmd = git.build_command(&["commit", "--quiet", "-m"]);
             cmd.envs(env.iter())
                 .arg(&message.to_string())
@@ -3790,36 +3751,23 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
 
         async move {
-<<<<<<< ours
-            let mut git_log_command = vec!["log", GRAPH_COMMIT_FORMAT, log_order.as_arg()];
-            git_log_command.extend(log_source.get_args()?);
-=======
-            let git = git_binary?;
-
             let mut git_log_command: Vec<String> = vec![
                 "log".to_string(),
                 GRAPH_COMMIT_FORMAT.to_string(),
                 log_order.as_arg().to_string(),
-                log_source.get_arg()?.to_string(),
             ];
+            git_log_command.extend(log_source.get_args()?.into_iter().map(str::to_string));
             git_log_command.extend(extra_args);
 
-            // `--` separator is required before any positional path argument.
-            // File-history mode (LogSource::File) and chip-Path filter
-            // (extra_paths) both feed paths on the same `--` block; if both
-            // are present, the file path comes first to preserve historic
-            // ordering.
-            let needs_path_separator =
-                matches!(&log_source, LogSource::File(_)) || !extra_paths.is_empty();
-            if needs_path_separator {
+            // `--` separator is required before any positional path argument
+            // contributed by the chip-Path filter (extra_paths). LogSource::Path
+            // already injects its own `--` via get_args(), so only add one here
+            // when extra_paths brings additional positional arguments.
+            if !extra_paths.is_empty() && !matches!(&log_source, LogSource::Path(_)) {
                 git_log_command.push("--".to_string());
-            }
-            if let LogSource::File(file_path) = &log_source {
-                git_log_command.push(file_path.as_unix_str().to_string());
             }
             git_log_command.extend(extra_paths);
 
->>>>>>> theirs
             let mut command = git.build_command(&git_log_command);
             command.stdout(Stdio::piped());
             command.stderr(Stdio::piped());
@@ -3900,14 +3848,7 @@ impl GitRepository for RealGitRepository {
             args.push("--grep");
             args.push(search_args.query.as_str());
 
-<<<<<<< ours
             args.extend(log_source.get_args()?);
-=======
-            if let LogSource::File(file_path) = &log_source {
-                args.extend(["--", file_path.as_unix_str()]);
-            }
-
->>>>>>> theirs
             let mut command = git.build_command(&args);
             command.stdout(Stdio::piped());
             command.stderr(Stdio::null());

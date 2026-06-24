@@ -65,13 +65,8 @@ use gpui::{
     Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
     PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
-<<<<<<< ours
-    SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds, WindowHandle,
-    WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
-=======
     SystemWindowTabController, Task, Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId,
     WindowOptions, actions, canvas, point, px, relative, size, transparent_black,
->>>>>>> theirs
 };
 pub use history_manager::*;
 pub use item::{
@@ -145,11 +140,7 @@ use std::{
     time::Duration,
 };
 use task::{DebugScenario, SharedTaskContext, SpawnInTerminal};
-<<<<<<< ours
-use theme::{ActiveTheme, ClientDecorationsExt, SystemAppearance};
-=======
-use theme::ActiveTheme;
->>>>>>> theirs
+use theme::{ActiveTheme, SystemAppearance};
 use theme_settings::ThemeSettings;
 pub use toolbar::{
     PaneSearchBarCallbacks, Toolbar, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
@@ -165,13 +156,8 @@ use util::{
 };
 use uuid::Uuid;
 pub use workspace_settings::{
-<<<<<<< ours
-    AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, FocusFollowsMouse,
-    RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings, WorkspaceSettings,
-=======
     AutosaveSetting, FocusFollowsMouse, RestoreOnStartupBehavior, StatusBarSettings,
     TabBarSettings, WorkspaceSettings,
->>>>>>> theirs
 };
 use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
 
@@ -6365,8 +6351,6 @@ impl Workspace {
             title.push_str(" ↗");
         }
 
-<<<<<<< ours
-=======
         // S-SAR — flag snapshot worktrees in the OS title so the user
         // can tell at a glance that this window is read-only and that
         // edits will be refused at the buffer layer.
@@ -6374,7 +6358,6 @@ impl Workspace {
             title.push_str(" [READ-ONLY]");
         }
 
->>>>>>> theirs
         let document_path = active_project_path
             .as_ref()
             .and_then(|path| project.absolute_path(path, cx));
@@ -6394,10 +6377,10 @@ impl Workspace {
         self.last_window_title = Some(title);
     }
 
-<<<<<<< ours
     fn is_window_edited(&self, cx: &App) -> bool {
         !self.project.read(cx).is_disconnected(cx) && !self.dirty_items.is_empty()
-=======
+    }
+
     /// Force the platform window title to be re-set even if it matches
     /// what this workspace last wrote. Used by `MultiWorkspace::activate`
     /// when switching solution tabs: each tab's `Workspace` keeps its
@@ -6409,7 +6392,6 @@ impl Workspace {
     pub fn refresh_window_title(&mut self, window: &mut Window, cx: &mut App) {
         self.last_window_title = None;
         self.update_window_title(window, cx);
->>>>>>> theirs
     }
 
     fn update_window_edited(&mut self, window: &mut Window, cx: &mut App) {
@@ -11470,8 +11452,6 @@ mod tests {
 
     #[gpui::test]
     async fn test_document_path_updates_with_active_item(cx: &mut TestAppContext) {
-<<<<<<< ours
-=======
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -11552,7 +11532,6 @@ mod tests {
 
     #[gpui::test]
     async fn test_close_window(cx: &mut TestAppContext) {
->>>>>>> theirs
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -16405,7 +16384,6 @@ mod tests {
     }
 
     #[gpui::test]
-<<<<<<< ours
     async fn test_open_url_or_file_routes_urls(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -16448,7 +16426,9 @@ mod tests {
             workspace.open_url_or_file("nonexistent.txt", None, window, cx);
         });
         assert_eq!(cx.opened_url(), Some("nonexistent.txt".to_string()));
-=======
+    }
+
+    #[gpui::test]
     async fn swap_worktrees_to_replaces_old_with_new(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
@@ -16581,6 +16561,5 @@ mod tests {
             right_dock.origin.x,
             "bottom dock right edge should meet right dock left edge"
         );
->>>>>>> theirs
     }
 }

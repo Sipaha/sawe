@@ -1,23 +1,16 @@
 use gpui::{
-<<<<<<< ours
-    App, Context, Empty, EventEmitter, IntoElement, ParentElement, Render, SharedString, Window,
-=======
-    Context, Empty, EventEmitter, IntoElement, ParentElement, Render, SharedString, WeakEntity,
-    Window,
->>>>>>> theirs
+    App, Context, Empty, EventEmitter, IntoElement, ParentElement, Render, SharedString,
+    WeakEntity, Window,
 };
 use project::Project;
 use settings::Settings;
 use ui::{Button, Tooltip, prelude::*};
 use util::paths::PathStyle;
 
-<<<<<<< ours
 use crate::{
-    HideStatusItem, StatusItemView, item::ItemHandle, workspace_settings::StatusBarSettings,
+    HideStatusItem, StatusItemView, Workspace, item::ItemHandle,
+    workspace_settings::StatusBarSettings,
 };
-=======
-use crate::{StatusItemView, Workspace, item::ItemHandle, workspace_settings::StatusBarSettings};
->>>>>>> theirs
 
 pub struct ActiveFileName {
     /// Path shown in the status bar — the active file's path relative to

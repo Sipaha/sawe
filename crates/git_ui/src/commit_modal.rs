@@ -1,11 +1,7 @@
 use crate::branch_picker::{self, BranchList};
-<<<<<<< ours
 use crate::git_panel::{
     GitPanel, commit_message_editor, commit_title_exceeds_limit, git_commit_editor_style,
 };
-=======
-use crate::git_panel::{GitPanel, commit_message_editor, panel_editor_style};
->>>>>>> theirs
 use crate::git_panel_settings::GitPanelSettings;
 use git::repository::CommitOptions;
 use git::{Amend, Commit, GenerateCommitMessage, Signoff};
@@ -589,11 +585,7 @@ impl Render for CommitModal {
                 .text(cx)
                 .lines()
                 .next()
-<<<<<<< ours
                 .is_some_and(|title| commit_title_exceeds_limit(title, max_title_length))
-=======
-                .is_some_and(|title| title.len() > max_title_length)
->>>>>>> theirs
         } else {
             false
         };
@@ -630,11 +622,7 @@ impl Render for CommitModal {
                 }),
             )
             .w(width)
-<<<<<<< ours
             .min_h_112()
-=======
-            .h_112()
->>>>>>> theirs
             .p(container_padding)
             .elevation_3(cx)
             .overflow_hidden()

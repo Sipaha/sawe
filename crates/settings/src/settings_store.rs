@@ -286,7 +286,6 @@ pub struct SettingsJsonSchemaParams<'a> {
 
 impl SettingsStore {
     pub fn new(cx: &mut App, default_settings: &str) -> Self {
-<<<<<<< ours
         Self::new_with_semantic_tokens(cx, default_settings)
     }
 
@@ -297,10 +296,6 @@ impl SettingsStore {
 
     fn from_settings_content(cx: &mut App, default_settings: SettingsContent) -> Self {
         let (setting_file_updates_tx, mut setting_file_updates_rx) = mpsc::unbounded();
-=======
-        let (setting_file_updates_tx, mut setting_file_updates_rx) = mpsc::unbounded();
-        let default_settings = Self::parse_default_settings(default_settings).unwrap();
->>>>>>> theirs
         if !cx.has_global::<DefaultSemanticTokenRules>() {
             cx.set_global::<DefaultSemanticTokenRules>(
                 crate::parse_json_with_comments::<SemanticTokenRules>(
@@ -1803,18 +1798,10 @@ mod tests {
 
     #[gpui::test]
     fn test_default_settings_release_channel_overrides(cx: &mut App) {
-<<<<<<< ours
         // The test deals with overrides and should ignore the other set-ups (Preview and Stable runs)
         if *release_channel::RELEASE_CHANNEL != release_channel::ReleaseChannel::Dev {
             return;
         }
-=======
-        assert_eq!(
-            *release_channel::RELEASE_CHANNEL,
-            release_channel::ReleaseChannel::Dev,
-            "tests expect the dev release channel",
-        );
->>>>>>> theirs
 
         let mut defaults: serde_json::Value =
             crate::parse_json_with_comments(&default_settings()).unwrap();
@@ -2348,14 +2335,10 @@ mod tests {
               "terminal": {
                 "bell": "system"
               },
-<<<<<<< ours
               "base_keymap": "VSCode",
               "minimap": {
                 "show": "always"
               }
-=======
-              "base_keymap": "VSCode"
->>>>>>> theirs
             }
             "#
             .unindent(),
@@ -2374,14 +2357,10 @@ mod tests {
               "terminal": {
                 "bell": "off"
               },
-<<<<<<< ours
               "base_keymap": "VSCode",
               "minimap": {
                 "show": "always"
               }
-=======
-              "base_keymap": "VSCode"
->>>>>>> theirs
             }
             "#
             .unindent(),
@@ -2400,14 +2379,10 @@ mod tests {
               "terminal": {
                 "bell": "system"
               },
-<<<<<<< ours
               "base_keymap": "VSCode",
               "minimap": {
                 "show": "always"
               }
-=======
-              "base_keymap": "VSCode"
->>>>>>> theirs
             }
             "#
             .unindent(),
@@ -2426,14 +2401,10 @@ mod tests {
               "terminal": {
                 "bell": "off"
               },
-<<<<<<< ours
               "base_keymap": "VSCode",
               "minimap": {
                 "show": "always"
               }
-=======
-              "base_keymap": "VSCode"
->>>>>>> theirs
             }
             "#
             .unindent(),
@@ -2456,14 +2427,10 @@ mod tests {
               "terminal": {
                 "bell": "off"
               },
-<<<<<<< ours
               "base_keymap": "VSCode",
               "minimap": {
                 "show": "always"
               }
-=======
-              "base_keymap": "VSCode"
->>>>>>> theirs
             }
             "#
             .unindent(),

@@ -136,18 +136,10 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
                 }
             }
 
-<<<<<<< ours
             if matches!(format, EditPredictionPromptFormat::Zeta(_)) {
-                Some(EditPredictionProviderConfig::Zed(EditPredictionModel::Zeta))
-=======
-            if matches!(
-                format,
-                EditPredictionPromptFormat::Zeta | EditPredictionPromptFormat::Zeta2
-            ) {
                 // Zeta-format prompts route through the Zed cloud delegate, which
                 // requires a Zed account; spk-editor disables that path.
                 None
->>>>>>> theirs
             } else {
                 Some(EditPredictionProviderConfig::Zed(
                     EditPredictionModel::Fim { format },

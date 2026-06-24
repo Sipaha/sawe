@@ -9,7 +9,6 @@ use gpui::{
 use settings::{SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
-<<<<<<< ours
 use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
 
 /// Describes how a status-bar item can be hidden by the user.
@@ -39,9 +38,6 @@ impl HideStatusItem {
         update_settings_file(fs, cx, move |settings, _cx| (hide)(settings));
     }
 }
-=======
-use ui::{Divider, Indicator, Tooltip, prelude::*};
->>>>>>> theirs
 
 pub trait StatusItemView: Render {
     /// Event callback that is triggered when the active pane item changes.
@@ -160,7 +156,7 @@ impl StatusBar {
     fn render_left_tools(
         &self,
         _sidebar: &SidebarStatus,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // SPK fork: sidebar is disabled (see `zed::zed::initialize_workspace`),
         // so the status-bar toggle that normally re-opens it is hidden.
@@ -168,29 +164,20 @@ impl StatusBar {
             .gap_1()
             .min_w_0()
             .overflow_x_hidden()
-<<<<<<< ours
-            .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Left,
-                |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
-            )
             .children(self.left_items.iter().enumerate().map(|(index, item)| {
                 render_hideable_item("status-bar-left", index, item.as_ref(), cx)
             }))
-=======
-            .children(self.left_items.iter().map(|item| item.to_any()))
->>>>>>> theirs
     }
 
     fn render_right_tools(
         &self,
         _sidebar: &SidebarStatus,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
             .gap_1()
             .overflow_x_hidden()
-<<<<<<< ours
             .children(
                 self.right_items
                     .iter()
@@ -200,13 +187,6 @@ impl StatusBar {
                         render_hideable_item("status-bar-right", index, item.as_ref(), cx)
                     }),
             )
-            .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
-                |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
-            )
-=======
-            .children(self.right_items.iter().rev().map(|item| item.to_any()))
->>>>>>> theirs
     }
 
     #[allow(dead_code)]

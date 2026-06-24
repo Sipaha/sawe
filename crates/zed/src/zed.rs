@@ -73,12 +73,9 @@ use settings::{
     VIM_KEYMAP_PATH, initial_local_debug_tasks_content, initial_project_settings_content,
     initial_tasks_content, update_settings_file,
 };
-<<<<<<< ours
 use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
-=======
->>>>>>> theirs
 
 use std::{
     borrow::Cow,
@@ -625,11 +622,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
-<<<<<<< ours
-=======
             status_bar.add_right_item(solutions_status, window, cx);
             status_bar.add_right_item(remote_control_status, window, cx);
->>>>>>> theirs
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);

@@ -1573,7 +1573,6 @@
     },
   },
   {
-<<<<<<< ours
     "context": "GitGraph",
     "bindings": {
       "tab": "git_graph::FocusNextTabStop",
@@ -1605,7 +1604,9 @@
       "ctrl-enter": "skill_creator::SaveSkill",
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
-=======
+    },
+  },
+  {
     "context": "SolutionSessionView",
     "bindings": {
       "ctrl-f": "solution_agent::FindInSession",
@@ -1629,7 +1630,6 @@
     "bindings": {
       "enter": "solution_agent::FindNextMatch",
       "shift-enter": "solution_agent::FindPreviousMatch",
->>>>>>> theirs
     },
   },
 ]

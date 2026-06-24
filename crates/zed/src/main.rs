@@ -85,9 +85,8 @@ use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-<<<<<<< ours
-fn build_application() -> Application {
-    let platform = gpui_platform::current_platform(false);
+fn build_application(headless: bool) -> Application {
+    let platform = gpui_platform::current_platform(headless);
     if std::env::var("ZED_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
         Application::with_platform(platform)
     } else {
@@ -95,12 +94,8 @@ fn build_application() -> Application {
     }
 }
 
-fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
-    let message = "Zed failed to launch";
-=======
 fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>, headless: bool) {
     let message = "SPK Editor failed to launch";
->>>>>>> theirs
     let error_details = errors
         .into_iter()
         .flat_map(|(kind, paths)| {
@@ -127,17 +122,13 @@ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>, headl
         .collect::<Vec<_>>().join("\n\n");
 
     eprintln!("{message}: {error_details}");
-<<<<<<< ours
-    build_application()
-=======
     // In headless mode there's no display to put a prompt window on, so the
     // launch-failure path just printed-and-exits. The full prompt path stays
     // on the on-screen platform.
     if headless {
         return;
     }
-    Application::with_platform(gpui_platform::current_platform(false))
->>>>>>> theirs
+    build_application(false)
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             if let Ok(window) = cx.open_window(gpui::WindowOptions::default(), |_, cx| {
@@ -259,8 +250,6 @@ fn main() {
         return;
     }
 
-<<<<<<< ours
-=======
     // `zed --nc` Makes zed operate in nc/netcat mode for use with MCP
     if let Some(socket) = &args.nc {
         match nc::main(socket) {
@@ -301,7 +290,6 @@ fn main() {
         }
     }
 
->>>>>>> theirs
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
     unsafe {
         use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
@@ -458,12 +446,7 @@ fn main() {
     #[cfg(windows)]
     check_for_conpty_dll();
 
-<<<<<<< ours
-    let app = build_application().with_assets(Assets);
-=======
-    let app = Application::with_platform(gpui_platform::current_platform(args.headless))
-        .with_assets(Assets);
->>>>>>> theirs
+    let app = build_application(args.headless).with_assets(Assets);
 
     let app_db = db::AppDatabase::new();
     let system_id = app.background_executor().spawn(system_id());
@@ -476,31 +459,6 @@ fn main() {
         KeyValueStore::from_app_db(&app_db),
     ));
     let background_executor = app.background_executor();
-<<<<<<< ours
-=======
-    crashes::init(
-        InitCrashHandler {
-            session_id,
-            // strip the build and channel information from the version string, we send them separately
-            zed_version: semver::Version::new(
-                app_version.major,
-                app_version.minor,
-                app_version.patch,
-            )
-            .to_string(),
-            binary: "zed".to_string(),
-            release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
-            commit_sha: app_commit_sha
-                .as_ref()
-                .map(|sha| sha.full())
-                .unwrap_or_else(|| "no sha".to_owned()),
-        },
-        |task| {
-            app.background_executor().spawn(task).detach();
-        },
-        move |duration| background_executor.timer(duration),
-    );
->>>>>>> theirs
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
@@ -1922,29 +1880,6 @@ pub(crate) async fn restore_or_create_workspace(
                             _ => {
                                 Editor::new_file(workspace, &Default::default(), window, cx);
                             }
-<<<<<<< ours
-                        }
-                    },
-                )
-            })
-            .await?;
-        }
-    } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-        cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
-    } else {
-        cx.update(|cx| {
-            workspace::open_new(
-                Default::default(),
-                app_state,
-                cx,
-                |workspace, window, cx| {
-                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-=======
->>>>>>> theirs
                         }
                     },
                 )
@@ -2144,9 +2079,6 @@ struct Args {
     #[arg(long)]
     system_specs: bool,
 
-<<<<<<< ours
-    /// Used for recording minidumps on crashes by having Zed run a separate
-=======
     /// Used for the MCP Server, to remove the need for netcat as a dependency,
     /// by having SPK Editor act like netcat communicating over a Unix socket.
     #[arg(long, hide = true)]
@@ -2181,7 +2113,6 @@ struct Args {
     git_message_set: Option<String>,
 
     /// Used for recording minidumps on crashes by having SPK Editor run a separate
->>>>>>> theirs
     /// process communicating over a socket.
     #[arg(long, hide = true)]
     crash_handler: Option<PathBuf>,

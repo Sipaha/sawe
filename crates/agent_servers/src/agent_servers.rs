@@ -24,11 +24,7 @@ pub use acp::test_support::{
 };
 pub use acp::{
     AcpConnection, AcpDebugMessage, AcpDebugMessageContent, AcpDebugMessageDirection,
-<<<<<<< ours
-    GEMINI_TERMINAL_AUTH_METHOD_ID,
-=======
     GEMINI_TERMINAL_AUTH_METHOD_ID, mcp_servers_for_project,
->>>>>>> theirs
 };
 
 pub struct AgentServerDelegate {
@@ -70,8 +66,6 @@ pub trait AgentServer: Send {
     fn set_default_mode(
         &self,
         _mode_id: Option<acp_schema::SessionModeId>,
-<<<<<<< ours
-=======
         _fs: Arc<dyn Fs>,
         _cx: &mut App,
     ) {
@@ -84,19 +78,15 @@ pub trait AgentServer: Send {
     fn set_default_model(
         &self,
         _model_id: Option<acp_schema::ModelId>,
->>>>>>> theirs
         _fs: Arc<dyn Fs>,
         _cx: &mut App,
     ) {
     }
 
-<<<<<<< ours
-=======
     fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<acp_schema::ModelId> {
         HashSet::default()
     }
 
->>>>>>> theirs
     fn default_config_option(&self, _config_id: &str, _cx: &App) -> Option<String> {
         None
     }
@@ -122,8 +112,6 @@ pub trait AgentServer: Send {
         &self,
         _config_id: acp_schema::SessionConfigId,
         _value_id: acp_schema::SessionConfigValueId,
-<<<<<<< ours
-=======
         _should_be_favorite: bool,
         _fs: Arc<dyn Fs>,
         _cx: &App,
@@ -133,7 +121,6 @@ pub trait AgentServer: Send {
     fn toggle_favorite_model(
         &self,
         _model_id: acp_schema::ModelId,
->>>>>>> theirs
         _should_be_favorite: bool,
         _fs: Arc<dyn Fs>,
         _cx: &App,

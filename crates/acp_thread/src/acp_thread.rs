@@ -530,9 +530,7 @@ pub struct ToolCall {
     pub raw_output: Option<serde_json::Value>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
-<<<<<<< ours
     pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
-=======
     /// Parent tool_use id (`toolu_xxx`) when this tool call was emitted from
     /// inside a claude_native subagent; `None` for parent-level tool calls.
     /// See `AssistantMessage::subagent_id` for the wire-shape contract.
@@ -544,7 +542,6 @@ pub struct ToolCall {
     /// state (e.g. cold-persistence hydration) and never re-entered
     /// `InProgress`.
     pub status_started_at: Option<DateTime<Utc>>,
->>>>>>> theirs
 }
 
 impl ToolCall {
@@ -612,12 +609,9 @@ impl ToolCall {
             raw_output: tool_call.raw_output,
             tool_name,
             subagent_session_info,
-<<<<<<< ours
             sandbox_authorization_details,
-=======
             subagent_id,
             status_started_at,
->>>>>>> theirs
         };
         Ok(result)
     }
@@ -2468,14 +2462,11 @@ impl AcpThread {
                     raw_output: None,
                     tool_name: None,
                     subagent_session_info: None,
-<<<<<<< ours
                     sandbox_authorization_details: None,
-=======
                     subagent_id: None,
                     // Synthetic Failed call — never observed an
                     // InProgress transition, so no timestamp.
                     status_started_at: None,
->>>>>>> theirs
                 };
                 self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
                 return Ok(());
@@ -2886,7 +2877,6 @@ impl AcpThread {
         // `git add --all` can't traverse cleanly. `message.checkpoint` stays
         // `None` and `update_last_checkpoint` early-returns on that.
         self.run_turn(cx, async move |this, cx| {
-<<<<<<< ours
             if push_user_message {
                 this.update(cx, |this, cx| {
                     this.push_entry(
@@ -2919,19 +2909,6 @@ impl AcpThread {
             }
 
             this.update(cx, |this, cx| {
-=======
-            this.update(cx, |this, cx| {
-                this.push_entry(
-                    AgentThreadEntry::UserMessage(UserMessage {
-                        id: Some(message_id.clone()),
-                        content: block,
-                        chunks: message,
-                        checkpoint: None,
-                        indented: false,
-                    }),
-                    cx,
-                );
->>>>>>> theirs
                 this.connection.prompt(message_id, request, cx)
             })?
             .await
@@ -6818,30 +6795,6 @@ mod tests {
         });
     }
 
-<<<<<<< ours
-    /// Regression test: if the inner send_task is cancelled before it can
-    /// fire `tx.send(...)` (e.g. because the underlying future was dropped),
-    /// the outer task observes `rx.await` returning `Err(Cancelled)` and
-    /// must still clear `running_turn` so the panel transitions out of
-    /// `Generating`. Without this, the agent thread is wedged in the
-    /// loading state until Zed restarts.
-    #[gpui::test]
-    async fn test_running_turn_cleared_when_send_task_dropped(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-
-        // Handler hangs forever so the spawn at run_turn is parked inside
-        // `f(this, cx).await` with `tx` still alive but unsent.
-        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
-            |_params, _thread, _cx| {
-                async move { futures::future::pending::<Result<acp::PromptResponse>>().await }
-                    .boxed_local()
-            },
-        ));
-
-=======
     fn meta_with_subagent(parent_tool_use_id: &str) -> acp::Meta {
         let mut nested = serde_json::Map::new();
         nested.insert(
@@ -6969,7 +6922,6 @@ mod tests {
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
         let connection = Rc::new(FakeAgentConnection::new());
->>>>>>> theirs
         let thread = cx
             .update(|cx| {
                 connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
@@ -6977,36 +6929,6 @@ mod tests {
             .await
             .unwrap();
 
-<<<<<<< ours
-        let request = thread.update(cx, |thread, cx| thread.send_raw("hello", cx));
-        cx.run_until_parked();
-
-        assert_eq!(
-            thread.read_with(cx, |t, _| t.status()),
-            ThreadStatus::Generating,
-            "thread should be generating while the handler is parked"
-        );
-
-        // Replace the in-flight send_task with a no-op. Dropping the original
-        // Task cancels its inner future, which drops `tx` without ever calling
-        // `tx.send(...)`. This mirrors the production scenario where the
-        // send_task future is cancelled before completion.
-        thread.update(cx, |thread, _| {
-            thread.running_turn.as_mut().unwrap().send_task = Task::ready(());
-        });
-
-        let result = request.await;
-        assert!(
-            matches!(result, Ok(None)),
-            "outer task should resolve to Ok(None) on dropped tx, got {result:?}"
-        );
-
-        assert_eq!(
-            thread.read_with(cx, |t, _| t.status()),
-            ThreadStatus::Idle,
-            "running_turn must be cleared even when tx was dropped without send"
-        );
-=======
         thread.update(cx, |thread, cx| {
             thread
                 .handle_session_update(
@@ -7181,6 +7103,64 @@ mod tests {
             };
             assert_eq!(call.subagent_id, Some(SharedString::from("T3")));
         });
->>>>>>> theirs
+    }
+
+    /// Regression test: if the inner send_task is cancelled before it can
+    /// fire `tx.send(...)` (e.g. because the underlying future was dropped),
+    /// the outer task observes `rx.await` returning `Err(Cancelled)` and
+    /// must still clear `running_turn` so the panel transitions out of
+    /// `Generating`. Without this, the agent thread is wedged in the
+    /// loading state until Zed restarts.
+    #[gpui::test]
+    async fn test_running_turn_cleared_when_send_task_dropped(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        // Handler hangs forever so the spawn at run_turn is parked inside
+        // `f(this, cx).await` with `tx` still alive but unsent.
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            |_params, _thread, _cx| {
+                async move { futures::future::pending::<Result<acp::PromptResponse>>().await }
+                    .boxed_local()
+            },
+        ));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let request = thread.update(cx, |thread, cx| thread.send_raw("hello", cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            thread.read_with(cx, |t, _| t.status()),
+            ThreadStatus::Generating,
+            "thread should be generating while the handler is parked"
+        );
+
+        // Replace the in-flight send_task with a no-op. Dropping the original
+        // Task cancels its inner future, which drops `tx` without ever calling
+        // `tx.send(...)`. This mirrors the production scenario where the
+        // send_task future is cancelled before completion.
+        thread.update(cx, |thread, _| {
+            thread.running_turn.as_mut().unwrap().send_task = Task::ready(());
+        });
+
+        let result = request.await;
+        assert!(
+            matches!(result, Ok(None)),
+            "outer task should resolve to Ok(None) on dropped tx, got {result:?}"
+        );
+
+        assert_eq!(
+            thread.read_with(cx, |t, _| t.status()),
+            ThreadStatus::Idle,
+            "running_turn must be cleared even when tx was dropped without send"
+        );
     }
 }

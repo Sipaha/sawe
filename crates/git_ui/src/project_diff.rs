@@ -428,10 +428,6 @@ impl ProjectDiff {
         })
     }
 
-<<<<<<< ours
-    #[cfg(test)]
-    #[allow(dead_code)]
-=======
     /// S-CTM "Compare with Local Working Tree" — opens a `ProjectDiff` tab
     /// showing every file modified between `base_ref` (a commit SHA, branch
     /// name, or any rev-parseable ref) and the current working tree.
@@ -481,7 +477,8 @@ impl ProjectDiff {
             .detach_and_notify_err(workspace_weak, window, cx);
     }
 
->>>>>>> theirs
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn new_with_default_branch(
         project: Entity<Project>,
         workspace: Entity<Workspace>,

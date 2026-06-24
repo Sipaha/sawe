@@ -61,15 +61,9 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     Color, ContextMenu, ContextMenuEntry, DecoratedIcon, Icon, IconDecoration, IconDecorationKind,
-<<<<<<< ours
-    IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, Label, LabelSize, ListItem,
-    ListItemSpacing, ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate,
+    IndentGuideColors, IndentGuideLayout, Indicator, Label, LabelSize, ListItem,
+    ListItemSpacing, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate,
     Tooltip, WithScrollbar, prelude::*, v_flex,
-=======
-    IndentGuideColors, IndentGuideLayout, Indicator, Label, LabelSize, ListItem, ListItemSpacing,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
-    v_flex,
->>>>>>> theirs
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -534,7 +528,6 @@ pub fn init(cx: &mut App) {
                 panel.update(cx, |panel, cx| panel.delete(action, window, cx));
             }
         });
-<<<<<<< ours
 
         // Forwards `git::FileHistory` to `git_ui::git_graph` when the project
         // panel is the focused source of selection. Lives here (and not in
@@ -579,8 +572,6 @@ pub fn init(cx: &mut App) {
                 cx.stop_propagation();
             })
         });
-=======
->>>>>>> theirs
     })
     .detach();
 }
@@ -1127,11 +1118,7 @@ impl ProjectPanel {
                     || (settings.hide_root && visible_worktrees_count == 1));
             let should_show_compare = !is_dir && self.file_abs_paths_to_diff(cx).is_some();
 
-<<<<<<< ours
             let (has_git_repo, has_history) = {
-=======
-            let (has_git_repo, has_file_history) = {
->>>>>>> theirs
                 let project_path = project::ProjectPath {
                     worktree_id,
                     path: entry.path.clone(),
@@ -1140,20 +1127,11 @@ impl ProjectPanel {
                 let has_git_repo = git_store
                     .repository_and_path_for_project_path(&project_path, cx)
                     .is_some();
-<<<<<<< ours
                 let has_history = has_git_repo
                     && !git_store
                         .project_path_git_status(&project_path, cx)
                         .is_some_and(|status| status.is_created());
                 (has_git_repo, has_history)
-=======
-                let has_file_history = !is_dir
-                    && has_git_repo
-                    && !git_store
-                        .project_path_git_status(&project_path, cx)
-                        .is_some_and(|status| status.is_created());
-                (has_git_repo, has_file_history)
->>>>>>> theirs
             };
 
             let has_pasteable_content = self.has_pasteable_content(cx);
@@ -1228,17 +1206,12 @@ impl ProjectPanel {
                                         )
                                     })
                                     .action("Add to .gitignore", Box::new(git::AddToGitignore))
-<<<<<<< ours
                                     .action(
                                         "Add to .git/info/exclude",
                                         Box::new(git::AddToGitInfoExclude),
                                     )
                                     .when(has_history, |menu| {
                                         menu.action("View History", Box::new(git::FileHistory))
-=======
-                                    .when(has_file_history, |menu| {
-                                        menu.action("View File History", Box::new(git::FileHistory))
->>>>>>> theirs
                                     })
                             })
                             .when(!should_hide_rename, |menu| {
@@ -2405,7 +2378,6 @@ impl ProjectPanel {
         });
     }
 
-<<<<<<< ours
     fn add_to_git_info_exclude(
         &mut self,
         _: &git::AddToGitInfoExclude,
@@ -2453,8 +2425,6 @@ impl ProjectPanel {
         });
     }
 
-=======
->>>>>>> theirs
     fn remove(
         &mut self,
         trash: bool,
@@ -3941,19 +3911,19 @@ impl ProjectPanel {
         Some((worktree.read(cx), entry))
     }
 
-<<<<<<< ours
     pub fn selected_entry_project_path(&self, cx: &App) -> Option<ProjectPath> {
         let (worktree, entry) = self.selected_sub_entry(cx)?;
         Some(ProjectPath {
             worktree_id: worktree.read(cx).id(),
             path: entry.path.clone(),
-=======
+        })
+    }
+
     pub fn selected_file_project_path(&self, cx: &App) -> Option<ProjectPath> {
         let (worktree, entry) = self.selected_sub_entry(cx)?;
         Some(ProjectPath {
             worktree_id: worktree.read(cx).id(),
             path: entry.is_file().then(|| entry.path.clone())?,
->>>>>>> theirs
         })
     }
 
@@ -7023,10 +6993,7 @@ impl Render for ProjectPanel {
                         .on_action(cx.listener(Self::duplicate))
                         .on_action(cx.listener(Self::restore_file))
                         .on_action(cx.listener(Self::add_to_gitignore))
-<<<<<<< ours
                         .on_action(cx.listener(Self::add_to_git_info_exclude))
-=======
->>>>>>> theirs
                         .when(!project.is_remote(), |el| {
                             el.on_action(cx.listener(Self::trash))
                         })
@@ -7448,38 +7415,6 @@ impl Render for ProjectPanel {
                     .with_priority(3)
                 }))
         } else {
-<<<<<<< ours
-            let focus_handle = self.focus_handle(cx);
-            let workspace = self.workspace.clone();
-            let workspace_clone = self.workspace.clone();
-
-            v_flex()
-                .id("empty-project_panel-wrapper")
-                .size_full()
-                .child(
-                    ProjectEmptyState::new(
-                        "Project Panel",
-                        focus_handle.clone(),
-                        KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
-                    )
-                    .on_open_project(move |_, window, cx| {
-                        telemetry::event!("Project Panel Add Project Clicked");
-                        workspace
-                            .update(cx, |_, cx| {
-                                window
-                                    .dispatch_action(workspace::Open::default().boxed_clone(), cx);
-                            })
-                            .log_err();
-                    })
-                    .on_clone_repo(move |_, window, cx| {
-                        telemetry::event!("Project Panel Clone Repo Clicked");
-                        workspace_clone
-                            .update(cx, |_, cx| {
-                                window.dispatch_action(git::Clone.boxed_clone(), cx);
-                            })
-                            .log_err();
-                    }),
-=======
             // SPK fork: workspaces always belong to a Solution, so the
             // upstream "Open Project / Clone Repository" empty state is
             // never the right CTA. The toolbar's "Select Opened File"
@@ -7504,7 +7439,6 @@ impl Render for ProjectPanel {
                                 .text_color(cx.theme().colors().text_muted)
                                 .child("Add projects from the catalog to start working."),
                         ),
->>>>>>> theirs
                 )
                 .when(is_local, |div| {
                     div.when(panel_settings.drag_and_drop, |div| {

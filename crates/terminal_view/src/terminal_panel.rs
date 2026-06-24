@@ -1509,13 +1509,8 @@ impl Focusable for TerminalPanel {
 // Bottom because the panel never reaches a render path. B12 cleanup will
 // shrink TerminalPanel down to just its still-used helpers.
 impl Panel for TerminalPanel {
-<<<<<<< ours
-    fn position(&self, _window: &Window, cx: &App) -> DockPosition {
-        TerminalSettings::get_global(cx).dock.into()
-=======
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
         DockPosition::Bottom
->>>>>>> theirs
     }
 
     fn position_is_valid(&self, _: DockPosition) -> bool {

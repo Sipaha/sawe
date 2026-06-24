@@ -1253,24 +1253,17 @@ async fn open_worktree_workspace(
 
         if is_creating_new_worktree {
             new_workspace.update(cx, |workspace, cx| {
-<<<<<<< ours
                 // Run create-worktree setup hooks regardless of foreground vs
                 // background — the worktree was created either way.
                 workspace.run_create_worktree_tasks(window, cx);
 
                 if activate && let Some(dock_position) = focused_dock {
-=======
-                workspace.run_create_worktree_tasks(window, cx);
-
-                if let Some(dock_position) = focused_dock {
->>>>>>> theirs
                     let dock = workspace.dock_at_position(dock_position);
                     if let Some(panel) = dock.read(cx).active_panel() {
                         panel.panel_focus_handle(cx).focus(window, cx);
                     }
                 }
             });
-<<<<<<< ours
         }
     })?;
 
@@ -1313,10 +1306,8 @@ mod tests {
                 .expect("terminal spawn mutex should not be poisoned")
                 .push(task.label);
             Task::ready(Some(Ok(ExitStatus::default())))
-=======
->>>>>>> theirs
         }
-    })?;
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         zlog::init_test();

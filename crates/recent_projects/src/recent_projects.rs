@@ -1297,14 +1297,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                             h_flex()
                                 .id("open_folder_item")
                                 .w_full()
-<<<<<<< ours
                                 .min_w_0()
                                 .gap_2p5()
                                 .when(show_icon, |this| {
-=======
-                                .gap_2p5()
-                                .when(self.has_any_non_local_projects, |this| {
->>>>>>> theirs
                                     this.child(Icon::new(icon).color(Color::Muted))
                                 })
                                 .child(
@@ -1369,12 +1364,8 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .map(|p| p.compact().to_string_lossy().to_string())
                     .collect();
                 let tooltip_path: SharedString = ordered_paths.join("\n").into();
-<<<<<<< ours
                 let icon = icon_for_project_group(key);
                 let show_icon = self.filtered_entries_include_remote_project();
-=======
-                let icon = icon_for_remote_connection(self.project_connection_options.as_ref());
->>>>>>> theirs
 
                 let mut path_start_offset = 0;
                 let (match_labels, path_highlights): (Vec<_>, Vec<_>) = paths
@@ -1461,15 +1452,10 @@ impl PickerDelegate for RecentProjectsDelegate {
                         .child(
                             h_flex()
                                 .id("open_project_info_container")
-<<<<<<< ours
                                 .w_full()
                                 .min_w_0()
                                 .gap_2p5()
                                 .when(show_icon, |this| {
-=======
-                                .gap_2p5()
-                                .when(self.has_any_non_local_projects, |this| {
->>>>>>> theirs
                                     this.child(Icon::new(icon).color(Color::Muted))
                                 })
                                 .child({
@@ -1632,17 +1618,11 @@ impl PickerDelegate for RecentProjectsDelegate {
                         .child(
                             h_flex()
                                 .id("project_info_container")
-<<<<<<< ours
                                 .w_full()
                                 .min_w_0()
                                 .gap_2p5()
                                 .flex_grow_1()
                                 .when(show_icon, |this| {
-=======
-                                .gap_2p5()
-                                .flex_grow()
-                                .when(self.has_any_non_local_projects, |this| {
->>>>>>> theirs
                                     this.child(Icon::new(icon).color(Color::Muted))
                                 })
                                 .child({

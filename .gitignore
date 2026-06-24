@@ -57,10 +57,8 @@ crates/docs_preprocessor/actions.json
 /december-2025-releases.md
 /docs/december-2025-documentation-gaps.md
 
-<<<<<<< ours
 # NixOS integration test state
 .nixos-test-history
-=======
+
 # Personal agent plans / specs (kept locally, not committed)
 /docs/superpowers/
->>>>>>> theirs

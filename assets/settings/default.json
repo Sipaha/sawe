@@ -385,11 +385,8 @@
   // 1. Vertically center the target in the viewport: `center` (default)
   // 2. Scroll the minimum amount needed to make the target visible: `minimum`
   // 3. Scroll so the target appears near the top of the viewport: `top`
-<<<<<<< ours
   // 4. Preserve the cursor's vertical position within the viewport, falling back to `center` when the cursor is
   //    offscreen: `preserve`
-=======
->>>>>>> theirs
   "go_to_definition_scroll_strategy": "center",
   // Which level to use to filter out diagnostics displayed in the editor.
   //
@@ -1067,10 +1064,6 @@
     // Maximum length of the commit message title before a warning is shown.
     // Set to 0 to disable.
     //
-<<<<<<< ours
-    // Default: 0
-    "commit_title_max_length": 0,
-=======
     // Default: 72
     "commit_title_max_length": 72,
     // Commit-view (S-DET) options.
@@ -1125,7 +1118,6 @@
       // Default: 7
       "cache_ttl_days": 7,
     },
->>>>>>> theirs
   },
   "message_editor": {
     // Whether to automatically replace emoji shortcodes with emoji characters.
@@ -1635,14 +1627,10 @@
     // Send debug info like crash reports.
     "diagnostics": false,
     // Send anonymized usage data like what languages you're using Zed with.
-<<<<<<< ours
-    "metrics": true,
+    "metrics": false,
     // Allow sending requests to Anthropic models that cannot be offered with
     // Zero Data Retention
     "anthropic_retention": false,
-=======
-    "metrics": false,
->>>>>>> theirs
   },
   // Whether to disable all AI features in Zed.
   //
