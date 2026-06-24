@@ -169,8 +169,21 @@ const GLOBAL_TOOLS: &[&str] = &[
     "catalog.edit_project",
     "catalog.refresh_cache",
     "catalog.clear_cache",
-    // Cross-solution window enumeration.
+    // Windows are orthogonal to Solutions — one window hosts many Solutions,
+    // so a window has no single owner and window ops can't be solution-scoped.
+    // The whole `windows.*` surface is cross-solution (operator-level), kept
+    // off per-solution sockets entirely.
     "windows.list",
+    "windows.focus",
+    "windows.close",
+    "windows.dispatch_action",
+    "windows.send_keystroke",
+    "windows.send_text",
+    "windows.click_at",
+    "windows.click_id",
+    "windows.hover_at",
+    "windows.hover_id",
+    "windows.dump_visual_structure",
 ];
 
 fn is_global_tool(name: &str) -> bool {
