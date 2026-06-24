@@ -5,7 +5,6 @@ use super::edit_session::{
     EditSession, EditSessionContext, EditSessionMode, EditSessionResult,
     initial_title_from_partial_path, run_session,
 };
-<<<<<<< ours
 use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, ToolInputPayload};
 use action_log::ActionLog;
 use agent_client_protocol::schema as acp;
@@ -14,20 +13,6 @@ use futures::FutureExt as _;
 use gpui::{App, AsyncApp, Entity, Task, WeakEntity};
 use language::LanguageRegistry;
 use project::Project;
-=======
-use acp_thread::Diff;
-use agent_client_protocol::schema as acp;
-use anyhow::{Context as _, Result};
-use collections::HashSet;
-use futures::{FutureExt as _, StreamExt as _};
-use gpui::{App, AppContext, AsyncApp, Entity, Task, WeakEntity};
-use indoc::formatdoc;
-use language::language_settings::{self, FormatOnSave};
-use language::{LanguageRegistry, ToPoint};
-use language_model::{CompletionIntent, LanguageModelToolResultContent};
-use project::lsp_store::{FormatTrigger, LspFormatTarget};
-use project::{Project, ProjectPath};
->>>>>>> theirs
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -277,7 +262,6 @@ impl AgentTool for EditFileTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx: &mut AsyncApp| {
-<<<<<<< ours
             run_session(
                 self.process_streaming_edits(&mut input, &event_stream, cx)
                     .await,
@@ -285,272 +269,6 @@ impl AgentTool for EditFileTool {
                 cx,
             )
             .await
-=======
-            let input = input.recv().await.map_err(|e| EditFileToolOutput::Error {
-                error: format!("Failed to receive tool input: {e}"),
-            })?;
-
-            let project = self
-                .thread
-                .read_with(cx, |thread, _cx| thread.project().clone())
-                .map_err(|_| EditFileToolOutput::Error {
-                    error: "thread was dropped".to_string(),
-                })?;
-
-            let (project_path, abs_path, allow_thinking, update_agent_location, authorize) =
-                cx.update(|cx| {
-                    let project_path = resolve_path(&input, project.clone(), cx).map_err(|err| {
-                        EditFileToolOutput::Error {
-                            error: err.to_string(),
-                        }
-                    })?;
-                    let abs_path = project.read(cx).absolute_path(&project_path, cx);
-                    if let Some(abs_path) = abs_path.clone() {
-                        event_stream.update_fields(
-                            acp::ToolCallUpdateFields::new()
-                                .locations(vec![acp::ToolCallLocation::new(abs_path)]),
-                        );
-                    }
-                    let allow_thinking = self
-                        .thread
-                        .read_with(cx, |thread, _cx| thread.thinking_enabled())
-                        .unwrap_or(true);
-
-                    let update_agent_location = self.thread.read_with(cx, |thread, _cx| !thread.is_subagent()).unwrap_or_default();
-
-                    let authorize = self.authorize(&input, &event_stream, cx);
-                    Ok::<_, EditFileToolOutput>((project_path, abs_path, allow_thinking, update_agent_location, authorize))
-                })?;
-
-            let result: anyhow::Result<EditFileToolOutput> = async {
-                authorize.await?;
-
-                let (request, model, action_log) = self.thread.update(cx, |thread, cx| {
-                    let request = thread.build_completion_request(CompletionIntent::ToolResults, cx);
-                    (request, thread.model().cloned(), thread.action_log().clone())
-                })?;
-                let request = request?;
-                let model = model.context("No language model configured")?;
-
-                let edit_format = EditFormat::from_model(model.clone())?;
-                let edit_agent = EditAgent::new(
-                    model,
-                    project.clone(),
-                    action_log.clone(),
-                    self.templates.clone(),
-                    edit_format,
-                    allow_thinking,
-                    update_agent_location,
-                );
-
-                let buffer = project
-                    .update(cx, |project, cx| {
-                        project.open_buffer(project_path.clone(), cx)
-                    })
-                    .await?;
-
-                // Check if the file has been modified since the agent last read it
-                if let Some(abs_path) = abs_path.as_ref() {
-                    let last_read_mtime = action_log.read_with(cx, |log, _| log.file_read_time(abs_path));
-                    let (current_mtime, is_dirty, has_save_tool, has_restore_tool) = self.thread.read_with(cx, |thread, cx| {
-                        let current = buffer.read(cx).file().and_then(|file| file.disk_state().mtime());
-                        let dirty = buffer.read(cx).is_dirty();
-                        let has_save = thread.has_tool(SaveFileTool::NAME);
-                        let has_restore = thread.has_tool(RestoreFileFromDiskTool::NAME);
-                        (current, dirty, has_save, has_restore)
-                    })?;
-
-                    // Check for unsaved changes first - these indicate modifications we don't know about
-                    if is_dirty {
-                        let message = match (has_save_tool, has_restore_tool) {
-                            (true, true) => {
-                                "This file has unsaved changes. Ask the user whether they want to keep or discard those changes. \
-                                If they want to keep them, ask for confirmation then use the save_file tool to save the file, then retry this edit. \
-                                If they want to discard them, ask for confirmation then use the restore_file_from_disk tool to restore the on-disk contents, then retry this edit."
-                            }
-                            (true, false) => {
-                                "This file has unsaved changes. Ask the user whether they want to keep or discard those changes. \
-                                If they want to keep them, ask for confirmation then use the save_file tool to save the file, then retry this edit. \
-                                If they want to discard them, ask the user to manually revert the file, then inform you when it's ok to proceed."
-                            }
-                            (false, true) => {
-                                "This file has unsaved changes. Ask the user whether they want to keep or discard those changes. \
-                                If they want to keep them, ask the user to manually save the file, then inform you when it's ok to proceed. \
-                                If they want to discard them, ask for confirmation then use the restore_file_from_disk tool to restore the on-disk contents, then retry this edit."
-                            }
-                            (false, false) => {
-                                "This file has unsaved changes. Ask the user whether they want to keep or discard those changes, \
-                                then ask them to save or revert the file manually and inform you when it's ok to proceed."
-                            }
-                        };
-                        anyhow::bail!("{}", message);
-                    }
-
-                    // Check if the file was modified on disk since we last read it
-                    if let (Some(last_read), Some(current)) = (last_read_mtime, current_mtime) {
-                        // MTime can be unreliable for comparisons, so our newtype intentionally
-                        // doesn't support comparing them. If the mtime at all different
-                        // (which could be because of a modification or because e.g. system clock changed),
-                        // we pessimistically assume it was modified.
-                        if current != last_read {
-                            anyhow::bail!(
-                                "The file {} has been modified since you last read it. \
-                                Please read the file again to get the current state before editing it.",
-                                input.path.display()
-                            );
-                        }
-                    }
-                }
-
-                let diff = cx.new(|cx| Diff::new(buffer.clone(), cx));
-                event_stream.update_diff(diff.clone());
-                let _finalize_diff = util::defer({
-                    let diff = diff.downgrade();
-                    let mut cx = cx.clone();
-                    move || {
-                        diff.update(&mut cx, |diff, cx| diff.finalize(cx)).ok();
-                    }
-                });
-
-                let old_snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
-                let old_text = cx
-                    .background_spawn({
-                        let old_snapshot = old_snapshot.clone();
-                        async move { Arc::new(old_snapshot.text()) }
-                    })
-                    .await;
-
-                let (output, mut events) = if matches!(input.mode, EditFileMode::Edit) {
-                    edit_agent.edit(
-                        buffer.clone(),
-                        input.display_description.clone(),
-                        &request,
-                        cx,
-                    )
-                } else {
-                    edit_agent.overwrite(
-                        buffer.clone(),
-                        input.display_description.clone(),
-                        &request,
-                        cx,
-                    )
-                };
-
-                let mut hallucinated_old_text = false;
-                let mut ambiguous_ranges = Vec::new();
-                let mut emitted_location = false;
-                loop {
-                    let event = futures::select! {
-                        event = events.next().fuse() => match event {
-                            Some(event) => event,
-                            None => break,
-                        },
-                        _ = event_stream.cancelled_by_user().fuse() => {
-                            anyhow::bail!("Edit cancelled by user");
-                        }
-                    };
-                    match event {
-                        EditAgentOutputEvent::Edited(range) => {
-                            if !emitted_location {
-                                let line = Some(buffer.update(cx, |buffer, _cx| {
-                                    range.start.to_point(&buffer.snapshot()).row
-                                }));
-                                if let Some(abs_path) = abs_path.clone() {
-                                    event_stream.update_fields(acp::ToolCallUpdateFields::new().locations(vec![acp::ToolCallLocation::new(abs_path).line(line)]));
-                                }
-                                emitted_location = true;
-                            }
-                        },
-                        EditAgentOutputEvent::UnresolvedEditRange => hallucinated_old_text = true,
-                        EditAgentOutputEvent::AmbiguousEditRange(ranges) => ambiguous_ranges = ranges,
-                        EditAgentOutputEvent::ResolvingEditRange(range) => {
-                            diff.update(cx, |card, cx| card.reveal_range(range.clone(), cx));
-                        }
-                    }
-                }
-
-                output.await?;
-
-                let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
-                    let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
-                    settings.format_on_save != FormatOnSave::Off
-                });
-
-                if format_on_save_enabled {
-                    action_log.update(cx, |log, cx| {
-                        log.buffer_edited(buffer.clone(), cx);
-                    });
-
-                    let format_task = project.update(cx, |project, cx| {
-                        project.format(
-                            HashSet::from_iter([buffer.clone()]),
-                            LspFormatTarget::Buffers,
-                            false, // Don't push to history since the tool did it.
-                            FormatTrigger::Save,
-                            cx,
-                        )
-                    });
-                    format_task.await.log_err();
-                }
-
-                project
-                    .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
-                    .await?;
-
-                action_log.update(cx, |log, cx| {
-                    log.buffer_edited(buffer.clone(), cx);
-                });
-
-                let new_snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
-                let (new_text, unified_diff) = cx
-                    .background_spawn({
-                        let new_snapshot = new_snapshot.clone();
-                        let old_text = old_text.clone();
-                        async move {
-                            let new_text = new_snapshot.text();
-                            let diff = language::unified_diff(&old_text, &new_text);
-                            (new_text, diff)
-                        }
-                    })
-                    .await;
-
-                let input_path = input.path.display();
-                if unified_diff.is_empty() {
-                    anyhow::ensure!(
-                        !hallucinated_old_text,
-                        formatdoc! {"
-                            Some edits were produced but none of them could be applied.
-                            Read the relevant sections of {input_path} again so that
-                            I can perform the requested edits.
-                        "}
-                    );
-                    anyhow::ensure!(
-                        ambiguous_ranges.is_empty(),
-                        {
-                            let line_numbers = ambiguous_ranges
-                                .iter()
-                                .map(|range| range.start.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            formatdoc! {"
-                                <old_text> matches more than one position in the file (lines: {line_numbers}). Read the
-                                relevant sections of {input_path} again and extend <old_text> so
-                                that I can perform the requested edits.
-                            "}
-                        }
-                    );
-                }
-
-                anyhow::Ok(EditFileToolOutput::Success {
-                    input_path: input.path,
-                    new_text,
-                    old_text,
-                    diff: unified_diff,
-                })
-            }.await;
-            result
-                .map_err(|e| EditFileToolOutput::Error { error: e.to_string() })
->>>>>>> theirs
         })
     }
 
@@ -1528,19 +1246,7 @@ mod tests {
         // Test 4: Path with .zed in the middle should require confirmation
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
         let _auth = cx.update(|cx| {
-<<<<<<< ours
             edit_tool.authorize(&PathBuf::from("root/.zed/tasks.json"), &stream_tx, cx)
-=======
-            tool.authorize(
-                &EditFileToolInput {
-                    display_description: "test 1".into(),
-                    path: ".spke/settings.json".into(),
-                    mode: EditFileMode::Edit,
-                },
-                &stream_tx,
-                cx,
-            )
->>>>>>> theirs
         });
         let event = stream_rx.expect_authorization().await;
         assert_eq!(
@@ -1709,17 +1415,8 @@ mod tests {
 
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
         let _auth = cx.update(|cx| {
-<<<<<<< ours
             edit_tool.authorize(
                 &PathBuf::from(path!("/root/.zed/foo/../settings.json")),
-=======
-            tool.authorize(
-                &EditFileToolInput {
-                    display_description: "test 4".into(),
-                    path: "root/.spke/tasks.json".into(),
-                    mode: EditFileMode::Edit,
-                },
->>>>>>> theirs
                 &stream_tx,
                 cx,
             )
@@ -1759,22 +1456,10 @@ mod tests {
         let (edit_tool, _project, _action_log, _fs, _thread) =
             setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
 
-<<<<<<< ours
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
         let _auth = cx.update(|cx| {
             edit_tool.authorize(
                 &PathBuf::from(path!("/root/safe/settings.json")),
-=======
-        // 5.1: .spke/settings.json is a sensitive path — still prompts
-        let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
-        let _auth = cx.update(|cx| {
-            tool.authorize(
-                &EditFileToolInput {
-                    display_description: "test 5.1".into(),
-                    path: ".spke/settings.json".into(),
-                    mode: EditFileMode::Edit,
-                },
->>>>>>> theirs
                 &stream_tx,
                 cx,
             )
@@ -2098,7 +1783,7 @@ mod tests {
         fs.insert_tree(
             "/workspace/shared",
             json!({
-                ".spke": {
+                ".zed": {
                     "settings.json": "{}"
                 }
             }),
@@ -2119,7 +1804,7 @@ mod tests {
             ("frontend/src/main.js", false, "File in first worktree"),
             ("backend/src/main.rs", false, "File in second worktree"),
             (
-                "shared/.spke/settings.json",
+                "shared/.zed/settings.json",
                 true,
                 ".zed file in third worktree",
             ),
@@ -2156,11 +1841,11 @@ mod tests {
         fs.insert_tree(
             "/project",
             json!({
-                ".spke": {
+                ".zed": {
                     "settings.json": "{}"
                 },
                 "src": {
-                    ".spke": {
+                    ".zed": {
                         "local.json": "{}"
                     }
                 }
@@ -2217,7 +1902,7 @@ mod tests {
             "/project",
             json!({
                 "existing.txt": "content",
-                ".spke": {
+                ".zed": {
                     "settings.json": "{}"
                 }
             }),
@@ -2232,19 +1917,7 @@ mod tests {
             // Test .zed path with different modes
             let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
             let _auth = cx.update(|cx| {
-<<<<<<< ours
                 edit_tool.authorize(&PathBuf::from("project/.zed/settings.json"), &stream_tx, cx)
-=======
-                tool.authorize(
-                    &EditFileToolInput {
-                        display_description: "Edit settings".into(),
-                        path: "project/.spke/settings.json".into(),
-                        mode: mode.clone(),
-                    },
-                    &stream_tx,
-                    cx,
-                )
->>>>>>> theirs
             });
 
             stream_rx.expect_authorization().await;

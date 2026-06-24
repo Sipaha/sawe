@@ -302,14 +302,7 @@ impl AgentTool for ToolRequiringPermission {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         cx.spawn(async move |cx| {
-<<<<<<< ours
             let _input = input.recv().await.map_err(|e| e.to_string())?;
-=======
-            let _input = input
-                .recv()
-                .await
-                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
->>>>>>> theirs
 
             let authorize = cx.update(|cx| {
                 let context = crate::ToolPermissionContext::new(Self::NAME, vec![String::new()]);
@@ -354,14 +347,7 @@ impl AgentTool for ToolRequiringPermission2 {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         cx.spawn(async move |cx| {
-<<<<<<< ours
             let _input = input.recv().await.map_err(|e| e.to_string())?;
-=======
-            let _input = input
-                .recv()
-                .await
-                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
->>>>>>> theirs
 
             let authorize = cx.update(|cx| {
                 let context = crate::ToolPermissionContext::new(Self::NAME, vec![String::new()]);

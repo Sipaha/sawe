@@ -1,10 +1,6 @@
 use super::tool_permissions::{
     authorize_symlink_access, canonicalize_worktree_roots, detect_symlink_escape,
-<<<<<<< ours
     resolve_global_skill_descendant_path, resolves_to_global_skills_dir, sensitive_settings_kind,
-=======
-    sensitive_settings_kind,
->>>>>>> theirs
 };
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,

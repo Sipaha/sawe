@@ -168,11 +168,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                 .push(entry);
         }
         for entries in per_project.values_mut() {
-<<<<<<< ours
             entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
-=======
-            entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
->>>>>>> theirs
             for entry in entries.iter_mut().take(5) {
                 entry.archived = false;
             }

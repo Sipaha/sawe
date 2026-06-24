@@ -338,10 +338,6 @@ impl AgentTool for ListDirectoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-<<<<<<< ours
-=======
-    use fs::Fs as _;
->>>>>>> theirs
     use gpui::{TestAppContext, UpdateGlobal};
     use indoc::indoc;
     use project::{FakeFs, Project};
@@ -698,7 +694,7 @@ mod tests {
         fs.insert_tree(
             path!("/worktree1"),
             json!({
-                ".spke": {
+                ".zed": {
                     "settings.json": r#"{
                         "file_scan_exclusions": ["**/fixture.*"],
                         "private_files": ["**/secret.rs", "**/config.toml"]
@@ -721,7 +717,7 @@ mod tests {
         fs.insert_tree(
             path!("/worktree2"),
             json!({
-                ".spke": {
+                ".zed": {
                     "settings.json": r#"{
                         "file_scan_exclusions": ["**/internal.*"],
                         "private_files": ["**/private.js", "**/data.json"]

@@ -9,7 +9,6 @@ use crate::thread_metadata_store::{ThreadMetadata, ThreadMetadataStore};
 use acp_thread::MentionUri;
 use agent_client_protocol::schema as acp;
 use anyhow::Result;
-use console_panel::ConsolePanel;
 use editor::{CompletionProvider, Editor, code_context_menus::COMPLETION_MENU_MAX_WIDTH};
 use futures::FutureExt as _;
 use fuzzy::{PathMatch, StringMatch, StringMatchCandidate};
@@ -27,13 +26,9 @@ use project::{
 };
 
 use rope::Point;
-<<<<<<< ours
 use settings::Settings;
 use terminal::terminal_settings::TerminalSettings;
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-=======
-use terminal_view::TerminalView;
->>>>>>> theirs
 use text::{Anchor, ToOffset as _, ToPoint as _};
 use ui::IconName;
 use ui::prelude::*;
@@ -2516,44 +2511,12 @@ fn build_code_label_for_path(
 fn terminal_view_selection(terminal_view: &Entity<TerminalView>, cx: &App) -> Option<String> {
     terminal_view
         .read(cx)
-<<<<<<< ours
         .terminal()
         .read(cx)
         .last_content
         .selection_text
         .clone()
         .filter(|text| !text.is_empty())
-=======
-        .active_item(cx)
-        .and_then(|item| item.act_as::<TerminalView>(cx))
-    {
-        if let Some(text) = terminal_view
-            .read(cx)
-            .terminal()
-            .read(cx)
-            .last_content
-            .selection_text
-            .clone()
-            .filter(|text| !text.is_empty())
-        {
-            selections.push(text);
-        }
-    }
-
-    if let Some(panel) = workspace.read(cx).panel::<ConsolePanel>(cx) {
-        let position = panel.read(cx).dock_position();
-        let dock_is_open = workspace
-            .read(cx)
-            .dock_at_position(position)
-            .read(cx)
-            .is_open();
-        if dock_is_open {
-            selections.extend(panel.read(cx).terminal_selections(cx));
-        }
-    }
-
-    selections
->>>>>>> theirs
 }
 
 fn editor_selection_ranges(

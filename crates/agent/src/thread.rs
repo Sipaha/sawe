@@ -11,10 +11,7 @@ use acp_thread::{MentionUri, UserMessageId};
 use action_log::ActionLog;
 use agent_settings::UserAgentsMd;
 
-<<<<<<< ours
 use crate::sandboxing::{SandboxRequest, ThreadSandboxGrants, sandboxing_enabled};
-=======
->>>>>>> theirs
 use agent_client_protocol::schema as acp;
 use agent_settings::{
     AgentProfileId, AgentSettings, AutoCompactThreshold, COMPACTION_PROMPT,
@@ -53,11 +50,8 @@ use serde::{Deserialize, Serialize};
 use settings::{
     LanguageModelSelection, Settings, SettingsStore, ToolPermissionMode, update_settings_file,
 };
-<<<<<<< ours
 use std::fmt::Write;
 use std::{cell::RefCell, ops::ControlFlow};
-=======
->>>>>>> theirs
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
@@ -5196,7 +5190,6 @@ impl ToolCallEventStream {
         self.run_authorization_loop(title, options, Some(context), None, cx)
     }
 
-<<<<<<< ours
     /// Gate a sandbox *escalation* (network access, per-path writes, or full
     /// filesystem write access) on user approval.
     ///
@@ -5213,37 +5206,6 @@ impl ToolCallEventStream {
     ) -> Task<Result<()>> {
         if Self::sandbox_request_covered_by_grants(&request, &self.sandbox_grants, cx) {
             return Task::ready(Ok(()));
-=======
-    /// Prompts the user for authorization.
-    ///
-    /// When `check_settings` is `Some`, this gate is settings-driven: the
-    /// settings are evaluated up-front (an Allow or Deny result resolves the
-    /// task immediately without prompting), and while a prompt is pending a
-    /// `SettingsStore` subscription watches for changes. A subsequent Allow
-    /// or Deny dismisses the prompt UI and resolves the task without user
-    /// interaction.
-    ///
-    /// When `check_settings` is `None`, the user is always prompted and
-    /// settings changes are ignored. This suits prompts that aren't
-    /// settings-driven (e.g. symlink-escape confirmations).
-    fn run_authorization_loop(
-        &self,
-        title: String,
-        options: acp_thread::PermissionOptions,
-        context: Option<ToolPermissionContext>,
-        check_settings: Option<Box<dyn Fn(&App) -> ToolPermissionDecision>>,
-        cx: &mut App,
-    ) -> Task<Result<()>> {
-        // Short-circuit when current settings yield a definitive answer.
-        if let Some(check) = check_settings.as_ref() {
-            match check(cx) {
-                ToolPermissionDecision::Allow => return Task::ready(Ok(())),
-                ToolPermissionDecision::Deny(reason) => {
-                    return Task::ready(Err(anyhow!(reason)));
-                }
-                ToolPermissionDecision::Confirm => {}
-            }
->>>>>>> theirs
         }
 
         let title = title.into();
@@ -5279,10 +5241,7 @@ impl ToolCallEventStream {
         let fs = self.fs.clone();
         let stream = self.stream.clone();
         let tool_use_id = self.tool_use_id.clone();
-<<<<<<< ours
         let sandbox_grants = self.sandbox_grants.clone();
-=======
->>>>>>> theirs
         cx.spawn(async move |cx| {
             let (response_tx, mut response_rx) = oneshot::channel();
             if let Err(error) = stream
@@ -5292,7 +5251,6 @@ impl ToolCallEventStream {
                         tool_call: acp::ToolCallUpdate::new(
                             tool_use_id.to_string(),
                             acp::ToolCallUpdateFields::new().title(title),
-<<<<<<< ours
                         )
                         .meta(acp_thread::meta_with_sandbox_authorization(
                             sandbox_authorization_details,
@@ -5308,27 +5266,6 @@ impl ToolCallEventStream {
                 return Err(anyhow!("Failed to send sandbox authorization: {error}"));
             }
 
-=======
-                        ),
-                        options,
-                        response: response_tx,
-                        context,
-                    },
-                )))
-            {
-                log::error!("Failed to send tool call authorization: {error}");
-                return Err(anyhow!("Failed to send tool call authorization: {error}"));
-            }
-
-            let Some(check_settings) = check_settings else {
-                let outcome = response_rx
-                    .await
-                    .map_err(|_| anyhow!("authorization channel closed"))?;
-
-                return Self::persist_permission_outcome(&outcome, fs, cx);
-            };
-
->>>>>>> theirs
             let (mut settings_tx, mut settings_rx) = watch::channel(());
             let _settings_subscription = cx.update(|cx| {
                 cx.observe_global::<SettingsStore>(move |_cx| {
@@ -5336,14 +5273,6 @@ impl ToolCallEventStream {
                 })
             });
 
-<<<<<<< ours
-=======
-            // Race the user's response against settings changes. On each
-            // settings change, re-evaluate `check_settings`: if it now
-            // yields a definitive Allow or Deny, resolve the prompt
-            // without user interaction. Otherwise keep waiting on the
-            // same prompt.
->>>>>>> theirs
             loop {
                 let settings_changed = async {
                     if settings_rx.changed().await.is_err() {
@@ -5354,7 +5283,6 @@ impl ToolCallEventStream {
                     outcome = (&mut response_rx).fuse() => {
                         let outcome = outcome
                             .map_err(|_| anyhow!("authorization channel closed"))?;
-<<<<<<< ours
                         return Self::handle_sandbox_permission_outcome(
                             &outcome,
                             &request,
@@ -5377,38 +5305,6 @@ impl ToolCallEventStream {
                                 None,
                             );
                             return Ok(());
-=======
-                        return Self::persist_permission_outcome(&outcome, fs.clone(), cx);
-                    }
-                    _ = settings_changed.fuse() => {
-                        // On auto-resolve, we dismiss the prompt UI by
-                        // replacing the tool call's `WaitingForConfirmation`
-                        // status with `InProgress` (or `Failed`). Dropping
-                        // `response_rx` closes the `oneshot` held by the
-                        // UI, so any late click by the user is a no-op.
-                        match cx.update(|cx| check_settings(cx)) {
-                            ToolPermissionDecision::Allow => {
-                                drop(response_rx);
-                                stream.update_tool_call_fields(
-                                    &tool_use_id,
-                                    acp::ToolCallUpdateFields::new()
-                                        .status(acp::ToolCallStatus::InProgress),
-                                    None,
-                                );
-                                return Ok(());
-                            }
-                            ToolPermissionDecision::Deny(reason) => {
-                                drop(response_rx);
-                                stream.update_tool_call_fields(
-                                    &tool_use_id,
-                                    acp::ToolCallUpdateFields::new()
-                                        .status(acp::ToolCallStatus::Failed),
-                                    None,
-                                );
-                                return Err(anyhow!(reason));
-                            }
-                            ToolPermissionDecision::Confirm => continue,
->>>>>>> theirs
                         }
                     }
                 }
@@ -5434,7 +5330,6 @@ impl ToolCallEventStream {
         fs: Option<Arc<dyn Fs>>,
         cx: &AsyncApp,
     ) -> Result<()> {
-<<<<<<< ours
         debug_assert!(
             outcome.params.is_none(),
             "unexpected params for sandbox permission"
@@ -5731,48 +5626,6 @@ impl ToolCallEventStream {
             );
             return if option_id == "allow" { Ok(()) } else { err() };
         }
-=======
-        let option_id = outcome.option_id.0.as_ref();
-        let err = || Err(anyhow!("Permission to run tool denied by user"));
-
-        let always_permission = option_id
-            .strip_prefix("always_allow:")
-            .map(|tool| (tool, ToolPermissionMode::Allow))
-            .or_else(|| {
-                option_id
-                    .strip_prefix("always_deny:")
-                    .map(|tool| (tool, ToolPermissionMode::Deny))
-            })
-            .or_else(|| {
-                option_id
-                    .strip_prefix("always_allow_mcp:")
-                    .map(|tool| (tool, ToolPermissionMode::Allow))
-            })
-            .or_else(|| {
-                option_id
-                    .strip_prefix("always_deny_mcp:")
-                    .map(|tool| (tool, ToolPermissionMode::Deny))
-            });
-
-        if let Some((tool, mode)) = always_permission {
-            let params = outcome.params.as_ref();
-            Self::persist_always_permission(tool, mode, params, fs, cx);
-            return if mode == ToolPermissionMode::Allow {
-                Ok(())
-            } else {
-                err()
-            };
-        }
-
-        // Handle simple "allow" / "deny" (once, no persistence)
-        if option_id == "allow" || option_id == "deny" {
-            debug_assert!(
-                outcome.params.is_none(),
-                "unexpected params for once-only permission"
-            );
-            return if option_id == "allow" { Ok(()) } else { err() };
-        }
->>>>>>> theirs
 
         debug_assert!(false, "unexpected permission option_id: {option_id}");
 

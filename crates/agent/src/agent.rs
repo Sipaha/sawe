@@ -35,10 +35,6 @@ use agent_skills::{
     SkillSource, SkillSummary, builtin_skills, global_skills_dir, load_skills_from_directory,
     parse_skill_frontmatter, project_skills_relative_path, read_skill_body_from_content,
 };
-<<<<<<< ours
-=======
-use agent_client_protocol::schema as acp;
->>>>>>> theirs
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet, IndexMap};

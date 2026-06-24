@@ -1,20 +1,10 @@
 use std::{any::Any, rc::Rc, sync::Arc};
 
-<<<<<<< ours
-=======
-use agent_client_protocol::schema as acp;
->>>>>>> theirs
 use agent_servers::{AgentServer, AgentServerDelegate};
 use anyhow::Result;
 use fs::Fs;
 use gpui::{App, Entity, Task};
 use project::{AgentId, Project};
-<<<<<<< ours
-=======
-use prompt_store::PromptStore;
-use settings::{LanguageModelSelection, Settings as _, update_settings_file};
-use util::ResultExt as _;
->>>>>>> theirs
 
 use crate::{NativeAgent, NativeAgentConnection, ThreadStore, templates::Templates};
 
@@ -51,17 +41,9 @@ impl AgentServer for NativeAgentServer {
         cx.spawn(async move |cx| {
             log::debug!("Creating templates for native agent");
             let templates = Templates::new();
-<<<<<<< ours
 
             log::debug!("Creating native agent entity");
             let agent = cx.update(|cx| NativeAgent::new(thread_store, templates, fs, cx));
-=======
-            let prompt_store = prompt_store.await.log_err();
-
-            log::debug!("Creating native agent entity");
-            let agent =
-                cx.update(|cx| NativeAgent::new(thread_store, templates, prompt_store, fs, cx));
->>>>>>> theirs
 
             // Create the connection wrapper
             let connection = NativeAgentConnection(agent);

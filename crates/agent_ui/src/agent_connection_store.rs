@@ -98,7 +98,6 @@ impl AgentConnectionStore {
             .unwrap_or(AgentConnectionStatus::Disconnected)
     }
 
-<<<<<<< ours
     pub fn agent_version(&self, key: &Agent, cx: &App) -> Option<SharedString> {
         match self.entries.get(key)?.read(cx) {
             AgentConnectionEntry::Connected(state) => state.connection.agent_version(),
@@ -106,8 +105,6 @@ impl AgentConnectionStore {
         }
     }
 
-=======
->>>>>>> theirs
     pub fn active_acp_connections(&self, cx: &App) -> Vec<ActiveAcpConnection> {
         self.entries
             .values()

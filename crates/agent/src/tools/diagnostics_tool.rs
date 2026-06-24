@@ -1,13 +1,7 @@
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema as acp;
-<<<<<<< ours
 use futures::{Future, FutureExt as _};
 use gpui::{App, AsyncApp, Entity, Task};
-=======
-use anyhow::Result;
-use futures::FutureExt as _;
-use gpui::{App, Entity, Task};
->>>>>>> theirs
 use language::{DiagnosticSeverity, OffsetRangeExt};
 use project::Project;
 use schemars::JsonSchema;

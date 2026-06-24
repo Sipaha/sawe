@@ -2,11 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use acp_thread::MentionUri;
 use agent_client_protocol::schema as acp;
-<<<<<<< ours
 use editor::Editor;
-=======
-use editor::{Editor, SelectionEffects, scroll::Autoscroll};
->>>>>>> theirs
 use gpui::{
     Animation, AnimationExt, AnyView, Context, IntoElement, TaskExt, WeakEntity, Window,
     pulsating_between,

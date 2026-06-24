@@ -69,14 +69,10 @@ use workspace::Workspace;
 
 use crate::agent_configuration::{ConfigureContextServerModal, ManageProfilesModal};
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
-<<<<<<< ours
 pub use crate::agent_panel::{
     AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, MaxIdleRetainedThreads, TerminalId,
     ThreadTitleRegenerationResult,
 };
-=======
-pub use crate::agent_panel::{AgentPanel, AgentPanelEvent, MaxIdleRetainedThreads};
->>>>>>> theirs
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
@@ -977,8 +973,6 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
-            managed_agent_stale_timeout_secs: 120,
-            managed_agent_dead_linger_secs: 300,
         };
 
         cx.update(|cx| {

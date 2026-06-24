@@ -67,7 +67,7 @@ pub async fn canonicalize_worktree_roots<C: gpui::AppContext>(
 ///
 /// This is needed for paths where the leaf (or intermediate directories) don't
 /// exist yet but an ancestor may be a symlink. For example, when creating
-/// `.spke/settings.json` where `.zed` is a symlink to an external directory.
+/// `.zed/settings.json` where `.zed` is a symlink to an external directory.
 ///
 /// Note: intermediate directories *can* be symlinks (not just leaf entries),
 /// so we must walk the full ancestor chain. For example:
@@ -116,7 +116,6 @@ fn is_within_any_worktree(canonical_path: &Path, canonical_worktree_roots: &[Pat
         .any(|root| canonical_path.starts_with(root))
 }
 
-<<<<<<< ours
 /// If `path` names `~/.agents/skills` or one of its descendants, return the
 /// canonicalized absolute path. Returns `None` for any path that resolves
 /// outside the global skills tree, for relative paths that don't start with
@@ -314,11 +313,6 @@ pub async fn sensitive_settings_kind(
     canonical_worktree_roots: &[PathBuf],
     fs: &dyn Fs,
 ) -> Option<SensitiveSettingsKind> {
-=======
-/// Returns the kind of sensitive settings location this path targets, if any:
-/// either inside a `.spke/` local-settings directory or inside the global config dir.
-pub async fn sensitive_settings_kind(path: &Path, fs: &dyn Fs) -> Option<SensitiveSettingsKind> {
->>>>>>> theirs
     let local_settings_folder = paths::local_settings_folder_name();
 
     // Fast path: scan the raw path components before any I/O. Covers the
@@ -515,14 +509,11 @@ pub fn authorize_with_sensitive_settings(
         Some(SensitiveSettingsKind::Global) => {
             event_stream.authorize_always_prompt(format!("{title} (settings)"), context, cx)
         }
-<<<<<<< ours
         Some(SensitiveSettingsKind::AgentSkills) => event_stream.authorize_always_prompt(
             format!("{title} (agent skills)"),
             context.for_agent_skills(),
             cx,
         ),
-=======
->>>>>>> theirs
         None => event_stream.authorize(title, context, cx),
     }
 }
@@ -750,11 +741,7 @@ pub fn authorize_file_edit(
                         vec![path_owned.to_string_lossy().to_string()],
                     );
                     event_stream.authorize_always_prompt(
-<<<<<<< ours
                         format!("{title} (local settings)"),
-=======
-                        format!("{} (local settings)", display_description),
->>>>>>> theirs
                         context,
                         cx,
                     )
@@ -767,7 +754,6 @@ pub fn authorize_file_edit(
                         &tool_name,
                         vec![path_owned.to_string_lossy().to_string()],
                     );
-<<<<<<< ours
                     event_stream.authorize_always_prompt(format!("{title} (settings)"), context, cx)
                 });
                 return authorize.await;
@@ -781,10 +767,6 @@ pub fn authorize_file_edit(
                     .for_agent_skills();
                     event_stream.authorize_always_prompt(
                         format!("{title} (agent skills)"),
-=======
-                    event_stream.authorize_always_prompt(
-                        format!("{} (settings)", display_description),
->>>>>>> theirs
                         context,
                         cx,
                     )

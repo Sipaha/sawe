@@ -6884,7 +6884,7 @@ async fn test_edit_file_tool_allow_still_prompts_for_local_settings(cx: &mut Tes
     fs.insert_tree(
         "/root",
         json!({
-            ".spke": {
+            ".zed": {
                 "settings.json": "{}"
             },
             "README.md": "# Hello"
@@ -6923,20 +6923,14 @@ async fn test_edit_file_tool_allow_still_prompts_for_local_settings(cx: &mut Tes
         language_registry,
     ));
 
-    // Editing a file inside .spke/ should still prompt even with global default: allow,
+    // Editing a file inside .zed/ should still prompt even with global default: allow,
     // because local settings paths are sensitive and require confirmation regardless.
     let (event_stream, mut rx) = crate::ToolCallEventStream::test();
     let _task = cx.update(|cx| {
         tool.run(
             ToolInput::resolved(crate::EditFileToolInput {
-<<<<<<< ours
                 path: "root/.zed/settings.json".into(),
                 edits: vec![],
-=======
-                display_description: "Edit local settings".to_string(),
-                path: "root/.spke/settings.json".into(),
-                mode: crate::EditFileMode::Edit,
->>>>>>> theirs
             }),
             event_stream,
             cx,

@@ -1,10 +1,6 @@
 use super::tool_permissions::{
     authorize_symlink_access, canonicalize_worktree_roots, detect_symlink_escape,
-<<<<<<< ours
     resolve_creatable_global_skill_path, sensitive_settings_kind,
-=======
-    sensitive_settings_kind,
->>>>>>> theirs
 };
 use agent_client_protocol::schema as acp;
 use agent_settings::AgentSettings;
@@ -63,11 +59,7 @@ impl AgentTool for CreateDirectoryTool {
     const NAME: &'static str = "create_directory";
 
     fn kind() -> acp::ToolKind {
-<<<<<<< ours
         acp::ToolKind::Edit
-=======
-        acp::ToolKind::Read
->>>>>>> theirs
     }
 
     fn initial_title(
