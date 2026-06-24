@@ -11,42 +11,6 @@ use util::rel_path::RelPath;
 /// A default editorconfig file name to use when resolving project settings.
 pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 
-<<<<<<< ours
-/// The application name, used to derive platform-specific data, config, cache,
-/// and state directory paths.
-///
-/// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "Zed";
-
-/// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
-/// Linux/FreeBSD and the macOS `~/.config` fallback.
-pub const APP_NAME_LOWERCASE: &str = {
-    assert!(!APP_NAME.is_empty(), "APP_NAME must not be empty");
-    assert!(APP_NAME.as_bytes().is_ascii(), "APP_NAME must be ASCII");
-    const BYTES: [u8; APP_NAME.len()] = {
-        let mut bytes = [0u8; APP_NAME.len()];
-        let mut i = 0;
-        while i < APP_NAME.len() {
-            assert!(
-                APP_NAME.as_bytes()[i] != b'/' && APP_NAME.as_bytes()[i] != b'\\',
-                "APP_NAME must not contain path separators",
-            );
-            assert!(
-                APP_NAME.as_bytes()[i] >= 0x20,
-                "APP_NAME must not contain control characters"
-            );
-            bytes[i] = APP_NAME.as_bytes()[i];
-            i += 1;
-        }
-        bytes.make_ascii_lowercase();
-        bytes
-    };
-    match std::str::from_utf8(&BYTES) {
-        Ok(s) => s,
-        Err(_) => unreachable!(),
-    }
-};
-=======
 /// True when this build should use a `-dev` directory suffix to keep
 /// developer state separate from a production install's database,
 /// sessions, MCP socket, and so on.
@@ -89,7 +53,6 @@ pub fn dir_name_pascal() -> &'static str {
         "SpkEditor"
     }
 }
->>>>>>> theirs
 
 /// A custom data directory override, set only by `set_custom_data_dir`.
 /// This is used to override the default data directory location.
@@ -192,24 +155,8 @@ pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.join("config")
-<<<<<<< ours
-        } else if cfg!(target_os = "windows") {
-            dirs::config_dir()
-                .expect("failed to determine RoamingAppData directory")
-                .join(APP_NAME)
-        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-            if let Ok(flatpak_xdg_config) = std::env::var("FLATPAK_XDG_CONFIG_HOME") {
-                flatpak_xdg_config.into()
-            } else {
-                dirs::config_dir().expect("failed to determine XDG_CONFIG_HOME directory")
-            }
-            .join(APP_NAME_LOWERCASE)
-        } else {
-            home_dir().join(".config").join(APP_NAME_LOWERCASE)
-=======
         } else {
             base_dir().join("config")
->>>>>>> theirs
         }
     })
 }
@@ -219,24 +166,6 @@ pub fn data_dir() -> &'static PathBuf {
     CURRENT_DATA_DIR.get_or_init(|| {
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.clone()
-<<<<<<< ours
-        } else if cfg!(target_os = "macos") {
-            home_dir()
-                .join("Library/Application Support")
-                .join(APP_NAME)
-        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-            if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
-                flatpak_xdg_data.into()
-            } else {
-                dirs::data_local_dir().expect("failed to determine XDG_DATA_HOME directory")
-            }
-            .join(APP_NAME_LOWERCASE)
-        } else if cfg!(target_os = "windows") {
-            dirs::data_local_dir()
-                .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME)
-=======
->>>>>>> theirs
         } else {
             base_dir().join("data")
         }
@@ -245,62 +174,13 @@ pub fn data_dir() -> &'static PathBuf {
 
 pub fn state_dir() -> &'static PathBuf {
     static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
-<<<<<<< ours
-    STATE_DIR.get_or_init(|| {
-        if cfg!(target_os = "macos") {
-            return home_dir().join(".local").join("state").join(APP_NAME);
-        }
-
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-            return if let Ok(flatpak_xdg_state) = std::env::var("FLATPAK_XDG_STATE_HOME") {
-                flatpak_xdg_state.into()
-            } else {
-                dirs::state_dir().expect("failed to determine XDG_STATE_HOME directory")
-            }
-            .join(APP_NAME_LOWERCASE);
-        } else {
-            // Windows
-            return dirs::data_local_dir()
-                .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME);
-        }
-    })
-=======
     STATE_DIR.get_or_init(|| base_dir().join("state"))
->>>>>>> theirs
 }
 
 /// Returns the path to the temp / cache directory used by SPK Editor.
 pub fn temp_dir() -> &'static PathBuf {
     static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
-<<<<<<< ours
-    TEMP_DIR.get_or_init(|| {
-        if cfg!(target_os = "macos") {
-            return dirs::cache_dir()
-                .expect("failed to determine cachesDirectory directory")
-                .join(APP_NAME);
-        }
-
-        if cfg!(target_os = "windows") {
-            return dirs::cache_dir()
-                .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME);
-        }
-
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-            return if let Ok(flatpak_xdg_cache) = std::env::var("FLATPAK_XDG_CACHE_HOME") {
-                flatpak_xdg_cache.into()
-            } else {
-                dirs::cache_dir().expect("failed to determine XDG_CACHE_HOME directory")
-            }
-            .join(APP_NAME_LOWERCASE);
-        }
-
-        home_dir().join(".cache").join(APP_NAME_LOWERCASE)
-    })
-=======
     TEMP_DIR.get_or_init(|| base_dir().join("cache"))
->>>>>>> theirs
 }
 
 /// Returns the path to the hang traces directory.
@@ -312,17 +192,7 @@ pub fn hang_traces_dir() -> &'static PathBuf {
 /// Returns the path to the logs directory.
 pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
-<<<<<<< ours
-    LOGS_DIR.get_or_init(|| {
-        if cfg!(target_os = "macos") {
-            home_dir().join("Library/Logs").join(APP_NAME)
-        } else {
-            data_dir().join("logs")
-        }
-    })
-=======
     LOGS_DIR.get_or_init(|| base_dir().join("logs"))
->>>>>>> theirs
 }
 
 /// Returns the path to the SPK Editor server directory on this SSH host.
@@ -334,21 +204,13 @@ pub fn remote_server_state_dir() -> &'static PathBuf {
 /// Returns the path to the `SpkEditor.log` file.
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-<<<<<<< ours
-    LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log", APP_NAME)))
-=======
     LOG_FILE.get_or_init(|| logs_dir().join("SpkEditor.log"))
->>>>>>> theirs
 }
 
 /// Returns the path to the `SpkEditor.log.old` file.
 pub fn old_log_file() -> &'static PathBuf {
     static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-<<<<<<< ours
-    OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log.old", APP_NAME)))
-=======
     OLD_LOG_FILE.get_or_init(|| logs_dir().join("SpkEditor.log.old"))
->>>>>>> theirs
 }
 
 /// Returns the path to the database directory.
@@ -413,33 +275,6 @@ pub fn debug_scenarios_file() -> &'static PathBuf {
     DEBUG_SCENARIOS_FILE.get_or_init(|| config_dir().join("debug.json"))
 }
 
-<<<<<<< ours
-/// Returns the path to the user-global `AGENTS.md` file.
-///
-/// This file holds personal agent instructions that apply to every project the
-/// user opens, and is loaded into the native Zed agent's system prompt.
-pub fn agents_file() -> &'static PathBuf {
-    static AGENTS_FILE: OnceLock<PathBuf> = OnceLock::new();
-    AGENTS_FILE.get_or_init(|| config_dir().join("AGENTS.md"))
-}
-
-/// User-facing display form of the user-global `AGENTS.md` file path —
-/// i.e. what a human should see in messages and prompts, with the
-/// platform's native path separator and home/config directory shorthand.
-///
-/// Windows doesn't recognize `~` as the home directory, so the env-var
-/// form (`%APPDATA%`) is used there instead. Note that this is the
-/// *typical* location: a user with `XDG_CONFIG_HOME` set or running in a
-/// Flatpak sandbox would see a different `agents_file()` at runtime than
-/// this displays. The display string trades that precision for
-/// readability in announcement copy.
-#[cfg(target_os = "windows")]
-pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
-    const_format::concatcp!("%APPDATA%\\", APP_NAME, "\\AGENTS.md");
-#[cfg(not(target_os = "windows"))]
-pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
-    const_format::concatcp!("~/.config/", APP_NAME_LOWERCASE, "/AGENTS.md");
-=======
 /// Returns the path to the `run-configurations.json` file.
 pub fn run_configurations_file() -> &'static PathBuf {
     static RUN_CONFIGURATIONS_FILE: OnceLock<PathBuf> = OnceLock::new();
@@ -467,7 +302,6 @@ pub fn remote_control_key_file() -> &'static PathBuf {
     static REMOTE_CONTROL_KEY_FILE: OnceLock<PathBuf> = OnceLock::new();
     REMOTE_CONTROL_KEY_FILE.get_or_init(|| config_dir().join("remote-control.key.der"))
 }
->>>>>>> theirs
 
 /// Returns the path to the extensions directory.
 ///

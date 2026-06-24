@@ -193,75 +193,12 @@ pub enum ListSizingBehavior {
     Auto,
 }
 
-/// Default chunk size for [`ListMeasuringBehavior::MeasureLast`] when no
-/// explicit batch is specified. Sized to keep one chunk's measurement
-/// well under a 16ms frame budget on typical chat content (markdown +
-/// tool calls); under gradual scroll the boundary advances batch-by-batch
-/// in step with the user without stalling input.
-const MEASURE_LAST_DEFAULT_BATCH: usize = 64;
-
-/// Default prefetch window kept measured ahead of the scroll target.
-/// Picked so a moderate scroll-up burst (mouse wheel, trackpad fling)
-/// stays inside already-measured territory while the chunked extension
-/// catches up.
-const MEASURE_LAST_DEFAULT_LOOKAHEAD: usize = 100;
-
-/// Default gap above which a single frame measures the entire range
-/// in one pass instead of advancing by `batch`. Catches scroll-bar
-/// drag-to-top, Home / Page-Up jumps, and similar teleports — gradual
-/// chunked measurement would take seconds across thousands of items
-/// and the user would scroll through unmeasured territory the whole
-/// time. One frame stall is the better deal.
-const MEASURE_LAST_DEFAULT_EAGER_THRESHOLD: usize = 200;
-
-/// Sentinel value for [`ListMeasuringBehavior::MeasureLast::measured_start`]
-/// meaning "no measurement has run yet." `Option<usize>` would also work
-/// (it's both `Copy` and `Ord`), but the layout pass branches on this
-/// value once per frame and a sentinel keeps the hot path free of
-/// `match`/`unwrap` noise. `0` is unavailable as a sentinel because it's
-/// a real measured boundary — "everything measured" is the terminal
-/// state of the watermark.
-const MEASURE_LAST_UNINIT: usize = usize::MAX;
-
 /// The measuring behavior to apply during layout.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ListMeasuringBehavior {
     /// Measure all items in the list.
     /// Note: This can be expensive for the first frame in a large list.
     Measure(bool),
-    /// Scroll-driven incremental measurement of the tail. Maintains a
-    /// `measured_start` watermark — every item index `>= measured_start`
-    /// is measured. Each layout pass advances the watermark toward
-    /// `desired_start = min(total - initial_floor, scroll_top - prefetch_lookahead)`,
-    /// in `batch`-sized chunks under gradual scroll OR a single eager
-    /// chunk when the gap exceeds `eager_threshold` (drag-to-top etc.).
-    ///
-    /// Best fit for chat-style lists with potentially thousands of
-    /// entries: cold-load only pays for `initial_floor` warmup, the
-    /// rest is measured on demand as the user actually scrolls into
-    /// it, and the watermark only ever moves down (never re-measures
-    /// items already covered).
-    MeasureLast {
-        /// Minimum number of tail items measured at cold-load (before
-        /// any scroll). Drives the warmup cost.
-        initial_floor: usize,
-        /// Number of items kept measured ahead of the live scroll target
-        /// during gradual scroll, so a brief scroll-up burst stays inside
-        /// already-measured territory.
-        prefetch_lookahead: usize,
-        /// Items measured per frame under gradual scroll. Sized to fit
-        /// the chunk inside one ~16ms frame budget.
-        batch: usize,
-        /// Gap above which a single frame measures the entire range in
-        /// one pass — drag-to-top, Home, Page-Up. Below this the
-        /// gradual `batch` arm is used.
-        eager_threshold: usize,
-        /// Lowest item index that's been measured so far. The watermark
-        /// only ever moves down (toward 0). [`MEASURE_LAST_UNINIT`]
-        /// signals "no measurement has run yet" — initialized to `total`
-        /// on the first layout pass.
-        measured_start: usize,
-    },
     /// Only measure visible items
     #[default]
     Visible,
@@ -271,9 +208,6 @@ impl ListMeasuringBehavior {
     fn reset(&mut self) {
         match self {
             ListMeasuringBehavior::Measure(has_measured) => *has_measured = false,
-            ListMeasuringBehavior::MeasureLast { measured_start, .. } => {
-                *measured_start = MEASURE_LAST_UNINIT;
-            }
             ListMeasuringBehavior::Visible => {}
         }
     }
@@ -299,17 +233,6 @@ struct ItemLayout {
     index: usize,
     element: AnyElement,
     size: Size<Pixels>,
-}
-
-/// Internal plan produced by `layout_all_items` to describe which slice
-/// of items should be measured on the current pass and whether the list
-/// needs another frame to finish. `Measure(_)` produces a single plan
-/// covering the whole list; `MeasureLast { .. }` produces one per frame
-/// until the tail target is fully measured.
-struct MeasurePlan {
-    skip: usize,
-    end: usize,
-    request_followup: bool,
 }
 
 /// Frame state used by the [List] element after layout.
@@ -412,68 +335,6 @@ impl ListState {
     /// This is useful for ensuring that the scrollbar size is correct instead of based on only rendered elements.
     pub fn measure_all(self) -> Self {
         self.0.borrow_mut().measuring_behavior = ListMeasuringBehavior::Measure(false);
-        self
-    }
-
-    /// Configure scroll-driven incremental measurement of the tail.
-    /// `initial_floor` is the minimum number of items at the bottom of
-    /// the list that get measured on cold-load (chunked across frames
-    /// so the first paint stays interactive). The watermark extends
-    /// further upward only when the user scrolls toward it; see
-    /// [`ListMeasuringBehavior::MeasureLast`] for the full state machine.
-    ///
-    /// Uses default values for `prefetch_lookahead`, `batch`, and
-    /// `eager_threshold` — call [`Self::measure_last_with`] to override.
-    ///
-    /// **Contract on list mutations.** The watermark is maintained by
-    /// item index, not by item identity, so mutations that insert
-    /// `Unmeasured` items at indices `>= measured_start` (i.e. into
-    /// the claimed-measured tail region) leave the new items
-    /// claim-but-don't-measure: they render at zero height until the
-    /// regular visible-band layout path measures them. For chat-style
-    /// lists where `splice` is append-or-remove-only AND the new tail
-    /// entry stays in the visible band (the typical `FollowMode::Tail`
-    /// case), this is masked — visible-band measurement runs on every
-    /// paint and catches the new item before any user-visible
-    /// rendering. If you need to support arbitrary mid-list inserts
-    /// or batch inserts that land outside the visible band, prefer
-    /// [`Self::measure_all`] or call [`Self::reset`] after the
-    /// mutation to re-arm the watermark.
-    pub fn measure_last(self, initial_floor: usize) -> Self {
-        self.measure_last_with(
-            initial_floor,
-            MEASURE_LAST_DEFAULT_LOOKAHEAD,
-            MEASURE_LAST_DEFAULT_BATCH,
-            MEASURE_LAST_DEFAULT_EAGER_THRESHOLD,
-        )
-    }
-
-    /// Configure scroll-driven incremental measurement with full control
-    /// over the watermark advancement parameters.
-    ///
-    /// - `initial_floor`: minimum number of tail items measured at the
-    ///   start (drives cold-load cost).
-    /// - `prefetch_lookahead`: how far ahead of the scroll target the
-    ///   watermark stays measured during gradual scroll.
-    /// - `batch`: items measured per frame under gradual scroll.
-    /// - `eager_threshold`: scroll-target jumps that need more than this
-    ///   many items measured in one go are handled in a single frame
-    ///   instead of chunked (drag-to-top / Home / Page-Up).
-    pub fn measure_last_with(
-        self,
-        initial_floor: usize,
-        prefetch_lookahead: usize,
-        batch: usize,
-        eager_threshold: usize,
-    ) -> Self {
-        let batch = batch.max(1);
-        self.0.borrow_mut().measuring_behavior = ListMeasuringBehavior::MeasureLast {
-            initial_floor,
-            prefetch_lookahead,
-            batch,
-            eager_threshold,
-            measured_start: MEASURE_LAST_UNINIT,
-        };
         self
     }
 
@@ -1033,120 +894,39 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let total = self.items.summary().count;
-        // `MeasureLast` consults the current scroll target so the
-        // watermark can chase the user's scroll position. Captured
-        // here before we re-borrow `self.measuring_behavior` mutably.
-        let scroll_top_ix = self
-            .logical_scroll_top
-            .as_ref()
-            .map(|s| s.item_ix)
-            .unwrap_or(total);
-        // Decide what range to measure on this pass and whether to
-        // request another frame to keep going. `Measure(_)` does the
-        // whole list once; `MeasureLast` advances `measured_start`
-        // toward `desired_start`, in chunks under gradual scroll OR a
-        // single eager chunk when a teleport opens a large gap.
-        let plan = match &mut self.measuring_behavior {
-            ListMeasuringBehavior::Visible => return,
+        match &mut self.measuring_behavior {
+            ListMeasuringBehavior::Visible => {
+                return;
+            }
             ListMeasuringBehavior::Measure(has_measured) => {
                 if *has_measured {
                     return;
                 }
                 *has_measured = true;
-                if total == 0 {
-                    return;
-                }
-                MeasurePlan {
-                    skip: 0,
-                    end: total,
-                    request_followup: false,
-                }
             }
-            ListMeasuringBehavior::MeasureLast {
-                initial_floor,
-                prefetch_lookahead,
-                batch,
-                eager_threshold,
-                measured_start,
-            } => {
-                if total == 0 {
-                    return;
-                }
-                // Where the watermark *wants* to be: low enough to
-                // cover the initial-floor warmup AND any prefetch
-                // window ahead of the live scroll target.
-                let floor_target = total.saturating_sub(*initial_floor);
-                let scroll_target = scroll_top_ix.saturating_sub(*prefetch_lookahead);
-                let desired_start = floor_target.min(scroll_target);
-                // First call is signalled by the sentinel — initialize
-                // to `total` so the gap calculation reflects "nothing
-                // measured yet" without a separate boolean flag.
-                let measured_top = (*measured_start).min(total);
-                if measured_top <= desired_start {
-                    return;
-                }
-                let gap = measured_top - desired_start;
-                // Eager arm collapses the whole gap into one frame —
-                // user is willing to trade a brief stall for the
-                // alternative of seconds of glitchy scroll-through-
-                // unmeasured during a teleport. Gradual arm advances
-                // by `batch` so input stays responsive.
-                let chunk = if gap > *eager_threshold {
-                    gap
-                } else {
-                    (*batch).min(gap)
-                };
-                let new_start = measured_top - chunk;
-                *measured_start = new_start;
-                let request_followup = new_start > desired_start;
-                MeasurePlan {
-                    skip: new_start,
-                    end: measured_top,
-                    request_followup,
-                }
-            }
-        };
+        }
 
+        let mut cursor = self.items.cursor::<Count>(());
         let available_item_space = size(
             AvailableSpace::Definite(available_width),
             AvailableSpace::MinContent,
         );
 
-        // In-place SumTree mutation: keep the prefix and suffix slices
-        // pointer-equal to the originals (only `[plan.skip, plan.end)`
-        // is rebuilt) so each chunked pass costs O(batch + log N) — not
-        // O(total). The full-list `Measure(_)` arm degenerates to the
-        // same pattern with a single chunk that covers everything.
-        let new_items = {
-            let mut cursor = self.items.cursor::<Count>(());
-            let mut new_items = cursor.slice(&Count(plan.skip), Bias::Right);
-            let to_measure = cursor.slice(&Count(plan.end), Bias::Right);
-            for (offset, item) in to_measure.iter().enumerate() {
-                let absolute_ix = plan.skip + offset;
-                let size = item.size().unwrap_or_else(|| {
-                    let mut element = render_item(absolute_ix, window, cx);
-                    element.layout_as_root(available_item_space, window, cx)
-                });
-                new_items.push(
-                    ListItem::Measured {
-                        size,
-                        focus_handle: item.focus_handle(),
-                    },
-                    (),
-                );
-            }
-            new_items.append(cursor.suffix(), ());
-            new_items
-        };
-        self.items = new_items;
+        let mut measured_items = Vec::default();
 
-        if plan.request_followup {
-            // Schedule another paint so the next chunk runs on the
-            // following frame — this is what spreads the work across
-            // the rendering "background" without ever blocking input.
-            window.refresh();
+        for (ix, item) in cursor.enumerate() {
+            let size = item.size().unwrap_or_else(|| {
+                let mut element = render_item(ix, window, cx);
+                element.layout_as_root(available_item_space, window, cx)
+            });
+
+            measured_items.push(ListItem::Measured {
+                size,
+                focus_handle: item.focus_handle(),
+            });
         }
+
+        self.items = SumTree::from_iter(measured_items, ());
     }
 
     fn layout_items(
@@ -1385,14 +1165,6 @@ impl StateInner {
         window.transact(|window| {
             match self.measuring_behavior {
                 ListMeasuringBehavior::Measure(has_measured) if !has_measured => {
-                    self.layout_all_items(bounds.size.width, render_item, window, cx);
-                }
-                // For `MeasureLast` we always defer the gating decision
-                // to `layout_all_items`: it needs the live scroll target
-                // and the current item count to compute `desired_start`,
-                // and bails internally when the watermark already covers
-                // it.
-                ListMeasuringBehavior::MeasureLast { .. } => {
                     self.layout_all_items(bounds.size.width, render_item, window, cx);
                 }
                 _ => {}
@@ -2667,20 +2439,12 @@ mod test {
         assert!(state.is_following_tail());
 
         // Drag the scrollbar up to the middle — follow_tail should suspend.
-<<<<<<< ours
         state.set_offset_from_scrollbar(point(px(0.), px(-150.)));
-=======
-        state.set_offset_from_scrollbar(point(px(0.), px(150.)));
->>>>>>> theirs
         assert!(!state.is_following_tail());
 
         // Drag the scrollbar back to the bottom — follow_tail should re-engage
         // on the next paint.
-<<<<<<< ours
         state.set_offset_from_scrollbar(point(px(0.), px(-300.)));
-=======
-        state.set_offset_from_scrollbar(point(px(0.), px(300.)));
->>>>>>> theirs
         cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
             view.into_any_element()
         });
@@ -2690,7 +2454,6 @@ mod test {
         );
     }
 
-<<<<<<< ours
     #[gpui::test]
     fn test_follow_tail_reengages_after_scrollbar_drag_to_bottom_while_growing(
         cx: &mut TestAppContext,
@@ -2698,31 +2461,6 @@ mod test {
         let cx = cx.add_empty_window();
 
         let state = ListState::new(10, crate::ListAlignment::Top, px(0.)).measure_all();
-=======
-    /// `measure_last` covers both the gradual cold-load arm (default
-    /// scroll target stays at the tail, so only `initial_floor` items
-    /// get measured up-front) and the eager catch-up arm (a teleport
-    /// scroll opens a gap larger than `eager_threshold`, collapsing the
-    /// whole catch-up into a single layout pass).
-    ///
-    /// The test deliberately sets `batch=10` (smaller than the forced
-    /// 40-item teleport gap) so the eager arm is the only path that
-    /// produces the fully-measured `px(2300.)` after one paint —
-    /// removing the eager arm would degenerate to `chunk = batch.min(gap) = 10`
-    /// (20 items measured total, 1000px content, 800px max_offset) which
-    /// would fail the assertion.
-    #[gpui::test]
-    fn test_measure_last_initial_floor_and_eager_catchup(cx: &mut TestAppContext) {
-        let cx = cx.add_empty_window();
-
-        // 50 items × 50px = 2500px total when fully measured. With a 200px
-        // viewport, max_offset would be 2300 in the fully-measured state.
-        // `initial_floor=10`, `prefetch_lookahead=0`, `batch=10` (small,
-        // so eager-vs-gradual is observable), `eager_threshold=20` is
-        // below the 40-item gap we'll force on scroll-to-top.
-        let state = ListState::new(50, crate::ListAlignment::Bottom, px(0.))
-            .measure_last_with(10, 0, 10, 20);
->>>>>>> theirs
 
         struct TestView(ListState);
         impl Render for TestView {
@@ -2737,7 +2475,6 @@ mod test {
 
         let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
 
-<<<<<<< ours
         state.set_follow_mode(FollowMode::Tail);
         cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
             view.clone().into_any_element()
@@ -2763,36 +2500,6 @@ mod test {
             "follow_tail should re-engage when the user drags the scrollbar to \
              the bottom of its track, even when content has grown during the drag \
              (so frozen_bottom < live_bottom)"
-=======
-        // First paint: scroll target defaults to the tail
-        // (`ListAlignment::Bottom`), so only `initial_floor=10` items
-        // measure. 10 × 50 = 500px total height; max_offset = 500 - 200.
-        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
-            view.clone().into_any_element()
-        });
-        assert_eq!(
-            state.max_offset_for_scrollbar().y,
-            px(300.),
-            "after cold-load only `initial_floor` items measured \
-             (gradual arm: gap < eager_threshold)"
-        );
-
-        // Teleport to the top — opens a gap of 40 items between the
-        // current watermark (40) and `desired_start=0`. 40 > 20 fires
-        // the eager arm.
-        state.scroll_to(gpui::ListOffset {
-            item_ix: 0,
-            offset_in_item: px(0.),
-        });
-        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
-            view.into_any_element()
-        });
-        assert_eq!(
-            state.max_offset_for_scrollbar().y,
-            px(2300.),
-            "after teleport-to-top all 50 items measured in one pass \
-             (eager arm: gap > eager_threshold)"
->>>>>>> theirs
         );
     }
 }

@@ -62,12 +62,9 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 
-<<<<<<< ours
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
-=======
->>>>>>> theirs
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
