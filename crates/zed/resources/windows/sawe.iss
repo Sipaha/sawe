@@ -3,9 +3,9 @@ AppId={#AppId}
 AppName={#AppName}
 AppVerName={#AppDisplayName}
 AppPublisher=Simonov Pavel
-AppPublisherURL=https://github.com/Sipaha/spk-editor
-AppSupportURL=https://github.com/Sipaha/spk-editor/issues
-AppUpdatesURL=https://github.com/Sipaha/spk-editor/releases
+AppPublisherURL=https://github.com/Sipaha/sawe
+AppSupportURL=https://github.com/Sipaha/sawe/issues
+AppUpdatesURL=https://github.com/Sipaha/sawe/releases
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
@@ -1256,10 +1256,10 @@ Root: HKCU; Subkey: "Software\Classes\Drive\shell\{#RegValueName}\command"; Valu
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{code:AddToPath|{app}\bin}"; Tasks: addtopath; Check: NeedsAddToPath(ExpandConstant('{app}\bin'))
 
 ; URI Scheme
-Root: HKCU; Subkey: "Software\Classes\spk-editor"; ValueType: "string"; ValueData: "URL:spk-editor Protocol"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\spk-editor"; ValueType: "string"; ValueName: "URL Protocol"; ValueData: ""
-Root: HKCU; Subkey: "Software\Classes\spk-editor\DefaultIcon"; ValueType: "string"; ValueData: "{app}\{#AppExeName}.exe,1"
-Root: HKCU; Subkey: "Software\Classes\spk-editor\shell\open\command"; ValueType: "string"; ValueData: """{app}\{#AppExeName}.exe"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\sawe"; ValueType: "string"; ValueData: "URL:sawe Protocol"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\sawe"; ValueType: "string"; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\sawe\DefaultIcon"; ValueType: "string"; ValueData: "{app}\{#AppExeName}.exe,1"
+Root: HKCU; Subkey: "Software\Classes\sawe\shell\open\command"; ValueType: "string"; ValueData: """{app}\{#AppExeName}.exe"" ""%1"""
 
 [Code]
 function WizardNotSilent(): Boolean;

@@ -200,7 +200,7 @@ impl McpServerTool for UndoLastTool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
-/// Input for `editor.git.cleanup_backups`. Removes spk-editor backup-refs
+/// Input for `editor.git.cleanup_backups`. Removes sawe backup-refs
 /// older than `older_than_days`. The undo-registry entries themselves are
 /// not pruned — they have independent retention.
 pub struct CleanupBackupsInput {

@@ -12,17 +12,17 @@ badges now work (gotcha #1 RESOLVED — see below).
 ## Continued this session (after V3 shipped)
 
 - **Code review** (`/review-changes`, Sonnet+Opus) of the whole session → fixes in
-  `spk-editor` `7f86c01ea8` (committed + **pushed** to origin): unique per-pill `{id}-close`
+  `sawe` `7f86c01ea8` (committed + **pushed** to origin): unique per-pill `{id}-close`
   ElementIds (was a constant → × click misrouting with ≥2 terminal pills); `read_complete_lines_from`
   skips an over-cap line instead of wedging the completion scan forever (+ regression test);
   doc/test fixes. Deferred (follow-up): extract the background-shell machinery out of the
   `store.rs` god-object into `store/background_shell.rs` (recorded in the review dismissed archive).
   New review-surfaced memories: [[incremental-tail-offset-wedge]], [[gpui-duplicate-elementid-in-lists]].
 - **Background Shells on Mobile arc** (F-arc precedent, two repos — NOT yet pushed):
-  - SERVER `spk-editor` `cdfd800e0f`: `get_session_background_shells` tool + `BackgroundShellDto`
+  - SERVER `sawe` `cdfd800e0f`: `get_session_background_shells` tool + `BackgroundShellDto`
     + `agent_session_background_shells_changed` notification (replaced the event_sources no-op) +
     remote_control allow-list. Additive, no wire-schema bump. 330 `solution_agent` tests.
-  - CLIENT `spk-editor-mobile` `2ae83135`: `BackgroundShellDto`/payload DTOs (+7 `:core` tests),
+  - CLIENT `sawe-mobile` `2ae83135`: `BackgroundShellDto`/payload DTOs (+7 `:core` tests),
     notification dispatch + `DetailNotificationRouter.onBackgroundShellsChanged`, `SessionDetailStore`
     `backgroundShells` StateFlow, `BackgroundShellStrip` pills + `include_output` stdout drill-in sheet.
     `:core:test` green; `:app:assembleDebug` OK (debug APK ~22.4 MB).
@@ -31,10 +31,10 @@ badges now work (gotcha #1 RESOLVED — see below).
     Android debug APK; open a session with a background shell → pill strip + tap → stdout sheet.
   - Out of scope (follow-ups): a kill action from mobile.
 - **Background Agents on Mobile arc** (mirror of the shells arc — two repos):
-  - SERVER `spk-editor` `f0d1c197b7`: `get_session_background_agents` tool + `BackgroundAgentDto`
+  - SERVER `sawe` `f0d1c197b7`: `get_session_background_agents` tool + `BackgroundAgentDto`
     (label/mtime_ms/stop_reason — no command/output_tail, no include flag) +
     `agent_session_background_agents_changed` notification (replaced its no-op) + allow-list. 334 tests.
-  - CLIENT `spk-editor-mobile` `93969b7`: DTO + dispatch + `onBackgroundAgentsChanged` +
+  - CLIENT `sawe-mobile` `93969b7`: DTO + dispatch + `onBackgroundAgentsChanged` +
     `backgroundAgents` StateFlow + `BackgroundAgentStrip` (running/done pills) + minimal drill-in sheet
     (no network fetch — DTO has everything). `:core:test` green (+6); `:app:assembleDebug` ~23.6 MB.
   - Plan: `docs/superpowers/plans/2026-05-29-background-agents-on-mobile.md` (COMPLETE).
@@ -142,7 +142,7 @@ rows dropped on hydrate (no phantom pills after restart).
 
 ## Manual smoke recipe (for the user / next live session)
 
-1. Launch the release-fast editor (`target/release-fast/spk-editor`, sha `244256d885`).
+1. Launch the release-fast editor (`target/release-fast/sawe`, sha `244256d885`).
 2. In a session, ask claude: *"Run `for i in $(seq 1 30); do echo tick $i; sleep 2;
    done` in the background, then leave it."*
 3. EXPECT: a terminal-icon pill appears in the subagent strip labelled

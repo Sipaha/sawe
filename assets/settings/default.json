@@ -11,7 +11,7 @@
     "light": "One Light",
     "dark": "One Dark",
   },
-  // SPK Editor: defaults to Material Icon Theme (colored file/folder icons)
+  // Sawe: defaults to Material Icon Theme (colored file/folder icons)
   // instead of upstream "Zed (Default)" (monochrome). The extension is
   // listed in auto_install_extensions so a fresh install pulls it from
   // the zed.dev registry on first launch.
@@ -140,7 +140,7 @@
   //         "restore_on_startup": "last_workspace",
   //  3. Do not restore previous workspaces
   //         "restore_on_startup": "none",
-  // SPK Editor: default is "launchpad" so the Welcome page (with the
+  // Sawe: default is "launchpad" so the Welcome page (with the
   // Solutions list + Create button) is always shown on startup, instead of
   // restoring the last workspace or opening an untitled buffer. See FORK.md
   // §10.
@@ -772,7 +772,7 @@
     // Default width of the project panel.
     "default_width": 240,
     // Where to dock the project panel. Can be 'left' or 'right'.
-    // SPK Editor: defaults to "left" — IDEA convention. Upstream Zed defaults
+    // Sawe: defaults to "left" — IDEA convention. Upstream Zed defaults
     // to "right" but every IDEA-style IDE puts the project tree on the left.
     "dock": "left",
     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
@@ -945,10 +945,10 @@
   "solutions": {
     // Default root directory for new Solutions. Leave commented out to
     // pick up the runtime default — `<base_dir>/solutions`, where
-    // `<base_dir>` is `~/spk-editor` in release and `~/spk-editor-dev`
+    // `<base_dir>` is `~/sawe` in release and `~/sawe-dev`
     // in debug. Set this to override (existing Solutions store
     // absolute paths and are unaffected by changes to this setting).
-    // "root": "~/spk-editor/solutions",
+    // "root": "~/sawe/solutions",
     "git": {
       "aggregated_log": {
         // Pre-warm per-member git-log buffers in the background on
@@ -1092,14 +1092,14 @@
       // Snapshot worktrees created by `git: show repository at revision`
       // live under `<temp_dir>/worktrees/`. Anything older than this
       // many hours is removed at editor startup with
-      // `git worktree remove --force`. Covers the case where spk-editor
+      // `git worktree remove --force`. Covers the case where sawe
       // crashed before the on-close cleanup could run.
       //
       // Default: 24
       "cleanup_orphans_older_than_h": 24,
     },
     // Pre-commit checks (S-PCH-HK). When true, the commit panel exposes
-    // the "Run pre-commit hook" checkbox; when ticked, spk-editor runs
+    // the "Run pre-commit hook" checkbox; when ticked, sawe runs
     // `<repo>/.git/hooks/pre-commit` itself and then issues
     // `git commit --no-verify` to avoid double-execution. When false the
     // checkbox is hidden and git itself runs the hook (same behavior as
@@ -1410,7 +1410,7 @@
   //     "autosave": "on_focus_change",
   // 4. Save when idle for a certain amount of time:
   //     "autosave": { "after_delay": {"milliseconds": 500} },
-  // SPK Editor fork: default to IDEA-style autosave (save a buffer when focus
+  // Sawe fork: default to IDEA-style autosave (save a buffer when focus
   // leaves it). Set to "off" to restore upstream Zed's manual-save default.
   "autosave": "on_focus_change",
   // Maximum number of tabs per pane. Unset for unlimited.
@@ -1828,7 +1828,7 @@
   "load_direnv": "direct",
   "edit_predictions": {
     // Which edit prediction provider to use.
-    // spk-editor disables the "zed" (Zeta) provider since it requires a Zed account.
+    // sawe disables the "zed" (Zeta) provider since it requires a Zed account.
     // Set to "copilot", "codestral", "ollama", "open_ai_compatible_api", or "mercury" to opt in.
     "provider": "none",
     // A list of globs representing files that edit predictions should be disabled for.
@@ -1844,7 +1844,7 @@
       "**/*.crt",
       "**/.dev.vars",
       "**/secrets.yml",
-      "**/.spke/settings.json", // spk-editor project settings
+      "**/.sawe/settings.json", // sawe project settings
       "/**/zed/settings.json", // zed user settings
       "/**/zed/keymap.json",
     ],
@@ -2191,7 +2191,7 @@
   //
   "file_types": {
     "JSONC": [
-      "**/.spke/*.json",
+      "**/.sawe/*.json",
       "**/.vscode/**/*.json",
       "**/{zed,Zed}/{settings,keymap,tasks,debug}.json",
       "tsconfig*.json",
@@ -2221,7 +2221,7 @@
   // and change the value to `false`.
   "auto_install_extensions": {
     "html": true,
-    // SPK Editor: bundled by default so a fresh install lands on colored
+    // Sawe: bundled by default so a fresh install lands on colored
     // file/folder icons (the upstream "Zed (Default)" theme is monochrome,
     // which makes the project tree feel grey vs IDEA's coloured one). The
     // matching default lives at the top of this file: "icon_theme": "Material Icon Theme".
@@ -2829,7 +2829,7 @@
   // Configures context servers for use by the agent.
   "context_servers": {},
   // Configures agent servers available in the agent panel.
-  // SPK Editor: claude-acp pre-configured as a Custom agent that runs the
+  // Sawe: claude-acp pre-configured as a Custom agent that runs the
   // official ACP wrapper directly via npx, bypassing the async registry
   // fetch + binary-download dance. Without this entry, the solution_agent
   // navigator's "+ New Claude Session" button errors with "Custom agent

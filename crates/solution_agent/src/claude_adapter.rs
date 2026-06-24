@@ -53,7 +53,7 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
         );
         buf.push_str(&format!(
             "\nThis solution's id is `{id}`. You can manage its member projects with \
-             these MCP tools (provided by the `spk-editor` server):\n\
+             these MCP tools (provided by the `sawe` server):\n\
              - `catalog.list` — list every available registry (catalog) project.\n\
              - `solutions.add_member {{\"solution_id\": \"{id}\", \"catalog_id\": \
              \"<id from catalog.list>\"}}` — clone an existing registry project into \

@@ -5,7 +5,7 @@
 # It expects a version to be passed as the first argument, and expects
 # the built `.snap` for that version to be in the current directory.
 #
-# This will uninstall the current `spk-editor` snap, replacing it with a snap
+# This will uninstall the current `sawe` snap, replacing it with a snap
 # that directly uses the `snap/unpacked` directory.
 
 set -euxo pipefail
@@ -18,8 +18,8 @@ fi
 # Rerun as root
 [ "$UID" -eq 0 ] || exec sudo bash -e "$0" "$@"
 
-snap remove spk-editor || true
+snap remove sawe || true
 mkdir -p snap
 rm -rf snap/unpacked
-unsquashfs -dest snap/unpacked "spk-editor_$1_amd64.snap"
+unsquashfs -dest snap/unpacked "sawe_$1_amd64.snap"
 snap try --classic snap/unpacked

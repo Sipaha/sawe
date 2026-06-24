@@ -1,12 +1,12 @@
 # Background Shells on Mobile — implementation plan
 
-**Status:** COMPLETE (2026-05-29). Server: `spk-editor` `cdfd800e0f` (get_session_background_shells
+**Status:** COMPLETE (2026-05-29). Server: `sawe` `cdfd800e0f` (get_session_background_shells
 tool + agent_session_background_shells_changed notification + allow-list; 330 solution_agent tests,
-clippy clean). Client: `spk-editor-mobile` `2ae83135` (BackgroundShellDto + dispatch + BackgroundShellStrip
+clippy clean). Client: `sawe-mobile` `2ae83135` (BackgroundShellDto + dispatch + BackgroundShellStrip
 pills + stdout drill-in sheet; `:core:test` green incl. 7 new BackgroundShellTest; `:app:assembleDebug`
 OK, debug APK ~22.4 MB). Additive wire, no schema bump. Needs: editor release-fast rebuild to serve the
 new wire for end-to-end mobile testing.
-**Track:** HEAVY, two repos (server in `spk-editor`, client in `spk-editor-mobile`).
+**Track:** HEAVY, two repos (server in `sawe`, client in `sawe-mobile`).
 **Goal:** Surface the desktop V3 "Background Shells Strip" on the Android client — a pill
 strip of the session's background shells (Bash run_in_background) with state + a drill-in
 showing the stdout tail. Follows the "F" (sub-agent indication) arc precedent: server wire
@@ -36,7 +36,7 @@ R-5e. Scope is SHELLS ONLY — background *agents* on mobile is a separate follo
 
 ## Scope
 
-### Phase 1 — SERVER (`spk-editor`, crate `solution_agent` + `remote_control`)
+### Phase 1 — SERVER (`sawe`, crate `solution_agent` + `remote_control`)
 
 A. **`crates/solution_agent/src/mcp.rs`** — mirror `GetSessionChildrenTool`:
    - `BackgroundShellDto { id, command, state, mtime_ms: Option<i64>, output_tail: Option<String> }`
@@ -60,10 +60,10 @@ C. **`crates/remote_control/src/allow_list.rs`** — add
 D. Tests: an mcp-level test that a session with a registered shell returns it via the tool
    (lite + `include_output=true`); a test that `include_output=false` omits `output_tail`.
    Mirror existing `get_session_children` / `get_session_entry` tests. Verify
-   `cargo build --bin spk-editor` + `cargo test -p solution_agent --lib` + clippy
+   `cargo build --bin sawe` + `cargo test -p solution_agent --lib` + clippy
    `-p solution_agent -p remote_control --no-deps`.
 
-### Phase 2 — CLIENT (`spk-editor-mobile`)
+### Phase 2 — CLIENT (`sawe-mobile`)
 
 E. **`core/.../RemoteDtos.kt`** — `BackgroundShellDto(id, command, state, @SerialName("mtime_ms") mtimeMs: Long?=null, @SerialName("output_tail") outputTail: String?=null)`;
    `GetSessionBackgroundShellsResult(@SerialName("background_shells") backgroundShells: List<BackgroundShellDto> = emptyList())`;
@@ -94,13 +94,13 @@ I. Tests: `:core` DTO tests (E). Verify `./gradlew :core:test` green; `./gradlew
 - A "kill shell" / × action from mobile (read-only surface for V1).
 
 ## Verification
-- Server: `cargo build --bin spk-editor`; `cargo test -p solution_agent --lib`;
+- Server: `cargo build --bin sawe`; `cargo test -p solution_agent --lib`;
   `cargo clippy -p solution_agent -p remote_control --no-deps --all-targets -- -D warnings`.
 - Client: `./gradlew :core:test`; `./gradlew :app:assembleDebug`.
 - Supervisor end-to-end: optional — would need the mobile app against a live editor; defer to
   user hands-on (document a recipe in the handoff).
 
 ## When done
-- Server tool + notification + allow-list shipped + tested on `spk-editor` main.
-- Mobile DTO + dispatch + strip + drill-in shipped + `:core` tests green on `spk-editor-mobile` main.
+- Server tool + notification + allow-list shipped + tested on `sawe` main.
+- Mobile DTO + dispatch + strip + drill-in shipped + `:core` tests green on `sawe-mobile` main.
 - FORK.md untouched (no upstream-Zed files). INDEX + handoff updated.

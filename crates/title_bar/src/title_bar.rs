@@ -106,7 +106,7 @@ pub fn init(cx: &mut App) {
             set_window_layout(WindowLayout::Agent(None), cx);
         });
 
-        // SPK Editor fork: the full-width project toolbar row that sits below
+        // Sawe fork: the full-width project toolbar row that sits below
         // the title bar (hosts the project-tab strip + relocated branch widget
         // + run-config strip). Created here alongside the title bar because the
         // `workspace` crate can't depend on `solutions_ui`/`git_ui`/`run_config`.
@@ -172,7 +172,7 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(
             |workspace, _: &git_ui::branch_picker::BranchesPopupOpen, window, cx| {
-                // SPK Editor fork: the branch widget moved from the title bar to
+                // Sawe fork: the branch widget moved from the title bar to
                 // the project toolbar row, so reach it via `project_toolbar_item`.
                 if let Some(toolbar) = workspace
                     .project_toolbar_item()
@@ -277,7 +277,7 @@ impl Render for TitleBar {
                             self.application_menu.clone().filter(|_| !show_menus),
                             |title_bar, menu| title_bar.child(menu),
                         )
-                        // SPK Editor fork: the "Restricted Mode" badge in
+                        // Sawe fork: the "Restricted Mode" badge in
                         // the title bar competes for attention with little
                         // upside — trust is granted at the solution
                         // catalog layer (see `solutions::auto_trust`), so
@@ -286,7 +286,7 @@ impl Render for TitleBar {
                         // single-file ad-hoc opens. Render-site disabled,
                         // function intact for upstream-merge friendliness.
                         // .children(self.render_restricted_mode(cx))
-                        // SPK Editor fork: the upstream project-info chain
+                        // Sawe fork: the upstream project-info chain
                         // (solution name + project name + worktree/branch)
                         // is replaced by the horizontal solution-tab strip.
                         // The strip's tabs are the per-solution surface
@@ -327,7 +327,7 @@ impl Render for TitleBar {
                     | client::Status::Authenticated
                     | client::Status::Connecting
             );
-        // Sign-in UI is hidden in spk-editor — Zed accounts are not used.
+        // Sign-in UI is hidden in sawe — Zed accounts are not used.
         // let is_signed_out_or_auth_error = user.is_none()
         //     && matches!(
         //         status,
@@ -345,13 +345,13 @@ impl Render for TitleBar {
                 })
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                // SPK Editor fork: the branch widget and run-config strip moved
+                // Sawe fork: the branch widget and run-config strip moved
                 // out of the title bar into the new project toolbar row
                 // (`ProjectToolbar`, mounted below the title bar by `Workspace`).
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
-                // Sign-in UI is hidden in spk-editor — Zed accounts are not used.
+                // Sign-in UI is hidden in sawe — Zed accounts are not used.
                 // .when(
                 //     user.is_none()
                 //         && is_signed_out_or_auth_error
@@ -388,7 +388,7 @@ impl Render for TitleBar {
                 );
             });
 
-            // SPK Editor fork: the content row uses the fork-local
+            // Sawe fork: the content row uses the fork-local
             // height so we can resize it for the solution-tab strip
             // without also enlarging the platform window-controls row.
             let height = fork_title_bar_content_height();
@@ -539,7 +539,7 @@ impl TitleBar {
         self.solution_tab_strip.clone()
     }
 
-    // SPK Editor fork: render site is disabled (see comment near the
+    // Sawe fork: render site is disabled (see comment near the
     // title-bar layout above). Function is kept for upstream-merge
     // friendliness; allow-dead-code so the unused-warn doesn't fire.
     #[allow(dead_code)]

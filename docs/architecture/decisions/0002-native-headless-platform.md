@@ -9,7 +9,7 @@
 
 ## Context
 
-`script/run-mcp` exists so an autonomous agent can drive a live spk-editor
+`script/run-mcp` exists so an autonomous agent can drive a live sawe
 window over the embedded MCP socket without a human attached. From day one
 that's worked by wrapping the editor in `xvfb-run`, which spins up a virtual
 X server and presents the swap-chain frames to it. Two pain points

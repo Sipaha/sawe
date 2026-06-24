@@ -1685,7 +1685,7 @@ mod tests {
                     .update_file_based_tasks(
                         TaskSettingsLocation::Worktree(SettingsLocation {
                             worktree_id,
-                            path: rel_path(".spke"),
+                            path: rel_path(".sawe"),
                         }),
                         Some(hook_tasks_json),
                     )
@@ -1708,7 +1708,7 @@ mod tests {
             json!({
                 "project": {
                     ".git": {},
-                    ".spke": {
+                    ".sawe": {
                         "tasks.json": hook_tasks_json,
                     },
                     "src": {

@@ -1,7 +1,7 @@
 # R-5f: Android client consumes R-5e enriched fields + diff streaming
 
 **Status:** complete (sibling-repo commit `ee804aa`)
-**Repo:** `spk-editor-mobile` (sibling of spk-editor)
+**Repo:** `sawe-mobile` (sibling of sawe)
 **Depends on:** R-5e (server enrichment shipped on `main` as `d8592b05dc`).
 **Goal:** Replace truncated-preview rendering with rich markdown + inline images + structured tool-call rows. Switch the chat surface from "full `get_session` re-fetch on every notification" to diff streaming via `get_session_entry { index }` keyed by the new `entry_index` in `agent_session_message_appended` payloads.
 
@@ -112,7 +112,7 @@ If `entry.markdown` is null AND it's a `user` / `assistant` role (legacy server 
 ## Acceptance
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 ANDROID_HOME=$HOME/Android/Sdk JAVA_HOME=$HOME/.jdks/temurin-21.0.10 ./gradlew :core:test :app:assembleDebug --rerun-tasks 2>&1 | tail -10
 ```
 

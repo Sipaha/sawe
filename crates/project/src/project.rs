@@ -252,7 +252,7 @@ pub struct Project {
     downloading_files: Arc<Mutex<HashMap<(WorktreeId, String), DownloadingFile>>>,
     last_worktree_paths: WorktreePaths,
     /// Worktree roots flagged as read-only by an out-of-band marker file
-    /// (e.g. `.spke-readonly.json` written by S-SAR's snapshot worktrees).
+    /// (e.g. `.sawe-readonly.json` written by S-SAR's snapshot worktrees).
     /// Buffers loaded from any path under one of these roots are forced
     /// to `Capability::Read` and the workspace title bar shows
     /// `[READ-ONLY]`.
@@ -263,7 +263,7 @@ pub struct Project {
 /// to tag the worktree as a read-only snapshot. Detected by Project at
 /// `WorktreeAdded` time; presence flips that root into the
 /// `read_only_roots` set.
-pub const READ_ONLY_MARKER_FILE: &str = ".spke-readonly.json";
+pub const READ_ONLY_MARKER_FILE: &str = ".sawe-readonly.json";
 
 struct DownloadingFile {
     destination_path: PathBuf,
@@ -1132,7 +1132,7 @@ impl DisableAiSettings {
     /// Returns whether AI is disabled for the given file.
     ///
     /// This checks the project-level settings for the file's worktree,
-    /// allowing `disable_ai` to be configured per-project in `.spke/settings.json`.
+    /// allowing `disable_ai` to be configured per-project in `.sawe/settings.json`.
     pub fn is_ai_disabled_for_buffer(buffer: Option<&Entity<Buffer>>, cx: &App) -> bool {
         Self::is_ai_disabled_for_file(buffer.and_then(|buffer| buffer.read(cx).file()), cx)
     }
@@ -2985,7 +2985,7 @@ impl Project {
 
     /// Marks `root` as a read-only worktree root. Buffers loaded from any
     /// path under `root` will be forced to `Capability::Read`. Used by
-    /// S-SAR snapshot worktrees (which carry a `.spke-readonly.json`
+    /// S-SAR snapshot worktrees (which carry a `.sawe-readonly.json`
     /// marker) and could be reused for any other "freeze this directory
     /// at the buffer layer" use case.
     pub fn register_read_only_root(&mut self, root: PathBuf) {
@@ -3368,7 +3368,7 @@ impl Project {
         self.request_buffer_diff_recalculation(buffer, cx);
 
         // S-SAR — buffers loaded from a snapshot worktree (one whose
-        // root carries the `.spke-readonly.json` marker) are forced
+        // root carries the `.sawe-readonly.json` marker) are forced
         // read-only. Editor / collab paths still have their own gates,
         // but we want the buffer-level capability flipped early so any
         // edit-attempt code path trips the same `read_only()` check.
@@ -3876,7 +3876,7 @@ impl Project {
         self.detect_read_only_marker(worktree, cx);
     }
 
-    /// Look for a `.spke-readonly.json` file at the worktree root; if
+    /// Look for a `.sawe-readonly.json` file at the worktree root; if
     /// present, register the root as read-only so any buffer opened
     /// from underneath it is forced to `Capability::Read`. The marker
     /// is itself written by S-SAR's `show_at_revision` handler.

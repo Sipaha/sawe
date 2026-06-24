@@ -7,7 +7,7 @@ use solutions_ui::project_tab_strip::ProjectTabStrip;
 use ui::{PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use workspace::{MultiWorkspace, Workspace};
 
-/// SPK Editor fork: a full-width toolbar row mounted by `Workspace` directly
+/// Sawe fork: a full-width toolbar row mounted by `Workspace` directly
 /// below the title bar (see `Workspace::project_toolbar_item`). It hosts the
 /// per-solution `ProjectTabStrip` on the left and the relocated git-branch
 /// widget + run-config strip on the right.

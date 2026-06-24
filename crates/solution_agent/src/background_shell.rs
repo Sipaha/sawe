@@ -264,7 +264,7 @@ mod tests {
     fn background_shell_clone_round_trip_ids_equal() {
         let shell = BackgroundShell {
             id: BackgroundShellId::new("bvb4ful1z"),
-            command: SharedString::from("cargo build --bin spk-editor"),
+            command: SharedString::from("cargo build --bin sawe"),
             output_path: PathBuf::from("/tmp/claude-1000/tasks/bvb4ful1z.output"),
             registered_at: chrono::Utc::now(),
             latest: None,
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(shell.id, cloned.id);
     }
 
-    const REAL_ANNOUNCEMENT: &str = "Command running in background with ID: bvb4ful1z. Output is being written to: /tmp/claude-1000/-home-spk--spk-spk-editor-dev-solutions-alphasol/6e524c79-5089-4a74-9419-bd18e9119e0b/tasks/bvb4ful1z.output. You will be notified when it completes. To check interim output, use Read on that file path.";
+    const REAL_ANNOUNCEMENT: &str = "Command running in background with ID: bvb4ful1z. Output is being written to: /tmp/claude-1000/-home-spk--spk-sawe-dev-solutions-alphasol/6e524c79-5089-4a74-9419-bd18e9119e0b/tasks/bvb4ful1z.output. You will be notified when it completes. To check interim output, use Read on that file path.";
 
     #[test]
     fn parse_bash_bg_launch_happy_path() {
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(
             result.1,
             PathBuf::from(
-                "/tmp/claude-1000/-home-spk--spk-spk-editor-dev-solutions-alphasol/6e524c79-5089-4a74-9419-bd18e9119e0b/tasks/bvb4ful1z.output"
+                "/tmp/claude-1000/-home-spk--spk-sawe-dev-solutions-alphasol/6e524c79-5089-4a74-9419-bd18e9119e0b/tasks/bvb4ful1z.output"
             )
         );
     }

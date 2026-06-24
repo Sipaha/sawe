@@ -1,12 +1,12 @@
 //! Per-client HMAC-SHA256 challenge auth — ADR-0003.
 //!
 //! Server sends a 16-byte random `challenge` immediately after TLS comes
-//! up. Client replies with `HMAC-SHA256(secret, b"spk-editor-remote-v1\0"
+//! up. Client replies with `HMAC-SHA256(secret, b"sawe-remote-v1\0"
 //! || challenge)`. Server tries every authorised client's secret in
 //! constant time; first match identifies the client. No match → close
 //! the connection with WS code 1008.
 //!
-//! The challenge framing (`b"spk-editor-remote-v1\0" ||` prefix) is a
+//! The challenge framing (`b"sawe-remote-v1\0" ||` prefix) is a
 //! domain-separation tag — if we ever reuse the same HMAC primitive for
 //! a different purpose (e.g. signed control messages), the input
 //! prefix prevents a recorded challenge response from being replayed
@@ -24,8 +24,8 @@ use crate::model::AuthorizedClient;
 
 /// Domain-separation tag prefixed to the challenge before HMAC-ing.
 /// Must match `HMAC_DOMAIN_TAG` in the Android client
-/// (`spk-editor-android-client/core/src/main/kotlin/ru/sipaha/spkremote/core/HmacChallengeAuth.kt`).
-pub const HMAC_DOMAIN_TAG: &[u8] = b"spk-editor-remote-v1\0";
+/// (`sawe-android-client/core/src/main/kotlin/ru/sipaha/spkremote/core/HmacChallengeAuth.kt`).
+pub const HMAC_DOMAIN_TAG: &[u8] = b"sawe-remote-v1\0";
 
 /// Generate a fresh 16-byte challenge from the OS RNG.
 pub fn make_challenge() -> Result<[u8; 16]> {
@@ -137,7 +137,7 @@ mod tests {
         //
         // secret = base64("\x00" * 32) → "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         // challenge = [0u8; 16]
-        // expected_response = HMAC-SHA256(b"\0"*32, b"spk-editor-remote-v1\0" || b"\0"*16)
+        // expected_response = HMAC-SHA256(b"\0"*32, b"sawe-remote-v1\0" || b"\0"*16)
         let secret_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let challenge = [0u8; 16];
         let response = expected_response(secret_base64, &challenge).expect("compute");

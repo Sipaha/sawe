@@ -17,7 +17,7 @@ const OP_LOCK_FILE: &str = "op.lock";
 /// show a useful message ("Repository busy: cherry_pick in progress").
 #[derive(Debug, Clone)]
 pub enum BusyReason {
-    /// Another spk-editor operation is in flight, identified by `AtomicGitOp::op_name`.
+    /// Another sawe operation is in flight, identified by `AtomicGitOp::op_name`.
     OtherOp(String),
     /// `.git/index.lock` is present — an external `git` process is running.
     ExternalGit,

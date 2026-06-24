@@ -576,7 +576,7 @@ impl InteractiveRebaseView {
     /// hand to git). Used by the Show preview button.
     pub fn preview_todo_text(&self) -> String {
         self.build_todo()
-            .serialize_with_helper("<spk-editor-helper> --git-message-set")
+            .serialize_with_helper("<sawe-helper> --git-message-set")
     }
 
     fn start_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {

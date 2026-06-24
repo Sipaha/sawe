@@ -3699,7 +3699,7 @@ mod tests {
 pub fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
-    let mut servers: Vec<acp::McpServer> = spk_editor_mcp_bridge_server().into_iter().collect();
+    let mut servers: Vec<acp::McpServer> = sawe_mcp_bridge_server().into_iter().collect();
     servers.extend(
         context_server_store
             .configured_server_ids()
@@ -3747,7 +3747,7 @@ pub fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::
     servers
 }
 
-/// SPK Editor fork: build an `McpServer::Stdio` entry that points at the
+/// Sawe fork: build an `McpServer::Stdio` entry that points at the
 /// embedded editor MCP socket via the editor binary's own `--nc` bridge.
 /// This is what makes `solution_agent.*` / `solutions.*` / `editor.*` /
 /// `windows.*` / etc. tools visible to the spawned ACP subagent
@@ -3756,7 +3756,7 @@ pub fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::
 /// when the socket file is missing (test harnesses, headless runs that
 /// failed to start the server) or when `current_exe` cannot be resolved
 /// (CI sandbox, etc.). See FORK.md decision 14.
-fn spk_editor_mcp_bridge_server() -> Option<acp::McpServer> {
+fn sawe_mcp_bridge_server() -> Option<acp::McpServer> {
     let socket = editor_mcp::socket_path();
     if !socket.exists() {
         return None;
@@ -3765,7 +3765,7 @@ fn spk_editor_mcp_bridge_server() -> Option<acp::McpServer> {
 
     // Per P-4 / S-BAK: `--nc` bridge subagents default to `Write` tier;
     // `Destructive` requires the user opting in via the parent process env
-    // (`SPK_EDITOR_MCP_BRIDGE_CAPS=destructive`). The bridge stamps whatever
+    // (`SAWE_MCP_BRIDGE_CAPS=destructive`). The bridge stamps whatever
     // value is currently set into the spawned subprocess so the editor-side
     // `nc` mode picks it up on the connection. When the env is unset we
     // explicitly stamp `write` so missing env vars don't accidentally
@@ -3774,7 +3774,7 @@ fn spk_editor_mcp_bridge_server() -> Option<acp::McpServer> {
         std::env::var(editor_mcp::BRIDGE_CAPS_ENV_VAR).unwrap_or_else(|_| "write".to_string());
 
     Some(acp::McpServer::Stdio(
-        acp::McpServerStdio::new("spk-editor", exe.to_string_lossy().as_ref())
+        acp::McpServerStdio::new("sawe", exe.to_string_lossy().as_ref())
             .args(vec![
                 "--nc".to_string(),
                 socket.to_string_lossy().into_owned(),

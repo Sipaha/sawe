@@ -29,7 +29,7 @@ use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
 use fs::Fs;
-// SPK Editor: FutureExt was used by initialize_agent_panel — keep the import
+// Sawe: FutureExt was used by initialize_agent_panel — keep the import
 // commented (instead of deleted) so re-enabling the agent panel is a one-line
 // flip without re-discovering which trait `.map()` came from.
 // use futures::FutureExt as _;
@@ -501,7 +501,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                         }
                     }
 
-                    // SPK Editor: do NOT mount the upstream AgentPanel here.
+                    // Sawe: do NOT mount the upstream AgentPanel here.
                     // `initialize_panels` deliberately omits it (this fork's AI
                     // surface is `solution_agent`, not upstream's agent panel).
                     // Re-adding it on every active-workspace switch was a
@@ -763,14 +763,14 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let console_panel = console_panel::ConsolePanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
-        // SPK Editor: the commit-log graph as a bottom-docked panel
+        // Sawe: the commit-log graph as a bottom-docked panel
         // (IDEA-style "Git" tool window); still also openable as a pane item.
         let git_graph_panel =
             git_graph::git_graph_panel::GitGraphPanel::load(workspace_handle.clone(), cx.clone());
-        // SPK Editor: the upstream-style left-dock SolutionsPanel was
+        // Sawe: the upstream-style left-dock SolutionsPanel was
         // removed; Solutions are surfaced via the title-bar tab strip
         // (`solutions_ui::solution_tab_strip`) instead.
-        // Collab panel disabled in spk-editor (no Zed Industries collab server access).
+        // Collab panel disabled in sawe (no Zed Industries collab server access).
         // let channels_panel =
         //     collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
@@ -798,7 +798,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(git_graph_panel, workspace_handle.clone(), cx.clone()),
             // add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-            // SPK Editor: agent_panel disabled — this fork's AI story is the
+            // Sawe: agent_panel disabled — this fork's AI story is the
             // solution_agent crate (per-Solution Claude Code sessions). Leaving
             // upstream's AgentPanel registered creates a parallel, unconfigured
             // AI surface that confuses users about where to find AI features.
@@ -872,7 +872,7 @@ fn ensure_agent_panel_for_workspace(
     })
 }
 
-// SPK Editor: kept in tree but no longer called (see futures::join! above).
+// Sawe: kept in tree but no longer called (see futures::join! above).
 // Leaving it here preserves merge-friendliness with upstream and means
 // re-enabling the panel is a one-line uncomment in `initialize_panels`.
 #[allow(dead_code)]
@@ -1493,7 +1493,7 @@ fn open_about_window(cx: &mut App) {
                 })
                 .unwrap_or_else(|| "dev".to_string());
 
-            let message: SharedString = format!("SPK Editor v{version} ({commit_sha})").into();
+            let message: SharedString = format!("Sawe v{version} ({commit_sha})").into();
             let commit = AppCommitSha::try_global(cx)
                 .map(|sha| sha.full())
                 .filter(|commit| !commit.is_empty())
@@ -1501,7 +1501,7 @@ fn open_about_window(cx: &mut App) {
 
             let attribution: SharedString =
                 "Fork of Zed by Zed Industries, Inc., modified by Simonov Pavel.".into();
-            let source_url: SharedString = "https://github.com/Sipaha/spk-editor".into();
+            let source_url: SharedString = "https://github.com/Sipaha/sawe".into();
             let licenses: SharedString = "Distributed under GPL-3.0-or-later (editor), AGPL-3.0 (collab), Apache-2.0 (libraries).".into();
 
             Self {
@@ -1646,7 +1646,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About SPK Editor".into()),
+                title: Some("About Sawe".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),
@@ -5692,14 +5692,14 @@ mod tests {
             .insert_tree(
                 Path::new("/root"),
                 json!({
-                    ".spke": {
+                    ".sawe": {
                         "settings.json": settings_init
                     }
                 }),
             )
             .await;
 
-        eprintln!("Created project with .spke/settings.json containing UNIQUEVALUE");
+        eprintln!("Created project with .sawe/settings.json containing UNIQUEVALUE");
 
         // 2. Create a project with the file system and load it
         let project = Project::test(app_state.fs.clone(), [Path::new("/root")], cx).await;
@@ -5707,7 +5707,7 @@ mod tests {
         // Save original settings content for comparison
         let original_settings = app_state
             .fs
-            .load(Path::new("/root/.spke/settings.json"))
+            .load(Path::new("/root/.sawe/settings.json"))
             .await
             .unwrap();
 
@@ -5724,7 +5724,7 @@ mod tests {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |worktree_settings| {
                 worktree_settings.project.worktree.file_scan_exclusions =
-                    Some(vec![".spke".to_string()]);
+                    Some(vec![".sawe".to_string()]);
             });
         });
 
@@ -5739,7 +5739,7 @@ mod tests {
         let has_zed_entry = cx.update(|cx| {
             worktree
                 .read(cx)
-                .entry_for_path(rel_path(".spke"))
+                .entry_for_path(rel_path(".sawe"))
                 .is_some()
         });
 
@@ -5777,7 +5777,7 @@ mod tests {
         // 8. Verify file contents after calling function
         let new_content = app_state
             .fs
-            .load(Path::new("/root/.spke/settings.json"))
+            .load(Path::new("/root/.sawe/settings.json"))
             .await
             .unwrap();
 

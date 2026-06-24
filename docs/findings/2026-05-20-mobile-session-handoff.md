@@ -1,14 +1,14 @@
 # Session handoff — mobile chat polish + project-registry feature (2026-05-20)
 
 Continuation snapshot for a fresh context. This session was **user-driven
-mobile work** (spk-editor-mobile + supporting server changes), NOT the
+mobile work** (sawe-mobile + supporting server changes), NOT the
 autonomous-supervisor track.
 
 ## State at pause
 
 Both repos are **clean and pushed**:
-- `spk-editor` @ `fc73594c5d` (main, pushed).
-- `spk-editor-mobile` @ `9c39678` (main, pushed).
+- `sawe` @ `fc73594c5d` (main, pushed).
+- `sawe-mobile` @ `9c39678` (main, pushed).
 
 Running editor binary: built **10:59 (2026-05-20)** from `fc73594c5d`.
 Verify any time without bothering the user:
@@ -16,7 +16,7 @@ Verify any time without bothering the user:
 python3 - <<'EOF'
 import socket,os,json
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(8)
-s.connect(os.path.expanduser("~/.spk/spk-editor/config/mcp.sock"))
+s.connect(os.path.expanduser("~/.spk/sawe/config/mcp.sock"))
 s.sendall((json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"editor.capabilities","arguments":{}}})+"\n").encode())
 b=b""
 while True:
@@ -39,7 +39,7 @@ need a manual editor restart by the user.
 
 ## What shipped this session (committed)
 
-**spk-editor `fc73594c5d`** (one commit):
+**sawe `fc73594c5d`** (one commit):
 - `solution_agent.reset_context` MCP tool (mobile "Reset context" — clears
   conversation, keeps id+title; cold sessions resolve a headless project).
 - upload resolver preserves ResourceLink `_meta` → queued image keeps its
@@ -50,7 +50,7 @@ need a manual editor restart by the user.
 - reqwest_client: normalize bare `socks://` → `socks5://` proxy scheme.
 - editor.capabilities: `binary_path` + `binary_built_at`.
 
-**spk-editor-mobile `ae87530..9c39678`**:
+**sawe-mobile `ae87530..9c39678`**:
 - DIY AnnotatedString markdown renderer (replaced multiplatform-markdown-
   renderer — its internal Loading-state caused per-emit flicker).
 - `animateHeightOnly` modifier: animates content-size HEIGHT only (plain
@@ -93,16 +93,16 @@ projects to an existing Solution, and create new empty (non-git) projects
   allowlist entry → "method not found" even though the tool exists. This
   burned a full rebuild cycle this session.
 - Events the phone consumes also need `allow_list::should_forward_event`.
-- Server release builds: `cargo build --bin spk-editor --profile
-  release-fast` (~5 min). The user runs `target/release-fast/spk-editor`;
-  socket `~/.spk/spk-editor/config/mcp.sock` (NOT `-dev`). Build in the
+- Server release builds: `cargo build --bin sawe --profile
+  release-fast` (~5 min). The user runs `target/release-fast/sawe`;
+  socket `~/.spk/sawe/config/mcp.sock` (NOT `-dev`). Build in the
   background; verify via the capabilities snippet above.
-- Mobile build+install: `cd spk-editor-mobile && ./gradlew :app:assembleDebug`
+- Mobile build+install: `cd sawe-mobile && ./gradlew :app:assembleDebug`
   then `adb -s A3SQUT5902000367 install -r app/build/outputs/apk/debug/app-debug.apk`.
   The phone drops off adb frequently — re-ask the user to reconnect.
 - Inspect live session/queue state over the socket with
   `solution_agent.list_sessions` / `get_session` (this session's chat is
-  session `8l84aoiw`, title "spk-editor").
+  session `8l84aoiw`, title "sawe").
 - `git push` in the mobile repo once reported "up-to-date" with a stale
   `@{u}`; use `git push origin main` explicitly.
 - No `Co-Authored-By` in commits (user rule). Fork lands directly on `main`.

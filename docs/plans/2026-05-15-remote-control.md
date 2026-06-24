@@ -27,7 +27,7 @@ progress when away from the workstation.
 > новые. Главное внутри — доступ к диалогам с агентами (раздавать
 > команды + следить за прогрессом, когда не у компа).
 >
-> Также нужно создать проект `spk-editor-mobile` для клиента,
+> Также нужно создать проект `sawe-mobile` для клиента,
 > чтобы с Android-телефона управлять и следить за прогрессом агентов в
 > солюшенах.
 
@@ -45,7 +45,7 @@ scoping notes; the per-phase plan docs land as the phases start.
 - Modal: address (text field + "Detect via ifconfig.me" or similar
   button), port (default suggestion + editable), start/stop button,
   client list (initially empty).
-- Settings persistence: `~/.config/spk-editor/remote-control.json` (or
+- Settings persistence: `~/.config/sawe/remote-control.json` (or
   reuse SolutionsDb).
 - No network listener yet — UI scaffolding only.
 
@@ -87,9 +87,9 @@ scoping notes; the per-phase plan docs land as the phases start.
 - Auth: every request signed/authenticated by the client's secret.
 - Throttling: rate limits per client.
 
-### Phase R-5 — Android client scaffold (`spk-editor-mobile`)
+### Phase R-5 — Android client scaffold (`sawe-mobile`)
 
-- New project, OUTSIDE the spk-editor repo (or as a sibling crate? unlikely —
+- New project, OUTSIDE the sawe repo (or as a sibling crate? unlikely —
   Android needs Gradle/Kotlin, not Cargo; separate repo).
 - QR scanner → parse `spk-remote://` URL → establish encrypted channel.
 - UI: list of solutions, drill into one, list agent sessions, drill into

@@ -140,7 +140,7 @@ pub fn init(cx: &mut App) {
     register_serializable_item::<Onboarding>(cx);
 }
 
-/// First-launch entry point. Opens the SPK Editor launcher window
+/// First-launch entry point. Opens the Sawe launcher window
 /// (`WelcomeWindow`) — a dedicated, chrome-less top-level window, NOT
 /// a workspace tab. Sets the historical `FIRST_OPEN` flag so future
 /// code paths that test it see the post-onboarding state.
@@ -194,7 +194,7 @@ impl Onboarding {
     }
 
     fn handle_sign_in(&mut self, _: &SignIn, _window: &mut Window, _cx: &mut Context<Self>) {
-        // Sign-in UI is hidden in spk-editor — Zed accounts are not used.
+        // Sign-in UI is hidden in sawe — Zed accounts are not used.
     }
 
     fn render_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -258,7 +258,7 @@ impl Render for Onboarding {
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to SPK Editor")
+                                                        Headline::new("Welcome to Sawe")
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(

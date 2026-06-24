@@ -16,14 +16,14 @@ actions!(
     ]
 );
 
-const ZED_REPO_URL: &str = "https://github.com/Sipaha/spk-editor";
+const ZED_REPO_URL: &str = "https://github.com/Sipaha/sawe";
 
-const REQUEST_FEATURE_URL: &str = "https://github.com/Sipaha/spk-editor/discussions/new/choose";
+const REQUEST_FEATURE_URL: &str = "https://github.com/Sipaha/sawe/discussions/new/choose";
 
 fn file_bug_report_url(specs: &SystemSpecs) -> String {
     format!(
         concat!(
-            "https://github.com/Sipaha/spk-editor/issues/new",
+            "https://github.com/Sipaha/sawe/issues/new",
             "?",
             "environment={}"
         ),
@@ -32,7 +32,7 @@ fn file_bug_report_url(specs: &SystemSpecs) -> String {
 }
 
 fn email_zed_url(_specs: &SystemSpecs) -> String {
-    "https://github.com/Sipaha/spk-editor/issues/new".to_string()
+    "https://github.com/Sipaha/sawe/issues/new".to_string()
 }
 
 pub fn init(cx: &mut App) {

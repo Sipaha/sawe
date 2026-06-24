@@ -172,9 +172,9 @@ pub(crate) static JOBS: LazyLock<[Job; 22]> = LazyLock::new(|| {
         // Move old files
         // Not deleting because installing new files can fail
         Job::mkdir(p("old")),
-        Job::move_file(p("spk-editor.exe"), p("old\\spk-editor.exe")),
+        Job::move_file(p("sawe.exe"), p("old\\sawe.exe")),
         Job::mkdir(p("old\\bin")),
-        Job::move_file(p("bin\\spk-editor.exe"), p("old\\bin\\spk-editor.exe")),
+        Job::move_file(p("bin\\sawe.exe"), p("old\\bin\\sawe.exe")),
         Job::move_file(p("bin\\zed"), p("old\\bin\\zed")),
         //
         // TODO: remove after a few weeks once everyone is on the new version and this file never exists
@@ -189,8 +189,8 @@ pub(crate) static JOBS: LazyLock<[Job; 22]> = LazyLock::new(|| {
         //
         Job::move_file(p("conpty.dll"), p("old\\conpty.dll")),
         // Copy new files
-        Job::move_file(p("install\\spk-editor.exe"), p("spk-editor.exe")),
-        Job::move_file(p("install\\bin\\spk-editor.exe"), p("bin\\spk-editor.exe")),
+        Job::move_file(p("install\\sawe.exe"), p("sawe.exe")),
+        Job::move_file(p("install\\bin\\sawe.exe"), p("bin\\sawe.exe")),
         Job::move_file(p("install\\bin\\zed"), p("bin\\zed")),
         //
         Job::mkdir_if_exists(p("x64"), p("install\\x64")),
@@ -279,8 +279,8 @@ pub(crate) static JOBS: LazyLock<[Job; 9]> = LazyLock::new(|| {
 fn release_file_handles(app_dir: &Path) -> Result<()> {
     // Files that commonly get locked by Explorer or other processes
     let files_to_release = [
-        app_dir.join("spk-editor.exe"),
-        app_dir.join("bin\\spk-editor.exe"),
+        app_dir.join("sawe.exe"),
+        app_dir.join("bin\\sawe.exe"),
         app_dir.join("bin\\zed"),
         app_dir.join("conpty.dll"),
     ];
@@ -428,7 +428,7 @@ pub(crate) fn perform_update(app_dir: &Path, hwnd: Option<isize>, launch: bool) 
 
     if launch {
         #[allow(clippy::disallowed_methods, reason = "doesn't run in the main binary")]
-        let _ = std::process::Command::new(app_dir.join("spk-editor.exe")).spawn();
+        let _ = std::process::Command::new(app_dir.join("sawe.exe")).spawn();
     }
     log::info!("Update completed successfully");
     Ok(())

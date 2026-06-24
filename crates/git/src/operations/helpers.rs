@@ -1,5 +1,5 @@
-//! Pure-stdlib subcommand handlers for `spk-editor --git-rebase-helper` and
-//! `spk-editor --git-message-set`. Called from `crates/zed/src/main.rs` argv
+//! Pure-stdlib subcommand handlers for `sawe --git-rebase-helper` and
+//! `sawe --git-message-set`. Called from `crates/zed/src/main.rs` argv
 //! handling. No GPUI / no editor init — the helper binary path is invoked
 //! many times per interactive rebase by `git`, so fast exit is critical.
 //!
@@ -61,7 +61,7 @@ pub enum HelperError {
     Spawn(#[source] std::io::Error),
 }
 
-/// Implementation of `spk-editor --git-rebase-helper <todo-path>`. Reads
+/// Implementation of `sawe --git-rebase-helper <todo-path>`. Reads
 /// `<session-dir>/todo.txt`, validates it parses as a git rebase todo, and
 /// overwrites `todo_path` in place.
 pub fn rebase_helper_main(todo_path: &Path) -> Result<(), HelperError> {
@@ -93,7 +93,7 @@ pub fn rebase_helper_main(todo_path: &Path) -> Result<(), HelperError> {
     Ok(())
 }
 
-/// Implementation of `spk-editor --git-message-set <token>`. Looks up the
+/// Implementation of `sawe --git-message-set <token>`. Looks up the
 /// pre-staged commit message at `<session-dir>/messages/<token>.txt` and
 /// runs `git commit --amend -F <path>` in the current working directory.
 pub fn message_set_main(token: &str) -> Result<(), HelperError> {
@@ -356,7 +356,7 @@ mod tests {
 # this is a comment
 pick deadbeef do thing
 squash cafef00d another
-exec spk-editor --git-message-set 0123456789abcdef0123456789abcdef
+exec sawe --git-message-set 0123456789abcdef0123456789abcdef
 drop bbbbbbbb
 ";
         validate_todo_body(body).expect("ok");

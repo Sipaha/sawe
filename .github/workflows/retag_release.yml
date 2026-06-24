@@ -10,7 +10,7 @@ on:
         type: string
 jobs:
   run_retag_release:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:
     - id: generate-token

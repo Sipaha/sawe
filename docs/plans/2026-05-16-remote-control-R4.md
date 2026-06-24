@@ -182,7 +182,7 @@ This is the load-bearing acceptance gate.
   overflow, drop oldest and log. (Better than killing the connection
   on a momentary client stall.)
 - **`editor_mcp::socket_path()` race.** The embedded server symlinks
-  `~/.spk/spk-editor-dev/config/mcp.sock` to a tempdir-backed socket;
+  `~/.spk/sawe-dev/config/mcp.sock` to a tempdir-backed socket;
   the symlink lifetime is the editor's lifetime. Resolve the path at
   proxy-open time, not at listener startup, so an editor restart
   (which rebuilds the symlink target) doesn't break new proxies.
@@ -190,10 +190,10 @@ This is the load-bearing acceptance gate.
 ## Verification
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
 
 set -o pipefail
-cargo build --bin spk-editor 2>&1 | tee /tmp/r4_build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/r4_build.txt
 grep -E "^error|could not compile" /tmp/r4_build.txt
 
 cargo clippy -p remote_control --all-targets -- -D warnings 2>&1 | tee /tmp/r4_clippy.txt
@@ -207,7 +207,7 @@ grep "proxy_e2e" /tmp/r4_test.txt
 
 Acceptance:
 
-- [x] `cargo build --bin spk-editor` passes.
+- [x] `cargo build --bin sawe` passes.
 - [x] `cargo clippy -p remote_control --all-targets -- -D warnings` passes.
 - [x] `cargo test -p remote_control` ≥ 31 tests (R-2 baseline) + new
       proxy unit tests + the `proxy_e2e` integration test, all green.

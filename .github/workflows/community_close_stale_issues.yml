@@ -13,7 +13,7 @@ on:
 
 jobs:
   stale:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
       - uses: actions/stale@997185467fa4f803885201cee163a9f38240193d # v10

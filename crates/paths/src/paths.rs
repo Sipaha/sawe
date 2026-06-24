@@ -1,4 +1,4 @@
-//! Paths to locations used by SPK Editor.
+//! Paths to locations used by Sawe.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 ///   * Debug builds (`cfg!(debug_assertions)`) → `true`
 ///   * Release builds → `false`
 ///
-/// Override (in either direction) via the `SPK_EDITOR_DEV_DIRS` env
+/// Override (in either direction) via the `SAWE_DEV_DIRS` env
 /// var: set to `1` / `true` to force the dev suffix on (useful when
 /// you want a release-shaped binary to write to a sandboxed dir),
 /// set to `0` / `false` to force it off (useful when a debug build
@@ -27,7 +27,7 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// to reproduce a bug against their workspace database).
 fn use_dev_suffix() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| match std::env::var("SPK_EDITOR_DEV_DIRS") {
+    *CACHED.get_or_init(|| match std::env::var("SAWE_DEV_DIRS") {
         Ok(v) => matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -39,18 +39,18 @@ fn use_dev_suffix() -> bool {
 /// Kebab-case directory name (Linux / generic). See `use_dev_suffix`.
 pub fn dir_name_kebab() -> &'static str {
     if use_dev_suffix() {
-        "spk-editor-dev"
+        "sawe-dev"
     } else {
-        "spk-editor"
+        "sawe"
     }
 }
 
 /// PascalCase directory name (macOS / Windows). See `use_dev_suffix`.
 pub fn dir_name_pascal() -> &'static str {
     if use_dev_suffix() {
-        "SpkEditor-Dev"
+        "Sawe-Dev"
     } else {
-        "SpkEditor"
+        "Sawe"
     }
 }
 
@@ -61,16 +61,14 @@ static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved data directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/Library/Application Support/SpkEditor`.
-/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/spk-editor`.
-/// On Windows, this is `%LOCALAPPDATA%\SpkEditor`.
+/// On all platforms this is `base_dir()/data`, i.e. `~/.spk/sawe/data`
+/// (or `~/.spk/sawe-dev/data` for dev builds). See `base_dir`.
 static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved config directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/.config/spk-editor`.
-/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/spk-editor`.
-/// On Windows, this is `%APPDATA%\SpkEditor`.
+/// On all platforms this is `base_dir()/config`, i.e. `~/.spk/sawe/config`
+/// (or `~/.spk/sawe-dev/config` for dev builds). See `base_dir`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Returns the relative path to the zed_server directory on the ssh host.
@@ -133,13 +131,13 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
 /// their own state under the same umbrella.
 ///
 /// Layout:
-///   `~/.spk/spk-editor/` — release profile of this editor
-///   `~/.spk/spk-editor-dev/` — debug profile of this editor
+///   `~/.spk/sawe/` — release profile of this editor
+///   `~/.spk/sawe-dev/` — debug profile of this editor
 ///   `~/.spk/<other-spk-tool>/` — sibling apps drop their state here
 ///
 /// Windows / macOS get the same single-folder layout (no native
 /// `Application Support` / `AppData` split) so the cleanup story
-/// stays one-line everywhere: `rm -rf ~/.spk/spk-editor[-dev]`.
+/// stays one-line everywhere: `rm -rf ~/.spk/sawe[-dev]`.
 pub fn base_dir() -> &'static PathBuf {
     static BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
     BASE_DIR.get_or_init(|| {
@@ -150,7 +148,7 @@ pub fn base_dir() -> &'static PathBuf {
     })
 }
 
-/// Returns the path to the configuration directory used by SPK Editor.
+/// Returns the path to the configuration directory used by Sawe.
 pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
@@ -161,7 +159,7 @@ pub fn config_dir() -> &'static PathBuf {
     })
 }
 
-/// Returns the path to the data directory used by SPK Editor.
+/// Returns the path to the data directory used by Sawe.
 pub fn data_dir() -> &'static PathBuf {
     CURRENT_DATA_DIR.get_or_init(|| {
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
@@ -177,7 +175,7 @@ pub fn state_dir() -> &'static PathBuf {
     STATE_DIR.get_or_init(|| base_dir().join("state"))
 }
 
-/// Returns the path to the temp / cache directory used by SPK Editor.
+/// Returns the path to the temp / cache directory used by Sawe.
 pub fn temp_dir() -> &'static PathBuf {
     static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
     TEMP_DIR.get_or_init(|| base_dir().join("cache"))
@@ -195,22 +193,22 @@ pub fn logs_dir() -> &'static PathBuf {
     LOGS_DIR.get_or_init(|| base_dir().join("logs"))
 }
 
-/// Returns the path to the SPK Editor server directory on this SSH host.
+/// Returns the path to the Sawe server directory on this SSH host.
 pub fn remote_server_state_dir() -> &'static PathBuf {
     static REMOTE_SERVER_STATE: OnceLock<PathBuf> = OnceLock::new();
     REMOTE_SERVER_STATE.get_or_init(|| data_dir().join("server_state"))
 }
 
-/// Returns the path to the `SpkEditor.log` file.
+/// Returns the path to the `Sawe.log` file.
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    LOG_FILE.get_or_init(|| logs_dir().join("SpkEditor.log"))
+    LOG_FILE.get_or_init(|| logs_dir().join("Sawe.log"))
 }
 
-/// Returns the path to the `SpkEditor.log.old` file.
+/// Returns the path to the `Sawe.log.old` file.
 pub fn old_log_file() -> &'static PathBuf {
     static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    OLD_LOG_FILE.get_or_init(|| logs_dir().join("SpkEditor.log.old"))
+    OLD_LOG_FILE.get_or_init(|| logs_dir().join("Sawe.log.old"))
 }
 
 /// Returns the path to the database directory.
@@ -450,9 +448,9 @@ pub fn devcontainer_dir() -> &'static PathBuf {
     DEVCONTAINER_DIR.get_or_init(|| data_dir().join("devcontainer"))
 }
 
-/// Returns the relative path to a `.spke` folder within a project.
+/// Returns the relative path to a `.sawe` folder within a project.
 pub fn local_settings_folder_name() -> &'static str {
-    ".spke"
+    ".sawe"
 }
 
 /// Returns the relative path to a `.vscode` folder within a project.
@@ -463,21 +461,21 @@ pub fn local_vscode_folder_name() -> &'static str {
 /// Returns the relative path to a `settings.json` file within a project.
 pub fn local_settings_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".spke/settings.json").unwrap());
+        LazyLock::new(|| RelPath::unix(".sawe/settings.json").unwrap());
     *CACHED
 }
 
 /// Returns the relative path to a `tasks.json` file within a project.
 pub fn local_tasks_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".spke/tasks.json").unwrap());
+        LazyLock::new(|| RelPath::unix(".sawe/tasks.json").unwrap());
     *CACHED
 }
 
 /// Returns the relative path to a `run-configurations.json` file within a project.
 pub fn local_run_configurations_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".spke/run-configurations.json").unwrap());
+        LazyLock::new(|| RelPath::unix(".sawe/run-configurations.json").unwrap());
     *CACHED
 }
 
@@ -497,10 +495,10 @@ pub fn task_file_name() -> &'static str {
 }
 
 /// Returns the relative path to a `debug.json` file within a project.
-/// .spke/debug.json
+/// .sawe/debug.json
 pub fn local_debug_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".spke/debug.json").unwrap());
+        LazyLock::new(|| RelPath::unix(".sawe/debug.json").unwrap());
     *CACHED
 }
 
@@ -615,11 +613,11 @@ mod rebrand_tests {
     use super::*;
 
     #[test]
-    fn config_dir_contains_spk_editor() {
+    fn config_dir_contains_sawe() {
         let p = config_dir();
         assert!(
-            p.to_string_lossy().contains("spk-editor") || p.to_string_lossy().contains("SpkEditor"),
-            "config_dir should mention spk-editor; got {p:?}"
+            p.to_string_lossy().contains("sawe") || p.to_string_lossy().contains("Sawe"),
+            "config_dir should mention sawe; got {p:?}"
         );
         assert!(
             !p.to_string_lossy().to_ascii_lowercase().contains("zed"),
@@ -628,11 +626,11 @@ mod rebrand_tests {
     }
 
     #[test]
-    fn data_dir_contains_spk_editor() {
+    fn data_dir_contains_sawe() {
         let p = data_dir();
         assert!(
-            p.to_string_lossy().contains("spk-editor") || p.to_string_lossy().contains("SpkEditor"),
-            "data_dir should mention spk-editor; got {p:?}"
+            p.to_string_lossy().contains("sawe") || p.to_string_lossy().contains("Sawe"),
+            "data_dir should mention sawe; got {p:?}"
         );
         assert!(
             !p.to_string_lossy().to_ascii_lowercase().contains("zed"),

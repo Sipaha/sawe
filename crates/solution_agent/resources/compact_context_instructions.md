@@ -138,17 +138,17 @@ After all files are on disk, invoke the editor's
 
 ### How to invoke (pick the path your runtime supports — try in order)
 
-1. **Native MCP-tool binding.** If the spk-editor MCP server's tools
+1. **Native MCP-tool binding.** If the sawe MCP server's tools
    are auto-bound in your runtime as callable functions (Claude Code
    bridges them as `mcp__<server>__<tool>` or similar), invoke
    directly. The exact callable name varies by harness; try
-   `mcp__spk-editor__solution_agent_compact_session` or
-   `mcp__spk_editor__solution_agent_compact_session` first.
+   `mcp__sawe__solution_agent_compact_session` or
+   `mcp__sawe__solution_agent_compact_session` first.
 
 2. **Direct JSON-RPC over the editor's Unix socket.** Always works as
    long as the editor process is alive. The socket lives at
-   `$HOME/.spk/spk-editor-dev/config/mcp.sock` for a `--debug` build
-   or `$HOME/.spk/spk-editor/config/mcp.sock` for release; the path
+   `$HOME/.spk/sawe-dev/config/mcp.sock` for a `--debug` build
+   or `$HOME/.spk/sawe/config/mcp.sock` for release; the path
    is symlinked into the runtime tmpdir but the symlink under
    `$HOME` is stable. Newline-delimited JSON-RPC 2.0. Example using
    Bash + Python (substitute `{{session_id}}` and the prompt path):
@@ -157,7 +157,7 @@ After all files are on disk, invoke the editor's
    python3 - <<'PY'
    import socket, json, os
    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-   sock.connect(os.path.expanduser("~/.spk/spk-editor/config/mcp.sock"))
+   sock.connect(os.path.expanduser("~/.spk/sawe/config/mcp.sock"))
    f = sock.makefile("rwb", buffering=0)
    req = {
        "jsonrpc": "2.0", "id": 1,

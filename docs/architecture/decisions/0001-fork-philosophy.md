@@ -9,7 +9,7 @@
 
 ## Context
 
-SPK Editor is a personal hard fork of [Zed](https://github.com/zed-industries/zed)
+Sawe is a personal hard fork of [Zed](https://github.com/zed-industries/zed)
 maintained by @Sipaha. The fork has shipped meaningful local additions
 (`solutions`, `solution_agent`, `solutions_ui`, `editor_mcp`, `solution_git`,
 `run_config*`) and disabled meaningful upstream subsystems (`collab`,

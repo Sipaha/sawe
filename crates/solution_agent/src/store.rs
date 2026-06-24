@@ -2018,7 +2018,7 @@ impl SolutionAgentStore {
                 .join(session_id.to_string())
                 .join("inbox"),
             None => std::env::temp_dir()
-                .join("spk-editor-inbox")
+                .join("sawe-inbox")
                 .join(session_id.to_string()),
         }
     }
@@ -5195,7 +5195,7 @@ impl SolutionAgentStore {
         ) {
             let (title, body) = {
                 let s = session.read(cx);
-                let title = format!("SPK Editor — {} ({})", s.agent_id, s.title);
+                let title = format!("Sawe — {} ({})", s.agent_id, s.title);
                 let body = match decision.kind {
                     notifier::NotifyKind::Completed => {
                         format!("Done after {} min", decision.elapsed.as_secs() / 60)

@@ -1,4 +1,4 @@
-//! Editor MCP — single-instance MCP server embedded in SPK Editor.
+//! Editor MCP — single-instance MCP server embedded in Sawe.
 //!
 //! Approach C central registry: domain crates register their tools during
 //! their own `init()` via [`register_tool`]. After all init is done, the

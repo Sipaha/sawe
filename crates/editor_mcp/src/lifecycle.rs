@@ -11,9 +11,9 @@ use util::ResultExt as _;
 
 /// Overrides the directory containing `mcp.lock` and `mcp.sock`. Set by
 /// integration tests to isolate the well-known socket from any live
-/// `spk-editor` instance running on the same machine. Without this,
+/// `sawe` instance running on the same machine. Without this,
 /// concurrent e2e tests would race the live editor's lock and clobber
-/// the user's `~/.config/spk-editor/mcp.{lock,sock}` files.
+/// the user's `~/.config/sawe/mcp.{lock,sock}` files.
 ///
 /// For end-to-end probe instances (running a real editor in parallel with the
 /// user's), use `script/run-mcp --runtime-dir DIR` instead — that overrides
@@ -52,10 +52,10 @@ impl std::fmt::Display for LockError {
             LockError::Busy {
                 holder_pid: Some(pid),
             } => {
-                write!(f, "another spk-editor instance holds the lock (PID {pid})")
+                write!(f, "another sawe instance holds the lock (PID {pid})")
             }
             LockError::Busy { holder_pid: None } => {
-                write!(f, "another spk-editor instance holds the lock")
+                write!(f, "another sawe instance holds the lock")
             }
             LockError::Io(err) => write!(f, "io error: {err}"),
         }
@@ -114,8 +114,8 @@ impl Global for ActiveServer {}
 
 pub fn start_server(cx: &mut App) -> Result<()> {
     // S-BAK: derive process-global caller capabilities from the
-    // `SPK_EDITOR_MCP_BRIDGE_CAPS` env var on first server start. The bridge
-    // (`agent_servers::acp::spk_editor_mcp_bridge_server`) stamps this on
+    // `SAWE_MCP_BRIDGE_CAPS` env var on first server start. The bridge
+    // (`agent_servers::acp::sawe_mcp_bridge_server`) stamps this on
     // each subagent's `--nc` subprocess; the editor itself usually inherits
     // an unset value, in which case we default to Write (subagent-safe).
     // See `tier_guard.rs` for the trade-off (process-global, not per-conn).

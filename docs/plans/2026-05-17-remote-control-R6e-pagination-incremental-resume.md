@@ -1,7 +1,7 @@
 # R-6e: Pagination on `get_session` + incremental resume via `lastSeenEntryIndex`
 
 **Status:** complete (server commit `b756392b52`, client commit `c7fbddc`)
-**Repos:** spk-editor (server) → `spk-editor-mobile` (client). Two sub-agent dispatches.
+**Repos:** sawe (server) → `sawe-mobile` (client). Two sub-agent dispatches.
 **Depends on:** R-5e (`get_session` shape) + R-6d (`lastSeenEntryIndex` persisted on the client side).
 **Goal:** Stop sending entire session histories on every reconnect / screen entry. A 200-entry chat with embedded images can be 50+ MB on the wire; on a flaky LTE link, that's the difference between "instant" and "30-second waits + frequent timeouts". Add cursor-style pagination to `get_session` + wire the client to fetch only the delta on reconnect.
 
@@ -165,9 +165,9 @@ Add to `:app`-side ViewModel-level: skip (no `:app` test infra; document for nex
 ## Acceptance (server side)
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
 set -o pipefail
-cargo build --bin spk-editor 2>&1 | tee /tmp/r6e_build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/r6e_build.txt
 grep -E "^error|could not compile" /tmp/r6e_build.txt
 cargo clippy -p solution_agent --all-targets -- -D warnings 2>&1 | tee /tmp/r6e_clippy.txt
 cargo test -p solution_agent --no-fail-fast 2>&1 | tee /tmp/r6e_test.txt
@@ -185,7 +185,7 @@ cargo test -p remote_control proxy_e2e 2>&1 | grep "test result:"
 ## Acceptance (client side, after server lands)
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 ANDROID_HOME=$HOME/Android/Sdk JAVA_HOME=$HOME/.jdks/temurin-21.0.10 ./gradlew :core:test :app:assembleRelease --rerun-tasks 2>&1 | tee /tmp/r6e_client.txt | tail -10
 grep -E "BUILD SUCCESSFUL|FAILURE:" /tmp/r6e_client.txt
 ```
@@ -198,6 +198,6 @@ grep -E "BUILD SUCCESSFUL|FAILURE:" /tmp/r6e_client.txt
 
 ## When done
 
-Server sub-agent reports: commit SHA on spk-editor main, test count delta, any place where the existing `acp_thread` API forced a less-clean filter (e.g. if entries don't carry indices naturally).
+Server sub-agent reports: commit SHA on sawe main, test count delta, any place where the existing `acp_thread` API forced a less-clean filter (e.g. if entries don't carry indices naturally).
 
 Client sub-agent reports: sibling commit SHA, test count delta, new APK size, UX trade-offs (when to auto-load-older vs require a tap), any place where the server's wire shape didn't match the spec above.

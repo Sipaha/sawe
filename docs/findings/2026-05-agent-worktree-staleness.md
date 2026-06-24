@@ -87,4 +87,4 @@ isn't here", the workaround applies. Or proactively, `cd <worktree-path>
 ## Status
 
 This is an Agent-SDK behavioural quirk we work around in our prompts.
-Not an SPK Editor bug; no upstream fix to file.
+Not an Sawe bug; no upstream fix to file.

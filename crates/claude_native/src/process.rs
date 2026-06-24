@@ -230,7 +230,7 @@ async fn read_stdout(
                     // `initialize` via the outgoing channel directly, not via
                     // `send_control`, so its response has no pending sender)
                     // and for any unsolicited acks claude may emit. Logged at
-                    // debug so SpkEditor.log isn't flooded — set RUST_LOG to
+                    // debug so Sawe.log isn't flooded — set RUST_LOG to
                     // include it if you're debugging the control plane.
                     None => log::debug!("control response for unknown request_id {request_id}"),
                 }

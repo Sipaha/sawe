@@ -1,24 +1,24 @@
-name: spk-editor
-title: SPK Editor
+name: sawe
+title: Sawe
 base: core24
 version: "$RELEASE_VERSION"
 summary: Personal fork of Zed code editor
 description: |
-  SPK Editor is a personal fork of Zed by Zed Industries, Inc., modified by
+  Sawe is a personal fork of Zed by Zed Industries, Inc., modified by
   Simonov Pavel. It is a modern open-source code editor, built from the ground
   up in Rust with a GPU-accelerated renderer.
 grade: stable
 confinement: classic
 compression: lzo
-website: https://github.com/Sipaha/spk-editor
-source-code: https://github.com/Sipaha/spk-editor
-issues: https://github.com/Sipaha/spk-editor/issues
-contact: https://github.com/Sipaha/spk-editor/issues
+website: https://github.com/Sipaha/sawe
+source-code: https://github.com/Sipaha/sawe
+issues: https://github.com/Sipaha/sawe/issues
+contact: https://github.com/Sipaha/sawe/issues
 
 parts:
-  spk-editor:
+  sawe:
     plugin: dump
-    source: "https://github.com/Sipaha/spk-editor/releases/download/v$RELEASE_VERSION/spk-editor-linux-x86_64.tar.gz"
+    source: "https://github.com/Sipaha/sawe/releases/download/v$RELEASE_VERSION/sawe-linux-x86_64.tar.gz"
 
     organize:
       # These renames seem to not be necessary, but it's tidier.
@@ -27,10 +27,10 @@ parts:
 
     stage-packages:
       - libasound2t64
-      # snapcraft has a lint that this is unused, but without it SPK Editor exits with
+      # snapcraft has a lint that this is unused, but without it Sawe exits with
       # "Missing Vulkan entry points: LibraryLoadFailure" in wgpu.
       - libvulkan1
-      # snapcraft has a lint that this is unused, but without it SPK Editor exits with
+      # snapcraft has a lint that this is unused, but without it Sawe exits with
       # "NoWaylandLib" when run with Wayland.
       - libwayland-client0
       - libxcb1
@@ -53,8 +53,8 @@ parts:
       - -usr/share/man
 
 apps:
-  spk-editor:
-    command: usr/bin/spk-editor
-    common-id: ru.sipaha.spk-editor
+  sawe:
+    command: usr/bin/sawe
+    common-id: ru.sipaha.sawe
     environment:
       ZED_BUNDLE_TYPE: snap

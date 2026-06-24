@@ -44,7 +44,7 @@ the index into all the other plans / ADRs / findings created today.
 | Item | Track | Where | Notes |
 |---|---|---|---|
 | **R-2** Server protocol + listener | HEAVY (large) | `crates/remote_control` (new MCP-equivalent namespace `remote.*`) | Needs ADR-0003 first — pick WebSocket+Noise vs raw TCP+TLS, decide NAT/uPnP, decide MCP-subset vs custom protocol. Open design questions in [`plans/2026-05-15-remote-control.md`](../plans/2026-05-15-remote-control.md) § "Open design questions". |
-| **R-3..R-6** | HEAVY × 4 | (Same arc) | Phase R-3 = client provisioning UX (already mostly UI from R-1/R-1.5 — needs server-side auth from R-2). R-4 = `remote.*` MCP tools. R-5 = Android client (`spk-editor-mobile`, separate repo). R-6 = polish. |
+| **R-3..R-6** | HEAVY × 4 | (Same arc) | Phase R-3 = client provisioning UX (already mostly UI from R-1/R-1.5 — needs server-side auth from R-2). R-4 = `remote.*` MCP tools. R-5 = Android client (`sawe-mobile`, separate repo). R-6 = polish. |
 | **E** Queued message → claude | HEAVY | `crates/solution_agent` | User-requested 2026-05-15: send a queued message while the agent is mid-turn; auto-dispatch on turn completion. Backend (store queue) + UI (input stays editable + "queued" indicator). |
 | **F** Sub-agent indication UI | HEAVY | `spk-cockpit` (different project) | User-requested 2026-05-15. Show running sub-agents with progress / tokens / interrupt. Cross-project, colder context. |
 | **G** `spk-image://` URL in queued message | LIGHT | `spk-cockpit` (different project) | User-reported 2026-05-15: images don't open in queued messages — the custom scheme isn't registered. |

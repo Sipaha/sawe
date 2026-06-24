@@ -116,7 +116,7 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
     match provider {
         EditPredictionProvider::None => None,
         EditPredictionProvider::Copilot => Some(EditPredictionProviderConfig::Copilot),
-        // Edit prediction (Zeta) disabled in spk-editor (requires Zed account).
+        // Edit prediction (Zeta) disabled in sawe (requires Zed account).
         EditPredictionProvider::Zed => None,
         EditPredictionProvider::Codestral => Some(EditPredictionProviderConfig::Codestral),
         EditPredictionProvider::Ollama | EditPredictionProvider::OpenAiCompatibleApi => {
@@ -138,7 +138,7 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
 
             if matches!(format, EditPredictionPromptFormat::Zeta(_)) {
                 // Zeta-format prompts route through the Zed cloud delegate, which
-                // requires a Zed account; spk-editor disables that path.
+                // requires a Zed account; sawe disables that path.
                 None
             } else {
                 Some(EditPredictionProviderConfig::Zed(

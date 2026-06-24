@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 jobs:
   detect_changed_extensions:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::checkout_repo
@@ -47,7 +47,7 @@ jobs:
   bump_extension_versions:
     needs:
     - detect_changed_extensions
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     permissions:
       actions: write
       contents: write

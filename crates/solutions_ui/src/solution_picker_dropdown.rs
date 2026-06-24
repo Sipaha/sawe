@@ -494,7 +494,7 @@ mod tests {
             },
             ClosedSolutionRow {
                 id: SolutionId("3".into()),
-                name: "spk-editor".into(),
+                name: "sawe".into(),
                 root: PathBuf::from("/x/3"),
             },
         ];
@@ -512,6 +512,6 @@ mod tests {
             .filter(|r| r.name.to_lowercase().contains(&query))
             .map(|r| r.name.as_ref())
             .collect();
-        assert_eq!(matched, vec!["spk-editor"]);
+        assert_eq!(matched, vec!["sawe"]);
     }
 }

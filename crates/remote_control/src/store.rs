@@ -82,7 +82,7 @@ impl RemoteControlStore {
 
     /// SHA-256 fingerprint of the live TLS cert (set once the listener has
     /// successfully bound). The R-3 QR generator reads this to embed
-    /// `server_fp=<base64>` in the `spk-editor-remote://` URL.
+    /// `server_fp=<base64>` in the `sawe-remote://` URL.
     pub fn cert_fingerprint(&self) -> Option<[u8; 32]> {
         self.cert_fingerprint
     }

@@ -121,7 +121,7 @@ pub fn dispatch(decision: &NotificationDecision, title: &str, body: &str, _cx: &
             };
             proxy
                 .add_notification(
-                    &format!("dev.spk-editor.session-{session_id_str}"),
+                    &format!("dev.sawe.session-{session_id_str}"),
                     Notification::new(&title)
                         .body(body.as_str())
                         .priority(priority),

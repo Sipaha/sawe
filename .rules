@@ -1,6 +1,6 @@
-# Project: SPK Editor
+# Project: Sawe
 
-SPK Editor is a personal fork of [Zed](https://github.com/zed-industries/zed) maintained by Simonov Pavel ([@Sipaha](https://github.com/Sipaha)). Repo: <https://github.com/Sipaha/spk-editor>.
+Sawe is a personal fork of [Zed](https://github.com/zed-industries/zed) maintained by Simonov Pavel ([@Sipaha](https://github.com/Sipaha)). Repo: <https://github.com/Sipaha/sawe>.
 
 ## Entry points
 
@@ -50,7 +50,7 @@ makes the next resume bootstrap-free.
 
 ## Fork philosophy — read this before suggesting changes
 
-SPK Editor is a standalone product. We do **not** merge or cherry-pick from
+Sawe is a standalone product. We do **not** merge or cherry-pick from
 upstream Zed. The codebase is fully ours — every crate is fair game for
 bug fixes, refactors, renames, cleanup, and feature work driven by product
 needs, not by upstream-diff hygiene. There is no "untouched core" zone:
@@ -69,14 +69,14 @@ Rules that still apply:
   subsystems' types, traits, or globals.
 
 - **Locked rebrand identifiers** (spec §3, change requires user approval):
-  display name `SPK Editor` (Dock/About/title bar); CLI binary
-  `spk-editor`; macOS bundle ids `ru.sipaha.spk-editor[-{preview,nightly,dev,debug}]`;
-  URL scheme `spk-editor://`; config dir `~/.config/spk-editor/` (Linux),
-  `~/Library/Application Support/SpkEditor/` (macOS — no space in path,
-  display name keeps space), `%APPDATA%\SpkEditor\` (Windows — no space in
-  path); GitHub `Sipaha/spk-editor`; attribution string `Fork of Zed by
+  display name `Sawe` (Dock/About/title bar); CLI binary
+  `sawe`; macOS bundle ids `ru.sipaha.sawe[-{preview,nightly,dev,debug}]`;
+  URL scheme `sawe://`; config dir `~/.config/sawe/` (Linux),
+  `~/Library/Application Support/Sawe/` (macOS — no space in path,
+  display name keeps space), `%APPDATA%\Sawe\` (Windows — no space in
+  path); GitHub `Sipaha/sawe`; attribution string `Fork of Zed by
   Zed Industries, Inc., modified by Simonov Pavel`; per-project config
-  dir `.spke/` (replacing upstream `.zed/`; `.zed_server` /
+  dir `.sawe/` (replacing upstream `.zed/`; `.zed_server` /
   `.zed_wsl_server` remain unchanged as preserved upstream identifiers).
   These are user-visible identity, not merge-friendliness — they don't
   change just because the merge cost went away.
@@ -112,27 +112,27 @@ Rules that still apply:
 
 ## Build + test conventions
 
-- Bundling produces `bin/spk-editor` + `libexec/spk-editor-bin` (Linux), `SpkEditor.app/Contents/MacOS/spk-editor` (macOS — display name stays `SPK Editor` via plutil override in `script/bundle-mac`), `SpkEditorSetup-*.exe` (Windows).
-- Cargo target binary is `target/release/spk-editor`. The cargo crate name `zed` itself is unchanged: the rename would touch hundreds of files for ~zero functional gain, and any future cherry-pick from upstream into the editor crate would textually conflict on every renamed identifier. Only the `[[bin]] name` is overridden.
-- Codesign / notarize gated behind `SPK_EDITOR_SIGN` env var; default produces unsigned bundles.
+- Bundling produces `bin/sawe` + `libexec/sawe-bin` (Linux), `Sawe.app/Contents/MacOS/sawe` (macOS — display name stays `Sawe` via plutil override in `script/bundle-mac`), `SaweSetup-*.exe` (Windows).
+- Cargo target binary is `target/release/sawe`. The cargo crate name `zed` itself is unchanged: the rename would touch hundreds of files for ~zero functional gain, and any future cherry-pick from upstream into the editor crate would textually conflict on every renamed identifier. Only the `[[bin]] name` is overridden.
+- Codesign / notarize gated behind `SAWE_SIGN` env var; default produces unsigned bundles.
 - Specs and plans for the rebrand work live in `docs/superpowers/{specs,plans}/`.
 - **Build profile depends on who tests next.**
   - *Autonomous / agent-only verification* (cargo test, headless e2e, MCP-socket probes the agent drives itself) → **debug only**: `script/run-mcp --debug`, `cargo build` without `--release`, `cargo test` without `--release`. Don't burn a 3–9 min release compile for an agent's own checks.
-  - *Hand-off back to the user for hands-on testing* (they'll actually launch / use the editor and judge the change) → **build `release-fast` proactively**: `cargo build --bin spk-editor --profile release-fast` (~5 min, run in background). The user's running editor is the release-fast binary at `target/release-fast/spk-editor` talking to `~/.spk/spk-editor/config/mcp.sock` (NOT `-dev`); a debug bundle won't replace it, so without this step the "ready to test" hand-off is false. This is required, not optional — the constraint is "no surprise release compiles for agent-only work," not "never compile release."
+  - *Hand-off back to the user for hands-on testing* (they'll actually launch / use the editor and judge the change) → **build `release-fast` proactively**: `cargo build --bin sawe --profile release-fast` (~5 min, run in background). The user's running editor is the release-fast binary at `target/release-fast/sawe` talking to `~/.spk/sawe/config/mcp.sock` (NOT `-dev`); a debug bundle won't replace it, so without this step the "ready to test" hand-off is false. This is required, not optional — the constraint is "no surprise release compiles for agent-only work," not "never compile release."
   - Full `cargo build --release` and `script/bundle-*` remain reserved for the maintainer.
-- **`script/run-mcp` only compiles the binary if it's _missing_** (`if [[ ! -x "$binary" ]]`). After editing any crate, run `cargo build --bin spk-editor` yourself first — otherwise `run-mcp` happily launches the stale binary and you'll silently test old code (a binary with a stale mtime / no expected `strings` match is the tell). No special feature flags are needed; `workspace.screenshot` works in plain debug builds under the native `--headless` platform (see "Screenshots" below).
+- **`script/run-mcp` only compiles the binary if it's _missing_** (`if [[ ! -x "$binary" ]]`). After editing any crate, run `cargo build --bin sawe` yourself first — otherwise `run-mcp` happily launches the stale binary and you'll silently test old code (a binary with a stale mtime / no expected `strings` match is the tell). No special feature flags are needed; `workspace.screenshot` works in plain debug builds under the native `--headless` platform (see "Screenshots" below).
 - **`cargo build … | tail` masks cargo's exit code** — the pipe reports `tail`'s status (always 0), so a failed build looks like it "succeeded" (and leaves the old binary in place). Use `set -o pipefail`, or don't pipe and grep the captured output for `^error` / `could not compile`.
 - **The rust-analyzer flycheck (`cargo check --workspace --all-targets`) holds `target/debug/.cargo-lock`.** If your `cargo build`/`cargo check` sits on "Blocking waiting for file lock on build directory" for minutes, `pkill -f "cargo check --workspace"` (it restarts harmlessly when RA next needs it).
-- **`pkill`/`kill` with a pattern that matches `spk-editor` can match the issuing Bash shell itself** → the command reports exit 144. That's noise; the kill still happened. Prefer `kill <pid>` by PID, or run the kill in a separate command from the one that depends on its result.
-- **`--features test-support` is usable as a superset but hard-codes `util::paths::home_dir()` to `/home/zed`** (deterministic test snapshots), so a `test-support` binary won't create its config dirs unless `SPK_EDITOR_HOME` is set — `script/run-mcp` sets it. You generally don't need `test-support` anymore (the screenshot tool no longer requires it).
+- **`pkill`/`kill` with a pattern that matches `sawe` can match the issuing Bash shell itself** → the command reports exit 144. That's noise; the kill still happened. Prefer `kill <pid>` by PID, or run the kill in a separate command from the one that depends on its result.
+- **`--features test-support` is usable as a superset but hard-codes `util::paths::home_dir()` to `/home/zed`** (deterministic test snapshots), so a `test-support` binary won't create its config dirs unless `SAWE_HOME` is set — `script/run-mcp` sets it. You generally don't need `test-support` anymore (the screenshot tool no longer requires it).
 
 ## Autonomous testing via embedded MCP
 
-A running `spk-editor` instance exposes an MCP server over a Unix socket so an agent can drive a real editor for end-to-end testing without a human in the loop. Use this whenever a change touches workspace/project/buffer/LSP behavior and you want to verify it against a live UI rather than only unit tests.
+A running `sawe` instance exposes an MCP server over a Unix socket so an agent can drive a real editor for end-to-end testing without a human in the loop. Use this whenever a change touches workspace/project/buffer/LSP behavior and you want to verify it against a live UI rather than only unit tests.
 
 **Extend the MCP surface when it's missing a primitive — don't push the gap onto the operator.** The whole point of this layer is to let an agent verify its own work hands-off. If a check is blocked only because the MCP catalog lacks a tool (a missing input primitive, an unqueryable bit of state, an event you can't subscribe to), the default is to *add that tool* in the same session — mirror the nearest existing tool (registration in the owning domain crate's `init`, a `…Params`/`…Result` pair, a unit test, a bump of the catalog count here), then use it. New primitives are cheap and compound; a human clicking through a manual repro every time does not. Only fall back to asking the operator when the gap is genuinely outside the editor (real GPU display stacking, OS dialogs, external auth). Example: `windows.hover_at` / `windows.hover_id` were added exactly this way to surface `visible_on_hover` UI (timestamps, copy buttons) that a static screenshot can't reveal.
 
-**Socket:** `~/.spk/spk-editor-dev/config/mcp.sock` for a `--debug` build, `~/.spk/spk-editor/config/mcp.sock` for release (NOT `~/.config/spk-editor/` — see `crates/paths`). Single-instance — one editor process at a time holds the socket; a second `spk-editor` invocation hands off CLI args via the existing socket and exits. Lock file is `…/config/mcp.lock`. (`script/run-mcp` prints the resolved socket path on launch.)
+**Socket:** `~/.spk/sawe-dev/config/mcp.sock` for a `--debug` build, `~/.spk/sawe/config/mcp.sock` for release (NOT `~/.config/sawe/` — see `crates/paths`). Single-instance — one editor process at a time holds the socket; a second `sawe` invocation hands off CLI args via the existing socket and exits. Lock file is `…/config/mcp.lock`. (`script/run-mcp` prints the resolved socket path on launch.)
 
 **Tool catalog** (84 tools, JSON-RPC 2.0 over the socket — namespaces: `editor.*`, `windows.*`, `solutions.*`, `solution.git.*`, `catalog.*`, `solution_agent.*`, `workspace.*`, `project.*`, `diagnostics.*`):
 - **Probe / control:** `editor.capabilities`, `editor.handle_cli_args`, `editor.{subscribe,unsubscribe,list_subscriptions}`, `editor.{get_operation,cancel_operation}`
@@ -146,7 +146,7 @@ A running `spk-editor` instance exposes an MCP server over a Unix socket so an a
 
 **Self-test recipe:**
 1. Build + launch via `script/run-mcp --debug --headless` (debug is mandatory for agent-driven runs — see "Build + test conventions"; `script/run-mcp` builds the binary if missing and prints the socket path when ready). **Always prefer `--headless` for agent work:** it uses the native HeadlessClient + offscreen WgpuHeadlessRenderer (ADR-0002), needs no X server, AND fully supports `workspace.screenshot`. With `$DISPLAY` set the default flips to display mode (real X window); `--display` forces that, `--headless` forces native headless. **Do not try `xvfb-run --display` as a no-display workaround for screenshots — the NVIDIA adapter under Xvfb produces blank PNGs (`docs/findings/2026-05-headless-screenshot-blank.md`).** The dev profile builds in 1-2 min (incremental) and is fine for probing structure / opening Welcome / verifying UI changes. If a check genuinely needs release-profile behaviour, pause and ask the user.
-2. Connect via `socat - UNIX-CONNECT:$HOME/.spk/spk-editor-dev/config/mcp.sock` for ad-hoc probes, or write a small Rust/Python client. JSON-RPC frames are newline-delimited.
+2. Connect via `socat - UNIX-CONNECT:$HOME/.spk/sawe-dev/config/mcp.sock` for ad-hoc probes, or write a small Rust/Python client. JSON-RPC frames are newline-delimited.
 3. Always start with `editor.capabilities` to confirm protocol version and supported event kinds.
 4. For long-running ops (`solutions.add_member`, `catalog.refresh_cache`) use the returned `operation_id` with `editor.get_operation` to poll, or subscribe via `editor.subscribe { kinds: ["operation_completed", "operation_progress"] }` for push notifications.
 5. For visual assertions, `workspace.screenshot {solution_id, format}` returns a real PNG/WebP/JPEG of the editor *window content* (offscreen-rendered — see "Screenshots" below): immune to other windows covering the editor, **works under the native `--headless` mode** (preferred for agents) without needing any X server. `workspace.dump_visual_structure` is still useful as a cheap structured tree but does *not* recurse into rendered pane-item content (`Pane { children: [] }` is ambiguous), so screenshot when you need to see what's actually painted. **If your change touches UI — panel, dock, status row, strip, modal, widget — a screenshot of the running editor is part of "done."** Drive the right panel into view before snapping (`windows.dispatch_action {action_name: "console_panel::ToggleFocus"}` etc.) — `windows.focus` alone doesn't change which dock is visible.
@@ -154,7 +154,7 @@ A running `spk-editor` instance exposes an MCP server over a Unix socket so an a
 
 **Event subscriptions** broadcast as JSON-RPC `editor/notification` frames. Wired kinds: `operation_progress`, `operation_completed`, `solution_changed`, `solution_active_changed`, `solution_member_add_progress`, `solution_member_add_completed`, `solution_active_member_changed`, `buffer_opened`, `buffer_closed`, `buffer_saved`, `buffer_dirty_changed`, `diagnostic_updated`, `lsp_started`, `lsp_stopped`, `window_focused`, `agent_session_created`, `agent_session_closed`, `agent_session_state_changed`, `agent_session_title_changed`, `agent_session_message_appended`, `agent_session_notification_sent`. Deferred: `selection_changed` (Editor-level, not Buffer), `cli_args_received`, `server_shutting_down`. Note: AI session events use the `agent_session_*` prefix (not bare `session_*`) — defensive namespacing against future collisions.
 
-**Integration tests** in `crates/editor_mcp/tests/*_e2e_test.rs` are isolated via `editor_mcp::set_runtime_dir_for_test(tempdir)` — each test pins its own `mcp.{lock,sock}` to a tempdir, so they can run safely alongside a live `spk-editor` instance and never touch `~/.config/spk-editor/`. When you write a new e2e test that calls `editor_mcp::start_server`, you MUST call `set_runtime_dir_for_test` first or you will collide with (and corrupt) the user's real lock and socket.
+**Integration tests** in `crates/editor_mcp/tests/*_e2e_test.rs` are isolated via `editor_mcp::set_runtime_dir_for_test(tempdir)` — each test pins its own `mcp.{lock,sock}` to a tempdir, so they can run safely alongside a live `sawe` instance and never touch `~/.config/sawe/`. When you write a new e2e test that calls `editor_mcp::start_server`, you MUST call `set_runtime_dir_for_test` first or you will collide with (and corrupt) the user's real lock and socket.
 
 **Screenshots — the agent's "look at the editor" capability:** `workspace.screenshot` returns a real PNG/WebP/JPEG of the editor window content via `gpui_wgpu::WgpuHeadlessRenderer::render_to_image` (renders the current scene into an offscreen texture, reads it back). Works in plain debug *and* release builds. **If you implemented or modified ANY user-visible UI (panel, dock, strip, modal, theme, widget), screenshot before claiming the work is done — unit tests verify code correctness, not pixels.** The Read tool can open the returned PNG directly, so you can see what you painted without round-tripping through the user. **Canonical launch path for screenshots: `script/run-mcp --debug --headless`** (the native HeadlessClient + WgpuHeadlessRenderer route from ADR-0002; no Xvfb, no X server). After opening a session, drive the UI before snapping: `windows.focus` → `windows.dispatch_action {action_name: "console_panel::ToggleFocus"}` (or the analogous panel action) → `workspace.screenshot {solution_id: "...", format: "png"}`. Sample call shape: `solution_id` (not `window_id`) is the screenshot param; the returned PNG arrives inside the MCP `content` array as an `{"type":"image","data":"<base64>"}` block (NOT in `structuredContent`). **Do NOT try `xvfb-run … --display` as a fallback:** NVIDIA's Vulkan ICD silently fails the offscreen pass under Xvfb (no DRI3 → adapter selection picks NVIDIA discrete → render-attachment never rasterises), producing a uniform dark-slate PNG every time — see `docs/findings/2026-05-headless-screenshot-blank.md` for the full story and ADR-0002 for why native headless is the answer. macOS non-test builds also fall back to the blank error (the Metal `render_to_image` override is still `cfg`-gated; ungate it if a macOS agent ever drives this). `import -window root /tmp/screen.png` (ImageMagick) / `grim` (Wayland) still work for grabbing a real X display when you need to see window stacking, but for "what is the editor painting" prefer `workspace.screenshot` over the native headless build.
 

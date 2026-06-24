@@ -1,11 +1,11 @@
-# Supervisor mode — multi-agent workflow for spk-editor
+# Supervisor mode — multi-agent workflow for sawe
 
 > Read by the **top-level supervisor** (main Claude Code session). Sub-agents
 > have a narrow task scope from their dispatch prompt — they do NOT read this
 > file.
 >
 > Adapted 2026-05-15 from voxelcraft's `docs/workflow/supervisor-mode.md`,
-> tailored to spk-editor's "fork-of-Zed, mostly bugfixes + targeted feature
+> tailored to sawe's "fork-of-Zed, mostly bugfixes + targeted feature
 > work" reality. The playbook itself is **in scope to improve** — when a step
 > trips you twice, fix the doc, don't soldier through it.
 
@@ -56,7 +56,7 @@ mid-flight, never the reverse).
 LIGHT  (bugfix / small UI tweak / single-crate refactor)
   1. READ      → CLAUDE.md (in context), FORK.md if upstream-zone, 1–2 grep findings
   2. DISPATCH  → Agent (general-purpose), single sub-agent, worktree OPTIONAL
-  3. VERIFY    → cargo build --bin spk-editor + clippy/test on touched crate
+  3. VERIFY    → cargo build --bin sawe + clippy/test on touched crate
                  + MCP smoke-test if UI-visible
   4. COMMIT    → one commit, descriptive subject (NO Co-Authored-By, NO amend)
 
@@ -158,7 +158,7 @@ Otherwise: HEAVY. When in doubt, HEAVY — the cost of an unnecessary plan doc
 - <risk>: <mitigation>
 
 ## Verification
-- cargo build --bin spk-editor
+- cargo build --bin sawe
 - cargo clippy -p <crate> -- -D warnings
 - cargo test -p <crate>
 - MCP smoke-test: <what the agent will drive via the socket; what the assertion is>
@@ -245,7 +245,7 @@ For each section:
 - NO `unwrap()` / `expect()` in production code. In `#[cfg(test)]` / `tests/` — fine.
 - NO `let _ = fallible_call()?` — handle errors (`?` to propagate, `.log_err()`
   to swallow visibly, `match` for custom logic).
-- NO release builds. Always `cargo build --bin spk-editor` (debug), `cargo test`
+- NO release builds. Always `cargo build --bin sawe` (debug), `cargo test`
   (debug). `cargo build --release` / `script/bundle-*` is for the maintainer.
 - NO changes to locked rebrand identifiers (CLAUDE.md § "Locked rebrand
   identifiers") without explicit user approval.
@@ -262,15 +262,15 @@ For each section:
   upstream file modifications" in the same commit.
 - New files: prefer `src/<module>.rs`, NOT `src/<module>/mod.rs`. New crates:
   set `[lib] path = "<name>.rs"` in Cargo.toml.
-- Build verification: `cargo build --bin spk-editor` MUST pass before commit.
+- Build verification: `cargo build --bin sawe` MUST pass before commit.
   If you ran `cargo build … | tail` and saw "succeeded" — re-check with
   `set -o pipefail` or read the captured output; the pipe masks cargo exit
   codes (CLAUDE.md trap).
 
 ## CHECKS
 
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
-cargo build --bin spk-editor 2>&1 | tee /tmp/build.txt
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
+cargo build --bin sawe 2>&1 | tee /tmp/build.txt
 grep -E "^error|could not compile" /tmp/build.txt    # must be empty
 cargo clippy -p <crate> --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.txt
 cargo test -p <crate> --no-fail-fast 2>&1 | tee /tmp/test.txt
@@ -344,7 +344,7 @@ git merge worktree-agent-<id_A> --no-edit
 git merge worktree-agent-<id_B> --no-edit
 
 # Re-run checks on the merged state.
-cargo build --bin spk-editor 2>&1 | tee /tmp/post_merge_build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/post_merge_build.txt
 cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/post_merge_clippy.txt
 cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/post_merge_test.txt
 # If anything fails on merged state that didn't fail in either branch in isolation
@@ -388,7 +388,7 @@ When the sub-agent finishes:
 ```bash
 git log --oneline -3                                   # did it actually commit?
 git status                                             # clean? (if not — uncommitted leftovers)
-cargo build --bin spk-editor 2>&1 | tee /tmp/build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/build.txt
 grep -E "^error|could not compile" /tmp/build.txt      # must be empty
 cargo clippy -p <touched-crate> --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.txt
 cargo test -p <touched-crate> --no-fail-fast 2>&1 | tee /tmp/test.txt
@@ -414,18 +414,18 @@ delivery all work uniformly.
 
 ```bash
 # 1. Make sure no stale editor process is holding the socket.
-pgrep -af "target/debug/spk-editor" | grep -v bash || echo "no leftover"
-# If there's one — kill by PID, NOT by pattern (a `pkill -f spk-editor`
+pgrep -af "target/debug/sawe" | grep -v bash || echo "no leftover"
+# If there's one — kill by PID, NOT by pattern (a `pkill -f sawe`
 # can match the current bash and exit-144 yourself).
 
 # 2. Launch.
 script/run-mcp --debug --headless &   # state-only verification (preferred)
 # OR:
 script/run-mcp --debug --display &    # when a screenshot is required
-# Both auto-build if missing, set SPK_EDITOR_HOME, and strip stale
+# Both auto-build if missing, set SAWE_HOME, and strip stale
 # socket/lock state up front (so a failing precheck doesn't leave a
 # half-ready state behind).
-until [ -S "$HOME/.spk/spk-editor-dev/config/mcp.sock" ]; do sleep 0.5; done
+until [ -S "$HOME/.spk/sawe-dev/config/mcp.sock" ]; do sleep 0.5; done
 
 # 3. Drive via a small Python (or socat) client over the JSON-RPC newline-delimited socket.
 #    Always start with `editor.capabilities`. Then exercise the scenario from
@@ -438,7 +438,7 @@ until [ -S "$HOME/.spk/spk-editor-dev/config/mcp.sock" ]; do sleep 0.5; done
 #    eyeball the visual.
 
 # 5. Teardown.
-pkill -f target/debug/spk-editor      # OK by name here — exit 144 noise is harmless
+pkill -f target/debug/sawe      # OK by name here — exit 144 noise is harmless
 ```
 
 **The screenshot is the source of truth.** A sub-agent report saying "the
@@ -550,7 +550,7 @@ code.** `cargo build … | tail` reports `tail`'s exit (always 0) — a failed
 build looks "succeeded" and leaves stale binary. Use `set -o pipefail`, or pipe
 to file and grep the file.
 
-❌ **`pkill -f spk-editor` from the shell that's about to depend on the kill
+❌ **`pkill -f sawe` from the shell that's about to depend on the kill
 result.** The pattern matches the current bash → exit 144. The kill happens
 but the next command in the same chain sees noise. Prefer `kill <pid>` by PID,
 or split the kill into its own command.

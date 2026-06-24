@@ -340,7 +340,7 @@ craneLib.buildPackage (
 
           # Physical location of the CLI must be inside the app bundle as this is used
           # to determine which app to start
-          ln -s "$out/Applications/Zed Nightly.app/Contents/MacOS/cli" $out/bin/spk-editor
+          ln -s "$out/Applications/Zed Nightly.app/Contents/MacOS/cli" $out/bin/sawe
 
           runHook postInstall
         ''
@@ -349,9 +349,9 @@ craneLib.buildPackage (
           runHook preInstall
 
           mkdir -p $out/bin $out/libexec
-          cp $TARGET_DIR/zed $out/libexec/spk-editor-bin
-          cp $TARGET_DIR/cli  $out/bin/spk-editor
-          ln -s $out/bin/spk-editor $out/bin/zeditor  # home-manager expects the CLI binary to be here
+          cp $TARGET_DIR/zed $out/libexec/sawe-bin
+          cp $TARGET_DIR/cli  $out/bin/sawe
+          ln -s $out/bin/sawe $out/bin/zeditor  # home-manager expects the CLI binary to be here
 
 
           install -D "crates/zed/resources/app-icon-nightly@2x.png" \
@@ -376,7 +376,7 @@ craneLib.buildPackage (
 
     # TODO: why isn't this also done on macOS?
     postFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
-      wrapProgram $out/libexec/spk-editor-bin --suffix PATH : ${lib.makeBinPath [ nodejs_22 ]}
+      wrapProgram $out/libexec/sawe-bin --suffix PATH : ${lib.makeBinPath [ nodejs_22 ]}
     '';
 
     meta = {

@@ -54,7 +54,7 @@ macro_rules! serialize_property {
 }
 
 pub fn send_event(_event: Event) {
-    // spk-editor: telemetry is permanently disabled. No events are queued.
+    // sawe: telemetry is permanently disabled. No events are queued.
     return;
 }
 

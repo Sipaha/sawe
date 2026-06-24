@@ -19,7 +19,7 @@ actual rendered pixels (closing
 
 ## Context
 
-Currently `--headless` mode wraps `spk-editor` in `xvfb-run` — works for
+Currently `--headless` mode wraps `sawe` in `xvfb-run` — works for
 state ops but `workspace.screenshot` is blank because NVIDIA Vulkan under
 Xvfb silently fails the offscreen RENDER_ATTACHMENT pass. The Xvfb path
 is also ~3 MB of extra system deps + a wrapper process per launch.
@@ -157,16 +157,16 @@ finding + fix it minimally inline.
 Post-merge, the supervisor runs:
 
 ```bash
-cargo build --bin spk-editor
+cargo build --bin sawe
 script/run-mcp --debug --headless &
-until [ -S "$HOME/.spk/spk-editor-dev/config/mcp.sock" ]; do sleep 0.5; done
+until [ -S "$HOME/.spk/sawe-dev/config/mcp.sock" ]; do sleep 0.5; done
 # Python client: open AlphaSol, screenshot, assert non-blank
 python3 <<'PY'
 import socket, json, base64, os, time, hashlib
 # … connect, solutions.open, sleep 5, workspace.screenshot
 # Decode PNG, assert at least N distinct colors (not solid dark slate)
 PY
-pkill -f target/debug/spk-editor
+pkill -f target/debug/sawe
 ```
 
 Acceptance: the screenshot contains the rendered Workspace UI (title bar,
@@ -227,7 +227,7 @@ without a window on the user's screen.
    returning `Some` to route to the right window. Track a single
    pointer in `HeadlessClientState`.
 5. **CLI flag, not env var**, for `--headless`. The flag is on the
-   spk-editor binary itself, propagated from `script/run-mcp --headless`
+   sawe binary itself, propagated from `script/run-mcp --headless`
    via `forward_args`. Env vars are hidden state; a CLI flag is visible
    in `ps aux` and discoverable via `--help`.
 
@@ -263,7 +263,7 @@ decision-tree of "Xvfb vs native vs hide-after-show" and locks in #1, #2,
 
 ```bash
 # 1. Build clean
-cargo build --bin spk-editor 2>&1 | tee /tmp/build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/build.txt
 grep -E "^error|could not compile" /tmp/build.txt    # must be empty
 
 # 2. Clippy + tests (touched crates only — workspace test is overkill for
@@ -272,9 +272,9 @@ cargo clippy -p gpui -p gpui_wgpu -p gpui_linux -p gpui_platform -p zed --all-ta
 cargo test -p gpui -p gpui_wgpu -p gpui_linux -p gpui_platform --no-fail-fast
 
 # 3. Native headless smoke-test (the acceptance check)
-pgrep -af "target/debug/spk-editor" | grep -v bash || echo "clean"
+pgrep -af "target/debug/sawe" | grep -v bash || echo "clean"
 script/run-mcp --debug --headless &
-until [ -S "$HOME/.spk/spk-editor-dev/config/mcp.sock" ]; do sleep 0.5; done
+until [ -S "$HOME/.spk/sawe-dev/config/mcp.sock" ]; do sleep 0.5; done
 # Verify no Xvfb spawned:
 pgrep -af "Xvfb|xvfb-run" | grep -v bash && echo "FAIL: still using Xvfb" || echo "PASS: native headless"
 
@@ -292,7 +292,7 @@ data = base64.b64decode(sc["base64_data"])
 assert len(data) > 60_000, f"screenshot looks blank: {len(data)} bytes (rendered should be ≥60 KB)"
 print(f"OK: screenshot {sc['width']}x{sc['height']} = {len(data)} bytes")
 PY
-pkill -f target/debug/spk-editor
+pkill -f target/debug/sawe
 ```
 
 Acceptance: the assertion above passes (screenshot ≥60 KB, indicating
@@ -301,7 +301,7 @@ tool to confirm it shows the Workspace UI.
 
 ## When done
 
-- [x] `cargo build --bin spk-editor` clean.
+- [x] `cargo build --bin sawe` clean.
 - [x] `cargo clippy` on touched crates clean (`gpui` / `gpui_wgpu` / `gpui_linux` / `gpui_platform` / `zed`).
 - [x] `cargo test` on touched crates green (160 passed, 0 failed).
 - [x] `script/run-mcp --debug --headless` launches without `xvfb-run` (no

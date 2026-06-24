@@ -7,7 +7,7 @@ on:
   workflow_dispatch: {}
 jobs:
   scheduled_compliance_check:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::checkout_repo

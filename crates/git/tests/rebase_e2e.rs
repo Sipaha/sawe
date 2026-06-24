@@ -96,7 +96,7 @@ fn ensure_paths_pinned() {
 
 /// Generate a tiny shell helper that imitates the editor subcommands.
 fn write_helper_stub(home: &Path) -> PathBuf {
-    let path = home.join("spk-editor-stub.sh");
+    let path = home.join("sawe-stub.sh");
     let temp_root = home.to_string_lossy().into_owned();
     let body = include_str!("rebase_e2e_stub.sh.in")
         .replace("__SESSION_ENV__", SESSION_ENV)

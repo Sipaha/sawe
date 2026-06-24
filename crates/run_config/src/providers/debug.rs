@@ -14,7 +14,7 @@ pub struct DebugSettings {
     /// Adapter-specific launch/attach config passed through verbatim (e.g. `request`, `program`).
     #[serde(default)]
     pub config: serde_json::Value,
-    /// Optional label of a `.spke/tasks.json` task to run as a build step before launching.
+    /// Optional label of a `.sawe/tasks.json` task to run as a build step before launching.
     #[serde(default)]
     pub build: Option<String>,
 }

@@ -72,7 +72,7 @@ Already started but **paused before Task 1** — current branch state is unexpec
 When this session ended, the local checkout was on `feature/unified-workspace-wire`, NOT `main`:
 
 ```
-1276811c29 docs(readme): rebrand from SPK Editor to Sawe
+1276811c29 docs(readme): rebrand from Sawe to Sawe
 8a2335bf88 test(workspace_events): full lifecycle round-trip e2e
 2b941553ab feat(workspace_events): close_solution cancels in-flight agent threads (terminals TBD)
 … (~18 commits ahead of where we left off on main)
@@ -120,9 +120,9 @@ This is why the spec puts the regex parse on `tool.name.eq_ignore_ascii_case("ag
 
 Disabled in commit `0ac4d1a4ca` (FORK.md decision #23). Side effect for the next agent: `UserMessage.checkpoint` is always `None`; `restore_checkpoint(id)` is a no-op; any new code that wants a checkpoint must restore the capture at the `send` call site (3 lines around `acp_thread.rs:2450`).
 
-### Build target = `spk-editor` (the cargo bin), not `sawe`
+### Build target = `sawe` (the cargo bin), not `sawe`
 
-Despite the README rebrand on the `feature/unified-workspace-wire` branch, `cargo build --bin spk-editor` is still the right binary command — the cargo bin name + `target/release-fast/spk-editor` are intentionally unchanged (see FORK.md "Locked rebrand identifiers" — rename "requires user approval" and hasn't been done).
+Despite the README rebrand on the `feature/unified-workspace-wire` branch, `cargo build --bin sawe` is still the right binary command — the cargo bin name + `target/release-fast/sawe` are intentionally unchanged (see FORK.md "Locked rebrand identifiers" — rename "requires user approval" and hasn't been done).
 
 ## What to do on resume
 

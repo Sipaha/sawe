@@ -1,6 +1,6 @@
 //! `editor.handle_cli_args` MCP tool — single-instance handoff endpoint.
 //!
-//! When a second `spk-editor` process launches, it connects to the existing
+//! When a second `sawe` process launches, it connects to the existing
 //! instance's socket and calls this tool with the CLI paths. The existing
 //! instance opens them in (or as) a workspace and returns metadata.
 use context_server::listener::{McpServerTool, ToolResponse};

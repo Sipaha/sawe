@@ -3552,11 +3552,11 @@ async fn test_local_settings(
         .insert_tree(
             "/dir",
             json!({
-                ".spke": {
+                ".sawe": {
                     "settings.json": r#"{ "tab_size": 2 }"#
                 },
                 "a": {
-                    ".spke": {
+                    ".sawe": {
                         "settings.json": r#"{ "tab_size": 8 }"#
                     },
                     "a.txt": "a-contents",
@@ -3600,7 +3600,7 @@ async fn test_local_settings(
     // As client A, update a settings file. As Client B, see the changed settings.
     client_a
         .fs()
-        .insert_file("/dir/.spke/settings.json", r#"{}"#.into())
+        .insert_file("/dir/.sawe/settings.json", r#"{}"#.into())
         .await;
     executor.run_until_parked();
     cx_b.read(|cx| {
@@ -3620,7 +3620,7 @@ async fn test_local_settings(
     // As client A, create and remove some settings files. As client B, see the changed settings.
     client_a
         .fs()
-        .remove_file("/dir/.spke/settings.json".as_ref(), Default::default())
+        .remove_file("/dir/.sawe/settings.json".as_ref(), Default::default())
         .await
         .unwrap();
     client_a
@@ -3630,7 +3630,7 @@ async fn test_local_settings(
         .unwrap();
     client_a
         .fs()
-        .insert_file("/dir/b/.spke/settings.json", r#"{"tab_size": 4}"#.into())
+        .insert_file("/dir/b/.sawe/settings.json", r#"{"tab_size": 4}"#.into())
         .await;
     executor.run_until_parked();
     cx_b.read(|cx| {
@@ -3657,11 +3657,11 @@ async fn test_local_settings(
     // As client A, change and remove settings files while client B is disconnected.
     client_a
         .fs()
-        .insert_file("/dir/a/.spke/settings.json", r#"{"hard_tabs":true}"#.into())
+        .insert_file("/dir/a/.sawe/settings.json", r#"{"hard_tabs":true}"#.into())
         .await;
     client_a
         .fs()
-        .remove_file("/dir/b/.spke/settings.json".as_ref(), Default::default())
+        .remove_file("/dir/b/.sawe/settings.json".as_ref(), Default::default())
         .await
         .unwrap();
     executor.run_until_parked();

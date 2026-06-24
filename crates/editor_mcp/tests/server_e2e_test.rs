@@ -16,8 +16,8 @@
 //!
 //! Isolation: the test pins the lock + socket directory to a tempdir via
 //! `editor_mcp::set_runtime_dir_for_test` so it can run alongside a live
-//! `spk-editor` instance without colliding on the user's real
-//! `~/.config/spk-editor/mcp.{lock,sock}` files.
+//! `sawe` instance without colliding on the user's real
+//! `~/.config/sawe/mcp.{lock,sock}` files.
 
 use gpui::TestAppContext;
 use serde_json::json;

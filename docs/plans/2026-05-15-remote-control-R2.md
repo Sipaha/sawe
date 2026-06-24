@@ -35,7 +35,7 @@ Existing pieces this builds on:
   `RemoteControlSettings`, `AuthorizedClient { name,
   secret_base64, created_at }`.
 - `paths::remote_control_settings_file()` →
-  `~/.config/spk-editor/remote-control.json`. Cert files land
+  `~/.config/sawe/remote-control.json`. Cert files land
   alongside as `remote-control.cert.der` / `remote-control.key.der`.
 - `editor_mcp` JSON-RPC newline-delimited framing, tool registry,
   notification fan-out (the surface this remote layer eventually
@@ -124,7 +124,7 @@ Existing pieces this builds on:
 - `pub trait RemoteDispatcher: Send + Sync { fn dispatch(&self, client_name: &str, req: JsonRpcRequest) -> BoxFuture<'static, JsonRpcResponse>; }`.
 - Implementation `MinimalDispatcher` (R-2 stub):
   - Allow-list: `["remote.editor.capabilities", "remote.editor.ping"]`.
-  - `remote.editor.capabilities` returns `{ "protocol_version": 1, "server_software": "spk-editor", "tool_namespaces": ["remote.editor"], "capabilities": ["json-rpc-2.0", "hmac-sha256-challenge"] }`.
+  - `remote.editor.capabilities` returns `{ "protocol_version": 1, "server_software": "sawe", "tool_namespaces": ["remote.editor"], "capabilities": ["json-rpc-2.0", "hmac-sha256-challenge"] }`.
   - `remote.editor.ping` returns `{ "pong": true, "now": "<iso8601>" }`.
   - Anything else → `-32601` method-not-found.
 - R-4 will replace `MinimalDispatcher` with a real
@@ -298,10 +298,10 @@ is done.
 ## Verification
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
 
 # Build
-cargo build --bin spk-editor 2>&1 | tee /tmp/r2_build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/r2_build.txt
 grep -E "^error|could not compile" /tmp/r2_build.txt   # must be empty
 
 # Clippy on the touched crate
@@ -320,7 +320,7 @@ Acceptance:
 - [x] R-2 plan-doc committed and dispatched (sub-agent reads the
       inlined plan via `## PLAN DOC` in the dispatch prompt; the
       committed copy is for `git log` / future sessions).
-- [x] `cargo build --bin spk-editor` passes from a clean target.
+- [x] `cargo build --bin sawe` passes from a clean target.
 - [x] `cargo clippy -p remote_control --all-targets -- -D warnings`
       passes.
 - [x] `cargo test -p remote_control` passes including the new
@@ -328,7 +328,7 @@ Acceptance:
       31 tests).
 - [ ] Toggling Remote Control ON in the modal (with a non-empty
       address) generates a cert at
-      `~/.config/spk-editor/remote-control.cert.der` (the
+      `~/.config/sawe/remote-control.cert.der` (the
       supervisor's post-merge MCP smoke-test will verify visually).
 - [x] Toggling OFF cleanly tears down the listener (covered by
       `set_enabled_starts_and_stops_listener` unit test — drops the

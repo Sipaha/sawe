@@ -10,7 +10,7 @@ R-4 wire protocol is unaffected. Re-open when upstream lands the
 extension (long-open issue on `snapview/tungstenite-rs`) or when we
 migrate the WS stack.
 
-**Repos:** spk-editor (server) → `spk-editor-mobile` (client verify).
+**Repos:** sawe (server) → `sawe-mobile` (client verify).
 **Depends on:** R-6e shipped (so the wire payloads that benefit are already minimised, and compression layers on top).
 **Goal:** Enable RFC 7692 `permessage-deflate` on the WebSocket so the JSON-RPC text frames (markdown, tool-call previews, list responses) compress on the wire. Image content blocks are pre-compressed and won't benefit much; text payloads typically shrink 5-10×.
 
@@ -87,9 +87,9 @@ The honest read: without an OkHttp extension or replacing OkHttp's WS implementa
 ## Acceptance (server)
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
 set -o pipefail
-cargo build --bin spk-editor 2>&1 | tee /tmp/r6f_build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/r6f_build.txt
 grep -E "^error|could not compile" /tmp/r6f_build.txt
 cargo clippy -p remote_control --all-targets -- -D warnings 2>&1 | tee /tmp/r6f_clippy.txt
 cargo test -p remote_control --no-fail-fast 2>&1 | tee /tmp/r6f_test.txt

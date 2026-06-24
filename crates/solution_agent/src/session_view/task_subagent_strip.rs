@@ -759,7 +759,7 @@ mod classifier_tests {
     #[test]
     fn shell_pill_label_truncates_long_command() {
         let id = BackgroundShellId::new("bvb4ful1z");
-        let label = shell_pill_label(&id, "cargo build --bin spk-editor --profile release-fast");
+        let label = shell_pill_label(&id, "cargo build --bin sawe --profile release-fast");
         assert!(label.starts_with("bvb4ful1z·"));
         assert!(label.ends_with('…'));
     }

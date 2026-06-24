@@ -83,7 +83,7 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
 }
 
 pub async fn upload_previous_minidumps(client: Arc<Client>) -> anyhow::Result<()> {
-    // spk-editor: crash uploads are disabled. Panics are still written to disk for the user to inspect.
+    // sawe: crash uploads are disabled. Panics are still written to disk for the user to inspect.
     let _ = client;
     return Ok(());
 
@@ -134,7 +134,7 @@ async fn upload_minidump(
     minidump: Vec<u8>,
     metadata: &crashes::CrashInfo,
 ) -> Result<()> {
-    // spk-editor: crash uploads are disabled. Panics are still written to disk for the user to inspect.
+    // sawe: crash uploads are disabled. Panics are still written to disk for the user to inspect.
     let _ = (&client, endpoint, &minidump, metadata);
     return Ok(());
 
@@ -291,7 +291,7 @@ struct BuildTiming {
 // So, we have it upload the timings on their behalf, it'd be better to do
 // this more directly in ./script/cargo-timing-info.js.
 async fn upload_build_timings(_client: Arc<Client>) -> Result<()> {
-    // spk-editor: crash uploads are disabled. Panics are still written to disk for the user to inspect.
+    // sawe: crash uploads are disabled. Panics are still written to disk for the user to inspect.
     return Ok(());
 
     #[allow(unreachable_code)]

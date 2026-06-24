@@ -10,7 +10,7 @@ env:
 
 jobs:
   notify-slack:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     # Serialize per-issue so concurrent `labeled` events can't both observe
     # the trifecta and double-notify.

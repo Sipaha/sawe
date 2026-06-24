@@ -48,7 +48,7 @@ struct TelemetryState {
     installation_id: Option<Arc<str>>, // Per app installation (different for dev, nightly, preview, and stable)
     session_id: Option<String>,        // Per app launch
     metrics_id: Option<Arc<str>>,      // Per logged-in user
-    // spk-editor: written during init, read only by the disabled HTTP dispatch path.
+    // sawe: written during init, read only by the disabled HTTP dispatch path.
     #[allow(dead_code)]
     release_channel: Option<ReleaseChannel>,
     #[allow(dead_code)]
@@ -585,7 +585,7 @@ impl Telemetry {
         self.state.lock().is_staff
     }
 
-    // spk-editor: retained but unused; `flush_events_inner` no longer dispatches HTTP.
+    // sawe: retained but unused; `flush_events_inner` no longer dispatches HTTP.
     #[allow(dead_code)]
     fn build_request(
         self: &Arc<Self>,
@@ -611,7 +611,7 @@ impl Telemetry {
     }
 
     pub async fn flush_events_inner(self: &Arc<Self>) -> Result<()> {
-        // spk-editor: telemetry is permanently disabled. Drain any queued events
+        // sawe: telemetry is permanently disabled. Drain any queued events
         // without performing any HTTP request, so nothing ever leaves the process.
         let mut state = self.state.lock();
         state.first_event_date_time = None;

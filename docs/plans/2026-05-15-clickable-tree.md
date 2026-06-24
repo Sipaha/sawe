@@ -249,13 +249,13 @@ have, deferred.
 
 ```bash
 cd <worktree>
-cargo build --bin spk-editor 2>&1 | tee /tmp/build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/build.txt
 grep -E "^error|could not compile" /tmp/build.txt   # must be empty
 cargo clippy -p gpui -p solutions -p workspace -p editor_mcp --all-targets -- -D warnings
 cargo test -p gpui -p solutions -p workspace -p editor_mcp --no-fail-fast
 # End-to-end via the headless platform (now reliable post ADR-0002):
 script/run-mcp --debug --headless &
-until [ -S "$HOME/.spk/spk-editor-dev/config/mcp.sock" ]; do sleep 0.5; done
+until [ -S "$HOME/.spk/sawe-dev/config/mcp.sock" ]; do sleep 0.5; done
 # Drive a Python client:
 # - solutions.open alphasol
 # - workspace.dump_visual_structure → assert clickables.len() >= 5
@@ -263,7 +263,7 @@ until [ -S "$HOME/.spk/spk-editor-dev/config/mcp.sock" ]; do sleep 0.5; done
 #   the dump now reports that tab focused
 # - right-click a project-panel row (button: "right") via click_id; sleep
 #   200 ms; new dump shows the context menu's items as clickables
-pkill -f target/debug/spk-editor
+pkill -f target/debug/sawe
 ```
 
 Supervisor § H smoke-test runs the Python flow above; sub-agent does NOT
@@ -271,7 +271,7 @@ inline it (per supervisor-mode.md HARD RULES).
 
 ## When done
 
-- [ ] `cargo build --bin spk-editor` clean.
+- [ ] `cargo build --bin sawe` clean.
 - [ ] `cargo clippy` on touched crates clean.
 - [ ] `cargo test` on touched crates green.
 - [ ] `Window::iter_hitboxes()` (or equivalent accessor) exists in `gpui`.

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <!--
-    SPK Editor — in-app stencil logo (Welcome screen, About dialog,
+    Sawe — in-app stencil logo (Welcome screen, About dialog,
     onboarding, etc.). GPUI's `Vector` element renders SVGs as a
     single-colour stencil (`paint_svg` ignores per-path fills and
     paints the whole silhouette with `text_color`), so this asset
@@ -8,7 +8,7 @@
     plate — the surrounding UI provides the background.
 
     The full-colour version with the indigo plate lives at
-    `assets/spk-editor-icon.svg` and is the source for the OS app
+    `assets/sawe-icon.svg` and is the source for the OS app
     icon PNGs in `crates/zed/resources/`.
   -->
   <g transform="translate(256 256)">

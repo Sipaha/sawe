@@ -12,16 +12,16 @@ flaky LTE/Wi-Fi, renders rich chat with images + tool-calls.
 | Phase | Commit (and where) | Summary |
 |---|---|---|
 | R-5f | sibling `ee804aa` | Android consumes R-5e enriched data (markdown + images + tool_call + plan) via `multiplatform-markdown-renderer-m3:0.27.0`; diff streaming via `get_session_entry(entry_index)`. `:core` 45 → 54 tests, APK 11.21 → 11.58 MB. |
-| R-5g server | spk-editor `3fb5ee51ac` | New `solution_agent.list_agents` MCP tool + allow-list extension. `solution_agent` 90 → 91 tests. |
+| R-5g server | sawe `3fb5ee51ac` | New `solution_agent.list_agents` MCP tool + allow-list extension. `solution_agent` 90 → 91 tests. |
 | R-5g client | sibling `41531a1` | FAB stub replaced with Material 3 AlertDialog (RadioButton agent picker + optional initial message + auto-open-and-retry on `no_active_workspace_for_solution`). `:core` 54 → 57 tests, APK 11.58 → 11.59 MB. |
 | R-6a | sibling `c69e7e3` | WS reconnect with 1-2-4-8-16-30s backoff, OkHttp `pingInterval(30s)`, `queueCall` 5-min TTL FIFO for `send_message`, subscription auto-restore, `ConnectionState` StateFlow + Compose banner, `lastSeenEntryIndex` per session. New `RemoteTransport` seam (`OkHttpRemoteTransport` + `FakeRemoteTransport`). `:core` 57 → 72 tests, APK 11.59 → 11.63 MB. |
 | R-6b | sibling `c517f03` | Pairing persistence (`EncryptedSharedPreferences`) + Settings screen + adaptive launcher icon + INTERNET permission + signed-release Gradle config + ProGuard rules + expanded README. `:core` stable at 72 tests. Debug APK 11.63 → 12.0 MB; **release APK 2.12 MB after R8**. |
-| Welcome delete fix | spk-editor `8c7d87c931` | Replaced silent `DeleteSolution` action dispatch (no Workspace in WelcomeWindow's focus tree → action dropped) with in-row "Delete?" [Yes][Cancel] confirmation in the same WelcomeEditMode state machine as Rename. |
-| Remote Control Detect HTML bug | spk-editor `4cba330338` | `ifconfig.me` → `ifconfig.me/ip` so the public IP comes back as plain text instead of an HTML page. |
-| Remote Control QR popover crash | spk-editor `900e894942` | `workspace.toggle_modal` from inside the modal's own listener double-borrowed; now deferred via `window.defer(...)`. |
-| Welcome window delete | spk-editor `8c7d87c931` | (Same as the line above — duplicated bullet here is intentional, the welcome delete bug is the third of the three small bug fixes from the start of this session.) |
+| Welcome delete fix | sawe `8c7d87c931` | Replaced silent `DeleteSolution` action dispatch (no Workspace in WelcomeWindow's focus tree → action dropped) with in-row "Delete?" [Yes][Cancel] confirmation in the same WelcomeEditMode state machine as Rename. |
+| Remote Control Detect HTML bug | sawe `4cba330338` | `ifconfig.me` → `ifconfig.me/ip` so the public IP comes back as plain text instead of an HTML page. |
+| Remote Control QR popover crash | sawe `900e894942` | `workspace.toggle_modal` from inside the modal's own listener double-borrowed; now deferred via `window.defer(...)`. |
+| Welcome window delete | sawe `8c7d87c931` | (Same as the line above — duplicated bullet here is intentional, the welcome delete bug is the third of the three small bug fixes from the start of this session.) |
 
-## Cumulative state of the Android client (sibling `spk-editor-mobile`)
+## Cumulative state of the Android client (sibling `sawe-mobile`)
 
 Six R-5 phases + two R-6 phases shipped over 2026-05-16 → 2026-05-17. Sibling-repo chain:
 
@@ -41,7 +41,7 @@ d83ab47 R-5a fixup (:core api configuration after SDK install)
 End-state: `:core` 72 tests green, debug APK 12.0 MB, release APK 2.12 MB.
 Build commands and pairing instructions live in the sibling repo's README.
 
-**Sibling repo remote** (added 2026-05-18): `git@github.com:Sipaha/spk-editor-mobile.git`. Push uses the same `github.com-sipaha` SSH host-alias as the spk-editor remote (config in `~/.ssh/config`). The local directory was renamed from `spk-editor-android-client` to `spk-editor-mobile` on 2026-05-18 to match the GitHub repo name; older plan-docs (R-5a..R-5e historical record) still use the original name in their commit-message quotes but the project is now uniformly `spk-editor-mobile`.
+**Sibling repo remote** (added 2026-05-18): `git@github.com:Sipaha/sawe-mobile.git`. Push uses the same `github.com-sipaha` SSH host-alias as the sawe remote (config in `~/.ssh/config`). The local directory was renamed from `sawe-android-client` to `sawe-mobile` on 2026-05-18 to match the GitHub repo name; older plan-docs (R-5a..R-5e historical record) still use the original name in their commit-message quotes but the project is now uniformly `sawe-mobile`.
 No CI yet.
 
 ## Additional 2026-05-17 phases (after the 1st handoff cut)
@@ -49,9 +49,9 @@ No CI yet.
 | Phase | Commit | Summary |
 |---|---|---|
 | R-6d disk persistence | sibling `ff9ca8c` | `QueueStore` interface in `:core` + `EncryptedQueueStore` in `:app` (FIFO, .commit() synchronous so "Send → force-kill" path is durable); TTL **5 min → 24 h**; `DraftRepository` per session (debounced 500ms saves; read-and-clear `bouncedFor` channel); `LastSeenRepository` per session; `NavStateRepository` with route-template resolver; single shared `AppMasterKey` singleton. `:core` tests 72 → 82. |
-| R-6e server pagination | spk-editor `b756392b52` | Cursor params on `get_session` (`before_index` / `after_index` / `count`) + `list_sessions` (`before_last_activity_at_ms` / `count`); always-populated `EntrySummary.index`; `total_count` on both results. Additive, back-compat. `solution_agent` tests 91 → 99. |
+| R-6e server pagination | sawe `b756392b52` | Cursor params on `get_session` (`before_index` / `after_index` / `count`) + `list_sessions` (`before_last_activity_at_ms` / `count`); always-populated `EntrySummary.index`; `total_count` on both results. Additive, back-compat. `solution_agent` tests 91 → 99. |
 | R-6e client pagination | sibling `c7fbddc` | Paginated initial pull (`count=50`), `loadOlder` via `before_index=oldestLoaded` with LazyColumn auto-trigger, `resumeSession` on `Disconnected→Connected` via `after_index=lastSeenRepository.get()` with gap-detect safety net falling back to full `openSession`. `:core` tests 82 → 87. APK 2.22 → 2.24 MB. |
-| R-6f WS compression | spk-editor `2b22c9557c` | **Cancelled (upstream gap)** — `tokio-tungstenite 0.28` and `0.29` parse `permessage-deflate` headers but don't implement the codec. Listener stays uncompressed. Sub-agent refused to fake-ship; committed docs-only deferral + finding (`docs/findings/2026-05-17-remote-control-r6f-upstream-gap.md`). R-6e's diff streaming + pagination remains the load-bearing bandwidth win. Re-open when upstream lands the extension or when we migrate the WS stack. |
+| R-6f WS compression | sawe `2b22c9557c` | **Cancelled (upstream gap)** — `tokio-tungstenite 0.28` and `0.29` parse `permessage-deflate` headers but don't implement the codec. Listener stays uncompressed. Sub-agent refused to fake-ship; committed docs-only deferral + finding (`docs/findings/2026-05-17-remote-control-r6f-upstream-gap.md`). R-6e's diff streaming + pagination remains the load-bearing bandwidth win. Re-open when upstream lands the extension or when we migrate the WS stack. |
 
 ## Open follow-ups
 
@@ -59,8 +59,8 @@ No CI yet.
 |---|---|---|
 | **R-6c** FCM push + multi-server | HEAVY (sibling) | Push notifications when an agent finishes a turn (needs Firebase project setup by the maintainer); support multiple paired workstations from one phone app. Defer until single-server v1 has real-world use feedback. |
 | **Crash reporting** | LIGHT-MEDIUM (sibling) | No Crashlytics / Sentry yet by design. Add a local-log fallback if shipping reveals visibility gaps. |
-| **F** Sub-agent indication UI | HEAVY (spk-editor + sibling) | **Shipped 2026-05-17/18**: F-server `104881302c`, F-desktop `cd8a6aebb5`, F-phone (sibling) `1af444b`. Sub-agents modelled as first-class sessions with `parent_session_id`; new `get_session_children` MCP tool; `SessionSummary` carries `total_tokens` + `parent_session_id`; desktop bubble strip in session_view above status row (DFS, indent per nesting, click→open_session); phone AssistChip LazyRow above compose. Trade-off: Claude Code's internal Task tool dispatches still won't surface — parent agents must explicitly call `create_session({parent_session_id})` to be visible (filed as a potential future synthetic-from-tool_use phase). solution_agent tests 99 → 112, `:core` 87 → 91. |
-| **G** `spk-image://` in queued message | LIGHT (spk-editor) | Audit 2026-05-16 showed `spk-image://` IS wired in 3 places. Bug from 2026-05-15 likely already fixed; needs user repro to confirm there's still a remaining failure mode. |
+| **F** Sub-agent indication UI | HEAVY (sawe + sibling) | **Shipped 2026-05-17/18**: F-server `104881302c`, F-desktop `cd8a6aebb5`, F-phone (sibling) `1af444b`. Sub-agents modelled as first-class sessions with `parent_session_id`; new `get_session_children` MCP tool; `SessionSummary` carries `total_tokens` + `parent_session_id`; desktop bubble strip in session_view above status row (DFS, indent per nesting, click→open_session); phone AssistChip LazyRow above compose. Trade-off: Claude Code's internal Task tool dispatches still won't surface — parent agents must explicitly call `create_session({parent_session_id})` to be visible (filed as a potential future synthetic-from-tool_use phase). solution_agent tests 99 → 112, `:core` 87 → 91. |
+| **G** `spk-image://` in queued message | LIGHT (sawe) | Audit 2026-05-16 showed `spk-image://` IS wired in 3 places. Bug from 2026-05-15 likely already fixed; needs user repro to confirm there's still a remaining failure mode. |
 | **R-6f re-open** | HEAVY (deferred) | When `tokio-tungstenite` ships permessage-deflate (long-open upstream issue) OR when we migrate the WS stack to a compression-capable alternative (`fastwebsockets`, OkHttp + custom extension, etc.). |
 | **`list_sessions` UI pagination** | LIGHT (sibling) | R-6e wired the wire-side `total_count` for list_sessions; UI infinite-scroll on solutions/sessions list deferred until needed. |
 
@@ -95,8 +95,8 @@ snapshots; this is authoritative for current state.
 1. Read this file first.
 2. Read `docs/INDEX.md`.
 3. Read `docs/workflow/supervisor-mode.md`.
-4. `git log --oneline -25` for the spk-editor side.
-5. `cd ../spk-editor-mobile && git log --oneline -10` for the sibling.
+4. `git log --oneline -25` for the sawe side.
+5. `cd ../sawe-mobile && git log --oneline -10` for the sibling.
 6. The R-5/R-6 arc closes here. Pool of named items: R-6c (push + multi-server), outbound-queue disk persistence, crash reporting, F (sub-agent indication UI), G (`spk-image://` repro). User direction expected before picking up F/G; the others are LIGHT-MEDIUM polish work.
 
 If the user gives a direction in their first message, that overrides the pool ordering.

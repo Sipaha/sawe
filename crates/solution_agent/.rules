@@ -36,7 +36,7 @@ These came up multiple times during initial implementation. Each is **non-obviou
 - Tool imports come from `context_server::listener::{McpServerTool, ToolResponse}` and `context_server::types::ToolResponseContent`, **not** `editor_mcp::*`. `editor_mcp` only re-exports `register_tool` + `emit_notification` + the `set_runtime_dir_for_test` helpers.
 - `AsyncApp::update(...)` returns `R` directly, **not** `Result<R>`. Don't `?` it. (`WeakEntity::update` does return `Result<R>` — be careful which one you have.)
 - Empty-input MCP tools need a custom `Deserialize` that tolerates a missing or `null` `arguments` field. See `ListSessionsParams` for the canonical pattern (delegate to a private `Helper` struct, default on parse error).
-- E2E tests **must** call `editor_mcp::set_runtime_dir_for_test(tempdir)` before `editor_mcp::init` and `start_server`. Without it, tests collide with the user's real `~/.config/spk-editor/mcp.{lock,sock}`. Cargo's `tests/` convention runs each `tests/*.rs` as a separate binary — keep one e2e scenario per file because `start_server` binds the runtime-dir socket once per process.
+- E2E tests **must** call `editor_mcp::set_runtime_dir_for_test(tempdir)` before `editor_mcp::init` and `start_server`. Without it, tests collide with the user's real `~/.config/sawe/mcp.{lock,sock}`. Cargo's `tests/` convention runs each `tests/*.rs` as a separate binary — keep one e2e scenario per file because `start_server` binds the runtime-dir socket once per process.
 
 ## Event prefixes
 

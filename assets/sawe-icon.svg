@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="SPK Editor">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Sawe">
   <!--
-    SPK Editor — application icon.
+    Sawe — application icon.
 
     Concept: four elongated rhombi, all sides equal, sharing a
     single inner vertex at the centre and pointing NE / SE / SW /
@@ -22,8 +22,8 @@
     same silhouette.
 
     To regenerate the editor's app PNGs:
-      convert -background none -resize 512x512  spk-editor-icon.svg crates/zed/resources/app-icon.png
-      convert -background none -resize 1024x1024 spk-editor-icon.svg crates/zed/resources/app-icon@2x.png
+      convert -background none -resize 512x512  sawe-icon.svg crates/zed/resources/app-icon.png
+      convert -background none -resize 1024x1024 sawe-icon.svg crates/zed/resources/app-icon@2x.png
   -->
 
   <rect width="512" height="512" rx="112" fill="#11102a"/>

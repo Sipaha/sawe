@@ -111,7 +111,7 @@ and changes from "expand" semantics to "dropdown" semantics.
 
 ```bash
 cd <worktree>
-cargo build --bin spk-editor 2>&1 | tee /tmp/build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/build.txt
 grep -E "^error|could not compile" /tmp/build.txt   # must be empty
 cargo clippy -p solutions_ui -p project_panel --all-targets -- -D warnings
 cargo test -p solutions_ui -p project_panel --no-fail-fast

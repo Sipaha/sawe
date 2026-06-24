@@ -5872,7 +5872,7 @@ impl ProjectPanel {
                             cx.notify();
                         }
                     } else {
-                        // SPK Editor fork: files open on double-click only
+                        // Sawe fork: files open on double-click only
                         // (IDEA convention). Upstream opened on every
                         // single click — that meant an arrow-key/click
                         // walk through the panel would spawn a

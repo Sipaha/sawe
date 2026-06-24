@@ -316,7 +316,7 @@ impl SolutionAgentStore {
     /// already consumed `prompt_tx` at the moment of the cancel forward,
     /// neither `cancel` nor its escalation arms anything that ever fires
     /// `Stopped`, and the queue state is left in `Stopping` forever (the
-    /// observed bug: 14h+ stuck `spk-editor` tab on 2026-05-24).
+    /// observed bug: 14h+ stuck `sawe` tab on 2026-05-24).
     ///
     /// Idempotent: if a safety net is already armed for the session, the
     /// existing timer is reused. The task is stored on the session and

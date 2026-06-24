@@ -15,7 +15,7 @@ on:
         default: 'true'
 jobs:
   run_autofix:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-16x32-ubuntu-2204
     env:
       CC: clang
@@ -91,7 +91,7 @@ jobs:
   commit_changes:
     needs:
     - run_autofix
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - id: generate-token

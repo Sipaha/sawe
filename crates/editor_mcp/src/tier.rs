@@ -95,12 +95,12 @@ impl CallerCapabilities {
 
 /// Env-var name used by the `--nc` bridge to declare caller capabilities to
 /// the editor-side MCP server. Set on subprocess spawn in
-/// `agent_servers::acp::spk_editor_mcp_bridge_server`; read by the `nc` mode
+/// `agent_servers::acp::sawe_mcp_bridge_server`; read by the `nc` mode
 /// when it accepts a connection.
 ///
 /// Values: `"read_only"`, `"write"` (default), `"destructive"`. Anything else
 /// is treated as `"write"` per [`CallerCapabilities::from_bridge_env_value`].
-pub const BRIDGE_CAPS_ENV_VAR: &str = "SPK_EDITOR_MCP_BRIDGE_CAPS";
+pub const BRIDGE_CAPS_ENV_VAR: &str = "SAWE_MCP_BRIDGE_CAPS";
 
 #[cfg(test)]
 mod tests {

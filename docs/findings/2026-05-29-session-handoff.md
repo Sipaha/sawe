@@ -22,7 +22,7 @@ Head at handoff: `0855f2b003`.
 | `0855f2b003` | `conversation_render: show first input arg next to tool name in tool_call header` |
 | (this commit) | session handoff + V3 plan |
 
-Total: 254 unit tests passing in `solution_agent`. Release-fast binary at `target/release-fast/spk-editor` is up-to-date with the head commit.
+Total: 254 unit tests passing in `solution_agent`. Release-fast binary at `target/release-fast/sawe` is up-to-date with the head commit.
 
 ## What shipped this session
 
@@ -58,7 +58,7 @@ All 5 outstanding follow-ups from the V1 handoff doc landed:
 
 ### Tool-call arg preview (`0855f2b003`)
 
-New `tool_call_arg_preview(raw_input: &Value) -> Option<String>` in `conversation_render.rs`. Extracts a one-line summary from `raw_input` (preferred keys: `command`, `file_path`, `path`, `pattern`, `query`, `url`, `old_string`; falls back to first non-empty string value). Newlines collapsed to `↵`. Truncated to 120 chars with `…`. Rendered inline between the tool name and status badge: `[🔨] Bash · cargo build --bin spk-editor … · done`. 6 unit tests cover preferred-key selection, fallback, newline collapse, truncation, empty input.
+New `tool_call_arg_preview(raw_input: &Value) -> Option<String>` in `conversation_render.rs`. Extracts a one-line summary from `raw_input` (preferred keys: `command`, `file_path`, `path`, `pattern`, `query`, `url`, `old_string`; falls back to first non-empty string value). Newlines collapsed to `↵`. Truncated to 120 chars with `…`. Rendered inline between the tool name and status badge: `[🔨] Bash · cargo build --bin sawe … · done`. 6 unit tests cover preferred-key selection, fallback, newline collapse, truncation, empty input.
 
 ## Outstanding work pool
 
@@ -86,7 +86,7 @@ User asked we surface Claude Code's background shells (`Bash(run_in_background=t
 
 ### Task 14 of V1 (manual smoke) — still NOT done
 
-Same agent-verification ceiling as the V1 handoff: requires a real claude subprocess + actual `Agent`-tool dispatch (no synthetic MCP injection tool). The user has the release-fast binary at `target/release-fast/spk-editor`, sha `0855f2b003`; manual recipe in V1 handoff doc steps 4–7.
+Same agent-verification ceiling as the V1 handoff: requires a real claude subprocess + actual `Agent`-tool dispatch (no synthetic MCP injection tool). The user has the release-fast binary at `target/release-fast/sawe`, sha `0855f2b003`; manual recipe in V1 handoff doc steps 4–7.
 
 ## Architectural decisions made this session (worth keeping)
 
@@ -116,9 +116,9 @@ Same agent-verification ceiling as the V1 handoff: requires a real claude subpro
 
 ## Environment / mechanics
 
-- Working dir: `/home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor` (cwd persistence between Bash calls is inconsistent — always pass absolute paths or `cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor &&` prefix).
-- Release-fast binary: `target/release-fast/spk-editor`, mtime ~`2026-05-29 09:43+`, sha `0855f2b003`.
-- MCP socket: `~/.spk/spk-editor/config/mcp.sock` (release) or `~/.spk/spk-editor-dev/config/mcp.sock` (debug).
+- Working dir: `/home/spk/.spk/sawe/solutions/spk-solutions/sawe` (cwd persistence between Bash calls is inconsistent — always pass absolute paths or `cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe &&` prefix).
+- Release-fast binary: `target/release-fast/sawe`, mtime ~`2026-05-29 09:43+`, sha `0855f2b003`.
+- MCP socket: `~/.spk/sawe/config/mcp.sock` (release) or `~/.spk/sawe-dev/config/mcp.sock` (debug).
 - Memory pressure: no spikes this session. Both kotlin daemon + rust-analyzer flycheck stayed under 6 GiB total.
 - All test commands run as `cargo test -p solution_agent --lib 2>&1 | tail -<N>` — never `| tail` without `2>&1` because cargo build pipes mask exit codes (see CLAUDE.md "Build + test conventions").
 

@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 jobs:
   publish_job:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:
     - name: steps::checkout_repo
@@ -32,7 +32,7 @@ jobs:
   update_sha_in_zed:
     needs:
     - publish_job
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-8x16-ubuntu-2204
     steps:
     - id: generate-token
@@ -82,7 +82,7 @@ jobs:
   update_sha_in_extensions:
     needs:
     - publish_job
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - id: generate-token

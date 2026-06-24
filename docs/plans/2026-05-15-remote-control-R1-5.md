@@ -80,7 +80,7 @@ of a half-formed URL.
 ## Verification
 
 ```bash
-cargo build --bin spk-editor 2>&1 | tee /tmp/build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/build.txt
 grep -E "^error|could not compile" /tmp/build.txt   # must be empty
 cargo clippy -p remote_control_ui --all-targets -- -D warnings
 cargo test -p remote_control_ui --no-fail-fast

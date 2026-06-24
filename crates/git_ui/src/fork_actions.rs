@@ -1,6 +1,6 @@
 //! Fork-local git actions.
 //!
-//! These actions belong to the SPK Editor fork's git feature set (S-STH
+//! These actions belong to the Sawe fork's git feature set (S-STH
 //! stashes pane, S-SHL shelf pane, patch apply, S-BAK undo registry, S-SAR
 //! show-at-revision, interactive rebase). Upstream Zed v1.7.2 does not define
 //! them. They keep the `git` keymap namespace so existing keybindings
@@ -46,7 +46,7 @@ pub struct ApplyPatchFromClipboard;
 #[serde(deny_unknown_fields)]
 pub struct UndoLast;
 
-/// Deletes spk-editor backup-refs older than `older_than_days` from the
+/// Deletes sawe backup-refs older than `older_than_days` from the
 /// active repository. Default 30 days.
 #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = git)]

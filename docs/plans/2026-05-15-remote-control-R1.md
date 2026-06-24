@@ -34,7 +34,7 @@ Pattern after the existing `crates/run_config` crate (fork-owned).
 
 - `RemoteControlSettings { server_address: Option<String>, server_port: u16, enabled: bool, clients: Vec<AuthorizedClient> }`.
 - `AuthorizedClient { name: String, secret_base64: String, created_at: chrono::DateTime<chrono::Utc> }`.
-- JSON persistence at `~/.config/spk-editor/remote-control.json` (use the existing `paths::remote_control_settings_file()` helper if it exists; else add one to `crates/paths`).
+- JSON persistence at `~/.config/sawe/remote-control.json` (use the existing `paths::remote_control_settings_file()` helper if it exists; else add one to `crates/paths`).
 - Defaults: `server_port: 7777`, `enabled: false`, empty clients list.
 - `RemoteControlStore` GPUI global (mirrors `SolutionStore` / `RunConfigStore`) with `update_settings`, `add_client(name) -> Result<&AuthorizedClient>` (generates a random 32-byte secret via `rand::rngs::OsRng`), `remove_client(name)`, `set_enabled(bool)`, `set_address(...)`, `set_port(u16)`.
 - Emits `RemoteControlStoreEvent::Changed` on every mutation.
@@ -77,7 +77,7 @@ Pattern after `crates/run_config_ui`.
 - `FORK.md` row for `crates/zed/src/zed.rs` if not already listed (it
   is — the agent_panel toggle row covers it).
 - `FORK.md` row for `crates/paths/src/paths.rs` if you add the path
-  helper there (already listed — `.spke` rename + run_configurations_file
+  helper there (already listed — `.sawe` rename + run_configurations_file
   + local_run_configurations_file_relative_path).
 - `.rules`: no new tool catalog entries yet (R-1 doesn't ship MCP tools).
 
@@ -112,7 +112,7 @@ Pattern after `crates/run_config_ui`.
 
 ```bash
 cd <worktree>
-cargo build --bin spk-editor 2>&1 | tee /tmp/build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/build.txt
 grep -E "^error|could not compile" /tmp/build.txt   # must be empty
 cargo clippy -p remote_control -p remote_control_ui --all-targets -- -D warnings
 cargo test -p remote_control -p remote_control_ui --no-fail-fast
@@ -130,7 +130,7 @@ Supervisor § H smoke-test post-merge:
 
 ## When done
 
-- [ ] `cargo build --bin spk-editor` clean.
+- [ ] `cargo build --bin sawe` clean.
 - [ ] `cargo clippy` on touched crates clean.
 - [ ] `cargo test` on touched crates green.
 - [ ] `RemoteControlStatusItem` visible in the status bar.
@@ -141,6 +141,6 @@ Supervisor § H smoke-test post-merge:
   failure rather than panic).
 - [ ] Add-client by name works; secret is generated + stored.
 - [ ] Settings persist across editor restarts
-  (`~/.config/spk-editor/remote-control.json`).
+  (`~/.config/sawe/remote-control.json`).
 - [ ] FORK.md updated with the two new crates.
 - [ ] Plan doc ticked + final SHA appended.

@@ -11,10 +11,10 @@
     </developer>
     <description>
         <p>
-            SPK Editor is a personal fork of Zed by Zed Industries, Inc., modified by Simonov Pavel.
+            Sawe is a personal fork of Zed by Zed Industries, Inc., modified by Simonov Pavel.
         </p>
         <p>
-            Productive coding starts with a tool that stays out of your way. SPK Editor blends the power of an IDE with the speed of a lightweight editor for productivity you can feel under your fingertips.
+            Productive coding starts with a tool that stays out of your way. Sawe blends the power of an IDE with the speed of a lightweight editor for productivity you can feel under your fingertips.
         </p>
         <p>Features:</p>
         <ul>
@@ -37,10 +37,10 @@
         <content_attribute id="social-audio">intense</content_attribute>
     </content_rating>
 
-    <url type="homepage">https://github.com/Sipaha/spk-editor</url>
-    <url type="bugtracker">https://github.com/Sipaha/spk-editor/issues</url>
-    <url type="vcs-browser">https://github.com/Sipaha/spk-editor</url>
-    <url type="contribute">https://github.com/Sipaha/spk-editor/blob/main/CONTRIBUTING.md</url>
+    <url type="homepage">https://github.com/Sipaha/sawe</url>
+    <url type="bugtracker">https://github.com/Sipaha/sawe/issues</url>
+    <url type="vcs-browser">https://github.com/Sipaha/sawe</url>
+    <url type="contribute">https://github.com/Sipaha/sawe/blob/main/CONTRIBUTING.md</url>
 
     <supports>
         <internet>offline-only</internet>

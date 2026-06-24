@@ -24,7 +24,7 @@ Four commits, pushed to `origin/status-bar-model-selector`
 
 All verified on the headless MCP harness (incl. hovering a real bubble to confirm the
 timestamp no longer overlaps; the Update/Push buttons + right-click; cleaned branch popup).
-A fresh `target/release-fast/spk-editor` was built (≈16:38) for the maintainer to test.
+A fresh `target/release-fast/sawe` was built (≈16:38) for the maintainer to test.
 
 ## Uncommitted (intentionally left in working tree — DO NOT commit)
 
@@ -36,7 +36,7 @@ diagnosis. Never `git add` this; never `git add -A`.
 
 The maintainer approved re-forking onto a recent upstream stable tag (to restore real git
 ancestry — our history is disjoint from upstream's after 2021, so `git merge upstream/main`
-is infeasible; only cherry-pick works today) **combined with the `spk-editor → sawe`
+is infeasible; only cherry-pick works today) **combined with the `sawe → sawe`
 rebrand**. Execution happens in a **fresh context**.
 
 **Plan doc:** `docs/superpowers/plans/2026-06-24-refork-and-rebrand-sawe.md`
@@ -49,15 +49,15 @@ map, the `zed`-strip scope (§6a), and the verification ritual.
 - Target = the clean **`sawe` member repo** (`solutions/spk-solutions/sawe`), commit
   straight to **`main`**, push to `Sipaha/sawe`. Configured this session: `origin` =
   `git@github.com-sipaha:Sipaha/sawe.git` (pushes as Sipaha, ssh-verified),
-  `user.email=sipahabk@gmail.com`, `user.name=Pavel Simonov`. The `spk-editor` repo is the
-  donor of fork code. NOT a branch in spk-editor; no GitHub repo rename needed.
-- `.spke` → `.sawe`; `SPK_EDITOR_*` → `SAWE_*`; root `~/.spk/sawe`; target = latest stable
+  `user.email=sipahabk@gmail.com`, `user.name=Pavel Simonov`. The `sawe` repo is the
+  donor of fork code. NOT a branch in sawe; no GitHub repo rename needed.
+- `.sawe` → `.sawe`; `SAWE_*` → `SAWE_*`; root `~/.spk/sawe`; target = latest stable
   upstream tag (confirm exact at start).
 - **Strip `zed`/`Zed` from brand/user-visible surfaces**, keep only license-required
   mentions (LICENSE-*, copyright, `Fork of Zed…` attribution, `legal/upstream-zed/`,
   `.zed_server`) AND the internal `zed` cargo-crate / shared upstream identifiers (renaming
   those would conflict on every future merge — see plan §6a).
-- `paths.rs` doc-comments + `.rules` claim config lives at `~/.config/spk-editor` — STALE;
+- `paths.rs` doc-comments + `.rules` claim config lives at `~/.config/sawe` — STALE;
   real root is `~/.spk/<kebab>` on all platforms. Fix during rebrand.
 
 ## Upstream comparison context (already done)

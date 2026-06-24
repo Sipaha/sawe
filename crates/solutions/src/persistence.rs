@@ -22,7 +22,7 @@ pub enum LoadError {
     Io(#[from] std::io::Error),
     #[error("invalid JSON: {0}")]
     Parse(#[from] serde_json::Error),
-    #[error("unsupported config version {0} (newer than this build supports — upgrade SPK Editor)")]
+    #[error("unsupported config version {0} (newer than this build supports — upgrade Sawe)")]
     UnsupportedVersion(u32),
 }
 
@@ -60,11 +60,11 @@ mod tests {
             solutions: vec![Solution {
                 id: SolutionId("ecos-platform".into()),
                 name: "ECOS Platform".into(),
-                root: PathBuf::from("/home/user/spk-editor/solutions/ecos-platform"),
+                root: PathBuf::from("/home/user/sawe/solutions/ecos-platform"),
                 members: vec![SolutionMember {
                     catalog_id: CatalogId("ecos-base".into()),
                     local_path: PathBuf::from(
-                        "/home/user/spk-editor/solutions/ecos-platform/ecos-base",
+                        "/home/user/sawe/solutions/ecos-platform/ecos-base",
                     ),
                 }],
                 last_opened_at: None,

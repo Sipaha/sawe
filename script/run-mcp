@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launch spk-editor with the MCP socket exposed for autonomous agent driving.
-# The MCP socket lives at $XDG_CONFIG_HOME/spk-editor/mcp.sock by default;
+# Launch sawe with the MCP socket exposed for autonomous agent driving.
+# The MCP socket lives at $XDG_CONFIG_HOME/sawe/mcp.sock by default;
 # pass --runtime-dir <path> to override.
 #
 # Usage:
@@ -13,12 +13,12 @@
 #   script/run-mcp --display      # use the existing $DISPLAY (fails if unset)
 #   script/run-mcp --debug        # use the dev (debug) build — much faster to
 #                                 # rebuild during iteration; runtime is slower
-#   script/run-mcp --release      # use target/release/spk-editor (default)
+#   script/run-mcp --release      # use target/release/sawe (default)
 #   script/run-mcp --skip-onboarding  # pre-seed kvp so the Onboarding screen
 #                                     # is skipped (only meaningful with
 #                                     # --runtime-dir on a fresh dir; requires
 #                                     # the sqlite3 CLI tool)
-#   script/run-mcp -- <args>      # pass extra args to spk-editor
+#   script/run-mcp -- <args>      # pass extra args to sawe
 #
 # Behavior:
 # - Builds the chosen binary (release by default, dev with --debug) if missing.
@@ -81,11 +81,11 @@ done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "$profile" == "dev" ]]; then
-    binary="$repo_root/target/debug/spk-editor"
-    cargo_flags=(--bin spk-editor)
+    binary="$repo_root/target/debug/sawe"
+    cargo_flags=(--bin sawe)
 else
-    binary="$repo_root/target/release/spk-editor"
-    cargo_flags=(--release --bin spk-editor)
+    binary="$repo_root/target/release/sawe"
+    cargo_flags=(--release --bin sawe)
 fi
 
 # Resolve socket_dir + socket_path UP FRONT (before build / xvfb checks /
@@ -97,25 +97,25 @@ if [[ -n "$runtime_dir" ]]; then
     # Full isolation: editor's config / data / cache all land under
     # $runtime_dir. The editor uses its standard XDG-derived paths, which
     # means a fresh state — no user settings, themes, keymaps, db, etc.
-    # The MCP socket lands at $runtime_dir/spk-editor/mcp.sock.
+    # The MCP socket lands at $runtime_dir/sawe/mcp.sock.
     mkdir -p "$runtime_dir"
     export XDG_CONFIG_HOME="$runtime_dir"
     export XDG_DATA_HOME="$runtime_dir"
     export XDG_CACHE_HOME="$runtime_dir"
-    socket_dir="$runtime_dir/spk-editor"
+    socket_dir="$runtime_dir/sawe"
 else
-    # SPK Editor uses ~/.spk/spk-editor[-dev]/config/ (see crates/paths) —
+    # Sawe uses ~/.spk/sawe[-dev]/config/ (see crates/paths) —
     # NOT XDG_CONFIG_HOME. The dev binary suffixes with `-dev`.
     if [[ "$profile" == "dev" ]]; then
-        socket_dir="$HOME/.spk/spk-editor-dev/config"
+        socket_dir="$HOME/.spk/sawe-dev/config"
     else
-        socket_dir="$HOME/.spk/spk-editor/config"
+        socket_dir="$HOME/.spk/sawe/config"
     fi
     # Pin the editor's home-dir resolution to the real $HOME. A binary built
     # with `--features test-support` (needed for the workspace.screenshot MCP
     # tool) would otherwise hard-code /home/zed in util::paths::home_dir() and
     # fail to create its config/data dirs. Harmless for normal builds.
-    export SPK_EDITOR_HOME="$HOME"
+    export SAWE_HOME="$HOME"
 fi
 socket_path="$socket_dir/mcp.sock"
 lock_path="$socket_dir/mcp.lock"
@@ -174,7 +174,7 @@ if (( skip_onboarding )); then
     # invocations stack duplicates and sqlez ends up reading "step N" =
     # "the Nth row" out of order, then aborts with "Migration changed
     # for KeyValueStore at step N" and falls back to an in-memory DB.
-    data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/spk-editor"
+    data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/sawe"
     for channel in dev stable preview nightly; do
         db_dir="$data_dir/db/0-$channel"
         db_file="$db_dir/db.sqlite"

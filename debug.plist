@@ -3,13 +3,13 @@
 <plist version="1.0">
     <dict>
         <key>CFBundleDisplayName</key>
-        <string>SPK Editor Debug</string>
+        <string>Sawe Debug</string>
         <key>CFBundleExecutable</key>
-        <string>spk-editor-debug</string>
+        <string>sawe-debug</string>
         <key>CFBundleIdentifier</key>
-        <string>ru.sipaha.spk-editor-debug</string>
+        <string>ru.sipaha.sawe-debug</string>
         <key>CFBundleName</key>
-        <string>SPK Editor Debug</string>
+        <string>Sawe Debug</string>
         <key>com.apple.security.get-task-allow</key>
         <true/>
     </dict>

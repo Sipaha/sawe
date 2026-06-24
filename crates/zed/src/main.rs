@@ -89,7 +89,7 @@ fn build_application(headless: bool) -> Application {
 }
 
 fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>, headless: bool) {
-    let message = "SPK Editor failed to launch";
+    let message = "Sawe failed to launch";
     let error_details = errors
         .into_iter()
         .flat_map(|(kind, paths)| {
@@ -157,7 +157,7 @@ fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncApp) {
 
 fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
     eprintln!(
-        "SPK Editor failed to open a window: {e:?}. See https://github.com/Sipaha/spk-editor for troubleshooting."
+        "Sawe failed to open a window: {e:?}. See https://github.com/Sipaha/sawe for troubleshooting."
     );
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
@@ -177,7 +177,7 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
             proxy
                 .add_notification(
                     notification_id,
-                    Notification::new("SPK Editor failed to launch")
+                    Notification::new("Sawe failed to launch")
                         .body(Some(
                             format!(
                                 "{e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
@@ -255,7 +255,7 @@ fn main() {
         }
     }
 
-    // `spk-editor --git-rebase-helper <todo-path>` runs as `GIT_SEQUENCE_EDITOR`
+    // `sawe --git-rebase-helper <todo-path>` runs as `GIT_SEQUENCE_EDITOR`
     // during programmatic interactive rebase (S-RBL). The implementation lives
     // in `git::operations::helpers` so it can be exercised by unit tests
     // without GPUI init. Exits directly without booting the editor — `git`
@@ -271,7 +271,7 @@ fn main() {
         }
     }
 
-    // `spk-editor --git-message-set <token>` runs as an `exec` step inside an
+    // `sawe --git-message-set <token>` runs as an `exec` step inside an
     // interactive rebase to swap in a pre-staged commit message via
     // `git commit --amend -F`.
     if let Some(token) = &args.git_message_set {
@@ -378,7 +378,7 @@ fn main() {
             client::telemetry::os_name(),
             client::telemetry::os_version(),
         );
-        println!("SPK Editor System Specs (from CLI):\n{}", system_specs);
+        println!("Sawe System Specs (from CLI):\n{}", system_specs);
         return;
     }
 
@@ -399,7 +399,7 @@ fn main() {
             .unwrap_or("unknown"),
     );
 
-    // Single-instance handoff: if another spk-editor is already running and
+    // Single-instance handoff: if another sawe is already running and
     // its MCP server is reachable, hand off our CLI paths to it and exit.
     // Otherwise we continue and become the canonical instance (later we'll
     // bind the MCP server in `editor_mcp::start_server`).
@@ -417,14 +417,14 @@ fn main() {
     match editor_mcp::try_handoff_to_existing_instance(handoff_paths) {
         Ok(editor_mcp::HandoffOutcome::HandedOff { focused_window_id }) => {
             log::info!(
-                "spk-editor: handed off to existing instance (window: {:?})",
+                "sawe: handed off to existing instance (window: {:?})",
                 focused_window_id
             );
             return;
         }
         Ok(editor_mcp::HandoffOutcome::LockBusyButUnreachable { lockholder_pid }) => {
             eprintln!(
-                "Another spk-editor instance is starting (lock held by PID {:?}); please wait or terminate it.",
+                "Another sawe instance is starting (lock held by PID {:?}); please wait or terminate it.",
                 lockholder_pid
             );
             process::exit(1);
@@ -433,7 +433,7 @@ fn main() {
             // Continue normal startup; we'll bind the MCP server later.
         }
         Err(err) => {
-            log::warn!("spk-editor: handoff probe failed: {err}; continuing as canonical");
+            log::warn!("sawe: handoff probe failed: {err}; continuing as canonical");
         }
     }
 
@@ -478,7 +478,7 @@ fn main() {
         }
     };
     if failed_single_instance_check {
-        println!("spk-editor is already running");
+        println!("sawe is already running");
         return;
     }
 
@@ -766,10 +766,10 @@ fn main() {
         });
         AppState::set_global(app_state.clone(), cx);
 
-        // Auto-update disabled in spk-editor: no upstream channel, builds from source.
+        // Auto-update disabled in sawe: no upstream channel, builds from source.
         // auto_update::init(client.clone(), cx);
         dap_adapters::init(cx);
-        // Auto-update UI disabled in spk-editor: no upstream channel, builds from source.
+        // Auto-update UI disabled in sawe: no upstream channel, builds from source.
         // auto_update_ui::init(cx);
         reliability::init(client.clone(), cx);
         extension_host::init(
@@ -903,7 +903,7 @@ fn main() {
         language_tools::init(cx);
         call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-        // Collab is disabled in spk-editor (no Zed Industries collab server access).
+        // Collab is disabled in sawe (no Zed Industries collab server access).
         // collab_ui::init(&app_state, cx);
         // title_bar::init was nested inside collab_ui::init upstream; call it directly
         // since it has nothing to do with collab and is required for window decorations.
@@ -1700,7 +1700,7 @@ async fn open_solution_by_name_or_id(
 
     let Some(resolved) = resolved else {
         log::warn!(
-            "spk-editor: --solution {name_or_id:?} not found in solutions.json; falling back to welcome"
+            "sawe: --solution {name_or_id:?} not found in solutions.json; falling back to welcome"
         );
         return Ok(false);
     };
@@ -2005,25 +2005,25 @@ fn stdout_is_a_pty() -> bool {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "spk-editor", disable_version_flag = true, max_term_width = 100)]
+#[command(name = "sawe", disable_version_flag = true, max_term_width = 100)]
 struct Args {
     /// A sequence of space-separated paths or urls that you want to open.
     ///
     /// Use `path:line:row` syntax to open a file at a specific location.
     /// Non-existing paths and directories will ignore `:line:row` suffix.
     ///
-    /// URLs can either be `file://` or `spk-editor://` scheme.
+    /// URLs can either be `file://` or `sawe://` scheme.
     paths_or_urls: Vec<String>,
 
     /// Open a Solution by name or id and skip the Welcome screen.
     ///
-    /// Looks up the named entry in `~/.config/spk-editor/solutions.json`
+    /// Looks up the named entry in `~/.config/sawe/solutions.json`
     /// (matching either the human-readable `name` or the slug `id`) and
     /// opens its member worktrees in a new window. If the solution has no
     /// members yet, the window opens at `solution.root` with the empty-
     /// solution placeholder page so the user can add projects.
     ///
-    /// Example: `spk-editor --solution probe-test`
+    /// Example: `sawe --solution probe-test`
     #[arg(long, value_name = "NAME-OR-ID")]
     solution: Option<String>,
 
@@ -2035,14 +2035,14 @@ struct Args {
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     ///
     /// This overrides the default platform-specific data directory location.
-    /// On macOS, the default is `~/Library/Application Support/SpkEditor`.
-    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/spk-editor`.
-    /// On Windows, the default is `%LOCALAPPDATA%\SpkEditor`.
+    /// On macOS, the default is `~/Library/Application Support/Sawe`.
+    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/sawe`.
+    /// On Windows, the default is `%LOCALAPPDATA%\Sawe`.
     #[arg(long, value_name = "DIR", verbatim_doc_comment)]
     user_data_dir: Option<String>,
 
     /// The username and WSL distribution to use when opening paths. If not specified,
-    /// SPK Editor will attempt to open the paths directly.
+    /// Sawe will attempt to open the paths directly.
     ///
     /// The username is optional, and if not specified, the default user for the distribution
     /// will be used.
@@ -2061,20 +2061,20 @@ struct Args {
     #[arg(long)]
     dev_container: bool,
 
-    /// Instructs spk-editor to run as a dev server on this machine. (not implemented)
+    /// Instructs sawe to run as a dev server on this machine. (not implemented)
     #[arg(long)]
     dev_server_token: Option<String>,
 
     /// Prints system specs.
     ///
     /// Useful for submitting issues on GitHub when encountering a bug that
-    /// prevents SPK Editor from starting, so you can't run `zed: copy system specs to
+    /// prevents Sawe from starting, so you can't run `zed: copy system specs to
     /// clipboard`
     #[arg(long)]
     system_specs: bool,
 
     /// Used for the MCP Server, to remove the need for netcat as a dependency,
-    /// by having SPK Editor act like netcat communicating over a Unix socket.
+    /// by having Sawe act like netcat communicating over a Unix socket.
     #[arg(long, hide = true)]
     nc: Option<String>,
 
@@ -2106,12 +2106,12 @@ struct Args {
     #[arg(long, hide = true)]
     git_message_set: Option<String>,
 
-    /// Used for recording minidumps on crashes by having SPK Editor run a separate
+    /// Used for recording minidumps on crashes by having Sawe run a separate
     /// process communicating over a socket.
     #[arg(long, hide = true)]
     crash_handler: Option<PathBuf>,
 
-    /// Run spk-editor in the foreground, only used on Windows, to match the behavior on macOS.
+    /// Run sawe in the foreground, only used on Windows, to match the behavior on macOS.
     #[arg(long)]
     #[cfg(target_os = "windows")]
     #[arg(hide = true)]
@@ -2124,7 +2124,7 @@ struct Args {
     dock_action: Option<usize>,
 
     /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
-    /// by having SPK Editor act like netcat communicating over a Unix socket.
+    /// by having Sawe act like netcat communicating over a Unix socket.
     #[arg(long)]
     #[cfg(not(target_os = "windows"))]
     #[arg(hide = true)]
@@ -2142,7 +2142,7 @@ struct Args {
     #[arg(long, hide = true)]
     record_etw_trace: bool,
 
-    /// The PID of the SPK Editor process to trace for heap analysis.
+    /// The PID of the Sawe process to trace for heap analysis.
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true, allow_hyphen_values = true)]
     etw_zed_pid: Option<i64>,
@@ -2152,7 +2152,7 @@ struct Args {
     #[arg(long, hide = true)]
     etw_output: Option<PathBuf>,
 
-    /// Unix socket path for IPC with the parent SPK Editor process.
+    /// Unix socket path for IPC with the parent Sawe process.
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true)]
     etw_socket: Option<String>,
@@ -2181,7 +2181,7 @@ fn is_url_scheme(arg: &str) -> bool {
         || arg.starts_with("zed://")
         || arg.starts_with("zed-cli://")
         || arg.starts_with("ssh://")
-        || arg.starts_with("spk-editor://")
+        || arg.starts_with("sawe://")
 }
 
 fn parse_url_arg(arg: &str, cx: &App) -> String {

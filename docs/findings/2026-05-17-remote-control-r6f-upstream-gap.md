@@ -101,7 +101,7 @@ Nothing functional. This commit:
 - Updates `docs/INDEX.md` plans table row.
 
 `Cargo.toml`, `crates/remote_control/`, and `FORK.md` are untouched.
-`cargo build --bin spk-editor` and `cargo test -p remote_control` were
+`cargo build --bin sawe` and `cargo test -p remote_control` were
 not re-run — no code changed.
 
 ## When this unblocks

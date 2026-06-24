@@ -1,7 +1,7 @@
 # R-5d: Chat UI with streaming responses + cancel-turn
 
 **Status:** complete (sibling-repo commit `6ef0cd7`) — closes the R-5 arc
-**Repo:** `spk-editor-mobile/`
+**Repo:** `sawe-mobile/`
 **Depends on:** R-5a (`:core`), R-5b (pairing), R-5c (sessions list).
 **Goal:** The session detail screen lights up as a real chat. User types → message goes to the agent → reply streams in bubble-by-bubble. Cancel button stops a turn. Closes the R-5 arc.
 
@@ -59,7 +59,7 @@ If a message contains `Image` content blocks, render them inline (`Coil` for bas
 
 ## DTO extension in `:core`
 
-`:core` needs `Message`, `ContentBlock` (text / image / tool_call / tool_result) DTOs that round-trip the same JSON shapes spk-editor sends. Use kotlinx.serialization's `polymorphic` discriminator on `type`. Add JSON round-trip tests per DTO variant.
+`:core` needs `Message`, `ContentBlock` (text / image / tool_call / tool_result) DTOs that round-trip the same JSON shapes sawe sends. Use kotlinx.serialization's `polymorphic` discriminator on `type`. Add JSON round-trip tests per DTO variant.
 
 ## Out of scope
 
@@ -72,7 +72,7 @@ If a message contains `Image` content blocks, render them inline (`Coil` for bas
 
 ## Architectural decisions
 
-1. **Optimistic user bubble** — the user types and Send is pressed; the bubble appears immediately even before the server `send_message` resolves. This matches the existing UX on the spk-editor side (`render_resuming_section`).
+1. **Optimistic user bubble** — the user types and Send is pressed; the bubble appears immediately even before the server `send_message` resolves. This matches the existing UX on the sawe side (`render_resuming_section`).
 2. **Auto-scroll with manual override** — once the user scrolls up, stop auto-scrolling; show a "Jump to bottom" pill so they can opt back in. Standard chat-app pattern.
 3. **Server is the source of truth** — when notification arrives, replace the optimistic bubble with the server-acknowledged one (matched by id). If the server never echoes (timeout 30s), surface an error.
 4. **Image inline rendering via Coil**, not a separate viewer. Tap → full-screen via `LocalAnimatedContentScope`. Caps applied for memory.
@@ -80,7 +80,7 @@ If a message contains `Image` content blocks, render them inline (`Coil` for bas
 ## Verification
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 JAVA_HOME=$HOME/.jdks/temurin-21.0.10 ./gradlew :core:test :app:assembleDebug --rerun-tasks 2>&1 | tee /tmp/r5d.txt
 grep -E "BUILD SUCCESSFUL|FAILURE:" /tmp/r5d.txt
 ```
@@ -105,7 +105,7 @@ Manual smoke (load-bearing — this is the user-facing feature):
 
 This closes R-5. Hand off to R-6 (push notifications + reconnect + multi-server) when the user wants it.
 
-Sub-agent reports commit SHA, Compose performance observations (any frame drops on streaming?), Coil version + memory cap chosen, and any server-side schema gap that surfaced (so we can fix on the spk-editor side rather than papering over on the client).
+Sub-agent reports commit SHA, Compose performance observations (any frame drops on streaming?), Coil version + memory cap chosen, and any server-side schema gap that surfaced (so we can fix on the sawe side rather than papering over on the client).
 
 ---
 
@@ -126,7 +126,7 @@ Sub-agent reports commit SHA, Compose performance observations (any frame drops 
 
 ## Known limitations of R-5d (filed for future phases)
 
-Two server-side enrichments would unlock noticeably richer chat. Both live in `spk-editor::crates/solution_agent/src/mcp.rs` + `event_sources.rs` (fork-owned, refactor-friendly):
+Two server-side enrichments would unlock noticeably richer chat. Both live in `sawe::crates/solution_agent/src/mcp.rs` + `event_sources.rs` (fork-owned, refactor-friendly):
 
 1. **`EntrySummary` enrichment.** Currently `{ role, preview }` where `preview` is the truncated 200-char markdown. Future shape: include full markdown rendering, image `data:` URIs or referenceable image ids, structured tool-call args/results. Without this, R-5d phone client shows truncated text and no images, even though the desktop side has all of it.
 2. **Notification payload enrichment.** Currently `agent_session_message_appended` is `{ session_id }` only. Each event triggers a full `get_session` re-fetch on the client. Future shape: `{ session_id, entry_index, entry: EntrySummary }` so the client can append/update without round-tripping. Big perf + UX win on a slow LTE link.
@@ -137,11 +137,11 @@ Filing as **R-5e (server-side enrichment for remote chat rendering)** — separa
 
 | Phase | Sibling-repo commit | What landed |
 |---|---|---|
-| R-1 (spk-editor-side) | `ee50a95..5735a4c` | Remote Control settings + status-bar + modal UI |
-| R-1.5 (spk-editor-side) | `d9fa51c` | QR popover replaces toast stub |
-| R-2 (spk-editor-side) | `8bc441e` | TLS+WS+HMAC listener |
-| R-3 (spk-editor-side) | `85dec79` | Server fingerprint in pairing QR |
-| R-4 (spk-editor-side) | `5d8e013` | `remote.*` proxy to embedded MCP socket |
+| R-1 (sawe-side) | `ee50a95..5735a4c` | Remote Control settings + status-bar + modal UI |
+| R-1.5 (sawe-side) | `d9fa51c` | QR popover replaces toast stub |
+| R-2 (sawe-side) | `8bc441e` | TLS+WS+HMAC listener |
+| R-3 (sawe-side) | `85dec79` | Server fingerprint in pairing QR |
+| R-4 (sawe-side) | `5d8e013` | `remote.*` proxy to embedded MCP socket |
 | **R-5a** | `77eb966` | New sibling repo bootstrap, `:core` connection lib (30 tests) + `:app` Compose stub |
 | **R-5a follow-up** | `4e478f1` | `:cli` smoke client + six-step `LiveEditorIntegrationTest` |
 | **R-5a fixup** | `d83ab47` | `:core` `api` configuration (post-SDK-install) |
@@ -152,6 +152,6 @@ Filing as **R-5e (server-side enrichment for remote chat rendering)** — separa
 End state in the sibling repo: 6 commits, `:core` 45 tests green, `:app:assembleDebug` produces an 11.22 MB APK that the maintainer can install on any Android 8.0+ device.
 
 Original user ask 2026-05-15 met:
-> Установить Android-приложение, отсканировать QR из spk-editor, увидеть открытые solutions, открыть одну, увидеть её agent sessions, послать сообщение агенту, видеть как ответ агента стримится в чате. Канал зашифрован, авторизация по per-client секрету.
+> Установить Android-приложение, отсканировать QR из sawe, увидеть открытые solutions, открыть одну, увидеть её agent sessions, послать сообщение агенту, видеть как ответ агента стримится в чате. Канал зашифрован, авторизация по per-client секрету.
 
-Все шесть пунктов закрыты сборкой. Полная end-to-end проверка ждёт ручного запуска на устройстве с одновременно работающим spk-editor.
+Все шесть пунктов закрыты сборкой. Полная end-to-end проверка ждёт ручного запуска на устройстве с одновременно работающим sawe.

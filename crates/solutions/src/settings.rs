@@ -100,7 +100,7 @@ impl Default for SolutionsSettings {
 
 /// Default solutions storage root: `<base_dir>/solutions`. The base
 /// directory comes from `paths::base_dir()` (single-folder profile —
-/// `~/spk-editor` for release, `~/spk-editor-dev` for debug, or any
+/// `~/sawe` for release, `~/sawe-dev` for debug, or any
 /// `set_custom_data_dir` override) so all per-profile state lives in
 /// one place.
 fn default_root() -> PathBuf {
@@ -192,8 +192,8 @@ mod tests {
             "tilde was not expanded: {}",
             s.root.display()
         );
-        // Root is `~/spk-editor/solutions` in release and
-        // `~/spk-editor-dev/solutions` in debug. Either way the last
+        // Root is `~/sawe/solutions` in release and
+        // `~/sawe-dev/solutions` in debug. Either way the last
         // segment is `solutions` and the parent matches the active
         // base directory name.
         assert!(s.root.ends_with("solutions"));

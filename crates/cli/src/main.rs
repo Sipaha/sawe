@@ -44,22 +44,22 @@ trait InstalledApp {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "spk-editor",
+    name = "sawe",
     disable_version_flag = true,
-    about = "SPK Editor — fork of Zed by Zed Industries, Inc., modified by Simonov Pavel",
-    before_help = "The SPK Editor CLI binary.
-This CLI is a separate binary that invokes SPK Editor.
+    about = "Sawe — fork of Zed by Zed Industries, Inc., modified by Simonov Pavel",
+    before_help = "The Sawe CLI binary.
+This CLI is a separate binary that invokes Sawe.
 
 Examples:
-    `spk-editor`
-          Simply opens SPK Editor
-    `spk-editor --foreground`
+    `sawe`
+          Simply opens Sawe
+    `sawe --foreground`
           Runs in foreground (shows all logs)
-    `spk-editor path-to-your-project`
-          Open your project in SPK Editor
-    `spk-editor -n path-to-file `
+    `sawe path-to-your-project`
+          Open your project in Sawe
+    `sawe -n path-to-file `
           Open file/folder in a new window",
-    after_help = "To read from stdin, append '-', e.g. 'ps axf | spk-editor -'"
+    after_help = "To read from stdin, append '-', e.g. 'ps axf | sawe -'"
 )]
 struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
@@ -881,8 +881,8 @@ mod linux {
                 // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
                 // ./zed is for the target directory in development builds.
                 let possible_locations = [
-                    "../libexec/spk-editor-bin",
-                    "../lib/spk-editor/spk-editor-bin",
+                    "../libexec/sawe-bin",
+                    "../lib/sawe/sawe-bin",
                     "./zed",
                 ];
                 possible_locations
@@ -1049,7 +1049,7 @@ mod flatpak {
 
             if !is_app_location_set {
                 args.push("--zed".into());
-                args.push(flatpak_dir.join("libexec").join("spk-editor-bin").into());
+                args.push(flatpak_dir.join("libexec").join("sawe-bin").into());
             }
 
             let error = exec::execvp("/usr/bin/flatpak-spawn", args);
@@ -1060,10 +1060,10 @@ mod flatpak {
 
     pub fn set_bin_if_no_escape(mut args: super::Args) -> super::Args {
         if env::var(NO_ESCAPE_ENV_NAME).is_ok()
-            && env::var("FLATPAK_ID").is_ok_and(|id| id.starts_with("ru.sipaha.spk-editor"))
+            && env::var("FLATPAK_ID").is_ok_and(|id| id.starts_with("ru.sipaha.sawe"))
             && args.zed.is_none()
         {
-            args.zed = Some("/app/libexec/spk-editor-bin".into());
+            args.zed = Some("/app/libexec/sawe-bin".into());
             unsafe { env::set_var("ZED_UPDATE_EXPLANATION", "Please use flatpak to update zed") };
         }
         args
@@ -1075,7 +1075,7 @@ mod flatpak {
         }
 
         if let Ok(flatpak_id) = env::var("FLATPAK_ID") {
-            if !flatpak_id.starts_with("ru.sipaha.spk-editor") {
+            if !flatpak_id.starts_with("ru.sipaha.sawe") {
                 return None;
             }
 
@@ -1219,11 +1219,11 @@ mod windows {
                 let cli = std::env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // ../spk-editor.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
+                // ../sawe.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
                 // directory in development builds.
                 let possible_locations = [
-                    "../spk-editor.exe",
-                    "../lib/spk-editor/spk-editor-bin.exe",
+                    "../sawe.exe",
+                    "../lib/sawe/sawe-bin.exe",
                     "./zed.exe",
                 ];
                 possible_locations
@@ -1401,7 +1401,7 @@ mod mac_os {
             user_data_dir: Option<&str>,
         ) -> io::Result<ExitStatus> {
             let path = match self {
-                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/spk-editor"),
+                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/sawe"),
                 Bundle::LocalPath { executable, .. } => executable.clone(),
             };
 
@@ -1415,7 +1415,7 @@ mod mac_os {
 
         fn path(&self) -> PathBuf {
             match self {
-                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/spk-editor"),
+                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/sawe"),
                 Bundle::LocalPath { executable, .. } => executable.clone(),
             }
         }

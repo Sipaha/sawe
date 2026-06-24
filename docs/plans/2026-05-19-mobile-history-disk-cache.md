@@ -141,7 +141,7 @@ Hook into each of the four mutation sites:
 ## Verification
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 ./gradlew :core:test  # SessionHistoryMerge tests
 ./gradlew :app:compileDebugKotlin
 ./gradlew :app:testDebugUnitTest  # if any :app unit tests exist

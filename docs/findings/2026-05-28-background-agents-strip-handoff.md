@@ -37,7 +37,7 @@ The commit `8a1e20e0a6 solutions.create: mark_open the new solution before retur
 Test status at handoff:
 - `cargo test -p solution_agent --lib`: **248 passed, 0 failed, 0 ignored**.
 - `cargo check` clean on `acp_thread`, `workspace_events`, `editor_mcp`, `agent_servers`.
-- `cargo build --bin spk-editor --profile release-fast`: green (binary at `target/release-fast/spk-editor`, ~6.3 GB, sha `0084dbbf99`).
+- `cargo build --bin sawe --profile release-fast`: green (binary at `target/release-fast/sawe`, ~6.3 GB, sha `0084dbbf99`).
 
 ## V1 deviations from the plan (load-bearing)
 
@@ -75,13 +75,13 @@ The unit/integration tests cover the data + persistence + lifecycle plumbing. Wh
 
 ```bash
 # 1. Confirm the release-fast binary is the new one:
-ls -la target/release-fast/spk-editor
+ls -la target/release-fast/sawe
 # mtime should be 2026-05-28 18:45 or later.
 
 # 2. Stop any running editor and start a fresh one via the release-fast binary:
-~/.spk/spk-editor/config/  # find the running pid
+~/.spk/sawe/config/  # find the running pid
 # kill it, then:
-./target/release-fast/spk-editor
+./target/release-fast/sawe
 
 # 3. Open a Solution with at least one project. Create a new claude session.
 

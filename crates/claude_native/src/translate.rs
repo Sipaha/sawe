@@ -240,7 +240,7 @@ pub fn classify_result(r: &ResultMessage) -> TurnEnd {
         // execution / "agent error (success)" cases — without this the
         // error string alone has zero diagnostic value (the user just sees
         // a red banner with no clue what claude tried to say). Logged at
-        // warn level so it shows up in SpkEditor.log next to the wire spam.
+        // warn level so it shows up in Sawe.log next to the wire spam.
         log::warn!(
             target: "claude_native::result",
             "is_error result classified to TurnEnd::Error: subtype={subtype:?} stop_reason={stop_reason:?} errors={errors:?} usage={usage:?} result={result:?}",

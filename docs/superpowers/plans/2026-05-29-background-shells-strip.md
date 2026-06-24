@@ -121,7 +121,7 @@ existing `managed_agent_*` settings keys in `crates/agent_settings` (reused, no 
 
 ## Verification (whole feature)
 
-- `cargo build --bin spk-editor` clean.
+- `cargo build --bin sawe` clean.
 - `cargo clippy -p solution_agent --all-targets -- -D warnings` clean.
 - `cargo test -p solution_agent --lib` — all green (254 baseline + new).
 - MCP smoke-test (supervisor, post-merge) + screenshot of the strip with a shell pill.
@@ -341,7 +341,7 @@ fingerprint cache `(BackgroundShellId, SystemTime, u64)`.
       (`/tmp` `.output` paths are stale across restarts; don't restore phantom pills).
       Test that hydrate clears persisted shells.
 - [ ] Commit `solution_agent: disable compose in shell view + drop stale shells on hydrate`.
-- [ ] Supervisor: `cargo build --bin spk-editor --profile release-fast`; MCP
+- [ ] Supervisor: `cargo build --bin sawe --profile release-fast`; MCP
       screenshot of the strip with a shell pill; manual recipe (ask claude to run a
       background `sleep` + touch a sentinel) in the session handoff.
 

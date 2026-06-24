@@ -164,10 +164,10 @@ if (user) {
 }
 
 let buildArgs = ["build"];
-let zedBinary = "target/debug/spk-editor";
+let zedBinary = "target/debug/sawe";
 if (isReleaseMode) {
   buildArgs.push("--release");
-  zedBinary = "target/release/spk-editor";
+  zedBinary = "target/release/sawe";
 }
 
 try {

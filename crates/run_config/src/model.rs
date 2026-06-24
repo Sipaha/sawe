@@ -60,9 +60,9 @@ pub enum BeforeLaunchStep {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigScope {
-    /// Persisted in `<worktree-root>/.spke/run-configurations.json`.
+    /// Persisted in `<worktree-root>/.sawe/run-configurations.json`.
     Project { worktree: WorktreeId },
-    /// Persisted in the global `~/.config/spk-editor/run-configurations.json`.
+    /// Persisted in the global `~/.config/sawe/run-configurations.json`.
     Global,
     /// Discovered at load time by a provider; never written to disk.
     Ephemeral,

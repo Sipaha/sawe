@@ -10,7 +10,7 @@
 //!
 //! Isolation: pins the lock + socket to a tempdir via
 //! `editor_mcp::set_runtime_dir_for_test`, so it is safe to run alongside
-//! a live `spk-editor` instance.
+//! a live `sawe` instance.
 
 use gpui::UpdateGlobal as _;
 use serde_json::{Value, json};

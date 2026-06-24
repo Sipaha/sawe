@@ -301,4 +301,4 @@ fn apply_branch_protection_decision(
 // per test (the caps cell is a `OnceLock`); the tier-permit logic itself is
 // covered by unit tests in `tier.rs`. End-to-end enforcement is exercised
 // indirectly by any e2e test that connects through the `--nc` bridge with a
-// non-default `SPK_EDITOR_MCP_BRIDGE_CAPS` value.
+// non-default `SAWE_MCP_BRIDGE_CAPS` value.

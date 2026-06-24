@@ -11,7 +11,7 @@
 //!    The 8-hex random suffix prevents path collision when the same
 //!    commit is opened twice.
 //! 3. `git worktree add --detach <target> <sha>` against the source repo.
-//! 4. Drop a `.spke-readonly.json` marker at the target root with
+//! 4. Drop a `.sawe-readonly.json` marker at the target root with
 //!    `{ base_sha, branch_template, created_at_unix, source_repo }`.
 //!    The `Project` constructor's `WorktreeAdded` hook reads this
 //!    marker and registers the path in `Project::read_only_roots`.
@@ -165,7 +165,7 @@ pub fn show_at_revision(
                     .log_err();
             })
             .detach();
-            return Err(err.context("writing .spke-readonly.json marker"));
+            return Err(err.context("writing .sawe-readonly.json marker"));
         }
 
         // Open the snapshot as a new top-level window. We use
@@ -250,7 +250,7 @@ pub fn cleanup_for_worktree_path(worktree_path: PathBuf, cx: &mut App) {
 }
 
 /// Walk `<temp_dir>/worktrees/` at editor startup and remove any
-/// snapshot worktree dir whose `.spke-readonly.json` marker is older
+/// snapshot worktree dir whose `.sawe-readonly.json` marker is older
 /// than `older_than_hours` hours. Best-effort: every failure is
 /// logged, none aborts the scan.
 pub fn cleanup_orphan_worktrees(older_than_hours: u32) {

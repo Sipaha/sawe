@@ -156,7 +156,7 @@ fn build_window_info(
 // known root paths, falling back to the product name when no folder is open.
 fn compute_title(root_paths: &[String]) -> String {
     if root_paths.is_empty() {
-        return String::from("SPK Editor");
+        return String::from("Sawe");
     }
     let names: Vec<String> = root_paths
         .iter()
@@ -167,7 +167,7 @@ fn compute_title(root_paths: &[String]) -> String {
         })
         .collect();
     if names.is_empty() {
-        String::from("SPK Editor")
+        String::from("Sawe")
     } else {
         names.join(", ")
     }

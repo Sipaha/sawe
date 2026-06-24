@@ -315,7 +315,7 @@ impl McpServer {
                 ..Default::default()
             },
             server_info: Implementation {
-                name: "spk-editor".into(),
+                name: "sawe".into(),
                 title: None,
                 version: env!("CARGO_PKG_VERSION").into(),
                 description: None,
@@ -553,7 +553,7 @@ mod tests {
 
     /// Round-trip the MCP `initialize` handshake against a live server
     /// over a Unix socket. Regression for the bug that left the SDK
-    /// unable to register the spk-editor MCP server because the server
+    /// unable to register the sawe MCP server because the server
     /// answered `-32601 unhandled method initialize`.
     #[gpui::test]
     async fn initialize_handshake_succeeds(cx: &mut TestAppContext) {

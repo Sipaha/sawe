@@ -96,7 +96,7 @@ which matters when filtering at the fan-out layer.
 ## How to verify
 
 ```
-$ socat - UNIX-CONNECT:$HOME/.spk/spk-editor-dev/config/mcp.sock
+$ socat - UNIX-CONNECT:$HOME/.spk/sawe-dev/config/mcp.sock
 {"jsonrpc":"2.0","id":1,"method":"editor.capabilities"}
 {"jsonrpc":"2.0","id":1,"error":{"message":"unhandled method editor.capabilities","code":-32601}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"editor.capabilities","arguments":{}}}

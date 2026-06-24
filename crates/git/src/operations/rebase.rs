@@ -770,7 +770,7 @@ mod tests {
             .fixup("dddd")
             .edit("eeee")
             .build();
-        let body = todo.serialize_with_helper("/spk-editor --git-message-set");
+        let body = todo.serialize_with_helper("/sawe --git-message-set");
         assert_eq!(
             body,
             "pick aaaa\nsquash bbbb\ndrop cccc\nfixup dddd\nedit eeee\n"
@@ -783,14 +783,14 @@ mod tests {
             .pick("aaaa")
             .reword("bbbb", "new message".to_string())
             .build();
-        let body = todo.serialize_with_helper("/path/spk-editor --git-message-set");
+        let body = todo.serialize_with_helper("/path/sawe --git-message-set");
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "pick aaaa");
         assert_eq!(lines[1], "pick bbbb");
-        assert!(lines[2].starts_with("exec /path/spk-editor --git-message-set "));
+        assert!(lines[2].starts_with("exec /path/sawe --git-message-set "));
         let token = lines[2]
-            .strip_prefix("exec /path/spk-editor --git-message-set ")
+            .strip_prefix("exec /path/sawe --git-message-set ")
             .expect("exec prefix");
         assert_eq!(token.len(), 32);
         assert!(
@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn shell_quote_round_trip() {
-        assert_eq!(shell_quote("/usr/bin/spk-editor"), "/usr/bin/spk-editor");
+        assert_eq!(shell_quote("/usr/bin/sawe"), "/usr/bin/sawe");
         assert_eq!(shell_quote("path with spaces"), "'path with spaces'");
         assert_eq!(shell_quote("it's mine"), "'it'\\''s mine'");
     }

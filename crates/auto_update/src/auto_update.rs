@@ -360,7 +360,7 @@ impl InstallerDir {
     async fn new() -> Result<Self> {
         let installer_dir = std::env::current_exe()?
             .parent()
-            .context("No parent dir for spk-editor.exe")?
+            .context("No parent dir for sawe.exe")?
             .join("updates");
         if smol::fs::metadata(&installer_dir).await.is_ok() {
             smol::fs::remove_dir_all(&installer_dir).await?;
@@ -834,7 +834,7 @@ impl AutoUpdater {
         let filename = match OS {
             "macos" => anyhow::Ok("Zed.dmg"),
             "linux" => Ok("zed.tar.gz"),
-            "windows" => Ok("spk-editor.exe"),
+            "windows" => Ok("sawe.exe"),
             unsupported_os => anyhow::bail!("not supported: {unsupported_os}"),
         }?;
 
@@ -1040,12 +1040,12 @@ async fn install_release_linux(
     } else {
         String::default()
     };
-    let app_folder_name = format!("spk-editor{}.app", suffix);
+    let app_folder_name = format!("sawe{}.app", suffix);
 
     let from = extracted.join(&app_folder_name);
     let mut to = home_dir.join(".local");
 
-    let expected_suffix = format!("{}/libexec/spk-editor-bin", app_folder_name);
+    let expected_suffix = format!("{}/libexec/sawe-bin", app_folder_name);
 
     if let Some(prefix) = running_app_path
         .to_str()
@@ -1129,7 +1129,7 @@ async fn install_release_macos(
 async fn cleanup_windows() -> Result<()> {
     let parent = std::env::current_exe()?
         .parent()
-        .context("No parent dir for spk-editor.exe")?
+        .context("No parent dir for sawe.exe")?
         .to_owned();
 
     // keep in sync with crates/auto_update_helper/src/updater.rs
@@ -1156,7 +1156,7 @@ async fn install_release_windows(downloaded_installer: &Path) -> Result<Option<P
     // deleting the old one, and launching the new binary.
     let helper_path = std::env::current_exe()?
         .parent()
-        .context("No parent dir for spk-editor.exe")?
+        .context("No parent dir for sawe.exe")?
         .join("tools")
         .join("auto_update_helper.exe");
     Ok(Some(helper_path))

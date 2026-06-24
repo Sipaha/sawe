@@ -1,14 +1,14 @@
 # Background Agents on Mobile — implementation plan
 
-**Status:** COMPLETE (2026-05-29). Server: `spk-editor` `f0d1c197b7` (get_session_background_agents
+**Status:** COMPLETE (2026-05-29). Server: `sawe` `f0d1c197b7` (get_session_background_agents
 tool + agent_session_background_agents_changed notification + allow-list; 334 solution_agent tests,
-clippy clean). Client: `spk-editor-mobile` `93969b7` (BackgroundAgentDto + dispatch + BackgroundAgentStrip
+clippy clean). Client: `sawe-mobile` `93969b7` (BackgroundAgentDto + dispatch + BackgroundAgentStrip
 pills running/done + minimal drill-in sheet; `:core:test` green incl. 6 new BackgroundAgentTest;
 `:app:assembleDebug` OK, debug APK ~23.6 MB). Additive, no schema bump. Needs editor release-fast
 rebuild to serve the new wire. Follow-up: full JSONL-transcript drill-in for agents.
 **Track:** HEAVY, two repos. **This is a near-exact mirror of the just-shipped
 `2026-05-29-background-shells-on-mobile.md` arc** — read that plan + its commits
-(`spk-editor cdfd800e0f`, `spk-editor-mobile 2ae83135`) as the template. This doc only
+(`sawe cdfd800e0f`, `sawe-mobile 2ae83135`) as the template. This doc only
 records the DELTAS for managed **agents**.
 
 **Goal:** surface the desktop managed-agents ("Background Agents") strip on the Android
@@ -36,7 +36,7 @@ Same gap (agents not on the wire; `SessionBackgroundAgentsChanged(_) => {}` no-o
 
 ## Scope
 
-### Phase 1 — SERVER (`spk-editor`, `solution_agent` + `remote_control`) — mirror cdfd800e0f
+### Phase 1 — SERVER (`sawe`, `solution_agent` + `remote_control`) — mirror cdfd800e0f
 A. `mcp.rs`: `BackgroundAgentDto { id, label, mtime_ms: Option<i64> (skip_if none), stop_reason: Option<String> (skip_if none) }`;
    `GetSessionBackgroundAgentsParams { session_id }` (NO include flag);
    `GetSessionBackgroundAgentsResult { background_agents: Vec<BackgroundAgentDto> }`;
@@ -52,10 +52,10 @@ C. `remote_control/src/allow_list.rs`: add
    `"remote.solution_agent.get_session_background_agents" => Some("solution_agent.get_session_background_agents")`.
 D. Tests: tool returns ordered agents (with + without a snapshot → label defaults to "Generating…");
    stop_reason surfaces; unknown session errors; notification-payload builder test. Mirror the shell tests.
-   Verify `cargo build --bin spk-editor` + `cargo test -p solution_agent --lib` + clippy
+   Verify `cargo build --bin sawe` + `cargo test -p solution_agent --lib` + clippy
    `-p solution_agent -p remote_control --no-deps`.
 
-### Phase 2 — CLIENT (`spk-editor-mobile`) — mirror 2ae83135
+### Phase 2 — CLIENT (`sawe-mobile`) — mirror 2ae83135
 E. `core/.../RemoteDtos.kt`: `BackgroundAgentDto(id, label, @SerialName("mtime_ms") mtimeMs: Long?=null, @SerialName("stop_reason") stopReason: String?=null)`;
    `GetSessionBackgroundAgentsResult(@SerialName("background_agents") backgroundAgents = emptyList())`;
    `SessionBackgroundAgentsChangedPayload(@SerialName("session_id") sessionId, @SerialName("background_agents") backgroundAgents = emptyList())`.
@@ -76,6 +76,6 @@ I. Verify `./gradlew :core:test` + `:app:compileDebugKotlin` (or `:app:assembleD
 - Merging the three mobile strips (subagents / shells / agents) into one row — keep separate for now.
 
 ## Verification / When done
-Same matrix as the shells arc. Server tool+notification+allow-list tested on `spk-editor`;
-mobile DTO+dispatch+strip+drill-in with `:core` tests green on `spk-editor-mobile`. FORK.md
+Same matrix as the shells arc. Server tool+notification+allow-list tested on `sawe`;
+mobile DTO+dispatch+strip+drill-in with `:core` tests green on `sawe-mobile`. FORK.md
 untouched. Plan→complete, handoff + INDEX updated.

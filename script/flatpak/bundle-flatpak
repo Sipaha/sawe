@@ -5,33 +5,33 @@ cd "$(dirname "$0")/../.."
 shopt -s extglob
 
 script/bundle-linux --flatpak
-archive_match="spk-editor(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+archive_match="sawe(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 archive=$(ls "target/release" | grep -E ${archive_match})
 channel=$(<crates/zed/RELEASE_CHANNEL)
 
 export CHANNEL="$channel"
 export ARCHIVE="$archive"
 if [[ "$channel" == "dev" ]]; then
-    export APP_ID="ru.sipaha.spk-editor-dev"
-    export APP_NAME="SPK Editor Devel"
+    export APP_ID="ru.sipaha.sawe-dev"
+    export APP_NAME="Sawe Devel"
     export BRANDING_LIGHT="#99c1f1"
     export BRANDING_DARK="#1a5fb4"
     export ICON_FILE="app-icon-dev"
 elif [[ "$channel" == "nightly" ]]; then
-    export APP_ID="ru.sipaha.spk-editor-nightly"
-    export APP_NAME="SPK Editor Nightly"
+    export APP_ID="ru.sipaha.sawe-nightly"
+    export APP_NAME="Sawe Nightly"
     export BRANDING_LIGHT="#e9aa6a"
     export BRANDING_DARK="#1a5fb4"
     export ICON_FILE="app-icon-nightly"
 elif [[ "$channel" == "preview" ]]; then
-    export APP_ID="ru.sipaha.spk-editor-preview"
-    export APP_NAME="SPK Editor Preview"
+    export APP_ID="ru.sipaha.sawe-preview"
+    export APP_NAME="Sawe Preview"
     export BRANDING_LIGHT="#99c1f1"
     export BRANDING_DARK="#1a5fb4"
     export ICON_FILE="app-icon-preview"
 elif [[ "$channel" == "stable" ]]; then
-    export APP_ID="ru.sipaha.spk-editor"
-    export APP_NAME="SPK Editor"
+    export APP_ID="ru.sipaha.sawe"
+    export APP_NAME="Sawe"
     export BRANDING_LIGHT="#99c1f1"
     export BRANDING_DARK="#1a5fb4"
     export ICON_FILE="app-icon"

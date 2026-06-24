@@ -264,7 +264,7 @@ impl ConnectionDispatcher for MinimalConnection {
                     request.id,
                     serde_json::json!({
                         "protocol_version": 1,
-                        "server_software": "spk-editor",
+                        "server_software": "sawe",
                         "tool_namespaces": ["remote.editor"],
                         "capabilities": ["json-rpc-2.0", "hmac-sha256-challenge"],
                     }),
@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["id"], 1);
         assert_eq!(parsed["result"]["protocol_version"], 1);
-        assert_eq!(parsed["result"]["server_software"], "spk-editor");
+        assert_eq!(parsed["result"]["server_software"], "sawe");
     }
 
     #[test]

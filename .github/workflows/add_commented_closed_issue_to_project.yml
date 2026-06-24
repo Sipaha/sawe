@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   add-to-project:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     timeout-minutes: 5
     steps:

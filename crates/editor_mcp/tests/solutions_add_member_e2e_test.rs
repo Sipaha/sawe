@@ -8,7 +8,7 @@
 //!
 //! Isolation: pins the lock + socket to a tempdir via
 //! `editor_mcp::set_runtime_dir_for_test`, so it is safe to run alongside
-//! a live `spk-editor` instance.
+//! a live `sawe` instance.
 
 use gpui::{TestAppContext, UpdateGlobal as _};
 use serde_json::{Value, json};
@@ -51,7 +51,7 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
     });
 
     // Override solutions.root and solutions.cache_root so the test does not
-    // touch the real ~/spk-editor/solutions/ or ~/.cache/spk-editor/.
+    // touch the real ~/sawe/solutions/ or ~/.cache/sawe/.
     let user_settings = json!({
         "solutions": {
             "root": solutions_root.to_string_lossy(),

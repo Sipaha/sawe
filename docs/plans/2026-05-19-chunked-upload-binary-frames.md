@@ -282,14 +282,14 @@ Once chunked upload lands and the inline-base64 image flow is gone, the post-#15
 
 ```bash
 # Server
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
-cargo build --bin spk-editor
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
+cargo build --bin sawe
 cargo clippy -p solution_agent -p remote_control --all-targets -- -D warnings
 cargo test -p solution_agent --no-fail-fast  # 117 + upload tests
 cargo test -p remote_control --lib  # 37 + allow-list extension
 
 # Mobile
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 ./gradlew :core:test  # 222 + UploadProtocol tests + DTO tests
 ./gradlew :app:compileDebugKotlin
 ./gradlew :app:assembleDebug

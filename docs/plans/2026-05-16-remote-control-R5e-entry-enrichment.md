@@ -3,7 +3,7 @@
 **Status:** complete (commit `d8592b05dc`)
 **Estimated:** 1 sub-agent session, ~3–4 h, worktree-isolated
 **Depends on:** R-4 (proxy), R-5d closure (so the consumer's shape is locked).
-**Goal:** Enrich the data spk-editor's MCP server exposes per agent-session entry so the Android client (and any future remote consumer) can render real chat — full message text, image content blocks, tool-call args/results — without 200-char truncation. Additive only — old field shapes preserved, old clients keep working.
+**Goal:** Enrich the data sawe's MCP server exposes per agent-session entry so the Android client (and any future remote consumer) can render real chat — full message text, image content blocks, tool-call args/results — without 200-char truncation. Additive only — old field shapes preserved, old clients keep working.
 
 ## Why this phase exists
 
@@ -173,7 +173,7 @@ No migration step required. No version bump.
 - Image deduplication across entries (each `EntryImage` payload duplicates if the same image is in multiple entries — accept the wire cost).
 - Compression (the MCP framing layer doesn't currently compress; add later if profiling shows it matters).
 - Schema versioning headers (JSON-RPC's tolerance for unknown keys covers us for now).
-- Updating the Android client (`spk-editor-mobile`) to consume the new fields — that's R-5e-client / R-5f, a separate phase.
+- Updating the Android client (`sawe-mobile`) to consume the new fields — that's R-5e-client / R-5f, a separate phase.
 
 ## Architectural decisions (this phase)
 
@@ -192,10 +192,10 @@ No migration step required. No version bump.
 ## Verification
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
 
 set -o pipefail
-cargo build --bin spk-editor 2>&1 | tee /tmp/r5e_build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/r5e_build.txt
 grep -E "^error|could not compile" /tmp/r5e_build.txt
 
 cargo clippy -p solution_agent --all-targets -- -D warnings 2>&1 | tee /tmp/r5e_clippy.txt
@@ -209,7 +209,7 @@ grep "test result:" /tmp/r5e_proxy.txt
 
 Acceptance:
 
-- [x] `cargo build --bin spk-editor` passes.
+- [x] `cargo build --bin sawe` passes.
 - [x] `cargo clippy -p solution_agent --all-targets -- -D warnings` clean.
 - [x] `cargo test -p solution_agent` — pre-existing tests still green + ~8-10 new tests passing.
 - [x] `cargo test -p remote_control proxy_e2e` — still passes (allow-list addition didn't break the R-4 proxy test).
@@ -264,4 +264,4 @@ Documented in `GetSessionParams`'s doc comment so consumers can pick wisely. For
 
 ## Follow-up
 
-- **R-5e-client (Android-side update)** — extend `:core` DTOs in `spk-editor-mobile` to consume the new `markdown` / `images` / `tool_call` / `plan` fields. `MainViewModel.openSession` to pass `include_full_content: true, include_images: true`. Render rich markdown (CommonMark renderer like `compose-multiplatform-markdown` or roll a simple `Text` with inline image lookups). Wire `Icon`/expand for tool_call rows. Plan-doc to be written when picked up.
+- **R-5e-client (Android-side update)** — extend `:core` DTOs in `sawe-mobile` to consume the new `markdown` / `images` / `tool_call` / `plan` fields. `MainViewModel.openSession` to pass `include_full_content: true, include_images: true`. Render rich markdown (CommonMark renderer like `compose-multiplatform-markdown` or roll a simple `Text` with inline image lookups). Wire `Icon`/expand for tool_call rows. Plan-doc to be written when picked up.

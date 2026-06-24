@@ -14,8 +14,8 @@
 //!
 //! Isolation: pins the lock + socket to a tempdir via
 //! `editor_mcp::set_runtime_dir_for_test` so it is safe to run alongside a
-//! live `spk-editor` instance and never touches the user's real
-//! `~/.config/spk-editor/mcp.{lock,sock}` files.
+//! live `sawe` instance and never touches the user's real
+//! `~/.config/sawe/mcp.{lock,sock}` files.
 //!
 //! One test per binary: cargo runs `#[gpui::test]`s in the same file in
 //! parallel threads, but `set_runtime_dir_for_test` writes to a process-
@@ -38,7 +38,7 @@ async fn list_sessions_starts_empty(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
 
     // Pin lock + socket to a tempdir BEFORE init — without this the test
-    // would corrupt the user's real `~/.config/spk-editor/mcp.sock`.
+    // would corrupt the user's real `~/.config/sawe/mcp.sock`.
     let runtime_dir = tempfile::tempdir().expect("runtime tempdir");
     let socket_path = runtime_dir.path().join("mcp.sock");
     editor_mcp::set_runtime_dir_for_test(runtime_dir.path().to_path_buf());

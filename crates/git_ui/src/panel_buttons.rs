@@ -1,6 +1,6 @@
 //! Panel button helpers.
 //!
-//! The donor SPK Editor fork defined these in the `panel` crate; the re-fork's
+//! The donor Sawe fork defined these in the `panel` crate; the re-fork's
 //! `panel` crate is kept close to upstream and does not export them, so they
 //! live here to keep edits scoped to `git_ui`.
 

@@ -125,7 +125,7 @@ fn generate(server_address: Option<&str>) -> Result<ServerCert> {
         .map_err(|err| anyhow!("cert params: {err}"))?;
     params.subject_alt_names = sans;
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "SPK Editor Remote Control");
+    dn.push(DnType::CommonName, "Sawe Remote Control");
     params.distinguished_name = dn;
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);

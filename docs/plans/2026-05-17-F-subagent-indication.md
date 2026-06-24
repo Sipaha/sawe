@@ -1,7 +1,7 @@
 # F: Sub-agent indication UI
 
 **Status:** complete — F-server `104881302c`, F-desktop `cd8a6aebb5`, F-phone (sibling) `1af444b`
-**Repos:** spk-editor (server + desktop UI) → `spk-editor-mobile` (phone UI).
+**Repos:** sawe (server + desktop UI) → `sawe-mobile` (phone UI).
 **Depends on:** R-5e (`get_session` enriched shape), R-5g (`create_session`), R-6e (pagination + index).
 **Goal:** Surface "sub-agents" — independent AI sessions spawned from a parent session — in both the desktop session view and the phone client. Inspired by Claude Code's running-agents bar: a horizontal strip of bubbles above the status row, click a bubble to drill into that session's chat. Auto-hides when no sub-agents exist.
 
@@ -12,7 +12,7 @@ User-confirmed scope:
 
 ## Sub-agent model
 
-We model sub-agents as **first-class spk-editor sessions** with a `parent_session_id` reference, NOT as Task-tool tool_use frames inside the parent's ACP thread. Rationale:
+We model sub-agents as **first-class sawe sessions** with a `parent_session_id` reference, NOT as Task-tool tool_use frames inside the parent's ACP thread. Rationale:
 
 1. **Visibility (b) requires real transcripts.** Claude Code's internal Task tool dispatches do NOT stream their sub-agent transcripts through ACP — they're internal to Claude Code's runtime. We can't show "what they're doing" if we only see the final `tool_result`.
 2. **Real sub-sessions have their own ACP threads.** That gives us full transcripts (the same `get_session(child_id)` API works), full token tracking, full state transitions, full reconnect / streaming behavior — all the infrastructure R-5/R-6 already built.
@@ -22,7 +22,7 @@ If the user later wants Claude Code's Task tool dispatches to ALSO show up — t
 
 ## Scope
 
-### Phase F-server (spk-editor)
+### Phase F-server (sawe)
 
 **1. `crates/solution_agent/src/model.rs`** — `SolutionSession` gains:
 
@@ -110,7 +110,7 @@ Target: `solution_agent` tests grow by 5-6.
 
 **8. FORK.md** one-line: "F: parent_session_id on sessions + get_session_children tool + token field on SessionSummary."
 
-### Phase F-desktop (spk-editor, `crates/solution_agent/src/session_view.rs`)
+### Phase F-desktop (sawe, `crates/solution_agent/src/session_view.rs`)
 
 Render a **sub-agents strip** as a new fixed-height container directly above the existing status row in `SolutionSessionView`:
 
@@ -149,7 +149,7 @@ Data flow: subscribe to `SolutionAgentStoreEvent::SessionCreated` / `SessionStat
 
 **9. Tests for the desktop UI:** add at least one rendering test that asserts the strip appears when children exist + is absent otherwise. Use the existing `solution_agent` test infra.
 
-### Phase F-phone (`spk-editor-mobile`)
+### Phase F-phone (`sawe-mobile`)
 
 After F-server lands, the wire shape is stable. Phone UI:
 
@@ -185,9 +185,9 @@ DTO round-trip tests for the new fields.
 ## Acceptance — F-server
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
 set -o pipefail
-cargo build --bin spk-editor 2>&1 | tee /tmp/F_build.txt
+cargo build --bin sawe 2>&1 | tee /tmp/F_build.txt
 grep -E "^error|could not compile" /tmp/F_build.txt
 cargo clippy -p solution_agent --all-targets -- -D warnings 2>&1 | tee /tmp/F_clippy.txt
 cargo test -p solution_agent --no-fail-fast 2>&1 | tee /tmp/F_test.txt
@@ -204,7 +204,7 @@ cargo test -p remote_control proxy_e2e 2>&1 | grep "test result:"
 ## Acceptance — F-phone (after F-server merges)
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 ANDROID_HOME=$HOME/Android/Sdk JAVA_HOME=$HOME/.jdks/temurin-21.0.10 ./gradlew :core:test :app:assembleRelease --rerun-tasks 2>&1 | tee /tmp/F_phone.txt | tail -10
 grep -E "BUILD SUCCESSFUL|FAILURE:" /tmp/F_phone.txt
 ```

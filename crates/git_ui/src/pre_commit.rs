@@ -64,7 +64,7 @@ pub struct PreCommitConfig {
     /// sequence the user sees in the panel.
     #[serde(default)]
     pub tasks: Vec<String>,
-    /// Run `<repo>/.git/hooks/pre-commit` from spk-editor, then issue
+    /// Run `<repo>/.git/hooks/pre-commit` from sawe, then issue
     /// `git commit --no-verify` to suppress double-execution. When `false`,
     /// git itself runs the hook (same behavior as without our UI).
     #[serde(default)]

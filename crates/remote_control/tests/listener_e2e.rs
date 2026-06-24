@@ -277,7 +277,7 @@ async fn full_handshake_and_minimal_dispatcher_round_trip() -> Result<()> {
     let caps_parsed: serde_json::Value = serde_json::from_str(caps_text.as_ref())?;
     assert_eq!(caps_parsed["id"], 2);
     assert_eq!(caps_parsed["result"]["protocol_version"], 1);
-    assert_eq!(caps_parsed["result"]["server_software"], "spk-editor");
+    assert_eq!(caps_parsed["result"]["server_software"], "sawe");
 
     // 6. JSON-RPC unknown method → -32601.
     ws.send(Message::Text(

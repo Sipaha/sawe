@@ -8,7 +8,7 @@
 //!
 //! Isolation: pins lock + socket to a tempdir via
 //! `editor_mcp::set_runtime_dir_for_test` so it never touches the user's
-//! `~/.config/spk-editor/mcp.{lock,sock}`.
+//! `~/.config/sawe/mcp.{lock,sock}`.
 
 use gpui::{TestAppContext, UpdateGlobal as _};
 use serde_json::json;
@@ -40,7 +40,7 @@ async fn solutions_flow_over_socket(cx: &mut TestAppContext) {
     });
 
     // Override the solutions root so create_solution doesn't try to mkdir
-    // under the real ~/spk-editor/solutions path.
+    // under the real ~/sawe/solutions path.
     let solutions_root = dir.path().join("sol-root");
     std::fs::create_dir_all(&solutions_root).expect("mkdir sol-root");
     let user_settings = json!({

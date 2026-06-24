@@ -37,7 +37,7 @@ pub struct RunConfigStore {
     fs: Option<Arc<dyn fs::Fs>>,
     /// Configs loaded from the global `run-configurations.json`.
     global_configs: Vec<RunConfiguration>,
-    /// Configs loaded from each worktree's `.spke/run-configurations.json`.
+    /// Configs loaded from each worktree's `.sawe/run-configurations.json`.
     worktree_configs: HashMap<WorktreeId, Vec<RunConfiguration>>,
     /// Running config ids keyed by the source controller's entity id (as u64).
     /// Each `RunController` owns its own entry; `is_running` unions across all sources.
@@ -386,7 +386,7 @@ impl RunConfigStore {
 
     /// Write the current persisted configs back to disk: global-scoped ones to
     /// the global `run-configurations.json`, project-scoped ones to each
-    /// worktree's `.spke/run-configurations.json`. Best-effort: with no `fs` /
+    /// worktree's `.sawe/run-configurations.json`. Best-effort: with no `fs` /
     /// no project handle only what can be written is written; failures are
     /// logged, not propagated.
     ///
@@ -727,7 +727,7 @@ mod tests {
         cx.run_until_parked();
 
         let project_text = fs
-            .load(Path::new("/proj/.spke/run-configurations.json"))
+            .load(Path::new("/proj/.sawe/run-configurations.json"))
             .await
             .expect("project run-configurations.json was written");
         assert!(
@@ -806,7 +806,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let project_path = Path::new("/proj/.spke/run-configurations.json");
+        let project_path = Path::new("/proj/.sawe/run-configurations.json");
         let text = fs.load(project_path).await.expect("project file written");
         assert!(text.contains("\"Only\""), "project file: {text}");
         store.read_with(cx, |s, _| {
@@ -845,7 +845,7 @@ mod tests {
         fs.insert_tree(
             "/proj",
             serde_json::json!({
-                ".spke": {
+                ".sawe": {
                     "run-configurations.json": r#"{ "configurations": [ { "name": "X", "type": "shell", "command": "echo" } ] }"#
                 }
             }),
@@ -865,7 +865,7 @@ mod tests {
         });
 
         fs.write(
-            Path::new("/proj/.spke/run-configurations.json"),
+            Path::new("/proj/.sawe/run-configurations.json"),
             br#"{ "configurations": [ { "name": "Y", "type": "shell", "command": "echo" } ] }"#,
         )
         .await

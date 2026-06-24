@@ -100,7 +100,7 @@ impl ClaudeCommandSpec {
 
 /// Build the `--mcp-config` JSON from the ACP `mcp_servers` the editor would
 /// have sent in the ACP `session/new` request. Only the stdio transport (the
-/// `spk-editor` bridge) is mapped — the fork uses no http/sse MCP servers; any
+/// `sawe` bridge) is mapped — the fork uses no http/sse MCP servers; any
 /// such (or future `#[non_exhaustive]`) variants are skipped.
 pub fn mcp_config_json(servers: &[acp::McpServer]) -> String {
     let mut map = serde_json::Map::new();
@@ -235,19 +235,19 @@ mod tests {
     #[test]
     fn maps_stdio_bridge_server() {
         let server = acp::McpServer::Stdio(
-            acp::McpServerStdio::new("spk-editor", "/path/exe")
+            acp::McpServerStdio::new("sawe", "/path/exe")
                 .args(vec!["--nc".to_string(), "/tmp/mcp.sock".to_string()])
                 .env(vec![acp::EnvVariable::new(
-                    "SPK_EDITOR_MCP_BRIDGE_CAPS",
+                    "SAWE_MCP_BRIDGE_CAPS",
                     "write",
                 )]),
         );
         let json: serde_json::Value = serde_json::from_str(&mcp_config_json(&[server])).unwrap();
-        let s = &json["mcpServers"]["spk-editor"];
+        let s = &json["mcpServers"]["sawe"];
         assert_eq!(s["type"], "stdio");
         assert_eq!(s["command"], "/path/exe");
         assert_eq!(s["args"][0], "--nc");
         assert_eq!(s["args"][1], "/tmp/mcp.sock");
-        assert_eq!(s["env"]["SPK_EDITOR_MCP_BRIDGE_CAPS"], "write");
+        assert_eq!(s["env"]["SAWE_MCP_BRIDGE_CAPS"], "write");
     }
 }

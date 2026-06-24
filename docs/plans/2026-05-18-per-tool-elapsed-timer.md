@@ -68,7 +68,7 @@ Mobile is task #9 and is blocked on the parallel-session mobile-WIP situation. T
 ## Verification
 
 ```bash
-cargo build --bin spk-editor
+cargo build --bin sawe
 cargo clippy -p acp_thread --all-targets -- -D warnings
 cargo clippy -p solution_agent --all-targets -- -D warnings
 cargo test -p acp_thread --no-fail-fast

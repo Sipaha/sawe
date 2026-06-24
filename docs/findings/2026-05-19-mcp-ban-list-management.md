@@ -19,7 +19,7 @@ disk persistence and no admin surface — once a subnet hits failure #3
 `consecutive_failures - 1`), the maintainer's only recovery options
 today are:
 
-1. Restart `spk-editor` — drops the bans, BUT also tears down every
+1. Restart `sawe` — drops the bans, BUT also tears down every
    live ACP session, which is costly mid-conversation (and impossible
    without losing in-flight agent work / pending sends).
 2. Switch network (mobile data ↔ Wi-Fi) so the new connection comes

@@ -27,7 +27,7 @@ Existing inputs that constrain the decision:
 
 - `RemoteControlSettings::clients[]` already has `name` + `secret_base64`
   (32-byte symmetric secret, base64). R-1.5 surfaces this via QR code as
-  `spk-editor-remote://<addr>:<port>?secret=<b64>&client=<name>`. So **the
+  `sawe-remote://<addr>:<port>?secret=<b64>&client=<name>`. So **the
   pre-shared symmetric secret is already provisioned end-to-end**; any
   protocol choice must consume it directly (no PKI, no separate cert
   enrollment dance).
@@ -39,7 +39,7 @@ Existing inputs that constrain the decision:
 - Workspace already depends on `rustls = 0.23` (declared workspace-wide)
   and pulls `tokio-tungstenite` transitively through other crates.
   Adding **no** new heavy crates is preferable.
-- `spk-editor-mobile` will be Kotlin + Jetpack Compose + OkHttp
+- `sawe-mobile` will be Kotlin + Jetpack Compose + OkHttp
   (R-5 plan). OkHttp ships first-class WebSocket + TLS + cert-pinning
   support out of the box. Anything Noise-based would require porting a
   Noise implementation to Kotlin or pulling in `noise-java` (dormant
@@ -55,13 +55,13 @@ Existing inputs that constrain the decision:
   Server boots, generates a self-signed TLS cert via `rcgen`, persists it
   alongside `remote-control.json` so cert identity is stable across
   restarts. The cert's SHA-256 fingerprint is included in the QR alongside
-  the secret: `spk-editor-remote://<addr>:<port>?secret=<b64>&client=<name>&server_fp=<b64>`.
+  the secret: `sawe-remote://<addr>:<port>?secret=<b64>&client=<name>&server_fp=<b64>`.
 - **Server auth:** Android client pins by fingerprint (rejects any cert
   whose SHA-256 differs from the one in the QR). No CA, no Let's Encrypt,
   no DNS dependency.
 - **Client auth:** post-TLS, server sends a 16-byte random `challenge`
   frame as the first WebSocket message. Client replies with
-  `HMAC-SHA256(secret, "spk-editor-remote-v1\0" || challenge)`. Server verifies
+  `HMAC-SHA256(secret, "sawe-remote-v1\0" || challenge)`. Server verifies
   against every authorized client's secret (constant-time compare); the
   first match identifies which `AuthorizedClient` this is. Mismatch closes
   the connection with policy code 1008.
@@ -160,7 +160,7 @@ Existing inputs that constrain the decision:
 
 ### Option D — Stay on the existing `editor_mcp` Unix socket via SSH tunnel
 
-- Don't add a TCP listener at all. Instruct the user to `ssh -L 7777:$HOME/.spk/spk-editor/config/mcp.sock` from their phone (Termux + ssh on Android).
+- Don't add a TCP listener at all. Instruct the user to `ssh -L 7777:$HOME/.spk/sawe/config/mcp.sock` from their phone (Termux + ssh on Android).
 - **Pros:** Zero new code. Reuses the existing 60-tool surface as-is.
 - **Cons:**
   - **Termux SSH is not a remote-control UX.** The Android product needs
@@ -168,7 +168,7 @@ Existing inputs that constrain the decision:
     a private key, configure ssh-agent, and tunnel a Unix socket is a
     different product (developer ssh-into-laptop, not phone-as-pager).
   - **No client identity model.** The local MCP socket has no auth: any
-    process with FS access to `~/.spk/spk-editor/config/` can drive the
+    process with FS access to `~/.spk/sawe/config/` can drive the
     editor. Punching that through ssh exposes the same trust model to
     every device on the other side of the tunnel; one phone with the
     private key = full editor control with no per-client revoke.
@@ -283,12 +283,12 @@ When R-2 lands, expect these new files in `crates/remote_control/`:
 - `crates/remote_control/src/cert.rs` — `rcgen::CertificateParams::new`
   for a self-signed cert (DNS-name = configured `server_address`,
   validity = 10 years). Persist `(cert.der, key.der)` next to
-  `remote-control.json` (`~/.config/spk-editor/remote-control.cert.der` +
+  `remote-control.json` (`~/.config/sawe/remote-control.cert.der` +
   `…/remote-control.key.der`). Generate on first `enabled = true` if
   absent; reuse otherwise.
 - `crates/remote_control/src/auth.rs` — HMAC-SHA256 challenge logic.
   Server sends 16 random bytes as the first WS frame after TLS. Client
-  has 10 s to reply with `hex(HMAC-SHA256(secret, b"spk-editor-remote-v1\0" || challenge))`.
+  has 10 s to reply with `hex(HMAC-SHA256(secret, b"sawe-remote-v1\0" || challenge))`.
   Server tries each `AuthorizedClient.secret_base64` in constant time;
   identifies the client on match or closes the connection (WS code 1008)
   on mismatch / timeout.
@@ -300,7 +300,7 @@ When R-2 lands, expect these new files in `crates/remote_control/`:
 ### QR payload extension (R-3 / R-1.5 follow-up)
 
 ```
-spk-editor-remote://<addr>:<port>?secret=<b64-32>&client=<name>&server_fp=<b64-sha256-32>
+sawe-remote://<addr>:<port>?secret=<b64-32>&client=<name>&server_fp=<b64-sha256-32>
 ```
 
 `server_fp` is the **SHA-256 of the cert's DER bytes**, base64-encoded
@@ -379,5 +379,5 @@ typo.
 - Tooling note: when R-2 actually ships, an end-to-end smoke test would
   be a Python `websockets` + `cryptography` client that completes the
   handshake and calls `remote.editor.capabilities`. ~50 LOC, runs
-  against a `spk-editor --debug --headless` instance with a paired
+  against a `sawe --debug --headless` instance with a paired
   client preloaded. R-2 plan-doc should bake that in as part of CHECKS.

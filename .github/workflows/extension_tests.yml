@@ -17,7 +17,7 @@ on:
         default: .
 jobs:
   orchestrate:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::checkout_repo
@@ -69,7 +69,7 @@ jobs:
   check_rust:
     needs:
     - orchestrate
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-8x32-ubuntu-2404
     steps:
     - name: steps::checkout_repo
@@ -111,7 +111,7 @@ jobs:
   check_extension:
     needs:
     - orchestrate
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-8x32-ubuntu-2404
     steps:
     - name: steps::checkout_repo
@@ -194,7 +194,7 @@ jobs:
     - orchestrate
     - check_rust
     - check_extension
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: run_tests::tests_pass

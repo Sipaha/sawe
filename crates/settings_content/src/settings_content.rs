@@ -742,7 +742,7 @@ pub struct GitPanelSettingsContent {
 
     /// Pre-commit checks (S-PCH-HK): when `true`, the commit panel offers a
     /// `Run pre-commit hook` checkbox that, when ticked, executes
-    /// `<repo>/.git/hooks/pre-commit` from spk-editor and then issues
+    /// `<repo>/.git/hooks/pre-commit` from sawe and then issues
     /// `git commit --no-verify` to suppress git's own hook re-run. When
     /// `false`, the checkbox is hidden and git itself runs the hook (same
     /// as without our UI).
@@ -1207,7 +1207,7 @@ pub struct SolutionsSettingsContent {
     /// the user's home directory. Existing Solutions store absolute paths
     /// and are unaffected by changes to this setting.
     ///
-    /// Default: "~/spk-editor/solutions"
+    /// Default: "~/sawe/solutions"
     pub root: Option<String>,
 
     /// Solution-wide git settings (S-SOL-LOG and follow-ups).

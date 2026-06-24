@@ -43,13 +43,13 @@ const MANIFEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/mani
 
 pub fn compile(manifest: bool) -> Result<(), Box<dyn std::error::Error>> {
     let channel = option_env!("RELEASE_CHANNEL").unwrap_or("dev");
-    // spk-editor: locked rebrand identifier — Windows resource brand strings
-    // carry "SPK Editor", not upstream "Zed".
+    // sawe: locked rebrand identifier — Windows resource brand strings
+    // carry "Sawe", not upstream "Zed".
     let (icon_filename, product_name) = match channel {
-        "stable" => ("app-icon.ico", "SPK Editor"),
-        "preview" => ("app-icon-preview.ico", "SPK Editor Preview"),
-        "nightly" => ("app-icon-nightly.ico", "SPK Editor Nightly"),
-        _ => ("app-icon-dev.ico", "SPK Editor Dev"),
+        "stable" => ("app-icon.ico", "Sawe"),
+        "preview" => ("app-icon-preview.ico", "Sawe Preview"),
+        "nightly" => ("app-icon-nightly.ico", "Sawe Nightly"),
+        _ => ("app-icon-dev.ico", "Sawe Dev"),
     };
     let icon = std::path::PathBuf::from(ICON_DIR).join(icon_filename);
     let icon_escaped = icon.to_string_lossy().replace('\\', "\\\\");

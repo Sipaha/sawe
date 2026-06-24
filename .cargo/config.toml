@@ -24,7 +24,7 @@ rustflags = [
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
-# SPK Editor fork-local: mandatory mold for x86_64-linux. ~5-10x faster link, lower peak RAM.
+# Sawe fork-local: mandatory mold for x86_64-linux. ~5-10x faster link, lower peak RAM.
 # Upstream uses system `ld`. See FORK.md decision #15. Requires `apt install mold` / `brew install mold`.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]

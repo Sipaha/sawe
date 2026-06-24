@@ -15,7 +15,7 @@ const DETECTED_TASKS_FOLDER: &str = "Detected tasks";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TaskRefSettings {
-    /// Label of a task defined in `.spke/tasks.json` (or a language runnable).
+    /// Label of a task defined in `.sawe/tasks.json` (or a language runnable).
     pub task_label: String,
 }
 
@@ -135,7 +135,7 @@ mod tests {
         fs.insert_tree(
             "/proj",
             serde_json::json!({
-                ".spke": {
+                ".sawe": {
                     "tasks.json": r#"[
                         { "label": "build", "command": "cargo", "args": ["build"] }
                     ]"#
@@ -144,7 +144,7 @@ mod tests {
         )
         .await;
         let project = project::Project::test(fs, [Path::new("/proj")], cx).await;
-        // Let the worktree scan + settings observer load `.spke/tasks.json` into
+        // Let the worktree scan + settings observer load `.sawe/tasks.json` into
         // the task inventory before we read it back.
         cx.run_until_parked();
         project

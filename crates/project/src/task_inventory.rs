@@ -149,7 +149,7 @@ impl<T> Default for InventoryFor<T> {
 pub enum TaskSourceKind {
     /// bash-like commands spawned by users, not associated with any path
     UserInput,
-    /// Tasks from the worktree's .spke/task.json
+    /// Tasks from the worktree's .sawe/task.json
     Worktree {
         id: WorktreeId,
         directory_in_worktree: Arc<RelPath>,
@@ -733,7 +733,7 @@ impl Inventory {
             .collect()
     }
 
-    /// SPK Editor fork (S-PCH-HK): returns task templates flagged with
+    /// Sawe fork (S-PCH-HK): returns task templates flagged with
     /// `before_commit: true` from the worktree-scoped + global settings.
     /// Used by the git panel to render pre-commit check rows.
     pub fn before_commit_templates(
@@ -746,10 +746,10 @@ impl Inventory {
             .collect()
     }
 
-    /// SPK Editor fork (S-RUN): returns all settings-derived task templates
+    /// Sawe fork (S-RUN): returns all settings-derived task templates
     /// (worktree-scoped first, then global) without requiring a `TaskContext`
     /// or async resolution. Used by the `task-ref` run-config provider to list
-    /// and look up `.spke/tasks.json` tasks synchronously. Language runnables
+    /// and look up `.sawe/tasks.json` tasks synchronously. Language runnables
     /// are *not* included (those need an async, buffer-aware listing — see
     /// `Inventory::list_tasks`).
     pub fn task_templates_from_settings(

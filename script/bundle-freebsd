@@ -97,12 +97,12 @@ fi
 # Move everything that should end up in the final package
 # into a temp directory.
 # temp_dir=$(mktemp -d)
-# zed_dir="${temp_dir}/spk-editor$suffix.app"
+# zed_dir="${temp_dir}/sawe$suffix.app"
 
 # Binary
 # mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
-# cp "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/spk-editor-bin"
-# cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/spk-editor"
+# cp "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/sawe-bin"
+# cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/sawe"
 
 # Libs
 # find_libs() {
@@ -117,31 +117,31 @@ fi
 
 # Icons
 # mkdir -p "${zed_dir}/share/icons/hicolor/512x512/apps"
-# cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/spk-editor.png"
+# cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/sawe.png"
 # mkdir -p "${zed_dir}/share/icons/hicolor/1024x1024/apps"
-# cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/spk-editor.png"
+# cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/sawe.png"
 
 # .desktop
 # export DO_STARTUP_NOTIFY="true"
-# export APP_CLI="spk-editor"
-# export APP_ICON="spk-editor"
+# export APP_CLI="sawe"
+# export APP_ICON="sawe"
 # export APP_ARGS="%U"
 # if [[ "$channel" == "preview" ]]; then
-#     export APP_NAME="SPK Editor Preview"
-#     APP_ID="ru.sipaha.spk-editor-preview"
+#     export APP_NAME="Sawe Preview"
+#     APP_ID="ru.sipaha.sawe-preview"
 # elif [[ "$channel" == "nightly" ]]; then
-#     export APP_NAME="SPK Editor Nightly"
-#     APP_ID="ru.sipaha.spk-editor-nightly"
+#     export APP_NAME="Sawe Nightly"
+#     APP_ID="ru.sipaha.sawe-nightly"
 # elif [[ "$channel" == "dev" ]]; then
-#     export APP_NAME="SPK Editor Devel"
-#     APP_ID="ru.sipaha.spk-editor-dev"
+#     export APP_NAME="Sawe Devel"
+#     APP_ID="ru.sipaha.sawe-dev"
 # else
-#     export APP_NAME="SPK Editor"
-#     APP_ID="ru.sipaha.spk-editor"
+#     export APP_NAME="Sawe"
+#     APP_ID="ru.sipaha.sawe"
 # fi
 
 # mkdir -p "${zed_dir}/share/applications"
-# envsubst <"crates/zed/resources/spk-editor.desktop.in" >"${zed_dir}/share/applications/$APP_ID.desktop"
+# envsubst <"crates/zed/resources/sawe.desktop.in" >"${zed_dir}/share/applications/$APP_ID.desktop"
 # chmod +x "${zed_dir}/share/applications/$APP_ID.desktop"
 
 # Copy generated licenses so they'll end up in archive too
@@ -151,15 +151,15 @@ fi
 arch=$(uname -m)
 # target="freebsd-${arch}"
 # if [[ "$channel" == "dev" ]]; then
-#     archive="spk-editor-${commit}-${target}.tar.gz"
+#     archive="sawe-${commit}-${target}.tar.gz"
 # else
-#     archive="spk-editor-${target}.tar.gz"
+#     archive="sawe-${target}.tar.gz"
 # fi
 
 # rm -rf "${archive}"
-# remove_match="spk-editor(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+# remove_match="sawe(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 # ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
-# tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "spk-editor$suffix.app"
+# tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "sawe$suffix.app"
 
 gzip -f --stdout --best "${target_dir}/${remote_server_triple}/release/remote_server" \
-    > "${target_dir}/spk-editor-remote-server-freebsd-x86_64.gz"
+    > "${target_dir}/sawe-remote-server-freebsd-x86_64.gz"

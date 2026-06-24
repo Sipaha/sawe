@@ -38,7 +38,7 @@ pub trait RunConfigProvider: Send + Sync + 'static {
     fn new_template(&self, cx: &App) -> serde_json::Value;
 
     /// Configs auto-discovered for the current project (cargo crates, npm
-    /// scripts, existing `.spke/tasks.json` tasks, …). Default: none.
+    /// scripts, existing `.sawe/tasks.json` tasks, …). Default: none.
     /// Returned configs MUST carry `ConfigScope::Ephemeral` and a
     /// `RunConfigId::discovered(self.type_id(), …)` id.
     fn discover(&self, _project: &Entity<Project>, _cx: &mut App) -> Vec<RunConfiguration> {

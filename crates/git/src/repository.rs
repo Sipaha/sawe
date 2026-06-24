@@ -4632,9 +4632,9 @@ pub(crate) fn parse_contains_output(stdout: &str) -> Vec<SharedString> {
 
 fn checkpoint_author_envs() -> HashMap<String, String> {
     HashMap::from_iter([
-        ("GIT_AUTHOR_NAME".to_string(), "SPK Editor".to_string()),
+        ("GIT_AUTHOR_NAME".to_string(), "Sawe".to_string()),
         ("GIT_AUTHOR_EMAIL".to_string(), "hi@zed.dev".to_string()),
-        ("GIT_COMMITTER_NAME".to_string(), "SPK Editor".to_string()),
+        ("GIT_COMMITTER_NAME".to_string(), "Sawe".to_string()),
         ("GIT_COMMITTER_EMAIL".to_string(), "hi@zed.dev".to_string()),
     ])
 }

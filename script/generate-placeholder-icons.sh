@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generates placeholder icons for SPK Editor (a single 'S' on a colored
+# Generates placeholder icons for Sawe (a single 'S' on a colored
 # background) in every size / format the project needs. Replace the output
 # files with proper artwork later; this script is the single source of truth
 # for placeholder geometry.

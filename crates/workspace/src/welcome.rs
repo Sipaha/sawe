@@ -1,4 +1,4 @@
-//! `WelcomeWindow` — the SPK Editor launcher.
+//! `WelcomeWindow` — the Sawe launcher.
 //!
 //! Welcome is a top-level window in its own right (root view =
 //! `WelcomeWindow`), NOT a workspace tab. The previous design embedded
@@ -32,7 +32,7 @@ use zed_actions::{Extensions, OpenKeymap, OpenSettings};
 actions!(
     zed,
     [
-        /// Show the SPK Editor welcome / launcher window.
+        /// Show the Sawe welcome / launcher window.
         ShowWelcome
     ]
 );
@@ -110,7 +110,7 @@ fn render_registered_sections(cx: &mut App) -> Vec<AnyElement> {
         .collect()
 }
 
-/// Root view of the SPK Editor launcher window. Owns its own focus
+/// Root view of the Sawe launcher window. Owns its own focus
 /// handle and renders the sections registered via
 /// `register_welcome_section`.
 pub struct WelcomeWindow {
@@ -258,7 +258,7 @@ impl Render for WelcomeWindow {
                                     .child(Vector::square(VectorName::SpkLogo, rems_from_px(45.)))
                                     .child(
                                         v_flex()
-                                            .child(Headline::new("Welcome to SPK Editor"))
+                                            .child(Headline::new("Welcome to Sawe"))
                                             .child(
                                                 Label::new("The editor for what's next")
                                                     .size(LabelSize::Small)

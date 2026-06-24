@@ -32,7 +32,7 @@ jobs:
   # Job for PRs merged to main - batch suggestions to branch
   # Only runs for PRs from the same repo (not forks) since secrets aren't available for fork PRs
   batch-suggestions:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -264,7 +264,7 @@ jobs:
     concurrency:
       group: docs-suggestions-${{ github.event.pull_request.number || inputs.pr_number || 'manual' }}
       cancel-in-progress: true
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
 
     steps:
       - name: Checkout repository

@@ -1,6 +1,6 @@
 # Mobile: session state stuck at `Running` after backgrounded transition
 
-**Repo:** `spk-editor-mobile` (sibling)
+**Repo:** `sawe-mobile` (sibling)
 **Reported:** 2026-05-18 (user, in-session)
 **Status:** unreproduced in isolation; logged for next mobile-side pass.
 

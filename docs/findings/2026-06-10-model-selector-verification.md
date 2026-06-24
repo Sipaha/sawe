@@ -25,7 +25,7 @@ A per-session model selector on the AI session status row:
 
 ## Verified ✅
 
-- **Compiles**: `cargo build --bin spk-editor` clean (debug + release-fast).
+- **Compiles**: `cargo build --bin sawe` clean (debug + release-fast).
 - **Unit tests green** (per task): `claude_native` 69 lib + 14 integration;
   `solution_agent` 358 + 2. Covers: `set_model` wire shape, `--model` arg
   on/off, `parse_available_models` (+ malformed), `PersistedSession` round-trip
@@ -49,7 +49,7 @@ the two Phase-0 assumptions below remain live-unconfirmed.
 
 > Future sessions: don't burn time driving live `claude` turns in the headless
 > dev instance — they stall here. Verify UI hands-on in the real release-fast
-> instance (`~/.spk/spk-editor/config/mcp.sock`).
+> instance (`~/.spk/sawe/config/mcp.sock`).
 
 ## Follow-up work (2026-06-10, same branch)
 
@@ -75,7 +75,7 @@ the two Phase-0 assumptions below remain live-unconfirmed.
 
 ## Hand-off
 
-`release-fast` binary built for hands-on testing (`target/release-fast/spk-editor`).
+`release-fast` binary built for hands-on testing (`target/release-fast/sawe`).
 To verify: open a Solution, run one agent turn, confirm the model dropdown
 appears on the status row with the current model checked; switch models and run
 another turn (label should follow); restart the editor and confirm a restored

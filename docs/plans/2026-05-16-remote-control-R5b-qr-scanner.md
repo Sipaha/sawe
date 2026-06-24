@@ -1,9 +1,9 @@
 # R-5b: Android QR scanner — pair from a scanned `spk-remote://` URL
 
 **Status:** complete (sibling-repo commit `6e444e5`)
-**Repo:** `spk-editor-mobile/` (sibling of `spk-editor`)
+**Repo:** `sawe-mobile/` (sibling of `sawe`)
 **Depends on:** R-5a (`:core` parsing + connection layer), Android SDK present (`ANDROID_HOME` set, platform-34 + build-tools-34.x).
-**Goal:** Replace the R-5a "paste URL" Compose surface with a real QR scanner. Scanning the QR shown by the spk-editor Remote Control modal (server fingerprint + secret + name embedded) parses straight into `PairingUrl` and transitions to `Connecting`.
+**Goal:** Replace the R-5a "paste URL" Compose surface with a real QR scanner. Scanning the QR shown by the sawe Remote Control modal (server fingerprint + secret + name embedded) parses straight into `PairingUrl` and transitions to `Connecting`.
 
 ## Why this phase exists
 
@@ -37,13 +37,13 @@ app/src/main/kotlin/ru/sipaha/spkremote/app/
 1. App opens to `QrPairingScreen` (replacing direct paste). UI: app logo, big "Scan pairing QR" button, small "Enter manually" link.
 2. Tapping "Scan" launches the zxing scanner activity. App requests CAMERA permission inline (the contract handles the rationale rendering).
 3. On scan success, `pairFromScannedUrl(raw)`:
-   - `PairingUrl.parse(raw)` (already from R-5a). On failure: snackbar "Not a valid SPK Editor pairing QR".
+   - `PairingUrl.parse(raw)` (already from R-5a). On failure: snackbar "Not a valid Sawe pairing QR".
    - On success: transitions ViewModel state to `Connecting`, runs `RemoteClient.connect()`, transitions to `Connected(caps)` or `Error(msg)`.
 4. Manually-entered URL takes the same code path.
 
 ### Permissions
 
-- `CAMERA` runtime permission. Rationale: "Needed to scan the pairing QR shown by SPK Editor on your computer."
+- `CAMERA` runtime permission. Rationale: "Needed to scan the pairing QR shown by Sawe on your computer."
 - No location, no network beyond what the WS connect uses (no new permissions there).
 
 ### Out of scope
@@ -61,14 +61,14 @@ app/src/main/kotlin/ru/sipaha/spkremote/app/
 ## Verification
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 JAVA_HOME=$HOME/.jdks/temurin-21.0.10 ./gradlew :app:assembleDebug 2>&1 | tee /tmp/r5b.txt
 grep -E "BUILD SUCCESSFUL|FAILURE:" /tmp/r5b.txt
 ```
 
 Manual smoke (sub-agent or maintainer with a device):
 - Install `:app` debug APK on an Android device.
-- Boot spk-editor with Remote Control enabled, generate a client, show its QR.
+- Boot sawe with Remote Control enabled, generate a client, show its QR.
 - On the phone: scan → see "Connecting" → "Connected" with the protocol version.
 
 ## Acceptance
@@ -76,7 +76,7 @@ Manual smoke (sub-agent or maintainer with a device):
 - [x] `:app:assembleDebug` BUILD SUCCESSFUL.
 - [x] Manual smoke: scanning a real R-3 QR results in a connected state.
 - [x] Camera-permission-denied path shows a snackbar, no crash.
-- [x] Malformed QR (random URL or non-`spk-remote://` scheme) shows "Not a valid SPK Editor pairing QR" snackbar, no crash.
+- [x] Malformed QR (random URL or non-`spk-remote://` scheme) shows "Not a valid Sawe pairing QR" snackbar, no crash.
 - [x] "Enter manually" fallback still works (regression check on R-5a behavior).
 
 ## When done

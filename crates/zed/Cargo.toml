@@ -1,12 +1,12 @@
 [package]
-description = "SPK Editor — a personal fork of Zed by Zed Industries, Inc."
+description = "Sawe — a personal fork of Zed by Zed Industries, Inc."
 edition.workspace = true
 name = "zed"
 version = "1.7.2"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
-default-run = "spk-editor"
+default-run = "sawe"
 
 [lints]
 workspace = true
@@ -54,7 +54,7 @@ visual-tests = [
 ]
 
 [[bin]]
-name = "spk-editor"
+name = "sawe"
 path = "src/main.rs"
 
 [[bin]]
@@ -289,35 +289,35 @@ repl = { workspace = true, features = ["test-support"] }
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "ru.sipaha.spk-editor-dev"
-name = "SpkEditorDev"
+identifier = "ru.sipaha.sawe-dev"
+name = "SaweDev"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["spk-editor"]
+osx_url_schemes = ["sawe"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
-identifier = "ru.sipaha.spk-editor-nightly"
-name = "SpkEditorNightly"
+identifier = "ru.sipaha.sawe-nightly"
+name = "SaweNightly"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["spk-editor"]
+osx_url_schemes = ["sawe"]
 
 [package.metadata.bundle-preview]
 icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
-identifier = "ru.sipaha.spk-editor-preview"
-name = "SpkEditorPreview"
+identifier = "ru.sipaha.sawe-preview"
+name = "SawePreview"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["spk-editor"]
+osx_url_schemes = ["sawe"]
 
 [package.metadata.bundle-stable]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
-identifier = "ru.sipaha.spk-editor"
-name = "SpkEditor"
+identifier = "ru.sipaha.sawe"
+name = "Sawe"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["spk-editor"]
+osx_url_schemes = ["sawe"]
 
 [package.metadata.cargo-machete]
 ignored = ["profiling", "zstd", "tracing"]

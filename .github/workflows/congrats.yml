@@ -5,7 +5,7 @@ on:
 
 jobs:
   check-author:
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     outputs:
       should_congratulate: ${{ steps.check.outputs.should_congratulate }}
@@ -55,7 +55,7 @@ jobs:
 
   congrats:
     needs: check-author
-    if: false # spk-editor: not applicable
+    if: false # sawe: not applicable
     uses: withastro/automation/.github/workflows/congratsbot.yml@a5bd0c5748c4d56e687cdd558064f9ee8adfb1f2 # main
     with:
       EMOJIS: 🎉,🎊,🧑‍🚀,🥳,🙌,🚀,🦀,🔥,🚢

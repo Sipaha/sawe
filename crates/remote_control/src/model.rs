@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Default port the Remote Control listener binds to.
 pub const DEFAULT_PORT: u16 = 21772;
 
-/// Persisted shape of `~/.config/spk-editor/remote-control.json`.
+/// Persisted shape of `~/.config/sawe/remote-control.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RemoteControlSettings {
     /// The public address the listener advertises (e.g. `203.0.113.1`).

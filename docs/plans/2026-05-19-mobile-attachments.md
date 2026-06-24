@@ -148,14 +148,14 @@ Verify by adding a round-trip test in `:core` that constructs a Kotlin `ContentB
 
 ```bash
 # Server
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor
-cargo build --bin spk-editor
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
+cargo build --bin sawe
 cargo clippy -p solution_agent -p remote_control --all-targets -- -D warnings
 cargo test -p solution_agent --no-fail-fast
 cargo test -p remote_control --lib allow_list
 
 # Mobile
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 ./gradlew :core:test --rerun-tasks
 ./gradlew :app:compileDebugKotlin
 ./gradlew :app:assembleDebug
@@ -173,7 +173,7 @@ Manual smoke (deferred to maintainer after rebuild + restart of release-fast bin
 
 ## When done
 
-- [x] `solution_agent::SendMessageBlocksTool` registered + allow-listed (spk-editor `5adf824ef7`).
+- [x] `solution_agent::SendMessageBlocksTool` registered + allow-listed (sawe `5adf824ef7`).
 - [~] Server unit tests skipped to match existing `SendMessageTool` precedent (which also has no tool-level test; the underlying `store::send_message_blocks` is fully covered). Mobile end-to-end exercises the wire path.
 - [x] Mobile `ContentBlockDto` (text/image/resource_link/audio/resource variants, `@JsonClassDiscriminator("type")`) + `UserMessageBlocks` encoder + 13 tests covering each branch.
 - [x] Mobile compose row attach button (`Icons.Filled.AttachFile` — AutoMirrored variant doesn't exist in Compose 1.7.x) + `ModalBottomSheet` + `PickMultipleVisualMedia(maxItems=4, ImageOnly)` + `OpenDocument()` + horizontal LazyRow of preview cards + dismiss × buttons.
@@ -190,7 +190,7 @@ Manual smoke (deferred to maintainer after rebuild + restart of release-fast bin
 - **`SessionDetailStore` has 3 places that clear optimistic state** (reset, openSession's pre-load reset, closeSession). Adding the new `optimisticBlocksFlags` doubled the surface area for "forgot to clear one of three lists" bugs. A `clearOptimisticStateLocked()` helper is a sensible follow-up.
 
 ## Final commit SHAs
-- `5adf824ef7` solution_agent: send_message_blocks MCP tool (server side, spk-editor main)
+- `5adf824ef7` solution_agent: send_message_blocks MCP tool (server side, sawe main)
 - `817fa4a` feat: ContentBlockDto + UserMessageBlocks encoder (mobile)
 - `e5e111a` feat: file + image attach in mobile chat compose (mobile)
 - `0f5ffe4` feat: EncryptedQueueStore persists block lists alongside text (mobile)

@@ -18,4 +18,4 @@ script/run-mcp --debug --headless --skip-onboarding &
 # workspace.screenshot { solution_id: "alphasol", format: "png" }
 ```
 
-(Use `python3` against `~/.spk/spk-editor-dev/config/mcp.sock` via a 10-line JSON-RPC client — see `crates/editor_mcp/tests/solutions_add_member_e2e_test.rs::call_tool` for the shape.)
+(Use `python3` against `~/.spk/sawe-dev/config/mcp.sock` via a 10-line JSON-RPC client — see `crates/editor_mcp/tests/solutions_add_member_e2e_test.rs::call_tool` for the shape.)

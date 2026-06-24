@@ -1,7 +1,7 @@
 # R-5c: Solutions + agent-sessions list UI
 
 **Status:** complete (sibling-repo commit `7fa4615`)
-**Repo:** `spk-editor-mobile/`
+**Repo:** `sawe-mobile/`
 **Depends on:** R-5a (`:core` `RemoteClient`), R-5b (QR pairing reaches a connected state).
 **Goal:** From the post-pairing connected state, drill into solutions → drill into one solution → see its agent sessions → drill into one. Pure read paths; chat send/receive lives in R-5d.
 
@@ -30,7 +30,7 @@ After successful `RemoteClient.connect()`, navigate to `solutions`.
 - Calls `client.call("remote.solutions.list")` on entry; deserialises into `List<SolutionSummary>`.
 - Pull-to-refresh (`PullToRefreshBox`).
 - Lazy column: each row shows solution name + member count + status indicator (idle/agent-running). Tapping a row navigates to `solutions/{id}`.
-- Empty state: "No solutions open in SPK Editor. Open one on your computer to see it here."
+- Empty state: "No solutions open in Sawe. Open one on your computer to see it here."
 - Error state: snackbar "Couldn't load solutions: {message}", with retry button.
 
 **`SolutionDetailScreen`**
@@ -83,12 +83,12 @@ Map from the actual `remote.solutions.list` / `remote.solution_agent.list_sessio
 ## Verification
 
 ```bash
-cd /home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor-mobile
+cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe-mobile
 JAVA_HOME=$HOME/.jdks/temurin-21.0.10 ./gradlew :app:assembleDebug :core:test --rerun-tasks 2>&1 | tee /tmp/r5c.txt
 grep -E "BUILD SUCCESSFUL|FAILURE:" /tmp/r5c.txt
 ```
 
-Manual smoke against a live spk-editor with at least one solution open + one running agent session:
+Manual smoke against a live sawe with at least one solution open + one running agent session:
 - Pair, land on solutions list, see the solution.
 - Tap → see sessions list with at least one row.
 - Trigger an `agent_session_state_changed` event on the server side (e.g. start an agent turn) → row's pill updates without manual refresh.
@@ -103,7 +103,7 @@ Manual smoke against a live spk-editor with at least one solution open + one run
 
 ## When done
 
-Sub-agent reports commit SHA, Navigation Compose version chosen, sample JSON frames the DTOs were validated against, and any place where the server-side schema was ambiguous (so the supervisor can clarify on the spk-editor side for R-5d).
+Sub-agent reports commit SHA, Navigation Compose version chosen, sample JSON frames the DTOs were validated against, and any place where the server-side schema was ambiguous (so the supervisor can clarify on the sawe side for R-5d).
 
 ---
 

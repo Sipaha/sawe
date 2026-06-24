@@ -207,7 +207,7 @@ fn main() {
 
         #[cfg(windows)]
         {
-            // spk-editor: the `windows_resources` helper carries the "SPK Editor"
+            // sawe: the `windows_resources` helper carries the "Sawe"
             // brand strings (FileDescription / ProductName) — see that crate's
             // `compile()`; the icon selection / RC toolkit handling lives there too.
             windows_resources::compile(false).expect("failed to compile Windows resources");

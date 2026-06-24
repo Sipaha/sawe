@@ -33,7 +33,7 @@ anyhow.workspace = true
 chrono.workspace = true
 client.workspace = true
 collections.workspace = true
-# SPK Editor fork: read the embedded MCP socket path so spawned ACP
+# Sawe fork: read the embedded MCP socket path so spawned ACP
 # subagents (claude-acp etc.) can be wired to it via a stdio bridge —
 # see `mcp_servers_for_project` for the injection site and FORK.md
 # decision 14.

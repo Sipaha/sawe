@@ -3,7 +3,7 @@ use settings::{RegisterSetting, Settings, SettingsContent};
 
 #[derive(Copy, Clone, Debug, RegisterSetting)]
 pub struct TitleBarSettings {
-    // SPK Editor fork: the project-info chain (project name +
+    // Sawe fork: the project-info chain (project name +
     // worktree/branch) is replaced by the solution-tab strip in the
     // title bar (see Phase 2 Task 8) and by the active-solution +
     // branch surface in the fork status bar (Phase 2 Task 9). These
@@ -18,7 +18,7 @@ pub struct TitleBarSettings {
     pub show_branch_name: bool,
     #[allow(dead_code)]
     pub show_project_items: bool,
-    // Sign-in UI is hidden in spk-editor — Zed accounts are not used.
+    // Sign-in UI is hidden in sawe — Zed accounts are not used.
     #[allow(dead_code)]
     pub show_sign_in: bool,
     pub show_user_menu: bool,
