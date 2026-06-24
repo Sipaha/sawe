@@ -2957,8 +2957,14 @@ impl GitStore {
         let (subscriber_sender, subscriber_receiver) = async_channel::unbounded();
         let (cached_commits, error, is_loading) =
             repository_handle.update(&mut cx, |repository, cx| {
-                let response =
-                    repository.graph_data(log_source.clone(), log_order, 0..usize::MAX, cx);
+                let response = repository.graph_data(
+                    log_source.clone(),
+                    log_order,
+                    Vec::new(),
+                    Vec::new(),
+                    0..usize::MAX,
+                    cx,
+                );
                 let cached_commits = response.commits.to_vec();
                 let error = response.error.clone();
                 let is_loading = response.is_loading;
@@ -2966,7 +2972,7 @@ impl GitStore {
                 if is_loading {
                     if let Some(graph_data) = repository
                         .initial_graph_data
-                        .get_mut(&(log_source.clone(), log_order))
+                        .get_mut(&(log_source.clone(), log_order, Vec::new(), Vec::new()))
                     {
                         graph_data.subscribers.push(subscriber_sender);
                     }
@@ -5996,7 +6002,7 @@ impl Repository {
 
     async fn append_initial_graph_commits(
         this: &WeakEntity<Self>,
-        graph_data_key: &(LogSource, LogOrder),
+        graph_data_key: &(LogSource, LogOrder, Vec<String>, Vec<String>),
         initial_graph_commit_data: Vec<Arc<InitialGraphCommitData>>,
         cx: &mut AsyncApp,
     ) {
@@ -6085,7 +6091,7 @@ impl Repository {
         let repository_id = this
             .update(cx, |repository, _| repository.id)
             .map_err(|err| SharedString::from(err.to_string()))?;
-        let graph_data_key = (log_source.clone(), log_order);
+        let graph_data_key = (log_source.clone(), log_order, Vec::new(), Vec::new());
         let mut response = remote
             .client
             .request_stream(proto::GetInitialGraphData {
@@ -7045,7 +7051,7 @@ impl Repository {
                 _ => None,
             });
         let this = cx.weak_entity();
-        self.send_job(None, move |git_repo, mut cx| async move {
+        self.send_job("stash_push", None, move |git_repo, mut cx| async move {
             match git_repo {
                 RepositoryState::Local(LocalRepositoryState {
                     backend,
@@ -7095,7 +7101,7 @@ impl Repository {
                 _ => None,
             });
         let this = cx.weak_entity();
-        self.send_job(None, move |git_repo, mut cx| async move {
+        self.send_job("stash_branch", None, move |git_repo, mut cx| async move {
             match git_repo {
                 RepositoryState::Local(LocalRepositoryState {
                     backend,
@@ -7132,7 +7138,7 @@ impl Repository {
         &mut self,
         stash_ref: String,
     ) -> oneshot::Receiver<anyhow::Result<String>> {
-        self.send_job(None, move |git_repo, _cx| async move {
+        self.send_job("stash_show_patch", None, move |git_repo, _cx| async move {
             match git_repo {
                 RepositoryState::Local(LocalRepositoryState {
                     backend,
@@ -7151,7 +7157,7 @@ impl Repository {
         &mut self,
         stash_ref: String,
     ) -> oneshot::Receiver<anyhow::Result<git::stash::StashStat>> {
-        self.send_job(None, move |git_repo, _cx| async move {
+        self.send_job("stash_stat", None, move |git_repo, _cx| async move {
             match git_repo {
                 RepositoryState::Local(LocalRepositoryState {
                     backend,
@@ -8330,6 +8336,7 @@ impl Repository {
     /// without checking it out. Errors if the branch already exists.
     pub fn branch_at_sha(&mut self, name: String, sha: String) -> oneshot::Receiver<Result<()>> {
         self.send_job(
+            "branch_at_sha",
             Some(format!("git branch {name} {sha}").into()),
             move |repo, _cx| async move {
                 match repo {
@@ -8355,6 +8362,7 @@ impl Repository {
         let kind = if message.is_some() { "tag -a" } else { "tag" };
         let this = self.this.clone();
         self.send_job(
+            "tag_at_sha",
             Some(format!("git {kind} {name} {sha}").into()),
             move |repo, mut cx| async move {
                 let result = match repo {
@@ -8378,6 +8386,7 @@ impl Repository {
     /// HEAD is detached; the UI surfaces the warning before invocation.
     pub fn checkout_revision(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
         self.send_job(
+            "checkout_revision",
             Some(format!("git checkout {sha}").into()),
             move |repo, _cx| async move {
                 match repo {
@@ -8395,7 +8404,7 @@ impl Repository {
     /// S-CTM "Checkout Revision" pre-check — `git status --porcelain`
     /// non-empty.
     pub fn is_dirty(&mut self) -> oneshot::Receiver<Result<bool>> {
-        self.send_job(None, move |repo, _cx| async move {
+        self.send_job("is_dirty", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.is_dirty().await
@@ -8408,7 +8417,7 @@ impl Repository {
     /// S-CTM "Copy Patch ID" — runs `git show <sha> | git patch-id` and
     /// returns the first whitespace-separated token of the result.
     pub fn compute_patch_id(&mut self, sha: String) -> oneshot::Receiver<Result<String>> {
-        self.send_job(None, move |repo, _cx| async move {
+        self.send_job("compute_patch_id", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.compute_patch_id(sha).await
@@ -8459,6 +8468,7 @@ impl Repository {
         upstream: String,
     ) -> oneshot::Receiver<Result<()>> {
         self.send_job(
+            "set_upstream",
             Some(format!("git branch -u {upstream} {branch}").into()),
             move |repo, _cx| async move {
                 match repo {
@@ -8477,6 +8487,7 @@ impl Repository {
     pub fn delete_tag(&mut self, name: String) -> oneshot::Receiver<Result<()>> {
         let this = self.this.clone();
         self.send_job(
+            "delete_tag",
             Some(format!("git tag -d {name}").into()),
             move |repo, mut cx| async move {
                 let result = match repo {
@@ -8499,6 +8510,7 @@ impl Repository {
     /// S-BRP "Push Tag" — `git push <remote> <tag>`.
     pub fn push_tag(&mut self, remote: String, tag: String) -> oneshot::Receiver<Result<()>> {
         self.send_job(
+            "push_tag",
             Some(format!("git push {remote} {tag}").into()),
             move |repo, _cx| async move {
                 match repo {
@@ -8524,6 +8536,7 @@ impl Repository {
         tag: String,
     ) -> oneshot::Receiver<Result<()>> {
         self.send_job(
+            "delete_remote_tag",
             Some(format!("git push {remote} --delete refs/tags/{tag}").into()),
             move |repo, _cx| async move {
                 match repo {
@@ -8540,7 +8553,7 @@ impl Repository {
 
     /// S-BRP — list tag names sorted by tagger date (newest first).
     pub fn tags(&mut self) -> oneshot::Receiver<Result<Vec<SharedString>>> {
-        self.send_job(None, move |repo, _cx| async move {
+        self.send_job("tags", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.tags().await
@@ -10396,8 +10409,8 @@ async fn compute_snapshot(
         let backend = backend.clone();
         async move {
             match backend.head_sha().await {
-                Some(head_sha) => backend.show(head_sha).await.log_err(),
-                None => None,
+                Some(head_sha) => backend.show(head_sha).await.map(Some),
+                None => Ok(None),
             }
         }
     };
