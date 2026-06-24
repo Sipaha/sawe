@@ -140,7 +140,7 @@ use std::{
     time::Duration,
 };
 use task::{DebugScenario, SharedTaskContext, SpawnInTerminal};
-use theme::{ActiveTheme, SystemAppearance};
+use theme::{ActiveTheme, ClientDecorationsExt, SystemAppearance};
 use theme_settings::ThemeSettings;
 pub use toolbar::{
     PaneSearchBarCallbacks, Toolbar, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
@@ -1805,7 +1805,14 @@ impl Workspace {
                 }));
                 cx.notify();
             }),
-            theme_settings::track_window_appearance(window, cx),
+            cx.observe_window_appearance(window, |_, window, cx| {
+                let window_appearance = window.appearance();
+
+                *SystemAppearance::global_mut(cx) = SystemAppearance(window_appearance.into());
+
+                theme_settings::reload_theme(cx);
+                theme_settings::reload_icon_theme(cx);
+            }),
             cx.on_release({
                 let weak_handle = weak_handle.clone();
                 move |this, cx| {

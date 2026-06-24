@@ -18,6 +18,7 @@ pub enum VectorName {
     ProTrialStamp,
     ProUserStamp,
     StudentStamp,
+    SpkLogo,
     ZedLogo,
     ZedXCopilot,
 }

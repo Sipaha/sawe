@@ -128,7 +128,16 @@ impl WelcomeWindow {
         // up front — without this the launcher paints with the
         // default Light value and picks the wrong theme variant on a
         // dark system.
-        let appearance_subscription = theme_settings::track_window_appearance(window, cx);
+        *theme::SystemAppearance::global_mut(cx) =
+            theme::SystemAppearance(window.appearance().into());
+        theme_settings::reload_theme(cx);
+        theme_settings::reload_icon_theme(cx);
+        let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
+            *theme::SystemAppearance::global_mut(cx) =
+                theme::SystemAppearance(window.appearance().into());
+            theme_settings::reload_theme(cx);
+            theme_settings::reload_icon_theme(cx);
+        });
 
         Self {
             focus_handle,

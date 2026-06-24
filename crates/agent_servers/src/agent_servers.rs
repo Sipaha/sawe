@@ -11,7 +11,7 @@ use fs::Fs;
 use http_client::read_no_proxy_from_env;
 use project::{AgentId, Project, agent_server_store::AgentServerStore};
 
-use acp_thread::AgentConnection;
+use acp_thread::{AgentConnection, AgentModelId};
 use agent_client_protocol::schema as acp_schema;
 use anyhow::Result;
 use gpui::{App, AppContext, Entity, Task};
@@ -71,19 +71,19 @@ pub trait AgentServer: Send {
     ) {
     }
 
-    fn default_model(&self, _cx: &App) -> Option<acp_schema::ModelId> {
+    fn default_model(&self, _cx: &App) -> Option<AgentModelId> {
         None
     }
 
     fn set_default_model(
         &self,
-        _model_id: Option<acp_schema::ModelId>,
+        _model_id: Option<AgentModelId>,
         _fs: Arc<dyn Fs>,
         _cx: &mut App,
     ) {
     }
 
-    fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<acp_schema::ModelId> {
+    fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<AgentModelId> {
         HashSet::default()
     }
 
@@ -120,7 +120,7 @@ pub trait AgentServer: Send {
 
     fn toggle_favorite_model(
         &self,
-        _model_id: acp_schema::ModelId,
+        _model_id: AgentModelId,
         _should_be_favorite: bool,
         _fs: Arc<dyn Fs>,
         _cx: &App,
