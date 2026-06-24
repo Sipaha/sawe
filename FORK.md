@@ -4,6 +4,34 @@ This file is an index of everything **Sawe** adds on top of upstream [Zed](https
 
 For fork **philosophy** (rebrand identifiers, what's disabled, build conventions, embedded MCP usage) see `.rules` / `CLAUDE.md` at the repo root.
 
+## Re-fork onto upstream v1.7.2 (2026-06-24)
+
+This repo's `main` was **re-forked onto upstream Zed `v1.7.2`** (commit
+`aa8ac4b04e261f19c2465f68e9ce2fa9721ae1a2`) and rebranded `spk-editor` → **`sawe`**.
+The predecessor fork (`SPK Editor`, content base Zed v0.235) had a git history disjoint
+from upstream after March 2021, so `git merge upstream/main` was infeasible. The re-fork
+restores a **real recent merge-base**, so future `git merge upstream/main` is a normal merge.
+
+Method: based `main` on the `v1.7.2` tag, copied the 18 net-new fork crates, applied the
+fork delta (`git diff v0.235-base..predecessor-tip`) as a 3-way patch, then resolved
+conflicts by the rule **prefer upstream v1.7.2 unless the hunk is a documented fork feature**
+(most of the old delta was upstream commits the predecessor had already absorbed, now native
+in v1.7.2). A layered compile-loop fixed v0.235→v1.7.2 API drift; Phase B rebranded the
+product identity to `sawe` (internal `zed` cargo crate + `zed_actions` + license kept).
+
+Consequences for future upstream merges:
+- **`git2` was re-added** (`git2` workspace dep, used by `git/src/operations` for the
+  `git_conflict_ui` resolver). Upstream v1.7.2 went shell-only (no libgit2); this fork still
+  needs git2. Keep ours on future merges.
+- The screenshot/headless stack (`gpui_wgpu::render_to_image`/`render_scene_into`,
+  `WgpuRenderer::new_offscreen`, the Option-`surface` refactor) and `ListState::measure_last`
+  were re-grafted additively onto v1.7.2's evolved renderer/list internals.
+- Resolved-functionality stubs to revisit: `solution_agent` managed-agent timeouts pinned as
+  consts (not re-plumbed into `AgentSettings`); the `AcpModelSelector` status-bar model selector
+  was dropped against v1.7.2's refactored model plumbing (re-implement when needed); two
+  `project_panel` tests still reference the removed in-`git_ui` `git_graph` module (affects
+  `cargo test` only, not the `--bin` build).
+
 ## Fork-only crates
 
 | Crate | Purpose | Notes |
