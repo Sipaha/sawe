@@ -1,4 +1,6 @@
 pub(super) mod blame;
+pub(super) mod blame_colors;
+pub(super) mod blame_filters;
 
 use super::*;
 use ::git::{Restore, blame::BlameEntry, commit::ParsedCommitMessage, status::FileStatus};
