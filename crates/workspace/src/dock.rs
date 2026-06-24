@@ -8,14 +8,15 @@ use client::proto;
 use db::kvp::KeyValueStore;
 
 use gpui::{
-    Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Action, Anchor, AnyView, App, AppContext as _, Axis, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement, Render, SharedString, StyleRefinement, Styled, Subscription, Task, WeakEntity,
+    Window, deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
 use std::sync::Arc;
+use std::time::Duration;
 use ui::{
     ContextMenu, CountBadge, Divider, DividerColor, IconButton, Tooltip, prelude::*,
     right_click_menu,
@@ -277,6 +278,12 @@ pub struct Dock {
     pub(crate) serialized_dock: Option<DockData>,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
+    /// Debounce token for KVP-backed size persistence. While the user is
+    /// dragging the resize handle the listener fires per mouse-move (60+/s);
+    /// each fire used to schedule its own `cx.background_spawn` write,
+    /// piling up SQLite tasks and showing up as visible drag lag. We coalesce
+    /// to a single trailing-edge write after the user stops moving the mouse.
+    _persist_panel_size_task: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -355,6 +362,7 @@ struct PanelEntry {
 
 pub struct PanelButtons {
     dock: Entity<Dock>,
+    vertical: bool,
     _settings_subscription: Subscription,
 }
 
@@ -418,6 +426,7 @@ impl Dock {
                 is_open: false,
                 focus_handle: focus_handle.clone(),
                 focus_follows_mouse: WorkspaceSettings::get_global(cx).focus_follows_mouse,
+                _persist_panel_size_task: None,
                 _subscriptions: [focus_subscription, zoom_subscription],
                 serialized_dock: None,
                 zoom_layer_open: false,
@@ -971,17 +980,36 @@ impl Dock {
         {
             let (panel_key, size_state) =
                 resize_panel_entry(self.position, entry, size, flex, window, cx);
+            self.schedule_persist_panel_size(panel_key, size_state, cx);
+            cx.notify();
+        }
+    }
 
-            let workspace = self.workspace.clone();
-            cx.defer(move |cx| {
+    /// Trailing-edge debounce of the KVP write for the active panel's size.
+    /// Replaces a per-mouse-move `cx.background_spawn` (which the resize
+    /// listener fired at ~60 Hz, swamping the SQLite executor and showing up
+    /// as visible drag jitter) with a single write 200 ms after the last
+    /// resize. Dropping the previous task cancels its pending timer, so we
+    /// only ever persist the trailing position the user rests on.
+    fn schedule_persist_panel_size(
+        &mut self,
+        panel_key: &'static str,
+        size_state: PanelSizeState,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        self._persist_panel_size_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            cx.update(|cx| {
                 if let Some(workspace) = workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
                         workspace.persist_panel_size_state(panel_key, size_state, cx);
                     });
                 }
             });
-            cx.notify();
-        }
+        }));
     }
 
     pub fn resize_all_panels(
@@ -1017,16 +1045,23 @@ impl Dock {
             }
         }
 
+        // Same trailing-edge debounce as `resize_active_panel` — drag fires
+        // 60+ events/s, immediate persistence created visible jitter.
         let workspace = self.workspace.clone();
-        cx.defer(move |cx| {
-            if let Some(workspace) = workspace.upgrade() {
-                workspace.update(cx, |workspace, cx| {
-                    for (panel_key, size_state) in size_states_to_persist {
-                        workspace.persist_panel_size_state(panel_key, size_state, cx);
-                    }
-                });
-            }
-        });
+        self._persist_panel_size_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            cx.update(|cx| {
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        for (panel_key, size_state) in size_states_to_persist {
+                            workspace.persist_panel_size_state(panel_key, size_state, cx);
+                        }
+                    });
+                }
+            });
+        }));
 
         cx.notify();
     }
@@ -1203,6 +1238,20 @@ impl PanelButtons {
         let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         Self {
             dock,
+            vertical: false,
+            _settings_subscription: settings_subscription,
+        }
+    }
+
+    /// Vertical layout used by the IDEA-style edge strips on the workspace.
+    /// Buttons render top-to-bottom with larger icons; no horizontal dividers
+    /// or right-side reversal.
+    pub fn new_vertical(dock: Entity<Dock>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&dock, |_, _, cx| cx.notify()).detach();
+        let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
+        Self {
+            dock,
+            vertical: true,
             _settings_subscription: settings_subscription,
         }
     }
@@ -1214,10 +1263,22 @@ impl Render for PanelButtons {
         let active_index = dock.active_panel_index;
         let is_open = dock.is_open;
         let dock_position = dock.position;
+        let vertical = self.vertical;
 
-        let (menu_anchor, menu_attach) = match dock.position {
-            DockPosition::Left => (Anchor::BottomLeft, Anchor::TopLeft),
-            DockPosition::Bottom | DockPosition::Right => (Anchor::BottomRight, Anchor::TopRight),
+        let (menu_anchor, menu_attach) = if vertical {
+            match dock.position {
+                // Right-strip menus pop out to the left of the button.
+                DockPosition::Right => (Anchor::TopRight, Anchor::TopLeft),
+                // Left-strip and bottom-on-left-strip menus pop out to the right.
+                DockPosition::Left | DockPosition::Bottom => (Anchor::TopLeft, Anchor::TopRight),
+            }
+        } else {
+            match dock.position {
+                DockPosition::Left => (Anchor::BottomLeft, Anchor::TopLeft),
+                DockPosition::Bottom | DockPosition::Right => {
+                    (Anchor::BottomRight, Anchor::TopRight)
+                }
+            }
         };
 
         let dock_entity = self.dock.clone();
@@ -1354,8 +1415,13 @@ impl Render for PanelButtons {
                         .trigger(move |is_active, _window, _cx| {
                             // Include active state in element ID to invalidate the cached
                             // tooltip when panel state changes (e.g., via keyboard shortcut)
+                            let icon_size = if vertical {
+                                IconSize::Custom(rems_from_px(24.))
+                            } else {
+                                IconSize::Small
+                            };
                             let button = IconButton::new((name, is_active_button as u64), icon)
-                                .icon_size(IconSize::Small)
+                                .icon_size(icon_size)
                                 .toggle_state(is_active_button)
                                 .on_click({
                                     let action = action.boxed_clone();
@@ -1382,11 +1448,15 @@ impl Render for PanelButtons {
             })
             .collect();
 
-        if dock_position == DockPosition::Right {
+        if !vertical && dock_position == DockPosition::Right {
             buttons.reverse();
         }
 
         let has_buttons = !buttons.is_empty();
+
+        if vertical {
+            return v_flex().gap_2().children(buttons).into_any_element();
+        }
 
         h_flex()
             .gap_1()
@@ -1400,6 +1470,7 @@ impl Render for PanelButtons {
             .when(has_buttons && dock.position == DockPosition::Left, |this| {
                 this.child(Divider::vertical().color(DividerColor::Border))
             })
+            .into_any_element()
     }
 }
 

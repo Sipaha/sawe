@@ -1,11 +1,13 @@
 use std::sync::Arc;
-use std::time::Duration;
 
-use client::{Client, TelemetrySettings, UserStore, zed_urls};
-use cloud_api_types::Plan;
+use client::TelemetrySettings;
 use collections::HashMap;
 use fs::Fs;
+<<<<<<< ours
 use gpui::{Action, Animation, AnimationExt, App, Entity, IntoElement, TaskExt, pulsating_between};
+=======
+use gpui::{Action, App, IntoElement};
+>>>>>>> theirs
 use project::agent_server_store::AllAgentServersSettings;
 use project::project_settings::ProjectSettings;
 use project::{AgentRegistryStore, RegistryAgent};
@@ -250,7 +252,7 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
             SwitchField::new(
                 "onboarding-telemetry-metrics",
                 None::<&str>,
-                Some("Help improve Zed by sending anonymous usage data".into()),
+                Some("Help improve SPK Editor by sending anonymous usage data".into()),
                 if TelemetrySettings::get_global(cx).metrics {
                     ui::ToggleState::Selected
                 } else {
@@ -290,7 +292,7 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
                 "onboarding-telemetry-crash-reports",
                 None::<&str>,
                 Some(
-                    "Help fix Zed by sending crash reports so we can fix critical issues fast"
+                    "Help fix SPK Editor by sending crash reports so we can fix critical issues fast"
                         .into(),
                 ),
                 if TelemetrySettings::get_global(cx).diagnostics {
@@ -431,12 +433,15 @@ fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> imp
         ui::ToggleState::Unselected
     };
 
-    let tooltip_description = "Zed can only allow services like language servers, project settings, and MCP servers to run after you mark a new project as trusted.";
+    let tooltip_description = "SPK Editor can only allow services like language servers, project settings, and MCP servers to run after you mark a new project as trusted.";
 
     SwitchField::new(
         "onboarding-auto-trust-worktrees",
         Some("Trust All Projects By Default"),
-        Some("Automatically mark all new projects as trusted to unlock all Zed's features".into()),
+        Some(
+            "Automatically mark all new projects as trusted to unlock all SPK Editor's features"
+                .into(),
+        ),
         toggle_state,
         {
             let fs = <dyn Fs>::global(cx);
@@ -582,6 +587,7 @@ fn render_registry_agent_button(
         })
 }
 
+<<<<<<< ours
 fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
     let client = Client::global(cx);
     let status = *client.status().borrow();
@@ -655,6 +661,9 @@ fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl
 }
 
 fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
+=======
+fn render_ai_section(cx: &mut App) -> impl IntoElement {
+>>>>>>> theirs
     let registry_agents = AgentRegistryStore::try_global(cx)
         .map(|store| store.read(cx).agents().to_vec())
         .unwrap_or_default();
@@ -664,7 +673,7 @@ fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoE
         .get::<AllAgentServersSettings>(None)
         .clone();
 
-    let column_count = 1 + FEATURED_AGENT_IDS.len() as u16;
+    let column_count = FEATURED_AGENT_IDS.len() as u16;
 
     let grid = FEATURED_AGENT_IDS.iter().fold(
         div()
@@ -672,8 +681,7 @@ fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoE
             .mt_1p5()
             .grid()
             .grid_cols(column_count)
-            .gap_2()
-            .child(render_zed_agent_button(user_store, cx)),
+            .gap_2(),
         |grid, agent_id| {
             let Some(agent) = registry_agents
                 .iter()
@@ -696,7 +704,7 @@ fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoE
         .child(grid)
 }
 
-pub(crate) fn render_basics_page(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
+pub(crate) fn render_basics_page(cx: &mut App) -> impl IntoElement {
     let mut tab_index = 0;
 
     v_flex()
@@ -704,7 +712,7 @@ pub(crate) fn render_basics_page(user_store: &Entity<UserStore>, cx: &mut App) -
         .gap_6()
         .child(render_theme_section(&mut tab_index, cx))
         .child(render_base_keymap_section(&mut tab_index, cx))
-        .child(render_ai_section(user_store, cx))
+        .child(render_ai_section(cx))
         .child(render_import_settings_section(&mut tab_index, cx))
         .child(render_vim_mode_switch(&mut tab_index, cx))
         .child(render_worktree_auto_trust_switch(&mut tab_index, cx))

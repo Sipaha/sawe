@@ -1,4 +1,6 @@
 use crate::Editor;
+use crate::git::blame_colors::ColorMode;
+use crate::git::blame_filters::AuthorFilter;
 use anyhow::{Context as _, Result};
 use collections::HashMap;
 
@@ -24,6 +26,27 @@ use std::{sync::Arc, time::Duration};
 use sum_tree::SumTree;
 use text::BufferId;
 use workspace::Workspace;
+
+/// S-ANN — toolbar / persistence state controlling how the blame gutter
+/// renders and which lines are emphasized. Toggles for `ignore_whitespace`
+/// and `follow_renames` are honored by the `editor.git.blame` MCP tool;
+/// the editor-side gutter pipeline goes through
+/// [`project::Project::blame_buffer`] which doesn't yet plumb these
+/// flags down to the trait method (would require touching the
+/// remote-blame proto), so v1 of the toolbar tracks the state and
+/// re-runs `generate()` for parity with the MCP path. See `S-ANN`
+/// follow-ups.
+#[derive(Clone, Debug, Default)]
+pub struct BlameOptions {
+    pub ignore_whitespace: bool,
+    pub follow_renames: bool,
+    pub color_mode: ColorMode,
+    pub author_filter: AuthorFilter,
+    /// When `true`, render the per-line date as an absolute timestamp;
+    /// otherwise relative ("3d ago"). Configurable via the gutter
+    /// toolbar.
+    pub absolute_dates: bool,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct GitBlameEntry {
@@ -81,6 +104,7 @@ pub struct GitBlame {
     user_triggered: bool,
     regenerate_on_edit_task: Task<Result<()>>,
     _regenerate_subscriptions: Vec<Subscription>,
+    options: BlameOptions,
 }
 
 pub trait BlameRenderer {
@@ -99,6 +123,40 @@ pub trait BlameRenderer {
         window: &mut Window,
         _: &mut App,
     ) -> Option<AnyElement>;
+
+    /// S-ANN — options-aware variant. The default implementation
+    /// forwards to `render_blame_entry`, ignoring `options`. Renderers
+    /// that opt into the annotate-toolbar pipeline override this to
+    /// honor color modes / author filters / absolute-date toggles.
+    #[allow(clippy::too_many_arguments)]
+    fn render_blame_entry_with_options(
+        &self,
+        style: &TextStyle,
+        blame_entry: BlameEntry,
+        details: Option<ParsedCommitMessage>,
+        repository: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        editor: Entity<Editor>,
+        ix: usize,
+        sha_color: Hsla,
+        _options: &BlameOptions,
+        _date_range: Option<(i64, i64)>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        self.render_blame_entry(
+            style,
+            blame_entry,
+            details,
+            repository,
+            workspace,
+            editor,
+            ix,
+            sha_color,
+            window,
+            cx,
+        )
+    }
 
     fn render_inline_blame_entry(
         &self,
@@ -259,6 +317,7 @@ impl GitBlame {
                 project_subscription,
                 git_store_subscription,
             ],
+            options: BlameOptions::default(),
         };
         this.generate(cx);
         this
@@ -275,6 +334,46 @@ impl GitBlame {
 
     pub fn has_generated_entries(&self) -> bool {
         !self.buffers.is_empty()
+    }
+
+    pub fn options(&self) -> &BlameOptions {
+        &self.options
+    }
+
+    /// Replace the current options. When the parts that affect the
+    /// underlying `git blame` invocation change (currently
+    /// `ignore_whitespace` / `follow_renames`), `regenerate` is set
+    /// — callers may want to call `generate(cx)` afterward to refresh.
+    pub fn set_options(&mut self, options: BlameOptions, cx: &mut Context<Self>) -> bool {
+        let regenerate = self.options.ignore_whitespace != options.ignore_whitespace
+            || self.options.follow_renames != options.follow_renames;
+        self.options = options;
+        cx.notify();
+        if regenerate {
+            self.generate(cx);
+        }
+        regenerate
+    }
+
+    /// Iterator over every loaded blame entry across all buffers — used
+    /// by the toolbar's author-filter dropdown to enumerate
+    /// contributors.
+    pub fn all_entries(&self) -> impl Iterator<Item = &BlameEntry> + '_ {
+        self.buffers
+            .values()
+            .flat_map(|b| b.entries.iter().filter_map(|e| e.blame.as_ref()))
+    }
+
+    /// Min/max committer-time across all loaded blame entries — used by
+    /// the date-heatmap color mode.
+    pub fn date_range(&self) -> Option<(i64, i64)> {
+        let times = self
+            .all_entries()
+            .filter_map(|e| e.author_time)
+            .collect::<Vec<_>>();
+        let min = *times.iter().min()?;
+        let max = *times.iter().max()?;
+        Some((min, max))
     }
 
     pub fn details_for_entry(

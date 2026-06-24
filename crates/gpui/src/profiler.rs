@@ -646,6 +646,7 @@ impl Drop for ThreadTimings {
 }
 
 #[doc(hidden)]
+<<<<<<< ours
 pub fn update_running_task(spawned: SpawnTime, location: &'static std::panic::Location<'_>) {
     THREAD_TIMINGS.with(|timings| {
         timings.lock().update_running_task(spawned, location);
@@ -655,6 +656,12 @@ pub fn update_running_task(spawned: SpawnTime, location: &'static std::panic::Lo
 #[doc(hidden)]
 pub fn save_task_timing() {
     let yielded_at = YieldTime(Instant::now());
+=======
+pub fn add_task_timing(timing: TaskTiming) {
+    if !PROFILER_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+>>>>>>> theirs
     THREAD_TIMINGS.with(|timings| {
         timings.lock().save_task_timing(yielded_at);
     });
@@ -819,4 +826,29 @@ impl FrameTimingCollector {
         self.cursor = frames.total_pushed;
         unseen
     }
+}
+
+static PROFILER_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables task timing collection at runtime.
+///
+/// When transitioning from enabled to disabled, `add_task_timing` becomes a
+/// no-op and the existing per-thread buffers are cleared so stale data isn't
+/// reported after a later re-enable. Calls with the current value are a no-op.
+pub fn set_enabled(enabled: bool) -> bool {
+    if PROFILER_ENABLED.swap(enabled, Ordering::AcqRel) == enabled {
+        return false;
+    }
+
+    if !enabled {
+        for global in GLOBAL_THREAD_TIMINGS.lock().iter() {
+            if let Some(timings) = global.timings.upgrade() {
+                let mut timings = timings.lock();
+                timings.timings.clear();
+                timings.timings.shrink_to_fit();
+                timings.total_pushed = 0;
+            }
+        }
+    }
+    true
 }

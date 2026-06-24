@@ -1,14 +1,22 @@
 use std::path::PathBuf;
 use std::pin::Pin;
 
+<<<<<<< ours
 use anyhow::Result;
+=======
+use anyhow::{Context as _, Result};
+use async_process::Child;
+>>>>>>> theirs
 use async_trait::async_trait;
 use futures::io::{BufReader, BufWriter};
 use futures::{
     AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, Stream, StreamExt as _,
 };
 use gpui::AsyncApp;
+<<<<<<< ours
 
+=======
+>>>>>>> theirs
 use util::TryFutureExt as _;
 use util::process::Child;
 use util::shell::Shell;

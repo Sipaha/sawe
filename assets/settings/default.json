@@ -11,7 +11,11 @@
     "light": "One Light",
     "dark": "One Dark",
   },
-  "icon_theme": "Zed (Default)",
+  // SPK Editor: defaults to Material Icon Theme (colored file/folder icons)
+  // instead of upstream "Zed (Default)" (monochrome). The extension is
+  // listed in auto_install_extensions so a fresh install pulls it from
+  // the zed.dev registry on first launch.
+  "icon_theme": "Material Icon Theme",
   // The name of a base set of key bindings to use.
   // This setting can take six values, each named after another
   // text editor:
@@ -83,9 +87,6 @@
     // Values are clamped to the [0.0, 1.0] range.
     "inactive_opacity": 1.0,
   },
-  // Layout mode of the bottom dock. Defaults to "contained"
-  //   choices: contained, full, left_aligned, right_aligned
-  "bottom_dock_layout": "contained",
   // The direction that you want to split panes horizontally. Defaults to "down"
   "pane_split_direction_horizontal": "down",
   // The direction that you want to split panes vertically. Defaults to "right"
@@ -139,7 +140,11 @@
   //         "restore_on_startup": "last_workspace",
   //  3. Do not restore previous workspaces
   //         "restore_on_startup": "none",
-  "restore_on_startup": "last_session",
+  // SPK Editor: default is "launchpad" so the Welcome page (with the
+  // Solutions list + Create button) is always shown on startup, instead of
+  // restoring the last workspace or opening an untitled buffer. See FORK.md
+  // §10.
+  "restore_on_startup": "launchpad",
   // The default behavior when opening paths from the CLI without
   // an explicit `-e` (existing window) or `-n` (new window) flag.
   //
@@ -380,8 +385,11 @@
   // 1. Vertically center the target in the viewport: `center` (default)
   // 2. Scroll the minimum amount needed to make the target visible: `minimum`
   // 3. Scroll so the target appears near the top of the viewport: `top`
+<<<<<<< ours
   // 4. Preserve the cursor's vertical position within the viewport, falling back to `center` when the cursor is
   //    offscreen: `preserve`
+=======
+>>>>>>> theirs
   "go_to_definition_scroll_strategy": "center",
   // Which level to use to filter out diagnostics displayed in the editor.
   //
@@ -767,7 +775,9 @@
     // Default width of the project panel.
     "default_width": 240,
     // Where to dock the project panel. Can be 'left' or 'right'.
-    "dock": "right",
+    // SPK Editor: defaults to "left" — IDEA convention. Upstream Zed defaults
+    // to "right" but every IDEA-style IDE puts the project tree on the left.
+    "dock": "left",
     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
     "entry_spacing": "comfortable",
     // Whether to show file icons in the project panel.
@@ -865,7 +875,10 @@
     "drag_and_drop": true,
     // Whether to hide the root entry when only one folder is open in the window;
     // this also affects how file paths appear in the file finder history.
-    "hide_root": false,
+    // Defaults to `true` in this fork: Solutions render exactly one worktree
+    // at a time and the active-project selector header already names it, so
+    // showing the worktree root again as a foldable tree node duplicates it.
+    "hide_root": true,
     // Whether to hide the hidden entries in the project panel.
     "hide_hidden": false,
     // Settings for automatically opening files.
@@ -932,6 +945,50 @@
     // Set to 0 to collapse all items that have children, 1 or higher to collapse items at that depth or deeper.
     "expand_outlines_with_depth": 100,
   },
+  "solutions": {
+    // Default root directory for new Solutions. Leave commented out to
+    // pick up the runtime default — `<base_dir>/solutions`, where
+    // `<base_dir>` is `~/spk-editor` in release and `~/spk-editor-dev`
+    // in debug. Set this to override (existing Solutions store
+    // absolute paths and are unaffected by changes to this setting).
+    // "root": "~/spk-editor/solutions",
+    "git": {
+      "aggregated_log": {
+        // Pre-warm per-member git-log buffers in the background on
+        // Solution open, so toggling the Git Graph view to
+        // "Solution-wide" shows results immediately instead of waiting
+        // for the first batch of commits per member.
+        //
+        // Default: true
+        "background_load": true,
+        // Hard cap on the number of commits served from a single
+        // aggregated-log session. Above this the UI shows
+        // "Showing first N commits, narrow filters to see older history"
+        // and stops paginating. Protects against pathological scrolls
+        // when one member has 100k+ commits.
+        //
+        // Default: 50000
+        "max_total_commits": 50000,
+      },
+      "ai_cherry_pick_suggest": {
+        // Run cross-member cherry-pick analysis in the background on a
+        // daily cadence (and at every Fetch All). Off by default — every
+        // run consumes AI tokens, so the manual-trigger path
+        // (`solution: suggest cherry-picks across members`) is the
+        // recommended entry point.
+        //
+        // Default: false
+        "background": false,
+        // Hard cap on estimated tokens consumed per analyze run.
+        // ~$0.10 / Solution on typical Claude pricing. Above this the
+        // analyzer stops early and the dashboard shows "budget
+        // exhausted, processed N pairs of M".
+        //
+        // Default: 25000
+        "token_budget": 25000,
+      },
+    },
+  },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.
     "button": true,
@@ -940,10 +997,22 @@
     // Default width of the collaboration panel.
     "default_width": 240,
   },
+  "console_panel": {
+    // Where to dock the console panel. Can be 'left', 'bottom', or 'right'.
+    "default_position": "bottom",
+    // Default width of the console panel when docked left or right.
+    "default_width": 360,
+    // Default height of the console panel when docked bottom.
+    "default_height": 240,
+    // Whether to show the console panel button in the status bar.
+    "button_visible": true,
+  },
   "git_panel": {
     // Whether to show the git panel button in the status bar.
     "button": true,
-    // Where to dock the git panel. Can be 'left' or 'right'.
+    // Where to dock the git panel (the commit / changed-files list). Can
+    // be 'left' or 'right'. The git *graph* (commit log) is a separate
+    // bottom-docked panel.
     "dock": "right",
     // Default width of the git panel.
     "default_width": 360,
@@ -998,8 +1067,65 @@
     // Maximum length of the commit message title before a warning is shown.
     // Set to 0 to disable.
     //
+<<<<<<< ours
     // Default: 0
     "commit_title_max_length": 0,
+=======
+    // Default: 72
+    "commit_title_max_length": 72,
+    // Commit-view (S-DET) options.
+    "commit_view": {
+      // Fetch Gravatar avatars for commit authors. Off by default to avoid
+      // leaking the author email hash to a third party without consent.
+      "fetch_avatars": false,
+      // Threshold for lazy-loading affected files in the commit view. Commits
+      // with more files than this render the first 100 and expose a "Load
+      // more" button + fuzzy filter.
+      "affected_files_lazy_threshold": 500,
+      // Whether to parse `#1234` and `[ABC-123]` references in the commit
+      // message and render them as clickable mentions. URLs are always parsed.
+      "parse_issue_references": true,
+    },
+    // Interactive-rebase (S-IRB) options.
+    "interactive_rebase": {
+      // When true, the `editor.git.interactive_rebase` MCP tool accepts
+      // `exec` actions in the todo list. Off by default — prevents a
+      // subagent with the `Destructive` capability from running arbitrary
+      // shell commands through `git rebase exec`.
+      "allow_exec_via_mcp": false,
+    },
+    // Show-at-revision (S-SAR) options.
+    "show_at_revision": {
+      // Snapshot worktrees created by `git: show repository at revision`
+      // live under `<temp_dir>/worktrees/`. Anything older than this
+      // many hours is removed at editor startup with
+      // `git worktree remove --force`. Covers the case where spk-editor
+      // crashed before the on-close cleanup could run.
+      //
+      // Default: 24
+      "cleanup_orphans_older_than_h": 24,
+    },
+    // Pre-commit checks (S-PCH-HK). When true, the commit panel exposes
+    // the "Run pre-commit hook" checkbox; when ticked, spk-editor runs
+    // `<repo>/.git/hooks/pre-commit` itself and then issues
+    // `git commit --no-verify` to avoid double-execution. When false the
+    // checkbox is hidden and git itself runs the hook (same behavior as
+    // without our UI).
+    //
+    // Default: true
+    "run_pre_commit_hooks_in_panel": true,
+    // Commit-explanation cache (S-AI-EXP). The Explain button in the
+    // commit detail view caches the AI-generated 2-3 sentence summary
+    // under `<temp_dir>/commit_explanations/<repo-hash>/<sha>.txt`.
+    // `0` disables caching (the agent runs on every click). At startup
+    // anything older than `2 * cache_ttl_days` is swept; live reads
+    // also drop entries older than `cache_ttl_days` themselves, so a
+    // stale entry that survives cleanup just gets re-generated.
+    "commit_explanations": {
+      // Default: 7
+      "cache_ttl_days": 7,
+    },
+>>>>>>> theirs
   },
   "message_editor": {
     // Whether to automatically replace emoji shortcodes with emoji characters.
@@ -1231,6 +1357,19 @@
     //
     // Default: true
     "show_merge_conflict_indicator": true,
+    // Seconds of file inactivity before a managed (background) agent
+    // is considered dead. Once the agent's JSONL hasn't been written to
+    // for this long, its pill in the subagent strip renders in the
+    // dead (red) state.
+    //
+    // Default: 120
+    "managed_agent_stale_timeout_secs": 120,
+    // Seconds a dead managed-agent pill lingers in the subagent strip
+    // before auto-disappearing. User can dismiss earlier via the ×
+    // button on the dead pill.
+    //
+    // Default: 300
+    "managed_agent_dead_linger_secs": 300,
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,
@@ -1279,7 +1418,9 @@
   //     "autosave": "on_focus_change",
   // 4. Save when idle for a certain amount of time:
   //     "autosave": { "after_delay": {"milliseconds": 500} },
-  "autosave": "off",
+  // SPK Editor fork: default to IDEA-style autosave (save a buffer when focus
+  // leaves it). Set to "off" to restore upstream Zed's manual-save default.
+  "autosave": "on_focus_change",
   // Maximum number of tabs per pane. Unset for unlimited.
   "max_tabs": null,
   // Settings related to the editor's tab bar.
@@ -1492,12 +1633,16 @@
   // Control what info is collected by Zed.
   "telemetry": {
     // Send debug info like crash reports.
-    "diagnostics": true,
+    "diagnostics": false,
     // Send anonymized usage data like what languages you're using Zed with.
+<<<<<<< ours
     "metrics": true,
     // Allow sending requests to Anthropic models that cannot be offered with
     // Zero Data Retention
     "anthropic_retention": false,
+=======
+    "metrics": false,
+>>>>>>> theirs
   },
   // Whether to disable all AI features in Zed.
   //
@@ -1613,8 +1758,10 @@
     "gutter_debounce": 0,
     // Control whether the git blame information is shown inline,
     // in the currently focused line.
+    // SPK fork: off by default — the inline annotation is noisy on every
+    // line; users who want it can flip this to `true`.
     "inline_blame": {
-      "enabled": true,
+      "enabled": false,
       // Sets a delay after which the inline blame information is shown.
       // Delay is restarted with every cursor movement.
       "delay_ms": 0,
@@ -1665,6 +1812,15 @@
     //
     // Trailing slashes are ignored.
     "worktree_directory": "../worktrees",
+    // Git Log graph view settings.
+    "log": {
+      // When a commit has more refs than this threshold, the trailing
+      // chips collapse into a "+N" badge. Set to a high number (e.g.
+      // 1000) to effectively disable compaction.
+      //
+      // Default: 2
+      "compact_refs_threshold": 2
+    }
   },
   // The list of custom Git hosting providers.
   "git_hosting_providers": [
@@ -1684,7 +1840,9 @@
   "load_direnv": "direct",
   "edit_predictions": {
     // Which edit prediction provider to use.
-    "provider": "zed",
+    // spk-editor disables the "zed" (Zeta) provider since it requires a Zed account.
+    // Set to "copilot", "codestral", "ollama", "open_ai_compatible_api", or "mercury" to opt in.
+    "provider": "none",
     // A list of globs representing files that edit predictions should be disabled for.
     // There's a sensible default list of globs already included.
     // Any addition to this list will be merged with the default list.
@@ -1698,7 +1856,7 @@
       "**/*.crt",
       "**/.dev.vars",
       "**/secrets.yml",
-      "**/.zed/settings.json", // zed project settings
+      "**/.spke/settings.json", // spk-editor project settings
       "/**/zed/settings.json", // zed user settings
       "/**/zed/keymap.json",
     ],
@@ -1763,7 +1921,7 @@
     // Whether to show the status bar.
     "experimental.show": true,
     // Whether to show the name of the active file in the status bar.
-    "show_active_file": false,
+    "show_active_file": true,
     // Whether to show the active language button in the status bar.
     "active_language_button": true,
     // Whether to show the cursor position button in the status bar.
@@ -1790,8 +1948,6 @@
     //         }
     //     }
     "shell": "system",
-    // Where to dock terminals panel. Can be `left`, `right`, `bottom`.
-    "dock": "bottom",
     // Whether the terminal panel should use flexible (proportional) sizing.
     //
     // Default: true
@@ -2043,7 +2199,7 @@
   //
   "file_types": {
     "JSONC": [
-      "**/.zed/*.json",
+      "**/.spke/*.json",
       "**/.vscode/**/*.json",
       "**/{zed,Zed}/{settings,keymap,tasks,debug}.json",
       "tsconfig*.json",
@@ -2073,6 +2229,11 @@
   // and change the value to `false`.
   "auto_install_extensions": {
     "html": true,
+    // SPK Editor: bundled by default so a fresh install lands on colored
+    // file/folder icons (the upstream "Zed (Default)" theme is monochrome,
+    // which makes the project tree feel grey vs IDEA's coloured one). The
+    // matching default lives at the top of this file: "icon_theme": "Material Icon Theme".
+    "material-icon-theme": true,
   },
   // The capabilities granted to extensions.
   //
@@ -2676,7 +2837,28 @@
   // Configures context servers for use by the agent.
   "context_servers": {},
   // Configures agent servers available in the agent panel.
-  "agent_servers": {},
+  // SPK Editor: claude-acp pre-configured as a Custom agent that runs the
+  // official ACP wrapper directly via npx, bypassing the async registry
+  // fetch + binary-download dance. Without this entry, the solution_agent
+  // navigator's "+ New Claude Session" button errors with "Custom agent
+  // server `claude-acp` is not registered" because upstream's default
+  // `agent_servers` is empty.
+  //
+  // Custom (with explicit `command`) is preferred over `{"type":"registry"}`
+  // here for two reasons:
+  // 1. Registry agents only register once `AgentRegistryStore` finishes its
+  //    HTTP fetch from cdn.agentclientprotocol.com, which is async and racy
+  //    with first-launch session creation.
+  // 2. Auth is the user's existing `claude` CLI subscription (FORK.md §8 —
+  //    AI auth via CLI, NOT API keys). The ACP wrapper just shells out to
+  //    `claude` so the local install is the source of truth either way.
+  "agent_servers": {
+    "claude-acp": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["@agentclientprotocol/claude-agent-acp@latest"],
+    },
+  },
   "debugger": {
     "stepping_granularity": "line",
     "save_breakpoints": true,

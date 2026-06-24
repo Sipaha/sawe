@@ -16,33 +16,23 @@ actions!(
     ]
 );
 
-const ZED_REPO_URL: &str = "https://github.com/zed-industries/zed";
+const ZED_REPO_URL: &str = "https://github.com/Sipaha/spk-editor";
 
-const REQUEST_FEATURE_URL: &str = "https://github.com/zed-industries/zed/discussions/new/choose";
+const REQUEST_FEATURE_URL: &str = "https://github.com/Sipaha/spk-editor/discussions/new/choose";
 
 fn file_bug_report_url(specs: &SystemSpecs) -> String {
     format!(
         concat!(
-            "https://github.com/zed-industries/zed/issues/new",
+            "https://github.com/Sipaha/spk-editor/issues/new",
             "?",
-            "template=10_bug_report.yml",
-            "&",
             "environment={}"
         ),
         urlencoding::encode(&specs.to_string())
     )
 }
 
-fn email_zed_url(specs: &SystemSpecs) -> String {
-    format!(
-        concat!("mailto:hi@zed.dev", "?", "body={}"),
-        email_body(specs)
-    )
-}
-
-fn email_body(specs: &SystemSpecs) -> String {
-    let body = format!("\n\nSystem Information:\n\n{}", specs);
-    urlencoding::encode(&body).to_string()
+fn email_zed_url(_specs: &SystemSpecs) -> String {
+    "https://github.com/Sipaha/spk-editor/issues/new".to_string()
 }
 
 pub fn init(cx: &mut App) {

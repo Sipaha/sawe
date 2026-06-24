@@ -85,6 +85,7 @@ use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+<<<<<<< ours
 fn build_application() -> Application {
     let platform = gpui_platform::current_platform(false);
     if std::env::var("ZED_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
@@ -96,6 +97,10 @@ fn build_application() -> Application {
 
 fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
     let message = "Zed failed to launch";
+=======
+fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>, headless: bool) {
+    let message = "SPK Editor failed to launch";
+>>>>>>> theirs
     let error_details = errors
         .into_iter()
         .flat_map(|(kind, paths)| {
@@ -122,7 +127,17 @@ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
         .collect::<Vec<_>>().join("\n\n");
 
     eprintln!("{message}: {error_details}");
+<<<<<<< ours
     build_application()
+=======
+    // In headless mode there's no display to put a prompt window on, so the
+    // launch-failure path just printed-and-exits. The full prompt path stays
+    // on the on-screen platform.
+    if headless {
+        return;
+    }
+    Application::with_platform(gpui_platform::current_platform(false))
+>>>>>>> theirs
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             if let Ok(window) = cx.open_window(gpui::WindowOptions::default(), |_, cx| {
@@ -157,7 +172,7 @@ fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncApp) {
 
 fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
     eprintln!(
-        "Zed failed to open a window: {e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
+        "SPK Editor failed to open a window: {e:?}. See https://github.com/Sipaha/spk-editor for troubleshooting."
     );
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
@@ -177,7 +192,7 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
             proxy
                 .add_notification(
                     notification_id,
-                    Notification::new("Zed failed to launch")
+                    Notification::new("SPK Editor failed to launch")
                         .body(Some(
                             format!(
                                 "{e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
@@ -244,6 +259,49 @@ fn main() {
         return;
     }
 
+<<<<<<< ours
+=======
+    // `zed --nc` Makes zed operate in nc/netcat mode for use with MCP
+    if let Some(socket) = &args.nc {
+        match nc::main(socket) {
+            Ok(()) => return,
+            Err(err) => {
+                eprintln!("Error: {}", err);
+                process::exit(1);
+            }
+        }
+    }
+
+    // `spk-editor --git-rebase-helper <todo-path>` runs as `GIT_SEQUENCE_EDITOR`
+    // during programmatic interactive rebase (S-RBL). The implementation lives
+    // in `git::operations::helpers` so it can be exercised by unit tests
+    // without GPUI init. Exits directly without booting the editor — `git`
+    // invokes the helper many times per rebase and a heavyweight cold start
+    // would noticeably slow down each pause.
+    if let Some(todo_path) = &args.git_rebase_helper {
+        match git::operations::helpers::rebase_helper_main(todo_path) {
+            Ok(()) => process::exit(0),
+            Err(err) => {
+                eprintln!("--git-rebase-helper: {err}");
+                process::exit(1);
+            }
+        }
+    }
+
+    // `spk-editor --git-message-set <token>` runs as an `exec` step inside an
+    // interactive rebase to swap in a pre-staged commit message via
+    // `git commit --amend -F`.
+    if let Some(token) = &args.git_message_set {
+        match git::operations::helpers::message_set_main(token) {
+            Ok(()) => process::exit(0),
+            Err(err) => {
+                eprintln!("--git-message-set: {err}");
+                process::exit(1);
+            }
+        }
+    }
+
+>>>>>>> theirs
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
     unsafe {
         use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
@@ -282,11 +340,37 @@ fn main() {
 
     let file_errors = init_paths();
     if !file_errors.is_empty() {
-        files_not_created_on_launch(file_errors);
+        files_not_created_on_launch(file_errors, args.headless);
         return;
     }
 
     zlog::init();
+
+    // Best-effort cleanup of stale `git rebase` helper session directories
+    // (P-11 § orphan cleanup, S-RBL). Sessions are short-lived; anything
+    // older than an hour belongs to a crashed previous run.
+    git::operations::rebase::cleanup_orphan_sessions();
+
+    // Best-effort cleanup of stale snapshot worktrees from previous
+    // editor runs that crashed before the on-close handler could run
+    // (S-SAR § orphan cleanup). The TTL is configurable via
+    // `git_panel.show_at_revision.cleanup_orphans_older_than_h` —
+    // we use the default here because the settings store isn't
+    // initialised yet at this point in main; the user-facing setting
+    // applies on the *next* startup after the user changes it, which
+    // matches the existing pattern for the rebase helper cleanup.
+    git_ui::handlers::show_at_revision::cleanup_orphan_worktrees(
+        git_ui::handlers::show_at_revision::DEFAULT_CLEANUP_ORPHANS_OLDER_THAN_H,
+    );
+
+    // Best-effort cleanup of expired commit-explanation cache files
+    // (S-AI-EXP). The settings store is not yet initialised at this
+    // point in main, so we use the compile-time default. Anything
+    // older than `2 * cache_ttl_days` is removed; live reads still
+    // gate stale entries against the user-configured TTL.
+    git_ui::commit_view::ai_explain::cleanup_expired(
+        git_ui::commit_view::ai_explain::DEFAULT_CACHE_TTL_DAYS,
+    );
 
     if stdout_is_a_pty() {
         zlog::init_output_stdout();
@@ -312,7 +396,7 @@ fn main() {
             client::telemetry::os_name(),
             client::telemetry::os_version(),
         );
-        println!("Zed System Specs (from CLI):\n{}", system_specs);
+        println!("SPK Editor System Specs (from CLI):\n{}", system_specs);
         return;
     }
 
@@ -333,10 +417,53 @@ fn main() {
             .unwrap_or("unknown"),
     );
 
+    // Single-instance handoff: if another spk-editor is already running and
+    // its MCP server is reachable, hand off our CLI paths to it and exit.
+    // Otherwise we continue and become the canonical instance (later we'll
+    // bind the MCP server in `editor_mcp::start_server`).
+    let handoff_paths: Vec<PathBuf> = args
+        .paths_or_urls
+        .iter()
+        .filter_map(|arg| {
+            if is_url_scheme(arg) {
+                None
+            } else {
+                Some(PathBuf::from(arg))
+            }
+        })
+        .collect();
+    match editor_mcp::try_handoff_to_existing_instance(handoff_paths) {
+        Ok(editor_mcp::HandoffOutcome::HandedOff { focused_window_id }) => {
+            log::info!(
+                "spk-editor: handed off to existing instance (window: {:?})",
+                focused_window_id
+            );
+            return;
+        }
+        Ok(editor_mcp::HandoffOutcome::LockBusyButUnreachable { lockholder_pid }) => {
+            eprintln!(
+                "Another spk-editor instance is starting (lock held by PID {:?}); please wait or terminate it.",
+                lockholder_pid
+            );
+            process::exit(1);
+        }
+        Ok(editor_mcp::HandoffOutcome::BecameCanonical) => {
+            // Continue normal startup; we'll bind the MCP server later.
+        }
+        Err(err) => {
+            log::warn!("spk-editor: handoff probe failed: {err}; continuing as canonical");
+        }
+    }
+
     #[cfg(windows)]
     check_for_conpty_dll();
 
+<<<<<<< ours
     let app = build_application().with_assets(Assets);
+=======
+    let app = Application::with_platform(gpui_platform::current_platform(args.headless))
+        .with_assets(Assets);
+>>>>>>> theirs
 
     let app_db = db::AppDatabase::new();
     let system_id = app.background_executor().spawn(system_id());
@@ -349,6 +476,31 @@ fn main() {
         KeyValueStore::from_app_db(&app_db),
     ));
     let background_executor = app.background_executor();
+<<<<<<< ours
+=======
+    crashes::init(
+        InitCrashHandler {
+            session_id,
+            // strip the build and channel information from the version string, we send them separately
+            zed_version: semver::Version::new(
+                app_version.major,
+                app_version.minor,
+                app_version.patch,
+            )
+            .to_string(),
+            binary: "zed".to_string(),
+            release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
+            commit_sha: app_commit_sha
+                .as_ref()
+                .map(|sha| sha.full())
+                .unwrap_or_else(|| "no sha".to_owned()),
+        },
+        |task| {
+            app.background_executor().spawn(task).detach();
+        },
+        move |duration| background_executor.timer(duration),
+    );
+>>>>>>> theirs
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
@@ -374,7 +526,7 @@ fn main() {
         }
     };
     if failed_single_instance_check {
-        println!("zed is already running");
+        println!("spk-editor is already running");
         return;
     }
 
@@ -476,6 +628,16 @@ fn main() {
 
     app.run(move |cx| {
         cx.set_global(app_db);
+        // Cache `ThreadSafeConnection` handles for sync stores that don't have
+        // `cx` at their call sites (background-thread git operations,
+        // pre-commit checks, etc.). Each call clones an `Arc`-backed handle
+        // out of the per-App `AppDatabase` global into a module-local
+        // `OnceLock` so the public sync APIs (`record`, `list`, etc.) can
+        // resolve a connection without taking `&App`.
+        git::undo_registry::init(cx);
+        git::operations::shelf::init(cx);
+        git_ui::branch_picker::favorites::init(cx);
+        git_ui::pre_commit::init(cx);
         let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
             Ok(trusted_paths) => trusted_paths,
             Err(e) => {
@@ -498,7 +660,7 @@ fn main() {
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
 
         let user_agent = format!(
-            "Zed/{} ({}; {})",
+            "SPK-Editor/{} ({}; {})",
             AppVersion::global(cx),
             std::env::consts::OS,
             std::env::consts::ARCH
@@ -652,9 +814,11 @@ fn main() {
         });
         AppState::set_global(app_state.clone(), cx);
 
-        auto_update::init(client.clone(), cx);
+        // Auto-update disabled in spk-editor: no upstream channel, builds from source.
+        // auto_update::init(client.clone(), cx);
         dap_adapters::init(cx);
-        auto_update_ui::init(cx);
+        // Auto-update UI disabled in spk-editor: no upstream channel, builds from source.
+        // auto_update_ui::init(cx);
         reliability::init(client.clone(), cx);
         extension_host::init(
             extension_host_proxy.clone(),
@@ -672,6 +836,27 @@ fn main() {
             cx.background_executor().clone(),
         );
         command_palette::init(cx);
+        solutions::init(cx);
+        editor_mcp::init(cx);
+        solution_agent::init(cx);
+        workspace_events::init(cx);
+        solution_git::init(cx);
+        solutions_ui::init(cx);
+        run_config::init(cx);
+        run_config_ui::init(cx);
+        remote_control::init(cx);
+        // Wire solution_agent's binary-frame dispatch into remote_control's
+        // listener — this is the third-party site where both crates'
+        // public surfaces meet so neither has to dep on the other. The
+        // listener fires this callback on every authenticated WS binary
+        // frame; the closure parses the 16-byte upload header + writes
+        // to UploadManager. See remote_control::BinaryFrameHandler and
+        // docs/plans/2026-05-19-chunked-upload-binary-frames.md.
+        remote_control::set_binary_frame_handler(std::sync::Arc::new(|bytes: &[u8]| {
+            solution_agent::upload::dispatch_binary_frame(bytes)
+        }));
+        remote_control_ui::init(cx);
+        git_conflict_ui::init(cx);
         let copilot_chat_configuration = copilot_chat::CopilotChatConfiguration {
             enterprise_uri: language::language_settings::all_language_settings(None, cx)
                 .edit_predictions
@@ -755,6 +940,7 @@ fn main() {
         });
         vim::init(cx);
         terminal_view::init(cx);
+        console_panel::init(cx);
         journal::init(app_state.clone(), cx);
         encoding_selector::init(cx);
         language_selector::init(cx);
@@ -765,7 +951,11 @@ fn main() {
         language_tools::init(cx);
         call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-        collab_ui::init(&app_state, cx);
+        // Collab is disabled in spk-editor (no Zed Industries collab server access).
+        // collab_ui::init(&app_state, cx);
+        // title_bar::init was nested inside collab_ui::init upstream; call it directly
+        // since it has nothing to do with collab and is required for window decorations.
+        title_bar::init(cx);
         git_ui::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
@@ -917,6 +1107,12 @@ fn main() {
             )
         };
 
+        // `--solution <name-or-id>` short-circuits the normal restore /
+        // welcome flow: resolve the solution from the global SolutionStore
+        // (initialised earlier in `solutions::init`) and open its members
+        // directly. Falls through to the standard path on lookup failure
+        // so the user sees the welcome screen and gets a hint via log.
+        let solution_arg = args.solution.clone();
         let restore_task = match open_rx
             .try_recv()
             .ok()
@@ -937,6 +1133,14 @@ fn main() {
             None => cx.spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
+                    if let Some(name_or_id) = solution_arg
+                        && open_solution_by_name_or_id(&name_or_id, app_state.clone(), cx)
+                            .await
+                            .log_err()
+                            .unwrap_or(false)
+                    {
+                        return;
+                    }
                     if let Err(e) = restore_or_create_workspace(app_state, cx).await {
                         fail_to_open_window_async(e, cx)
                     }
@@ -973,6 +1177,8 @@ fn main() {
             }
         })
         .detach();
+
+        editor_mcp::start_server(cx).log_err();
     });
 }
 
@@ -1490,11 +1696,109 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
     Ok(IdType::New(installation_id))
 }
 
+/// Resolve a Solution by either its `name` or `id` slug, then open its
+/// member worktrees in a new workspace window. Empty solutions get the
+/// `EmptySolutionPage` placeholder so the user lands somewhere actionable
+/// instead of an empty pane.
+///
+/// Returns `Ok(true)` when the lookup succeeded and a window opened,
+/// `Ok(false)` when no solution matched (caller should fall back to the
+/// normal restore-or-welcome flow), and `Err(_)` for unrecoverable
+/// failures (no SolutionStore initialised, IO errors during open_paths).
+async fn open_solution_by_name_or_id(
+    name_or_id: &str,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<bool> {
+    use solutions::{SolutionId, SolutionStore};
+
+    struct Resolved {
+        id: SolutionId,
+        paths: Vec<PathBuf>,
+        name: String,
+        is_empty: bool,
+    }
+
+    let resolved: Option<Resolved> = cx.update(|cx| -> Result<Option<Resolved>> {
+        let Some(store) = SolutionStore::try_global(cx) else {
+            return Ok(None);
+        };
+        store.read_with(cx, |s, _| {
+            let Some(sol) = s
+                .solutions()
+                .iter()
+                .find(|sol| sol.id.0 == name_or_id || sol.name == name_or_id)
+            else {
+                return Ok::<_, anyhow::Error>(None);
+            };
+            let is_empty = sol.members.is_empty();
+            let paths = if is_empty {
+                vec![sol.root.clone()]
+            } else {
+                s.paths_for_open(&sol.id)?
+            };
+            Ok(Some(Resolved {
+                id: sol.id.clone(),
+                paths,
+                name: sol.name.clone(),
+                is_empty,
+            }))
+        })
+    })?;
+
+    let Some(resolved) = resolved else {
+        log::warn!(
+            "spk-editor: --solution {name_or_id:?} not found in solutions.json; falling back to welcome"
+        );
+        return Ok(false);
+    };
+
+    cx.update(|cx| {
+        if let Some(store) = SolutionStore::try_global(cx) {
+            store
+                .update(cx, |s, cx| s.touch_last_opened(&resolved.id, cx))
+                .log_err();
+        }
+    });
+
+    let mut options = workspace::OpenOptions::default();
+    options.open_mode = workspace::OpenMode::NewWindow;
+    let task =
+        cx.update(|cx| workspace::open_paths(&resolved.paths, app_state.clone(), options, cx));
+    let opened = task.await?;
+
+    if resolved.is_empty {
+        let sol_id = resolved.id.clone();
+        let name = resolved.name.clone();
+        cx.update(|cx| {
+            opened
+                .window
+                .update(cx, |multi_workspace, window, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    let weak_workspace = workspace.downgrade();
+                    workspace.update(cx, |ws, cx| {
+                        let page = cx.new(|cx| {
+                            solutions_ui::EmptySolutionPage::new(
+                                sol_id.clone(),
+                                name.clone(),
+                                weak_workspace,
+                                cx,
+                            )
+                        });
+                        ws.add_item_to_active_pane(Box::new(page), None, true, window, cx);
+                    });
+                })
+                .log_err();
+        });
+    }
+
+    Ok(true)
+}
+
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    let kvp = cx.update(|cx| KeyValueStore::global(cx));
     if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
         let mut error_count = 0;
         for multi_workspace in multi_workspaces {
@@ -1618,6 +1922,7 @@ pub(crate) async fn restore_or_create_workspace(
                             _ => {
                                 Editor::new_file(workspace, &Default::default(), window, cx);
                             }
+<<<<<<< ours
                         }
                     },
                 )
@@ -1638,12 +1943,24 @@ pub(crate) async fn restore_or_create_workspace(
                         workspace::RestoreOnStartupBehavior::Launchpad => {}
                         _ => {
                             Editor::new_file(workspace, &Default::default(), window, cx);
+=======
+>>>>>>> theirs
                         }
-                    }
-                },
-            )
-        })
-        .await?;
+                    },
+                )
+            })
+            .await?;
+        }
+    } else {
+        // SPK fork: Welcome is the launcher for every cold launch, not
+        // just the very first one. Upstream's `FIRST_OPEN` gate split
+        // the flow into "show onboarding once, then open an empty
+        // workspace forever after"; with Solutions as the project model
+        // an empty workspace is meaningless, so we always send the
+        // user to the Welcome window where they can pick or create a
+        // Solution.
+        let _ = FIRST_OPEN;
+        cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
     }
 
     Ok(())
@@ -1759,15 +2076,27 @@ fn stdout_is_a_pty() -> bool {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "zed", disable_version_flag = true, max_term_width = 100)]
+#[command(name = "spk-editor", disable_version_flag = true, max_term_width = 100)]
 struct Args {
     /// A sequence of space-separated paths or urls that you want to open.
     ///
     /// Use `path:line:row` syntax to open a file at a specific location.
     /// Non-existing paths and directories will ignore `:line:row` suffix.
     ///
-    /// URLs can either be `file://` or `zed://` scheme, or relative to <https://zed.dev>.
+    /// URLs can either be `file://` or `spk-editor://` scheme.
     paths_or_urls: Vec<String>,
+
+    /// Open a Solution by name or id and skip the Welcome screen.
+    ///
+    /// Looks up the named entry in `~/.config/spk-editor/solutions.json`
+    /// (matching either the human-readable `name` or the slug `id`) and
+    /// opens its member worktrees in a new window. If the solution has no
+    /// members yet, the window opens at `solution.root` with the empty-
+    /// solution placeholder page so the user can add projects.
+    ///
+    /// Example: `spk-editor --solution probe-test`
+    #[arg(long, value_name = "NAME-OR-ID")]
+    solution: Option<String>,
 
     /// Pairs of file paths to diff. Can be specified multiple times.
     /// When directories are provided, recurses into them and shows all changed files in a single multi-diff view.
@@ -1777,14 +2106,14 @@ struct Args {
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     ///
     /// This overrides the default platform-specific data directory location.
-    /// On macOS, the default is `~/Library/Application Support/Zed`.
-    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/zed`.
-    /// On Windows, the default is `%LOCALAPPDATA%\Zed`.
+    /// On macOS, the default is `~/Library/Application Support/SpkEditor`.
+    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/spk-editor`.
+    /// On Windows, the default is `%LOCALAPPDATA%\SpkEditor`.
     #[arg(long, value_name = "DIR", verbatim_doc_comment)]
     user_data_dir: Option<String>,
 
     /// The username and WSL distribution to use when opening paths. If not specified,
-    /// Zed will attempt to open the paths directly.
+    /// SPK Editor will attempt to open the paths directly.
     ///
     /// The username is optional, and if not specified, the default user for the distribution
     /// will be used.
@@ -1803,24 +2132,61 @@ struct Args {
     #[arg(long)]
     dev_container: bool,
 
-    /// Instructs zed to run as a dev server on this machine. (not implemented)
+    /// Instructs spk-editor to run as a dev server on this machine. (not implemented)
     #[arg(long)]
     dev_server_token: Option<String>,
 
     /// Prints system specs.
     ///
     /// Useful for submitting issues on GitHub when encountering a bug that
-    /// prevents Zed from starting, so you can't run `zed: copy system specs to
+    /// prevents SPK Editor from starting, so you can't run `zed: copy system specs to
     /// clipboard`
     #[arg(long)]
     system_specs: bool,
 
+<<<<<<< ours
     /// Used for recording minidumps on crashes by having Zed run a separate
+=======
+    /// Used for the MCP Server, to remove the need for netcat as a dependency,
+    /// by having SPK Editor act like netcat communicating over a Unix socket.
+    #[arg(long, hide = true)]
+    nc: Option<String>,
+
+    /// Run the editor on the native headless GPUI platform — no X / Wayland
+    /// connection, no window on the user's desktop, all rendering through
+    /// the offscreen wgpu pipeline. Used by `script/run-mcp --headless` to
+    /// drive the editor autonomously over the MCP socket.
+    ///
+    /// `workspace.screenshot` still works in this mode (the offscreen
+    /// renderer captures rendered pixels into a PNG). UI dispatch via
+    /// `windows.dispatch_action` / `send_keystroke` / `send_text` /
+    /// `click_at` works identically to the on-screen platform.
+    ///
+    /// SPK fork addition (was Xvfb-wrapped before; see ADR-0002).
+    #[arg(long)]
+    headless: bool,
+
+    /// Used as `GIT_SEQUENCE_EDITOR` during programmatic interactive rebase.
+    /// Reads the pre-built todo from the session directory pointed to by
+    /// `SPK_GIT_HELPER_SESSION` and overwrites the path passed by `git`.
+    /// See plan task S-RBL.
+    #[arg(long, hide = true)]
+    git_rebase_helper: Option<PathBuf>,
+
+    /// Used as `exec` step inside a programmatic interactive rebase.
+    /// Reads a pre-supplied commit message from the session directory
+    /// pointed to by `SPK_GIT_HELPER_SESSION` and runs
+    /// `git commit --amend -F <path>` in the rebase worktree. See plan task S-RBL.
+    #[arg(long, hide = true)]
+    git_message_set: Option<String>,
+
+    /// Used for recording minidumps on crashes by having SPK Editor run a separate
+>>>>>>> theirs
     /// process communicating over a socket.
     #[arg(long, hide = true)]
     crash_handler: Option<PathBuf>,
 
-    /// Run zed in the foreground, only used on Windows, to match the behavior on macOS.
+    /// Run spk-editor in the foreground, only used on Windows, to match the behavior on macOS.
     #[arg(long)]
     #[cfg(target_os = "windows")]
     #[arg(hide = true)]
@@ -1833,7 +2199,7 @@ struct Args {
     dock_action: Option<usize>,
 
     /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
-    /// by having Zed act like netcat communicating over a Unix socket.
+    /// by having SPK Editor act like netcat communicating over a Unix socket.
     #[arg(long)]
     #[cfg(not(target_os = "windows"))]
     #[arg(hide = true)]
@@ -1851,7 +2217,7 @@ struct Args {
     #[arg(long, hide = true)]
     record_etw_trace: bool,
 
-    /// The PID of the Zed process to trace for heap analysis.
+    /// The PID of the SPK Editor process to trace for heap analysis.
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true, allow_hyphen_values = true)]
     etw_zed_pid: Option<i64>,
@@ -1861,7 +2227,7 @@ struct Args {
     #[arg(long, hide = true)]
     etw_output: Option<PathBuf>,
 
-    /// Unix socket path for IPC with the parent Zed process.
+    /// Unix socket path for IPC with the parent SPK Editor process.
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true)]
     etw_socket: Option<String>,
@@ -1881,16 +2247,23 @@ impl ToString for IdType {
     }
 }
 
+/// Returns true if `arg` looks like a URL (any scheme this editor knows
+/// how to route via the URL handler). Path arguments must NOT match.
+/// Both single-instance handoff and CLI URL parsing rely on this, so a
+/// new scheme only needs to be added here.
+fn is_url_scheme(arg: &str) -> bool {
+    arg.starts_with("file://")
+        || arg.starts_with("zed://")
+        || arg.starts_with("zed-cli://")
+        || arg.starts_with("ssh://")
+        || arg.starts_with("spk-editor://")
+}
+
 fn parse_url_arg(arg: &str, cx: &App) -> String {
     match std::fs::canonicalize(Path::new(&arg)) {
         Ok(path) => format!("file://{}", path.display()),
         Err(_) => {
-            if arg.starts_with("file://")
-                || arg.starts_with("zed://")
-                || arg.starts_with("zed-cli://")
-                || arg.starts_with("ssh://")
-                || parse_zed_link(arg, cx).is_some()
-            {
+            if is_url_scheme(arg) || parse_zed_link(arg, cx).is_some() {
                 arg.into()
             } else {
                 format!("file://{arg}")

@@ -13,7 +13,10 @@ use dev_container::{
 };
 use editor::{Editor, EditorEvent};
 use extension_host::ExtensionStore;
+<<<<<<< ours
 use filter::{FilterData, FilteredServer};
+=======
+>>>>>>> theirs
 use futures::{FutureExt, StreamExt as _, channel::oneshot, future::Shared};
 use gpui::{
     Action, AnyElement, App, ClickEvent, ClipboardItem, Context, DismissEvent, Entity,
@@ -424,6 +427,8 @@ impl ProjectPicker {
                 connection_string: format!("mock-{}", options.id).into(),
                 nickname: None,
             },
+            #[cfg(not(any(test, feature = "test-support")))]
+            _ => unreachable!("Mock variant is only available in test/test-support"),
         };
         let _path_task = cx
             .spawn_in(window, {
@@ -2187,7 +2192,7 @@ impl RemoteServerProjects {
                                         .inset(true)
                                         .spacing(ui::ListItemSpacing::Sparse)
                                         .start_slot(Icon::new(IconName::File).color(Color::Muted))
-                                        .child(Label::new("Open Zed Log"))
+                                        .child(Label::new("Open SPK Editor Log"))
                                         .on_click(cx.listener(|_, _, window, cx| {
                                             window.dispatch_action(Box::new(OpenLog), cx);
                                             cx.emit(DismissEvent);

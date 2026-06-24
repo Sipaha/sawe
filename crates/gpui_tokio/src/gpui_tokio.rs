@@ -97,4 +97,11 @@ impl Tokio {
     pub fn handle(cx: &App) -> tokio::runtime::Handle {
         GlobalTokio::global(cx).handle.clone()
     }
+
+    /// Like `handle`, but returns `None` if the Tokio runtime global
+    /// hasn't been installed (e.g. a unit-test context that didn't call
+    /// `gpui_tokio::init`).
+    pub fn try_handle(cx: &App) -> Option<tokio::runtime::Handle> {
+        cx.try_global::<GlobalTokio>().map(|g| g.handle.clone())
+    }
 }

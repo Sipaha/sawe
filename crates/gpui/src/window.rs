@@ -62,9 +62,12 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 
+<<<<<<< ours
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
+=======
+>>>>>>> theirs
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -2233,7 +2236,10 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
+    ///
+    /// SPK fork: ungated (was `#[cfg(any(test, feature = "test-support"))]`) so the
+    /// `workspace.screenshot` MCP tool works in normal dev/release builds. Backends that
+    /// don't implement `PlatformWindow::render_to_image` still return an error.
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
@@ -4212,6 +4218,18 @@ impl Window {
         bounds
     }
 
+    /// Iterate over the hitboxes recorded during the most recently rendered
+    /// frame, in the order they were inserted (back-to-front in paint order).
+    ///
+    /// This is intended for introspection (e.g. the autonomous-testing MCP
+    /// tools that surface clickable regions to an agent); it does NOT include
+    /// hitboxes from the in-progress `next_frame`. The set is regenerated each
+    /// frame, so the returned [`HitboxId`]s are only stable within a single
+    /// rendered frame.
+    pub fn iter_hitboxes(&self) -> impl ExactSizeIterator<Item = &Hitbox> + '_ {
+        self.rendered_frame.hitboxes.iter()
+    }
+
     /// This method should be called during `prepaint`. You can use
     /// the returned [Hitbox] during `paint` or in an event handler
     /// to determine whether the inserted hitbox was the topmost.
@@ -5646,17 +5664,38 @@ impl Window {
         &mut self,
         hitbox_id: HitboxId,
         inspector_id: Option<&crate::InspectorElementId>,
-        cx: &App,
+        _cx: &App,
     ) {
         self.invalidator.debug_assert_paint_or_prepaint();
-        if !self.is_inspector_picking(cx) {
-            return;
-        }
+        // SPK fork: populate `inspector_hitboxes` unconditionally in debug
+        // builds (the cfg gate on this fn keeps it out of release). Upstream
+        // gated this on `is_inspector_picking` to keep the map empty unless
+        // the user opened the inspector — but `mcp::clickables` reads the
+        // same map to attach source-location labels to hitboxes so agents
+        // can identify what they're about to click without pixel-coordinate
+        // guesswork. Memory cost is per-element `InspectorElementId` entries
+        // (cleared at frame start); CPU is one FxHashMap insert per painted
+        // hitbox. See `workspace::mcp::clickables`.
         if let Some(inspector_id) = inspector_id {
             self.next_frame
                 .inspector_hitboxes
                 .insert(hitbox_id, inspector_id.clone());
         }
+    }
+
+    /// Look up the `InspectorElementId` (source-location-derived identifier)
+    /// for a hitbox painted in the last completed frame. Returns `None` if
+    /// the hitbox isn't tracked or if the build doesn't include inspector
+    /// support (`#[cfg(any(feature = "inspector", debug_assertions))]`).
+    ///
+    /// Used by `workspace::mcp::clickables` to attach human-readable labels
+    /// (`file:line`) to clickables in the MCP dump.
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub fn inspector_id_for_hitbox(
+        &self,
+        hitbox_id: HitboxId,
+    ) -> Option<&crate::InspectorElementId> {
+        self.rendered_frame.inspector_hitboxes.get(&hitbox_id)
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]

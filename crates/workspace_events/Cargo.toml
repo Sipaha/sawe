@@ -1,0 +1,52 @@
+[package]
+name = "workspace_events"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/workspace_events.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+
+# Added in Task A2 — required by emit_sequenced payload helpers
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Added in Task A3 — required by emit_sequenced calling into editor_mcp
+editor_mcp.workspace = true
+
+# Added in Task C — required by wire DTOs and tool input/output types
+chrono.workspace = true
+context_server.workspace = true
+schemars.workspace = true
+
+# Added in Task C/E — required by snapshot builder reading other stores
+solutions.workspace = true
+solution_agent.workspace = true
+
+# Added in Phase H — required by shutdown_agent_threads walking AcpThread entities
+acp_thread.workspace = true
+log.workspace = true
+
+# Required by workspace.open_solution to actually open the desktop window
+# (open_paths + AppState + OpenOptions live in `workspace`).
+workspace.workspace = true
+
+[dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
+editor_mcp.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+smol.workspace = true
+solution_agent = { workspace = true, features = ["test-support"] }
+solutions = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+tempfile.workspace = true

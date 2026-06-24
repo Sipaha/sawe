@@ -40,8 +40,13 @@ use ui_input::ErasedEditor;
 use util::ResultExt;
 use util::paths::PathExt;
 use workspace::{
+<<<<<<< ours
     CloseWindow, ModalView, PathList, RecentWorkspace, SerializedWorkspaceLocation, Workspace,
     WorkspaceDb, WorkspaceId,
+=======
+    CloseWindow, ModalView, PathList, SerializedWorkspaceLocation, Workspace, WorkspaceDb,
+    WorkspaceId, resolve_worktree_workspaces,
+>>>>>>> theirs
 };
 
 use zed_actions::agents_sidebar::FocusSidebarFilter;

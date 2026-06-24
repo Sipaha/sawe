@@ -387,7 +387,7 @@ pub mod feedback {
     actions!(
         feedback,
         [
-            /// Opens email client to send feedback to Zed support.
+            /// Opens GitHub to file an issue.
             EmailZed,
             /// Opens the bug report form.
             FileBugReport,

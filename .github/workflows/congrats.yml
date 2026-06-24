@@ -1,12 +1,11 @@
 name: Congratsbot
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   check-author:
-    if: ${{ github.repository_owner == 'zed-industries' }}
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     outputs:
       should_congratulate: ${{ steps.check.outputs.should_congratulate }}
@@ -56,7 +55,7 @@ jobs:
 
   congrats:
     needs: check-author
-    if: needs.check-author.outputs.should_congratulate == 'true'
+    if: false # spk-editor: not applicable
     uses: withastro/automation/.github/workflows/congratsbot.yml@a5bd0c5748c4d56e687cdd558064f9ee8adfb1f2 # main
     with:
       EMOJIS: 🎉,🎊,🧑‍🚀,🥳,🙌,🚀,🦀,🔥,🚢

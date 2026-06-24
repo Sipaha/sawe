@@ -103,6 +103,27 @@ pub trait AgentConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>>;
 
+    /// Create a new session and forward an `_meta` payload as part of
+    /// the underlying `NewSessionRequest`. The `_meta` field is the
+    /// ACP-defined extensibility channel — agents that understand
+    /// specific keys (e.g. `claude-agent-acp` reads `_meta.systemPrompt`
+    /// to seed Claude's system prompt for the session) act on it; agents
+    /// that don't ignore unknown keys per the protocol contract.
+    ///
+    /// Default impl drops `extra_meta` and falls back to `new_session`,
+    /// so adapters that don't speak `_meta` are unaffected. ACP-backed
+    /// connections override this to splice the map into the outbound
+    /// request alongside any meta they were already going to send.
+    fn new_session_with_meta(
+        self: Rc<Self>,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        _extra_meta: Option<acp::Meta>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.new_session(project, work_dirs, cx)
+    }
+
     /// Whether this agent supports loading existing sessions.
     fn supports_load_session(&self) -> bool {
         false
@@ -217,6 +238,19 @@ pub trait AgentConnection {
     /// If the agent does not support model selection, returns [None].
     /// This allows sharing the selector in UI components.
     fn model_selector(&self, _session_id: &acp::SessionId) -> Option<Rc<dyn AgentModelSelector>> {
+        None
+    }
+
+    /// The model id the agent has actually used on its most recent turn for
+    /// `session_id`. Live value — read on every status-row render. Returns
+    /// `None` before the first turn lands or when the connection doesn't
+    /// track the value at all. Implementations that DO track it (currently
+    /// only `claude_native`, which latches `message_start.model`) should
+    /// keep the read cheap (RefCell borrow + clone). Status surfaces prefer
+    /// this over `model_selector().selected_model()` because the selector
+    /// returns what the editor asked for; this returns what claude actually
+    /// used.
+    fn active_model(&self, _session_id: &acp::SessionId) -> Option<SharedString> {
         None
     }
 

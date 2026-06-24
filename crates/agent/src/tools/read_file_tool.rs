@@ -497,12 +497,20 @@ impl AgentTool for ReadFileTool {
                 }
                 if let Ok(LanguageModelToolResultContent::Text(text)) = &result {
                     let text: &str = text;
+<<<<<<< ours
                     // For outline responses, omit the path tag so the markdown renderer
                     // does not invoke tree-sitter syntax highlighting against pseudo-code
                     // outline text. The outline is not valid source for the file's language,
                     // so highlighting would be both expensive and incorrect.
                     let tag: &str = if is_outline_response { "" } else { &input.path };
                     let markdown = MarkdownCodeBlock { tag, text }.to_string();
+=======
+                    let markdown = MarkdownCodeBlock {
+                        tag: &input.path,
+                        text,
+                    }
+                    .to_string();
+>>>>>>> theirs
                     event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
                         acp::ToolCallContent::Content(acp::Content::new(markdown)),
                     ]));
@@ -1320,7 +1328,7 @@ mod test {
                     "test.rs": "mod tests { fn test_it() {} }",
                     "fixture.sql": "CREATE TABLE users (id INT, name VARCHAR(255));"
                 },
-                ".zed": {
+                ".spke": {
                     "settings.json": r#"{
                         "file_scan_exclusions": ["**/fixture.*"],
                         "private_files": ["**/secret.rs", "**/config.toml"]
@@ -1343,7 +1351,7 @@ mod test {
                     "README.md": "# Public Documentation",
                     "internal.md": "# Internal Secrets and Configuration"
                 },
-                ".zed": {
+                ".spke": {
                     "settings.json": r#"{
                         "file_scan_exclusions": ["**/internal.*"],
                         "private_files": ["**/private.js", "**/data.json"]

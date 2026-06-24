@@ -15,8 +15,6 @@
 name: Hotfix Review Monitor
 
 on:
-  schedule:
-    - cron: "30 13 * * 1-5" # 1:30 PM UTC weekdays
   workflow_dispatch: {}
 
 permissions:
@@ -25,7 +23,7 @@ permissions:
 
 jobs:
   check-hotfix-reviews:
-    if: github.repository_owner == 'zed-industries'
+    if: false # spk-editor: not applicable
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:

@@ -102,7 +102,10 @@ impl AgentDiffPane {
             );
             diff_display_editor
                 .set_render_diff_hunk_controls(diff_hunk_controls(&thread, workspace.clone()), cx);
+<<<<<<< ours
             diff_display_editor.set_render_diff_hunks_as_unstaged(cx);
+=======
+>>>>>>> theirs
             diff_display_editor.update_editors(cx, |editor, _cx| {
                 editor.register_addon(AgentDiffAddon);
             });
@@ -565,10 +568,13 @@ impl Item for AgentDiffPane {
             .read(cx)
             .rhs_editor()
             .for_each_project_item(cx, f)
+<<<<<<< ours
     }
 
     fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
         self.editor.read(cx).active_project_path(cx)
+=======
+>>>>>>> theirs
     }
 
     fn set_nav_history(

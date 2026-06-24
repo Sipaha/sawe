@@ -1,6 +1,9 @@
 use super::tool_permissions::{
     authorize_symlink_escapes, canonicalize_worktree_roots, collect_symlink_escapes,
+<<<<<<< ours
     resolve_creatable_global_skill_descendant_path, resolve_global_skill_descendant_path,
+=======
+>>>>>>> theirs
     sensitive_settings_kind,
 };
 use crate::{

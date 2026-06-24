@@ -195,6 +195,7 @@ impl MentionSet {
         self.mentions.get(crease_id).map(|(uri, _)| uri.clone())
     }
 
+<<<<<<< ours
     /// Returns the resolved mention for a crease, if any.
     pub fn resolved_mention_for_crease(
         &self,
@@ -205,6 +206,8 @@ impl MentionSet {
         Some((uri.clone(), mention))
     }
 
+=======
+>>>>>>> theirs
     pub fn set_mentions(&mut self, mentions: HashMap<CreaseId, (MentionUri, MentionTask)>) {
         self.crease_entities
             .retain(|id, _| mentions.contains_key(id));
@@ -216,6 +219,7 @@ impl MentionSet {
         self.mentions.drain()
     }
 
+<<<<<<< ours
     fn recompute_disambiguation(&self, cx: &mut App) {
         let labels =
             compute_disambiguated_labels(self.mentions.iter().map(|(id, (uri, _))| (*id, uri)));
@@ -232,6 +236,8 @@ impl MentionSet {
         }
     }
 
+=======
+>>>>>>> theirs
     pub fn confirm_mention_completion(
         &mut self,
         crease_text: SharedString,

@@ -100,10 +100,10 @@ function GenerateLicenses {
 }
 
 function BuildZedAndItsFriends {
-    Write-Output "Building Zed and its friends, for channel: $channel"
-    # Build zed.exe, cli.exe and auto_update_helper.exe
+    Write-Output "Building SPK Editor and its friends, for channel: $channel"
+    # Build spk-editor.exe, cli.exe and auto_update_helper.exe
     cargo build --release --package zed --package cli --package auto_update_helper --target $target
-    Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
+    Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\spk-editor.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
@@ -128,7 +128,7 @@ function BuildRemoteServer {
     # Create zipped remote server binary
     $remoteServerSrc = (Resolve-Path ".\$CargoOutDir\remote_server.exe").Path
 
-    if ($env:CI) {
+    if ($env:CI -and $env:SPK_EDITOR_SIGN) {
         Write-Output "Code signing remote_server.exe"
         & "$innoDir\sign.ps1" $remoteServerSrc
     }
@@ -203,8 +203,13 @@ function SignZedAndItsFriends {
     if (-not $env:CI) {
         return
     }
+    # SPK Editor: signing must be opt-in via SPK_EDITOR_SIGN to avoid invoking the upstream signing infra by accident.
+    if (-not $env:SPK_EDITOR_SIGN) {
+        Write-Output "SPK_EDITOR_SIGN not set; skipping code signing."
+        return
+    }
 
-    $files = "$innoDir\Zed.exe,$innoDir\cli.exe,$innoDir\auto_update_helper.exe,$innoDir\zed_explorer_command_injector.dll,$innoDir\zed_explorer_command_injector.appx"
+    $files = "$innoDir\spk-editor.exe,$innoDir\cli.exe,$innoDir\auto_update_helper.exe,$innoDir\zed_explorer_command_injector.dll,$innoDir\zed_explorer_command_injector.appx"
     & "$innoDir\sign.ps1" $files
 }
 
@@ -228,8 +233,8 @@ function DownloadConpty {
 function CollectFiles {
     Move-Item -Path "$innoDir\zed_explorer_command_injector.appx" -Destination "$innoDir\appx\zed_explorer_command_injector.appx" -Force
     Move-Item -Path "$innoDir\zed_explorer_command_injector.dll" -Destination "$innoDir\appx\zed_explorer_command_injector.dll" -Force
-    Move-Item -Path "$innoDir\cli.exe" -Destination "$innoDir\bin\zed.exe" -Force
-    Move-Item -Path "$innoDir\zed.sh" -Destination "$innoDir\bin\zed" -Force
+    Move-Item -Path "$innoDir\cli.exe" -Destination "$innoDir\bin\spk-editor.exe" -Force
+    Move-Item -Path "$innoDir\spk-editor.sh" -Destination "$innoDir\bin\spk-editor" -Force
     Move-Item -Path "$innoDir\auto_update_helper.exe" -Destination "$innoDir\tools\auto_update_helper.exe" -Force
     if($Architecture -eq "aarch64") {
         New-Item -Type Directory -Path "$innoDir\arm64" -Force
@@ -247,63 +252,64 @@ function CollectFiles {
 }
 
 function BuildInstaller {
-    $issFilePath = "$innoDir\zed.iss"
+    $issFilePath = "$innoDir\spk-editor.iss"
     switch ($channel) {
         "stable" {
-            $appId = "{{2DB0DA96-CA55-49BB-AF4F-64AF36A86712}"
+            $appId = "{{052B5017-0283-492E-AE7E-598DF69DEDBE}"
             $appIconName = "app-icon"
-            $appName = "Zed"
-            $appDisplayName = "Zed"
-            $appSetupName = "Zed-$Architecture"
-            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Stable-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "Zed"
-            $appUserId = "ZedIndustries.Zed"
-            $appShellNameShort = "Z&ed"
-            $appAppxFullName = "ZedIndustries.Zed_1.0.0.0_neutral__japxn1gcva8rg"
+            $appName = "SPK Editor"
+            $appDisplayName = "SPK Editor"
+            $installDirName = "SpkEditor"
+            $appSetupName = "SpkEditorSetup-$Architecture"
+            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs (built from release_channel::app_identifier()).
+            $appMutex = "SPK-Editor-Instance-Mutex"
+            $appExeName = "spk-editor"
+            $regValueName = "SpkEditor"
+            $appUserId = "Sipaha.SpkEditor"
+            $appShellNameShort = "S&PK Editor"
+            $appAppxFullName = "Sipaha.SpkEditor_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "preview" {
-            $appId = "{{F70E4811-D0E2-4D88-AC99-D63752799F95}"
+            $appId = "{{2327642F-2878-4F40-A4D2-0FCCD575B651}"
             $appIconName = "app-icon-preview"
-            $appName = "Zed Preview"
-            $appDisplayName = "Zed Preview"
-            $appSetupName = "Zed-$Architecture"
-            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Preview-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedPreview"
-            $appUserId = "ZedIndustries.Zed.Preview"
-            $appShellNameShort = "Z&ed Preview"
-            $appAppxFullName = "ZedIndustries.Zed.Preview_1.0.0.0_neutral__japxn1gcva8rg"
+            $appName = "SPK Editor Preview"
+            $appDisplayName = "SPK Editor Preview"
+            $installDirName = "SpkEditorPreview"
+            $appSetupName = "SpkEditorSetup-preview-$Architecture"
+            $appMutex = "SPK-Editor-Preview-Instance-Mutex"
+            $appExeName = "spk-editor"
+            $regValueName = "SpkEditorPreview"
+            $appUserId = "Sipaha.SpkEditor.Preview"
+            $appShellNameShort = "S&PK Editor Preview"
+            $appAppxFullName = "Sipaha.SpkEditor.Preview_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "nightly" {
-            $appId = "{{1BDB21D3-14E7-433C-843C-9C97382B2FE0}"
+            $appId = "{{F9F1373B-2512-4A2B-B250-F20F8F7DF63C}"
             $appIconName = "app-icon-nightly"
-            $appName = "Zed Nightly"
-            $appDisplayName = "Zed Nightly"
-            $appSetupName = "Zed-$Architecture"
-            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Nightly-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedNightly"
-            $appUserId = "ZedIndustries.Zed.Nightly"
-            $appShellNameShort = "Z&ed Editor Nightly"
-            $appAppxFullName = "ZedIndustries.Zed.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
+            $appName = "SPK Editor Nightly"
+            $appDisplayName = "SPK Editor Nightly"
+            $installDirName = "SpkEditorNightly"
+            $appSetupName = "SpkEditorSetup-nightly-$Architecture"
+            $appMutex = "SPK-Editor-Nightly-Instance-Mutex"
+            $appExeName = "spk-editor"
+            $regValueName = "SpkEditorNightly"
+            $appUserId = "Sipaha.SpkEditor.Nightly"
+            $appShellNameShort = "S&PK Editor Nightly"
+            $appAppxFullName = "Sipaha.SpkEditor.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "dev" {
-            $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
+            $appId = "{{DFFED44E-46C1-48AA-B476-500F7545A0B2}"
             $appIconName = "app-icon-dev"
-            $appName = "Zed Dev"
-            $appDisplayName = "Zed Dev"
-            $appSetupName = "Zed-$Architecture"
-            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Dev-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedDev"
-            $appUserId = "ZedIndustries.Zed.Dev"
-            $appShellNameShort = "Z&ed Dev"
-            $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
+            $appName = "SPK Editor Dev"
+            $appDisplayName = "SPK Editor Dev"
+            $installDirName = "SpkEditorDev"
+            $appSetupName = "SpkEditorSetup-dev-$Architecture"
+            $appMutex = "SPK-Editor-Dev-Instance-Mutex"
+            $appExeName = "spk-editor"
+            $regValueName = "SpkEditorDev"
+            $appUserId = "Sipaha.SpkEditor.Dev"
+            $appShellNameShort = "S&PK Editor Dev"
+            $appAppxFullName = "Sipaha.SpkEditor.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
         default {
             Write-Error "can't bundle installer for $channel."
@@ -323,6 +329,7 @@ function BuildInstaller {
         "AppSetupName"   = $appSetupName
         "AppName"        = $appName
         "AppDisplayName" = $appDisplayName
+        "InstallDirName" = $installDirName
         "RegValueName"   = $regValueName
         "AppMutex"       = $appMutex
         "AppExeName"     = $appExeName
@@ -340,7 +347,7 @@ function BuildInstaller {
     }
 
     $innoArgs = @($issFilePath) + $defs
-    if($env:CI) {
+    if ($env:CI -and $env:SPK_EDITOR_SIGN) {
         $signTool = "powershell.exe -ExecutionPolicy Bypass -File $innoDir\sign.ps1 `$f"
         $innoArgs += "/sDefaultsign=`"$signTool`""
     }
@@ -385,8 +392,8 @@ if($env:CI) {
 if ($buildSuccess) {
     Write-Output "Build successful"
     if ($Install) {
-        Write-Output "Installing Zed..."
-        Start-Process -FilePath "$env:ZED_WORKSPACE/target/ZedEditorUserSetup-x64-$env:RELEASE_VERSION.exe"
+        Write-Output "Installing SPK Editor..."
+        Start-Process -FilePath "$env:ZED_WORKSPACE/target/SpkEditorSetup-$Architecture.exe"
     }
     exit 0
 }

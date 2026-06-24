@@ -4,12 +4,10 @@ name: deploy_collab
 env:
   DOCKER_BUILDKIT: '1'
 on:
-  push:
-    tags:
-    - collab-production
+  workflow_dispatch:
 jobs:
   style:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     name: Check formatting and Clippy lints
     runs-on: namespace-profile-16x32-ubuntu-2204
     env:
@@ -41,6 +39,7 @@ jobs:
   tests:
     needs:
     - style
+    if: false # spk-editor: not applicable
     name: Run tests
     runs-on: namespace-profile-16x32-ubuntu-2204
     env:
@@ -83,6 +82,7 @@ jobs:
     needs:
     - style
     - tests
+    if: false # spk-editor: not applicable
     name: Publish collab server image
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:
@@ -109,6 +109,7 @@ jobs:
   deploy:
     needs:
     - publish
+    if: false # spk-editor: not applicable
     name: Deploy new server image
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:

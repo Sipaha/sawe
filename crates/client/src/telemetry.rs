@@ -7,7 +7,7 @@ use fs::Fs;
 use futures::channel::mpsc;
 use futures::{Future, StreamExt};
 use gpui::{App, AppContext as _, BackgroundExecutor, Task};
-use http_client::{self, AsyncBody, HttpClient, HttpClientWithUrl, Method, Request};
+use http_client::{self, AsyncBody, HttpClientWithUrl, Method, Request};
 use parking_lot::Mutex;
 use regex::Regex;
 use release_channel::ReleaseChannel;
@@ -15,10 +15,9 @@ use settings::{Settings, SettingsStore};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::Write;
 use std::sync::LazyLock;
 use std::time::Instant;
-use std::{env, mem, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 use telemetry_events::{AssistantEventData, AssistantPhase, Event, EventRequestBody, EventWrapper};
 
 pub struct TelemetrySubscription {
@@ -49,7 +48,10 @@ struct TelemetryState {
     installation_id: Option<Arc<str>>, // Per app installation (different for dev, nightly, preview, and stable)
     session_id: Option<String>,        // Per app launch
     metrics_id: Option<Arc<str>>,      // Per logged-in user
+    // spk-editor: written during init, read only by the disabled HTTP dispatch path.
+    #[allow(dead_code)]
     release_channel: Option<ReleaseChannel>,
+    #[allow(dead_code)]
     architecture: &'static str,
     events_queue: Vec<EventWrapper>,
     flush_events_task: Option<Task<()>>,
@@ -583,6 +585,8 @@ impl Telemetry {
         self.state.lock().is_staff
     }
 
+    // spk-editor: retained but unused; `flush_events_inner` no longer dispatches HTTP.
+    #[allow(dead_code)]
     fn build_request(
         self: &Arc<Self>,
         // We take in the JSON bytes buffer so we can reuse the existing allocation.
@@ -607,54 +611,13 @@ impl Telemetry {
     }
 
     pub async fn flush_events_inner(self: &Arc<Self>) -> Result<()> {
-        let (json_bytes, request_body) = {
-            let mut state = self.state.lock();
-            state.first_event_date_time = None;
-            let events = mem::take(&mut state.events_queue);
-            state.flush_events_task.take();
-            if events.is_empty() {
-                return Ok(());
-            }
-
-            let mut json_bytes = Vec::new();
-
-            if let Some(file) = &mut state.log_file {
-                for event in &events {
-                    json_bytes.clear();
-                    serde_json::to_writer(&mut json_bytes, event)?;
-                    file.write_all(&json_bytes)?;
-                    file.write_all(b"\n")?;
-                }
-            }
-
-            (
-                json_bytes,
-                EventRequestBody {
-                    system_id: state.system_id.as_deref().map(Into::into),
-                    installation_id: state.installation_id.as_deref().map(Into::into),
-                    session_id: state.session_id.clone(),
-                    metrics_id: state.metrics_id.as_deref().map(Into::into),
-                    is_staff: state.is_staff,
-                    app_version: state.app_version.clone(),
-                    os_name: state.os_name.clone(),
-                    os_version: state.os_version.clone(),
-                    architecture: state.architecture.to_string(),
-
-                    release_channel: state
-                        .release_channel
-                        .map(|channel| channel.display_name().to_owned()),
-                    events,
-                },
-            )
-        };
-
-        let request = self.build_request(json_bytes, &request_body)?;
-        let response = self.http_client.send(request).await?;
-        if response.status() != 200 {
-            log::error!("Failed to send events: HTTP {:?}", response.status());
-        }
-
-        anyhow::Ok(())
+        // spk-editor: telemetry is permanently disabled. Drain any queued events
+        // without performing any HTTP request, so nothing ever leaves the process.
+        let mut state = self.state.lock();
+        state.first_event_date_time = None;
+        state.events_queue.clear();
+        state.flush_events_task.take();
+        Ok(())
     }
 
     pub fn flush_events(self: &Arc<Self>) -> Task<()> {

@@ -196,6 +196,65 @@ async fn test_project_group_keys_add_workspace(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_reorder_workspaces_moves_tab(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_c", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    let project_c = Project::test(fs.clone(), ["/root_c".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    // Opening the sidebar retains the active workspace, so every added
+    // workspace lands in `retained_workspaces` in insertion order.
+    let ws_a = multi_workspace.update(cx, |mw, cx| {
+        mw.open_sidebar(cx);
+        mw.workspace().clone()
+    });
+    let ws_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b, window, cx)
+    });
+    let ws_c = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_c, window, cx)
+    });
+
+    multi_workspace.read_with(cx, |mw, _cx| {
+        let order: Vec<_> = mw.workspaces().cloned().collect();
+        assert_eq!(
+            order,
+            vec![ws_a.clone(), ws_b.clone(), ws_c.clone()],
+            "tabs start in insertion order"
+        );
+    });
+
+    // Drag the first tab (a) so it lands at the last tab's slot (c).
+    multi_workspace.update(cx, |mw, cx| mw.reorder_workspaces(0, 2, cx));
+
+    multi_workspace.read_with(cx, |mw, _cx| {
+        let order: Vec<_> = mw.workspaces().cloned().collect();
+        assert_eq!(
+            order,
+            vec![ws_b.clone(), ws_c.clone(), ws_a.clone()],
+            "moved tab lands at the target slot, others shift left"
+        );
+    });
+
+    // Out-of-range / no-op indices leave the order untouched.
+    multi_workspace.update(cx, |mw, cx| {
+        mw.reorder_workspaces(1, 1, cx);
+        mw.reorder_workspaces(0, 99, cx);
+    });
+    multi_workspace.read_with(cx, |mw, _cx| {
+        let order: Vec<_> = mw.workspaces().cloned().collect();
+        assert_eq!(order, vec![ws_b, ws_c, ws_a], "no-op reorders are inert");
+    });
+}
+
+#[gpui::test]
 async fn test_open_new_window_does_not_open_sidebar_on_existing_window(cx: &mut TestAppContext) {
     init_test(cx);
 

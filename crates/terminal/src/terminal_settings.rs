@@ -7,8 +7,12 @@ pub use settings::AlternateScroll;
 
 use settings::{
     IntoGpui, PathHyperlinkRegex, RegisterSetting, ShowScrollbar, TerminalBell, TerminalBlink,
+<<<<<<< ours
     TerminalDockPosition, TerminalLineHeight, VenvSettings, WorkingDirectory,
     merge_from::MergeFrom,
+=======
+    TerminalLineHeight, VenvSettings, WorkingDirectory, merge_from::MergeFrom,
+>>>>>>> theirs
 };
 use task::Shell;
 use theme_settings::FontFamilyName;
@@ -36,7 +40,6 @@ pub struct TerminalSettings {
     pub copy_on_select: bool,
     pub keep_selection_on_copy: bool,
     pub button: bool,
-    pub dock: TerminalDockPosition,
     pub flexible: bool,
     pub default_width: Pixels,
     pub default_height: Pixels,
@@ -106,7 +109,6 @@ impl settings::Settings for TerminalSettings {
             copy_on_select: user_content.copy_on_select.unwrap(),
             keep_selection_on_copy: user_content.keep_selection_on_copy.unwrap(),
             button: user_content.button.unwrap(),
-            dock: user_content.dock.unwrap(),
             default_width: px(user_content.default_width.unwrap()),
             default_height: px(user_content.default_height.unwrap()),
             flexible: user_content.flexible.unwrap(),

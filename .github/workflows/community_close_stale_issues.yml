@@ -1,7 +1,5 @@
 name: "Close Stale Issues"
 on:
-  schedule:
-    - cron: "0 2 * * 5"
   workflow_dispatch:
     inputs:
       debug-only:
@@ -15,7 +13,7 @@ on:
 
 jobs:
   stale:
-    if: github.repository_owner == 'zed-industries'
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
       - uses: actions/stale@997185467fa4f803885201cee163a9f38240193d # v10

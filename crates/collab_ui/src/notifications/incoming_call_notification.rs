@@ -126,7 +126,7 @@ impl Render for IncomingCallNotification {
                 }),
             )
             .child(Label::new(format!(
-                "{} is sharing a project in Zed",
+                "{} is sharing a project in SPK Editor",
                 self.state.call.calling_user.github_login
             ))),
         )

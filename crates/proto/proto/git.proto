@@ -129,9 +129,12 @@ message UpdateRepository {
   reserved 16;
   repeated Worktree linked_worktrees = 17;
   repeated Branch branch_list = 18;
+<<<<<<< ours
   optional string repository_dir_abs_path = 19;
   optional string common_dir_abs_path = 20;
   optional string branch_list_error = 21;
+=======
+>>>>>>> theirs
 }
 
 message RemoveRepository {
@@ -696,6 +699,7 @@ message CommitData {
 message GetCommitDataResponse {
   repeated CommitData commits = 1;
 }
+<<<<<<< ours
 
 message GitLogSourceAll {}
 
@@ -743,3 +747,5 @@ message SearchCommits {
 message SearchCommitsResponse {
   repeated string shas = 1;
 }
+=======
+>>>>>>> theirs

@@ -6,9 +6,15 @@ use collections::HashSet;
 use git::repository::{Branch, delete_branch_flag};
 use gpui::http_client::Url;
 use gpui::{
+<<<<<<< ours
     Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, PromptLevel,
     Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
+=======
+    Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, Render,
+    SharedString, Styled, Subscription, Task, WeakEntity, Window, actions, rems,
+>>>>>>> theirs
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::git_store::{Repository, RepositoryEvent};
@@ -24,6 +30,17 @@ use ui_input::ErasedEditor;
 use util::ResultExt;
 use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
+
+pub mod context_menu;
+pub mod favorites;
+mod popup;
+pub mod tree;
+
+// The IDEA-style branches popup (S-BRP) lives in the `popup` submodule. These
+// re-exports keep the public paths stable: `title_bar` references
+// `git_ui::branch_picker::{BranchesPopup, BranchesPopupOpen}`, and
+// `context_menu` references `super::{SetUpstreamModal, RenameBranchPopupModal}`.
+pub use popup::{BranchesPopup, BranchesPopupOpen, RenameBranchPopupModal, SetUpstreamModal};
 
 use crate::{branch_picker, git_panel::show_error_toast};
 
@@ -57,6 +74,42 @@ pub fn switch(
     open(workspace, &zed_actions::git::Branch, window, cx);
 }
 
+/// The repository of the active Solution member, if any. Mirrors
+/// `title_bar::ProjectToolbar::active_member_repository` /
+/// `git_panel::refresh_active_repository_for_selector`: in a multi-member
+/// Solution all members share ONE `Project`, so `Project::active_repository`
+/// can point at whichever repo was last touched rather than the project the
+/// user has selected in the tab strip. Scoping the branch picker to the
+/// active member's repo keeps "New Branch" / "Checkout…" showing only that
+/// project's branches. Returns `None` outside a Solution (plain project), so
+/// the caller falls back to `active_repository`.
+fn active_member_repository(
+    project: &Entity<project::Project>,
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    let store = solutions::SolutionStore::try_global(cx)?;
+    let store = store.read(cx);
+    let solution = project
+        .read(cx)
+        .worktrees(cx)
+        .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))?;
+    let catalog = store.active_member(&solution.id)?;
+    let member = solution
+        .members
+        .iter()
+        .find(|member| &member.catalog_id == catalog)?;
+    project
+        .read(cx)
+        .repositories(cx)
+        .values()
+        .find(|repo| {
+            repo.read(cx)
+                .work_directory_abs_path
+                .starts_with(&member.local_path)
+        })
+        .cloned()
+}
+
 pub fn open(
     workspace: &mut Workspace,
     _: &zed_actions::git::Branch,
@@ -64,7 +117,9 @@ pub fn open(
     cx: &mut Context<Workspace>,
 ) {
     let workspace_handle = workspace.weak_handle();
-    let repository = workspace.project().read(cx).active_repository(cx);
+    let project = workspace.project().clone();
+    let repository = active_member_repository(&project, cx)
+        .or_else(|| project.read(cx).active_repository(cx));
 
     workspace.toggle_modal(window, cx, |window, cx| {
         BranchList::new(
@@ -1050,10 +1105,15 @@ impl PickerDelegate for BranchListDelegate {
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         match self.state {
             PickerState::List | PickerState::NewRemote | PickerState::NewBranch => {
+<<<<<<< ours
                 if self.is_select_only() {
                     "Select branch…"
                 } else {
                     "Switch branch…"
+=======
+                match self.branch_filter {
+                    BranchFilter::All | BranchFilter::Remote => "Switch branch…",
+>>>>>>> theirs
                 }
             }
             PickerState::CreateRemote(_) => "Enter a name for this remote…",

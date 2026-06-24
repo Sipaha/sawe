@@ -236,7 +236,11 @@ In addition to being spawned manually, tasks can be configured to run automatica
 
 The following hooks are currently supported:
 
+<<<<<<< ours
 - `create_worktree` — runs after Zed creates a new linked Git worktree, either directly through the CLI or from the [worktree picker](./git.md#git-worktrees). The task is spawned with `ZED_WORKTREE_ROOT` pointing at the newly created worktree and `ZED_MAIN_GIT_WORKTREE` pointing at the original repository's working directory, which makes these hooks well-suited to copying untracked files (such as `.env` files) or running per-worktree setup commands.
+=======
+- `create_worktree` — runs after Zed creates a new linked Git worktree, either directly through the CLI or through the UI with the worktree modal. The task is spawned with `ZED_WORKTREE_ROOT` pointing at the newly created worktree and `ZED_MAIN_GIT_WORKTREE` pointing at the original repository's working directory, which makes these hooks well-suited to copying untracked files (such as `.env` files) or running per-worktree setup commands.
+>>>>>>> theirs
 
 Hook tasks are resolved from the same global and worktree-local `tasks.json` files as manually spawned tasks, and multiple tasks may register for the same hook; they all run when the hook fires. A hook task still benefits from the usual task configuration fields — `cwd`, `env`, `reveal`, `hide`, and so on — so you can control how much of the terminal UI is shown while it runs.
 
@@ -255,6 +259,7 @@ Hook tasks are resolved from the same global and worktree-local `tasks.json` fil
 
 Tasks that define `hooks` are still available from the task modal like any other task, so the same template can be reused for manual runs.
 
+<<<<<<< ours
 ## Custom Git Commands
 
 The Git Graph supports running custom Git command tasks from the commit context menu.
@@ -291,6 +296,8 @@ For example:
 ]
 ```
 
+=======
+>>>>>>> theirs
 ## VS Code Task Format
 
 When importing VS Code tasks from `.vscode/tasks.json`, you can omit the `label` field. Zed automatically generates labels based on the task type:

@@ -40,20 +40,34 @@ use language_model::{LanguageModelCompletionError, LanguageModelRegistry};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
+<<<<<<< ours
 use parking_lot::{Mutex, RwLock};
 use project::{AgentId, AgentServerStore, Project, ProjectEntryId, ProjectPath};
+=======
+use parking_lot::RwLock;
+use project::{AgentId, AgentServerStore, Project, ProjectEntryId};
+use prompt_store::{PromptId, PromptStore};
+>>>>>>> theirs
 
 use crate::message_editor::SessionCapabilities;
+<<<<<<< ours
 use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
 use lru::LruCache;
+=======
+use console_panel::ConsolePanel;
+>>>>>>> theirs
 use rope::Point;
 use settings::{NotifyWhenAgentWaiting, Settings as _, SettingsStore, ThinkingBlockDisplay};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+<<<<<<< ours
 use std::{rc::Rc, time::Duration};
 use terminal_view::terminal_panel::TerminalPanel;
+=======
+use std::{collections::BTreeMap, rc::Rc, time::Duration};
+>>>>>>> theirs
 use text::Anchor;
 use theme_settings::{AgentBufferFontSize, AgentUiFontSize};
 use ui::{
@@ -454,6 +468,7 @@ pub(crate) struct RootThreadUpdated;
 
 impl EventEmitter<RootThreadUpdated> for ConversationView {}
 
+<<<<<<< ours
 fn permission_option_for_action(
     options: &PermissionOptions,
     kind: acp::PermissionOptionKind,
@@ -474,6 +489,8 @@ pub struct StateChange;
 
 impl EventEmitter<StateChange> for ConversationView {}
 
+=======
+>>>>>>> theirs
 fn resolve_outcome_from_selection(
     options: &PermissionOptions,
     selection: Option<&thread_view::PermissionSelection>,
@@ -765,7 +782,10 @@ impl ConversationView {
         let code_span_resolver = AgentCodeSpanResolver::new(&project.downgrade(), cx);
         let mut subscriptions = vec![
             cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
+<<<<<<< ours
             cx.observe_global_in::<SettingsStore>(window, Self::invalidate_mermaid_caches),
+=======
+>>>>>>> theirs
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentBufferFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(
@@ -2034,7 +2054,7 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
+        let Some(terminal_panel) = workspace.read(cx).panel::<ConsolePanel>(cx) else {
             return Task::ready(Err(anyhow!("Terminal panel is unavailable")));
         };
 
@@ -3234,11 +3254,32 @@ pub(crate) struct AgentCodeSpanResolver {
     inner: Arc<AgentCodeSpanResolverInner>,
 }
 
+<<<<<<< ours
 /// Maximum number of memoized code-span resolutions kept in the cache.
 const CODE_SPAN_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(2048) {
     Some(n) => n,
     None => unreachable!(),
 };
+=======
+#[cfg(test)]
+pub(crate) mod tests {
+    use acp_thread::StubAgentConnection;
+    use action_log::ActionLog;
+    use agent::{AgentTool, EditFileTool, FetchTool, TerminalTool, ToolPermissionContext};
+    use agent_servers::FakeAcpAgentServer;
+    use editor::MultiBufferOffset;
+    use fs::FakeFs;
+    use gpui::{EventEmitter, TestAppContext, VisualTestContext};
+    use parking_lot::Mutex;
+    use project::Project;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use std::any::Any;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use workspace::{Item, MultiWorkspace};
+>>>>>>> theirs
 
 struct AgentCodeSpanResolverInner {
     project: WeakEntity<Project>,
@@ -7576,6 +7617,7 @@ pub(crate) mod tests {
         ])
     }
 
+<<<<<<< ours
     fn sandbox_permission_options() -> PermissionOptions {
         PermissionOptions::Flat(vec![
             acp::PermissionOption::new(
@@ -7612,6 +7654,8 @@ pub(crate) mod tests {
         assert_eq!(option.option_id.0.as_ref(), "allow_always");
     }
 
+=======
+>>>>>>> theirs
     #[test]
     fn resolve_outcome_from_selection_flat_allow_picks_allow_once() {
         let options = flat_allow_deny_options();

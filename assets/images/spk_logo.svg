@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!--
+    SPK Editor — in-app stencil logo (Welcome screen, About dialog,
+    onboarding, etc.). GPUI's `Vector` element renders SVGs as a
+    single-colour stencil (`paint_svg` ignores per-path fills and
+    paints the whole silhouette with `text_color`), so this asset
+    contains ONLY the four-rhombi silhouette without the rounded
+    plate — the surrounding UI provides the background.
+
+    The full-colour version with the indigo plate lives at
+    `assets/spk-editor-icon.svg` and is the source for the OS app
+    icon PNGs in `crates/zed/resources/`.
+  -->
+  <g transform="translate(256 256)">
+    <g transform="rotate(-45)"><polygon points="0,-220 70,-110 0,0 -70,-110"/></g>
+    <g transform="rotate(45)"><polygon points="0,-220 70,-110 0,0 -70,-110"/></g>
+    <g transform="rotate(135)"><polygon points="0,-220 70,-110 0,0 -70,-110"/></g>
+    <g transform="rotate(225)"><polygon points="0,-220 70,-110 0,0 -70,-110"/></g>
+  </g>
+</svg>

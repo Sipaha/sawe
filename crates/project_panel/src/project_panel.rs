@@ -61,9 +61,15 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     Color, ContextMenu, ContextMenuEntry, DecoratedIcon, Icon, IconDecoration, IconDecorationKind,
+<<<<<<< ours
     IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, Label, LabelSize, ListItem,
     ListItemSpacing, ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate,
     Tooltip, WithScrollbar, prelude::*, v_flex,
+=======
+    IndentGuideColors, IndentGuideLayout, Indicator, Label, LabelSize, ListItem, ListItemSpacing,
+    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    v_flex,
+>>>>>>> theirs
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -165,6 +171,7 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     state: State,
+    _store_subscription: gpui::Subscription,
 }
 
 struct UpdateVisibleEntriesTask {
@@ -527,6 +534,7 @@ pub fn init(cx: &mut App) {
                 panel.update(cx, |panel, cx| panel.delete(action, window, cx));
             }
         });
+<<<<<<< ours
 
         // Forwards `git::FileHistory` to `git_ui::git_graph` when the project
         // panel is the focused source of selection. Lives here (and not in
@@ -571,6 +579,8 @@ pub fn init(cx: &mut App) {
                 cx.stop_propagation();
             })
         });
+=======
+>>>>>>> theirs
     })
     .detach();
 }
@@ -844,6 +854,23 @@ impl ProjectPanel {
 
             let scroll_handle = UniformListScrollHandle::new();
             let weak_project_panel = cx.weak_entity();
+
+            // Rebuild the worktree view whenever the solution-wide active
+            // member flips so the panel renders the newly-selected project.
+            let store_subscription = cx.subscribe_in(
+                &solutions::SolutionStore::global(cx),
+                window,
+                |this, _store, event, window, cx| {
+                    if matches!(
+                        event,
+                        solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
+                    ) {
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
+                },
+            );
+
             let mut this = Self {
                 project: project.clone(),
                 hover_scroll_task: None,
@@ -880,6 +907,7 @@ impl ProjectPanel {
                 },
                 update_visible_entries_task: Default::default(),
                 undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
+                _store_subscription: store_subscription,
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -1099,7 +1127,11 @@ impl ProjectPanel {
                     || (settings.hide_root && visible_worktrees_count == 1));
             let should_show_compare = !is_dir && self.file_abs_paths_to_diff(cx).is_some();
 
+<<<<<<< ours
             let (has_git_repo, has_history) = {
+=======
+            let (has_git_repo, has_file_history) = {
+>>>>>>> theirs
                 let project_path = project::ProjectPath {
                     worktree_id,
                     path: entry.path.clone(),
@@ -1108,11 +1140,20 @@ impl ProjectPanel {
                 let has_git_repo = git_store
                     .repository_and_path_for_project_path(&project_path, cx)
                     .is_some();
+<<<<<<< ours
                 let has_history = has_git_repo
                     && !git_store
                         .project_path_git_status(&project_path, cx)
                         .is_some_and(|status| status.is_created());
                 (has_git_repo, has_history)
+=======
+                let has_file_history = !is_dir
+                    && has_git_repo
+                    && !git_store
+                        .project_path_git_status(&project_path, cx)
+                        .is_some_and(|status| status.is_created());
+                (has_git_repo, has_file_history)
+>>>>>>> theirs
             };
 
             let has_pasteable_content = self.has_pasteable_content(cx);
@@ -1187,12 +1228,17 @@ impl ProjectPanel {
                                         )
                                     })
                                     .action("Add to .gitignore", Box::new(git::AddToGitignore))
+<<<<<<< ours
                                     .action(
                                         "Add to .git/info/exclude",
                                         Box::new(git::AddToGitInfoExclude),
                                     )
                                     .when(has_history, |menu| {
                                         menu.action("View History", Box::new(git::FileHistory))
+=======
+                                    .when(has_file_history, |menu| {
+                                        menu.action("View File History", Box::new(git::FileHistory))
+>>>>>>> theirs
                                     })
                             })
                             .when(!should_hide_rename, |menu| {
@@ -2359,6 +2405,7 @@ impl ProjectPanel {
         });
     }
 
+<<<<<<< ours
     fn add_to_git_info_exclude(
         &mut self,
         _: &git::AddToGitInfoExclude,
@@ -2406,6 +2453,8 @@ impl ProjectPanel {
         });
     }
 
+=======
+>>>>>>> theirs
     fn remove(
         &mut self,
         trash: bool,
@@ -3892,11 +3941,19 @@ impl ProjectPanel {
         Some((worktree.read(cx), entry))
     }
 
+<<<<<<< ours
     pub fn selected_entry_project_path(&self, cx: &App) -> Option<ProjectPath> {
         let (worktree, entry) = self.selected_sub_entry(cx)?;
         Some(ProjectPath {
             worktree_id: worktree.read(cx).id(),
             path: entry.path.clone(),
+=======
+    pub fn selected_file_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        let (worktree, entry) = self.selected_sub_entry(cx)?;
+        Some(ProjectPath {
+            worktree_id: worktree.read(cx).id(),
+            path: entry.is_file().then(|| entry.path.clone())?,
+>>>>>>> theirs
         })
     }
 
@@ -4033,6 +4090,37 @@ impl ProjectPanel {
         }
     }
 
+    /// First solution (if any) whose `root` is an ancestor of one of this
+    /// panel's project worktrees. Mirrors the resolution the retired
+    /// `ActiveProjectSelector` performed from the workspace, but reads the
+    /// panel's own `project` handle since the panel doesn't carry a
+    /// `WeakEntity<Workspace>` for this purpose.
+    fn active_solution(&self, cx: &App) -> Option<solutions::Solution> {
+        let store = solutions::SolutionStore::try_global(cx)?;
+        let store = store.read(cx);
+        self.project
+            .read(cx)
+            .worktrees(cx)
+            .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))
+            .cloned()
+    }
+
+    /// Absolute path of the solution-wide active member for this panel's
+    /// solution, used to restrict the visible worktree to a single project.
+    /// `None` when no solution hosts the panel's worktrees, no active member
+    /// is recorded, or the active member is not in the solution.
+    fn active_member_path(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let solution = self.active_solution(cx)?;
+        let store = solutions::SolutionStore::try_global(cx)?;
+        let store = store.read(cx);
+        let catalog = store.active_member(&solution.id)?;
+        solution
+            .members
+            .iter()
+            .find(|member| &member.catalog_id == catalog)
+            .map(|member| member.local_path.clone())
+    }
+
     fn update_visible_entries(
         &mut self,
         new_selected_entry: Option<(WorktreeId, ProjectEntryId)>,
@@ -4053,17 +4141,31 @@ impl ProjectPanel {
         let old_ancestors = self.state.ancestors.clone();
         let temporary_unfolded_pending_state = self.state.temporarily_unfolded_pending_state.take();
         let mut new_state = State::derive(&self.state);
-        new_state.last_worktree_root_id = project
-            .visible_worktrees(cx)
-            .next_back()
-            .and_then(|worktree| worktree.read(cx).root_entry())
-            .map(|entry| entry.id);
         let mut max_width_item = None;
 
+        // SPK fork: in Solutions mode the active-member selector picks
+        // one worktree to render at a time, so apply that filter up
+        // front. Otherwise `hide_root` (gated on `len() == 1` to avoid
+        // collapsing multi-folder workspaces) would see 3 worktrees in
+        // a 3-member solution and refuse to hide the root, even though
+        // post-filter only one worktree actually renders. Filtering
+        // here also drops the wasted background traversal of
+        // worktrees we know we're going to discard, and lets
+        // `last_worktree_root_id` (used by context-menu / drag-drop
+        // targeting) line up with the worktree that's actually visible.
+        let active_member_path = self.active_member_path(cx);
         let visible_worktrees: Vec<_> = project
             .visible_worktrees(cx)
+            .filter(|worktree| match active_member_path.as_ref() {
+                Some(path) => worktree.read(cx).abs_path().starts_with(path),
+                None => true,
+            })
             .map(|worktree| worktree.read(cx).snapshot())
             .collect();
+        new_state.last_worktree_root_id = visible_worktrees
+            .last()
+            .and_then(|snapshot| snapshot.root_entry())
+            .map(|entry| entry.id);
         let hide_root = settings.hide_root && visible_worktrees.len() == 1;
         let hide_hidden = settings.hide_hidden;
 
@@ -5446,25 +5548,36 @@ impl ProjectPanel {
             None
         };
 
-        let border_color =
-            if !self.mouse_down && is_active && self.focus_handle.contains_focused(window, cx) {
-                match validation_color_and_message {
-                    Some((color, _)) => color,
-                    None => item_colors.focused,
-                }
-            } else {
-                bg_color
-            };
+        // Fork-local tweak: upstream gates the focused border on
+        // `!self.mouse_down` to avoid a brief border-flash on the
+        // newly-clicked entry when preview tabs are disabled (PR
+        // #20417 — opening the file moves focus to the editor and
+        // the border was showing for one frame on the new entry
+        // before vanishing). With preview tabs enabled (the default
+        // here), the panel keeps focus through the click, so the
+        // suppression instead removes the active entry's border for
+        // the duration the LMB is held — visible flicker on every
+        // click and a particularly jarring on/off/on/off on
+        // double-click. Drop the `!self.mouse_down` guard; the
+        // remaining `contains_focused` check still hides the border
+        // automatically when the click does steal focus.
+        let border_color = if is_active && self.focus_handle.contains_focused(window, cx) {
+            match validation_color_and_message {
+                Some((color, _)) => color,
+                None => item_colors.focused,
+            }
+        } else {
+            bg_color
+        };
 
-        let border_hover_color =
-            if !self.mouse_down && is_active && self.focus_handle.contains_focused(window, cx) {
-                match validation_color_and_message {
-                    Some((color, _)) => color,
-                    None => item_colors.focused,
-                }
-            } else {
-                bg_hover_color
-            };
+        let border_hover_color = if is_active && self.focus_handle.contains_focused(window, cx) {
+            match validation_color_and_message {
+                Some((color, _)) => color,
+                None => item_colors.focused,
+            }
+        } else {
+            bg_hover_color
+        };
 
         let folded_directory_drag_target = self.folded_directory_drag_target;
         let is_highlighted = {
@@ -5791,7 +5904,14 @@ impl ProjectPanel {
                             }
                         }
                     } else if kind.is_dir() {
+                        // Single click on a folder selects it but no longer
+                        // toggles its expansion — the chevron in the row
+                        // owns toggle. Double-click on the folder name
+                        // still toggles, mirroring IDEA's behaviour where
+                        // power-users can double-click anywhere on the row
+                        // to expand without aiming at the chevron.
                         project_panel.marked_entries.clear();
+                        project_panel.selection = Some(selection);
                         if is_sticky
                             && let Some((_, _, index)) =
                                 project_panel.index_for_entry(entry_id, worktree_id)
@@ -5816,18 +5936,31 @@ impl ProjectPanel {
                             });
                             return;
                         }
-                        if event.modifiers().alt {
-                            project_panel.toggle_expand_all(entry_id, window, cx);
+                        if event.click_count() > 1 {
+                            if event.modifiers().alt {
+                                project_panel.toggle_expand_all(entry_id, window, cx);
+                            } else {
+                                project_panel.toggle_expanded(entry_id, window, cx);
+                            }
                         } else {
-                            project_panel.toggle_expanded(entry_id, window, cx);
+                            cx.notify();
                         }
                     } else {
-                        let preview_tabs_enabled =
-                            PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
+                        // SPK Editor fork: files open on double-click only
+                        // (IDEA convention). Upstream opened on every
+                        // single click — that meant an arrow-key/click
+                        // walk through the panel would spawn a
+                        // preview tab per row. Single-click here only
+                        // updates the selection; double-click invokes
+                        // `open_entry` with focus.
                         let click_count = event.click_count();
-                        let focus_opened_item = click_count > 1;
-                        let allow_preview = preview_tabs_enabled && click_count == 1;
-                        project_panel.open_entry(entry_id, focus_opened_item, allow_preview, cx);
+                        if click_count > 1 {
+                            project_panel.open_entry(entry_id, true, false, cx);
+                        } else {
+                            project_panel.marked_entries.clear();
+                            project_panel.selection = Some(selection);
+                            cx.notify();
+                        }
                     }
                 }),
             )
@@ -5905,6 +6038,58 @@ impl ProjectPanel {
                             )
                         },
                     )
+                    .child(if kind.is_dir() {
+                        // IDEA-style expand/collapse chevron in front of every
+                        // directory. Click on the chevron toggles expansion
+                        // and stops propagation so the row's `on_click`
+                        // (which now only selects, no longer toggles) doesn't
+                        // re-fire. Files get an invisible spacer of the same
+                        // size so file names line up horizontally with folder
+                        // names that have the chevron prefix.
+                        let chevron_id = SharedString::from(format!("chevron-{entry_id:?}"));
+                        h_flex()
+                            .id(chevron_id)
+                            .size(IconSize::Small.rems())
+                            .flex_none()
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    // Block the row's mouse_down handler so a
+                                    // click on the chevron doesn't also flip
+                                    // selection state on top of toggling.
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_click(cx.listener(
+                                move |this, event: &gpui::ClickEvent, window, cx| {
+                                    if event.is_right_click() {
+                                        return;
+                                    }
+                                    cx.stop_propagation();
+                                    if event.modifiers().alt {
+                                        this.toggle_expand_all(entry_id, window, cx);
+                                    } else {
+                                        this.toggle_expanded(entry_id, window, cx);
+                                    }
+                                },
+                            ))
+                            .child(
+                                Icon::new(if details.is_expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                            )
+                    } else {
+                        h_flex()
+                            .id(SharedString::from(format!("chevron-spacer-{entry_id:?}")))
+                            .size(IconSize::Small.rems())
+                            .flex_none()
+                            .invisible()
+                    })
                     .child(if let Some(icon) = &icon {
                         if let Some((_, decoration_color)) =
                             entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
@@ -6351,6 +6536,59 @@ impl ProjectPanel {
         }
     }
 
+    /// Compact toolbar pinned above the entry list. Hosts the
+    /// "Select Opened File" button (IDEA-style "find current file in
+    /// the tree" affordance). The bound action `pane::RevealInProjectPanel`
+    /// also lives on the keymap (`ctrl-shift-e` on Linux), but a
+    /// visible button is the discoverable path most users will reach
+    /// for first.
+    fn render_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("project-panel-toolbar")
+            .flex_none()
+            .h_7()
+            .px_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                IconButton::new("project-panel-select-opened-file", IconName::Crosshair)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::for_action_title(
+                        "Select Opened File",
+                        &workspace::pane::RevealInProjectPanel::default(),
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.select_opened_file(window, cx);
+                    })),
+            )
+    }
+
+    /// Reveal the file backing the workspace's active editor in the
+    /// tree, expanding parents along the way and scrolling it into
+    /// view. Mirrors `pane::RevealInProjectPanel` but invoked from
+    /// the panel itself (so the user never has to switch focus into
+    /// the editor pane just to dispatch the action).
+    fn select_opened_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let entry_id = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.project_entry_ids(cx).first().copied())
+        });
+        let Some(entry_id) = entry_id else {
+            return;
+        };
+        let project = self.project.clone();
+        self.reveal_entry(project, entry_id, false, window, cx)
+            .log_err();
+    }
+
     fn dispatch_context(&self, window: &Window, cx: &Context<Self>) -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("ProjectPanel");
@@ -6785,7 +7023,10 @@ impl Render for ProjectPanel {
                         .on_action(cx.listener(Self::duplicate))
                         .on_action(cx.listener(Self::restore_file))
                         .on_action(cx.listener(Self::add_to_gitignore))
+<<<<<<< ours
                         .on_action(cx.listener(Self::add_to_git_info_exclude))
+=======
+>>>>>>> theirs
                         .when(!project.is_remote(), |el| {
                             el.on_action(cx.listener(Self::trash))
                         })
@@ -6805,6 +7046,7 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
+                        .child(self.render_toolbar(cx))
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
@@ -7206,6 +7448,7 @@ impl Render for ProjectPanel {
                     .with_priority(3)
                 }))
         } else {
+<<<<<<< ours
             let focus_handle = self.focus_handle(cx);
             let workspace = self.workspace.clone();
             let workspace_clone = self.workspace.clone();
@@ -7236,6 +7479,32 @@ impl Render for ProjectPanel {
                             })
                             .log_err();
                     }),
+=======
+            // SPK fork: workspaces always belong to a Solution, so the
+            // upstream "Open Project / Clone Repository" empty state is
+            // never the right CTA. The toolbar's "Select Opened File"
+            // button has nothing to act on with an empty pane, so it's
+            // dropped here; the empty-state body sits in a centred block.
+            v_flex()
+                .id("empty-project_panel")
+                .size_full()
+                .track_focus(&self.focus_handle(cx))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .p_4()
+                        .justify_center()
+                        .gap_1()
+                        .text_center()
+                        .text_size(rems(0.8125))
+                        .child(div().w_full().child("Solution is empty"))
+                        .child(
+                            div()
+                                .w_full()
+                                .text_color(cx.theme().colors().text_muted)
+                                .child("Add projects from the catalog to start working."),
+                        ),
+>>>>>>> theirs
                 )
                 .when(is_local, |div| {
                     div.when(panel_settings.drag_and_drop, |div| {
@@ -7374,6 +7643,25 @@ impl Panel for ProjectPanel {
         Some(workspace::HideStatusItem::new(|settings| {
             settings.project_panel.get_or_insert_default().button = Some(false);
         }))
+    }
+}
+
+impl ProjectPanel {
+    pub fn select_path_for_test(&mut self, project_path: ProjectPath, cx: &App) {
+        let Some(worktree) = self
+            .project
+            .read(cx)
+            .worktree_for_id(project_path.worktree_id, cx)
+        else {
+            return;
+        };
+        let Some(entry) = worktree.read(cx).entry_for_path(project_path.path.as_ref()) else {
+            return;
+        };
+        self.selection = Some(SelectedEntry {
+            worktree_id: project_path.worktree_id,
+            entry_id: entry.id,
+        });
     }
 }
 

@@ -19,9 +19,15 @@ Start with [AI Quick Start](./quick-start.md) if you know what you want to do. U
 
 Agent paths decide how agentic work runs in Zed.
 
+<<<<<<< ours
 - [Zed Agent](./zed-agent.md): Zed's native agent. It can use models configured through [LLM Providers](./llm-providers.md), including Zed-hosted models, provider API keys, supported subscriptions, gateways, and local models. It also uses built-in tools, profiles, skills, instructions, and MCP servers.
 - [External Agents](./external-agents.md): ACP-integrated agents that run through their own process and configuration.
 - [Terminal Threads](./terminal-threads.md): terminal-backed threads for running an agent CLI or TUI directly in Zed.
+=======
+The [Threads Sidebar](./parallel-agents.md#threads-sidebar) is where you organize agent work. Start a thread, give it a task, and the agent reads, edits, and runs code in your project. You can run multiple threads at once, each using a different agent and working against different projects. See [Tools](./tools.md) for the capabilities available to Zed's built-in agent.
+
+The [Agent Panel](./agent-panel.md) is the conversation view for the active thread. Use it to send prompts, review changes, add context, and interact with the agent as it works.
+>>>>>>> theirs
 
 The [Threads Sidebar](./parallel-agents.md#threads-sidebar) is where you organize agent work. You can run multiple agent threads and Terminal Threads at once, each using a different agent and working against different projects.
 
@@ -35,7 +41,15 @@ See [LLM Providers](./llm-providers.md) to choose a model access path.
 
 ## AI Features {#ai-features}
 
+<<<<<<< ours
 Zed has several AI-powered workflows:
+=======
+- [Configuration](./configuration.md): Connect to Anthropic, OpenAI, Ollama, Google AI, or other LLM providers.
+- [Parallel Agents](./parallel-agents.md): Run multiple threads at once with the Threads Sidebar.
+- [External Agents](./external-agents.md): Run Claude Agent, Codex, Aider, or other external agents inside Zed.
+- [Subscription](./subscription.md): Zed's hosted models and billing.
+- [Privacy and Security](./privacy-and-security.md): How Zed handles data when using AI features.
+>>>>>>> theirs
 
 - [Agent Panel](./agent-panel.md): prompt agents, add context, review changes, and manage active threads.
 - [Parallel Agents](./parallel-agents.md): run multiple threads across projects and worktrees.

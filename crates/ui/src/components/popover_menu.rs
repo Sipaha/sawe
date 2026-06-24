@@ -381,7 +381,22 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
                         anchored =
                             anchored.position(child_bounds.corner(self.resolved_attach()) + offset);
                     }
-                    let mut element = deferred(anchored.child(div().occlude().child(menu.clone())))
+                    // Dismiss the menu when the user mouses down anywhere
+                    // outside its bounds. PopoverMenu's only other built-in
+                    // dismiss path is "click on the trigger toggle", so
+                    // without this every popover stays stuck open until the
+                    // user explicitly hits Escape or clicks the trigger
+                    // again. Wired here on the menu's outer div (rather
+                    // than per-popover) so every PopoverMenu in the app
+                    // gets the same behaviour for free.
+                    let dismiss_menu = menu.clone();
+                    let menu_div = div()
+                        .occlude()
+                        .on_mouse_down_out(move |_, _, cx| {
+                            dismiss_menu.update(cx, |_, cx| cx.emit(DismissEvent));
+                        })
+                        .child(menu.clone());
+                    let mut element = deferred(anchored.child(menu_div))
                         .with_priority(1)
                         .into_any();
 

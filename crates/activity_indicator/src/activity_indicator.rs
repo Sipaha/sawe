@@ -22,7 +22,11 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+<<<<<<< ours
 use ui::{ContextMenu, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
+=======
+use ui::{CommonAnimationExt, ContextMenu, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
+>>>>>>> theirs
 use util::truncate_and_trailoff;
 use workspace::{StatusItemView, Workspace, item::ItemHandle};
 
@@ -658,9 +662,14 @@ impl Render for ActivityIndicator {
 
         let activity_indicator = cx.entity().downgrade();
         let truncate_content = content.message.len() > MAX_MESSAGE_LEN;
+<<<<<<< ours
         let has_click_handler = content.on_click.is_some();
 
         result.child(
+=======
+
+        result.gap_2().child(
+>>>>>>> theirs
             PopoverMenu::new("activity-indicator-popover")
                 .trigger(
                     Button::new("activity-indicator-trigger", {
@@ -671,6 +680,7 @@ impl Render for ActivityIndicator {
                         }
                     })
                     .label_size(LabelSize::Small)
+<<<<<<< ours
                     .map(|this| match content.icon {
                         ActivityIcon::LoadingSpinner => this.loading(true),
                         ActivityIcon::Icon(icon_name) => this.start_icon(
@@ -678,6 +688,14 @@ impl Render for ActivityIndicator {
                                 .size(IconSize::Small)
                                 .color(Color::Muted),
                         ),
+=======
+                    .when(content.icon.is_some(), |this| {
+                        this.start_icon(
+                            Icon::new(IconName::LoadCircle)
+                                .color(Color::Muted)
+                                .size(IconSize::Small),
+                        )
+>>>>>>> theirs
                     })
                     .map(|button| {
                         if truncate_content {

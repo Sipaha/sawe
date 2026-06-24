@@ -67,7 +67,11 @@ pub(crate) fn release() -> Workflow {
         job_output,
     );
 
+<<<<<<< ours
     let (auto_release_preview, auto_release_published) =
+=======
+    let auto_release_preview =
+>>>>>>> theirs
         auto_release_preview(&[&validate_release_assets, &release_compliance]);
 
     let test_jobs = [
@@ -593,6 +597,11 @@ pub(crate) fn push_release_update_notification(
                 echo ""
             elif [ "$VALIDATE_RESULT" == "failure" ]; then
                 echo "❌ Release validation failed for $TAG: missing assets: $RUN_URL"
+<<<<<<< ours
+=======
+            elif [ "$AUTO_RELEASE_RESULT" == "success" ]; then
+                echo "✅ Release $TAG was auto-released successfully: $RELEASE_URL"
+>>>>>>> theirs
             elif [ "$AUTO_RELEASE_RESULT" == "failure" ]; then
                 echo "❌ Auto release failed for $TAG: $RUN_URL"
             elif [ "$AUTO_RELEASE_RESULT" == "success" ] && [ "$AUTO_RELEASE_PUBLISHED" == "true" ]; then

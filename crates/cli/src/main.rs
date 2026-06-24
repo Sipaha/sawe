@@ -44,21 +44,22 @@ trait InstalledApp {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "zed",
+    name = "spk-editor",
     disable_version_flag = true,
-    before_help = "The Zed CLI binary.
-This CLI is a separate binary that invokes Zed.
+    about = "SPK Editor — fork of Zed by Zed Industries, Inc., modified by Simonov Pavel",
+    before_help = "The SPK Editor CLI binary.
+This CLI is a separate binary that invokes SPK Editor.
 
 Examples:
-    `zed`
-          Simply opens Zed
-    `zed --foreground`
+    `spk-editor`
+          Simply opens SPK Editor
+    `spk-editor --foreground`
           Runs in foreground (shows all logs)
-    `zed path-to-your-project`
-          Open your project in Zed
-    `zed -n path-to-file `
+    `spk-editor path-to-your-project`
+          Open your project in SPK Editor
+    `spk-editor -n path-to-file `
           Open file/folder in a new window",
-    after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
+    after_help = "To read from stdin, append '-', e.g. 'ps axf | spk-editor -'"
 )]
 struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
@@ -879,8 +880,11 @@ mod linux {
 
                 // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
                 // ./zed is for the target directory in development builds.
-                let possible_locations =
-                    ["../libexec/zed-editor", "../lib/zed/zed-editor", "./zed"];
+                let possible_locations = [
+                    "../libexec/spk-editor-bin",
+                    "../lib/spk-editor/spk-editor-bin",
+                    "./zed",
+                ];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -1045,7 +1049,7 @@ mod flatpak {
 
             if !is_app_location_set {
                 args.push("--zed".into());
-                args.push(flatpak_dir.join("libexec").join("zed-editor").into());
+                args.push(flatpak_dir.join("libexec").join("spk-editor-bin").into());
             }
 
             let error = exec::execvp("/usr/bin/flatpak-spawn", args);
@@ -1056,10 +1060,10 @@ mod flatpak {
 
     pub fn set_bin_if_no_escape(mut args: super::Args) -> super::Args {
         if env::var(NO_ESCAPE_ENV_NAME).is_ok()
-            && env::var("FLATPAK_ID").is_ok_and(|id| id.starts_with("dev.zed.Zed"))
+            && env::var("FLATPAK_ID").is_ok_and(|id| id.starts_with("ru.sipaha.spk-editor"))
             && args.zed.is_none()
         {
-            args.zed = Some("/app/libexec/zed-editor".into());
+            args.zed = Some("/app/libexec/spk-editor-bin".into());
             unsafe { env::set_var("ZED_UPDATE_EXPLANATION", "Please use flatpak to update zed") };
         }
         args
@@ -1071,7 +1075,7 @@ mod flatpak {
         }
 
         if let Ok(flatpak_id) = env::var("FLATPAK_ID") {
-            if !flatpak_id.starts_with("dev.zed.Zed") {
+            if !flatpak_id.starts_with("ru.sipaha.spk-editor") {
                 return None;
             }
 
@@ -1215,9 +1219,13 @@ mod windows {
                 let cli = std::env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // ../Zed.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
+                // ../spk-editor.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
                 // directory in development builds.
-                let possible_locations = ["../Zed.exe", "../lib/zed/zed-editor.exe", "./zed.exe"];
+                let possible_locations = [
+                    "../spk-editor.exe",
+                    "../lib/spk-editor/spk-editor-bin.exe",
+                    "./zed.exe",
+                ];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -1393,7 +1401,7 @@ mod mac_os {
             user_data_dir: Option<&str>,
         ) -> io::Result<ExitStatus> {
             let path = match self {
-                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/zed"),
+                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/spk-editor"),
                 Bundle::LocalPath { executable, .. } => executable.clone(),
             };
 
@@ -1407,7 +1415,7 @@ mod mac_os {
 
         fn path(&self) -> PathBuf {
             match self {
-                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/zed"),
+                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/spk-editor"),
                 Bundle::LocalPath { executable, .. } => executable.clone(),
             }
         }

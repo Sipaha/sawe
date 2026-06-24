@@ -6,7 +6,11 @@ use smallvec::SmallVec;
 use crate::prelude::*;
 
 const START_TAB_SLOT_SIZE: Pixels = px(12.);
-const END_TAB_SLOT_SIZE: Pixels = px(14.);
+// Wide enough that the centered close button (a Square `IconSize::Small`
+// button, ~16px) doesn't sit flush against the tab's trailing edge — the
+// slot is `justify_center`, so extra width pushes the `×` inward, away from
+// the tab border, instead of jamming it into the corner.
+const END_TAB_SLOT_SIZE: Pixels = px(20.);
 
 /// The position of a [`Tab`] within a list of tabs.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]

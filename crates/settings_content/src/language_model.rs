@@ -155,7 +155,10 @@ impl Default for KeepAlive {
 pub struct OpenCodeSettingsContent {
     pub api_url: Option<String>,
     pub available_models: Option<Vec<OpenCodeAvailableModel>>,
+<<<<<<< ours
     pub custom_headers: Option<HashMap<String, String>>,
+=======
+>>>>>>> theirs
     /// Whether to show OpenCode Zen models. Defaults to true.
     pub show_zen_models: Option<bool>,
     /// Whether to show OpenCode Go models. Defaults to true.
@@ -185,11 +188,14 @@ pub struct OpenCodeAvailableModel {
     pub subscription: Option<OpenCodeModelSubscription>,
     /// Custom Model API URL to use for this model.
     pub custom_model_api_url: Option<String>,
+<<<<<<< ours
     /// Supported reasoning effort levels, for example `["low", "medium", "high"].
     pub reasoning_effort_levels: Option<Vec<ReasoningEffort>>,
     /// When using OpenAiChat protocol, whether thinking tokens are sent as a dedicated `reasoning_content` field or inline in message text.
     #[serde(default)]
     pub interleaved_reasoning: bool,
+=======
+>>>>>>> theirs
 }
 
 #[with_fallible_options]

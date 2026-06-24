@@ -1,6 +1,10 @@
 [build]
 # v0 mangling scheme provides more detailed backtraces around closures
 rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
+# sccache: dedupe rustc artifacts across worktrees + parallel checkouts.
+# Required: `cargo install sccache --locked`.
+# Disable for one invocation: `RUSTC_WRAPPER= cargo build`.
+rustc-wrapper = "sccache"
 
 [alias]
 xtask = "run --package xtask --"
@@ -19,6 +23,11 @@ rustflags = [
 # We need lld to link libwebrtc.a successfully on aarch64-linux
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# SPK Editor fork-local: mandatory mold for x86_64-linux. ~5-10x faster link, lower peak RAM.
+# Upstream uses system `ld`. See FORK.md decision #15. Requires `apt install mold` / `brew install mold`.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "10.15.7"

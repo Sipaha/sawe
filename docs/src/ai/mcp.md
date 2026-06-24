@@ -163,9 +163,15 @@ Learn more about [how tool permissions work](./tool-permissions.md), how to furt
 
 ### External Agents
 
+<<<<<<< ours
 MCP servers configured in Zed are forwarded to [External Agents](./external-agents.md) via the [Agent Client Protocol](https://agentclientprotocol.com/). External Agents can also access MCP servers from their own native configuration files.
 
 For details on what configuration is shared between Zed and External Agents, see [Configuration Boundaries](./external-agents.md#configuration-boundaries).
+=======
+MCP servers configured in Zed are forwarded to [external agents](./external-agents.md) via the [Agent Client Protocol](https://agentclientprotocol.com/). External agents can also access MCP servers from their own native configuration files.
+
+For details on what configuration is shared between Zed and external agents, see [Configuration Boundaries](./external-agents.md#configuration-boundaries).
+>>>>>>> theirs
 
 ### Error Handling
 

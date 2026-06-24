@@ -11,7 +11,10 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
+<<<<<<< ours
 serde_yaml.workspace = true
+=======
+>>>>>>> theirs
 yaml-rust2.workspace = true
 shlex.workspace = true
 http_client.workspace = true

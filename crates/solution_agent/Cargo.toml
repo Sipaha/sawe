@@ -1,0 +1,91 @@
+[package]
+name = "solution_agent"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/solution_agent.rs"
+doctest = false
+
+[features]
+# Re-exports `test_support::{MockConnection, MockAgentServer}` so the
+# integration tests in `tests/*_e2e_test.rs` can build a working solution-
+# agent stack without spawning a real subprocess. We deliberately do NOT
+# cascade `acp_thread/test-support` or `agent_servers/test-support` —
+# enabling `project/test-support` transitively (which those would do)
+# triggers a non-exhaustive-match build error in `workspace` upstream.
+test-support = [
+    "dep:action_log",
+    "dep:async-channel",
+    "dep:watch",
+]
+
+[dependencies]
+acp_thread.workspace = true
+action_log = { workspace = true, optional = true }
+agent-client-protocol.workspace = true
+agent_servers.workspace = true
+agent_settings.workspace = true
+anyhow.workspace = true
+async-channel = { workspace = true, optional = true }
+base64.workspace = true
+chrono.workspace = true
+claude_native.workspace = true
+context_server.workspace = true
+dirs.workspace = true
+editor.workspace = true
+editor_mcp.workspace = true
+fs.workspace = true
+futures.workspace = true
+menu.workspace = true
+gpui.workspace = true
+indoc.workspace = true
+language.workspace = true
+language_models.workspace = true
+log.workspace = true
+markdown.workspace = true
+notifications.workspace = true
+parking_lot.workspace = true
+paths.workspace = true
+project.workspace = true
+rand.workspace = true
+regex.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+sha2.workspace = true
+smol.workspace = true
+solutions.workspace = true
+sqlez.workspace = true
+terminal.workspace = true
+ui.workspace = true
+util.workspace = true
+uuid = { workspace = true, features = ["serde", "v4"] }
+watch = { workspace = true, optional = true }
+workspace.workspace = true
+zed_actions.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ashpd.workspace = true
+
+[dev-dependencies]
+acp_thread = { workspace = true, features = ["test-support"] }
+action_log.workspace = true
+agent_servers = { workspace = true, features = ["test-support"] }
+async-channel.workspace = true
+claude_native = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings.workspace = true
+solutions = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+watch.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

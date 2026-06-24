@@ -4,6 +4,7 @@ use crate::{
     tests::{start_debug_session, start_debug_session_with},
     *,
 };
+use console_panel::ConsolePanel;
 use dap::{
     ErrorResponse, Message, RunInTerminalRequestArguments, SourceBreakpoint,
     StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest,
@@ -31,12 +32,11 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
-use terminal_view::terminal_panel::TerminalPanel;
 use tests::{active_debug_session_panel, init_test, init_test_workspace};
 use util::{path, rel_path::rel_path};
 use workspace::item::SaveOptions;
 use workspace::pane_group::SplitDirection;
-use workspace::{Item, dock::Panel, move_active_item};
+use workspace::{Item, move_active_item};
 
 #[gpui::test]
 async fn test_basic_show_debug_panel(executor: BackgroundExecutor, cx: &mut TestAppContext) {
@@ -556,12 +556,11 @@ async fn test_handle_error_run_in_terminal_reverse_request(
 
     workspace
         .update(cx, |workspace, _window, cx| {
-            let terminal_panel = workspace.panel::<TerminalPanel>(cx).unwrap();
+            let console_panel = workspace.panel::<ConsolePanel>(cx).unwrap();
 
-            assert_eq!(
-                0,
-                terminal_panel.read(cx).pane().unwrap().read(cx).items_len()
-            );
+            // ConsolePanel uses a Vec<ConsoleTab> instead of a Pane; assert no
+            // tabs (no terminal task was started by the malformed reverse req).
+            assert_eq!(0, console_panel.read(cx).tab_count());
         })
         .unwrap();
 }

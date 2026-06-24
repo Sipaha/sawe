@@ -6,6 +6,7 @@ publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [features]
+<<<<<<< ours
 test-support = [
     "acp_thread/test-support",
     "gpui/test-support",
@@ -15,6 +16,9 @@ test-support = [
     "dep:gpui_tokio",
     "reqwest_client/test-support",
 ]
+=======
+test-support = ["acp_thread/test-support", "gpui/test-support", "project/test-support", "dep:env_logger", "client/test-support", "dep:gpui_tokio", "reqwest_client/test-support"]
+>>>>>>> theirs
 e2e = []
 
 [lints]
@@ -33,6 +37,11 @@ anyhow.workspace = true
 chrono.workspace = true
 client.workspace = true
 collections.workspace = true
+# SPK Editor fork: read the embedded MCP socket path so spawned ACP
+# subagents (claude-acp etc.) can be wired to it via a stdio bridge —
+# see `mcp_servers_for_project` for the injection site and FORK.md
+# decision 14.
+editor_mcp.workspace = true
 env_logger = { workspace = true, optional = true }
 fs.workspace = true
 futures.workspace = true

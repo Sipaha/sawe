@@ -1,20 +1,26 @@
 mod application_menu;
 pub mod collab;
+mod fork_height;
 mod onboarding_banner;
 mod plan_chip;
+mod project_toolbar;
 mod title_bar_settings;
 mod update_version;
+
+pub use fork_height::{FORK_TITLE_BAR_CONTENT_HEIGHT_PX, fork_title_bar_content_height};
 
 use crate::application_menu::{ApplicationMenu, show_menus};
 use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
-use git_ui::worktree_picker::WorktreePicker;
 pub use platform_title_bar::{
     self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
     ShowNextWindowTab, ShowPreviousWindowTab,
 };
+<<<<<<< ours
 use project::{linked_worktree_short_name, repo_identity_path};
+=======
+>>>>>>> theirs
 
 #[cfg(not(target_os = "macos"))]
 use crate::application_menu::{
@@ -27,27 +33,38 @@ use client::{Client, UserStore, zed_urls};
 use command_palette_hooks::CommandPaletteFilter;
 
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity, Focusable,
+    Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
     pulsating_between,
 };
 use onboarding_banner::OnboardingBanner;
+<<<<<<< ours
 use project::{
     Project, git_store::GitStoreEvent, project_settings::ProjectSettings,
     trusted_worktrees::TrustedWorktrees,
 };
 use remote::RemoteConnectionOptions;
 use settings::{Settings as _, SettingsStore};
+=======
+use project::{Project, git_store::GitStoreEvent, trusted_worktrees::TrustedWorktrees};
+use project_toolbar::ProjectToolbar;
+use settings::Settings as _;
+use solutions_ui::solution_tab_strip::SolutionTabStrip;
+>>>>>>> theirs
 
 use std::any::TypeId;
 use std::sync::Arc;
 use std::time::Duration;
-use theme::ActiveTheme;
 use title_bar_settings::TitleBarSettings;
 use ui::{
+<<<<<<< ours
     Avatar, ButtonLike, ContextMenu, ContextMenuEntry, IconWithIndicator, Indicator, PopoverMenu,
     PopoverMenuHandle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
+=======
+    Avatar, ButtonLike, ContextMenu, ContextMenuEntry, Indicator, PopoverMenu, PopoverMenuHandle,
+    TintColor, Tooltip, prelude::*,
+>>>>>>> theirs
 };
 use update_version::UpdateVersion;
 use util::ResultExt;
@@ -56,13 +73,7 @@ use workspace::{
     notifications::{NotifyResultExt, NotifyTaskExt as _},
 };
 
-use zed_actions::OpenRemote;
-
 pub use onboarding_banner::restore_banner;
-
-const MAX_PROJECT_NAME_LENGTH: usize = 40;
-const MAX_BRANCH_NAME_LENGTH: usize = 40;
-const MAX_SHORT_SHA_LENGTH: usize = 8;
 
 actions!(
     collab,
@@ -101,9 +112,11 @@ pub fn init(cx: &mut App) {
             return;
         };
         let multi_workspace = workspace.multi_workspace().cloned();
-        let item = cx.new(|cx| TitleBar::new("title-bar", workspace, multi_workspace, window, cx));
+        let item =
+            cx.new(|cx| TitleBar::new("title-bar", workspace, multi_workspace.clone(), window, cx));
         workspace.set_titlebar_item(item.into(), window, cx);
 
+<<<<<<< ours
         workspace.register_action(|_workspace, _: &UseClassicLayout, _window, cx| {
             set_window_layout(WindowLayout::Editor(None), cx);
         });
@@ -111,6 +124,15 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|_workspace, _: &UseAgenticLayout, _window, cx| {
             set_window_layout(WindowLayout::Agent(None), cx);
         });
+=======
+        // SPK Editor fork: the full-width project toolbar row that sits below
+        // the title bar (hosts the project-tab strip + relocated branch widget
+        // + run-config strip). Created here alongside the title bar because the
+        // `workspace` crate can't depend on `solutions_ui`/`git_ui`/`run_config`.
+        let project_toolbar =
+            cx.new(|cx| ProjectToolbar::new(workspace, multi_workspace, cx));
+        workspace.set_project_toolbar_item(project_toolbar.into(), window, cx);
+>>>>>>> theirs
 
         workspace.register_action(|workspace, _: &SimulateUpdateAvailable, _window, cx| {
             if let Some(titlebar) = workspace
@@ -168,6 +190,35 @@ pub fn init(cx: &mut App) {
                 });
             }
         });
+
+        workspace.register_action(
+            |workspace, _: &git_ui::branch_picker::BranchesPopupOpen, window, cx| {
+                // SPK Editor fork: the branch widget moved from the title bar to
+                // the project toolbar row, so reach it via `project_toolbar_item`.
+                if let Some(toolbar) = workspace
+                    .project_toolbar_item()
+                    .and_then(|item| item.downcast::<ProjectToolbar>().ok())
+                {
+                    // Defer via `Window::defer` (callback gets `&mut Window,
+                    // &mut App` — crucially NOT `&mut Workspace`) so the popover's
+                    // `.menu()` closure, which reads the `Workspace` entity at show
+                    // time, doesn't double-lease it. `cx.defer_in` would re-lease
+                    // `Workspace` in its callback and panic just the same.
+                    window.defer(cx, move |window, cx| {
+                        toolbar.update(cx, |toolbar, cx| {
+                            toolbar.toggle_branch_popover(window, cx);
+                        });
+                    });
+                    return;
+                }
+                // Fallback: no title bar (e.g. headless) — open a centered modal.
+                let repository = workspace.project().read(cx).active_repository(cx);
+                let handle = workspace.weak_handle();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    git_ui::branch_picker::BranchesPopup::new(handle, repository, window, cx)
+                });
+            },
+        );
     })
     .detach();
 }
@@ -202,6 +253,10 @@ pub struct TitleBar {
     workspace: WeakEntity<Workspace>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     application_menu: Option<Entity<ApplicationMenu>>,
+    // Created lazily once both `workspace` and `multi_workspace` are
+    // resolved — `multi_workspace` may be `None` at construction and is
+    // populated in `render` (see the top of `Render::render`).
+    solution_tab_strip: Option<Entity<SolutionTabStrip>>,
     _subscriptions: Vec<Subscription>,
     banner: Option<Entity<OnboardingBanner>>,
     update_version: Entity<UpdateVersion>,
@@ -230,6 +285,7 @@ impl Render for TitleBar {
 
         let show_menus = show_menus(cx);
 
+<<<<<<< ours
         let mut children = <ArrayVec<_, 5>>::new();
 
         let mut project_name = None;
@@ -283,23 +339,23 @@ impl Render for TitleBar {
                 }
             }
         }
+=======
+        let solution_tab_strip = self.ensure_solution_tab_strip(cx);
+
+        let mut children = <ArrayVec<_, 4>>::new();
+>>>>>>> theirs
 
         children.push(
             h_flex()
                 .h_full()
                 .gap_0p5()
                 .map(|title_bar| {
-                    let mut render_project_items = title_bar_settings.show_branch_name
-                        || title_bar_settings.show_project_items;
                     title_bar
                         .when_some(
                             self.application_menu.clone().filter(|_| !show_menus),
-                            |title_bar, menu| {
-                                render_project_items &=
-                                    !menu.update(cx, |menu, cx| menu.all_menus_shown(cx));
-                                title_bar.child(menu)
-                            },
+                            |title_bar, menu| title_bar.child(menu),
                         )
+<<<<<<< ours
                         .children(self.render_restricted_mode(cx))
                         .when(render_project_items, |title_bar| {
                             title_bar
@@ -318,6 +374,32 @@ impl Render for TitleBar {
                                         ))
                                     },
                                 )
+=======
+                        // SPK Editor fork: the "Restricted Mode" badge in
+                        // the title bar competes for attention with little
+                        // upside — trust is granted at the solution
+                        // catalog layer (see `solutions::auto_trust`), so
+                        // any project inside a Solution's root is trusted
+                        // automatically. The badge stayed surprising for
+                        // single-file ad-hoc opens. Render-site disabled,
+                        // function intact for upstream-merge friendliness.
+                        // .children(self.render_restricted_mode(cx))
+                        // SPK Editor fork: the upstream project-info chain
+                        // (solution name + project name + worktree/branch)
+                        // is replaced by the horizontal solution-tab strip.
+                        // The strip's tabs are the per-solution surface
+                        // for switching between open solutions in this
+                        // window; the active solution + branch surface
+                        // moves into the new fork status bar (Phase 2
+                        // Task 9). The `show_branch_name` /
+                        // `show_project_items` settings no longer have a
+                        // surface to gate here.
+                        .when_some(solution_tab_strip, |title_bar, strip| {
+                            // Nudge the strip right so its first tab lines up
+                            // with the project tabs / left-panel edge below it
+                            // (the hamburger sits in the gutter to its left).
+                            title_bar.child(div().w(px(5.))).child(strip)
+>>>>>>> theirs
                         })
                 })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -344,11 +426,12 @@ impl Render for TitleBar {
                     | client::Status::Authenticated
                     | client::Status::Connecting
             );
-        let is_signed_out_or_auth_error = user.is_none()
-            && matches!(
-                status,
-                client::Status::SignedOut | client::Status::AuthenticationError
-            );
+        // Sign-in UI is hidden in spk-editor — Zed accounts are not used.
+        // let is_signed_out_or_auth_error = user.is_none()
+        //     && matches!(
+        //         status,
+        //         client::Status::SignedOut | client::Status::AuthenticationError
+        //     );
 
         children.push(
             h_flex()
@@ -361,15 +444,23 @@ impl Render for TitleBar {
                 })
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+<<<<<<< ours
                 .child(self.render_call_controls(window, cx))
+=======
+                // SPK Editor fork: the branch widget and run-config strip moved
+                // out of the title bar into the new project toolbar row
+                // (`ProjectToolbar`, mounted below the title bar by `Workspace`).
+                .children(self.render_call_controls(window, cx))
+>>>>>>> theirs
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
-                .when(
-                    user.is_none()
-                        && is_signed_out_or_auth_error
-                        && TitleBarSettings::get_global(cx).show_sign_in,
-                    |this| this.child(self.render_sign_in_button(cx)),
-                )
+                // Sign-in UI is hidden in spk-editor — Zed accounts are not used.
+                // .when(
+                //     user.is_none()
+                //         && is_signed_out_or_auth_error
+                //         && TitleBarSettings::get_global(cx).show_sign_in,
+                //     |this| this.child(self.render_sign_in_button(cx)),
+                // )
                 .when(is_signing_in, |this| {
                     this.child(
                         Label::new("Signing in…")
@@ -400,7 +491,10 @@ impl Render for TitleBar {
                 );
             });
 
-            let height = platform_title_bar_height(window);
+            // SPK Editor fork: the content row uses the fork-local
+            // height so we can resize it for the solution-tab strip
+            // without also enlarging the platform window-controls row.
+            let height = fork_title_bar_content_height();
             let title_bar_color = self.platform_titlebar.update(cx, |platform_titlebar, cx| {
                 platform_titlebar.title_bar_color(window, cx)
             });
@@ -508,6 +602,7 @@ impl TitleBar {
             application_menu,
             workspace: workspace.weak_handle(),
             multi_workspace,
+            solution_tab_strip: None,
             project,
             user_store,
             client,
@@ -523,33 +618,28 @@ impl TitleBar {
         this
     }
 
-    fn worktree_count(&self, cx: &App) -> usize {
-        self.project.read(cx).visible_worktrees(cx).count()
-    }
-
     fn toggle_update_simulation(&mut self, cx: &mut Context<Self>) {
         self.update_version
             .update(cx, |banner, cx| banner.update_simulation(cx));
         cx.notify();
     }
 
-    /// Returns the worktree to display in the title bar.
-    /// - Prefer the worktree owning the project's active repository
-    /// - Fall back to the first visible worktree
-    pub fn effective_active_worktree(&self, cx: &App) -> Option<Entity<project::Worktree>> {
-        let project = self.project.read(cx);
-
-        if let Some(repo) = project.active_repository(cx) {
-            let repo = repo.read(cx);
-            let repo_path = &repo.work_directory_abs_path;
-
-            for worktree in project.visible_worktrees(cx) {
-                let worktree_path = worktree.read(cx).abs_path();
-                if worktree_path == *repo_path || worktree_path.starts_with(repo_path.as_ref()) {
-                    return Some(worktree);
-                }
-            }
+    /// Build (or return the cached) `SolutionTabStrip` entity. Called from
+    /// `render`. The strip is created lazily because `multi_workspace` may
+    /// arrive after `TitleBar::new` (see the late-set fallback at the top
+    /// of `Render::render`); once both `workspace` and `multi_workspace`
+    /// are resolved the entity is cached for the lifetime of the title bar.
+    fn ensure_solution_tab_strip(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<SolutionTabStrip>> {
+        if self.solution_tab_strip.is_none() {
+            let workspace = self.workspace.clone();
+            let multi_workspace = self.multi_workspace.clone()?;
+            let strip = cx.new(|cx| SolutionTabStrip::new(workspace, multi_workspace, cx));
+            self.solution_tab_strip = Some(strip);
         }
+<<<<<<< ours
 
         project.visible_worktrees(cx).next()
     }
@@ -666,8 +756,15 @@ impl TitleBar {
                 .anchor(gpui::Anchor::TopLeft)
                 .into_any_element(),
         )
+=======
+        self.solution_tab_strip.clone()
+>>>>>>> theirs
     }
 
+    // SPK Editor fork: render site is disabled (see comment near the
+    // title-bar layout above). Function is kept for upstream-merge
+    // friendliness; allow-dead-code so the unused-warn doesn't fire.
+    #[allow(dead_code)]
     pub fn render_restricted_mode(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let has_restricted_worktrees =
             TrustedWorktrees::has_restricted_worktrees(&self.project.read(cx).worktree_store(), cx);
@@ -710,6 +807,7 @@ impl TitleBar {
         }
     }
 
+<<<<<<< ours
     pub fn render_project_host(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.project.read(cx).is_via_remote_server() {
             return self.render_remote_project_connection(cx);
@@ -1069,6 +1167,8 @@ impl TitleBar {
         )
     }
 
+=======
+>>>>>>> theirs
     fn window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if window.is_window_active() {
             ActiveCall::global(cx)
@@ -1258,6 +1358,13 @@ impl TitleBar {
                 let is_agent = matches!(current_layout, WindowLayout::Agent(_));
                 let is_custom = matches!(current_layout, WindowLayout::Custom(_));
 
+                let ai_enabled = !project::DisableAiSettings::get_global(cx).disable_ai;
+                let current_layout = AgentSettings::get_layout(cx);
+                let is_editor = matches!(current_layout, WindowLayout::Editor(_));
+                let is_agent = matches!(current_layout, WindowLayout::Agent(_));
+                let is_custom = matches!(current_layout, WindowLayout::Custom(_));
+                let fs = <dyn fs::Fs>::global(cx);
+
                 ContextMenu::build(window, cx, |menu, _, _cx| {
                     menu.when(is_signed_in, |this| {
                         let user_login = user_login.clone();
@@ -1367,12 +1474,20 @@ impl TitleBar {
                         zed_actions::Extensions::default().boxed_clone(),
                     )
                     .when(ai_enabled, |menu| {
+<<<<<<< ours
                         menu.separator()
                             .submenu("Panel Layout", move |menu, _window, _cx| {
+=======
+                        let fs = fs.clone();
+                        menu.separator()
+                            .submenu("Panel Layout", move |menu, _window, _cx| {
+                                let fs = fs.clone();
+>>>>>>> theirs
                                 menu.toggleable_entry(
                                     "Classic",
                                     is_editor,
                                     IconPosition::Start,
+<<<<<<< ours
                                     Some(UseClassicLayout.boxed_clone()),
                                     move |window, cx| {
                                         window.dispatch_action(UseClassicLayout.boxed_clone(), cx);
@@ -1387,6 +1502,30 @@ impl TitleBar {
                                         window.dispatch_action(UseAgenticLayout.boxed_clone(), cx);
                                     },
                                 )
+=======
+                                    None,
+                                    {
+                                        let fs = fs.clone();
+                                        move |_window, cx| {
+                                            drop(AgentSettings::set_layout(
+                                                WindowLayout::Editor(None),
+                                                fs.clone(),
+                                                cx,
+                                            ));
+                                        }
+                                    },
+                                )
+                                .toggleable_entry("Agentic", is_agent, IconPosition::Start, None, {
+                                    let fs = fs.clone();
+                                    move |_window, cx| {
+                                        drop(AgentSettings::set_layout(
+                                            WindowLayout::Agent(None),
+                                            fs.clone(),
+                                            cx,
+                                        ));
+                                    }
+                                })
+>>>>>>> theirs
                                 .when(is_custom, |menu| {
                                     menu.item(
                                         ContextMenuEntry::new("Custom")

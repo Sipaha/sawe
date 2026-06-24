@@ -1058,11 +1058,15 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
 
             let project_name = self.project_name().await?;
             self.docker_client
+<<<<<<< ours
                 .docker_compose_build(
                     &docker_compose_resources.files,
                     &project_name,
                     dev_container.run_services.as_ref(),
                 )
+=======
+                .docker_compose_build(&docker_compose_resources.files, &project_name)
+>>>>>>> theirs
                 .await?;
             (
                 self.docker_client
@@ -1155,11 +1159,15 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
 
                 let project_name = self.project_name().await?;
                 self.docker_client
+<<<<<<< ours
                     .docker_compose_build(
                         &docker_compose_resources.files,
                         &project_name,
                         dev_container.run_services.as_ref(),
                     )
+=======
+                    .docker_compose_build(&docker_compose_resources.files, &project_name)
+>>>>>>> theirs
                     .await?;
 
                 (

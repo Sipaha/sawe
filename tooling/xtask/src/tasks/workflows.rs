@@ -24,6 +24,7 @@ mod extensions;
 mod nix_build;
 mod publish_extension_cli;
 mod release_nightly;
+mod retag_release;
 mod run_bundling;
 
 mod release;
@@ -238,6 +239,12 @@ pub fn run_workflows(args: GenerateWorkflowArgs) -> Result<()> {
         WorkflowFile::zed(publish_extension_cli::publish_extension_cli),
         WorkflowFile::zed(release::release),
         WorkflowFile::zed(release_nightly::release_nightly),
+<<<<<<< ours
+=======
+        WorkflowFile::zed(retag_release::retag_release),
+        WorkflowFile::zed(run_agent_evals::run_cron_unit_evals),
+        WorkflowFile::zed(run_agent_evals::run_unit_evals),
+>>>>>>> theirs
         WorkflowFile::zed(run_bundling::run_bundling),
         WorkflowFile::zed(run_tests::run_tests),
         /* workflows used for CI/CD in extension repositories */

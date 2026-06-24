@@ -1,3 +1,165 @@
+# Project: SPK Editor
+
+SPK Editor is a personal fork of [Zed](https://github.com/zed-industries/zed) maintained by Simonov Pavel ([@Sipaha](https://github.com/Sipaha)). Repo: <https://github.com/Sipaha/spk-editor>.
+
+## Entry points
+
+- **Doc bookshelf:** [`docs/INDEX.md`](docs/INDEX.md) — start here every session after this file.
+- **Supervisor workflow** (multi-agent dispatch, plan docs, verification ritual): [`docs/workflow/supervisor-mode.md`](docs/workflow/supervisor-mode.md).
+- **Where do I write this?** → [`docs/workflow/doc-discipline.md`](docs/workflow/doc-discipline.md).
+- **What's different from upstream Zed?** → [`FORK.md`](FORK.md).
+
+## Resume protocol — "ты автономный супервизор. Продолжай работу"
+
+When the user says any of these (any language, any phrasing close to
+"continue work as the autonomous supervisor"):
+
+- `ты автономный супервизор`
+- `продолжай работу` / `продолжай`
+- `autonomous supervisor` / `continue work` / `continue`
+- `resume`
+
+…the supervisor **immediately** does this — no clarifying questions:
+
+1. `Glob` `docs/findings/*-session-handoff.md` → `Read` the
+   lexicographically-latest one. That file is the previous session's
+   pause snapshot — it lists the outstanding task pool, open
+   architectural decisions, and active gotchas.
+2. `Read` `docs/workflow/supervisor-mode.md` § 7 "NEXT" — the priority
+   heuristic for picking the next phase.
+3. `git log --oneline -15` — sanity-check the recent commit chain
+   matches what the handoff doc claims.
+4. **Pick the next phase** from the pool per § 7 heuristic (no
+   priority polling — `feedback_supervisor_no_priority_questions.md`
+   in memory) and start the work in the **same turn**:
+   - HEAVY → write plan-doc inline-friendly + commit + dispatch a
+     sub-agent in a worktree.
+   - LIGHT → just do it.
+
+If there is **no handoff finding** (first-ever session, or someone
+purged them): read `docs/INDEX.md` first, then start a sensible LIGHT
+or HEAVY pick based on what's at the top of the plans table.
+
+When the supervisor pauses a session (user says "сделай паузу",
+"приостанови", "пауза", "stop", "context reset"), it **must write a
+fresh `docs/findings/YYYY-MM-DD-session-handoff.md`** capturing:
+commit chain since the last handoff, what shipped, outstanding pool,
+open architectural decisions, active gotchas. Then update
+`docs/INDEX.md` § findings to add the new row at the top. This is what
+makes the next resume bootstrap-free.
+
+## Fork philosophy — read this before suggesting changes
+
+SPK Editor is a standalone product. We do **not** merge or cherry-pick from
+upstream Zed. The codebase is fully ours — every crate is fair game for
+bug fixes, refactors, renames, cleanup, and feature work driven by product
+needs, not by upstream-diff hygiene. There is no "untouched core" zone:
+if `editor`, `language`, `lsp`, `multi_buffer`, `project`, `terminal`,
+`dap`, `vim`, `theme`, `gpui`, etc. need changes to make a feature work
+right, change them.
+
+Rules that still apply:
+
+- **Disable, don't delete** for explicitly-disabled upstream subsystems
+  (collab, auto_update, telemetry, Zeta, native cloud LLM, Sentry uploads,
+  upstream agent panel). Keep the crates in the workspace and the code in
+  tree — only init / dispatch / UI registration sites are commented out
+  (`if false { … }` is fine). Re-enabling is a one-line change, and we
+  haven't audited what other crates implicitly depend on these
+  subsystems' types, traits, or globals.
+
+- **Locked rebrand identifiers** (spec §3, change requires user approval):
+  display name `SPK Editor` (Dock/About/title bar); CLI binary
+  `spk-editor`; macOS bundle ids `ru.sipaha.spk-editor[-{preview,nightly,dev,debug}]`;
+  URL scheme `spk-editor://`; config dir `~/.config/spk-editor/` (Linux),
+  `~/Library/Application Support/SpkEditor/` (macOS — no space in path,
+  display name keeps space), `%APPDATA%\SpkEditor\` (Windows — no space in
+  path); GitHub `Sipaha/spk-editor`; attribution string `Fork of Zed by
+  Zed Industries, Inc., modified by Simonov Pavel`; per-project config
+  dir `.spke/` (replacing upstream `.zed/`; `.zed_server` /
+  `.zed_wsl_server` remain unchanged as preserved upstream identifiers).
+  These are user-visible identity, not merge-friendliness — they don't
+  change just because the merge cost went away.
+
+- **License compliance**: never modify `LICENSE-{GPL,AGPL,APACHE}` or
+  remove `Copyright Zed Industries, Inc.` lines. Fork contents under same
+  SPDX as upstream (`GPL-3.0-or-later` editor, `AGPL-3.0` collab,
+  `Apache-2.0` libraries). Inherited Zed legal docs live in
+  `legal/upstream-zed/` and don't apply to this fork's binaries (no
+  service infrastructure).
+
+## What's disabled (do NOT try to "fix" these without explicit instruction)
+
+| Subsystem | Where disabled |
+|---|---|
+| `auto_update` | init skipped in `crates/zed/src/main.rs`; "Check for Updates" menu hidden in `app_menus.rs` |
+| `telemetry` | `send_event` + `flush_events_inner` early-return; defaults `metrics:false`/`diagnostics:false` |
+| `collab` / `collab_ui` | `collab_ui::init` skipped; CollabPanel not loaded; "Collab Panel" menu hidden |
+| Sign-in | title-bar `render_sign_in_button` not invoked; onboarding `SignIn` action no-op'd |
+| Native cloud LLM | `CloudLanguageModelProvider::new` wrapped in `if false`; "Zed Agent" entry hidden in agent panel |
+| `zeta` (edit prediction) | `EditPredictionProvider::Zed` arm returns `None`; default `provider:"none"` |
+| Sentry uploads | `upload_panic`/`upload_minidump`/`upload_build_timings` all early-return; local panic logs preserved |
+| CI workflows | 41 workflows hard-disabled (`if: false`); `run_tests.yml` is `workflow_dispatch:` only |
+| `agent_ui::AgentPanel` dock + Welcome agent card | `initialize_agent_panel` not called from `crates/zed/src/zed.rs::initialize_panels`; `crates/workspace/src/welcome.rs::render_agent_card` gated off via `false &&`. `agent_ui::init` still runs (inline_assistant / rules_library / context_server modal depend on it) — only the user-facing panel surface is hidden. Fork uses `solution_agent` for AI. |
+
+## What's kept
+
+- **Extension registry on `zed.dev`** — extensions panel still browses / installs from upstream registry.
+- **External agents via ACP** (Claude Code subprocess, Gemini CLI, etc.) — `agent_servers` + `acp*` are wired up; the upstream `AgentPanel` UI surface is hidden in this fork. AI in this fork = `claude` subprocess driven by `solution_agent`, NOT API tokens.
+- **BYOK providers** (Copilot, Anthropic via API key, Ollama, etc.) — defined but not promoted in UI.
+- **Multi-project Solutions** (`solutions` + `solutions_ui`) — group N catalog projects into one window. See `FORK.md`.
+- **Solution-scoped AI sessions** (`solution_agent`) — N parallel Claude Code sessions per Solution, multiplexed onto a shared subprocess per `(solution, agent)` pair. Auth via subscription, not API key. See `FORK.md`.
+
+## Build + test conventions
+
+- Bundling produces `bin/spk-editor` + `libexec/spk-editor-bin` (Linux), `SpkEditor.app/Contents/MacOS/spk-editor` (macOS — display name stays `SPK Editor` via plutil override in `script/bundle-mac`), `SpkEditorSetup-*.exe` (Windows).
+- Cargo target binary is `target/release/spk-editor`. The cargo crate name `zed` itself is unchanged: the rename would touch hundreds of files for ~zero functional gain, and any future cherry-pick from upstream into the editor crate would textually conflict on every renamed identifier. Only the `[[bin]] name` is overridden.
+- Codesign / notarize gated behind `SPK_EDITOR_SIGN` env var; default produces unsigned bundles.
+- Specs and plans for the rebrand work live in `docs/superpowers/{specs,plans}/`.
+- **Build profile depends on who tests next.**
+  - *Autonomous / agent-only verification* (cargo test, headless e2e, MCP-socket probes the agent drives itself) → **debug only**: `script/run-mcp --debug`, `cargo build` without `--release`, `cargo test` without `--release`. Don't burn a 3–9 min release compile for an agent's own checks.
+  - *Hand-off back to the user for hands-on testing* (they'll actually launch / use the editor and judge the change) → **build `release-fast` proactively**: `cargo build --bin spk-editor --profile release-fast` (~5 min, run in background). The user's running editor is the release-fast binary at `target/release-fast/spk-editor` talking to `~/.spk/spk-editor/config/mcp.sock` (NOT `-dev`); a debug bundle won't replace it, so without this step the "ready to test" hand-off is false. This is required, not optional — the constraint is "no surprise release compiles for agent-only work," not "never compile release."
+  - Full `cargo build --release` and `script/bundle-*` remain reserved for the maintainer.
+- **`script/run-mcp` only compiles the binary if it's _missing_** (`if [[ ! -x "$binary" ]]`). After editing any crate, run `cargo build --bin spk-editor` yourself first — otherwise `run-mcp` happily launches the stale binary and you'll silently test old code (a binary with a stale mtime / no expected `strings` match is the tell). No special feature flags are needed; `workspace.screenshot` works in plain debug builds under the native `--headless` platform (see "Screenshots" below).
+- **`cargo build … | tail` masks cargo's exit code** — the pipe reports `tail`'s status (always 0), so a failed build looks like it "succeeded" (and leaves the old binary in place). Use `set -o pipefail`, or don't pipe and grep the captured output for `^error` / `could not compile`.
+- **The rust-analyzer flycheck (`cargo check --workspace --all-targets`) holds `target/debug/.cargo-lock`.** If your `cargo build`/`cargo check` sits on "Blocking waiting for file lock on build directory" for minutes, `pkill -f "cargo check --workspace"` (it restarts harmlessly when RA next needs it).
+- **`pkill`/`kill` with a pattern that matches `spk-editor` can match the issuing Bash shell itself** → the command reports exit 144. That's noise; the kill still happened. Prefer `kill <pid>` by PID, or run the kill in a separate command from the one that depends on its result.
+- **`--features test-support` is usable as a superset but hard-codes `util::paths::home_dir()` to `/home/zed`** (deterministic test snapshots), so a `test-support` binary won't create its config dirs unless `SPK_EDITOR_HOME` is set — `script/run-mcp` sets it. You generally don't need `test-support` anymore (the screenshot tool no longer requires it).
+
+## Autonomous testing via embedded MCP
+
+A running `spk-editor` instance exposes an MCP server over a Unix socket so an agent can drive a real editor for end-to-end testing without a human in the loop. Use this whenever a change touches workspace/project/buffer/LSP behavior and you want to verify it against a live UI rather than only unit tests.
+
+**Extend the MCP surface when it's missing a primitive — don't push the gap onto the operator.** The whole point of this layer is to let an agent verify its own work hands-off. If a check is blocked only because the MCP catalog lacks a tool (a missing input primitive, an unqueryable bit of state, an event you can't subscribe to), the default is to *add that tool* in the same session — mirror the nearest existing tool (registration in the owning domain crate's `init`, a `…Params`/`…Result` pair, a unit test, a bump of the catalog count here), then use it. New primitives are cheap and compound; a human clicking through a manual repro every time does not. Only fall back to asking the operator when the gap is genuinely outside the editor (real GPU display stacking, OS dialogs, external auth). Example: `windows.hover_at` / `windows.hover_id` were added exactly this way to surface `visible_on_hover` UI (timestamps, copy buttons) that a static screenshot can't reveal.
+
+**Socket:** `~/.spk/spk-editor-dev/config/mcp.sock` for a `--debug` build, `~/.spk/spk-editor/config/mcp.sock` for release (NOT `~/.config/spk-editor/` — see `crates/paths`). Single-instance — one editor process at a time holds the socket; a second `spk-editor` invocation hands off CLI args via the existing socket and exits. Lock file is `…/config/mcp.lock`. (`script/run-mcp` prints the resolved socket path on launch.)
+
+**Tool catalog** (84 tools, JSON-RPC 2.0 over the socket — namespaces: `editor.*`, `windows.*`, `solutions.*`, `solution.git.*`, `catalog.*`, `solution_agent.*`, `workspace.*`, `project.*`, `diagnostics.*`):
+- **Probe / control:** `editor.capabilities`, `editor.handle_cli_args`, `editor.{subscribe,unsubscribe,list_subscriptions}`, `editor.{get_operation,cancel_operation}`
+- **Solutions / catalog (the multi-project workspace abstraction):** `solutions.{list,get,create,rename,delete,open,close,find_for_path,add_member,add_empty_member,remove_member,reorder_members}`, `catalog.{list,add_project,remove_project,edit_project,refresh_cache,clear_cache}`
+- **Solution-wide git (S-SOL-LOG / S-SOL-DSH):** `solution.git.{aggregated_log,status_dashboard,batch_fetch,batch_pull,checkout_pattern}` (the `commit_all` tool + solution-wide commit were removed — commit is per active project)
+- **Solution-scoped AI sessions:** `solution_agent.{list_sessions,get_session,create_session,send_message,cancel_turn,close_session,rename_session,restart_agent,authorize_tool_call,reset_context}`
+- **Windows:** `windows.{list,focus,close,dispatch_action,send_keystroke,send_text,click_at,click_id,hover_at,hover_id,dump_visual_structure}`
+- **Workspace state:** `workspace.{list_buffers,get_effective_settings,dispatch_action,screenshot,dump_visual_structure}` — the two `dump_visual_structure` variants now also return a `clickables: Vec<Clickable>` array; pair with `windows.click_id` to click by stable hash id rather than computing window-relative coordinates yourself.
+- **Project / buffer ops:** `project.{list_files,read_buffer,apply_edit,save_buffer,open_file,close_buffer,create_file,delete_file,rename_file,find_in_buffers,goto_definition,find_references}`
+- **Diagnostics:** `diagnostics.get` (per-file summaries + per-diagnostic items with severity / message / source / code)
+
+**Self-test recipe:**
+1. Build + launch via `script/run-mcp --debug --headless` (debug is mandatory for agent-driven runs — see "Build + test conventions"; `script/run-mcp` builds the binary if missing and prints the socket path when ready). **Always prefer `--headless` for agent work:** it uses the native HeadlessClient + offscreen WgpuHeadlessRenderer (ADR-0002), needs no X server, AND fully supports `workspace.screenshot`. With `$DISPLAY` set the default flips to display mode (real X window); `--display` forces that, `--headless` forces native headless. **Do not try `xvfb-run --display` as a no-display workaround for screenshots — the NVIDIA adapter under Xvfb produces blank PNGs (`docs/findings/2026-05-headless-screenshot-blank.md`).** The dev profile builds in 1-2 min (incremental) and is fine for probing structure / opening Welcome / verifying UI changes. If a check genuinely needs release-profile behaviour, pause and ask the user.
+2. Connect via `socat - UNIX-CONNECT:$HOME/.spk/spk-editor-dev/config/mcp.sock` for ad-hoc probes, or write a small Rust/Python client. JSON-RPC frames are newline-delimited.
+3. Always start with `editor.capabilities` to confirm protocol version and supported event kinds.
+4. For long-running ops (`solutions.add_member`, `catalog.refresh_cache`) use the returned `operation_id` with `editor.get_operation` to poll, or subscribe via `editor.subscribe { kinds: ["operation_completed", "operation_progress"] }` for push notifications.
+5. For visual assertions, `workspace.screenshot {solution_id, format}` returns a real PNG/WebP/JPEG of the editor *window content* (offscreen-rendered — see "Screenshots" below): immune to other windows covering the editor, **works under the native `--headless` mode** (preferred for agents) without needing any X server. `workspace.dump_visual_structure` is still useful as a cheap structured tree but does *not* recurse into rendered pane-item content (`Pane { children: [] }` is ambiguous), so screenshot when you need to see what's actually painted. **If your change touches UI — panel, dock, status row, strip, modal, widget — a screenshot of the running editor is part of "done."** Drive the right panel into view before snapping (`windows.dispatch_action {action_name: "console_panel::ToggleFocus"}` etc.) — `windows.focus` alone doesn't change which dock is visible.
+6. **Programmatic UI driving:** trigger keybindings via `windows.send_keystroke` (e.g. `{"window_id":..., "keystroke":"ctrl-shift-p"}`), type plain text via `windows.send_text`, click at coordinates via `windows.click_at` (logical pixels, top-left origin, window-relative — so it works even when the window is partly off-screen; `button: "right"` for context menus), and rest the synthetic cursor over a point/clickable via `windows.hover_at {x,y}` / `windows.hover_id {id}` (a `MouseMove` with no press — reveals `visible_on_hover` affordances like message-bubble timestamps and copy buttons; follow it with `workspace.screenshot`, which repaints and recomputes the hover hit-test from the rested cursor). Most clickable UI in this fork dispatches a named action — prefer `windows.dispatch_action` when one exists since it doesn't depend on rendered geometry. **Caveat:** `ContextMenu` submenus open on *hover*; `windows.click_at` on a submenu item just dismisses the menu. `windows.hover_at`/`hover_id` can now open a submenu by resting on its parent row, but the keyboard path (`down`/`up` to navigate, `right`/`enter` to open a submenu, `enter` to invoke) is still the more deterministic way to exercise a submenu entry. **Notification frames** (`editor/notification`) interleave with responses on the same socket; clients must filter by JSON-RPC `id` and skip frames without one (or with non-matching id) — see `crates/editor_mcp/tests/solutions_add_member_e2e_test.rs::call_tool` for a 10-line implementation.
+
+**Event subscriptions** broadcast as JSON-RPC `editor/notification` frames. Wired kinds: `operation_progress`, `operation_completed`, `solution_changed`, `solution_active_changed`, `solution_member_add_progress`, `solution_member_add_completed`, `solution_active_member_changed`, `buffer_opened`, `buffer_closed`, `buffer_saved`, `buffer_dirty_changed`, `diagnostic_updated`, `lsp_started`, `lsp_stopped`, `window_focused`, `agent_session_created`, `agent_session_closed`, `agent_session_state_changed`, `agent_session_title_changed`, `agent_session_message_appended`, `agent_session_notification_sent`. Deferred: `selection_changed` (Editor-level, not Buffer), `cli_args_received`, `server_shutting_down`. Note: AI session events use the `agent_session_*` prefix (not bare `session_*`) — defensive namespacing against future collisions.
+
+**Integration tests** in `crates/editor_mcp/tests/*_e2e_test.rs` are isolated via `editor_mcp::set_runtime_dir_for_test(tempdir)` — each test pins its own `mcp.{lock,sock}` to a tempdir, so they can run safely alongside a live `spk-editor` instance and never touch `~/.config/spk-editor/`. When you write a new e2e test that calls `editor_mcp::start_server`, you MUST call `set_runtime_dir_for_test` first or you will collide with (and corrupt) the user's real lock and socket.
+
+**Screenshots — the agent's "look at the editor" capability:** `workspace.screenshot` returns a real PNG/WebP/JPEG of the editor window content via `gpui_wgpu::WgpuHeadlessRenderer::render_to_image` (renders the current scene into an offscreen texture, reads it back). Works in plain debug *and* release builds. **If you implemented or modified ANY user-visible UI (panel, dock, strip, modal, theme, widget), screenshot before claiming the work is done — unit tests verify code correctness, not pixels.** The Read tool can open the returned PNG directly, so you can see what you painted without round-tripping through the user. **Canonical launch path for screenshots: `script/run-mcp --debug --headless`** (the native HeadlessClient + WgpuHeadlessRenderer route from ADR-0002; no Xvfb, no X server). After opening a session, drive the UI before snapping: `windows.focus` → `windows.dispatch_action {action_name: "console_panel::ToggleFocus"}` (or the analogous panel action) → `workspace.screenshot {solution_id: "...", format: "png"}`. Sample call shape: `solution_id` (not `window_id`) is the screenshot param; the returned PNG arrives inside the MCP `content` array as an `{"type":"image","data":"<base64>"}` block (NOT in `structuredContent`). **Do NOT try `xvfb-run … --display` as a fallback:** NVIDIA's Vulkan ICD silently fails the offscreen pass under Xvfb (no DRI3 → adapter selection picks NVIDIA discrete → render-attachment never rasterises), producing a uniform dark-slate PNG every time — see `docs/findings/2026-05-headless-screenshot-blank.md` for the full story and ADR-0002 for why native headless is the answer. macOS non-test builds also fall back to the blank error (the Metal `render_to_image` override is still `cfg`-gated; ungate it if a macOS agent ever drives this). `import -window root /tmp/screen.png` (ImageMagick) / `grim` (Wayland) still work for grabbing a real X display when you need to see window stacking, but for "what is the editor painting" prefer `workspace.screenshot` over the native headless build.
+
+**Architecture:** `editor_mcp` crate owns lifecycle (`SingleInstanceLock`, server bind, broadcast). Tools are registered from each domain crate's `init` (`solutions::init`, `workspace::init`) via `editor_mcp::register_tool`. Event-source coordinator is in `solutions::event_sources` (kept out of `editor_mcp` to avoid a `editor_mcp → solutions/workspace/project` dep cycle that earlier phases had to resolve).
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
@@ -163,12 +325,25 @@ Release Notes:
 - Fetch crash reports: `script/sentry-fetch <issue-id>`
 - Generate investigation prompt from crash: `script/crash-to-prompt <issue-id>`
 
+# Documenting fork-local work
+
+**Every fork-local addition or architectural decision on top of upstream MUST be recorded in `FORK.md`** at the repo root. That file is the single index for "what's different here" and the *why* behind non-obvious choices. Update it when:
+
+- A new fork-local crate is added (one row in the crates table + a one-line purpose).
+- An upstream file gets its **first** local modification (one row in the touched-files table). The point of the table is no longer "merge cost" but: "list of files where a future cherry-pick from upstream won't apply cleanly — reconcile by hand." Subsequent edits to an already-listed file don't need a new row.
+- A non-obvious architectural decision is made — record it as a numbered entry under "Key architectural decisions" with **why** (the constraint that ruled out the obvious approach) and **how to apply** (concrete guidance for future sessions).
+- A locked rebrand identifier changes (cross-reference the spec; keep `.rules` § "Locked rebrand identifiers" in sync).
+
+Don't put per-crate module layouts, type catalogs, or status updates in `FORK.md` — those go stale fast. Use `git log` for status, code for layout, and per-crate `.rules` for traps to avoid.
+
 # Rules Hygiene
 
 These `.rules` files are read by every agent session. Keep them high-signal.
 
 ## After any agentic session
 If you discover a non-obvious pattern that would help future sessions, include a **"Suggested .rules additions"** heading in your PR description with the proposed text. Do **not** edit `.rules` inline during normal feature/fix work. Reviewers decide what gets merged.
+
+Mechanical post-feature maintenance is fine without a separate suggestion (e.g. bumping the tool catalog count when a new MCP namespace lands). Architectural rules and "trap to avoid" entries follow the suggestion path.
 
 ## High bar for new rules
 Editing or clarifying existing rules is always welcome. New rules must meet **all three** criteria:

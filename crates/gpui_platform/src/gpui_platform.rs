@@ -59,20 +59,36 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
-/// Returns a new [`HeadlessRenderer`] for the current platform, if available.
-#[cfg(feature = "test-support")]
+/// Returns a new [`gpui::PlatformHeadlessRenderer`] for the current platform,
+/// if available. Used by the native headless platform path (e.g. by
+/// `HeadlessAppContext` for tests, or by callers that want to drive
+/// `Window::render_to_image` without going through the on-screen swap chain).
+///
+/// SPK fork: ungated (was `#[cfg(feature = "test-support")]`) so the native
+/// `--headless` runtime path on Linux can call this directly. The macOS arm
+/// still relies on `MetalHeadlessRenderer`, which is `test-support`-only —
+/// to use a real headless renderer on a non-test macOS build, that gating
+/// has to be removed first (see ADR-0002 § Consequences).
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "test-support"))]
     {
-        Some(Box::new(
+        return Some(Box::new(
             gpui_macos::metal_renderer::MetalHeadlessRenderer::new(),
-        ))
+        ));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        None
+        return gpui_wgpu::WgpuHeadlessRenderer::new(
+            gpui_wgpu::DEFAULT_OFFSCREEN_WIDTH,
+            gpui_wgpu::DEFAULT_OFFSCREEN_HEIGHT,
+        )
+        .map(|r| Box::new(r) as Box<dyn gpui::PlatformHeadlessRenderer>)
+        .ok();
     }
+
+    #[allow(unreachable_code)]
+    None
 }
 
 #[cfg(all(test, target_os = "macos"))]

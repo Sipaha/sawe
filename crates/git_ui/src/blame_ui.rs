@@ -1,19 +1,29 @@
 use crate::{
+    commit_context_menu::{CommitContext, build_commit_context_menu},
     commit_tooltip::{CommitAvatar, CommitTooltip},
     commit_view::CommitView,
+    git_panel::OpenAtCommit,
 };
-use editor::{BlameRenderer, Editor, hover_markdown_style};
-use git::{blame::BlameEntry, commit::ParsedCommitMessage, repository::CommitSummary};
+use editor::{
+    BlameRenderer, Editor,
+    git::blame::BlameOptions,
+    git::blame_colors::{ColorMode, author_color, date_color},
+    hover_markdown_style,
+};
+use git::{
+    GitHostingProviderRegistry, blame::BlameEntry, commit::ParsedCommitMessage,
+    parse_git_remote_url, repository::CommitSummary,
+};
 use gpui::{
-    ClipboardItem, Entity, Hsla, MouseButton, ScrollHandle, Subscription, TextStyle,
-    TextStyleRefinement, UnderlineStyle, WeakEntity, prelude::*,
+    Entity, Hsla, MouseButton, ScrollHandle, TextStyle, TextStyleRefinement, UnderlineStyle,
+    WeakEntity, prelude::*,
 };
 use markdown::{Markdown, MarkdownElement};
 use project::{git_store::Repository, project_settings::ProjectSettings};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
-use ui::{ContextMenu, CopyButton, Divider, prelude::*, tooltip_container};
+use ui::{CopyButton, Divider, prelude::*, tooltip_container};
 use workspace::Workspace;
 
 const GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED: usize = 20;
@@ -38,10 +48,70 @@ impl BlameRenderer for GitBlameRenderer {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let relative_timestamp = blame_entry_relative_timestamp(&blame_entry);
+        self.render_blame_entry_with_options(
+            style,
+            blame_entry,
+            details,
+            repository,
+            workspace,
+            editor,
+            ix,
+            sha_color,
+            &BlameOptions::default(),
+            None,
+            window,
+            cx,
+        )
+    }
+
+    fn render_blame_entry_with_options(
+        &self,
+        style: &TextStyle,
+        blame_entry: BlameEntry,
+        details: Option<ParsedCommitMessage>,
+        repository: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        editor: Entity<Editor>,
+        ix: usize,
+        sha_color: Hsla,
+        options: &BlameOptions,
+        date_range: Option<(i64, i64)>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        // S-ANN — when an author filter is active and this entry doesn't
+        // match, render a single muted dot so the gutter remains readable
+        // but other people's lines visually recede.
+        if !options.author_filter.matches(&blame_entry) {
+            return Some(render_muted_blame_entry(style, ix, cx));
+        }
+
+        let timestamp = if options.absolute_dates {
+            blame_entry_absolute_timestamp(&blame_entry)
+        } else {
+            blame_entry_relative_timestamp(&blame_entry)
+        };
         let short_commit_id = blame_entry.sha.display_short();
         let author_name = blame_entry.author.as_deref().unwrap_or("<no name>");
         let name = util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED);
+
+        let resolved_color = match options.color_mode {
+            ColorMode::None => sha_color,
+            ColorMode::ByAuthor => blame_entry
+                .author_mail
+                .as_deref()
+                .map(|email| author_color(email, cx))
+                .unwrap_or(sha_color),
+            ColorMode::ByDate => date_range
+                .and_then(|(oldest, newest)| {
+                    let theme = cx.theme();
+                    let cold = theme.status().info;
+                    let hot = theme.status().error;
+                    let time = blame_entry.author_time?;
+                    date_color(time, oldest, newest, cold, hot)
+                })
+                .unwrap_or(sha_color),
+        };
 
         let avatar = if ProjectSettings::get_global(cx).git.blame.show_avatar {
             let author_email = blame_entry.author_mail.as_ref().map(|email| {
@@ -79,23 +149,27 @@ impl BlameRenderer for GitBlameRenderer {
                         .child(
                             h_flex()
                                 .gap_2()
-                                .child(div().text_color(sha_color).child(short_commit_id))
+                                .child(div().text_color(resolved_color).child(short_commit_id))
                                 .children(avatar)
                                 .child(name),
                         )
-                        .child(relative_timestamp)
+                        .child(timestamp)
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
                         .cursor_pointer()
                         .on_mouse_down(MouseButton::Right, {
                             let blame_entry = blame_entry.clone();
                             let details = details.clone();
                             let editor = editor.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
                             move |event, window, cx| {
                                 cx.stop_propagation();
 
                                 deploy_blame_entry_context_menu(
                                     &blame_entry,
                                     details.as_ref(),
+                                    repository.clone(),
+                                    workspace.clone(),
                                     editor.clone(),
                                     event.position,
                                     window,
@@ -104,19 +178,12 @@ impl BlameRenderer for GitBlameRenderer {
                             }
                         })
                         .on_click({
+                            // S-ANN — left-click navigates to the commit in
+                            // the Git Graph view (opens it if not present).
                             let blame_entry = blame_entry.clone();
-                            let repository = repository.clone();
-                            let workspace = workspace.clone();
                             move |_, window, cx| {
-                                CommitView::open(
-                                    blame_entry.sha.to_string(),
-                                    repository.downgrade(),
-                                    workspace.clone(),
-                                    None,
-                                    None,
-                                    window,
-                                    cx,
-                                )
+                                let sha = blame_entry.sha.to_string();
+                                window.dispatch_action(Box::new(OpenAtCommit { sha }), cx);
                             }
                         })
                         .when(!editor.read(cx).has_mouse_context_menu(), |el| {
@@ -272,6 +339,7 @@ impl BlameRenderer for GitBlameRenderer {
             has_parent: false,
         };
 
+        let sha_for_log = sha.to_string();
         Some(
             tooltip_container(cx, |this, cx| {
                 this.occlude()
@@ -338,6 +406,28 @@ impl BlameRenderer for GitBlameRenderer {
                                                 )
                                                 .child(Divider::vertical())
                                             })
+                                            // S-ANN — "Show in Log" jumps to
+                                            // this commit in the Git Graph
+                                            // view (opens it on demand).
+                                            .child(
+                                                Button::new("show-in-log-button", "Show in Log")
+                                                    .color(Color::Muted)
+                                                    .start_icon(
+                                                        Icon::new(IconName::ListTree)
+                                                            .size(IconSize::Small)
+                                                            .color(Color::Muted),
+                                                    )
+                                                    .on_click(move |_, window, cx| {
+                                                        window.dispatch_action(
+                                                            Box::new(OpenAtCommit {
+                                                                sha: sha_for_log.clone(),
+                                                            }),
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    }),
+                                            )
+                                            .child(Divider::vertical())
                                             .child(
                                                 Button::new(
                                                     "commit-sha-button",
@@ -398,32 +488,90 @@ impl BlameRenderer for GitBlameRenderer {
 fn deploy_blame_entry_context_menu(
     blame_entry: &BlameEntry,
     details: Option<&ParsedCommitMessage>,
+    repository: Entity<Repository>,
+    workspace: WeakEntity<Workspace>,
     editor: Entity<Editor>,
     position: gpui::Point<Pixels>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let context_menu = ContextMenu::build(window, cx, move |menu, _, _| {
-        let sha = format!("{}", blame_entry.sha);
-        menu.on_blur_subscription(Subscription::new(|| {}))
-            .entry("Copy Commit SHA", None, move |_, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()));
-            })
-            .when_some(
-                details.and_then(|details| details.permalink.clone()),
-                |this, url| {
-                    this.entry("Open Permalink", None, move |_, cx| {
-                        cx.open_url(url.as_str())
-                    })
-                },
-            )
+    // S-ANN — reuse the S-CTM commit context menu so the right-click
+    // experience on the blame gutter is identical to the Git Graph row
+    // menu (Copy / New Branch / New Tag / Checkout / Compare / Show /
+    // External / Destructive submenu / Patch).
+    let sha: SharedString = blame_entry.sha.to_string().into();
+    let subject: SharedString = details
+        .and_then(|d| {
+            d.message
+                .split('\n')
+                .next()
+                .map(|s| s.trim_end().to_string())
+        })
+        .map(SharedString::from)
+        .unwrap_or_default();
+    let provider = repository.read(cx).default_remote_url().and_then(|url| {
+        let registry = GitHostingProviderRegistry::default_global(cx);
+        parse_git_remote_url(registry, &url)
+            .map(|(provider, _)| (provider.name(), provider.base_url().to_string()))
     });
+    let work_dir = Some(
+        repository
+            .read(cx)
+            .work_directory_abs_path
+            .as_ref()
+            .to_path_buf(),
+    );
+
+    let ctx = CommitContext {
+        workspace,
+        repository,
+        sha,
+        subject,
+        provider,
+        work_dir,
+        member_id: None,
+        // The blame gutter has no ref-decoration info, so the
+        // branches/tags section stays hidden here.
+        refs: Vec::new(),
+        head_branch: None,
+        local_branches: Vec::new(),
+    };
+    let context_menu = build_commit_context_menu(ctx, window, cx);
 
     editor.update(cx, move |editor, cx| {
         editor.hide_blame_popover(false, cx);
         editor.deploy_mouse_context_menu(position, context_menu, window, cx);
         cx.notify();
     });
+}
+
+/// S-ANN — render a single muted dot for a line whose author is filtered
+/// out. Keeps the gutter visually aligned without distracting the user.
+fn render_muted_blame_entry(style: &TextStyle, ix: usize, cx: &mut App) -> AnyElement {
+    h_flex()
+        .id(("blame-muted", ix))
+        .w_full()
+        .font(style.font())
+        .line_height(style.line_height)
+        .text_color(cx.theme().colors().text_disabled)
+        .child("·")
+        .into_any()
+}
+
+fn blame_entry_absolute_timestamp(blame_entry: &BlameEntry) -> String {
+    match blame_entry.author_offset_date_time() {
+        Ok(timestamp) => {
+            let local_offset =
+                time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+            time_format::format_localized_timestamp(
+                timestamp,
+                time::OffsetDateTime::now_utc(),
+                local_offset,
+                time_format::TimestampFormat::MediumAbsolute,
+            )
+        }
+        Err(_) => "Error parsing date".to_string(),
+    }
 }
 
 fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {

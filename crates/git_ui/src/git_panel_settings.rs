@@ -14,6 +14,36 @@ pub struct ScrollbarSettings {
     pub show: Option<ShowScrollbar>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitViewSettings {
+    pub fetch_avatars: bool,
+    pub affected_files_lazy_threshold: usize,
+    pub parse_issue_references: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveRebaseSettings {
+    pub allow_exec_via_mcp: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowAtRevisionSettings {
+    pub cleanup_orphans_older_than_h: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitExplanationsSettings {
+    pub cache_ttl_days: u32,
+}
+
+impl Default for CommitExplanationsSettings {
+    fn default() -> Self {
+        Self {
+            cache_ttl_days: crate::commit_view::ai_explain::DEFAULT_CACHE_TTL_DAYS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, RegisterSetting)]
 pub struct GitPanelSettings {
     pub button: bool,
@@ -31,6 +61,14 @@ pub struct GitPanelSettings {
     pub show_count_badge: bool,
     pub starts_open: bool,
     pub commit_title_max_length: usize,
+<<<<<<< ours
+=======
+    pub commit_view: CommitViewSettings,
+    pub interactive_rebase: InteractiveRebaseSettings,
+    pub show_at_revision: ShowAtRevisionSettings,
+    pub run_pre_commit_hooks_in_panel: bool,
+    pub commit_explanations: CommitExplanationsSettings,
+>>>>>>> theirs
 }
 
 #[derive(Default)]
@@ -78,6 +116,40 @@ impl Settings for GitPanelSettings {
             show_count_badge: git_panel.show_count_badge.unwrap(),
             starts_open: git_panel.starts_open.unwrap(),
             commit_title_max_length: git_panel.commit_title_max_length.unwrap(),
+<<<<<<< ours
+=======
+            commit_view: {
+                let raw = git_panel.commit_view.unwrap();
+                CommitViewSettings {
+                    fetch_avatars: raw.fetch_avatars.unwrap_or(false),
+                    affected_files_lazy_threshold: raw.affected_files_lazy_threshold.unwrap_or(500),
+                    parse_issue_references: raw.parse_issue_references.unwrap_or(true),
+                }
+            },
+            interactive_rebase: {
+                let raw = git_panel.interactive_rebase.unwrap_or_default();
+                InteractiveRebaseSettings {
+                    allow_exec_via_mcp: raw.allow_exec_via_mcp.unwrap_or(false),
+                }
+            },
+            show_at_revision: {
+                let raw = git_panel.show_at_revision.unwrap_or_default();
+                ShowAtRevisionSettings {
+                    cleanup_orphans_older_than_h: raw.cleanup_orphans_older_than_h.unwrap_or(
+                        crate::handlers::show_at_revision::DEFAULT_CLEANUP_ORPHANS_OLDER_THAN_H,
+                    ),
+                }
+            },
+            run_pre_commit_hooks_in_panel: git_panel.run_pre_commit_hooks_in_panel.unwrap_or(true),
+            commit_explanations: {
+                let raw = git_panel.commit_explanations.unwrap_or_default();
+                CommitExplanationsSettings {
+                    cache_ttl_days: raw
+                        .cache_ttl_days
+                        .unwrap_or(crate::commit_view::ai_explain::DEFAULT_CACHE_TTL_DAYS),
+                }
+            },
+>>>>>>> theirs
         }
     }
 }

@@ -3886,7 +3886,7 @@ mod tests {
             Some(&"{\n    \"agent\": {\n        \n    }\n}\n"),
         );
 
-        // Project-local settings (.zed/settings.json) with always_allow_tool_actions
+        // Project-local settings (.spke/settings.json) with always_allow_tool_actions
         // These files have no platform/channel overrides or root-level profiles.
         assert_migrate_with_migrations(
             &[MigrationType::Json(

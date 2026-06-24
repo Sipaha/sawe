@@ -226,14 +226,21 @@ fn register_language_model_providers(
     credentials_provider: Arc<dyn CredentialsProvider>,
     cx: &mut Context<LanguageModelRegistry>,
 ) {
-    registry.register_provider(
-        Arc::new(CloudLanguageModelProvider::new(
-            user_store,
-            client.clone(),
+    // spk-editor: do not register the Zed cloud LLM provider. We rely on
+    // external agents (Claude Code) over ACP for AI features, and reaching
+    // Zed's hosted models requires a Zed account which spk-editor does not
+    // expose. Keeping the constructor reachable behind `if false` so the type
+    // and its dependencies stay live for upstream-merge friendliness.
+    if false {
+        registry.register_provider(
+            Arc::new(CloudLanguageModelProvider::new(
+                user_store,
+                client.clone(),
+                cx,
+            )),
             cx,
-        )),
-        cx,
-    );
+        );
+    }
     registry.register_provider(
         Arc::new(AnthropicLanguageModelProvider::new(
             client.http_client(),

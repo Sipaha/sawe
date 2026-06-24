@@ -56,6 +56,7 @@ pub struct ThemeSettings {
     agent_ui_font_size: Option<Pixels>,
     /// The agent buffer font size. Determines the size of user messages in the agent panel.
     agent_buffer_font_size: Option<Pixels>,
+<<<<<<< ours
     git_commit_buffer_font_size: Option<Pixels>,
     /// The font family to use for rendering in the markdown preview.
     /// Falls back to the UI font family if unset.
@@ -63,6 +64,11 @@ pub struct ThemeSettings {
     /// The font family to use for code in the markdown preview.
     /// Falls back to the buffer font family if unset.
     markdown_preview_code_font_family: Option<SharedString>,
+=======
+    /// The font family to use for rendering in the markdown preview.
+    /// Falls back to the UI font family if unset.
+    markdown_preview_font_family: Option<SharedString>,
+>>>>>>> theirs
     /// The theme to use for the markdown preview.
     /// Falls back to the main editor theme if unset.
     pub markdown_preview_theme: Option<ThemeSelection>,
@@ -118,11 +124,14 @@ impl Global for AgentUiFontSize {}
 pub struct AgentBufferFontSize(Pixels);
 
 impl Global for AgentBufferFontSize {}
+<<<<<<< ours
 
 #[derive(Default)]
 pub struct GitCommitBufferFontSize(Pixels);
 
 impl Global for GitCommitBufferFontSize {}
+=======
+>>>>>>> theirs
 
 /// Represents the selection of a theme, which can be either static or dynamic.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -416,6 +425,7 @@ impl ThemeSettings {
             .unwrap_or_else(|| self.buffer_font_size(cx))
     }
 
+<<<<<<< ours
     pub fn git_commit_buffer_font_size(&self, cx: &App) -> Pixels {
         cx.try_global::<GitCommitBufferFontSize>()
             .map(|size| size.0)
@@ -424,6 +434,8 @@ impl ThemeSettings {
             .unwrap_or_else(|| self.buffer_font_size(cx))
     }
 
+=======
+>>>>>>> theirs
     /// Returns the font family to use in the markdown preview,
     /// falling back to the UI font family when unset.
     pub fn markdown_preview_font_family(&self) -> &SharedString {
@@ -432,6 +444,7 @@ impl ThemeSettings {
             .unwrap_or(&self.ui_font.family)
     }
 
+<<<<<<< ours
     /// Returns the font family to use for code in the markdown preview,
     /// falling back to the buffer font family when unset.
     pub fn markdown_preview_code_font_family(&self) -> &SharedString {
@@ -440,6 +453,8 @@ impl ThemeSettings {
             .unwrap_or(&self.buffer_font.family)
     }
 
+=======
+>>>>>>> theirs
     /// Returns the buffer font size, read from the settings.
     ///
     /// The real buffer font size is stored in-memory, to support temporary font size changes.
@@ -623,6 +638,7 @@ pub fn adjust_agent_buffer_font_size(cx: &mut App, f: impl FnOnce(Pixels) -> Pix
 pub fn reset_agent_buffer_font_size(cx: &mut App) {
     if cx.has_global::<AgentBufferFontSize>() {
         cx.remove_global::<AgentBufferFontSize>();
+<<<<<<< ours
         cx.refresh_windows();
     }
 }
@@ -639,6 +655,8 @@ pub fn adjust_git_commit_buffer_font_size(cx: &mut App, f: impl FnOnce(Pixels) -
 pub fn reset_git_commit_buffer_font_size(cx: &mut App) {
     if cx.has_global::<GitCommitBufferFontSize>() {
         cx.remove_global::<GitCommitBufferFontSize>();
+=======
+>>>>>>> theirs
         cx.refresh_windows();
     }
 }
@@ -692,15 +710,21 @@ impl settings::Settings for ThemeSettings {
             buffer_line_height: content.buffer_line_height.unwrap().into(),
             agent_ui_font_size: content.agent_ui_font_size.map(|s| s.into_gpui()),
             agent_buffer_font_size: content.agent_buffer_font_size.map(|s| s.into_gpui()),
+<<<<<<< ours
             git_commit_buffer_font_size: content.git_commit_buffer_font_size.map(|s| s.into_gpui()),
+=======
+>>>>>>> theirs
             markdown_preview_font_family: content
                 .markdown_preview_font_family
                 .as_ref()
                 .map(|f| f.0.clone().into()),
+<<<<<<< ours
             markdown_preview_code_font_family: content
                 .markdown_preview_code_font_family
                 .as_ref()
                 .map(|f| f.0.clone().into()),
+=======
+>>>>>>> theirs
             markdown_preview_theme: content
                 .markdown_preview_theme
                 .clone()

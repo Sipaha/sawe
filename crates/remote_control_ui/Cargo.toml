@@ -1,0 +1,35 @@
+[package]
+name = "remote_control_ui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/remote_control_ui.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+editor.workspace = true
+futures.workspace = true
+gpui.workspace = true
+http_client.workspace = true
+log.workspace = true
+menu.workspace = true
+qrcodegen.workspace = true
+remote_control.workspace = true
+serde.workspace = true
+theme.workspace = true
+ui.workspace = true
+urlencoding.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true

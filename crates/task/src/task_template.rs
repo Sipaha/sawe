@@ -78,6 +78,12 @@ pub struct TaskTemplate {
     /// Hooks that this task runs when emitted.
     #[serde(default)]
     pub hooks: HashSet<TaskHook>,
+    /// SPK Editor fork (S-PCH-HK): when `true`, this task is offered as a
+    /// before-commit check in the Git panel. The user can toggle individual
+    /// checks on/off; when enabled, the task is run sequentially before the
+    /// `git commit` and a non-zero exit aborts the commit.
+    #[serde(default)]
+    pub before_commit: bool,
 }
 
 #[derive(Deserialize, Eq, PartialEq, Clone, Debug)]

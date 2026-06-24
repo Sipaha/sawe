@@ -108,11 +108,14 @@ struct FocusFile(pub u32);
 struct SettingField<T: 'static> {
     pick: fn(&SettingsContent) -> Option<&T>,
     write: fn(&mut SettingsContent, Option<T>, &App),
+<<<<<<< ours
     /// Tells us whether the setting is overridden by the currently selected
     /// organization's settings. Takes the organization configuration and the
     /// resolved settings value, and returns `Some(...)` if the organization
     /// overrides the setting, otherwise `None`.
     organization_override: Option<fn(&OrganizationConfiguration) -> Option<&T>>,
+=======
+>>>>>>> theirs
 
     /// A json-path-like string that gives a unique-ish string that identifies
     /// where in the JSON the setting is defined.
@@ -162,7 +165,10 @@ impl<T: 'static> SettingField<T> {
         SettingField {
             pick: |_| Some(&UnimplementedSettingField),
             write: |_, _, _| unreachable!(),
+<<<<<<< ours
             organization_override: None,
+=======
+>>>>>>> theirs
             json_path: self.json_path,
         }
     }
@@ -513,7 +519,6 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::SaturatingBool>(render_toggle_button)
         .add_basic_renderer::<settings::CursorShape>(render_dropdown)
         .add_basic_renderer::<settings::RestoreOnStartupBehavior>(render_dropdown)
-        .add_basic_renderer::<settings::BottomDockLayout>(render_dropdown)
         .add_basic_renderer::<settings::OnLastWindowClosed>(render_dropdown)
         .add_basic_renderer::<settings::CliDefaultOpenBehavior>(render_dropdown)
         .add_basic_renderer::<settings::DefaultOpenBehavior>(render_dropdown)
@@ -563,7 +568,11 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::AlternateScroll>(render_dropdown)
         .add_basic_renderer::<settings::TerminalBlink>(render_dropdown)
         .add_basic_renderer::<settings::CursorShapeContent>(render_dropdown)
+<<<<<<< ours
         .add_basic_renderer::<settings::EditPredictionPromptFormatContent>(render_dropdown)
+=======
+        .add_basic_renderer::<settings::EditPredictionPromptFormat>(render_dropdown)
+>>>>>>> theirs
         .add_basic_renderer::<settings::EditPredictionDataCollectionChoice>(render_dropdown)
         .add_basic_renderer::<f32>(render_editable_number_field)
         .add_basic_renderer::<settings::AutoCompactThreshold>(render_text_field)
@@ -6156,7 +6165,7 @@ mod project_settings_update_tests {
         let fs = FakeFs::new(cx.executor());
         let tree = if let Some(settings_content) = initial_settings {
             json!({
-                ".zed": {
+                ".spke": {
                     "settings.json": settings_content
                 },
                 "src": { "main.rs": "" }
@@ -6173,7 +6182,7 @@ mod project_settings_update_tests {
             (worktree.read(cx).id(), worktree.downgrade())
         });
 
-        let rel_path: Arc<RelPath> = RelPath::unix(".zed/settings.json")
+        let rel_path: Arc<RelPath> = RelPath::unix(".spke/settings.json")
             .expect("valid path")
             .into_arc();
         let project_path = ProjectPath {
@@ -6403,7 +6412,7 @@ mod project_settings_update_tests {
 
         let file_content = setup
             .fs
-            .load("/project/.zed/settings.json".as_ref())
+            .load("/project/.spke/settings.json".as_ref())
             .await
             .unwrap();
         assert_eq!(
@@ -6436,7 +6445,7 @@ mod project_settings_update_tests {
         setup
             .fs
             .save(
-                "/project/.zed/settings.json".as_ref(),
+                "/project/.spke/settings.json".as_ref(),
                 &r#"{ "tab_size": 99 }"#.into(),
                 Default::default(),
             )

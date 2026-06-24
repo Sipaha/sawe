@@ -17,16 +17,25 @@ use base64::Engine as _;
 use editor::{
     Addon, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode,
     EditorStyle, Inlay, MultiBuffer, MultiBufferOffset, MultiBufferSnapshot, ToOffset,
+<<<<<<< ours
     actions::{Copy, Cut, Paste},
     code_context_menus::CodeContextMenu,
     display_map::{CreaseId, CreaseSnapshot},
+=======
+    actions::{Copy, Paste},
+    code_context_menus::CodeContextMenu,
+>>>>>>> theirs
     scroll::Autoscroll,
 };
 use futures::{FutureExt as _, future::join_all};
 use gpui::{
     AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+<<<<<<< ours
     Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
     TextStyle, WeakEntity,
+=======
+    Focusable, ImageFormat, KeyContext, SharedString, Subscription, Task, TextStyle, WeakEntity,
+>>>>>>> theirs
 };
 use language::{Buffer, language_settings::InlayHintKind};
 use parking_lot::RwLock;
@@ -1335,6 +1344,16 @@ impl MessageEditor {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.serialized_copy_text(cx) else {
+            cx.propagate();
+            return;
+        };
+
+        cx.stop_propagation();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     fn paste_raw(&mut self, _: &PasteRaw, window: &mut Window, cx: &mut Context<Self>) {
         let editor = self.editor.clone();
         window.defer(cx, move |window, cx| {
@@ -1517,6 +1536,7 @@ impl MessageEditor {
             .detach_and_log_err(cx);
     }
 
+<<<<<<< ours
     pub fn insert_skill_crease(
         &mut self,
         skill: &AvailableSkill,
@@ -1578,6 +1598,9 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+=======
+    pub fn insert_selections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+>>>>>>> theirs
         let editor = self.editor.read(cx);
         let editor_buffer = editor.buffer().read(cx);
         let Some(buffer) = editor_buffer.as_singleton() else {
@@ -1903,6 +1926,7 @@ impl MessageEditor {
         });
     }
 
+<<<<<<< ours
     fn serialize_selection_with_mentions(
         &self,
         expand_empty_to_line: bool,
@@ -1912,11 +1936,18 @@ impl MessageEditor {
             return None;
         }
 
+=======
+    fn serialized_copy_text(&self, cx: &mut App) -> Option<String> {
+>>>>>>> theirs
         let display_snapshot = self
             .editor
             .update(cx, |editor, cx| editor.display_snapshot(cx));
         let editor = self.editor.read(cx);
+<<<<<<< ours
         if !expand_empty_to_line && !editor.has_non_empty_selection(&display_snapshot) {
+=======
+        if !editor.has_non_empty_selection(&display_snapshot) {
+>>>>>>> theirs
             return None;
         }
 
@@ -1937,6 +1968,7 @@ impl MessageEditor {
             })
             .collect::<Vec<_>>();
 
+<<<<<<< ours
         let line_mode = editor.selections.line_mode();
         let max_point = snapshot.max_point();
         let point_selections = editor.selections.all::<Point>(&display_snapshot);
@@ -1986,6 +2018,50 @@ impl MessageEditor {
         }
 
         has_mentions.then_some((text, ranges))
+=======
+        let mut text = String::new();
+        let mut has_mentions = false;
+        let mut is_first = true;
+
+        for selection in editor
+            .selections
+            .all::<MultiBufferOffset>(&display_snapshot)
+        {
+            if is_first {
+                is_first = false;
+            } else {
+                text.push('\n');
+            }
+
+            let mut overlapping_mentions = mention_ranges
+                .iter()
+                .filter(|(start, end, _)| *start < selection.end && selection.start < *end)
+                .peekable();
+
+            if overlapping_mentions.peek().is_none() {
+                text.extend(snapshot.text_for_range(selection.start..selection.end));
+                continue;
+            }
+
+            has_mentions = true;
+
+            let mut cursor = selection.start;
+            for (start, end, uri) in overlapping_mentions {
+                if cursor < *start {
+                    text.extend(snapshot.text_for_range(cursor..*start));
+                }
+
+                write!(text, "{}", uri.as_link()).unwrap();
+                cursor = *end;
+            }
+
+            if cursor < selection.end {
+                text.extend(snapshot.text_for_range(cursor..selection.end));
+            }
+        }
+
+        has_mentions.then_some(text)
+>>>>>>> theirs
     }
 }
 
@@ -2004,7 +2080,10 @@ impl Render for MessageEditor {
             .on_action(cx.listener(Self::chat_with_follow))
             .on_action(cx.listener(Self::cancel))
             .capture_action(cx.listener(Self::copy))
+<<<<<<< ours
             .capture_action(cx.listener(Self::cut))
+=======
+>>>>>>> theirs
             .on_action(cx.listener(Self::paste_raw))
             .capture_action(cx.listener(Self::paste))
             .flex_1()
@@ -2270,9 +2349,13 @@ mod tests {
     use crate::{
         conversation_view::tests::init_test,
         mention_set::insert_crease_for_mention,
+<<<<<<< ours
         message_editor::{
             Mention, MessageEditor, MessageEditorEvent, SessionCapabilities, parse_mention_links,
         },
+=======
+        message_editor::{Mention, MessageEditor, SessionCapabilities, parse_mention_links},
+>>>>>>> theirs
     };
 
     #[test]
@@ -2616,7 +2699,7 @@ mod tests {
         fs.insert_tree(
             "/test",
             json!({
-                ".zed": {
+                ".spke": {
                     "tasks.json": r#"[{"label": "test", "command": "echo"}]"#
                 },
                 "src": {
@@ -4451,12 +4534,18 @@ mod tests {
         let first_uri = MentionUri::Selection {
             abs_path: Some(path!("/project/file.rs").into()),
             line_range: 0..=1,
+<<<<<<< ours
             column: None,
+=======
+>>>>>>> theirs
         };
         let second_uri = MentionUri::Selection {
             abs_path: Some(path!("/project/file.rs").into()),
             line_range: 2..=3,
+<<<<<<< ours
             column: None,
+=======
+>>>>>>> theirs
         };
 
         source_message_editor.update_in(&mut cx, |message_editor, window, cx| {
@@ -4480,7 +4569,11 @@ mod tests {
                     "line 3\nline 4\n".to_string(),
                 ),
             ] {
+<<<<<<< ours
                 let Some((crease_id, tx, _crease_entity)) = insert_crease_for_mention(
+=======
+                let Some((crease_id, tx)) = insert_crease_for_mention(
+>>>>>>> theirs
                     snapshot
                         .anchor_to_buffer_anchor(
                             snapshot.anchor_before(MultiBufferOffset(range.start)),
@@ -4502,7 +4595,11 @@ mod tests {
                 };
                 drop(tx);
 
+<<<<<<< ours
                 message_editor.mention_set.update(cx, |mention_set, cx| {
+=======
+                message_editor.mention_set.update(cx, |mention_set, _cx| {
+>>>>>>> theirs
                     mention_set.insert_mention(
                         crease_id,
                         uri,
@@ -4511,8 +4608,11 @@ mod tests {
                             tracked_buffers: Vec::new(),
                         }))
                         .shared(),
+<<<<<<< ours
                         None,
                         cx,
+=======
+>>>>>>> theirs
                     );
                 });
             }
@@ -4527,8 +4627,12 @@ mod tests {
 
         let copied_text = source_message_editor.update(&mut cx, |message_editor, cx| {
             message_editor
+<<<<<<< ours
                 .serialize_selection_with_mentions(false, cx)
                 .map(|(text, _)| text)
+=======
+                .serialized_copy_text(cx)
+>>>>>>> theirs
                 .expect("selection mentions should serialize")
         });
         let expected_text = format!(
@@ -4546,6 +4650,10 @@ mod tests {
                     workspace_handle,
                     project.downgrade(),
                     Some(thread_store),
+<<<<<<< ours
+=======
+                    None,
+>>>>>>> theirs
                     Default::default(),
                     "Test Agent".into(),
                     "Test",
@@ -4592,9 +4700,13 @@ mod tests {
         message_editor: Entity<MessageEditor>,
         first_uri: MentionUri,
         first_range: Range<usize>,
+<<<<<<< ours
         second_uri: MentionUri,
         second_range: Range<usize>,
         buffer_len: MultiBufferOffset,
+=======
+        second_range: Range<usize>,
+>>>>>>> theirs
     }
 
     async fn setup_selection_mention_fixture(
@@ -4613,15 +4725,24 @@ mod tests {
         let first_uri = MentionUri::Selection {
             abs_path: Some(path!("/project/file.rs").into()),
             line_range: 0..=1,
+<<<<<<< ours
             column: None,
+=======
+>>>>>>> theirs
         };
         let second_uri = MentionUri::Selection {
             abs_path: Some(path!("/project/file.rs").into()),
             line_range: 2..=3,
+<<<<<<< ours
             column: None,
         };
 
         let buffer_len = message_editor.update_in(&mut cx, |message_editor, window, cx| {
+=======
+        };
+
+        message_editor.update_in(&mut cx, |message_editor, window, cx| {
+>>>>>>> theirs
             message_editor.set_text(source_text, window, cx);
 
             let snapshot = message_editor
@@ -4642,7 +4763,11 @@ mod tests {
                     "line 3\nline 4\n".to_string(),
                 ),
             ] {
+<<<<<<< ours
                 let Some((crease_id, tx, _crease_entity)) = insert_crease_for_mention(
+=======
+                let Some((crease_id, tx)) = insert_crease_for_mention(
+>>>>>>> theirs
                     snapshot
                         .anchor_to_buffer_anchor(
                             snapshot.anchor_before(MultiBufferOffset(range.start)),
@@ -4664,7 +4789,11 @@ mod tests {
                 };
                 drop(tx);
 
+<<<<<<< ours
                 message_editor.mention_set.update(cx, |mention_set, cx| {
+=======
+                message_editor.mention_set.update(cx, |mention_set, _cx| {
+>>>>>>> theirs
                     mention_set.insert_mention(
                         crease_id,
                         uri,
@@ -4673,6 +4802,7 @@ mod tests {
                             tracked_buffers: Vec::new(),
                         }))
                         .shared(),
+<<<<<<< ours
                         None,
                         cx,
                     );
@@ -4680,6 +4810,11 @@ mod tests {
             }
 
             snapshot.len()
+=======
+                    );
+                });
+            }
+>>>>>>> theirs
         });
 
         (
@@ -4687,9 +4822,13 @@ mod tests {
                 message_editor,
                 first_uri,
                 first_range,
+<<<<<<< ours
                 second_uri,
                 second_range,
                 buffer_len,
+=======
+                second_range,
+>>>>>>> theirs
             },
             cx,
         )
@@ -4717,9 +4856,13 @@ mod tests {
         let copied = fixture
             .message_editor
             .update(&mut cx, |message_editor, cx| {
+<<<<<<< ours
                 message_editor
                     .serialize_selection_with_mentions(false, cx)
                     .map(|(text, _)| text)
+=======
+                message_editor.serialized_copy_text(cx)
+>>>>>>> theirs
             });
 
         assert_eq!(copied, Some(fixture.first_uri.as_link().to_string()));
@@ -4751,15 +4894,20 @@ mod tests {
         let copied = fixture
             .message_editor
             .update(&mut cx, |message_editor, cx| {
+<<<<<<< ours
                 message_editor
                     .serialize_selection_with_mentions(false, cx)
                     .map(|(text, _)| text)
+=======
+                message_editor.serialized_copy_text(cx)
+>>>>>>> theirs
             });
 
         assert_eq!(copied, None);
     }
 
     #[gpui::test]
+<<<<<<< ours
     async fn test_draft_content_blocks_snapshot_preserves_selection_mentions(
         cx: &mut TestAppContext,
     ) {
@@ -4921,6 +5069,8 @@ mod tests {
     }
 
     #[gpui::test]
+=======
+>>>>>>> theirs
     async fn test_paste_mention_link_with_completion_trigger_does_not_panic(
         cx: &mut TestAppContext,
     ) {

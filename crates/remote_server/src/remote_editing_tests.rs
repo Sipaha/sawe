@@ -2776,6 +2776,7 @@ async fn test_remote_apply_code_action_skips_unadvertised_command(
     assert_eq!(transaction.0.len(), 0);
 }
 
+<<<<<<< ours
 #[gpui::test]
 async fn test_remote_restore_unstaged_hunk_clears_diff(
     cx: &mut TestAppContext,
@@ -2885,6 +2886,8 @@ async fn test_remote_restore_unstaged_hunk_clears_diff(
     });
 }
 
+=======
+>>>>>>> theirs
 pub async fn init_test(
     server_fs: &Arc<FakeFs>,
     cx: &mut TestAppContext,

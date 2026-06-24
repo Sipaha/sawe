@@ -1,12 +1,11 @@
 name: Good First Issue Notifier
 
 on:
-  issues:
-    types: [labeled]
+  workflow_dispatch:
 
 jobs:
   handle-good-first-issue:
-    if: github.event.label.name == '.contrib/good first issue' && github.repository_owner == 'zed-industries'
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
 
     steps:

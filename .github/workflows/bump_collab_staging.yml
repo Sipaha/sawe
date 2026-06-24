@@ -1,13 +1,11 @@
 name: Bump collab-staging Tag
 
 on:
-  schedule:
-    # Fire every day at 16:00 UTC (At the start of the US workday)
-    - cron: "0 16 * * *"
+  workflow_dispatch:
 
 jobs:
   update-collab-staging-tag:
-    if: github.repository_owner == 'zed-industries'
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
       - name: Checkout repository

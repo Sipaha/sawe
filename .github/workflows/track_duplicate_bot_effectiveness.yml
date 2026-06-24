@@ -1,10 +1,6 @@
 name: Track duplicate bot effectiveness
 
 on:
-  issues:
-    types: [closed]
-  schedule:
-    - cron: "0 8 */2 * *" # every 2 days at 8 AM UTC
   workflow_dispatch:
 
 permissions:
@@ -12,6 +8,7 @@ permissions:
 
 jobs:
   classify-closed-issue:
+<<<<<<< ours
     if: >
       github.event_name == 'issues' &&
       github.repository == 'zed-industries/zed' &&
@@ -19,6 +16,9 @@ jobs:
       (github.event.issue.type == null ||
        github.event.issue.type.name == 'Bug' ||
        github.event.issue.type.name == 'Crash')
+=======
+    if: false # spk-editor: not applicable
+>>>>>>> theirs
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -55,9 +55,7 @@ jobs:
             classify-closed "$ISSUE_NUMBER" "$CLOSER_LOGIN" "$STATE_REASON"
 
   classify-open:
-    if: >
-      github.repository == 'zed-industries/zed' &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: false # spk-editor: not applicable
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

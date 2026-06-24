@@ -5,6 +5,7 @@ use gpui::{App, AsyncApp, Entity, SharedString, Task};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use settings::Settings;
 use std::{
     path::{Path, PathBuf},
@@ -13,7 +14,10 @@ use std::{
     time::Duration,
 };
 
+<<<<<<< ours
 use crate::sandboxing::sandboxing_enabled;
+=======
+>>>>>>> theirs
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
@@ -241,6 +245,7 @@ impl AgentTool for TerminalTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
+<<<<<<< ours
             let input = input.recv().await.map_err(|e| e.to_string())?;
             run_terminal_tool(
                 self.project.clone(),
@@ -360,6 +365,24 @@ async fn run_terminal_tool(
             ));
         }
     }
+=======
+            let input = input
+                .recv()
+                .await
+                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
+
+            let (working_dir, authorize) = cx.update(|cx| {
+                let working_dir =
+                    working_dir(&input, &self.project, cx).map_err(|err| err.to_string())?;
+                let context =
+                    crate::ToolPermissionContext::new(Self::NAME, vec![input.command.clone()]);
+                let authorize =
+                    event_stream.authorize(self.initial_title(Ok(input.clone()), cx), context, cx);
+                Result::<_, String>::Ok((working_dir, authorize))
+            })?;
+
+            authorize.await.map_err(|e| e.to_string())?;
+>>>>>>> theirs
 
     let extra_env = Vec::new();
 

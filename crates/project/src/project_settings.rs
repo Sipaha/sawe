@@ -494,6 +494,15 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: String,
+    /// Git Log graph view settings.
+    pub log: GitLogSettings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct GitLogSettings {
+    /// When a commit has more refs than this threshold, the trailing chips
+    /// collapse into a `+N` badge.
+    pub compact_refs_threshold: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -688,6 +697,13 @@ impl Settings for ProjectSettings {
                 .worktree_directory
                 .clone()
                 .unwrap_or_else(|| DEFAULT_WORKTREE_DIRECTORY.to_string()),
+            log: GitLogSettings {
+                compact_refs_threshold: git
+                    .log
+                    .as_ref()
+                    .and_then(|log| log.compact_refs_threshold)
+                    .unwrap_or(2),
+            },
         };
         Self {
             context_servers: project
@@ -796,7 +812,7 @@ pub struct SettingsObserver {
     _global_debug_config_watcher: Task<()>,
 }
 
-/// SettingsObserver observers changes to .zed/{settings, task}.json files in local worktrees
+/// SettingsObserver observers changes to .spke/{settings, task}.json files in local worktrees
 /// (or the equivalent protobuf messages from upstream) and updates local settings
 /// and sends notifications downstream.
 /// In ssh mode it also monitors ~/.config/zed/{settings, task}.json and sends the content

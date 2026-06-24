@@ -103,8 +103,11 @@ where
 mod tests {
     use std::process::ExitStatus;
 
+<<<<<<< ours
     use crate::docker::{DockerComposeConfig, DockerComposeServiceBuild};
 
+=======
+>>>>>>> theirs
     use super::*;
 
     fn success_output(stdout: &str) -> Output {
@@ -143,6 +146,7 @@ mod tests {
         let result: Option<TestItem> = deserialize_json_output(output).unwrap();
         assert_eq!(result, None);
     }
+<<<<<<< ours
 
     #[test]
     fn test_deserialize_yaml_docker_compose_config() {
@@ -204,4 +208,6 @@ mod tests {
         let result: Option<DockerComposeConfig> = deserialize_yaml_output(output).unwrap();
         assert_eq!(result, None);
     }
+=======
+>>>>>>> theirs
 }

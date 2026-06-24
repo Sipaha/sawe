@@ -330,11 +330,15 @@ impl RelatedExcerptStore {
                                     if is_tombi_lsp_in_toml(project, &buffer, cx) {
                                         return Task::ready(Ok(None));
                                     }
+<<<<<<< ours
                                     project.workspace_type_definitions(
                                         &buffer,
                                         identifier.range.start,
                                         cx,
                                     )
+=======
+                                    project.type_definitions(&buffer, identifier.range.start, cx)
+>>>>>>> theirs
                                 })
                                 .ok()?;
                             Some((definitions, type_definitions))

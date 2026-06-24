@@ -13,9 +13,6 @@
 name: Stale PR Review Reminder
 
 on:
-  schedule:
-    - cron: "0 14 * * 1-5" # 2 PM UTC weekdays
-    # - cron: "0 20 * * 1-5" # 8 PM UTC weekdays — enable after initial rollout
   workflow_dispatch: {}
 
 permissions:
@@ -24,7 +21,7 @@ permissions:
 
 jobs:
   check-stale-prs:
-    if: github.repository_owner == 'zed-industries'
+    if: false # spk-editor: not applicable
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:

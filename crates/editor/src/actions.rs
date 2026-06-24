@@ -927,8 +927,11 @@ actions!(
         AlignSelections,
         /// Saves the current location to navigation history.
         SaveLocation,
+<<<<<<< ours
         /// Toggles breadcrumbs display.
         ToggleBreadcrumb,
+=======
+>>>>>>> theirs
     ]
 );
 

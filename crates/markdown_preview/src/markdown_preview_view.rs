@@ -21,7 +21,11 @@ use markdown::{
 };
 use project::Project;
 use project::search::SearchQuery;
+<<<<<<< ours
 use settings::{SeedQuerySetting, Settings};
+=======
+use settings::Settings;
+>>>>>>> theirs
 use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
@@ -624,7 +628,10 @@ impl MarkdownPreviewView {
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
             .code_block_renderer(CodeBlockRenderer::Default {
                 copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
+<<<<<<< ours
                 wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
+=======
+>>>>>>> theirs
                 border: false,
             })
             .scroll_handle(self.scroll_handle.clone())
@@ -988,9 +995,13 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::scroll_down_by_item))
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_top))
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_bottom))
+<<<<<<< ours
             .w_full()
             .flex_1()
             .min_h_0()
+=======
+            .size_full()
+>>>>>>> theirs
             .bg(bg_color)
             .child(
                 div()

@@ -31,6 +31,7 @@ bitflags.workspace = true
 client.workspace = true
 collections.workspace = true
 command_palette_hooks.workspace = true
+console_panel.workspace = true
 dap.workspace = true
 dap_adapters = { workspace = true, optional = true }
 db.workspace = true
@@ -60,6 +61,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
 settings.workspace = true
+solution_agent.workspace = true
 sysinfo.workspace = true
 task.workspace = true
 tasks_ui.workspace = true

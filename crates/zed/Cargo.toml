@@ -1,12 +1,12 @@
 [package]
-description = "The fast, collaborative code editor."
+description = "SPK Editor — a personal fork of Zed by Zed Industries, Inc."
 edition.workspace = true
 name = "zed"
 version = "1.7.2"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
-default-run = "zed"
+default-run = "spk-editor"
 
 [lints]
 workspace = true
@@ -54,7 +54,7 @@ visual-tests = [
 ]
 
 [[bin]]
-name = "zed"
+name = "spk-editor"
 path = "src/main.rs"
 
 [[bin]]
@@ -89,6 +89,7 @@ collections.workspace = true
 command_palette.workspace = true
 component.workspace = true
 component_preview.workspace = true
+console_panel.workspace = true
 copilot.workspace = true
 copilot_chat.workspace = true
 copilot_ui.workspace = true
@@ -102,6 +103,7 @@ debugger_ui.workspace = true
 dev_container.workspace = true
 diagnostics.workspace = true
 editor.workspace = true
+editor_mcp.workspace = true
 encoding_selector.workspace = true
 env_logger.workspace = true
 extension.workspace = true
@@ -113,6 +115,11 @@ file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
 git.workspace = true
+<<<<<<< ours
+=======
+git_conflict_ui.workspace = true
+git_graph.workspace = true
+>>>>>>> theirs
 git_hosting_providers.workspace = true
 git_ui = { workspace = true, features = ["call"] }
 go_to_line.workspace = true
@@ -173,7 +180,11 @@ prompt_store.workspace = true
 proto.workspace = true
 recent_projects.workspace = true
 release_channel.workspace = true
+run_config.workspace = true
+run_config_ui.workspace = true
 remote.workspace = true
+remote_control.workspace = true
+remote_control_ui.workspace = true
 repl.workspace = true
 reqwest.workspace = true
 reqwest_client.workspace = true
@@ -190,6 +201,10 @@ sidebar.workspace = true
 smol.workspace = true
 snippet_provider.workspace = true
 snippets_ui.workspace = true
+solution_agent.workspace = true
+solution_git.workspace = true
+solutions.workspace = true
+solutions_ui.workspace = true
 svg_preview.workspace = true
 sysinfo.workspace = true
 tab_switcher.workspace = true
@@ -197,6 +212,7 @@ task.workspace = true
 tasks_ui.workspace = true
 telemetry.workspace = true
 telemetry_events.workspace = true
+workspace_events.workspace = true
 terminal_view.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
@@ -275,35 +291,35 @@ repl = { workspace = true, features = ["test-support"] }
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.zed.Zed-Dev"
-name = "Zed Dev"
+identifier = "ru.sipaha.spk-editor-dev"
+name = "SpkEditorDev"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["spk-editor"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
-identifier = "dev.zed.Zed-Nightly"
-name = "Zed Nightly"
+identifier = "ru.sipaha.spk-editor-nightly"
+name = "SpkEditorNightly"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["spk-editor"]
 
 [package.metadata.bundle-preview]
 icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
-identifier = "dev.zed.Zed-Preview"
-name = "Zed Preview"
+identifier = "ru.sipaha.spk-editor-preview"
+name = "SpkEditorPreview"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["spk-editor"]
 
 [package.metadata.bundle-stable]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
-identifier = "dev.zed.Zed"
-name = "Zed"
+identifier = "ru.sipaha.spk-editor"
+name = "SpkEditor"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["spk-editor"]
 
 [package.metadata.cargo-machete]
 ignored = ["profiling", "zstd", "tracing"]

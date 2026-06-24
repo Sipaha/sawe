@@ -1,8 +1,6 @@
 name: Comment on potential duplicate bug/crash reports
 
 on:
-  issues:
-    types: [opened]
   workflow_dispatch:
     inputs:
       issue_number:
@@ -16,8 +14,7 @@ concurrency:
 
 jobs:
   identify-duplicates:
-    # For manual testing, allow running on any branch; for automatic runs, only on main repo
-    if: github.event_name == 'workflow_dispatch' || github.repository == 'zed-industries/zed'
+    if: false # spk-editor: not applicable
     runs-on: ubuntu-latest
     timeout-minutes: 5
 

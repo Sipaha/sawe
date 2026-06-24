@@ -4,6 +4,7 @@ use gpui::{App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Task
 use itertools::Itertools;
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::{Project, git_store::Repository};
+use solutions;
 use std::sync::Arc;
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use workspace::{ModalView, Workspace};
@@ -37,8 +38,35 @@ impl RepositorySelector {
         cx: &mut Context<Self>,
     ) -> Self {
         let git_store = project_handle.read(cx).git_store().clone();
+
+        // Resolve the active solution member's local path so we can scope the
+        // repository list to only that project. When there is no active solution
+        // (plain non-solution project) we fall back to listing all repos.
+        let active_member_path: Option<std::path::PathBuf> =
+            solutions::SolutionStore::try_global(cx).and_then(|store| {
+                let store = store.read(cx);
+                let solution = project_handle
+                    .read(cx)
+                    .worktrees(cx)
+                    .find_map(|wt| store.solution_for_path(&wt.read(cx).abs_path()))?;
+                let catalog_id = store.active_member(&solution.id)?;
+                solution
+                    .members
+                    .iter()
+                    .find(|member| &member.catalog_id == catalog_id)
+                    .map(|member| member.local_path.clone())
+            });
+
         let repository_entries = git_store.update(cx, |git_store, _cx| {
             let mut repos: Vec<_> = git_store.repositories().values().cloned().collect();
+
+            if let Some(member_path) = active_member_path.as_ref() {
+                repos.retain(|repo| {
+                    repo.read(_cx)
+                        .work_directory_abs_path
+                        .starts_with(member_path)
+                });
+            }
 
             repos.sort_by(|a, b| {
                 a.read(_cx)

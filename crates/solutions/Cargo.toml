@@ -1,0 +1,51 @@
+[package]
+name = "solutions"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/solutions.rs"
+doctest = false
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+collections.workspace = true
+context_server.workspace = true
+db.workspace = true
+editor_mcp.workspace = true
+fs.workspace = true
+globset.workspace = true
+gpui.workspace = true
+image.workspace = true
+language.workspace = true
+log.workspace = true
+lsp.workspace = true
+paths.workspace = true
+project.workspace = true
+regex.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+sha2.workspace = true
+shellexpand.workspace = true
+smol.workspace = true
+thiserror.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true
+tempfile.workspace = true

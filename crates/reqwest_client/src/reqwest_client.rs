@@ -55,7 +55,7 @@ impl ReqwestClient {
         let client_has_proxy;
 
         if let Some(proxy) = proxy.as_ref().and_then(|proxy_url| {
-            reqwest::Proxy::all(proxy_url.clone())
+            reqwest::Proxy::all(normalize_proxy_scheme(proxy_url))
                 .inspect_err(|e| {
                     log::error!(
                         "Failed to parse proxy URL '{}': {}",
@@ -80,6 +80,23 @@ impl ReqwestClient {
         client.user_agent = Some(user_agent);
         Ok(client)
     }
+}
+
+/// reqwest only recognises the `socks4`, `socks4a`, `socks5`, and
+/// `socks5h` proxy schemes — a bare `socks://` (the form v2ray / xray
+/// configs and many `ALL_PROXY` env vars use) is rejected with
+/// "unknown proxy scheme". Treat the ambiguous `socks` scheme as
+/// `socks5` (the de-facto meaning) so those configs work without the
+/// user having to rewrite every proxy URL. Any other scheme is passed
+/// through untouched; a re-parse failure falls back to the original.
+fn normalize_proxy_scheme(proxy_url: &Url) -> Url {
+    if proxy_url.scheme() == "socks" {
+        if let Ok(rewritten) = Url::parse(&proxy_url.as_str().replacen("socks://", "socks5://", 1))
+        {
+            return rewritten;
+        }
+    }
+    proxy_url.clone()
 }
 
 pub fn runtime() -> &'static tokio::runtime::Runtime {

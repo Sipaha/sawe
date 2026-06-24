@@ -6,7 +6,11 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
+<<<<<<< ours
 use anyhow::Context as _;
+=======
+use agent_client_protocol::schema as acp;
+>>>>>>> theirs
 use collections::{HashSet, IndexMap};
 use fs::Fs;
 use futures::channel::oneshot;
@@ -238,7 +242,13 @@ pub struct AgentSettings {
     pub show_turn_stats: bool,
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
+<<<<<<< ours
     pub sandbox_permissions: SandboxPermissions,
+=======
+    pub new_thread_location: NewThreadLocation,
+    pub managed_agent_stale_timeout_secs: u64,
+    pub managed_agent_dead_linger_secs: u64,
+>>>>>>> theirs
 }
 
 impl AgentSettings {
@@ -275,10 +285,17 @@ impl AgentSettings {
         self.message_editor_min_lines * 2
     }
 
+<<<<<<< ours
     pub fn favorite_model_ids(&self) -> HashSet<SharedString> {
         self.favorite_models
             .iter()
             .map(|sel| SharedString::from(format!("{}/{}", sel.provider.0, sel.model)))
+=======
+    pub fn favorite_model_ids(&self) -> HashSet<acp::ModelId> {
+        self.favorite_models
+            .iter()
+            .map(|sel| acp::ModelId::new(format!("{}/{}", sel.provider.0, sel.model)))
+>>>>>>> theirs
             .collect()
     }
 }
@@ -769,7 +786,13 @@ impl Settings for AgentSettings {
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
+<<<<<<< ours
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
+=======
+            new_thread_location: agent.new_thread_location.unwrap_or_default(),
+            managed_agent_stale_timeout_secs: agent.managed_agent_stale_timeout_secs.unwrap_or(120),
+            managed_agent_dead_linger_secs: agent.managed_agent_dead_linger_secs.unwrap_or(300),
+>>>>>>> theirs
         }
     }
 }

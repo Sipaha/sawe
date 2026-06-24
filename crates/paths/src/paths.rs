@@ -1,4 +1,4 @@
-//! Paths to locations used by Zed.
+//! Paths to locations used by SPK Editor.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use util::rel_path::RelPath;
 /// A default editorconfig file name to use when resolving project settings.
 pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 
+<<<<<<< ours
 /// The application name, used to derive platform-specific data, config, cache,
 /// and state directory paths.
 ///
@@ -45,6 +46,50 @@ pub const APP_NAME_LOWERCASE: &str = {
         Err(_) => unreachable!(),
     }
 };
+=======
+/// True when this build should use a `-dev` directory suffix to keep
+/// developer state separate from a production install's database,
+/// sessions, MCP socket, and so on.
+///
+/// Default rule:
+///   * Debug builds (`cfg!(debug_assertions)`) → `true`
+///   * Release builds → `false`
+///
+/// Override (in either direction) via the `SPK_EDITOR_DEV_DIRS` env
+/// var: set to `1` / `true` to force the dev suffix on (useful when
+/// you want a release-shaped binary to write to a sandboxed dir),
+/// set to `0` / `false` to force it off (useful when a debug build
+/// needs to pick up the user's actual production data — e.g. trying
+/// to reproduce a bug against their workspace database).
+fn use_dev_suffix() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("SPK_EDITOR_DEV_DIRS") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => cfg!(debug_assertions),
+    })
+}
+
+/// Kebab-case directory name (Linux / generic). See `use_dev_suffix`.
+pub fn dir_name_kebab() -> &'static str {
+    if use_dev_suffix() {
+        "spk-editor-dev"
+    } else {
+        "spk-editor"
+    }
+}
+
+/// PascalCase directory name (macOS / Windows). See `use_dev_suffix`.
+pub fn dir_name_pascal() -> &'static str {
+    if use_dev_suffix() {
+        "SpkEditor-Dev"
+    } else {
+        "SpkEditor"
+    }
+}
+>>>>>>> theirs
 
 /// A custom data directory override, set only by `set_custom_data_dir`.
 /// This is used to override the default data directory location.
@@ -53,16 +98,16 @@ static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved data directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/Library/Application Support/Zed`.
-/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/zed`.
-/// On Windows, this is `%LOCALAPPDATA%\Zed`.
+/// On macOS, this is `~/Library/Application Support/SpkEditor`.
+/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/spk-editor`.
+/// On Windows, this is `%LOCALAPPDATA%\SpkEditor`.
 static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved config directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/.config/zed`.
-/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/zed`.
-/// On Windows, this is `%APPDATA%\Zed`.
+/// On macOS, this is `~/.config/spk-editor`.
+/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/spk-editor`.
+/// On Windows, this is `%APPDATA%\SpkEditor`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Returns the relative path to the zed_server directory on the ssh host.
@@ -118,11 +163,36 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
     })
 }
 
-/// Returns the path to the configuration directory used by Zed.
+/// Single root directory under which **all** profile state lives —
+/// config, data, cache, logs, solutions, the lot. We tuck everything
+/// into a hidden `~/.spk/` namespace so `~/` doesn't accumulate
+/// per-app dotfree folders, and so sibling SPK tools can colocate
+/// their own state under the same umbrella.
+///
+/// Layout:
+///   `~/.spk/spk-editor/` — release profile of this editor
+///   `~/.spk/spk-editor-dev/` — debug profile of this editor
+///   `~/.spk/<other-spk-tool>/` — sibling apps drop their state here
+///
+/// Windows / macOS get the same single-folder layout (no native
+/// `Application Support` / `AppData` split) so the cleanup story
+/// stays one-line everywhere: `rm -rf ~/.spk/spk-editor[-dev]`.
+pub fn base_dir() -> &'static PathBuf {
+    static BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
+    BASE_DIR.get_or_init(|| {
+        if let Some(custom) = CUSTOM_DATA_DIR.get() {
+            return custom.clone();
+        }
+        home_dir().join(".spk").join(dir_name_kebab())
+    })
+}
+
+/// Returns the path to the configuration directory used by SPK Editor.
 pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.join("config")
+<<<<<<< ours
         } else if cfg!(target_os = "windows") {
             dirs::config_dir()
                 .expect("failed to determine RoamingAppData directory")
@@ -136,15 +206,20 @@ pub fn config_dir() -> &'static PathBuf {
             .join(APP_NAME_LOWERCASE)
         } else {
             home_dir().join(".config").join(APP_NAME_LOWERCASE)
+=======
+        } else {
+            base_dir().join("config")
+>>>>>>> theirs
         }
     })
 }
 
-/// Returns the path to the data directory used by Zed.
+/// Returns the path to the data directory used by SPK Editor.
 pub fn data_dir() -> &'static PathBuf {
     CURRENT_DATA_DIR.get_or_init(|| {
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.clone()
+<<<<<<< ours
         } else if cfg!(target_os = "macos") {
             home_dir()
                 .join("Library/Application Support")
@@ -160,14 +235,17 @@ pub fn data_dir() -> &'static PathBuf {
             dirs::data_local_dir()
                 .expect("failed to determine LocalAppData directory")
                 .join(APP_NAME)
+=======
+>>>>>>> theirs
         } else {
-            config_dir().clone() // Fallback
+            base_dir().join("data")
         }
     })
 }
 
 pub fn state_dir() -> &'static PathBuf {
     static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
+<<<<<<< ours
     STATE_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
             return home_dir().join(".local").join("state").join(APP_NAME);
@@ -187,11 +265,15 @@ pub fn state_dir() -> &'static PathBuf {
                 .join(APP_NAME);
         }
     })
+=======
+    STATE_DIR.get_or_init(|| base_dir().join("state"))
+>>>>>>> theirs
 }
 
-/// Returns the path to the temp directory used by Zed.
+/// Returns the path to the temp / cache directory used by SPK Editor.
 pub fn temp_dir() -> &'static PathBuf {
     static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
+<<<<<<< ours
     TEMP_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
             return dirs::cache_dir()
@@ -216,6 +298,9 @@ pub fn temp_dir() -> &'static PathBuf {
 
         home_dir().join(".cache").join(APP_NAME_LOWERCASE)
     })
+=======
+    TEMP_DIR.get_or_init(|| base_dir().join("cache"))
+>>>>>>> theirs
 }
 
 /// Returns the path to the hang traces directory.
@@ -227,6 +312,7 @@ pub fn hang_traces_dir() -> &'static PathBuf {
 /// Returns the path to the logs directory.
 pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
+<<<<<<< ours
     LOGS_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
             home_dir().join("Library/Logs").join(APP_NAME)
@@ -234,24 +320,35 @@ pub fn logs_dir() -> &'static PathBuf {
             data_dir().join("logs")
         }
     })
+=======
+    LOGS_DIR.get_or_init(|| base_dir().join("logs"))
+>>>>>>> theirs
 }
 
-/// Returns the path to the Zed server directory on this SSH host.
+/// Returns the path to the SPK Editor server directory on this SSH host.
 pub fn remote_server_state_dir() -> &'static PathBuf {
     static REMOTE_SERVER_STATE: OnceLock<PathBuf> = OnceLock::new();
     REMOTE_SERVER_STATE.get_or_init(|| data_dir().join("server_state"))
 }
 
-/// Returns the path to the `Zed.log` file.
+/// Returns the path to the `SpkEditor.log` file.
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+<<<<<<< ours
     LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log", APP_NAME)))
+=======
+    LOG_FILE.get_or_init(|| logs_dir().join("SpkEditor.log"))
+>>>>>>> theirs
 }
 
-/// Returns the path to the `Zed.log.old` file.
+/// Returns the path to the `SpkEditor.log.old` file.
 pub fn old_log_file() -> &'static PathBuf {
     static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+<<<<<<< ours
     OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log.old", APP_NAME)))
+=======
+    OLD_LOG_FILE.get_or_init(|| logs_dir().join("SpkEditor.log.old"))
+>>>>>>> theirs
 }
 
 /// Returns the path to the database directory.
@@ -316,6 +413,7 @@ pub fn debug_scenarios_file() -> &'static PathBuf {
     DEBUG_SCENARIOS_FILE.get_or_init(|| config_dir().join("debug.json"))
 }
 
+<<<<<<< ours
 /// Returns the path to the user-global `AGENTS.md` file.
 ///
 /// This file holds personal agent instructions that apply to every project the
@@ -341,6 +439,35 @@ pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
 #[cfg(not(target_os = "windows"))]
 pub const GLOBAL_AGENTS_FILE_DISPLAY: &str =
     const_format::concatcp!("~/.config/", APP_NAME_LOWERCASE, "/AGENTS.md");
+=======
+/// Returns the path to the `run-configurations.json` file.
+pub fn run_configurations_file() -> &'static PathBuf {
+    static RUN_CONFIGURATIONS_FILE: OnceLock<PathBuf> = OnceLock::new();
+    RUN_CONFIGURATIONS_FILE.get_or_init(|| config_dir().join("run-configurations.json"))
+}
+
+/// Returns the path to the `remote-control.json` file.
+pub fn remote_control_settings_file() -> &'static PathBuf {
+    static REMOTE_CONTROL_SETTINGS_FILE: OnceLock<PathBuf> = OnceLock::new();
+    REMOTE_CONTROL_SETTINGS_FILE.get_or_init(|| config_dir().join("remote-control.json"))
+}
+
+/// Returns the path to the persisted Remote Control self-signed TLS cert
+/// (`remote-control.cert.der`). The cert is generated on first `enabled =
+/// true` and reused on subsequent starts so the SHA-256 fingerprint stays
+/// stable across editor restarts — the Android client pins on it.
+pub fn remote_control_cert_file() -> &'static PathBuf {
+    static REMOTE_CONTROL_CERT_FILE: OnceLock<PathBuf> = OnceLock::new();
+    REMOTE_CONTROL_CERT_FILE.get_or_init(|| config_dir().join("remote-control.cert.der"))
+}
+
+/// Returns the path to the persisted Remote Control private key
+/// (`remote-control.key.der`). Sibling to `remote_control_cert_file`.
+pub fn remote_control_key_file() -> &'static PathBuf {
+    static REMOTE_CONTROL_KEY_FILE: OnceLock<PathBuf> = OnceLock::new();
+    REMOTE_CONTROL_KEY_FILE.get_or_init(|| config_dir().join("remote-control.key.der"))
+}
+>>>>>>> theirs
 
 /// Returns the path to the extensions directory.
 ///
@@ -483,9 +610,9 @@ pub fn devcontainer_dir() -> &'static PathBuf {
     DEVCONTAINER_DIR.get_or_init(|| data_dir().join("devcontainer"))
 }
 
-/// Returns the relative path to a `.zed` folder within a project.
+/// Returns the relative path to a `.spke` folder within a project.
 pub fn local_settings_folder_name() -> &'static str {
-    ".zed"
+    ".spke"
 }
 
 /// Returns the relative path to a `.vscode` folder within a project.
@@ -496,14 +623,21 @@ pub fn local_vscode_folder_name() -> &'static str {
 /// Returns the relative path to a `settings.json` file within a project.
 pub fn local_settings_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".zed/settings.json").unwrap());
+        LazyLock::new(|| RelPath::unix(".spke/settings.json").unwrap());
     *CACHED
 }
 
 /// Returns the relative path to a `tasks.json` file within a project.
 pub fn local_tasks_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".zed/tasks.json").unwrap());
+        LazyLock::new(|| RelPath::unix(".spke/tasks.json").unwrap());
+    *CACHED
+}
+
+/// Returns the relative path to a `run-configurations.json` file within a project.
+pub fn local_run_configurations_file_relative_path() -> &'static RelPath {
+    static CACHED: LazyLock<&'static RelPath> =
+        LazyLock::new(|| RelPath::unix(".spke/run-configurations.json").unwrap());
     *CACHED
 }
 
@@ -523,10 +657,10 @@ pub fn task_file_name() -> &'static str {
 }
 
 /// Returns the relative path to a `debug.json` file within a project.
-/// .zed/debug.json
+/// .spke/debug.json
 pub fn local_debug_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".zed/debug.json").unwrap());
+        LazyLock::new(|| RelPath::unix(".spke/debug.json").unwrap());
     *CACHED
 }
 
@@ -634,4 +768,35 @@ pub fn global_gitignore_path() -> Option<PathBuf> {
     GLOBAL_GITIGNORE_PATH
         .get_or_init(::ignore::gitignore::gitconfig_excludes_path)
         .clone()
+}
+
+#[cfg(test)]
+mod rebrand_tests {
+    use super::*;
+
+    #[test]
+    fn config_dir_contains_spk_editor() {
+        let p = config_dir();
+        assert!(
+            p.to_string_lossy().contains("spk-editor") || p.to_string_lossy().contains("SpkEditor"),
+            "config_dir should mention spk-editor; got {p:?}"
+        );
+        assert!(
+            !p.to_string_lossy().to_ascii_lowercase().contains("zed"),
+            "config_dir must not mention zed; got {p:?}"
+        );
+    }
+
+    #[test]
+    fn data_dir_contains_spk_editor() {
+        let p = data_dir();
+        assert!(
+            p.to_string_lossy().contains("spk-editor") || p.to_string_lossy().contains("SpkEditor"),
+            "data_dir should mention spk-editor; got {p:?}"
+        );
+        assert!(
+            !p.to_string_lossy().to_ascii_lowercase().contains("zed"),
+            "data_dir must not mention zed; got {p:?}"
+        );
+    }
 }

@@ -186,6 +186,80 @@ async fn test_default_session_work_dirs_falls_back_to_home_for_empty_project(
     assert_eq!(ordered_paths, vec![paths::home_dir().to_path_buf()]);
 }
 
+/// S-SAR — verifies that a worktree containing a `.spke-readonly.json`
+/// marker is recognised as read-only and that
+/// `Project::is_path_read_only` returns true for paths under it.
+#[gpui::test]
+async fn test_read_only_marker_recognition(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/snapshot"),
+        json!({
+            ".spke-readonly.json": "{\"base_sha\":\"deadbeef\",\"branch_template\":\"snapshot/dead\",\"created_at_unix\":1700000000,\"source_repo\":\"/src\"}",
+            "src": {
+                "main.rs": "fn main() {}"
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs, [Path::new(path!("/snapshot"))], cx).await;
+
+    // The marker recognition is async (fs.is_file → cx.spawn). Drive
+    // the executor until the read-only registration task completes.
+    cx.run_until_parked();
+
+    project.read_with(cx, |project, _| {
+        assert!(
+            project.has_read_only_root(),
+            "snapshot worktree should register a read-only root"
+        );
+        assert!(
+            project.is_path_read_only(Path::new(path!("/snapshot/src/main.rs"))),
+            "files under snapshot should be flagged read-only"
+        );
+        assert!(
+            !project.is_path_read_only(Path::new(path!("/elsewhere/file.rs"))),
+            "files outside any registered root must not be flagged"
+        );
+    });
+}
+
+/// S-SAR — verifies that a worktree without the marker file is *not*
+/// flagged read-only. Guard rail against a path-prefix bug that would
+/// silently freeze every workspace.
+#[gpui::test]
+async fn test_no_marker_means_no_read_only_root(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/normal"),
+        json!({
+            "src": {
+                "main.rs": "fn main() {}"
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs, [Path::new(path!("/normal"))], cx).await;
+    cx.run_until_parked();
+
+    project.read_with(cx, |project, _| {
+        assert!(
+            !project.has_read_only_root(),
+            "normal worktree must not be flagged read-only"
+        );
+        assert!(
+            !project.is_path_read_only(Path::new(path!("/normal/src/main.rs"))),
+            "files in a normal worktree must remain editable"
+        );
+    });
+}
+
 // NOTE:
 // While POSIX symbolic links are somewhat supported on Windows, they are an opt in by the user, and thus
 // we assume that they are not supported out of the box.
@@ -255,7 +329,7 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
             tab_width = 10
             max_line_length = off
         "#,
-        ".zed": {
+        ".spke": {
             "settings.json": r#"{
                 "tab_size": 8,
                 "hard_tabs": false,
@@ -314,7 +388,7 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
     let settings_c = settings_for("c.js", cx).await;
     let settings_d = settings_for("d/d.rs", cx).await;
     let settings_readme = settings_for("README.json", cx).await;
-    // .editorconfig overrides .zed/settings
+    // .editorconfig overrides .spke/settings
     assert_eq!(Some(settings_a.tab_size), NonZeroU32::new(3));
     assert_eq!(settings_a.hard_tabs, true);
     assert_eq!(settings_a.ensure_final_newline_on_save, true);
@@ -331,7 +405,7 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
     // "indent_size" is not set, so "tab_width" is used
     assert_eq!(Some(settings_c.tab_size), NonZeroU32::new(10));
 
-    // When max_line_length is "off", default to .zed/settings.json
+    // When max_line_length is "off", default to .spke/settings.json
     assert_eq!(settings_b.preferred_line_length, 64);
     assert_eq!(settings_c.preferred_line_length, 64);
 
@@ -910,7 +984,7 @@ async fn test_git_provider_project_setting(cx: &mut gpui::TestAppContext) {
     fs.insert_tree(
         path!("/dir"),
         json!({
-            ".zed": {
+            ".spke": {
                 "settings.json": r#"{
                     "git_hosting_providers": [
                         {
@@ -941,7 +1015,7 @@ async fn test_git_provider_project_setting(cx: &mut gpui::TestAppContext) {
     });
 
     fs.atomic_write(
-        Path::new(path!("/dir/.zed/settings.json")).to_owned(),
+        Path::new(path!("/dir/.spke/settings.json")).to_owned(),
         "{}".into(),
     )
     .await
@@ -969,7 +1043,7 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
     fs.insert_tree(
         path!("/dir"),
         json!({
-            ".zed": {
+            ".spke": {
                 "settings.json": r#"{ "tab_size": 8 }"#,
                 "tasks.json": r#"[{
                     "label": "cargo check all",
@@ -981,7 +1055,7 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
                 "a.rs": "fn a() {\n    A\n}"
             },
             "b": {
-                ".zed": {
+                ".spke": {
                     "settings.json": r#"{ "tab_size": 2 }"#,
                     "tasks.json": r#"[{
                         "label": "cargo check",
@@ -1011,7 +1085,7 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
 
     let topmost_local_task_source_kind = TaskSourceKind::Worktree {
         id: worktree_id,
-        directory_in_worktree: rel_path(".zed").into(),
+        directory_in_worktree: rel_path(".spke").into(),
         id_base: "local worktree tasks from directory \".zed\"".into(),
     };
 
@@ -1168,13 +1242,13 @@ async fn test_invalid_local_tasks_shows_toast_with_doc_link(cx: &mut gpui::TestA
     init_test(cx);
     TaskStore::init(None);
 
-    // We need to start with a valid `.zed/tasks.json` file as otherwise the
+    // We need to start with a valid `.spke/tasks.json` file as otherwise the
     // event is emitted before we havd a chance to setup the event subscription.
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         path!("/dir"),
         json!({
-            ".zed": {
+            ".spke": {
                 "tasks.json": r#"[{ "label": "valid task", "command": "echo" }]"#,
             },
             "file.rs": ""
@@ -1185,10 +1259,10 @@ async fn test_invalid_local_tasks_shows_toast_with_doc_link(cx: &mut gpui::TestA
     let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
     let saw_toast = Rc::new(RefCell::new(false));
 
-    // Update the `.zed/tasks.json` file with an invalid variable, so we can
+    // Update the `.spke/tasks.json` file with an invalid variable, so we can
     // later assert that the `Event::Toast` even is emitted.
     fs.save(
-        path!("/dir/.zed/tasks.json").as_ref(),
+        path!("/dir/.spke/tasks.json").as_ref(),
         &r#"[{ "label": "test $ZED_FOO", "command": "echo" }]"#.into(),
         Default::default(),
     )
@@ -1230,7 +1304,7 @@ async fn test_fallback_to_single_worktree_tasks(cx: &mut gpui::TestAppContext) {
     fs.insert_tree(
         path!("/dir"),
         json!({
-            ".zed": {
+            ".spke": {
                 "tasks.json": r#"[{
                     "label": "test worktree root",
                     "command": "echo $ZED_WORKTREE_ROOT"
@@ -1305,7 +1379,7 @@ async fn test_fallback_to_single_worktree_tasks(cx: &mut gpui::TestAppContext) {
         vec![(
             TaskSourceKind::Worktree {
                 id: worktree_id,
-                directory_in_worktree: rel_path(".zed").into(),
+                directory_in_worktree: rel_path(".spke").into(),
                 id_base: "local worktree tasks from directory \".zed\"".into(),
             },
             "echo /dir".to_string(),
@@ -1365,7 +1439,7 @@ async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
     fs.insert_tree(
         path!("/the-root"),
         json!({
-            ".zed": {
+            ".spke": {
                 "settings.json": r#"
                 {
                     "languages": {
@@ -2043,7 +2117,7 @@ async fn test_language_server_relative_path(cx: &mut gpui::TestAppContext) {
     fs.insert_tree(
         path!("/the-root"),
         json!({
-            ".zed": {
+            ".spke": {
                 "settings.json": settings_json_contents.to_string(),
             },
             ".relative_path": {
@@ -2120,7 +2194,7 @@ async fn test_language_server_tilde_path(cx: &mut gpui::TestAppContext) {
     fs.insert_tree(
         path!("/root"),
         json!({
-            ".zed": {
+            ".spke": {
                 "settings.json": settings_json_contents.to_string(),
             },
             "src": {
@@ -12996,14 +13070,14 @@ async fn test_initial_scan_complete(cx: &mut gpui::TestAppContext) {
         json!({
             "a": {
                 ".git": {},
-                ".zed": {
+                ".spke": {
                     "tasks.json": r#"[{"label": "task-a", "command": "echo a"}]"#
                 },
                 "src": { "main.rs": "" }
             },
             "b": {
                 ".git": {},
-                ".zed": {
+                ".spke": {
                     "tasks.json": r#"[{"label": "task-b", "command": "echo b"}]"#
                 },
                 "src": { "lib.rs": "" }

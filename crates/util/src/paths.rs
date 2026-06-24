@@ -22,6 +22,15 @@ use crate::rel_path::RelPathBuf;
 pub fn home_dir() -> &'static PathBuf {
     static HOME_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     HOME_DIR.get_or_init(|| {
+        // SPK fork escape hatch: a `feature = "test-support"` build otherwise
+        // hard-codes `/home/zed` (deterministic test snapshots), which makes
+        // the binary unusable as a real interactive app. `script/run-mcp` sets
+        // `SPK_EDITOR_HOME` so an agent can run a screenshot-capable
+        // (test-support) build against the real home directory. Unit tests
+        // never set this var, so their behaviour is unchanged.
+        if let Some(over) = std::env::var_os("SPK_EDITOR_HOME") {
+            return PathBuf::from(over);
+        }
         if cfg!(any(test, feature = "test-support")) {
             if cfg!(target_os = "macos") {
                 PathBuf::from("/Users/zed")

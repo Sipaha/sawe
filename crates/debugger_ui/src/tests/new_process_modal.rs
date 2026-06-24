@@ -215,7 +215,7 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
         .unwrap();
 
     let debug_json_content = fs
-        .load(path!("/project/.zed/debug.json").as_ref())
+        .load(path!("/project/.spke/debug.json").as_ref())
         .await
         .expect("debug.json should exist")
         .lines()
@@ -278,7 +278,7 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
         ]"#};
 
     let debug_json_content = fs
-        .load(path!("/project/.zed/debug.json").as_ref())
+        .load(path!("/project/.spke/debug.json").as_ref())
         .await
         .expect("debug.json should exist")
         .lines()
@@ -300,7 +300,7 @@ async fn test_debug_modal_subtitles_with_multiple_worktrees(
     fs.insert_tree(
         path!("/workspace1"),
         json!({
-            ".zed": {
+            ".spke": {
                 "debug.json": r#"[
                     {
                         "adapter": "fake-adapter",
@@ -353,7 +353,7 @@ async fn test_debug_modal_subtitles_with_multiple_worktrees(
 
     assert_eq!(
         subtitles.as_slice(),
-        [path!(".zed/debug.json"), path!(".zed/debug.json")]
+        [path!(".spke/debug.json"), path!(".spke/debug.json")]
     );
 }
 

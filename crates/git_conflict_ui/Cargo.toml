@@ -1,0 +1,44 @@
+[package]
+name = "git_conflict_ui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/git_conflict_ui.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+context_server.workspace = true
+editor.workspace = true
+editor_mcp.workspace = true
+futures.workspace = true
+git.workspace = true
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
+menu.workspace = true
+project.workspace = true
+schemars.workspace = true
+serde.workspace = true
+settings.workspace = true
+solution_agent.workspace = true
+solutions.workspace = true
+theme.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+fs.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings.workspace = true
+tempfile.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

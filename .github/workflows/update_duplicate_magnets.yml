@@ -1,14 +1,12 @@
 name: Update Duplicate Magnets Issue
 
 on:
-  schedule:
-    - cron: "0 6 * * 1,4" # Mondays and Thursdays at 6 AM UTC
   workflow_dispatch:
 
 jobs:
   update-duplicate-magnets:
     runs-on: ubuntu-latest
-    if: github.repository == 'zed-industries/zed'
+    if: false # spk-editor: not applicable
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 

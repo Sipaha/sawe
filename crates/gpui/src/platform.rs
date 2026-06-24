@@ -12,6 +12,8 @@ mod bench_dispatcher;
 #[cfg(any(test, feature = "test-support"))]
 mod test;
 
+mod headless;
+
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test;
 
@@ -44,7 +46,6 @@ use anyhow::Result;
 use anyhow::bail;
 use async_task::Runnable;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
@@ -80,8 +81,12 @@ pub(crate) use test::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
 
+<<<<<<< ours
 #[cfg(any(test, feature = "bench"))]
 pub use bench_dispatcher::BenchDispatcher;
+=======
+pub use headless::{HeadlessDisplay, HeadlessWindow};
+>>>>>>> theirs
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test::VisualTestPlatform;
@@ -676,8 +681,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_edited(&mut self, _edited: bool) {}
     fn set_document_path(&self, _path: Option<&std::path::Path>) {}
+<<<<<<< ours
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
+=======
+>>>>>>> theirs
     fn show_character_palette(&self) {}
     fn titlebar_double_click(&self) {}
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
@@ -735,14 +743,21 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
+    ///
+    /// SPK fork: ungated (was `#[cfg(any(test, feature = "test-support"))]`) so the
+    /// `workspace.screenshot` MCP tool works in normal builds. The Linux X11/Wayland
+    /// backends override this via the wgpu renderer; other backends fall back to this error.
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
 }
 
 /// A renderer for headless windows that can produce real rendered output.
-#[cfg(any(test, feature = "test-support"))]
+///
+/// SPK fork: ungated (was `#[cfg(any(test, feature = "test-support"))]`).
+/// The trait is needed at runtime by the native headless platform path
+/// (see `gpui::HeadlessWindow` + `gpui_wgpu::WgpuHeadlessRenderer`) — not
+/// just by tests anymore.
 pub trait PlatformHeadlessRenderer {
     /// Render a scene and return the result as an RGBA image.
     fn render_scene_to_image(

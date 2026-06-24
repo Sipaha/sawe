@@ -428,8 +428,60 @@ impl ProjectDiff {
         })
     }
 
+<<<<<<< ours
     #[cfg(test)]
     #[allow(dead_code)]
+=======
+    /// S-CTM "Compare with Local Working Tree" — opens a `ProjectDiff` tab
+    /// showing every file modified between `base_ref` (a commit SHA, branch
+    /// name, or any rev-parseable ref) and the current working tree.
+    /// Activates an existing matching tab when one is already open.
+    pub fn deploy_at_revision(
+        workspace: &mut Workspace,
+        base_ref: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let project = workspace.project().clone();
+        let workspace_handle = cx.entity();
+
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            matches!(item.read(cx).diff_base(cx), DiffBase::Merge { base_ref: existing } if existing == &base_ref)
+        });
+        if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            return;
+        }
+
+        let workspace_weak = workspace_handle.downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let branch_diff = cx.new_window_entity(|window, cx| {
+                    branch_diff::BranchDiff::new(
+                        DiffBase::Merge { base_ref },
+                        project.clone(),
+                        window,
+                        cx,
+                    )
+                })?;
+                let project_diff = cx.new_window_entity(|window, cx| {
+                    Self::new_impl(branch_diff, project, workspace_handle.clone(), window, cx)
+                })?;
+                workspace_handle.update_in(cx, |workspace, window, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(project_diff),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_notify_err(workspace_weak, window, cx);
+    }
+
+>>>>>>> theirs
     fn new_with_default_branch(
         project: Entity<Project>,
         workspace: Entity<Workspace>,

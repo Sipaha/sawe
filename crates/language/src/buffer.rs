@@ -2,7 +2,11 @@ pub mod row_chunk;
 
 use crate::{
     ByteContent, DebuggerTextObject, LanguageScope, ModelineSettings, Outline, OutlineConfig,
+<<<<<<< ours
     PLAIN_TEXT, RunnableTag, TextObject, TreeSitterOptions, analyze_byte_content,
+=======
+    PLAIN_TEXT, RunnableCapture, RunnableTag, TextObject, TreeSitterOptions, analyze_byte_content,
+>>>>>>> theirs
     diagnostic_set::{DiagnosticEntry, DiagnosticEntryRef, DiagnosticGroup},
     language_settings::{AutoIndentMode, LanguageSettings},
     outline::OutlineItem,

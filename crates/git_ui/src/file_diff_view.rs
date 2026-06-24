@@ -8,8 +8,13 @@ use gpui::{
     AnyElement, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Font, IntoElement, Render, Task, WeakEntity, Window,
 };
+<<<<<<< ours
 use language::{Buffer, HighlightedText};
 use project::{Project, ProjectPath};
+=======
+use language::{Buffer, HighlightedText, LanguageRegistry};
+use project::Project;
+>>>>>>> theirs
 use settings::Settings;
 use std::{
     any::{Any, TypeId},
@@ -107,7 +112,10 @@ impl FileDiffView {
                 editor.start_temporary_diff_override();
             });
             splittable.disable_diff_hunk_controls(cx);
+<<<<<<< ours
             splittable.set_render_diff_hunks_as_unstaged(cx);
+=======
+>>>>>>> theirs
             splittable
         });
 

@@ -949,7 +949,11 @@
       "space w j": "workspace::ActivatePaneDown",
       "space w k": "workspace::ActivatePaneUp",
       "space w l": "workspace::ActivatePaneRight",
+<<<<<<< ours
       "space w q": "pane::CloseActiveItem",
+=======
+	  "space w q": "pane::CloseActiveItem",
+>>>>>>> theirs
     },
   },
   {

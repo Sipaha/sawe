@@ -137,6 +137,11 @@ pub struct EditPredictionSettingsContent {
     pub ollama: Option<OllamaEditPredictionSettingsContent>,
     /// Settings specific to using custom OpenAI-compatible servers for edit prediction.
     pub open_ai_compatible_api: Option<CustomEditPredictionProviderSettingsContent>,
+<<<<<<< ours
+=======
+    /// The directory where manually captured edit prediction examples are stored.
+    pub examples_dir: Option<Arc<Path>>,
+>>>>>>> theirs
     /// Controls whether Zed may collect training data when using Zed's Edit Predictions.
     /// Data is only ever captured for files in projects that are detected as open source.
     ///
@@ -280,6 +285,33 @@ pub struct OllamaEditPredictionSettingsContent {
     ///
     /// Default: ""
     pub prompt_format: Option<EditPredictionPromptFormatContent>,
+}
+
+/// Controls whether Zed collects training data when using Zed's Edit Predictions.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EditPredictionDataCollectionChoice {
+    /// Use the preference previously set via the status-bar toggle, or false
+    /// if no preference has been stored.
+    #[default]
+    Default,
+    /// Allow Zed to collect training data from open-source projects.
+    Yes,
+    /// Never allow training data collection.
+    No,
 }
 
 /// Controls whether Zed collects training data when using Zed's Edit Predictions.

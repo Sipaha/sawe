@@ -18,7 +18,7 @@ use language::{
     language_settings::LanguageSettings,
 };
 use lsp::{LanguageServerId, LanguageServerName};
-use paths::{debug_task_file_name, task_file_name};
+use paths::{debug_task_file_name, local_settings_folder_name, task_file_name};
 use settings::{InvalidSettingsError, parse_json_with_comments};
 use task::{
     DebugScenario, ResolvedTask, SharedTaskContext, TaskContext, TaskHook, TaskId, TaskTemplate,
@@ -89,8 +89,10 @@ impl<T: InventoryContents> InventoryFor<T> {
         let worktree_dirs = self.worktree.get(&worktree);
         let has_zed_dir = worktree_dirs
             .map(|dirs| {
-                dirs.keys()
-                    .any(|dir| dir.file_name().is_some_and(|name| name == ".zed"))
+                dirs.keys().any(|dir| {
+                    dir.file_name()
+                        .is_some_and(|name| name == local_settings_folder_name())
+                })
             })
             .unwrap_or(false);
 
@@ -147,7 +149,7 @@ impl<T> Default for InventoryFor<T> {
 pub enum TaskSourceKind {
     /// bash-like commands spawned by users, not associated with any path
     UserInput,
-    /// Tasks from the worktree's .zed/task.json
+    /// Tasks from the worktree's .spke/task.json
     Worktree {
         id: WorktreeId,
         directory_in_worktree: Arc<RelPath>,
@@ -499,8 +501,10 @@ impl Inventory {
             .worktree
             .iter()
             .filter(|(_, dirs)| {
-                dirs.keys()
-                    .any(|dir| dir.file_name().is_some_and(|name| name == ".zed"))
+                dirs.keys().any(|dir| {
+                    dir.file_name()
+                        .is_some_and(|name| name == local_settings_folder_name())
+                })
             })
             .map(|(id, _)| *id)
             .collect();
@@ -726,6 +730,36 @@ impl Inventory {
         self.worktree_templates_from_settings(worktree)
             .chain(self.global_templates_from_settings())
             .filter(|(_, template)| !template.hooks.is_disjoint(hooks))
+            .collect()
+    }
+
+    /// SPK Editor fork (S-PCH-HK): returns task templates flagged with
+    /// `before_commit: true` from the worktree-scoped + global settings.
+    /// Used by the git panel to render pre-commit check rows.
+    pub fn before_commit_templates(
+        &self,
+        worktree: WorktreeId,
+    ) -> Vec<(TaskSourceKind, TaskTemplate)> {
+        self.worktree_templates_from_settings(worktree)
+            .chain(self.global_templates_from_settings())
+            .filter(|(_, template)| template.before_commit)
+            .collect()
+    }
+
+    /// SPK Editor fork (S-RUN): returns all settings-derived task templates
+    /// (worktree-scoped first, then global) without requiring a `TaskContext`
+    /// or async resolution. Used by the `task-ref` run-config provider to list
+    /// and look up `.spke/tasks.json` tasks synchronously. Language runnables
+    /// are *not* included (those need an async, buffer-aware listing — see
+    /// `Inventory::list_tasks`).
+    pub fn task_templates_from_settings(
+        &self,
+        worktree: Option<WorktreeId>,
+    ) -> Vec<(TaskSourceKind, TaskTemplate)> {
+        worktree
+            .into_iter()
+            .flat_map(|worktree| self.worktree_templates_from_settings(worktree))
+            .chain(self.global_templates_from_settings())
             .collect()
     }
 

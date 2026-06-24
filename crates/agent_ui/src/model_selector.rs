@@ -1,8 +1,14 @@
 use std::{cmp::Reverse, rc::Rc, sync::Arc};
 
+<<<<<<< ours
 use acp_thread::{
     AgentModelIcon, AgentModelId, AgentModelInfo, AgentModelList, AgentModelSelector,
 };
+=======
+use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelList, AgentModelSelector};
+use agent_client_protocol::schema as acp;
+use agent_servers::AgentServer;
+>>>>>>> theirs
 
 use anyhow::Result;
 use collections::{HashSet, IndexMap};
@@ -51,7 +57,11 @@ pub struct ModelPickerDelegate {
     selected_index: usize,
     selected_description: Option<(usize, SharedString)>,
     selected_model: Option<AgentModelInfo>,
+<<<<<<< ours
     favorites: HashSet<AgentModelId>,
+=======
+    favorites: HashSet<acp::ModelId>,
+>>>>>>> theirs
     _refresh_models_task: Task<()>,
     _settings_subscription: Subscription,
     focus_handle: FocusHandle,
@@ -382,7 +392,11 @@ impl PickerDelegate for ModelPickerDelegate {
 
 fn info_list_to_picker_entries(
     model_list: AgentModelList,
+<<<<<<< ours
     favorites: &HashSet<AgentModelId>,
+=======
+    favorites: &HashSet<acp::ModelId>,
+>>>>>>> theirs
 ) -> Vec<ModelPickerEntry> {
     let mut entries = Vec::new();
 
@@ -488,8 +502,12 @@ async fn fuzzy_search(
 
 #[cfg(test)]
 mod tests {
+<<<<<<< ours
     use gpui::{App, TestAppContext, VisualTestContext};
     use std::cell::RefCell;
+=======
+    use gpui::TestAppContext;
+>>>>>>> theirs
 
     use super::*;
 
@@ -550,8 +568,16 @@ mod tests {
         }
     }
 
+<<<<<<< ours
     fn create_favorites(models: Vec<&str>) -> HashSet<AgentModelId> {
         models.into_iter().map(AgentModelId::new).collect()
+=======
+    fn create_favorites(models: Vec<&str>) -> HashSet<acp::ModelId> {
+        models
+            .into_iter()
+            .map(|m| acp::ModelId::new(m.to_string()))
+            .collect()
+>>>>>>> theirs
     }
 
     fn get_entry_model_ids(entries: &[ModelPickerEntry]) -> Vec<&str> {
@@ -833,7 +859,11 @@ mod tests {
 
     #[gpui::test]
     fn test_favorites_count_returns_correct_count(_cx: &mut TestAppContext) {
+<<<<<<< ours
         let empty_favorites: HashSet<AgentModelId> = HashSet::default();
+=======
+        let empty_favorites: HashSet<acp::ModelId> = HashSet::default();
+>>>>>>> theirs
         assert_eq!(empty_favorites.len(), 0);
 
         let one_favorite = create_favorites(vec!["model-a"]);

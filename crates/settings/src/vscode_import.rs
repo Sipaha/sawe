@@ -179,6 +179,10 @@ impl VsCodeSettings {
             base_keymap: Some(BaseKeymapContent::VSCode),
             calls: None,
             collaboration_panel: None,
+<<<<<<< ours
+=======
+            console_panel: None,
+>>>>>>> theirs
             credentials_url: None,
             debugger: None,
             diagnostics: None,
@@ -208,6 +212,9 @@ impl VsCodeSettings {
             proxy: self.read_string("http.proxy"),
             remote: RemoteSettingsContent::default(),
             repl: None,
+            solutions: None,
+            solution_agent: None,
+            run_config: None,
             server_url: None,
             session: None,
             status_bar: self.status_bar_settings_content(),
@@ -890,7 +897,6 @@ impl VsCodeSettings {
             }),
             default_height: None,
             default_width: None,
-            dock: None,
             font_fallbacks,
             font_family,
             font_features: None,
@@ -978,9 +984,13 @@ impl VsCodeSettings {
             buffer_font_features: None,
             agent_ui_font_size: None,
             agent_buffer_font_size: None,
+<<<<<<< ours
             git_commit_buffer_font_size: None,
             markdown_preview_font_family: None,
             markdown_preview_code_font_family: None,
+=======
+            markdown_preview_font_family: None,
+>>>>>>> theirs
             markdown_preview_theme: None,
             theme: None,
             icon_theme: None,
@@ -1008,7 +1018,6 @@ impl VsCodeSettings {
                 "onWindowChange" => Some(AutosaveSetting::OnWindowChange),
                 _ => None,
             }),
-            bottom_dock_layout: None,
             centered_layout: None,
             cli_default_open_behavior: None,
             default_open_behavior: None,

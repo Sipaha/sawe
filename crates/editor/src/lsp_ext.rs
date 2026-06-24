@@ -3,7 +3,12 @@ use std::time::Duration;
 
 use crate::Editor;
 use collections::{HashMap, HashSet};
+<<<<<<< ours
 use futures::TryFutureExt;
+=======
+use futures_lite::FutureExt as _;
+use gpui::AsyncApp;
+>>>>>>> theirs
 use gpui::{App, Entity, Task};
 use gpui::{AsyncApp, FutureExt};
 use language::Buffer;

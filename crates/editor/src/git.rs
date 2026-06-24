@@ -1,3 +1,4 @@
+<<<<<<< ours
 pub(super) mod blame;
 
 use super::*;
@@ -2839,3 +2840,8 @@ pub(super) fn update_uncommitted_diff_for_buffer(
         });
     })
 }
+=======
+pub mod blame;
+pub mod blame_colors;
+pub mod blame_filters;
+>>>>>>> theirs

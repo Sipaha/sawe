@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# Launch spk-editor with the MCP socket exposed for autonomous agent driving.
+# The MCP socket lives at $XDG_CONFIG_HOME/spk-editor/mcp.sock by default;
+# pass --runtime-dir <path> to override.
+#
+# Usage:
+#   script/run-mcp                # uses $DISPLAY if set, otherwise --headless
+#   script/run-mcp --headless     # native headless platform — no X / Wayland
+#                                 # connection, no window on the user's
+#                                 # desktop, no Xvfb. workspace.screenshot
+#                                 # captures real rendered pixels via the
+#                                 # offscreen wgpu pipeline.
+#   script/run-mcp --display      # use the existing $DISPLAY (fails if unset)
+#   script/run-mcp --debug        # use the dev (debug) build — much faster to
+#                                 # rebuild during iteration; runtime is slower
+#   script/run-mcp --release      # use target/release/spk-editor (default)
+#   script/run-mcp --skip-onboarding  # pre-seed kvp so the Onboarding screen
+#                                     # is skipped (only meaningful with
+#                                     # --runtime-dir on a fresh dir; requires
+#                                     # the sqlite3 CLI tool)
+#   script/run-mcp -- <args>      # pass extra args to spk-editor
+#
+# Behavior:
+# - Builds the chosen binary (release by default, dev with --debug) if missing.
+# - Waits for the MCP socket to appear (timeout 30s) and prints its path
+#   so callers can pipe into a follow-up command.
+# - Forwards SIGINT/SIGTERM to the editor process.
+#
+# The script is idempotent against stale lock files: if mcp.lock exists
+# but its PID is dead, the editor reclaims it. If a real instance holds
+# the lock, this script's editor exits via the handoff path.
+#
+# Uses the native headless GPUI platform in --headless mode (ADR-0002);
+# no Xvfb required.
+
+set -euo pipefail
+
+mode=""
+forward_args=()
+runtime_dir=""
+profile="release"
+skip_onboarding=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --headless)
+            mode="headless"
+            shift
+            ;;
+        --display)
+            mode="display"
+            shift
+            ;;
+        --debug)
+            profile="dev"
+            shift
+            ;;
+        --release)
+            profile="release"
+            shift
+            ;;
+        --runtime-dir)
+            runtime_dir="$2"
+            shift 2
+            ;;
+        --skip-onboarding)
+            skip_onboarding=1
+            shift
+            ;;
+        --)
+            shift
+            forward_args=("$@")
+            break
+            ;;
+        *)
+            echo "unknown flag: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$profile" == "dev" ]]; then
+    binary="$repo_root/target/debug/spk-editor"
+    cargo_flags=(--bin spk-editor)
+else
+    binary="$repo_root/target/release/spk-editor"
+    cargo_flags=(--release --bin spk-editor)
+fi
+
+# Resolve socket_dir + socket_path UP FRONT (before build / xvfb checks /
+# any other early-exit path), then strip stale state immediately. If we
+# fail-fast later (e.g. xvfb-run missing), we don't leave a stale socket
+# symlink around to fool a follow-up `until [ -S "$socket_path" ]` wait
+# into thinking the editor is ready.
+if [[ -n "$runtime_dir" ]]; then
+    # Full isolation: editor's config / data / cache all land under
+    # $runtime_dir. The editor uses its standard XDG-derived paths, which
+    # means a fresh state — no user settings, themes, keymaps, db, etc.
+    # The MCP socket lands at $runtime_dir/spk-editor/mcp.sock.
+    mkdir -p "$runtime_dir"
+    export XDG_CONFIG_HOME="$runtime_dir"
+    export XDG_DATA_HOME="$runtime_dir"
+    export XDG_CACHE_HOME="$runtime_dir"
+    socket_dir="$runtime_dir/spk-editor"
+else
+    # SPK Editor uses ~/.spk/spk-editor[-dev]/config/ (see crates/paths) —
+    # NOT XDG_CONFIG_HOME. The dev binary suffixes with `-dev`.
+    if [[ "$profile" == "dev" ]]; then
+        socket_dir="$HOME/.spk/spk-editor-dev/config"
+    else
+        socket_dir="$HOME/.spk/spk-editor/config"
+    fi
+    # Pin the editor's home-dir resolution to the real $HOME. A binary built
+    # with `--features test-support` (needed for the workspace.screenshot MCP
+    # tool) would otherwise hard-code /home/zed in util::paths::home_dir() and
+    # fail to create its config/data dirs. Harmless for normal builds.
+    export SPK_EDITOR_HOME="$HOME"
+fi
+socket_path="$socket_dir/mcp.sock"
+lock_path="$socket_dir/mcp.lock"
+mkdir -p "$socket_dir"
+
+# Strip stale socket (symlink to a /tmp/zed-mcp*/mcp.sock that no live
+# process owns) and stale lock (PID file pointing at a dead process). Done
+# unconditionally and BEFORE any check that could exit non-zero — so a
+# failed precheck never leaves the door open for a follow-up wait-loop to
+# false-positive on the corpse of a previous run.
+[[ -L "$socket_path" || -S "$socket_path" ]] && rm -f "$socket_path"
+if [[ -f "$lock_path" ]]; then
+    lock_pid="$(cat "$lock_path" 2>/dev/null || true)"
+    if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        rm -f "$lock_path"
+    fi
+fi
+
+if [[ ! -x "$binary" ]]; then
+    echo "[run-mcp] building $binary (profile: $profile) ..."
+    (cd "$repo_root" && cargo build "${cargo_flags[@]}")
+fi
+
+# Decide whether to run headless. If $DISPLAY is unset and mode wasn't
+# forced to "display", use the native headless platform (no X server at
+# all; offscreen wgpu rendering — see ADR-0002).
+use_headless=0
+if [[ "$mode" == "headless" ]]; then
+    use_headless=1
+elif [[ "$mode" == "display" ]]; then
+    use_headless=0
+elif [[ -z "${DISPLAY:-}" ]]; then
+    use_headless=1
+fi
+
+if (( skip_onboarding )); then
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "[run-mcp] --skip-onboarding requires the sqlite3 CLI" >&2
+        exit 1
+    fi
+    # Seed first_open in the per-channel kvp DB so main.rs takes the
+    # launchpad branch instead of show_onboarding_view. main.rs uses
+    # KeyValueStore::global(cx), which reads from 0-{channel}/db.sqlite —
+    # NOT 0-global/db.sqlite (that one is GlobalKeyValueStore, used only
+    # for cross-channel things like installation_id).
+    #
+    # Local dev builds and unmodified `cargo build --release` both read
+    # crates/zed/RELEASE_CHANNEL, which is "dev" in this fork. Seed every
+    # known channel so this works regardless of which binary the user
+    # eventually runs against this runtime dir.
+    #
+    # Only the kv_store table is created (CREATE IF NOT EXISTS keeps it
+    # idempotent). The `migrations` table is intentionally NOT touched —
+    # sqlez populates it itself on first open. Manually inserting rows
+    # here is dangerous: the table has no UNIQUE constraint, so repeat
+    # invocations stack duplicates and sqlez ends up reading "step N" =
+    # "the Nth row" out of order, then aborts with "Migration changed
+    # for KeyValueStore at step N" and falls back to an in-memory DB.
+    data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/spk-editor"
+    for channel in dev stable preview nightly; do
+        db_dir="$data_dir/db/0-$channel"
+        db_file="$db_dir/db.sqlite"
+        mkdir -p "$db_dir"
+        sqlite3 "$db_file" <<'EOF'
+CREATE TABLE IF NOT EXISTS kv_store (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL
+) STRICT;
+INSERT OR REPLACE INTO kv_store VALUES ('first_open', '1');
+EOF
+    done
+fi
+
+cleanup() {
+    if [[ -n "${editor_pid:-}" ]] && kill -0 "$editor_pid" 2>/dev/null; then
+        kill -TERM "$editor_pid" 2>/dev/null || true
+        wait "$editor_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup INT TERM EXIT
+
+if (( use_headless )); then
+    echo "[run-mcp] launching with native --headless platform"
+    "$binary" --headless "${forward_args[@]}" &
+else
+    echo "[run-mcp] launching with display=$DISPLAY"
+    "$binary" "${forward_args[@]}" &
+fi
+editor_pid=$!
+
+# Wait up to 30s for the socket to appear.
+for _ in $(seq 1 60); do
+    if [[ -S "$socket_path" || -L "$socket_path" ]]; then
+        break
+    fi
+    if ! kill -0 "$editor_pid" 2>/dev/null; then
+        echo "[run-mcp] editor exited before socket appeared" >&2
+        exit 1
+    fi
+    sleep 0.5
+done
+
+if [[ ! -S "$socket_path" && ! -L "$socket_path" ]]; then
+    echo "[run-mcp] timeout waiting for $socket_path" >&2
+    exit 1
+fi
+
+echo "[run-mcp] mcp socket ready: $socket_path (editor pid: $editor_pid)"
+echo "[run-mcp] press Ctrl+C to stop"
+
+wait "$editor_pid"

@@ -1,3 +1,19 @@
+//! S-DET commit view — IDEA-style metadata surface (header, parents bar,
+//! refs bar, contains panel, affected files, footer) plus the existing
+//! diff editor. Decomposed into per-section modules under
+//! [`crate::commit_view::*`] so each part has a clear scope. Public API
+//! (`CommitView`, `CommitViewToolbar`, `CommitView::open`) is unchanged.
+
+mod affected_files;
+pub mod ai_explain;
+mod contains_panel;
+mod footer;
+mod header;
+pub(crate) mod mcp;
+mod mentions;
+mod parents_bar;
+mod refs_bar;
+
 use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use collections::HashMap;
@@ -13,10 +29,16 @@ use git::{
     parse_git_remote_url,
 };
 use gpui::{
+<<<<<<< ours
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
     PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Task, WeakEntity,
     Window, actions,
+=======
+    AnyElement, App, AppContext as _, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, PromptLevel, Render,
+    Styled, Task, WeakEntity, Window, actions,
+>>>>>>> theirs
 };
 use language::{
     Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
@@ -45,8 +67,16 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
+<<<<<<< ours
 use crate::commit_tooltip::CommitAvatar;
 use crate::git_panel::GitPanel;
+=======
+use crate::commit_view::affected_files::CommitAffectedFiles;
+use crate::commit_view::contains_panel::CommitContainsPanel;
+use crate::git_panel::{GitPanel, OpenAtCommit};
+use crate::git_panel_settings::GitPanelSettings;
+use settings::Settings as _;
+>>>>>>> theirs
 
 actions!(
     git,
@@ -54,11 +84,29 @@ actions!(
         ApplyCurrentStash,
         PopCurrentStash,
         DropCurrentStash,
+<<<<<<< ours
         OpenFileAtHead,
     ]
 );
+=======
+        /// S-AI-EXP — kick off an AI explanation for the open commit
+        /// (or expand/collapse the section when one already exists).
+        ExplainCommit,
+    ]
+);
+
+/// Action emitted by the footer's "Open in New Tab" button. The workspace
+/// handler resolves the target repository, fetches the commit, and adds a
+/// fresh `CommitView` pane item.
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = git)]
+pub struct OpenCommitInNewTab {
+    pub sha: String,
+}
+>>>>>>> theirs
 
 pub fn init(cx: &mut App) {
+    mcp::register(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &ApplyCurrentStash, window, cx| {
             CommitView::apply_stash(workspace, window, cx);
@@ -68,6 +116,20 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &PopCurrentStash, window, cx| {
             CommitView::pop_stash(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, action: &OpenCommitInNewTab, window, cx| {
+            let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
+                return;
+            };
+            CommitView::open(
+                action.sha.clone(),
+                repo.downgrade(),
+                workspace.weak_handle(),
+                None,
+                None,
+                window,
+                cx,
+            );
         });
     })
     .detach();
@@ -83,8 +145,46 @@ pub struct CommitView {
     multibuffer: Entity<MultiBuffer>,
     repository: Entity<Repository>,
     project: Entity<Project>,
+<<<<<<< ours
     workspace: WeakEntity<Workspace>,
+=======
+>>>>>>> theirs
     remote: Option<GitRemote>,
+    /// Parents in display order. Loaded asynchronously after `new`.
+    parents: Vec<SharedString>,
+    /// Ref decorations attached to this commit (branches / tags). The
+    /// `git_graph` callers already know these from the log row; for
+    /// standalone opens we re-derive them via `git log --decorate=full`.
+    ref_names: Vec<SharedString>,
+    /// `Some((name, email))` only when the committer differs from the
+    /// author. Surfaced as a second line under the author tile.
+    extra_committer: Option<(SharedString, SharedString)>,
+    /// Currently selected merge-parent index (1-based; 1 = first parent).
+    /// Hidden in the toolbar when the commit has a single parent.
+    selected_parent_index: usize,
+    /// Cached commit diff (for the currently selected merge-parent index)
+    /// — used by the affected-files component.
+    diff_files: Vec<git::repository::CommitFile>,
+    affected_files: CommitAffectedFiles,
+    contains_panel: CommitContainsPanel,
+    /// Whether this view is the standalone-tab variant. Drives the
+    /// "Open in New Tab" footer button visibility.
+    in_pane: bool,
+    /// S-AI-EXP — Explain button state. The body / cache flag are only
+    /// `Some` once an explanation has been produced (or pulled from
+    /// disk). `pending` is the spinner driver.
+    explain_body: Option<SharedString>,
+    explain_from_cache: bool,
+    explain_pending: bool,
+    explain_expanded: bool,
+    explain_error: Option<SharedString>,
+    _explain_task: Option<Task<()>>,
+    /// `Some` when this view was opened as a focused single-file diff
+    /// (clicking a file in the git-graph commit-detail panel) — render
+    /// only the diff editor, no metadata panel / commit-message excerpt,
+    /// and title the tab with the file name. Also keys the open-view
+    /// dedup so a single-file diff and the full commit view coexist.
+    single_file: Option<RepoPath>,
 }
 
 struct GitBlob {
@@ -165,6 +265,52 @@ impl CommitView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        Self::open_internal(
+            commit_sha,
+            repo,
+            workspace,
+            stash,
+            file_filter,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// Open a focused diff of a single file's changes in `commit_sha`
+    /// (its content at the commit vs. at the parent) — no commit
+    /// metadata chrome, tab titled with the file name. Used by the
+    /// changed-files list in the git-graph commit-detail panel.
+    pub fn open_file_diff(
+        commit_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        file: RepoPath,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Self::open_internal(
+            commit_sha,
+            repo,
+            workspace,
+            None,
+            Some(file),
+            true,
+            window,
+            cx,
+        );
+    }
+
+    fn open_internal(
+        commit_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        stash: Option<usize>,
+        file_filter: Option<RepoPath>,
+        single_file_mode: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let commit_diff = repo
             .update(cx, |repo, _| repo.load_commit_diff(commit_sha.clone()))
             .ok();
@@ -180,18 +326,27 @@ impl CommitView {
                 let mut commit_diff = commit_diff.log_err()?.log_err()?;
                 let commit_details = commit_details.log_err()?.log_err()?;
 
-                // Filter to specific file if requested
                 if let Some(ref filter_path) = file_filter {
                     commit_diff.files.retain(|f| &f.path == filter_path);
                 }
+
+                let single_file = if single_file_mode {
+                    file_filter.clone()
+                } else {
+                    None
+                };
 
                 let repo = repo.upgrade()?;
 
                 workspace
                     .update_in(cx, |workspace, window, cx| {
                         let project = workspace.project();
+<<<<<<< ours
                         let workspace_entity = cx.entity();
                         let workspace_handle = cx.weak_entity();
+=======
+                        let single_file_for_view = single_file.clone();
+>>>>>>> theirs
                         let commit_view = cx.new(|cx| {
                             CommitView::new(
                                 commit_details,
@@ -201,6 +356,7 @@ impl CommitView {
                                 workspace_entity,
                                 workspace_handle,
                                 stash,
+                                single_file_for_view,
                                 window,
                                 cx,
                             )
@@ -210,8 +366,10 @@ impl CommitView {
                         pane.update(cx, |pane, cx| {
                             let ix = pane.items().position(|item| {
                                 let commit_view = item.downcast::<CommitView>();
-                                commit_view
-                                    .is_some_and(|view| view.read(cx).commit.sha == commit_sha)
+                                commit_view.is_some_and(|view| {
+                                    let view = view.read(cx);
+                                    view.commit.sha == commit_sha && view.single_file == single_file
+                                })
                             });
                             if let Some(ix) = ix {
                                 let existing = pane
@@ -247,10 +405,15 @@ impl CommitView {
         workspace_entity: Entity<Workspace>,
         workspace: WeakEntity<Workspace>,
         stash: Option<usize>,
+        single_file: Option<RepoPath>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Single-file diff mode: render only the file's diff editor — skip
+        // the commit-message excerpt (and the metadata panel, see `render`).
+        let compact = single_file.is_some();
         let language_registry = project.read(cx).languages().clone();
+<<<<<<< ours
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -273,6 +436,76 @@ impl CommitView {
                 project.clone(),
                 workspace_entity.clone(),
                 window,
+=======
+        let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadOnly));
+
+        let message_buffer = (!compact).then(|| {
+            let buffer = cx.new(|cx| {
+                let mut buffer = Buffer::local(commit.message.clone(), cx);
+                buffer.set_capability(Capability::ReadOnly, cx);
+                buffer
+            });
+            multibuffer.update(cx, |multibuffer, cx| {
+                let snapshot = buffer.read(cx).snapshot();
+                let full_range = Point::zero()..snapshot.max_point();
+                let range = ExcerptRange {
+                    context: full_range.clone(),
+                    primary: full_range,
+                };
+                multibuffer.set_excerpt_ranges_for_path(
+                    PathKey::with_sort_prefix(
+                        COMMIT_MESSAGE_SORT_PREFIX,
+                        RelPath::unix("commit message").unwrap().into(),
+                    ),
+                    buffer.clone(),
+                    &snapshot,
+                    vec![range],
+                    cx,
+                )
+            });
+            buffer
+        });
+
+        let editor = cx.new(|cx| {
+            let mut editor =
+                Editor::for_multibuffer(multibuffer.clone(), Some(project.clone()), window, cx);
+
+            editor.disable_inline_diagnostics();
+            editor.set_show_bookmarks(false, cx);
+            editor.set_show_breakpoints(false, cx);
+            editor.set_show_diff_review_button(true, cx);
+            editor.set_expand_all_diff_hunks(cx);
+            if let Some(message_buffer) = &message_buffer {
+                editor.disable_header_for_buffer(message_buffer.read(cx).remote_id(), cx);
+                editor.disable_indent_guides_for_buffer(message_buffer.read(cx).remote_id(), cx);
+            }
+
+            let message_below_block = message_buffer.as_ref().and_then(|message_buffer| {
+                editor
+                    .buffer()
+                    .read(cx)
+                    .snapshot(cx)
+                    .anchor_in_buffer(Anchor::max_for_buffer(message_buffer.read(cx).remote_id()))
+                    .map(|anchor| BlockProperties {
+                        placement: BlockPlacement::Below(anchor),
+                        height: Some(1),
+                        style: BlockStyle::Sticky,
+                        render: Arc::new(|_| gpui::Empty.into_any_element()),
+                        priority: 0,
+                    })
+            });
+            editor.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Above(editor::Anchor::Min),
+                    height: Some(1),
+                    style: BlockStyle::Sticky,
+                    render: Arc::new(|_| gpui::Empty.into_any_element()),
+                    priority: 0,
+                }]
+                .into_iter()
+                .chain(message_below_block),
+                None,
+>>>>>>> theirs
                 cx,
             );
             editor.disable_diff_hunk_controls(cx);
@@ -294,6 +527,7 @@ impl CommitView {
             .map(|worktree| worktree.read(cx).id());
 
         let repository_clone = repository.clone();
+        let diff_files = commit_diff.files.iter().map(clone_commit_file).collect();
 
         cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
@@ -470,7 +704,12 @@ impl CommitView {
             })
         });
 
-        Self {
+        let lazy_threshold = GitPanelSettings::get_global(cx)
+            .commit_view
+            .affected_files_lazy_threshold;
+        let affected_files = CommitAffectedFiles::new(lazy_threshold, window, cx);
+
+        let mut view = Self {
             commit,
             editor,
             message,
@@ -478,33 +717,73 @@ impl CommitView {
             message_scroll_handle: ScrollHandle::new(),
             multibuffer,
             stash,
+<<<<<<< ours
             repository,
             project,
             workspace,
+=======
+            repository: repository.clone(),
+            project: project.clone(),
+>>>>>>> theirs
             remote,
+            parents: Vec::new(),
+            ref_names: Vec::new(),
+            extra_committer: None,
+            selected_parent_index: 1,
+            diff_files,
+            affected_files,
+            contains_panel: CommitContainsPanel::new(),
+            in_pane: true,
+            explain_body: None,
+            explain_from_cache: false,
+            explain_pending: false,
+            explain_expanded: false,
+            explain_error: None,
+            _explain_task: None,
+            single_file,
+        };
+        // The metadata panel (parents / refs / contains) isn't rendered in
+        // single-file diff mode, so don't pay for the git calls that fill it.
+        if !compact {
+            let sha_for_meta = view.commit.sha.to_string();
+            view.contains_panel
+                .load(sha_for_meta.clone(), repository.clone(), cx);
+            view.spawn_load_metadata(sha_for_meta, repository, cx);
         }
+        view
     }
 
-    fn render_commit_avatar(
-        &self,
-        sha: &SharedString,
-        size: impl Into<gpui::AbsoluteLength>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> AnyElement {
-        CommitAvatar::new(
-            sha,
-            Some(self.commit.author_email.clone()),
-            self.remote.as_ref(),
-        )
-        .size(size)
-        .render(window, cx)
+    fn spawn_load_metadata(
+        &mut self,
+        sha: String,
+        repository: Entity<Repository>,
+        cx: &mut Context<Self>,
+    ) {
+        let work_dir = repository.read(cx).work_directory_abs_path.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(
+                    async move { load_commit_metadata(work_dir.as_ref(), &sha).await },
+                )
+                .await;
+            if let Some(metadata) = result.log_err() {
+                this.update(cx, |view, cx| {
+                    view.parents = metadata.parents;
+                    view.ref_names = metadata.ref_names;
+                    view.extra_committer = metadata.extra_committer;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn calculate_changed_lines(&self, cx: &App) -> (u32, u32) {
         self.multibuffer.read(cx).snapshot(cx).total_changed_lines()
     }
 
+<<<<<<< ours
     fn open_file_at_head(
         &mut self,
         file: &Arc<dyn language::File>,
@@ -568,6 +847,128 @@ impl CommitView {
 
         let avatar_size = rems_from_px(40.);
         let avatar_size_px = avatar_size.to_pixels(window.rem_size());
+=======
+    /// True if there's a Solution available to host the ephemeral AI
+    /// session. Without one, [`ai_explain::explain_commit`] would
+    /// surface the same error via the toast path; disabling the button
+    /// up front is friendlier — and keeps the affordance consistent
+    /// with the conflict-resolver AI button.
+    fn has_active_solution(cx: &App) -> bool {
+        solutions::SolutionStore::try_global(cx)
+            .map(|store| !store.read(cx).solutions().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Reason the Explain button is disabled (or `None` when active).
+    /// Surfaced as the button's tooltip so the user knows why the
+    /// affordance is greyed out.
+    pub(crate) fn explain_disabled_reason(&self, cx: &App) -> Option<&'static str> {
+        if self.commit.sha.as_ref().is_empty() {
+            return Some("This commit has no SHA");
+        }
+        if self.stash.is_some() {
+            return Some("Explain is only available for non-stash commits");
+        }
+        if !Self::has_active_solution(cx) {
+            return Some("Explain requires an active Solution");
+        }
+        None
+    }
+
+    /// Toolbar / header click handler for the Explain button. If an
+    /// explanation is already produced, just toggles the expandable
+    /// section; otherwise kicks off the ephemeral AI task.
+    pub(crate) fn toggle_or_request_explain(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.explain_pending {
+            return;
+        }
+        if self.explain_body.is_some() {
+            self.explain_expanded = !self.explain_expanded;
+            cx.notify();
+            return;
+        }
+        if self.explain_disabled_reason(cx).is_some() {
+            return;
+        }
+        let work_dir: PathBuf = self
+            .repository
+            .read(cx)
+            .work_directory_abs_path
+            .as_ref()
+            .to_path_buf();
+        let sha = self.commit.sha.to_string();
+        let project = self.project.clone();
+        let cache_ttl_days = GitPanelSettings::get_global(cx)
+            .commit_explanations
+            .cache_ttl_days;
+
+        self.explain_pending = true;
+        self.explain_expanded = true;
+        self.explain_error = None;
+        cx.notify();
+
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let outcome = ai_explain::explain_commit(
+                &work_dir,
+                &sha,
+                &project,
+                cache_ttl_days,
+                &mut cx.clone(),
+            )
+            .await;
+            let _ = this.update(cx, |view, cx| {
+                view.explain_pending = false;
+                match outcome {
+                    Ok(out) => {
+                        view.explain_body = Some(SharedString::from(out.text));
+                        view.explain_from_cache = out.source == ai_explain::ExplainSource::Cached;
+                        view.explain_expanded = true;
+                    }
+                    Err(err) => {
+                        log::warn!("AI commit explain failed: {err:#}");
+                        view.explain_error = Some(SharedString::from(format!(
+                            "Couldn't explain commit: {err}"
+                        )));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._explain_task = Some(task);
+    }
+
+    /// Reload the diff for a different parent (1-based merge-parent toggle).
+    fn select_parent_index(&mut self, parent_index: usize, cx: &mut Context<Self>) {
+        if parent_index == self.selected_parent_index {
+            return;
+        }
+        self.selected_parent_index = parent_index;
+        let sha = self.commit.sha.to_string();
+        let task = self.repository.update(cx, |repo, _| {
+            repo.load_commit_diff_against_parent(sha, parent_index)
+        });
+        cx.spawn(async move |this, cx| {
+            if let Some(diff) = task.await.log_err().and_then(|res| res.log_err()) {
+                this.update(cx, |view, cx| {
+                    view.diff_files = diff.files.iter().map(clone_commit_file).collect();
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn render_metadata_panel(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+>>>>>>> theirs
         let gutter_width = self.editor.update(cx, |editor, cx| {
             let editor = editor.rhs_editor().clone();
             editor.update(cx, |editor, cx| {
@@ -584,19 +985,51 @@ impl CommitView {
         let avatar_container_min = avatar_size_px + avatar_min_side_padding;
         let avatar_container_width = gutter_width.max(avatar_container_min);
 
-        let clipboard_has_sha = cx
-            .read_from_clipboard()
-            .and_then(|entry| entry.text())
-            .map_or(false, |clipboard_text| {
-                clipboard_text.trim() == commit_sha.as_ref()
-            });
+        let head_branch_name = self
+            .repository
+            .read(cx)
+            .snapshot()
+            .branch
+            .as_ref()
+            .map(|branch| SharedString::from(branch.name().to_string()));
 
-        let (copy_icon, copy_icon_color) = if clipboard_has_sha {
-            (IconName::Check, Color::Success)
+        let explain_state = header::ExplainHeaderState {
+            pending: self.explain_pending,
+            body: self.explain_body.clone(),
+            error: self.explain_error.clone(),
+            from_cache: self.explain_from_cache,
+            expanded: self.explain_expanded,
+            disabled_reason: self.explain_disabled_reason(cx),
+            on_click: Arc::new(cx.listener(|view, _event, window, cx| {
+                view.toggle_or_request_explain(window, cx);
+            })),
+        };
+        let header = header::render_header(
+            &self.commit,
+            self.remote.as_ref(),
+            self.extra_committer.clone(),
+            self.stash.is_some(),
+            gutter_width,
+            explain_state,
+            window,
+            cx,
+        );
+
+        let parents = parents_bar::render_parents_bar(&self.parents);
+        let refs = refs_bar::render_refs_bar(&self.ref_names, head_branch_name.as_ref());
+        let contains = self.contains_panel.render(cx);
+
+        let affected = if self.diff_files.is_empty() {
+            None
         } else {
-            (IconName::Copy, Color::Muted)
+            Some(affected_files::render_affected_files(
+                &self.diff_files,
+                &self.affected_files,
+                cx,
+            ))
         };
 
+<<<<<<< ours
         let has_more = self.commit.message.trim().contains('\n');
         let is_expanded = self.message_expanded;
         let expand_tooltip = if is_expanded {
@@ -750,6 +1183,23 @@ impl CommitView {
                         .vertical_scrollbar_for(&self.message_scroll_handle, window, cx),
                 ),
         )
+=======
+        v_flex()
+            .gap_1()
+            .child(header)
+            .when_some(parents, |this, el| {
+                this.child(div().px_2().pt_1p5().child(el))
+            })
+            .when_some(refs, |this, el| this.child(div().px_2().child(el)))
+            .when_some(contains, |this, el| this.child(div().px_2().child(el)))
+            .when_some(affected, |this, el| {
+                this.child(div().px_2().pt_1p5().child(el))
+            })
+>>>>>>> theirs
+    }
+
+    fn render_inline_footer(&self, cx: &mut App) -> impl IntoElement {
+        footer::render_footer(&self.commit.sha, self.stash.is_some(), self.in_pane, cx)
     }
 
     fn apply_stash(workspace: &mut Workspace, window: &mut Window, cx: &mut App) {
@@ -912,6 +1362,82 @@ impl CommitView {
     }
 }
 
+fn clone_commit_file(file: &git::repository::CommitFile) -> git::repository::CommitFile {
+    git::repository::CommitFile {
+        path: file.path.clone(),
+        old_text: file.old_text.clone(),
+        new_text: file.new_text.clone(),
+        is_binary: file.is_binary,
+    }
+}
+
+struct LoadedCommitMetadata {
+    parents: Vec<SharedString>,
+    ref_names: Vec<SharedString>,
+    extra_committer: Option<(SharedString, SharedString)>,
+}
+
+async fn load_commit_metadata(
+    work_dir: &std::path::Path,
+    sha: &str,
+) -> Result<LoadedCommitMetadata> {
+    use util::command::new_command;
+    // %H<NUL>%P<NUL>%D<NUL>%an<NUL>%ae<NUL>%cn<NUL>%ce
+    let format = "--format=%H%x00%P%x00%D%x00%an%x00%ae%x00%cn%x00%ce";
+    let mut cmd = new_command("git");
+    cmd.current_dir(work_dir);
+    cmd.args(["show", "--no-patch", "--decorate=full", format, sha]);
+    let output = cmd
+        .output()
+        .await
+        .context("spawning git show for metadata")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git show --format= failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        );
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("git show metadata output not utf-8")?
+        .trim_end_matches('\n');
+    let mut parts = stdout.splitn(7, '\x00');
+    let _full_sha = parts.next().unwrap_or("");
+    let parents = parts
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|s| SharedString::from(s.to_string()))
+        .collect();
+    let refs_raw = parts.next().unwrap_or("");
+    let ref_names: Vec<SharedString> = if refs_raw.is_empty() {
+        Vec::new()
+    } else {
+        refs_raw
+            .split(", ")
+            .map(|s| SharedString::from(s.to_string()))
+            .collect()
+    };
+    let author_name = parts.next().unwrap_or("");
+    let author_email = parts.next().unwrap_or("");
+    let committer_name = parts.next().unwrap_or("");
+    let committer_email = parts.next().unwrap_or("");
+    let extra_committer = if !committer_name.is_empty()
+        && (committer_name != author_name || committer_email != author_email)
+    {
+        Some((
+            SharedString::from(committer_name.to_string()),
+            SharedString::from(committer_email.to_string()),
+        ))
+    } else {
+        None
+    };
+    Ok(LoadedCommitMetadata {
+        parents,
+        ref_names,
+        extra_committer,
+    })
+}
+
 impl language::File for GitBlob {
     fn as_local(&self) -> Option<&dyn language::LocalFile> {
         None
@@ -944,7 +1470,12 @@ impl language::File for GitBlob {
     }
 
     fn to_proto(&self, _cx: &App) -> language::proto::File {
-        unimplemented!()
+        // Synthetic CommitView buffers never travel over the collab wire —
+        // collab is disabled in this fork (.rules § "What's disabled"), so
+        // `to_proto` is unreachable. If collab is ever re-enabled,
+        // CommitView's read-only synthetic blobs would need a real
+        // serialization shape; until then `unreachable!` is correct.
+        unreachable!("CommitView synthetic File never serializes — collab disabled")
     }
 
     fn is_private(&self) -> bool {
@@ -1044,6 +1575,13 @@ impl Item for CommitView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        if let Some(path) = &self.single_file {
+            return path
+                .file_name()
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| path.as_unix_str().to_string())
+                .into();
+        }
         let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
         let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
         format!("{short_sha} — {subject}").into()
@@ -1052,6 +1590,23 @@ impl Item for CommitView {
     fn tab_tooltip_content(&self, _: &App) -> Option<TabTooltipContent> {
         let short_sha = self.commit.sha.get(0..16).unwrap_or(&*self.commit.sha);
         let subject = self.commit.message.split('\n').next().unwrap();
+
+        if let Some(path) = &self.single_file {
+            let path = path.as_unix_str().to_string();
+            let short_sha = short_sha.to_string();
+            return Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
+                move |_, _| {
+                    v_flex()
+                        .child(Label::new(path.clone()))
+                        .child(
+                            Label::new(format!("at {short_sha}"))
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                        )
+                        .into_any_element()
+                },
+            ))));
+        }
 
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
             let subject = subject.to_string();
@@ -1171,6 +1726,7 @@ impl Item for CommitView {
             .addon::<CommitDiffAddon>()
             .map(|addon| addon.file_statuses.clone())
             .unwrap_or_default();
+<<<<<<< ours
         let Some(workspace_entity) = self.workspace.upgrade() else {
             return Task::ready(None);
         };
@@ -1179,6 +1735,14 @@ impl Item for CommitView {
         let multibuffer = self.multibuffer.clone();
         Task::ready(Some(cx.new(|cx| {
             let commit_view = cx.weak_entity();
+=======
+        let parents = self.parents.clone();
+        let ref_names = self.ref_names.clone();
+        let extra_committer = self.extra_committer.clone();
+        let diff_files = self.diff_files.iter().map(clone_commit_file).collect();
+        let lazy_threshold = self.affected_files.lazy_threshold;
+        Task::ready(Some(cx.new(move |cx| {
+>>>>>>> theirs
             let editor = cx.new({
                 let file_statuses = file_statuses.clone();
                 let project = project.clone();
@@ -1206,6 +1770,7 @@ impl Item for CommitView {
                     editor
                 }
             });
+<<<<<<< ours
             let language_registry = project.read(cx).languages().clone();
             let message = cx.new(|cx| {
                 Markdown::new(
@@ -1215,6 +1780,10 @@ impl Item for CommitView {
                     cx,
                 )
             });
+=======
+            let multibuffer = editor.read(cx).buffer().clone();
+            let affected_files = CommitAffectedFiles::new(lazy_threshold, window, cx);
+>>>>>>> theirs
             Self {
                 editor,
                 message,
@@ -1225,8 +1794,26 @@ impl Item for CommitView {
                 stash: self.stash,
                 repository: self.repository.clone(),
                 project: self.project.clone(),
+<<<<<<< ours
                 workspace: self.workspace.clone(),
+=======
+>>>>>>> theirs
                 remote: self.remote.clone(),
+                parents,
+                ref_names,
+                extra_committer,
+                selected_parent_index: self.selected_parent_index,
+                diff_files,
+                affected_files,
+                contains_panel: CommitContainsPanel::new(),
+                in_pane: true,
+                explain_body: self.explain_body.clone(),
+                explain_from_cache: self.explain_from_cache,
+                explain_pending: false,
+                explain_expanded: self.explain_expanded,
+                explain_error: self.explain_error.clone(),
+                _explain_task: None,
+                single_file: self.single_file.clone(),
             }
         })))
     }
@@ -1236,16 +1823,35 @@ impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_stash = self.stash.is_some();
 
-        v_flex()
+        let base = v_flex()
             .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
             .on_action(cx.listener(Self::open_file_at_head_action))
             .size_full()
             .bg(cx.theme().colors().editor_background)
+<<<<<<< ours
             .child(self.render_header(window, cx))
             .when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
                 |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
             )
+=======
+            .on_action(cx.listener(|view, _: &ExplainCommit, window, cx| {
+                view.toggle_or_request_explain(window, cx);
+            }));
+
+        // Single-file diff mode — just the diff editor, no commit metadata.
+        if self.single_file.is_some() {
+            return base.when(!self.editor.read(cx).is_empty(cx), |this| {
+                this.child(div().flex_grow().child(self.editor.clone()))
+            });
+        }
+
+        base.child(self.render_metadata_panel(window, cx))
+            .when(!self.editor.read(cx).is_empty(cx), |this| {
+                this.child(div().flex_grow().child(self.editor.clone()))
+            })
+            .child(self.render_inline_footer(cx))
+>>>>>>> theirs
     }
 }
 
@@ -1273,6 +1879,8 @@ impl Render for CommitViewToolbar {
         let (additions, deletions) = commit_view_ref.calculate_changed_lines(cx);
 
         let commit_sha = commit_view_ref.commit.sha.clone();
+        let parents = commit_view_ref.parents.clone();
+        let selected_parent_index = commit_view_ref.selected_parent_index;
 
         let remote_info = commit_view_ref.remote.as_ref().map(|remote| {
             let provider = remote.host.name();
@@ -1289,6 +1897,7 @@ impl Render for CommitViewToolbar {
         });
 
         let sha_for_graph = commit_sha.to_string();
+        let commit_view_for_parent = commit_view.downgrade();
 
         h_flex()
             .gap_1()
@@ -1303,6 +1912,14 @@ impl Render for CommitViewToolbar {
                         ))
                         .child(Divider::vertical()),
                 )
+            })
+            .when(parents.len() > 1, |this| {
+                this.child(render_parent_toggle(
+                    selected_parent_index,
+                    parents.len(),
+                    commit_view_for_parent.clone(),
+                ))
+                .child(Divider::vertical())
             })
             .child(
                 IconButton::new("buffer-search", IconName::MagnifyingGlass)
@@ -1328,7 +1945,11 @@ impl Render for CommitViewToolbar {
                         .tooltip(Tooltip::text("Show in Git Graph"))
                         .on_click(move |_, window, cx| {
                             window.dispatch_action(
+<<<<<<< ours
                                 Box::new(crate::git_graph::OpenAtCommit {
+=======
+                                Box::new(OpenAtCommit {
+>>>>>>> theirs
                                     sha: sha_for_graph.clone(),
                                 }),
                                 cx,
@@ -1345,6 +1966,33 @@ impl Render for CommitViewToolbar {
                 }))
             })
     }
+}
+
+fn render_parent_toggle(
+    selected: usize,
+    parent_count: usize,
+    commit_view: WeakEntity<CommitView>,
+) -> AnyElement {
+    let label = format!("Diff vs parent: {}", selected.max(1).min(parent_count));
+    Button::new("merge-parent-toggle", label)
+        .style(ButtonStyle::Subtle)
+        .label_size(LabelSize::Small)
+        .tooltip(Tooltip::text(
+            "Cycle through merge-commit parents to diff against",
+        ))
+        .on_click(move |_, _, cx| {
+            let next = if selected >= parent_count {
+                1
+            } else {
+                selected + 1
+            };
+            commit_view
+                .update(cx, |view, cx| {
+                    view.select_parent_index(next, cx);
+                })
+                .ok();
+        })
+        .into_any_element()
 }
 
 impl ToolbarItemView for CommitViewToolbar {

@@ -29,7 +29,10 @@ use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
 use fs::Fs;
-use futures::FutureExt as _;
+// SPK Editor: FutureExt was used by initialize_agent_panel — keep the import
+// commented (instead of deleted) so re-enabling the agent panel is a one-line
+// flip without re-discovering which trait `.map()` came from.
+// use futures::FutureExt as _;
 use futures::{StreamExt, channel::mpsc, select_biased};
 use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
@@ -70,9 +73,12 @@ use settings::{
     VIM_KEYMAP_PATH, initial_local_debug_tasks_content, initial_project_settings_content,
     initial_tasks_content, update_settings_file,
 };
+<<<<<<< ours
 use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
+=======
+>>>>>>> theirs
 
 use std::{
     borrow::Cow,
@@ -80,7 +86,6 @@ use std::{
     sync::Arc,
     sync::atomic::{self, AtomicBool},
 };
-use terminal_view::terminal_panel::{self, TerminalPanel};
 use theme::{ActiveTheme, SystemAppearance, ThemeRegistry, deserialize_icon_theme};
 use theme_settings::{ThemeSettings, load_user_theme};
 use ui::{Navigable, NavigableEntry, PopoverMenuHandle, TintColor, prelude::*};
@@ -303,6 +308,18 @@ pub fn init(cx: &mut App) {
     });
 }
 
+/// True once no main editor window (a `MultiWorkspace`-rooted window) is
+/// left open. Auxiliary windows — the image preview, the detached compose
+/// editor, the About box — are `Normal` windows too, so the old
+/// `cx.windows().is_empty()` check let them keep the app alive after the
+/// last editor window closed. Closing the editor should quit regardless of
+/// those; `cx.quit()` tears them down.
+fn no_main_windows_left(cx: &App) -> bool {
+    !cx.windows()
+        .iter()
+        .any(|window| window.downcast::<MultiWorkspace>().is_some())
+}
+
 fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {
     #[cfg(target_os = "macos")]
     {
@@ -311,7 +328,7 @@ fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {
             .is_quit_app()
             .then(|| {
                 cx.on_window_closed(|cx, _window_id| {
-                    if cx.windows().is_empty() {
+                    if no_main_windows_left(cx) {
                         cx.quit();
                     }
                 })
@@ -320,7 +337,7 @@ fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {
     #[cfg(not(target_os = "macos"))]
     {
         Some(cx.on_window_closed(|cx, _window_id| {
-            if cx.windows().is_empty() {
+            if no_main_windows_left(cx) {
                 cx.quit();
             }
         }))
@@ -487,24 +504,28 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                         }
                     }
 
-                    ensure_agent_panel_for_workspace(workspace, source_workspace, window, cx)
-                        .detach_and_log_err(cx);
+                    // SPK Editor: do NOT mount the upstream AgentPanel here.
+                    // `initialize_panels` deliberately omits it (this fork's AI
+                    // surface is `solution_agent`, not upstream's agent panel).
+                    // Re-adding it on every active-workspace switch was a
+                    // leftover that reintroduced the stray ZedAssistant
+                    // (sparkle) toggle button in the left dock strip. The
+                    // guarded source-init above is inert while the panel is
+                    // unmounted and stays only so re-enabling is a one-line
+                    // change (restore the `ensure_agent_panel_for_workspace`
+                    // call here and the `initialize_agent_panel` line in
+                    // `initialize_panels`).
                 });
             },
         )
         .detach();
 
-        cx.defer(move |cx| {
-            window_handle
-                .update(cx, |_, window, cx| {
-                    let sidebar =
-                        cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
-                    multi_workspace_handle.update(cx, |multi_workspace, cx| {
-                        multi_workspace.register_sidebar(sidebar, cx);
-                    });
-                })
-                .ok();
-        });
+        // SPK fork: Sidebar (the IDEA-style left panel) is hidden — solutions
+        // already provide project/thread navigation, so the upstream agent
+        // sidebar is redundant and just adds an empty surface. The crate
+        // stays in tree for upstream-merge friendliness; only the
+        // registration site is gated.
+        let _ = (window_handle, multi_workspace_handle);
     })
     .detach();
 
@@ -562,7 +583,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let search_button = cx.new(|_| search::search_status_button::SearchButton::new());
         let diagnostic_summary =
             cx.new(|cx| diagnostics::items::DiagnosticIndicator::new(workspace, cx));
-        let active_file_name = cx.new(|_| workspace::active_file_name::ActiveFileName::new());
+        let active_file_name =
+            cx.new(|_| workspace::active_file_name::ActiveFileName::new(workspace));
         let activity_indicator = activity_indicator::ActivityIndicator::new(
             workspace,
             workspace.project().read(cx).languages().clone(),
@@ -593,6 +615,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
+        let solutions_status = cx.new(|cx| solutions_ui::SolutionsStatusItem::new(workspace, cx));
+        let remote_control_status =
+            cx.new(|cx| remote_control_ui::RemoteControlStatusItem::new(workspace, cx));
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
@@ -600,6 +625,11 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
+<<<<<<< ours
+=======
+            status_bar.add_right_item(solutions_status, window, cx);
+            status_bar.add_right_item(remote_control_status, window, cx);
+>>>>>>> theirs
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
@@ -737,10 +767,18 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
-        let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
+        let console_panel = console_panel::ConsolePanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
-        let channels_panel =
-            collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
+        // SPK Editor: the commit-log graph as a bottom-docked panel
+        // (IDEA-style "Git" tool window); still also openable as a pane item.
+        let git_graph_panel =
+            git_graph::git_graph_panel::GitGraphPanel::load(workspace_handle.clone(), cx.clone());
+        // SPK Editor: the upstream-style left-dock SolutionsPanel was
+        // removed; Solutions are surfaced via the title-bar tab strip
+        // (`solutions_ui::solution_tab_strip`) instead.
+        // Collab panel disabled in spk-editor (no Zed Industries collab server access).
+        // let channels_panel =
+        //     collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -761,12 +799,20 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(console_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(git_graph_panel, workspace_handle.clone(), cx.clone()),
+            // add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
+            // SPK Editor: agent_panel disabled — this fork's AI story is the
+            // solution_agent crate (per-Solution Claude Code sessions). Leaving
+            // upstream's AgentPanel registered creates a parallel, unconfigured
+            // AI surface that confuses users about where to find AI features.
+            // agent_ui::init still runs because other subsystems depend on it
+            // (inline_assistant, rules_library, ConfigureContextServerModal).
+            // initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
         );
+        let _ = workspace_handle;
 
         anyhow::Ok(())
     })
@@ -832,6 +878,10 @@ fn ensure_agent_panel_for_workspace(
     })
 }
 
+// SPK Editor: kept in tree but no longer called (see futures::join! above).
+// Leaving it here preserves merge-friendliness with upstream and means
+// re-enabling the panel is a one-line uncomment in `initialize_panels`.
+#[allow(dead_code)]
 async fn initialize_agent_panel(
     workspace_handle: WeakEntity<Workspace>,
     mut cx: AsyncWindowContext,
@@ -1163,14 +1213,6 @@ fn register_actions(
                 workspace.toggle_panel_focus::<collab_ui::collab_panel::CollabPanel>(window, cx);
             },
         )
-        .register_action(
-            |workspace: &mut Workspace,
-             _: &terminal_panel::ToggleFocus,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<TerminalPanel>(window, cx);
-            },
-        )
         .register_action({
             let app_state = app_state.clone();
             move |_, _: &NewWindow, _, cx| {
@@ -1439,25 +1481,34 @@ fn open_about_window(cx: &mut App) {
         message: SharedString,
         commit: Option<SharedString>,
         full_version: SharedString,
+        attribution: SharedString,
+        source_url: SharedString,
+        licenses: SharedString,
     }
 
     impl AboutWindow {
         fn new(cx: &mut Context<Self>) -> Self {
             let release_channel = ReleaseChannel::global(cx);
-            let release_channel_name = release_channel.display_name();
             let full_version: SharedString = AppVersion::global(cx).to_string().into();
             let version = env!("CARGO_PKG_VERSION");
 
-            let debug = if cfg!(debug_assertions) {
-                "(debug)"
-            } else {
-                ""
-            };
-            let message: SharedString = format!("{release_channel_name} {version} {debug}").into();
+            let commit_sha = AppCommitSha::try_global(cx)
+                .and_then(|sha| {
+                    let full = sha.full();
+                    if full.is_empty() { None } else { Some(full) }
+                })
+                .unwrap_or_else(|| "dev".to_string());
+
+            let message: SharedString = format!("SPK Editor v{version} ({commit_sha})").into();
             let commit = AppCommitSha::try_global(cx)
                 .map(|sha| sha.full())
                 .filter(|commit| !commit.is_empty())
                 .map(SharedString::from);
+
+            let attribution: SharedString =
+                "Fork of Zed by Zed Industries, Inc., modified by Simonov Pavel.".into();
+            let source_url: SharedString = "https://github.com/Sipaha/spk-editor".into();
+            let licenses: SharedString = "Distributed under GPL-3.0-or-later (editor), AGPL-3.0 (collab), Apache-2.0 (libraries).".into();
 
             Self {
                 focus_handle: cx.focus_handle(),
@@ -1467,19 +1518,24 @@ fn open_about_window(cx: &mut App) {
                 message,
                 commit,
                 full_version,
+                attribution,
+                source_url,
+                licenses,
             }
         }
 
         fn copy_details(&self, window: &mut Window, cx: &mut Context<Self>) {
-            let content = match self.commit.as_ref() {
-                Some(commit) => {
-                    format!(
-                        "{}\nCommit: {}\nVersion: {}",
-                        self.message, commit, self.full_version
-                    )
-                }
-                None => format!("{}\nVersion: {}", self.message, self.full_version),
-            };
+            let mut lines = vec![self.message.to_string()];
+            if let Some(commit) = self.commit.as_ref() {
+                lines.push(format!("Commit: {}", commit));
+            }
+            lines.push(format!("Version: {}", self.full_version));
+            lines.push(String::new());
+            lines.push(self.attribution.to_string());
+            lines.push(format!("Source: {}", self.source_url));
+            lines.push(String::new());
+            lines.push(self.licenses.to_string());
+            let content = lines.join("\n");
             cx.write_to_clipboard(ClipboardItem::new_string(content));
             window.remove_window();
         }
@@ -1513,20 +1569,9 @@ fn open_about_window(cx: &mut App) {
                             .items_center()
                             .child(img(self.app_icon.clone()).size_16().flex_none())
                             .child(Headline::new(self.message.clone()))
-                            .when_some(self.commit.clone(), |this, commit| {
-                                this.child(
-                                    Label::new("Commit")
-                                        .color(Color::Muted)
-                                        .size(LabelSize::XSmall),
-                                )
-                                .child(Label::new(commit).size(LabelSize::Small))
-                            })
-                            .child(
-                                Label::new("Version")
-                                    .color(Color::Muted)
-                                    .size(LabelSize::XSmall),
-                            )
-                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small)),
+                            .child(Label::new(self.attribution.clone()).size(LabelSize::Small))
+                            .child(Label::new(self.source_url.clone()).size(LabelSize::Small))
+                            .child(Label::new(self.licenses.clone()).size(LabelSize::Small)),
                     )
                     .child(
                         h_flex()
@@ -1607,7 +1652,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About SPK Editor".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),
@@ -5653,14 +5698,14 @@ mod tests {
             .insert_tree(
                 Path::new("/root"),
                 json!({
-                    ".zed": {
+                    ".spke": {
                         "settings.json": settings_init
                     }
                 }),
             )
             .await;
 
-        eprintln!("Created project with .zed/settings.json containing UNIQUEVALUE");
+        eprintln!("Created project with .spke/settings.json containing UNIQUEVALUE");
 
         // 2. Create a project with the file system and load it
         let project = Project::test(app_state.fs.clone(), [Path::new("/root")], cx).await;
@@ -5668,7 +5713,7 @@ mod tests {
         // Save original settings content for comparison
         let original_settings = app_state
             .fs
-            .load(Path::new("/root/.zed/settings.json"))
+            .load(Path::new("/root/.spke/settings.json"))
             .await
             .unwrap();
 
@@ -5685,7 +5730,7 @@ mod tests {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |worktree_settings| {
                 worktree_settings.project.worktree.file_scan_exclusions =
-                    Some(vec![".zed".to_string()]);
+                    Some(vec![".spke".to_string()]);
             });
         });
 
@@ -5697,8 +5742,12 @@ mod tests {
         // 5. Critical: Verify .zed is actually excluded from worktree
         let worktree = cx.update(|cx| project.read(cx).worktrees(cx).next().unwrap());
 
-        let has_zed_entry =
-            cx.update(|cx| worktree.read(cx).entry_for_path(rel_path(".zed")).is_some());
+        let has_zed_entry = cx.update(|cx| {
+            worktree
+                .read(cx)
+                .entry_for_path(rel_path(".spke"))
+                .is_some()
+        });
 
         eprintln!(
             "Is .zed directory visible in worktree after exclusion: {}",
@@ -5734,7 +5783,7 @@ mod tests {
         // 8. Verify file contents after calling function
         let new_content = app_state
             .fs
-            .load(Path::new("/root/.zed/settings.json"))
+            .load(Path::new("/root/.spke/settings.json"))
             .await
             .unwrap();
 

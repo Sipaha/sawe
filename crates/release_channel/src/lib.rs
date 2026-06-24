@@ -30,10 +30,10 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-Editor-Dev",
-        ReleaseChannel::Nightly => "Zed-Editor-Nightly",
-        ReleaseChannel::Preview => "Zed-Editor-Preview",
-        ReleaseChannel::Stable => "Zed-Editor-Stable",
+        ReleaseChannel::Dev => "SPK-Editor-Dev",
+        ReleaseChannel::Nightly => "SPK-Editor-Nightly",
+        ReleaseChannel::Preview => "SPK-Editor-Preview",
+        ReleaseChannel::Stable => "SPK-Editor",
     }
 }
 
@@ -191,10 +191,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
-            ReleaseChannel::Nightly => "Zed Nightly",
-            ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Dev => "SPK Editor Dev",
+            ReleaseChannel::Nightly => "SPK Editor Nightly",
+            ReleaseChannel::Preview => "SPK Editor Preview",
+            ReleaseChannel::Stable => "SPK Editor",
         }
     }
 
@@ -213,10 +213,10 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.zed.Zed-Dev",
-            ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
-            ReleaseChannel::Preview => "dev.zed.Zed-Preview",
-            ReleaseChannel::Stable => "dev.zed.Zed",
+            ReleaseChannel::Dev => "ru.sipaha.spk-editor-dev",
+            ReleaseChannel::Nightly => "ru.sipaha.spk-editor-nightly",
+            ReleaseChannel::Preview => "ru.sipaha.spk-editor-preview",
+            ReleaseChannel::Stable => "ru.sipaha.spk-editor",
         }
     }
 
@@ -267,6 +267,7 @@ impl FromStr for ReleaseChannel {
 }
 
 #[cfg(test)]
+<<<<<<< ours
 mod tests {
     use super::ReleaseChannel;
 
@@ -288,5 +289,32 @@ mod tests {
             ReleaseChannel::Stable.docs_url("settings"),
             "https://zed.dev/docs/settings"
         );
+=======
+mod rebrand_tests {
+    use super::*;
+
+    #[test]
+    fn display_names_use_spk_editor() {
+        assert_eq!(ReleaseChannel::Stable.display_name(), "SPK Editor");
+        assert_eq!(ReleaseChannel::Preview.display_name(), "SPK Editor Preview");
+        assert_eq!(ReleaseChannel::Nightly.display_name(), "SPK Editor Nightly");
+        assert_eq!(ReleaseChannel::Dev.display_name(), "SPK Editor Dev");
+    }
+
+    #[test]
+    fn app_ids_use_ru_sipaha() {
+        for ch in [
+            ReleaseChannel::Stable,
+            ReleaseChannel::Preview,
+            ReleaseChannel::Nightly,
+            ReleaseChannel::Dev,
+        ] {
+            let id = ch.app_id();
+            assert!(
+                id.starts_with("ru.sipaha.spk-editor"),
+                "app_id for {ch:?} should start with ru.sipaha.spk-editor; got {id}"
+            );
+        }
+>>>>>>> theirs
     }
 }

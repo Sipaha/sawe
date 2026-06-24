@@ -191,6 +191,120 @@ impl WgpuContext {
         })
     }
 
+    /// Build a wgpu instance suitable for the native headless / offscreen path
+    /// — no display-handle source available (no X / Wayland connection).
+    /// Used by `WgpuRenderer::new_offscreen`.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn instance_offscreen() -> wgpu::Instance {
+        wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        })
+    }
+
+    /// Build a `WgpuContext` for offscreen rendering — no surface compatibility
+    /// test (there's no surface), no compositor GPU hint (there's no
+    /// compositor). Adapter selection prefers integrated GPUs over discrete
+    /// because for pure offscreen work the integrated GPU is typically more
+    /// reliable on Linux (e.g. AMD RADV is more robust than NVIDIA's
+    /// proprietary stack for headless RENDER_ATTACHMENT passes — the original
+    /// reason the Xvfb screenshot path was blank).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_offscreen(instance: wgpu::Instance) -> anyhow::Result<Self> {
+        use gpui::block_on;
+
+        let mut adapters: Vec<_> = block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        if adapters.is_empty() {
+            anyhow::bail!("No GPU adapters found for offscreen rendering");
+        }
+
+        adapters.sort_by_key(|adapter| {
+            let info = adapter.get_info();
+            // Integrated > Discrete > Other > Virtual > Cpu. Inverted relative
+            // to the on-screen ordering: see fn doc.
+            let type_priority: u8 = match info.device_type {
+                wgpu::DeviceType::IntegratedGpu => 0,
+                wgpu::DeviceType::DiscreteGpu => 1,
+                wgpu::DeviceType::Other => 2,
+                wgpu::DeviceType::VirtualGpu => 3,
+                wgpu::DeviceType::Cpu => 4,
+            };
+            let backend_priority: u8 = match info.backend {
+                wgpu::Backend::Vulkan => 0,
+                wgpu::Backend::Metal => 0,
+                wgpu::Backend::Dx12 => 0,
+                _ => 1,
+            };
+            (type_priority, backend_priority)
+        });
+
+        log::info!("Offscreen adapter candidates ({} total):", adapters.len());
+        for adapter in &adapters {
+            let info = adapter.get_info();
+            log::info!(
+                "  - {} (vendor={:#06x}, device={:#06x}, backend={:?}, type={:?})",
+                info.name,
+                info.vendor,
+                info.device,
+                info.backend,
+                info.device_type,
+            );
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for adapter in adapters {
+            let info = adapter.get_info();
+            log::info!(
+                "Trying offscreen adapter: {} ({:?})",
+                info.name,
+                info.backend
+            );
+            match block_on(Self::create_device(&adapter)) {
+                Ok((device, queue, dual_source_blending, color_texture_format)) => {
+                    let device_lost = Arc::new(AtomicBool::new(false));
+                    device.set_device_lost_callback({
+                        let device_lost = Arc::clone(&device_lost);
+                        move |reason, message| {
+                            log::error!(
+                                "wgpu device lost (offscreen): reason={reason:?}, message={message}"
+                            );
+                            if reason != wgpu::DeviceLostReason::Destroyed {
+                                device_lost.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                    log::info!(
+                        "Selected offscreen GPU adapter: {} ({:?})",
+                        info.name,
+                        info.backend
+                    );
+                    return Ok(Self {
+                        instance,
+                        adapter,
+                        device: Arc::new(device),
+                        queue: Arc::new(queue),
+                        dual_source_blending,
+                        color_texture_format,
+                        device_lost,
+                    });
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Adapter {} ({:?}) failed device creation: {e}",
+                        info.name,
+                        info.backend
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No offscreen GPU adapter usable")))
+    }
+
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
         let caps = surface.get_capabilities(&self.adapter);
         if caps.formats.is_empty() {

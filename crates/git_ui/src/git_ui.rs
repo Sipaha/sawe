@@ -8,8 +8,20 @@ use ui::{
 };
 use workspace::{Toast, notifications::NotificationId};
 
+mod backup_mcp;
 mod blame_ui;
 pub mod clone;
+pub mod commit_context_menu;
+pub mod credentials;
+pub mod handlers;
+mod handlers_mcp;
+pub mod interactive_rebase;
+pub mod mini_graph;
+pub mod pre_commit;
+pub mod providers;
+pub mod push_dialog;
+mod push_dialog_mcp;
+pub mod undo_modal;
 
 use git::{
     repository::{Branch, CommitDetails, Upstream, UpstreamTracking, UpstreamTrackingStatus},
@@ -17,7 +29,11 @@ use git::{
 };
 use gpui::{
     App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+<<<<<<< ours
     SharedString, Subscription, Task, TaskExt, Window,
+=======
+    SharedString, Subscription, Task, Window,
+>>>>>>> theirs
 };
 use menu::{Cancel, Confirm};
 use project::git_store::Repository;
@@ -36,7 +52,10 @@ pub mod commit_tooltip;
 pub mod commit_view;
 mod conflict_view;
 pub mod file_diff_view;
+<<<<<<< ours
 pub mod git_graph;
+=======
+>>>>>>> theirs
 pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
@@ -46,8 +65,13 @@ pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
+<<<<<<< ours
 pub mod solo_diff_view;
+=======
+pub mod shelf;
+>>>>>>> theirs
 pub mod stash_picker;
+pub mod stashes;
 pub mod text_diff_view;
 pub mod worktree_names;
 pub mod worktree_picker;
@@ -72,20 +96,60 @@ pub fn get_provider_icon(name: &str) -> IconName {
 pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
+<<<<<<< ours
     git_graph::init(cx);
+=======
+    backup_mcp::register(cx);
+    handlers_mcp::register(cx);
+    push_dialog_mcp::register(cx);
+
+    // S-SOL-PRT — install the repo-id resolver so the registry-level
+    // branch-protection hook can map wire-format `repo_id`s back to
+    // working directories. The resolver mirrors
+    // `handlers_mcp::resolve_work_directory` for tools that can pin a
+    // specific repo by id; tools without `repo_id` payload fields
+    // continue to fall back on the in-process handler check.
+    editor_mcp::set_repo_path_resolver(Some(Box::new(|repo_id, cx| {
+        handlers_mcp::resolve_repo_path_by_id(repo_id, cx)
+    })));
+>>>>>>> theirs
 
     cx.observe_new(|editor: &mut Editor, _, cx| {
         conflict_view::register_editor(editor, editor.buffer().clone(), cx);
     })
     .detach();
 
-    cx.observe_new(|workspace: &mut Workspace, _, cx| {
+    cx.observe_new(|workspace: &mut Workspace, _window, cx| {
         ProjectDiff::register(workspace, cx);
         CommitModal::register(workspace);
         git_panel::register(workspace);
         repository_selector::register(workspace);
         git_picker::register(workspace);
+        undo_modal::register(workspace);
+        stashes::register(workspace);
+        shelf::register(workspace);
 
+        workspace.register_action(
+            |workspace, action: &git::InteractiveRebaseFromHere, window, cx| {
+                interactive_rebase_action(workspace, action.sha.clone(), window, cx);
+            },
+        );
+        // S-SAR — open a snapshot of the active repository at `sha`
+        // in a new top-level workspace window.
+        workspace.register_action(|workspace, action: &git::ShowAtRevision, window, cx| {
+            handlers::show_at_revision::show_at_revision_action(
+                workspace,
+                action.sha.clone(),
+                window,
+                cx,
+            );
+        });
+        workspace.register_action(|workspace, _: &git::ApplyPatchFromFile, window, cx| {
+            handlers::patch::apply_patch_from_file_action(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &git::ApplyPatchFromClipboard, window, cx| {
+            handlers::patch::apply_patch_from_clipboard_action(workspace, window, cx);
+        });
         workspace.register_action(
             |workspace, action: &zed_actions::CreateWorktree, window, cx| {
                 worktree_service::handle_create_worktree(workspace, action, window, None, cx);
@@ -174,13 +238,14 @@ pub fn init(cx: &mut App) {
                     panel.fetch(false, window, cx);
                 });
             });
+            // S-PSH — `git::Push` opens the preview dialog instead of
+            // running an immediate push. `git::ForcePush` opens the same
+            // dialog with the force-with-lease toggle pre-set, so the
+            // command-palette path keeps working. `git::PushTo` still
+            // routes through the panel's remote-picker → immediate push
+            // flow because it's about choosing a remote, not previewing.
             workspace.register_action(|workspace, _: &git::Push, window, cx| {
-                let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
-                    return;
-                };
-                panel.update(cx, |panel, cx| {
-                    panel.push(false, false, window, cx);
-                });
+                push_dialog::PushDialog::open(workspace, false, window, cx);
             });
             workspace.register_action(|workspace, _: &git::PushTo, window, cx| {
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
@@ -191,12 +256,7 @@ pub fn init(cx: &mut App) {
                 });
             });
             workspace.register_action(|workspace, _: &git::ForcePush, window, cx| {
-                let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
-                    return;
-                };
-                panel.update(cx, |panel, cx| {
-                    panel.push(true, false, window, cx);
-                });
+                push_dialog::PushDialog::open(workspace, true, window, cx);
             });
             workspace.register_action(|workspace, _: &git::Pull, window, cx| {
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
@@ -297,8 +357,54 @@ pub fn init(cx: &mut App) {
                 };
             },
         );
+<<<<<<< ours
+=======
     })
     .detach();
+}
+
+/// S-IRB action handler — open the Interactive Rebase view starting at
+/// `sha`. Refuses if `sha` isn't an ancestor of HEAD on the current
+/// branch.
+fn interactive_rebase_action(
+    workspace: &mut Workspace,
+    sha: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    let Some(repo) = project.read(cx).active_repository(cx) else {
+        log::warn!("git::InteractiveRebaseFromHere: no active repository");
+        return;
+    };
+    let workspace_handle = cx.entity();
+    let repo_path = repo.read(cx).work_directory_abs_path.to_path_buf();
+    let sha_for_check = sha.clone();
+    cx.spawn_in(window, async move |_workspace, cx| {
+        let ancestry = cx
+            .background_spawn(async move {
+                interactive_rebase::base_is_ancestor_of_head(&repo_path, &sha_for_check)
+            })
+            .await;
+        if let Err(err) = ancestry {
+            log::warn!("git::InteractiveRebaseFromHere: refused — {err}");
+            return Ok(());
+        }
+        cx.update(|window, cx| {
+            interactive_rebase::InteractiveRebaseView::open(
+                workspace_handle,
+                repo,
+                project,
+                sha,
+                window,
+                cx,
+            )
+            .detach_and_log_err(cx);
+        })?;
+        anyhow::Ok(())
+>>>>>>> theirs
+    })
+    .detach_and_log_err(cx);
 }
 
 fn open_modified_files(

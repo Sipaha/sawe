@@ -19,6 +19,7 @@ use gpui::{
     KeyContext, Render, Subscription, Task, TaskExt, WeakEntity, actions,
 };
 use itertools::Itertools as _;
+use paths::local_settings_folder_name;
 use picker::{Picker, PickerDelegate, highlighted_match_with_paths::HighlightedMatch};
 use project::{DebugScenarioContext, Project, TaskContexts, TaskSourceKind, task_store::TaskStore};
 use task::{DebugScenario, RevealTarget, SharedTaskContext, VariableName, ZedDebugConfig};
@@ -1068,7 +1069,7 @@ impl DebugDelegate {
                     };
 
                     match path.components().next_back() {
-                        Some(".zed") => {
+                        Some(name) if name == local_settings_folder_name() => {
                             path.push(RelPath::unix("debug.json").unwrap());
                         }
                         Some(".vscode") => {
@@ -1165,7 +1166,7 @@ impl DebugDelegate {
                         id: _,
                         directory_in_worktree: dir,
                         id_base: _,
-                    } => dir.ends_with(RelPath::unix(".zed").unwrap()),
+                    } => dir.ends_with(RelPath::unix(local_settings_folder_name()).unwrap()),
                     _ => false,
                 });
 

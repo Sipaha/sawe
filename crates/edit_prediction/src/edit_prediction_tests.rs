@@ -3,8 +3,12 @@ use clock::FakeSystemClock;
 use clock::ReplicaId;
 use cloud_api_types::{
     CreateLlmTokenResponse, LlmToken, Organization, OrganizationConfiguration,
+<<<<<<< ours
     OrganizationEditPredictionConfiguration, OrganizationId, SubmitEditPredictionSettledBody,
     SubmitEditPredictionSettledResponse,
+=======
+    OrganizationEditPredictionConfiguration, OrganizationId,
+>>>>>>> theirs
 };
 use cloud_llm_client::{
     EditPredictionRejectReason, EditPredictionRejection, PredictEditsRequestTrigger,
@@ -12,7 +16,12 @@ use cloud_llm_client::{
     predict_edits_v3::{PredictEditsV3Request, PredictEditsV3Response},
 };
 use db::AppDatabase;
+<<<<<<< ours
 use edit_prediction_types::EditPredictionRequestTrigger;
+=======
+use settings::EditPredictionDataCollectionChoice;
+
+>>>>>>> theirs
 use futures::{
     AsyncReadExt, FutureExt, StreamExt,
     channel::{mpsc, oneshot},
@@ -2832,7 +2841,11 @@ fn init_test_with_fake_client_and_legacy_data_collection(
     cx: &mut TestAppContext,
     legacy_data_collection_choice: Option<&str>,
 ) -> (Entity<EditPredictionStore>, RequestChannels) {
+<<<<<<< ours
     let result = cx.update(move |cx| {
+=======
+    cx.update(move |cx| {
+>>>>>>> theirs
         cx.set_global(AppDatabase::test_new());
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
@@ -3950,6 +3963,7 @@ async fn test_edit_prediction_settled(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+<<<<<<< ours
 async fn test_edit_prediction_settled_omits_body_when_data_collection_is_disabled(
     cx: &mut TestAppContext,
 ) {
@@ -4053,6 +4067,8 @@ fn test_buffer_path_with_id_fallback_for_untitled_buffers(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+=======
+>>>>>>> theirs
 async fn test_data_collection_disabled_by_default(cx: &mut TestAppContext) {
     let (ep_store, _channels) = init_test_with_fake_client(cx);
 
@@ -4298,7 +4314,11 @@ async fn test_upsell_dismissed_via_dismissable_api(cx: &mut TestAppContext) {
     kvp.delete_kvp(ZedPredictUpsell::KEY.into()).await.unwrap();
 }
 
+<<<<<<< ours
 #[ctor::ctor(unsafe)]
+=======
+#[ctor::ctor]
+>>>>>>> theirs
 fn init_logger() {
     zlog::init_test();
 }

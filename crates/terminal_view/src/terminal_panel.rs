@@ -18,7 +18,7 @@ use gpui::{
 use itertools::Itertools;
 use project::{Fs, Project};
 
-use settings::{Settings, TerminalDockPosition};
+use settings::Settings;
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
 use terminal::{Terminal, terminal_settings::TerminalSettings};
 use ui::{
@@ -637,7 +637,7 @@ impl TerminalPanel {
             RevealTarget::Center => self
                 .workspace
                 .update(cx, |workspace, cx| {
-                    Self::add_center_terminal(workspace, window, cx, |project, cx| {
+                    crate::add_center_terminal(workspace, window, cx, |project, cx| {
                         project.create_terminal_task(spawn_task, cx)
                     })
                 })
@@ -663,7 +663,7 @@ impl TerminalPanel {
         if center_pane_has_focus && active_center_item_is_terminal {
             let working_directory = default_working_directory(workspace, cx);
             let local = action.local;
-            Self::add_center_terminal(workspace, window, cx, move |project, cx| {
+            crate::add_center_terminal(workspace, window, cx, move |project, cx| {
                 if local {
                     project.create_local_terminal(cx)
                 } else {
@@ -746,42 +746,6 @@ impl TerminalPanel {
     ) {
         pane.update(cx, |pane, cx| {
             pane.activate_item(item_index, true, focus, window, cx)
-        })
-    }
-
-    pub fn add_center_terminal(
-        workspace: &mut Workspace,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-        create_terminal: impl FnOnce(
-            &mut Project,
-            &mut Context<Project>,
-        ) -> Task<Result<Entity<Terminal>>>
-        + 'static,
-    ) -> Task<Result<WeakEntity<Terminal>>> {
-        if !is_enabled_in_workspace(workspace, cx) {
-            return Task::ready(Err(anyhow!(
-                "terminal not yet supported for remote projects"
-            )));
-        }
-        let project = workspace.project().downgrade();
-        cx.spawn_in(window, async move |workspace, cx| {
-            let terminal = project.update(cx, create_terminal)?.await?;
-
-            workspace.update_in(cx, |workspace, window, cx| {
-                let terminal_view = cx.new(|cx| {
-                    TerminalView::new(
-                        terminal.clone(),
-                        workspace.weak_handle(),
-                        workspace.database_id(),
-                        workspace.project().downgrade(),
-                        window,
-                        cx,
-                    )
-                });
-                workspace.add_item_to_active_pane(Box::new(terminal_view), None, true, window, cx);
-            })?;
-            Ok(terminal.downgrade())
         })
     }
 
@@ -1537,9 +1501,21 @@ impl Focusable for TerminalPanel {
     }
 }
 
+// TerminalPanel is no longer registered as a workspace Panel — ConsolePanel
+// took over (see `console_panel` crate). The trait impl below is kept so
+// `terminal_view` still exports the type for internal helpers
+// (`new_terminal_pane`, `prepare_task_for_spawn`) without a separate
+// refactor. The dock-position methods are dead code paths; hardcoded to
+// Bottom because the panel never reaches a render path. B12 cleanup will
+// shrink TerminalPanel down to just its still-used helpers.
 impl Panel for TerminalPanel {
+<<<<<<< ours
     fn position(&self, _window: &Window, cx: &App) -> DockPosition {
         TerminalSettings::get_global(cx).dock.into()
+=======
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        DockPosition::Bottom
+>>>>>>> theirs
     }
 
     fn position_is_valid(&self, _: DockPosition) -> bool {
@@ -1548,18 +1524,10 @@ impl Panel for TerminalPanel {
 
     fn set_position(
         &mut self,
-        position: DockPosition,
+        _position: DockPosition,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
-            let dock = match position {
-                DockPosition::Left => TerminalDockPosition::Left,
-                DockPosition::Bottom => TerminalDockPosition::Bottom,
-                DockPosition::Right => TerminalDockPosition::Right,
-            };
-            settings.terminal.get_or_insert_default().dock = Some(dock);
-        });
     }
 
     fn default_size(&self, window: &Window, cx: &App) -> Pixels {
@@ -2012,7 +1980,7 @@ mod tests {
         window_handle
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
-                    TerminalPanel::add_center_terminal(workspace, window, cx, |project, cx| {
+                    crate::add_center_terminal(workspace, window, cx, |project, cx| {
                         project.create_terminal_shell(None, cx)
                     })
                 })
@@ -2181,7 +2149,7 @@ mod tests {
         window_handle
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
-                    TerminalPanel::add_center_terminal(workspace, window, cx, |project, cx| {
+                    crate::add_center_terminal(workspace, window, cx, |project, cx| {
                         project.create_terminal_shell(None, cx)
                     })
                 })
@@ -2271,7 +2239,7 @@ mod tests {
         window_handle
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
-                    TerminalPanel::add_center_terminal(workspace, window, cx, |project, cx| {
+                    crate::add_center_terminal(workspace, window, cx, |project, cx| {
                         project.create_terminal_shell(None, cx)
                     })
                 })

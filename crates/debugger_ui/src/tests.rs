@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use console_panel::ConsolePanel;
 use dap::adapters::DebugTaskDefinition;
 use dap::client::DebugAdapterClient;
 use gpui::{Entity, TestAppContext, WindowHandle};
 use project::{Project, debugger::session::Session};
 use settings::SettingsStore;
 use task::SharedTaskContext;
-use terminal_view::terminal_panel::TerminalPanel;
 use workspace::MultiWorkspace;
 
 use crate::{debugger_panel::DebugPanel, session::DebugSession};
@@ -46,6 +46,13 @@ pub fn init_test(cx: &mut gpui::TestAppContext) {
         editor::init(cx);
         crate::init(cx);
         dap_adapters::init(cx);
+
+        // ConsolePanel::load now requires a global SolutionAgentStore so the
+        // panel can wire up chat tabs. The debugger tests don't use chat, but
+        // the load() path reads the store unconditionally — set up an empty
+        // one rather than special-case the loader.
+        let registry = std::sync::Arc::new(solution_agent::adapter::AdapterRegistry::new());
+        solution_agent::store::SolutionAgentStore::init_global(cx, registry);
     });
 }
 
@@ -72,12 +79,12 @@ pub async fn init_test_workspace(
         .update(cx, |multi, window, cx| {
             let weak_workspace = multi.workspace().downgrade();
             cx.spawn_in(window, async move |_, cx| {
-                TerminalPanel::load(weak_workspace, cx.clone()).await
+                ConsolePanel::load(weak_workspace, cx.clone()).await
             })
         })
         .unwrap()
         .await
-        .expect("Failed to load terminal panel");
+        .expect("Failed to load console panel");
 
     workspace_handle
         .update(cx, |multi, window, cx| {

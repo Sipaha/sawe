@@ -17,6 +17,10 @@ test-support = ["gpui/test-support"]
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+<<<<<<< ours
+=======
+async-process.workspace = true
+>>>>>>> theirs
 async-trait.workspace = true
 base64.workspace = true
 collections.workspace = true

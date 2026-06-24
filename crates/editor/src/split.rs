@@ -469,12 +469,15 @@ impl SplittableEditor {
         self.update_editors(cx, |editor, cx| {
             editor.set_render_diff_hunk_controls(empty_controls.clone(), cx);
         });
+<<<<<<< ours
     }
 
     pub fn set_render_diff_hunks_as_unstaged(&self, cx: &mut Context<Self>) {
         self.update_editors(cx, |editor, cx| {
             editor.set_render_diff_hunks_as_unstaged(true, cx);
         });
+=======
+>>>>>>> theirs
     }
 
     fn focused_side(&self) -> SplitSide {

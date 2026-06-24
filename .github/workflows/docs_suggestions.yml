@@ -9,24 +9,6 @@ name: Documentation Suggestions
 # 5. Keep this workflow focused on suggestions only until that stable workflow is added.
 
 on:
-  # Run when PRs are merged to main
-  pull_request:
-    types: [closed]
-    branches: [main]
-    paths:
-      - 'crates/**/*.rs'
-      - '!crates/**/*_test.rs'
-      - '!crates/**/tests/**'
-
-  # Run on cherry-picks to release branches
-  pull_request_target:
-    types: [opened, synchronize]
-    branches:
-      - 'v0.*'
-    paths:
-      - 'crates/**/*.rs'
-
-  # Manual trigger for testing
   workflow_dispatch:
     inputs:
       pr_number:
@@ -50,17 +32,12 @@ jobs:
   # Job for PRs merged to main - batch suggestions to branch
   # Only runs for PRs from the same repo (not forks) since secrets aren't available for fork PRs
   batch-suggestions:
+    if: false # spk-editor: not applicable
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: read
-    if: |
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.merged == true &&
-       github.event.pull_request.base.ref == 'main' &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'batch')
 
     steps:
       - name: Checkout repository
@@ -287,12 +264,7 @@ jobs:
     concurrency:
       group: docs-suggestions-${{ github.event.pull_request.number || inputs.pr_number || 'manual' }}
       cancel-in-progress: true
-    if: |
-      (github.event_name == 'pull_request_target' &&
-       startsWith(github.event.pull_request.base.ref, 'v0.') &&
-       contains(fromJSON('["MEMBER","OWNER"]'),
-                github.event.pull_request.author_association)) ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'immediate')
+    if: false # spk-editor: not applicable
 
     steps:
       - name: Checkout repository

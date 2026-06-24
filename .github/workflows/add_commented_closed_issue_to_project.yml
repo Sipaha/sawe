@@ -1,22 +1,14 @@
 name: "Surface closed issues someone's commented on"
 
 on:
-  issue_comment:
-    types:
-      - created
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   add-to-project:
-    if: >
-      github.repository == 'zed-industries/zed' &&
-      github.event.issue.state == 'closed' &&
-      github.event.issue.pull_request == null &&
-      github.event.issue.type != null &&
-      github.event.issue.type.name == 'Bug' &&
-      github.event.comment.user.type != 'Bot'
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     timeout-minutes: 5
     steps:

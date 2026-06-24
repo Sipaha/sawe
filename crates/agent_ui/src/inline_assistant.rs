@@ -46,10 +46,11 @@ use project::{DisableAiSettings, Project};
 use prompt_store::PromptBuilder;
 use settings::{Settings, SettingsStore};
 
-use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use console_panel::ConsolePanel;
+use terminal_view::TerminalView;
 use ui::prelude::*;
 use util::{RangeExt, ResultExt, maybe};
-use workspace::{Toast, Workspace, dock::Panel, notifications::NotificationId};
+use workspace::{Toast, Workspace, notifications::NotificationId};
 use zed_actions::agent::OpenSettings;
 
 pub fn init(fs: Arc<dyn Fs>, prompt_builder: Arc<PromptBuilder>, cx: &mut App) {
@@ -134,7 +135,7 @@ impl InlineAssistant {
             let Some(workspace) = workspace_weak.upgrade() else {
                 return;
             };
-            let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
+            let Some(terminal_panel) = workspace.read(cx).panel::<ConsolePanel>(cx) else {
                 return;
             };
             let enabled = AgentSettings::get_global(cx).enabled(cx);
@@ -145,7 +146,7 @@ impl InlineAssistant {
         .detach();
 
         cx.observe(workspace, |workspace, cx| {
-            let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
+            let Some(terminal_panel) = workspace.read(cx).panel::<ConsolePanel>(cx) else {
                 return;
             };
             let enabled = AgentSettings::get_global(cx).enabled(cx);
@@ -1462,16 +1463,12 @@ impl InlineAssistant {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<InlineAssistTarget> {
-        if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx)
-            && terminal_panel
+        if let Some(console_panel) = workspace.panel::<ConsolePanel>(cx)
+            && console_panel
                 .read(cx)
                 .focus_handle(cx)
                 .contains_focused(window, cx)
-            && let Some(terminal_view) = terminal_panel.read(cx).pane().and_then(|pane| {
-                pane.read(cx)
-                    .active_item()
-                    .and_then(|t| t.downcast::<TerminalView>())
-            })
+            && let Some(terminal_view) = console_panel.read(cx).active_terminal_view(cx)
         {
             return Some(InlineAssistTarget::Terminal(terminal_view));
         }

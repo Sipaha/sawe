@@ -52,8 +52,33 @@ fn run_bump_patch_version(branch: &WorkflowInput) -> steps::NamedJob {
                 echo "version=$version"
                 echo "tag_suffix=$tag_suffix"
             } >> "$GITHUB_OUTPUT"
+<<<<<<< ours
         "#})
         .id("channel")
+    }
+
+    fn bump_version() -> Step<Run> {
+        named::bash(indoc::indoc! {r#"
+            version="$(cargo set-version -p zed --bump patch 2>&1 | sed 's/.* //')"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+=======
+>>>>>>> theirs
+        "#})
+        .id("channel")
+    }
+
+<<<<<<< ours
+=======
+    fn verify_prior_release_exists() -> Step<Run> {
+        named::bash(indoc::indoc! {r#"
+            status=$(curl -s -o /dev/null -w '%{http_code}' "https://cloud.zed.dev/releases/$CHANNEL/$VERSION/asset?asset=zed&os=macos&arch=aarch64")
+            if [[ "$status" != "200" ]]; then
+                echo "::error::version $VERSION has not been released on $CHANNEL yet (HTTP $status) — bump the patch version only after the current version is released"
+                exit 1
+            fi
+        "#})
+        .add_env(("CHANNEL", "${{ steps.channel.outputs.channel }}"))
+        .add_env(("VERSION", "${{ steps.channel.outputs.version }}"))
     }
 
     fn bump_version() -> Step<Run> {
@@ -64,6 +89,7 @@ fn run_bump_patch_version(branch: &WorkflowInput) -> steps::NamedJob {
         .id("bump-version")
     }
 
+>>>>>>> theirs
     let (authenticate, token) = steps::authenticate_as_zippy().into();
     let channel_step = read_channel();
     let tag_suffix = StepOutput::new(&channel_step, "tag_suffix");
@@ -84,6 +110,10 @@ fn run_bump_patch_version(branch: &WorkflowInput) -> steps::NamedJob {
             .add_step(authenticate)
             .add_step(checkout_branch(branch, &token))
             .add_step(channel_step)
+<<<<<<< ours
+=======
+            .add_step(verify_prior_release_exists())
+>>>>>>> theirs
             .add_step(steps::install_cargo_edit())
             .add_step(bump_version_step)
             .add_step(commit_step)

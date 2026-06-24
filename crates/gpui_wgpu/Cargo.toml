@@ -22,6 +22,7 @@ bytemuck = "1"
 collections.workspace = true
 cosmic-text = "0.19.0"
 etagere = "0.2"
+image.workspace = true
 itertools.workspace = true
 log.workspace = true
 parking_lot.workspace = true

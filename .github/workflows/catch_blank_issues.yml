@@ -1,17 +1,14 @@
 name: "Label new and reopened blank issues for triage"
 
 on:
-  issues:
-    types:
-      - opened
-      - reopened
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   add-triage-label:
-    if: github.repository == 'zed-industries/zed'
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     timeout-minutes: 5
     steps:

@@ -49,7 +49,12 @@ use release_channel::AppVersion;
 use semver::Version;
 use serde::de::DeserializeOwned;
 use settings::{
+<<<<<<< ours
     EditPredictionDataCollectionChoice, EditPredictionProvider, Settings as _, update_settings_file,
+=======
+    EditPredictionDataCollectionChoice, EditPredictionPromptFormat, EditPredictionProvider,
+    Settings as _, update_settings_file,
+>>>>>>> theirs
 };
 use std::collections::{VecDeque, hash_map};
 use std::env;
@@ -3512,10 +3517,13 @@ pub struct ZedUpdateRequiredError {
     minimum_version: Version,
 }
 
+<<<<<<< ours
 #[derive(Error, Debug)]
 #[error("Cloud request timed out")]
 pub(crate) struct CloudRequestTimeoutError;
 
+=======
+>>>>>>> theirs
 struct ZedPredictUpsell;
 
 fn is_upsell_dismissed(cx: &App) -> bool {

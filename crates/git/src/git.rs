@@ -1,10 +1,14 @@
+pub mod backup;
 pub mod blame;
 pub mod commit;
 mod hosting_provider;
+pub mod operations;
 mod remote;
+pub mod repo_lock;
 pub mod repository;
 pub mod stash;
 pub mod status;
+pub mod undo_registry;
 
 pub use crate::hosting_provider::*;
 pub use crate::remote::*;
@@ -63,6 +67,10 @@ actions!(
         StashPop,
         /// Apply the most recent stash.
         StashApply,
+        /// Opens the Stashes pane item (S-STH).
+        Stashes,
+        /// Opens the Shelf pane item (S-SHL).
+        Shelf,
         /// Restores all tracked files to their last committed state.
         RestoreTrackedFiles,
         /// Moves all untracked files to trash.
@@ -107,12 +115,84 @@ actions!(
         ViewCommit,
         /// Adds a file to .gitignore.
         AddToGitignore,
+<<<<<<< ours
         /// Adds a file to the repository's .git/info/exclude.
         AddToGitInfoExclude,
         /// Copies the current branch name to the clipboard.
         CopyBranchName,
+=======
+        /// Copies the current branch name to the clipboard.
+        CopyBranchName,
+        /// Applies a patch / mbox / diff file via a file picker.
+        ApplyPatchFromFile,
+        /// Applies a patch / mbox / diff stored in the system clipboard.
+        ApplyPatchFromClipboard,
+        /// S-ANN — toggles the blame gutter `ignore whitespace` flag.
+        ToggleBlameIgnoreWhitespace,
+        /// S-ANN — toggles the blame gutter `follow renames` flag.
+        ToggleBlameFollowRenames,
+        /// S-ANN — toggles between absolute and relative date display in
+        /// the blame gutter.
+        ToggleBlameAbsoluteDates,
+        /// S-ANN — cycles through blame gutter color modes (None →
+        /// Color by Date → Color by Author → None).
+        CycleBlameColorMode,
+        /// S-ANN — clears the active blame author filter.
+        ClearBlameAuthorFilter,
+>>>>>>> theirs
     ]
 );
+
+/// Opens the undo registry as a modal — restore a branch to before a recent
+/// destructive op (cherry-pick, drop, squash, rebase, …) recorded by the
+/// S-BAK auto-backup framework.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct UndoLast;
+
+/// Deletes spk-editor backup-refs older than `older_than_days` from the
+/// active repository. Default 30 days.
+#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupBackups {
+    #[serde(default = "default_cleanup_days")]
+    pub older_than_days: u32,
+}
+
+impl Default for CleanupBackups {
+    fn default() -> Self {
+        Self {
+            older_than_days: default_cleanup_days(),
+        }
+    }
+}
+
+fn default_cleanup_days() -> u32 {
+    30
+}
+
+/// Open the Interactive Rebase view starting at `sha`. Requires `sha` to
+/// be reachable from HEAD on the current branch.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct InteractiveRebaseFromHere {
+    pub sha: String,
+}
+
+/// S-SAR — open a read-only snapshot of the current repository at `sha`
+/// in a brand-new top-level workspace window. The snapshot is backed by
+/// a temporary `git worktree add --detach` checkout under
+/// `paths::temp_dir()/worktrees/`, marked with a `.spke-readonly.json`
+/// file so the new Project flips its root into the read-only set.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct ShowAtRevision {
+    pub sha: String,
+}
 
 /// Renames a git branch.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]

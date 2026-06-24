@@ -577,7 +577,10 @@ pub struct ThreadView {
     /// Used for showing/hiding tool call results, terminal output, etc.
     pub expanded_tool_calls: HashSet<acp::ToolCallId>,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
+<<<<<<< ours
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
+=======
+>>>>>>> theirs
     pub expanded_thinking_blocks: HashSet<(usize, usize)>,
     auto_expanded_thinking_block: Option<(usize, usize)>,
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
@@ -5017,7 +5020,7 @@ impl ThreadView {
 
         let has_terminal_selection = workspace
             .upgrade()
-            .and_then(|ws| ws.read(cx).panel::<TerminalPanel>(cx))
+            .and_then(|ws| ws.read(cx).panel::<ConsolePanel>(cx))
             .is_some_and(|panel| !panel.read(cx).terminal_selections(cx).is_empty());
 
         let has_selection = has_editor_selection || has_terminal_selection;
@@ -5612,6 +5615,7 @@ impl ThreadView {
                 chunks,
                 indented: _,
                 is_subagent_output: _,
+                subagent_id: _,
             }) => {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
@@ -6847,6 +6851,7 @@ impl ThreadView {
         // Suppress the code block's built-in copy button so we don't stack two
         // copy buttons on top of each other; the outer button below is the one
         // we want, because it copies the unfenced command text.
+<<<<<<< ours
         let markdown_element = self
             .render_markdown(command, style, cx)
             .code_block_renderer(CodeBlockRenderer::Default {
@@ -6854,6 +6859,14 @@ impl ThreadView {
                 wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
                 border: false,
             });
+=======
+        let markdown_element =
+            self.render_markdown(command, style)
+                .code_block_renderer(CodeBlockRenderer::Default {
+                    copy_button_visibility: CopyButtonVisibility::Hidden,
+                    border: false,
+                });
+>>>>>>> theirs
         let copy_button = CopyButton::new("copy-command", command_text)
             .tooltip_label("Copy Command")
             .visible_on_hover(group.clone());
@@ -7720,9 +7733,47 @@ impl ThreadView {
         tool_call_id: &acp::ToolCallId,
         details: &SandboxAuthorizationDetails,
         cx: &Context<Self>,
+<<<<<<< ours
     ) -> AnyElement {
         if details.write_paths.is_empty() {
             return Empty.into_any_element();
+=======
+    ) -> Div {
+        match options {
+            PermissionOptions::Flat(options) => self.render_permission_buttons_flat(
+                session_id,
+                is_first,
+                options,
+                entry_ix,
+                tool_call_id,
+                focus_handle,
+                cx,
+            ),
+            PermissionOptions::Dropdown(choices) => self.render_permission_buttons_with_dropdown(
+                is_first,
+                choices,
+                None,
+                entry_ix,
+                session_id,
+                tool_call_id,
+                focus_handle,
+                cx,
+            ),
+            PermissionOptions::DropdownWithPatterns {
+                choices,
+                patterns,
+                tool_name,
+            } => self.render_permission_buttons_with_dropdown(
+                is_first,
+                choices,
+                Some((patterns, tool_name)),
+                entry_ix,
+                session_id,
+                tool_call_id,
+                focus_handle,
+                cx,
+            ),
+>>>>>>> theirs
         }
 
         let is_open = !self

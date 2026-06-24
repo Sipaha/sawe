@@ -126,8 +126,13 @@
       "ctrl-\"": "editor::ExpandAllDiffHunks",
       "ctrl-i": "editor::ShowSignatureHelp",
       "alt-g b": "git::Blame",
+      // S-ANN — IDEA-style binding. `ctrl-alt-a` is also bound to
+      // `agent::OpenPermissionDropdown` inside `AgentPanel`, so it
+      // doesn't conflict in the Editor context.
+      "ctrl-alt-a": "git::Blame",
       "alt-g m": "git::OpenModifiedFiles",
       "alt-g r": "git::ReviewDiff",
+      "ctrl-k ctrl-h": "git::FileHistory",
       "menu": "editor::OpenContextMenu",
       "shift-f10": "editor::OpenContextMenu",
       "ctrl-alt-shift-e": "editor::ToggleEditPrediction",
@@ -246,6 +251,18 @@
       "escape": "menu::Cancel",
       "enter": "menu::Confirm",
       "alt-enter": "editor::Newline",
+    },
+  },
+  {
+    // Compose box inside the Solution-agent chat panel: Enter sends, Shift+Enter
+    // inserts a newline (Cursor / Claude Code CLI / Slack convention). Without
+    // this override the editor's default `enter: editor::Newline` swallows the
+    // submit, so the menu::Confirm handler on `SolutionSessionView` never sees
+    // the keystroke.
+    "context": "SolutionSessionView > Editor",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "shift-enter": "editor::Newline",
     },
   },
   {
@@ -612,6 +629,7 @@
       // "alt-ctrl-shift-o": ["projects::OpenRemote", { "from_existing_connection": true }],
       "alt-ctrl-shift-o": ["projects::OpenRemote", { "from_existing_connection": false }],
       "alt-ctrl-shift-b": "branches::OpenRecent",
+      "ctrl-shift-`": "git::BranchesPopupOpen",
       "alt-ctrl-shift-w": "git::Worktree",
       "alt-shift-enter": "toast::RunAction",
       "ctrl-~": "workspace::NewTerminal",
@@ -624,7 +642,7 @@
       "ctrl-n": "workspace::NewFile",
       "shift-new": "workspace::NewWindow",
       "ctrl-shift-n": "workspace::NewWindow",
-      "ctrl-`": "terminal_panel::Toggle",
+      "ctrl-`": "console_panel::ToggleFocus",
       "f10": ["app_menu::OpenApplicationMenu", "Zed"],
       "alt-1": ["workspace::ActivatePane", 0],
       "alt-2": ["workspace::ActivatePane", 1],
@@ -637,6 +655,7 @@
       "alt-9": ["workspace::ActivatePane", 8],
       "ctrl-alt-b": "workspace::ToggleRightDock",
       "ctrl-b": "workspace::ToggleLeftDock",
+      "ctrl-alt-o": "solutions::OpenSolution",
       "ctrl-j": "workspace::ToggleBottomDock",
       "ctrl-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
       "ctrl-alt-;": "multi_workspace::FocusWorkspaceSidebar",
@@ -698,6 +717,11 @@
       "f5": "debugger::Rerun",
       "ctrl-f4": "workspace::CloseActiveDock",
       "ctrl-w": "workspace::CloseActiveDock",
+      // Run configurations (IntelliJ-style; alt-shift variants avoid conflicts
+      // with shift-f10/shift-f9/ctrl-f2 which are already bound in Editor context).
+      "alt-shift-f10": "run_config::Run",
+      "alt-shift-f9": "run_config::Debug",
+      "alt-shift-f2": "run_config::Stop",
     },
   },
   {
@@ -1369,7 +1393,6 @@
       "ctrl-0": ["zed::ResetUiFontSize", { "persist": false }],
       "ctrl-enter": "onboarding::Finish",
       "alt-shift-l": "onboarding::SignIn",
-      "alt-shift-a": "onboarding::OpenAccount",
     },
   },
   {
@@ -1381,11 +1404,6 @@
       "ctrl-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "ctrl--": ["zed::DecreaseUiFontSize", { "persist": false }],
       "ctrl-0": ["zed::ResetUiFontSize", { "persist": false }],
-      "ctrl-1": ["welcome::OpenRecentProject", 0],
-      "ctrl-2": ["welcome::OpenRecentProject", 1],
-      "ctrl-3": ["welcome::OpenRecentProject", 2],
-      "ctrl-4": ["welcome::OpenRecentProject", 3],
-      "ctrl-5": ["welcome::OpenRecentProject", 4],
     },
   },
   {
@@ -1574,6 +1592,32 @@
       "ctrl-enter": "skill_creator::SaveSkill",
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
+    },
+  },
+  {
+    "context": "SolutionSessionView",
+    "bindings": {
+      "ctrl-f": "solution_agent::FindInSession",
+      "ctrl-shift-v": "solution_agent::PasteWithoutFormatting",
+      "escape": "solution_agent::StopResponse",
+    },
+  },
+  {
+    "context": "SolutionSessionFindEditor",
+    "bindings": {
+      "escape": "solution_agent::FindClose",
+      "ctrl-f": "solution_agent::FindInSession",
+    },
+  },
+  {
+    // enter/shift-enter must bind on the find *Editor* node (not the bar
+    // div) or `SolutionSessionView > Editor` (enter→menu::Confirm,
+    // shift-enter→editor::Newline) shadows them: it matches at the same
+    // editor node, and a binding on a shallower context node can't win there.
+    "context": "SolutionSessionFindEditor > Editor",
+    "bindings": {
+      "enter": "solution_agent::FindNextMatch",
+      "shift-enter": "solution_agent::FindPreviousMatch",
     },
   },
 ]

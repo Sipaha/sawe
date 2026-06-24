@@ -1,20 +1,19 @@
 #!/usr/bin/env sh
 set -eu
 
-# Downloads a tarball from https://zed.dev/releases and unpacks it
-# into ~/.local/. If you'd prefer to do this manually, instructions are at
-# https://zed.dev/docs/linux.
+# Installs spk-editor from a local tarball (e.g., ZED_BUNDLE_PATH environment variable).
+# For instructions on building spk-editor, see https://github.com/Sipaha/spk-editor
 
 main() {
     platform="$(uname -s)"
     arch="$(uname -m)"
-    channel="${ZED_CHANNEL:-stable}"
-    ZED_VERSION="${ZED_VERSION:-latest}"
+    channel="${SPK_EDITOR_CHANNEL:-stable}"
+    SPK_EDITOR_VERSION="${SPK_EDITOR_VERSION:-latest}"
     # Use TMPDIR if available (for environments with non-standard temp directories)
     if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR}" ]; then
-        temp="$(mktemp -d "$TMPDIR/zed-XXXXXX")"
+        temp="$(mktemp -d "$TMPDIR/spk-editor-XXXXXX")"
     else
-        temp="$(mktemp -d "/tmp/zed-XXXXXX")"
+        temp="$(mktemp -d "/tmp/spk-editor-XXXXXX")"
     fi
 
     if [ "$platform" = "Darwin" ]; then
@@ -54,10 +53,10 @@ main() {
 
     "$platform" "$@"
 
-    if [ "$(command -v zed)" = "$HOME/.local/bin/zed" ]; then
-        echo "Zed has been installed. Run with 'zed'"
+    if [ "$(command -v spk-editor)" = "$HOME/.local/bin/spk-editor" ]; then
+        echo "spk-editor has been installed. Run with 'spk-editor'"
     else
-        echo "To run Zed from your terminal, you must add ~/.local/bin to your PATH"
+        echo "To run spk-editor from your terminal, you must add ~/.local/bin to your PATH"
         echo "Run:"
 
         case "$SHELL" in
@@ -74,16 +73,16 @@ main() {
                 ;;
         esac
 
-        echo "To run Zed now, '~/.local/bin/zed'"
+        echo "To run spk-editor now, '~/.local/bin/spk-editor'"
     fi
 }
 
 linux() {
-    if [ -n "${ZED_BUNDLE_PATH:-}" ]; then
-        cp "$ZED_BUNDLE_PATH" "$temp/zed-linux-$arch.tar.gz"
+    if [ -n "${SPK_EDITOR_BUNDLE_PATH:-}" ]; then
+        cp "$SPK_EDITOR_BUNDLE_PATH" "$temp/spk-editor-linux-$arch.tar.gz"
     else
-        echo "Downloading Zed version: $ZED_VERSION"
-        curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&arch=$arch&os=linux&source=install.sh" > "$temp/zed-linux-$arch.tar.gz"
+        echo "spk-editor must be built from source. See https://github.com/Sipaha/spk-editor for instructions."
+        exit 1
     fi
 
     suffix=""
@@ -94,68 +93,55 @@ linux() {
     appid=""
     case "$channel" in
       stable)
-        appid="dev.zed.Zed"
+        appid="ru.sipaha.spk-editor"
         ;;
       nightly)
-        appid="dev.zed.Zed-Nightly"
+        appid="ru.sipaha.spk-editor-nightly"
         ;;
       preview)
-        appid="dev.zed.Zed-Preview"
+        appid="ru.sipaha.spk-editor-preview"
         ;;
       dev)
-        appid="dev.zed.Zed-Dev"
+        appid="ru.sipaha.spk-editor-dev"
         ;;
       *)
         echo "Unknown release channel: ${channel}. Using stable app ID."
-        appid="dev.zed.Zed"
+        appid="ru.sipaha.spk-editor"
         ;;
     esac
 
     # Unpack
-    rm -rf "$HOME/.local/zed$suffix.app"
-    mkdir -p "$HOME/.local/zed$suffix.app"
-    tar -xzf "$temp/zed-linux-$arch.tar.gz" -C "$HOME/.local/"
+    rm -rf "$HOME/.local/spk-editor$suffix.app"
+    mkdir -p "$HOME/.local/spk-editor$suffix.app"
+    tar -xzf "$temp/spk-editor-linux-$arch.tar.gz" -C "$HOME/.local/"
 
     # Setup ~/.local directories
     mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
 
     # Link the binary
-    if [ -f "$HOME/.local/zed$suffix.app/bin/zed" ]; then
-        ln -sf "$HOME/.local/zed$suffix.app/bin/zed" "$HOME/.local/bin/zed"
+    if [ -f "$HOME/.local/spk-editor$suffix.app/bin/spk-editor" ]; then
+        ln -sf "$HOME/.local/spk-editor$suffix.app/bin/spk-editor" "$HOME/.local/bin/spk-editor"
     else
         # support for versions before 0.139.x.
-        ln -sf "$HOME/.local/zed$suffix.app/bin/cli" "$HOME/.local/bin/zed"
+        ln -sf "$HOME/.local/spk-editor$suffix.app/bin/cli" "$HOME/.local/bin/spk-editor"
     fi
 
     # Copy .desktop file
     desktop_file_path="$HOME/.local/share/applications/${appid}.desktop"
-    src_dir="$HOME/.local/zed$suffix.app/share/applications"
+    src_dir="$HOME/.local/spk-editor$suffix.app/share/applications"
     if [ -f "$src_dir/${appid}.desktop" ]; then
         cp "$src_dir/${appid}.desktop" "${desktop_file_path}"
     else
         # Fallback for older tarballs
-        cp "$src_dir/zed$suffix.desktop" "${desktop_file_path}"
+        cp "$src_dir/spk-editor$suffix.desktop" "${desktop_file_path}"
     fi
-    sed -i "s|Icon=zed|Icon=$HOME/.local/zed$suffix.app/share/icons/hicolor/512x512/apps/zed.png|g" "${desktop_file_path}"
-    sed -i "s|Exec=zed|Exec=$HOME/.local/zed$suffix.app/bin/zed|g" "${desktop_file_path}"
+    sed -i "s|Icon=spk-editor|Icon=$HOME/.local/spk-editor$suffix.app/share/icons/hicolor/512x512/apps/spk-editor.png|g" "${desktop_file_path}"
+    sed -i "s|Exec=spk-editor|Exec=$HOME/.local/spk-editor$suffix.app/bin/spk-editor|g" "${desktop_file_path}"
 }
 
 macos() {
-    echo "Downloading Zed version: $ZED_VERSION"
-    curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&os=macos&arch=$arch&source=install.sh" > "$temp/Zed-$arch.dmg"
-    hdiutil attach -quiet "$temp/Zed-$arch.dmg" -mountpoint "$temp/mount"
-    app="$(cd "$temp/mount/"; echo *.app)"
-    echo "Installing $app"
-    if [ -d "/Applications/$app" ]; then
-        echo "Removing existing $app"
-        rm -rf "/Applications/$app"
-    fi
-    ditto "$temp/mount/$app" "/Applications/$app"
-    hdiutil detach -quiet "$temp/mount"
-
-    mkdir -p "$HOME/.local/bin"
-    # Link the binary
-    ln -sf "/Applications/$app/Contents/MacOS/cli" "$HOME/.local/bin/zed"
+    echo "spk-editor must be built from source. See https://github.com/Sipaha/spk-editor for instructions."
+    exit 1
 }
 
 main "$@"

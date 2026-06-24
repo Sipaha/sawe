@@ -324,6 +324,20 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub show_merge_conflict_indicator: Option<bool>,
+    /// Seconds of file inactivity before a managed (background) agent
+    /// is considered dead. Managed Agents are claude code's async
+    /// `Agent`-tool dispatches surfaced as pills in the subagent strip;
+    /// once their JSONL hasn't been written to for this long, the pill
+    /// renders in the dead (red) state.
+    ///
+    /// Default: 120
+    pub managed_agent_stale_timeout_secs: Option<u64>,
+    /// Seconds a dead managed-agent pill lingers in the subagent strip
+    /// before auto-disappearing. User can dismiss earlier via the ×
+    /// button on the dead pill.
+    ///
+    /// Default: 300
+    pub managed_agent_dead_linger_secs: Option<u64>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///

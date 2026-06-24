@@ -16,6 +16,64 @@ pub struct GitStash {
     pub entries: Arc<[StashEntry]>,
 }
 
+/// Lightweight stash badge data parsed from
+/// `git stash show --stat --include-untracked <stash>`. Surfaces just what
+/// the S-STH list rows need: how many files this stash touches, and
+/// whether any of them are tracked-untracked extras.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct StashStat {
+    pub file_count: usize,
+    pub has_untracked: bool,
+}
+
+impl StashStat {
+    /// Parse the trailing summary line of `git stash show --stat`. The
+    /// format is `N files changed[, A insertions(+)][, D deletions(-)]`
+    /// (or "1 file changed" for a singleton). Untracked entries appear as
+    /// "create mode 100644 <path>" lines mixed in with the diffstat — we
+    /// detect them via the `(untracked)` suffix git stash adds when it
+    /// included untracked files.
+    pub fn from_stat_output(stat: &str) -> Self {
+        let mut file_count: usize = 0;
+        let mut has_untracked = false;
+        for line in stat.lines() {
+            if line.contains("(untracked)") {
+                has_untracked = true;
+            }
+            if let Some(num) = parse_summary_line(line) {
+                file_count = num;
+            }
+        }
+        if file_count == 0 {
+            for line in stat.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.contains('|') {
+                    file_count += 1;
+                }
+            }
+        }
+        Self {
+            file_count,
+            has_untracked,
+        }
+    }
+}
+
+fn parse_summary_line(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    let mut iter = trimmed.splitn(2, ' ');
+    let num: usize = iter.next()?.parse().ok()?;
+    let rest = iter.next()?;
+    if rest.starts_with("file changed") || rest.starts_with("files changed") {
+        Some(num)
+    } else {
+        None
+    }
+}
+
 impl GitStash {
     pub fn apply(&mut self, other: GitStash) {
         self.entries = other.entries;
@@ -219,5 +277,43 @@ mod tests {
 
         let stash = GitStash::from_str("   \n  \n  ").unwrap();
         assert_eq!(stash.entries.len(), 0);
+    }
+
+    #[test]
+    fn test_stash_stat_summary_line() {
+        let raw =
+            " a.txt | 2 +-\n b.txt | 4 ++--\n 2 files changed, 3 insertions(+), 3 deletions(-)\n";
+        let stat = StashStat::from_stat_output(raw);
+        assert_eq!(stat.file_count, 2);
+        assert!(!stat.has_untracked);
+    }
+
+    #[test]
+    fn test_stash_stat_singleton() {
+        let raw = " a.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n";
+        let stat = StashStat::from_stat_output(raw);
+        assert_eq!(stat.file_count, 1);
+    }
+
+    #[test]
+    fn test_stash_stat_falls_back_to_pipe_count() {
+        let raw = " a.txt | 2 +-\n b.txt | 4 ++--\n";
+        let stat = StashStat::from_stat_output(raw);
+        assert_eq!(stat.file_count, 2);
+    }
+
+    #[test]
+    fn test_stash_stat_detects_untracked() {
+        let raw = " (untracked)\n new.txt | 1 +\n 1 file changed, 1 insertion(+)\n";
+        let stat = StashStat::from_stat_output(raw);
+        assert_eq!(stat.file_count, 1);
+        assert!(stat.has_untracked);
+    }
+
+    #[test]
+    fn test_stash_stat_empty() {
+        let stat = StashStat::from_stat_output("");
+        assert_eq!(stat.file_count, 0);
+        assert!(!stat.has_untracked);
     }
 }

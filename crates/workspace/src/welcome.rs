@@ -1,3 +1,4 @@
+<<<<<<< ours
 use crate::{
     NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
     ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
@@ -9,10 +10,37 @@ use git::Clone as GitClone;
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     ParentElement, Render, Styled, Task, TaskExt, Window, actions,
-};
-use gpui::{WeakEntity, linear_color_stop, linear_gradient};
-use menu::{SelectNext, SelectPrevious};
+=======
+//! `WelcomeWindow` — the SPK Editor launcher.
+//!
+//! Welcome is a top-level window in its own right (root view =
+//! `WelcomeWindow`), NOT a workspace tab. The previous design embedded
+//! a `WelcomePage` Item inside a regular `Workspace`, which forced a
+//! pile of conditional gates (hide dock strips, hide status bar, hide
+//! project panel, close all docks, …) to keep the launcher chrome-
+//! free. Now the launcher window doesn't share any structure with a
+//! Solution workspace, so chrome can't accidentally bleed in.
+//!
+//! Sibling crates (notably `solutions_ui`) plug content into the
+//! launcher via `register_welcome_section`, which keeps the
+//! `workspace → solutions` direction unchanged.
+//!
+//! Opening the window is the responsibility of the `onboarding`
+//! crate (which has the `ShowWelcome` action handler) or anyone else
+//! who calls `WelcomeWindow::open(...)`.
 
+use crate::AppState;
+use gpui::{
+    AnyElement, AnyWindowHandle, App, Context, FocusHandle, Focusable, Global, InteractiveElement,
+    ParentElement, Render, Styled, Window, WindowDecorations, WindowHandle, WindowKind, actions,
+    px,
+>>>>>>> theirs
+};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+<<<<<<< ours
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
@@ -28,22 +56,28 @@ use zed_actions::{
 pub struct OpenRecentProject {
     pub index: usize,
 }
+=======
+use ui::{ContextMenu, Divider, DividerColor, PopoverMenu, Vector, VectorName, prelude::*};
+use zed_actions::{Extensions, OpenKeymap, OpenSettings};
+>>>>>>> theirs
 
 actions!(
     zed,
     [
-        /// Show the Zed welcome screen
+        /// Show the SPK Editor welcome / launcher window.
         ShowWelcome
     ]
 );
 
+/// Header above a section list, used by registered sections via
+/// `SectionHeader::new(...)`.
 #[derive(IntoElement)]
-struct SectionHeader {
+pub struct SectionHeader {
     title: SharedString,
 }
 
 impl SectionHeader {
-    fn new(title: impl Into<SharedString>) -> Self {
+    pub fn new(title: impl Into<SharedString>) -> Self {
         Self {
             title: title.into(),
         }
@@ -66,225 +100,80 @@ impl RenderOnce for SectionHeader {
     }
 }
 
-#[derive(IntoElement)]
-struct SectionButton {
-    label: SharedString,
-    icon: IconName,
-    action: Box<dyn Action>,
-    tab_index: usize,
+/// Closure that renders an extra section into the launcher. Returns
+/// `None` when the section has nothing to show this frame.
+///
+/// Lives behind an `Rc` so the registry can hand out clones that
+/// outlive the borrow on the registry itself (rendering iterates
+/// registered sections one at a time and each call needs `&mut App`).
+pub type WelcomeSectionRenderer = Rc<dyn Fn(&mut App) -> Option<AnyElement>>;
+
+#[derive(Default)]
+struct WelcomeSectionRegistry {
+    sections: RefCell<Vec<WelcomeSectionRenderer>>,
+}
+
+impl Global for WelcomeSectionRegistry {}
+
+/// Register an extra section to render in the launcher window. Used
+/// by sibling crates (e.g. `solutions_ui`) to plug Recent Solutions
+/// in without `workspace` having to depend on `solutions`.
+pub fn register_welcome_section(
+    cx: &mut App,
+    renderer: impl Fn(&mut App) -> Option<AnyElement> + 'static,
+) {
+    if cx.try_global::<WelcomeSectionRegistry>().is_none() {
+        cx.set_global(WelcomeSectionRegistry::default());
+    }
+    cx.global::<WelcomeSectionRegistry>()
+        .sections
+        .borrow_mut()
+        .push(Rc::new(renderer));
+}
+
+fn render_registered_sections(cx: &mut App) -> Vec<AnyElement> {
+    let renderers: Vec<WelcomeSectionRenderer> = cx
+        .try_global::<WelcomeSectionRegistry>()
+        .map(|reg| reg.sections.borrow().iter().cloned().collect())
+        .unwrap_or_default();
+    renderers
+        .into_iter()
+        .filter_map(|render| render(cx))
+        .collect()
+}
+
+/// Root view of the SPK Editor launcher window. Owns its own focus
+/// handle and renders the sections registered via
+/// `register_welcome_section`.
+pub struct WelcomeWindow {
     focus_handle: FocusHandle,
-}
-
-impl SectionButton {
-    fn new(
-        label: impl Into<SharedString>,
-        icon: IconName,
-        action: &dyn Action,
-        tab_index: usize,
-        focus_handle: FocusHandle,
-    ) -> Self {
-        Self {
-            label: label.into(),
-            icon,
-            action: action.boxed_clone(),
-            tab_index,
-            focus_handle,
-        }
-    }
-}
-
-impl RenderOnce for SectionButton {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let id = format!("onb-button-{}-{}", self.label, self.tab_index);
-        let action_ref: &dyn Action = &*self.action;
-
-        ButtonLike::new(id)
-            .tab_index(self.tab_index as isize)
-            .full_width()
-            .size(ButtonSize::Medium)
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Icon::new(self.icon)
-                                    .color(Color::Muted)
-                                    .size(IconSize::Small),
-                            )
-                            .child(Label::new(self.label)),
-                    )
-                    .child(
-                        KeyBinding::for_action_in(action_ref, &self.focus_handle, cx)
-                            .size(rems_from_px(12.)),
-                    ),
-            )
-            .on_click(move |_, window, cx| {
-                self.focus_handle.dispatch_action(&*self.action, window, cx)
-            })
-    }
-}
-
-enum SectionVisibility {
-    Always,
-}
-
-impl SectionVisibility {
-    fn is_visible(&self) -> bool {
-        match self {
-            SectionVisibility::Always => true,
-        }
-    }
-}
-
-struct SectionEntry {
-    icon: IconName,
-    title: &'static str,
-    action: &'static dyn Action,
-    visibility_guard: SectionVisibility,
-}
-
-impl SectionEntry {
-    fn render(&self, button_index: usize, focus: &FocusHandle) -> Option<impl IntoElement> {
-        self.visibility_guard.is_visible().then(|| {
-            SectionButton::new(
-                self.title,
-                self.icon,
-                self.action,
-                button_index,
-                focus.clone(),
-            )
-        })
-    }
-}
-
-const CONTENT: (Section<4>, Section<3>) = (
-    Section {
-        title: "Get Started",
-        entries: [
-            SectionEntry {
-                icon: IconName::Plus,
-                title: "New File",
-                action: &NewFile,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::FolderOpen,
-                title: "Open Project",
-                action: &Open::DEFAULT,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::CloudDownload,
-                title: "Clone Repository",
-                action: &GitClone,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::ListCollapse,
-                title: "Open Command Palette",
-                action: &command_palette::Toggle,
-                visibility_guard: SectionVisibility::Always,
-            },
-        ],
-    },
-    Section {
-        title: "Configure",
-        entries: [
-            SectionEntry {
-                icon: IconName::Settings,
-                title: "Open Settings",
-                action: &OpenSettings,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::Keyboard,
-                title: "Customize Keymaps",
-                action: &OpenKeymap,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::Blocks,
-                title: "Explore Extensions",
-                action: &Extensions {
-                    category_filter: None,
-                    id: None,
-                },
-                visibility_guard: SectionVisibility::Always,
-            },
-        ],
-    },
-);
-
-struct Section<const COLS: usize> {
-    title: &'static str,
-    entries: [SectionEntry; COLS],
-}
-
-impl<const COLS: usize> Section<COLS> {
-    fn render(self, index_offset: usize, focus: &FocusHandle) -> impl IntoElement {
-        v_flex()
-            .min_w_full()
-            .child(SectionHeader::new(self.title))
-            .children(
-                self.entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, entry)| entry.render(index_offset + index, focus)),
-            )
-    }
-}
-
-pub struct WelcomePage {
-    workspace: WeakEntity<Workspace>,
-    focus_handle: FocusHandle,
+<<<<<<< ours
     fallback_to_recent_projects: bool,
     recent_workspaces: Option<Vec<RecentWorkspace>>,
+=======
+    _appearance_subscription: gpui::Subscription,
+>>>>>>> theirs
 }
 
-impl WelcomePage {
-    pub fn new(
-        workspace: WeakEntity<Workspace>,
-        fallback_to_recent_projects: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+impl WelcomeWindow {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify())
             .detach();
 
-        if fallback_to_recent_projects {
-            let fs = workspace
-                .upgrade()
-                .map(|ws| ws.read(cx).app_state().fs.clone());
-            let db = WorkspaceDb::global(cx);
-            cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-                let Some(fs) = fs else { return };
-                let workspaces = db
-                    .recent_project_workspaces(fs.as_ref())
-                    .await
-                    .log_err()
-                    .unwrap_or_default();
+        // Push the OS appearance into the `SystemAppearance` global
+        // up front — without this the launcher paints with the
+        // default Light value and picks the wrong theme variant on a
+        // dark system.
+        let appearance_subscription = theme_settings::track_window_appearance(window, cx);
 
-                this.update(cx, |this, cx| {
-                    this.recent_workspaces = Some(workspaces);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
-
-        WelcomePage {
-            workspace,
+        Self {
             focus_handle,
-            fallback_to_recent_projects,
-            recent_workspaces: None,
+            _appearance_subscription: appearance_subscription,
         }
     }
 
+<<<<<<< ours
     fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         window.focus_next(cx);
         cx.notify();
@@ -323,94 +212,81 @@ impl WelcomePage {
                     window.dispatch_action(OpenRecent::default().boxed_clone(), cx);
                 }
             }
+=======
+    /// Opens (or focuses, if one already exists) the launcher window.
+    /// Centred 720×720 by default — wider tends to feel half-empty
+    /// because the content column is 40rem.
+    pub fn open(
+        app_state: Arc<AppState>,
+        cx: &mut App,
+    ) -> anyhow::Result<WindowHandle<WelcomeWindow>> {
+        // Reuse the existing welcome window when one is already open
+        // — opening a second copy is never what the user wants.
+        if let Some(existing) = find_existing(cx) {
+            existing
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+            return Ok(existing);
+>>>>>>> theirs
         }
-    }
 
-    fn render_agent_card(&self, tab_index: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        let focus = self.focus_handle.clone();
-        let color = cx.theme().colors();
-
-        let description = "Run multiple threads at once, mix and match any ACP-compatible agent, and keep work conflict-free with worktrees.";
-
-        v_flex()
-            .w_full()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(color.border_variant)
-            .bg(linear_gradient(
-                360.,
-                linear_color_stop(color.panel_background, 1.0),
-                linear_color_stop(color.editor_background, 0.45),
-            ))
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .child(
-                        Icon::new(IconName::ZedAssistant)
-                            .color(Color::Muted)
-                            .size(IconSize::Small),
-                    )
-                    .child(Label::new("Collaborate with Agents")),
-            )
-            .child(
-                Label::new(description)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .mb_2(),
-            )
-            .child(
-                Button::new("open-agent", "Open Agent Panel")
-                    .full_width()
-                    .tab_index(tab_index as isize)
-                    .style(ButtonStyle::Outlined)
-                    .key_binding(
-                        KeyBinding::for_action_in(&ToggleFocus, &self.focus_handle, cx)
-                            .size(rems_from_px(12.)),
-                    )
-                    .on_click(move |_, window, cx| {
-                        focus.dispatch_action(&ToggleWorkspaceSidebar, window, cx);
-                        focus.dispatch_action(&ToggleFocus, window, cx);
-                    }),
-            )
-    }
-
-    fn render_recent_project_section(
-        &self,
-        recent_projects: Vec<impl IntoElement>,
-    ) -> impl IntoElement {
-        v_flex()
-            .w_full()
-            .child(SectionHeader::new("Recent Projects"))
-            .children(recent_projects)
-    }
-
-    fn render_recent_project(
-        &self,
-        project_index: usize,
-        tab_index: usize,
-        location: &SerializedWorkspaceLocation,
-        paths: &PathList,
-    ) -> impl IntoElement {
-        let name = project_name(paths);
-
-        let (icon, title) = match location {
-            SerializedWorkspaceLocation::Local => (IconName::Folder, name),
-            SerializedWorkspaceLocation::Remote(_) => (IconName::Server, name),
-        };
-
-        SectionButton::new(
-            title,
-            icon,
-            &OpenRecentProject {
-                index: project_index,
+        let bounds = gpui::WindowBounds::centered(
+            gpui::Size {
+                width: px(720.),
+                height: px(720.),
             },
-            tab_index,
-            self.focus_handle.clone(),
-        )
+            cx,
+        );
+        // Start from the same Workspace options to inherit the
+        // theme-aware `window_background` (otherwise the launcher
+        // falls back to the OS default — white on most Linux setups).
+        // Then ask for *server-side* decorations: the launcher has no
+        // custom titlebar item to host close / minimize / maximize
+        // buttons, so the OS draws a plain title bar with those
+        // controls for us. The Workspace builds its own titlebar
+        // (`titlebar_item`) and uses client-side decorations to fit
+        // tabs / project name in there — that machinery isn't here.
+        let mut options = (app_state.build_window_options)(None, cx);
+        options.window_bounds = Some(bounds);
+        options.show = true;
+        options.focus = true;
+        options.kind = WindowKind::Normal;
+        options.window_decorations = Some(WindowDecorations::Server);
+        options.titlebar = None;
+
+        let window = cx.open_window(options, |window, cx| cx.new(|cx| Self::new(window, cx)))?;
+        Ok(window)
+    }
+
+    fn render_configure_menu(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.focus_handle.clone();
+        PopoverMenu::new("welcome-configure-menu")
+            .trigger(
+                IconButton::new("welcome-configure-trigger", IconName::Settings)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(ui::Tooltip::text("Configure")),
+            )
+            .menu(move |window, cx| {
+                let focus = focus.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.action("Open Settings", Box::new(OpenSettings))
+                        .action("Customize Keymaps", Box::new(OpenKeymap))
+                        .action(
+                            "Explore Extensions",
+                            Box::new(Extensions {
+                                category_filter: None,
+                                id: None,
+                            }),
+                        )
+                        .context(focus)
+                }))
+            })
+            .anchor(gpui::Anchor::TopRight)
     }
 }
 
+<<<<<<< ours
 impl Render for WelcomePage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (first_section, second_section) = CONTENT;
@@ -453,247 +329,93 @@ impl Render for WelcomePage {
             "Welcome to Zed"
         };
 
+=======
+impl Render for WelcomeWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Wire the UI font + theme into this window the same way
+        // `Workspace::render` does. Without this, the launcher draws
+        // on top of the default platform theme (white background),
+        // since neither `Workspace` nor anyone else has set the
+        // window's text style or background for it.
+        let ui_font = theme_settings::setup_ui_font(window, cx);
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
+>>>>>>> theirs
         h_flex()
             .key_context("Welcome")
             .track_focus(&self.focus_handle(cx))
-            .on_action(cx.listener(Self::select_previous))
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::open_recent_project))
             .size_full()
-            .bg(cx.theme().colors().editor_background)
+            .font(ui_font)
+            .bg(colors.editor_background)
+            .text_color(colors.text)
             .justify_center()
             .child(
                 v_flex()
                     .id("welcome-content")
-                    .p_8()
-                    .max_w_128()
-                    .size_full()
+                    .px_8()
+                    .py_8()
+                    .w(rems(40.))
+                    .h_full()
                     .gap_6()
-                    .justify_center()
                     .overflow_y_scroll()
                     .child(
                         h_flex()
                             .w_full()
-                            .justify_center()
+                            .justify_between()
+                            .items_center()
                             .mb_4()
                             .gap_4()
-                            .child(Vector::square(VectorName::ZedLogo, rems_from_px(45.)))
                             .child(
-                                v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("The editor for what's next")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .italic(),
-                                ),
-                            ),
+                                h_flex()
+                                    .gap_4()
+                                    .items_center()
+                                    .child(Vector::square(VectorName::SpkLogo, rems_from_px(45.)))
+                                    .child(
+                                        v_flex()
+                                            .child(Headline::new("Welcome to SPK Editor"))
+                                            .child(
+                                                Label::new("The editor for what's next")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted)
+                                                    .italic(),
+                                            ),
+                                    ),
+                            )
+                            .child(self.render_configure_menu(cx)),
                     )
-                    .child(first_section.render(Default::default(), &self.focus_handle))
-                    .child(second_section)
-                    .when(ai_enabled && !showing_recent_projects, |this| {
-                        let agent_tab_index = next_tab_index;
-                        next_tab_index += 1;
-                        this.child(self.render_agent_card(agent_tab_index, cx))
-                    })
-                    .when(!self.fallback_to_recent_projects, |this| {
-                        this.child(
-                            v_flex().gap_4().child(Divider::horizontal()).child(
-                                Button::new("welcome-exit", "Return to Onboarding")
-                                    .tab_index(next_tab_index as isize)
-                                    .full_width()
-                                    .label_size(LabelSize::XSmall)
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(OpenOnboarding.boxed_clone(), cx);
-                                    }),
-                            ),
-                        )
-                    }),
+                    .children(render_registered_sections(cx)),
             )
     }
 }
 
-impl EventEmitter<ItemEvent> for WelcomePage {}
-
-impl Focusable for WelcomePage {
-    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+impl Focusable for WelcomeWindow {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Item for WelcomePage {
-    type Event = ItemEvent;
-
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Welcome".into()
-    }
-
-    fn telemetry_event_text(&self) -> Option<&'static str> {
-        Some("New Welcome Page Opened")
-    }
-
-    fn show_toolbar(&self) -> bool {
-        false
-    }
-
-    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(crate::item::ItemEvent)) {
-        f(*event)
-    }
-}
-
-impl crate::SerializableItem for WelcomePage {
-    fn serialized_item_kind() -> &'static str {
-        "WelcomePage"
-    }
-
-    fn cleanup(
-        workspace_id: crate::WorkspaceId,
-        alive_items: Vec<crate::ItemId>,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> Task<gpui::Result<()>> {
-        crate::delete_unloaded_items(
-            alive_items,
-            workspace_id,
-            "welcome_pages",
-            &persistence::WelcomePagesDb::global(cx),
-            cx,
-        )
-    }
-
-    fn deserialize(
-        _project: Entity<project::Project>,
-        workspace: gpui::WeakEntity<Workspace>,
-        workspace_id: crate::WorkspaceId,
-        item_id: crate::ItemId,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Task<gpui::Result<Entity<Self>>> {
-        if persistence::WelcomePagesDb::global(cx)
-            .get_welcome_page(item_id, workspace_id)
-            .ok()
-            .is_some_and(|is_open| is_open)
-        {
-            Task::ready(Ok(
-                cx.new(|cx| WelcomePage::new(workspace, false, window, cx))
-            ))
-        } else {
-            Task::ready(Err(anyhow::anyhow!("No welcome page to deserialize")))
+/// Returns the first window in the app whose root view is a
+/// `WelcomeWindow`, if any. Used to deduplicate the launcher window so
+/// repeatedly invoking `ShowWelcome` doesn't pile up extra copies.
+pub fn find_existing(cx: &App) -> Option<WindowHandle<WelcomeWindow>> {
+    for handle in cx.windows() {
+        if let Some(welcome) = handle.downcast::<WelcomeWindow>() {
+            return Some(welcome);
         }
     }
-
-    fn serialize(
-        &mut self,
-        workspace: &mut Workspace,
-        item_id: crate::ItemId,
-        _closing: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Task<gpui::Result<()>>> {
-        let workspace_id = workspace.database_id()?;
-        let db = persistence::WelcomePagesDb::global(cx);
-        Some(cx.background_spawn(
-            async move { db.save_welcome_page(item_id, workspace_id, true).await },
-        ))
-    }
-
-    fn should_serialize(&self, event: &Self::Event) -> bool {
-        event == &ItemEvent::UpdateTab
-    }
+    None
 }
 
-mod persistence {
-    use crate::WorkspaceDb;
-    use db::{
-        query,
-        sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
-        sqlez_macros::sql,
-    };
-
-    pub struct WelcomePagesDb(ThreadSafeConnection);
-
-    impl Domain for WelcomePagesDb {
-        const NAME: &str = stringify!(WelcomePagesDb);
-
-        const MIGRATIONS: &[&str] = (&[sql!(
-                    CREATE TABLE welcome_pages (
-                        workspace_id INTEGER,
-                        item_id INTEGER UNIQUE,
-                        is_open INTEGER DEFAULT FALSE,
-
-                        PRIMARY KEY(workspace_id, item_id),
-                        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
-                        ON DELETE CASCADE
-                    ) STRICT;
-        )]);
-    }
-
-    db::static_connection!(WelcomePagesDb, [WorkspaceDb]);
-
-    impl WelcomePagesDb {
-        query! {
-            pub async fn save_welcome_page(
-                item_id: crate::ItemId,
-                workspace_id: crate::WorkspaceId,
-                is_open: bool
-            ) -> Result<()> {
-                INSERT OR REPLACE INTO welcome_pages(item_id, workspace_id, is_open)
-                VALUES (?, ?, ?)
-            }
-        }
-
-        query! {
-            pub fn get_welcome_page(
-                item_id: crate::ItemId,
-                workspace_id: crate::WorkspaceId
-            ) -> Result<bool> {
-                SELECT is_open
-                FROM welcome_pages
-                WHERE item_id = ? AND workspace_id = ?
-            }
-        }
-    }
+/// Convenience for callers that just need to know whether *some*
+/// welcome window is up — useful in code paths that want to decide
+/// between "open new" and "do nothing".
+pub fn any_welcome_window_open(cx: &App) -> bool {
+    find_existing(cx).is_some()
 }
 
-fn project_name(paths: &PathList) -> String {
-    let joined = paths
-        .paths()
-        .iter()
-        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if joined.is_empty() {
-        "Untitled".to_string()
-    } else {
-        joined
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_project_name_empty() {
-        let paths = PathList::new::<&str>(&[]);
-        assert_eq!(project_name(&paths), "Untitled");
-    }
-
-    #[test]
-    fn test_project_name_single() {
-        let paths = PathList::new(&["/home/user/my-project"]);
-        assert_eq!(project_name(&paths), "my-project");
-    }
-
-    #[test]
-    fn test_project_name_multiple() {
-        // PathList sorts lexicographically, so filenames appear in alpha order
-        let paths = PathList::new(&["/home/user/zed", "/home/user/api"]);
-        assert_eq!(project_name(&paths), "api, zed");
-    }
-
-    #[test]
-    fn test_project_name_root_path_filtered() {
-        // A bare root "/" has no file_name(), falls back to "Untitled"
-        let paths = PathList::new(&["/"]);
-        assert_eq!(project_name(&paths), "Untitled");
-    }
+/// Returns true when the given window handle is a launcher window
+/// (root view = `WelcomeWindow`). Used by callers that have an
+/// `AnyWindowHandle` and want to special-case the launcher.
+pub fn is_welcome_window(handle: AnyWindowHandle) -> bool {
+    handle.downcast::<WelcomeWindow>().is_some()
 }

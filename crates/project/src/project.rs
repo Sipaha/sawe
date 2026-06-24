@@ -251,7 +251,19 @@ pub struct Project {
     agent_location: Option<AgentLocation>,
     downloading_files: Arc<Mutex<HashMap<(WorktreeId, String), DownloadingFile>>>,
     last_worktree_paths: WorktreePaths,
+    /// Worktree roots flagged as read-only by an out-of-band marker file
+    /// (e.g. `.spke-readonly.json` written by S-SAR's snapshot worktrees).
+    /// Buffers loaded from any path under one of these roots are forced
+    /// to `Capability::Read` and the workspace title bar shows
+    /// `[READ-ONLY]`.
+    read_only_roots: HashSet<PathBuf>,
 }
+
+/// Marker file dropped into a worktree root by S-SAR (`Show at Revision`)
+/// to tag the worktree as a read-only snapshot. Detected by Project at
+/// `WorktreeAdded` time; presence flips that root into the
+/// `read_only_roots` set.
+pub const READ_ONLY_MARKER_FILE: &str = ".spke-readonly.json";
 
 struct DownloadingFile {
     destination_path: PathBuf,
@@ -1120,7 +1132,7 @@ impl DisableAiSettings {
     /// Returns whether AI is disabled for the given file.
     ///
     /// This checks the project-level settings for the file's worktree,
-    /// allowing `disable_ai` to be configured per-project in `.zed/settings.json`.
+    /// allowing `disable_ai` to be configured per-project in `.spke/settings.json`.
     pub fn is_ai_disabled_for_buffer(buffer: Option<&Entity<Buffer>>, cx: &App) -> bool {
         Self::is_ai_disabled_for_file(buffer.and_then(|buffer| buffer.read(cx).file()), cx)
     }
@@ -1372,6 +1384,7 @@ impl Project {
                 agent_location: None,
                 downloading_files: Default::default(),
                 last_worktree_paths: WorktreePaths::default(),
+                read_only_roots: HashSet::default(),
             }
         })
     }
@@ -1614,6 +1627,7 @@ impl Project {
                 agent_location: None,
                 downloading_files: Default::default(),
                 last_worktree_paths: WorktreePaths::default(),
+                read_only_roots: HashSet::default(),
             };
 
             // remote server -> local machine handlers
@@ -1901,6 +1915,7 @@ impl Project {
                 agent_location: None,
                 downloading_files: Default::default(),
                 last_worktree_paths: WorktreePaths::default(),
+                read_only_roots: HashSet::default(),
             };
             project.set_role(role, cx);
             for worktree in worktrees {
@@ -2968,6 +2983,38 @@ impl Project {
         self.is_disconnected(cx) || !self.capability().editable()
     }
 
+    /// Marks `root` as a read-only worktree root. Buffers loaded from any
+    /// path under `root` will be forced to `Capability::Read`. Used by
+    /// S-SAR snapshot worktrees (which carry a `.spke-readonly.json`
+    /// marker) and could be reused for any other "freeze this directory
+    /// at the buffer layer" use case.
+    pub fn register_read_only_root(&mut self, root: PathBuf) {
+        self.read_only_roots.insert(root);
+    }
+
+    /// Whether `path` is contained in any registered read-only root.
+    /// Pure path-prefix check — no filesystem I/O — so it's cheap to call
+    /// from the buffer-creation hot path.
+    pub fn is_path_read_only(&self, path: &Path) -> bool {
+        self.read_only_roots
+            .iter()
+            .any(|root| path.starts_with(root))
+    }
+
+    /// Whether the project owns at least one read-only worktree root.
+    /// Used by the workspace title bar to render the `[READ-ONLY]`
+    /// suffix without iterating worktrees.
+    pub fn has_read_only_root(&self) -> bool {
+        !self.read_only_roots.is_empty()
+    }
+
+    /// Returns the read-only roots in arbitrary order. Used by
+    /// `Workspace`'s on-close cleanup to find snapshot worktrees that
+    /// need a `git worktree remove`.
+    pub fn read_only_roots(&self) -> impl Iterator<Item = &Path> {
+        self.read_only_roots.iter().map(|p| p.as_path())
+    }
+
     #[inline]
     pub fn is_local(&self) -> bool {
         match &self.client_state {
@@ -3319,6 +3366,26 @@ impl Project {
         }
 
         self.request_buffer_diff_recalculation(buffer, cx);
+
+        // S-SAR — buffers loaded from a snapshot worktree (one whose
+        // root carries the `.spke-readonly.json` marker) are forced
+        // read-only. Editor / collab paths still have their own gates,
+        // but we want the buffer-level capability flipped early so any
+        // edit-attempt code path trips the same `read_only()` check.
+        if !self.read_only_roots.is_empty() {
+            let buffer_path = buffer
+                .read(cx)
+                .file()
+                .and_then(|file| file.as_local())
+                .map(|local| local.abs_path(cx));
+            if let Some(path) = buffer_path
+                && self.is_path_read_only(&path)
+            {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_capability(Capability::ReadOnly, cx);
+                });
+            }
+        }
 
         cx.subscribe(buffer, |this, buffer, event, cx| {
             this.on_buffer_event(buffer, event, cx);
@@ -3799,11 +3866,40 @@ impl Project {
         }
     }
 
-    fn on_worktree_added(&mut self, worktree: &Entity<Worktree>, _: &mut Context<Self>) {
-        let mut remotely_created_models = self.remotely_created_models.lock();
-        if remotely_created_models.retain_count > 0 {
-            remotely_created_models.worktrees.push(worktree.clone())
+    fn on_worktree_added(&mut self, worktree: &Entity<Worktree>, cx: &mut Context<Self>) {
+        {
+            let mut remotely_created_models = self.remotely_created_models.lock();
+            if remotely_created_models.retain_count > 0 {
+                remotely_created_models.worktrees.push(worktree.clone())
+            }
         }
+        self.detect_read_only_marker(worktree, cx);
+    }
+
+    /// Look for a `.spke-readonly.json` file at the worktree root; if
+    /// present, register the root as read-only so any buffer opened
+    /// from underneath it is forced to `Capability::Read`. The marker
+    /// is itself written by S-SAR's `show_at_revision` handler.
+    fn detect_read_only_marker(&mut self, worktree: &Entity<Worktree>, cx: &mut Context<Self>) {
+        let worktree = worktree.read(cx);
+        if !worktree.is_local() {
+            return;
+        }
+        let root: PathBuf = worktree.abs_path().to_path_buf();
+        let marker = root.join(READ_ONLY_MARKER_FILE);
+        let fs = self.fs.clone();
+        cx.spawn(async move |this, cx| {
+            let exists = fs.is_file(&marker).await;
+            if !exists {
+                return;
+            }
+            this.update(cx, |project, cx| {
+                project.register_read_only_root(root);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn on_worktree_released(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {

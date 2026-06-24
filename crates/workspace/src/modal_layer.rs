@@ -26,6 +26,27 @@ pub trait ModalView: ManagedView {
     fn render_bare(&self) -> bool {
         false
     }
+<<<<<<< ours
+=======
+
+    /// Whether clicking on the modal's surrounding overlay should
+    /// dismiss it. Defaults to `true` (the standard "click outside to
+    /// close" UX). Set to `false` for modals that own real
+    /// user-entered state — losing that state from a stray click is
+    /// rarely worth the convenience.
+    fn dismiss_on_overlay_click(&self) -> bool {
+        true
+    }
+
+    /// Stable identifier for this modal kind, surfaced via
+    /// [`ModalLayer::active_modal_kind`] / [`super::Workspace::active_modal_kind`]
+    /// so external observers (introspection tools, MCP probes) can tell *what*
+    /// is open without holding a `TypeId`. Defaults to `"Modal"`; override in
+    /// concrete modal types (e.g. `"NewSolution"`, `"OpenSolution"`).
+    fn debug_kind(&self) -> &'static str {
+        "Modal"
+    }
+>>>>>>> theirs
 }
 
 trait ModalViewHandle {
@@ -33,6 +54,11 @@ trait ModalViewHandle {
     fn view(&self) -> AnyView;
     fn fade_out_background(&self, cx: &mut App) -> bool;
     fn render_bare(&self, cx: &mut App) -> bool;
+<<<<<<< ours
+=======
+    fn dismiss_on_overlay_click(&self, cx: &App) -> bool;
+    fn debug_kind(&self, cx: &App) -> &'static str;
+>>>>>>> theirs
 }
 
 impl<V: ModalView> ModalViewHandle for Entity<V> {
@@ -51,6 +77,17 @@ impl<V: ModalView> ModalViewHandle for Entity<V> {
     fn render_bare(&self, cx: &mut App) -> bool {
         self.read(cx).render_bare()
     }
+<<<<<<< ours
+=======
+
+    fn dismiss_on_overlay_click(&self, cx: &App) -> bool {
+        self.read(cx).dismiss_on_overlay_click()
+    }
+
+    fn debug_kind(&self, cx: &App) -> &'static str {
+        self.read(cx).debug_kind()
+    }
+>>>>>>> theirs
 }
 
 pub struct ActiveModal {
@@ -189,6 +226,16 @@ impl ModalLayer {
     pub fn has_active_modal(&self) -> bool {
         self.active_modal.is_some()
     }
+<<<<<<< ours
+=======
+
+    /// Stable kind name of the currently active modal, if any. Used by
+    /// introspection (e.g. `workspace.dump_visual_structure`) to surface
+    /// what modal is open without leaking GPUI type ids.
+    pub fn active_modal_kind(&self, cx: &App) -> Option<&'static str> {
+        self.active_modal.as_ref().map(|m| m.modal.debug_kind(cx))
+    }
+>>>>>>> theirs
 }
 
 impl Render for ModalLayer {
@@ -201,6 +248,7 @@ impl Render for ModalLayer {
             return active_modal.modal.view().into_any_element();
         }
 
+        let dismiss_on_overlay = active_modal.modal.dismiss_on_overlay_click(cx);
         div()
             .absolute()
             .size_full()
@@ -211,12 +259,14 @@ impl Render for ModalLayer {
                 background.fade_out(0.2);
                 this.bg(background)
             })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.hide_modal(window, cx);
-                }),
-            )
+            .when(dismiss_on_overlay, |this| {
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.hide_modal(window, cx);
+                    }),
+                )
+            })
             .child(
                 v_flex()
                     .h(px(0.0))

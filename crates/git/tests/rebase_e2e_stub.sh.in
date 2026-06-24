@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -eu
+cmd="${1:-}"
+case "$cmd" in
+  --git-rebase-helper)
+    todo_path="${2:?missing todo path}"
+    if [[ -z "${__SESSION_ENV__:-}" ]]; then
+      echo "missing __SESSION_ENV__" >&2
+      exit 1
+    fi
+    src="__TEMP_ROOT__/cache/git-helper/${__SESSION_ENV__}/todo.txt"
+    if [[ ! -f "$src" ]]; then
+      echo "no todo at $src" >&2
+      exit 1
+    fi
+    cp "$src" "$todo_path"
+    ;;
+  --git-message-set)
+    token="${2:?missing token}"
+    if [[ -z "${__SESSION_ENV__:-}" ]]; then
+      echo "missing __SESSION_ENV__" >&2
+      exit 1
+    fi
+    msg="__TEMP_ROOT__/cache/git-helper/${__SESSION_ENV__}/messages/${token}.txt"
+    if [[ ! -f "$msg" ]]; then
+      echo "no message at $msg" >&2
+      exit 1
+    fi
+    git commit --amend -F "$msg"
+    ;;
+  *)
+    echo "unknown subcommand: $cmd" >&2
+    exit 2
+    ;;
+esac

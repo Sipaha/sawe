@@ -1641,7 +1641,11 @@ mod tests {
         use pulldown_cmark::BlockQuoteKind;
 
         let markdown = "\n> [!NOTE]\n> A note.\n\n> [!TIP]\n> A tip.\n\n> [!IMPORTANT]\n> Important.\n\n> [!WARNING]\n> A warning.\n\n> [!CAUTION]\n> A caution.\n\n> Plain quote.\n";
+<<<<<<< ours
         let parsed = parse_markdown_with_options(markdown, false, false, false);
+=======
+        let parsed = parse_markdown_with_options(markdown, false, false);
+>>>>>>> theirs
 
         let block_quote_kinds: Vec<_> = parsed
             .events

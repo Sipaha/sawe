@@ -10633,12 +10633,23 @@ pub(crate) fn init_test(cx: &mut TestAppContext) {
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         crate::init(cx);
 
+        // ProjectPanel reads SolutionStore::global(cx) for the active member.
+        // Install a minimal store so tests that don't exercise solution
+        // filtering still construct cleanly.
+        let store = solutions::SolutionStore::for_test(PathBuf::new(), cx);
+        solutions::install_global_for_test(store, cx);
+
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
+                let panel = settings.project_panel.get_or_insert_default();
+                panel.auto_fold_dirs = Some(false);
+                // Tests assert tree shape with the worktree root visible
+                // (`v root1` followed by its children). The fork-default
+                // hides the root because the active-project selector
+                // header already names it; pin it back to `false` here so
+                // the upstream tree assertions still apply. Tests that
+                // explicitly cover `hide_root=true` flip it locally.
+                panel.hide_root = Some(false);
                 settings.project.worktree.file_scan_exclusions = Some(Vec::new());
             });
         });
@@ -10653,12 +10664,16 @@ fn init_test_with_editor(cx: &mut TestAppContext) {
         crate::init(cx);
         workspace::init(app_state, cx);
 
+        let store = solutions::SolutionStore::for_test(PathBuf::new(), cx);
+        solutions::install_global_for_test(store, cx);
+
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
+                let panel = settings.project_panel.get_or_insert_default();
+                panel.auto_fold_dirs = Some(false);
+                // See `init_test`: pin `hide_root` to false so the
+                // upstream tree-shape assertions hold.
+                panel.hide_root = Some(false);
                 settings.project.worktree.file_scan_exclusions = Some(Vec::new())
             });
         });
@@ -10849,25 +10864,44 @@ impl Render for TestProjectItemView {
     }
 }
 
+<<<<<<< ours
 #[gpui::test]
 async fn test_delete_prompt_escapes_markdown_in_file_name(cx: &mut gpui::TestAppContext) {
+=======
+/// Smoke test: the panel constructs without panic when the GlobalSolutionStore is
+/// installed but no solution matches the workspace (selector renders "No solution"
+/// and selected_member() returns None, so no filtering is applied).
+#[gpui::test]
+async fn project_panel_constructs_with_solution_store(cx: &mut gpui::TestAppContext) {
+>>>>>>> theirs
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
+<<<<<<< ours
         "/root",
         json!({
             "__somefile__": "",
+=======
+        "/root1",
+        json!({
+            "a.txt": "",
+>>>>>>> theirs
         }),
     )
     .await;
 
+<<<<<<< ours
     let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+=======
+    let project = Project::test(fs.clone(), ["/root1".as_ref()], cx).await;
+>>>>>>> theirs
     let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let workspace = window
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
     let cx = &mut VisualTestContext::from_window(window.into(), cx);
+<<<<<<< ours
     let panel = workspace.update_in(cx, ProjectPanel::new);
     cx.run_until_parked();
 
@@ -10882,5 +10916,17 @@ async fn test_delete_prompt_escapes_markdown_in_file_name(cx: &mut gpui::TestApp
     assert_eq!(
         message,
         "Are you sure you want to permanently delete `__somefile__`?"
+=======
+
+    // Panel must construct without panic; selector's selected_member() returns None
+    // (no solution matches) so visible_entries is not filtered.
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    // All entries visible when no member is selected (no filtering).
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..5, cx),
+        &["v root1", "      a.txt"],
+>>>>>>> theirs
     );
 }

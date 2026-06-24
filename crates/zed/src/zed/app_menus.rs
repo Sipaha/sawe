@@ -1,7 +1,7 @@
-use collab_ui::collab_panel;
+// Collab is disabled in spk-editor (no Zed Industries collab server access).
+// use collab_ui::collab_panel;
 use gpui::{App, Menu, MenuItem, OsAction};
 use release_channel::ReleaseChannel;
-use terminal_view::terminal_panel;
 use zed_actions::{debug_panel, dev};
 
 pub fn app_menus(cx: &mut App) -> Vec<Menu> {
@@ -42,8 +42,9 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action("Project Panel", zed_actions::project_panel::ToggleFocus),
         MenuItem::action("Outline Panel", outline_panel::ToggleFocus),
-        MenuItem::action("Collab Panel", collab_panel::ToggleFocus),
-        MenuItem::action("Terminal Panel", terminal_panel::ToggleFocus),
+        // Collab is disabled in spk-editor (no Zed Industries collab server access).
+        // MenuItem::action("Collab Panel", collab_panel::ToggleFocus),
+        MenuItem::action("Console Panel", console_panel::ToggleFocus),
         MenuItem::action("Debugger Panel", debug_panel::ToggleFocus),
         MenuItem::separator(),
         MenuItem::action("Diagnostics", diagnostics::Deploy),
@@ -60,11 +61,12 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
 
     vec![
         Menu {
-            name: "Zed".into(),
+            name: "SPK Editor".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("About Zed", zed_actions::About),
-                MenuItem::action("Check for Updates", auto_update::Check),
+                MenuItem::action("About SPK Editor", zed_actions::About),
+                // Auto-update disabled in spk-editor: no upstream channel.
+                // MenuItem::action("Check for Updates", auto_update::Check),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([
                     MenuItem::action("Open Settings", zed_actions::OpenSettings),
@@ -95,13 +97,13 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Install CLI", install_cli::InstallCliBinary),
                 MenuItem::separator(),
                 #[cfg(target_os = "macos")]
-                MenuItem::action("Hide Zed", super::Hide),
+                MenuItem::action("Hide SPK Editor", super::Hide),
                 #[cfg(target_os = "macos")]
                 MenuItem::action("Hide Others", super::HideOthers),
                 #[cfg(target_os = "macos")]
                 MenuItem::action("Show All", super::ShowAll),
                 MenuItem::separator(),
-                MenuItem::action("Quit Zed", Quit),
+                MenuItem::action("Quit SPK Editor", Quit),
             ],
         },
         Menu {
@@ -251,6 +253,15 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "Run".into(),
             disabled: false,
             items: vec![
+                MenuItem::action("Run", run_config_ui::actions::Run),
+                MenuItem::action("Debug", run_config_ui::actions::Debug),
+                MenuItem::action("Stop", run_config_ui::actions::Stop),
+                MenuItem::separator(),
+                MenuItem::action(
+                    "Edit Configurations…",
+                    run_config_ui::actions::EditConfigurations,
+                ),
+                MenuItem::separator(),
                 MenuItem::action(
                     "Spawn Task",
                     zed_actions::Spawn::ViaModal {
@@ -285,17 +296,18 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "Help".into(),
             disabled: false,
             items: vec![
-                MenuItem::action(
-                    "View Release Notes Locally",
-                    auto_update_ui::ViewReleaseNotesLocally,
-                ),
+                // Auto-update disabled in spk-editor: no upstream release notes.
+                // MenuItem::action(
+                //     "View Release Notes Locally",
+                //     auto_update_ui::ViewReleaseNotesLocally,
+                // ),
                 MenuItem::action("View Telemetry", zed_actions::OpenTelemetryLog),
                 MenuItem::action("View Dependency Licenses", zed_actions::OpenLicenses),
                 MenuItem::action("Show Welcome", onboarding::ShowWelcome),
                 MenuItem::separator(),
                 MenuItem::action("File Bug Report...", zed_actions::feedback::FileBugReport),
                 MenuItem::action("Request Feature...", zed_actions::feedback::RequestFeature),
-                MenuItem::action("Email Us...", zed_actions::feedback::EmailZed),
+                MenuItem::action("Open Issue on GitHub...", zed_actions::feedback::EmailZed),
                 MenuItem::separator(),
                 MenuItem::action(
                     "Documentation",

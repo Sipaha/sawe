@@ -16,7 +16,7 @@ on:
         default: ''
 jobs:
   fetch_extension_repos:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions') && github.ref == 'refs/heads/main'
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: checkout_zed_repo
@@ -105,7 +105,7 @@ jobs:
   rollout_workflows_to_extension:
     needs:
     - fetch_extension_repos
-    if: needs.fetch_extension_repos.outputs.repos != '[]'
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     strategy:
       matrix:
@@ -204,7 +204,7 @@ jobs:
   create_rollout_tag:
     needs:
     - rollout_workflows_to_extension
-    if: inputs.filter-repos == ''
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - id: generate-token

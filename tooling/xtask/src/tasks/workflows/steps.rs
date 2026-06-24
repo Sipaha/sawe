@@ -967,11 +967,16 @@ impl GitRef {
     }
 }
 
+<<<<<<< ours
+=======
+#[allow(unused)]
+>>>>>>> theirs
 enum RefOperation {
     Create,
     Update { force: bool },
 }
 
+<<<<<<< ours
 pub(crate) enum RefSha {
     Context,
     Custom(String),
@@ -990,6 +995,15 @@ impl<T: ToString> From<T> for RefSha {
     }
 }
 
+=======
+struct RefOp {
+    git_ref: GitRef,
+    operation: RefOperation,
+    sha: String,
+    token: String,
+}
+
+>>>>>>> theirs
 impl From<RefOp> for Step<Use> {
     fn from(op: RefOp) -> Self {
         let (api_method, ref_path, force_line) = match &op.operation {
@@ -1004,11 +1018,16 @@ impl From<RefOp> for Step<Use> {
             RefOperation::Create => format!("steps::create_{}", op.git_ref.kind()),
             RefOperation::Update { .. } => format!("steps::update_{}", op.git_ref.kind()),
         };
+<<<<<<< ours
+=======
+        let sha = &op.sha;
+>>>>>>> theirs
         let script = indoc::formatdoc! {r#"
             github.rest.git.{api_method}({{
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 ref: '{ref_path}',
+<<<<<<< ours
                 sha: {sha}{force_line}
             }})
             "#,
@@ -1021,32 +1040,67 @@ impl From<RefOp> for Step<Use> {
             .custom_name(&step_name)
             .token(op.token)
             .into()
+=======
+                sha: '{sha}'{force_line}
+            }})
+        "#};
+        Step::new(step_name)
+            .uses(
+                "actions",
+                "github-script",
+                "f28e40c7f34bde8b3046d885e986cb6290c5673b", // v7
+            )
+            .with(
+                Input::default()
+                    .add("script", script)
+                    .add("github-token", op.token),
+            )
+>>>>>>> theirs
     }
 }
 
 pub(crate) fn create_ref(
     git_ref: GitRef,
+<<<<<<< ours
     sha: impl Into<RefSha>,
+=======
+    sha: impl ToString,
+>>>>>>> theirs
     token: &StepOutput,
 ) -> impl Into<Step<Use>> {
     RefOp {
         git_ref,
         operation: RefOperation::Create,
+<<<<<<< ours
         sha: sha.into(),
+=======
+        sha: sha.to_string(),
+>>>>>>> theirs
         token: token.to_string(),
     }
 }
 
+<<<<<<< ours
 pub(crate) fn update_ref(
     git_ref: GitRef,
     sha: impl Into<RefSha>,
+=======
+#[allow(unused)]
+pub(crate) fn update_ref(
+    git_ref: GitRef,
+    sha: impl ToString,
+>>>>>>> theirs
     token: &StepOutput,
     force: bool,
 ) -> impl Into<Step<Use>> {
     RefOp {
         git_ref,
         operation: RefOperation::Update { force },
+<<<<<<< ours
         sha: sha.into(),
+=======
+        sha: sha.to_string(),
+>>>>>>> theirs
         token: token.to_string(),
     }
 }

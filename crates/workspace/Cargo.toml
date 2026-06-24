@@ -35,8 +35,13 @@ chrono.workspace = true
 clock.workspace = true
 collections.workspace = true
 component.workspace = true
+context_server.workspace = true
 db.workspace = true
+<<<<<<< ours
 dirs.workspace = true
+=======
+editor_mcp.workspace = true
+>>>>>>> theirs
 futures-lite.workspace = true
 fs.workspace = true
 futures.workspace = true

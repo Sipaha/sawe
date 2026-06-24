@@ -12,24 +12,27 @@ workspace = true
 path = "src/git.rs"
 
 [features]
-test-support = ["rand"]
+test-support = ["rand", "db/test-support"]
 
 [dependencies]
 anyhow.workspace = true
 askpass.workspace = true
 async-trait.workspace = true
 collections.workspace = true
+db.workspace = true
 derive_more.workspace = true
 gpui.workspace = true
 http_client.workspace = true
 itertools.workspace = true
 log.workspace = true
 parking_lot.workspace = true
+paths.workspace = true
 regex.workspace = true
 rand = { workspace = true, optional = true }
 rope.workspace = true
 schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 smallvec.workspace = true
 async-channel.workspace = true
 smol.workspace = true
@@ -44,7 +47,11 @@ uuid.workspace = true
 futures.workspace = true
 ztracing.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
 serde_json.workspace = true
 text = { workspace = true, features = ["test-support"] }

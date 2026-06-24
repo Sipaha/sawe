@@ -171,6 +171,7 @@ impl SearchQuery {
             include_ignored,
             one_match_per_line,
             inner,
+<<<<<<< ours
             false,
         )
     }
@@ -210,6 +211,44 @@ impl SearchQuery {
         )
     }
 
+=======
+        )
+    }
+
+    /// Create a regex query from a literal string, escaping any regex
+    /// metacharacters so that the resulting query matches the literal text.
+    ///
+    /// Unlike `regex`, the query stored on the resulting `SearchQuery` is the
+    /// original unescaped text, so `as_str` returns what the user typed.
+    pub fn escaped_regex(
+        query: impl ToString,
+        whole_word: bool,
+        case_sensitive: bool,
+        include_ignored: bool,
+        files_to_include: PathMatcher,
+        files_to_exclude: PathMatcher,
+        match_full_paths: bool,
+        buffers: Option<Vec<Entity<Buffer>>>,
+    ) -> Result<Self> {
+        let query = query.to_string();
+        let inner = SearchInputs {
+            query: Arc::from(query.as_str()),
+            files_to_include,
+            files_to_exclude,
+            match_full_paths,
+            buffers,
+        };
+        Self::build_regex(
+            regex::escape(&query),
+            whole_word,
+            case_sensitive,
+            include_ignored,
+            false,
+            inner,
+        )
+    }
+
+>>>>>>> theirs
     fn build_regex(
         mut pattern: String,
         whole_word: bool,
@@ -217,7 +256,10 @@ impl SearchQuery {
         include_ignored: bool,
         one_match_per_line: bool,
         inner: SearchInputs,
+<<<<<<< ours
         escaped: bool,
+=======
+>>>>>>> theirs
     ) -> Result<Self> {
         if let Some((case_sensitive_from_pattern, new_pattern)) =
             Self::case_sensitive_from_pattern(&pattern)

@@ -291,6 +291,29 @@ impl WorktreeStore {
         }
     }
 
+    /// Toggle whether all worktrees are stored as `Strong` handles. The
+    /// default behaviour treats invisible worktrees as transient and
+    /// stores them as `Weak`, which is correct for single-file opens
+    /// outside any worktree but wrong when a caller (e.g. Solutions UI's
+    /// empty-solution placeholder) needs an invisible worktree to outlive
+    /// the function that created it. Setting this to `true` also upgrades
+    /// any currently-Weak handles to Strong (mirroring `shared`'s logic).
+    pub fn set_retain_worktrees(&mut self, retain: bool) {
+        if self.retain_worktrees == retain {
+            return;
+        }
+        self.retain_worktrees = retain;
+        if retain {
+            for handle in self.worktrees.iter_mut() {
+                if let WorktreeHandle::Weak(weak) = handle
+                    && let Some(strong) = weak.upgrade()
+                {
+                    *handle = WorktreeHandle::Strong(strong);
+                }
+            }
+        }
+    }
+
     pub fn disable_scanner(&mut self) {
         self.scanning_enabled = false;
         *self.initial_scan_complete.0.borrow_mut() = true;

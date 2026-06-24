@@ -2,7 +2,10 @@ mod thread_switcher;
 
 use acp_thread::ThreadStatus;
 use action_log::DiffStats;
+<<<<<<< ours
 use agent::{ThreadStore, ZED_AGENT_ID};
+=======
+>>>>>>> theirs
 use agent_client_protocol::schema as acp;
 use agent_settings::AgentSettings;
 use agent_ui::terminal_thread_metadata_store::{
@@ -27,10 +30,18 @@ use editor::Editor;
 use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
+#[cfg(test)]
+use gpui::Action as _;
 use gpui::{
+<<<<<<< ours
     Action as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EntityId, FocusHandle,
     Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task, TaskExt,
     WeakEntity, Window, WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
+=======
+    AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EntityId, FocusHandle, Focusable,
+    KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task, WeakEntity, Window,
+    WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
+>>>>>>> theirs
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -63,7 +74,7 @@ use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
     CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent, NextProject,
-    NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey, SaveIntent,
+    NextThread, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey, SaveIntent,
     Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
     notifications::NotificationId, sidebar_side_context_menu,
 };
@@ -659,12 +670,20 @@ fn workspace_menu_worktree_labels(
 
             if let Some(snapshot) = repository_snapshot {
                 let worktree_name = if snapshot.is_linked_worktree() {
+<<<<<<< ours
                     snapshot
                         .main_worktree_abs_path()
                         .and_then(|main_worktree_path| {
                             project::linked_worktree_short_name(main_worktree_path, root_path)
                         })
                         .unwrap_or_else(|| folder_name.clone())
+=======
+                    project::linked_worktree_short_name(
+                        snapshot.original_repo_abs_path.as_ref(),
+                        root_path,
+                    )
+                    .unwrap_or_else(|| folder_name.clone())
+>>>>>>> theirs
                 } else {
                     "main".into()
                 };
@@ -5410,7 +5429,10 @@ impl Sidebar {
         thread_id: Option<agent_ui::ThreadId>,
         neighbor: Option<&ActivatableEntry>,
         thread_folder_paths: Option<&PathList>,
+<<<<<<< ours
         thread_remote_connection: Option<&RemoteConnectionOptions>,
+=======
+>>>>>>> theirs
         in_flight_archive: Option<(Task<()>, async_channel::Sender<()>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -5489,8 +5511,11 @@ impl Sidebar {
             return None;
         }
 
+<<<<<<< ours
         self.delete_empty_drafts_for_archive_roots(&roots, cx);
 
+=======
+>>>>>>> theirs
         let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
         let task = cx.spawn(async move |_this, cx| {
             match Self::archive_worktree_roots(roots, cancel_rx, cx).await {
@@ -7253,6 +7278,7 @@ impl Sidebar {
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+<<<<<<< ours
         ProjectEmptyState::new(
             "Threads Sidebar",
             self.focus_handle(cx),
@@ -7275,6 +7301,28 @@ impl Sidebar {
         .on_clone_repo(|_, window, cx| {
             window.dispatch_action(git::Clone.boxed_clone(), cx);
         })
+=======
+        v_flex()
+            .id("sidebar-empty-state")
+            .p_4()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .track_focus(&self.focus_handle(cx))
+            .child(
+                Label::new("Solution is empty")
+                    .size(LabelSize::Small)
+                    .color(Color::Default),
+            )
+            .child(
+                div().w_full().text_center().child(
+                    Label::new("Add projects from the catalog to start working.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
+>>>>>>> theirs
     }
 
     fn render_sidebar_header(

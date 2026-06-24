@@ -1,5 +1,6 @@
 mod action;
 mod agent;
+mod console_panel;
 mod editor;
 mod extension;
 mod fallible_options;
@@ -15,6 +16,7 @@ mod workspace;
 
 pub use action::{ActionName, ActionWithArguments};
 pub use agent::*;
+pub use console_panel::*;
 pub use editor::*;
 pub use extension::*;
 pub use fallible_options::*;
@@ -164,6 +166,9 @@ pub struct SettingsContent {
     /// Configuration for the collab panel visual settings.
     pub collaboration_panel: Option<PanelSettingsContent>,
 
+    /// Configuration for the console panel (unified terminal + AI-chat tabs).
+    pub console_panel: Option<ConsolePanelSettingsContent>,
+
     pub debugger: Option<DebuggerSettingsContent>,
 
     /// Configuration for Diagnostics-related features.
@@ -207,6 +212,18 @@ pub struct SettingsContent {
     pub outline_panel: Option<OutlinePanelSettingsContent>,
 
     pub project_panel: Option<ProjectPanelSettingsContent>,
+
+    /// Configuration for the Solutions feature (catalog of remote git projects
+    /// + named groups that open as a single editor window).
+    pub solutions: Option<SolutionsSettingsContent>,
+
+    /// Configuration for the per-Solution AI subprocess pool used by
+    /// `solution_agent` (ephemeral commit-message / explain / cherry-pick
+    /// suggestion tasks). See M5 in the git-panel plan.
+    pub solution_agent: Option<SolutionAgentSettingsContent>,
+
+    /// Configuration for the Run Configurations feature.
+    pub run_config: Option<RunConfigSettingsContent>,
 
     /// Configuration for the Message Editor
     pub message_editor: Option<MessageEditorSettings>,
@@ -709,8 +726,101 @@ pub struct GitPanelSettingsContent {
     /// Maximum length of the commit message title before a warning is shown.
     /// Set to 0 to disable.
     ///
+<<<<<<< ours
     /// Default: 0
     pub commit_title_max_length: Option<usize>,
+=======
+    /// Default: 72
+    pub commit_title_max_length: Option<usize>,
+
+    /// Commit-view (S-DET) configuration: avatars, lazy-load threshold for
+    /// affected files, mention parsing.
+    pub commit_view: Option<CommitViewSettingsContent>,
+
+    /// Interactive-rebase (S-IRB) configuration. Currently exposes the
+    /// MCP exec gate.
+    pub interactive_rebase: Option<InteractiveRebaseSettingsContent>,
+
+    /// Show-at-revision (S-SAR) configuration: orphan-worktree TTL.
+    pub show_at_revision: Option<ShowAtRevisionSettingsContent>,
+
+    /// Pre-commit checks (S-PCH-HK): when `true`, the commit panel offers a
+    /// `Run pre-commit hook` checkbox that, when ticked, executes
+    /// `<repo>/.git/hooks/pre-commit` from spk-editor and then issues
+    /// `git commit --no-verify` to suppress git's own hook re-run. When
+    /// `false`, the checkbox is hidden and git itself runs the hook (same
+    /// as without our UI).
+    ///
+    /// Default: true
+    pub run_pre_commit_hooks_in_panel: Option<bool>,
+
+    /// Commit-explanation cache (S-AI-EXP) configuration: TTL for the
+    /// per-sha cache file under `<temp_dir>/commit_explanations/`.
+    pub commit_explanations: Option<CommitExplanationsSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ShowAtRevisionSettingsContent {
+    /// Snapshot worktrees created by `git: show repository at revision`
+    /// live under `<paths::temp_dir()>/worktrees/`. At editor startup
+    /// any worktree whose marker file is older than this many hours
+    /// gets `git worktree remove --force`'d. Default 24h covers the
+    /// "I crashed yesterday and never closed the snapshot window"
+    /// case without nuking long-lived investigations.
+    ///
+    /// Default: 24
+    pub cleanup_orphans_older_than_h: Option<u32>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct InteractiveRebaseSettingsContent {
+    /// When `true`, the `editor.git.interactive_rebase` MCP tool accepts
+    /// `RebaseAction::Exec` entries in the todo. When `false` (default),
+    /// exec actions submitted via MCP are rejected, even for callers
+    /// holding the `Destructive` capability — preventing a subagent from
+    /// running arbitrary shell commands through `git rebase exec`.
+    ///
+    /// Default: false
+    pub allow_exec_via_mcp: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct CommitExplanationsSettingsContent {
+    /// Days a cached AI commit explanation under
+    /// `<temp_dir>/commit_explanations/<repo-hash>/<sha>.txt` stays valid.
+    /// `0` disables caching: every Explain click re-runs the agent.
+    /// At startup, anything older than `2 * cache_ttl_days` is swept.
+    ///
+    /// Default: 7
+    pub cache_ttl_days: Option<u32>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct CommitViewSettingsContent {
+    /// Whether to fetch Gravatar avatars for commit authors. When false, the
+    /// commit detail surface shows a placeholder character tile and never
+    /// leaks the author email hash to a third party.
+    ///
+    /// Default: false
+    pub fetch_avatars: Option<bool>,
+
+    /// File-list lazy-load threshold. Commits with more than this many
+    /// affected files render the first 100, then a "Load more" button — and
+    /// expose a fuzzy filter over the visible slice.
+    ///
+    /// Default: 500
+    pub affected_files_lazy_threshold: Option<usize>,
+
+    /// Whether to parse `#1234` issue references and `[ABC-123]` Jira-style
+    /// references in the commit subject + body. URLs are always parsed.
+    ///
+    /// Default: true
+    pub parse_issue_references: Option<bool>,
+>>>>>>> theirs
 }
 
 #[derive(
@@ -1092,6 +1202,149 @@ pub enum LineIndicatorFormat {
     Short,
     #[default]
     Long,
+}
+
+/// Configuration for the Solutions feature.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionsSettingsContent {
+    /// Default root directory for new Solutions. Tilde (`~`) is expanded to
+    /// the user's home directory. Existing Solutions store absolute paths
+    /// and are unaffected by changes to this setting.
+    ///
+    /// Default: "~/spk-editor/solutions"
+    pub root: Option<String>,
+
+    /// Solution-wide git settings (S-SOL-LOG and follow-ups).
+    pub git: Option<SolutionGitSettingsContent>,
+
+    /// Branch-protection rules (S-SOL-PRT). Solution-wide defaults plus
+    /// per-member overrides keyed by `SolutionMember::catalog_id`.
+    pub branch_protection: Option<SolutionBranchProtectionSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionGitSettingsContent {
+    /// Aggregated-log knobs (S-SOL-LOG).
+    pub aggregated_log: Option<SolutionGitAggregatedLogSettingsContent>,
+
+    /// AI cherry-pick suggestion knobs (S-AI-CHP). Manual-trigger by
+    /// default; `background = true` runs analyze on a daily cadence /
+    /// at every Fetch All.
+    pub ai_cherry_pick_suggest: Option<SolutionGitAiCherryPickSuggestSettingsContent>,
+}
+
+/// Run Configurations feature configuration.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct RunConfigSettingsContent {
+    /// Show the Run Configurations toolbar strip under the title bar. Default: true.
+    pub toolbar: Option<bool>,
+}
+
+/// Per-Solution AI subprocess pool configuration. Used by `solution_agent`
+/// for ephemeral tasks (commit message generation, explain commit,
+/// AI-suggested merge resolution, …). Persistent interactive sessions are
+/// not affected by these caps.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionAgentSettingsContent {
+    /// Ephemeral-task pool sizing. Optional — when absent, defaults apply
+    /// (3 concurrent / 30s queue timeout / 60s idle TTL).
+    pub ephemeral: Option<SolutionAgentEphemeralSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionAgentEphemeralSettingsContent {
+    /// Maximum number of concurrent ephemeral subprocesses per Solution.
+    /// Additional calls queue up until a slot frees or the queue timeout
+    /// expires.
+    ///
+    /// Default: 3
+    pub max_concurrent: Option<u32>,
+
+    /// How long an ephemeral call waits for a free slot when the
+    /// concurrency cap is hit. After this it returns an error.
+    ///
+    /// Default: 30
+    pub queue_timeout_seconds: Option<u32>,
+
+    /// How long an idle ephemeral subprocess is kept alive before being
+    /// shut down. Higher values amortize spawn cost across bursts of
+    /// activity.
+    ///
+    /// Default: 60
+    pub idle_ttl_seconds: Option<u32>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionBranchProtectionSettingsContent {
+    /// Glob patterns matched against branch names (gitignore-style).
+    /// `release/*` matches `release/v1` but not `release/v2/hotfix`;
+    /// use `release/**` for recursive matches. When omitted, defaults
+    /// to `["main", "master", "release/*"]`.
+    pub default_protected: Option<Vec<String>>,
+
+    /// Per-member overrides keyed by `SolutionMember::catalog_id`. Each
+    /// entry can extend `default_protected` and tighten the policy
+    /// (forbid force-push / hard reset / drop-commit instead of
+    /// requiring confirmation).
+    pub members: Option<BTreeMap<String, SolutionBranchProtectionMemberContent>>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionBranchProtectionMemberContent {
+    /// Additional glob patterns to treat as protected for this member
+    /// (in addition to `default_protected`).
+    pub protected: Option<Vec<String>>,
+    /// Forbid force-push to protected branches outright (default:
+    /// require confirmation).
+    pub no_force_push: Option<bool>,
+    /// Forbid `reset --hard` against protected branches outright.
+    pub no_force_reset: Option<bool>,
+    /// Forbid drop-commit on protected branches outright.
+    pub no_drop_commit: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionGitAggregatedLogSettingsContent {
+    /// Pre-warm member buffers in the background on Solution open so the
+    /// first time the user toggles to Solution-wide log, the initial
+    /// 200-commit batch per member is already cached.
+    ///
+    /// Default: true
+    pub background_load: Option<bool>,
+
+    /// Hard cap on commits served from a single aggregated-log session.
+    /// Above this the UI shows "Showing first N commits, narrow filters
+    /// to see older history" and stops paginating.
+    ///
+    /// Default: 50000
+    pub max_total_commits: Option<u32>,
+}
+
+/// S-AI-CHP — cross-member cherry-pick suggestion engine. Internal AI
+/// call; cost-conscious by default (manual-trigger, hard token budget).
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionGitAiCherryPickSuggestSettingsContent {
+    /// Run the analyzer in the background on a daily cadence (and at
+    /// every Fetch All). Off by default — every run consumes AI tokens.
+    ///
+    /// Default: false
+    pub background: Option<bool>,
+
+    /// Hard cap on estimated tokens consumed per analyze run. The
+    /// analyzer stops early when one more pair would exceed this; the
+    /// dashboard surfaces a "budget exhausted" indicator.
+    ///
+    /// Default: 25000
+    pub token_budget: Option<u32>,
 }
 
 /// The settings for the image viewer.

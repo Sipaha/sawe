@@ -1,5 +1,5 @@
 use crate::commit::parse_git_diff_name_status;
-use crate::stash::GitStash;
+use crate::stash::{GitStash, StashStat};
 use crate::status::{DiffTreeType, GitStatus, StatusCode, TreeDiff};
 use crate::{Oid, RunHook, SHORT_SHA_LENGTH};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -270,6 +270,17 @@ impl Branch {
                 .map(|commit| commit.commit_timestamp),
         )
     }
+}
+
+/// One row from `git shortlog -sne --all` — a unique author over the
+/// repository's full reachable history. Powers the chip-User filter
+/// popover (S-FLT). `commit_count` is the leading count column from
+/// shortlog; the popover surfaces it as a tail badge IDEA-style.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct AuthorHistoryEntry {
+    pub name: SharedString,
+    pub email: SharedString,
+    pub commit_count: usize,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -741,12 +752,17 @@ pub enum LogSource {
     All,
     Branch(SharedString),
     Sha(Oid),
+<<<<<<< ours
     Path(RepoPath),
+=======
+    File(RepoPath),
+>>>>>>> theirs
 }
 
 impl LogSource {
     fn get_args(&self) -> Result<Vec<&str>> {
         match self {
+<<<<<<< ours
             LogSource::All => Ok(vec![
                 "--ignore-missing", // needed in case of unborn HEAD
                 "--branches",
@@ -759,6 +775,14 @@ impl LogSource {
                 str::from_utf8(oid.as_bytes()).context("Failed to build str from sha")?,
             ]),
             LogSource::Path(path) => Ok(vec!["--follow", "--", path.as_unix_str()]),
+=======
+            LogSource::All => Ok("--all"),
+            LogSource::Branch(branch) => Ok(branch.as_str()),
+            LogSource::Sha(oid) => {
+                str::from_utf8(oid.as_bytes()).context("Failed to build str from sha")
+            }
+            LogSource::File(_) => Ok("--follow"),
+>>>>>>> theirs
         }
     }
 }
@@ -836,6 +860,98 @@ pub trait GitRepository: Send + Sync {
         force: bool,
     ) -> BoxFuture<'_, Result<()>>;
 
+    /// Create a branch `name` pointing at `sha` without checking it out.
+    /// Errors if a branch with that name already exists. S-CTM "New Branch
+    /// from Here…" handler.
+    fn branch_at_sha(&self, name: String, sha: String) -> BoxFuture<'_, Result<()>> {
+        let _ = (name, sha);
+        future::ready(Err(anyhow!("branch_at_sha not supported on this backend"))).boxed()
+    }
+
+    /// Create a tag `name` pointing at `sha`. When `message` is `Some`, the
+    /// tag is annotated (`git tag -a -m`). S-CTM "New Tag at Here…" handler.
+    fn tag_at_sha(
+        &self,
+        name: String,
+        sha: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (name, sha, message);
+        future::ready(Err(anyhow!("tag_at_sha not supported on this backend"))).boxed()
+    }
+
+    /// Check out `sha` directly via `git checkout <sha>`. Leaves HEAD
+    /// detached; the UI surfaces the warning. S-CTM "Checkout Revision"
+    /// handler.
+    fn checkout_revision(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let _ = sha;
+        future::ready(Err(anyhow!(
+            "checkout_revision not supported on this backend"
+        )))
+        .boxed()
+    }
+
+    /// True when `git status --porcelain` reports any tracked or untracked
+    /// changes. Used by S-CTM as a pre-check before non-fast-forward
+    /// checkout.
+    fn is_dirty(&self) -> BoxFuture<'_, Result<bool>> {
+        future::ready(Ok(false)).boxed()
+    }
+
+    /// Compute the patch-id of `sha` (the canonical hash of its diff,
+    /// independent of context lines). Pipes `git show <sha>` into
+    /// `git patch-id` and returns the first whitespace-separated token of
+    /// the resulting line. S-CTM "Copy Patch ID" handler.
+    fn compute_patch_id(&self, sha: String) -> BoxFuture<'_, Result<String>> {
+        let _ = sha;
+        future::ready(Err(anyhow!(
+            "compute_patch_id not supported on this backend"
+        )))
+        .boxed()
+    }
+
+    /// S-BRP "Set Upstream…" — `git branch -u <upstream> <branch>`.
+    /// `upstream` is a remote tracking ref like `origin/main`.
+    fn set_upstream(&self, branch: String, upstream: String) -> BoxFuture<'_, Result<()>> {
+        let _ = (branch, upstream);
+        future::ready(Err(anyhow!("set_upstream not supported on this backend"))).boxed()
+    }
+
+    /// S-BRP "Delete Tag" — `git tag -d <name>`.
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        let _ = name;
+        future::ready(Err(anyhow!("delete_tag not supported on this backend"))).boxed()
+    }
+
+    /// S-BRP "Push Tag" — `git push <remote> <tag>`.
+    fn push_tag(&self, remote: String, tag: String) -> BoxFuture<'_, Result<()>> {
+        let _ = (remote, tag);
+        future::ready(Err(anyhow!("push_tag not supported on this backend"))).boxed()
+    }
+
+    /// "Delete Remote Tag" — `git push <remote> --delete refs/tags/<tag>`.
+    fn delete_remote_tag(&self, remote: String, tag: String) -> BoxFuture<'_, Result<()>> {
+        let _ = (remote, tag);
+        future::ready(Err(anyhow!(
+            "delete_remote_tag not supported on this backend"
+        )))
+        .boxed()
+    }
+
+    /// S-BRP — list tag names via `git tag`. Sorted by tagger date, newest
+    /// first.
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        future::ready(Ok(Vec::new())).boxed()
+    }
+
+    /// Cheap unsorted tag-name list (`git for-each-ref refs/tags`) — no
+    /// annotated-tag peeling, no date sort. Used by the status scan to
+    /// notice tag create/delete from outside the editor (CLI / agents /
+    /// the `editor.git.tag_*` MCP tools) so graph views can refresh.
+    fn tag_names(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        future::ready(Ok(Vec::new())).boxed()
+    }
+
     fn worktrees(&self) -> BoxFuture<'_, Result<Vec<Worktree>>>;
 
     fn create_worktree(
@@ -872,6 +988,41 @@ pub trait GitRepository: Send + Sync {
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>>;
 
     fn load_commit(&self, commit: String, cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    /// Same as [`load_commit`] but diffs against an arbitrary parent index
+    /// (1-based to mirror git's `<sha>^N` syntax). Used by the commit-view
+    /// merge-parent toggle. The default impl delegates to [`load_commit`]
+    /// when `parent_index == 1`, which preserves the first-parent default.
+    fn load_commit_against_parent(
+        &self,
+        commit: String,
+        parent_index: usize,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        if parent_index <= 1 {
+            self.load_commit(commit, cx)
+        } else {
+            future::ready(Err(anyhow!(
+                "load_commit_against_parent not supported on this backend"
+            )))
+            .boxed()
+        }
+    }
+
+    /// Local branches (and remote-tracking branches if there's no
+    /// `--list` filter) that contain the given commit. Empty when the
+    /// commit is unreachable.
+    fn branches_containing(&self, sha: String) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let _ = sha;
+        future::ready(Ok(Vec::new())).boxed()
+    }
+
+    /// Tags that contain the given commit. Empty when the commit is
+    /// unreachable from any tag.
+    fn tags_containing(&self, sha: String) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let _ = sha;
+        future::ready(Ok(Vec::new())).boxed()
+    }
     fn blame(
         &self,
         path: RepoPath,
@@ -940,6 +1091,58 @@ pub trait GitRepository: Send + Sync {
         index: Option<usize>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
+
+    /// `git stash push -m <message> [--include-untracked] [--keep-index]`.
+    /// S-STH "Stash Current Changes…" form.
+    fn stash_push(
+        &self,
+        message: Option<String>,
+        include_untracked: bool,
+        keep_index: bool,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (message, include_untracked, keep_index, env);
+        future::ready(Err(anyhow!("stash_push not supported on this backend"))).boxed()
+    }
+
+    /// `git stash branch <name> <stash_ref>` — create a branch from the
+    /// stash and apply it. S-STH "Branch from Stash…" entry.
+    fn stash_branch(
+        &self,
+        name: String,
+        stash_ref: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (name, stash_ref, env);
+        future::ready(Err(anyhow!("stash_branch not supported on this backend"))).boxed()
+    }
+
+    /// `git stash show -p <stash_ref>` — full unified diff for a stash.
+    /// Used for the S-STH detail pane; default falls back to an error so
+    /// remote-only backends without stash patch access fail loudly.
+    fn stash_show_patch(
+        &self,
+        stash_ref: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<String>> {
+        let _ = (stash_ref, env);
+        future::ready(Err(anyhow!(
+            "stash_show_patch not supported on this backend"
+        )))
+        .boxed()
+    }
+
+    /// `git stash show --stat --include-untracked <stash_ref>` parsed for
+    /// (file count, has_untracked). Cheap badge data; the full diff lives
+    /// behind [`Self::stash_show_patch`].
+    fn stash_stat(
+        &self,
+        stash_ref: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<StashStat>> {
+        let _ = (stash_ref, env);
+        future::ready(Err(anyhow!("stash_stat not supported on this backend"))).boxed()
+    }
 
     fn push(
         &self,
@@ -1038,12 +1241,30 @@ pub trait GitRepository: Send + Sync {
         include_remote_name: bool,
     ) -> BoxFuture<'_, Result<Option<SharedString>>>;
 
+    /// Runs `git shortlog -sne --all` and returns one entry per unique
+    /// `(name, email)` author over the full reachable history. Powers the
+    /// chip-User filter popover (S-FLT).
+    fn author_history(&self) -> BoxFuture<'_, Result<Vec<AuthorHistoryEntry>>>;
+
     /// Runs `git rev-list --parents` to get the commit graph structure.
     /// Returns commit SHAs and their parent SHAs for building the graph visualization.
+    ///
+    /// `extra_args` is appended to the base `git log <log-source-arg>` invocation
+    /// before any `--` path separator. Used by the chip-filter toolbar (S-FLT) to
+    /// thread `--author`, `--since`, `--grep`, and similar arguments through.
+    /// Pass an empty `Vec` for the pre-S-FLT default behavior.
+    ///
+    /// `extra_paths` is appended *after* a `--` separator. Used by the chip-Path
+    /// filter (S-FLT) so `git log` restricts traversal to commits touching one
+    /// of the listed paths. Pass an empty `Vec` for the pre-S-FLT default
+    /// behavior. When `LogSource::File(_)` is used (file-history mode) the
+    /// implementation appends its file path on the same `--` block.
     fn initial_graph_data(
         &self,
         log_source: LogSource,
         log_order: LogOrder,
+        extra_args: Vec<String>,
+        extra_paths: Vec<String>,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>>;
 
@@ -1591,13 +1812,35 @@ impl GitRepository for RealGitRepository {
 
         self.executor
             .spawn(async move {
+<<<<<<< ours
                 let working_directory = working_directory?;
                 let git_binary = git_binary?;
                 let output = git_binary
+=======
+                let (working_directory, git_binary) = working_directory_and_git_binary?;
+
+                let output = match git_binary
+>>>>>>> theirs
                     .build_command(&["config", "--get", "commit.template"])
                     .output()
                     .await
-                    .context("failed to run git config --get commit.template")?;
+                {
+                    Ok(output) => output,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // ENOENT here means the working directory disappeared
+                        // mid-session (e.g. a git worktree that was just
+                        // removed) or the git binary path is gone. Neither is
+                        // actionable for "is there a commit template?" — treat
+                        // as "no template", log at debug level so it doesn't
+                        // flood the log alongside the fs_watcher noise that
+                        // surfaces the same root cause.
+                        log::debug!("git config --get commit.template skipped: {err}");
+                        return Ok(None);
+                    }
+                    Err(err) => {
+                        return Err(err).context("failed to run git config --get commit.template");
+                    }
+                };
 
                 let raw_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !output.status.success() || raw_path.is_empty() {
@@ -2130,8 +2373,19 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
-    fn blame(
+    fn branch_at_sha(&self, name: String, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                git_binary?.run(&["branch", &name, &sha]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn tag_at_sha(
         &self,
+<<<<<<< ours
         path: RepoPath,
         content: Rope,
         line_ending: LineEnding,
@@ -2142,6 +2396,199 @@ impl GitRepository for RealGitRepository {
             .spawn(async move {
                 let git = git?;
                 crate::blame::Blame::for_path(&git, &path, &content, line_ending).await
+=======
+        name: String,
+        sha: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                if let Some(message) = message {
+                    git.run(&["tag", "-a", "-m", &message, &name, &sha]).await?;
+                } else {
+                    git.run(&["tag", &name, &sha]).await?;
+                }
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn checkout_revision(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                git_binary?.run(&["checkout", &sha]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn is_dirty(&self) -> BoxFuture<'_, Result<bool>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git_binary?.run(&["status", "--porcelain"]).await?;
+                Ok(!output.trim().is_empty())
+            })
+            .boxed()
+    }
+
+    fn compute_patch_id(&self, sha: String) -> BoxFuture<'_, Result<String>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                // Step 1: capture `git show <sha>`. We don't pipe directly
+                // into `git patch-id`'s stdin because `util::command::Child`
+                // smol-process stdout is not `Into<Stdio>` on all targets.
+                let show_output = git.build_command(&["show", &sha]).output().await?;
+                anyhow::ensure!(
+                    show_output.status.success(),
+                    "Failed to run `git show {}`:\n{}",
+                    sha,
+                    String::from_utf8_lossy(&show_output.stderr)
+                );
+                // Step 2: feed it to `git patch-id --stable` via stdin.
+                let mut patch_id_command = git.build_command(&["patch-id", "--stable"]);
+                patch_id_command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = patch_id_command
+                    .spawn()
+                    .context("spawning `git patch-id`")?;
+                {
+                    let mut stdin = child
+                        .stdin
+                        .take()
+                        .context("`git patch-id` stdin pipe unavailable")?;
+                    stdin
+                        .write_all(&show_output.stdout)
+                        .await
+                        .context("writing diff to `git patch-id` stdin")?;
+                    stdin.flush().await.ok();
+                }
+                let output = child.output().await.context("waiting on `git patch-id`")?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to run `git patch-id`:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8(output.stdout)?;
+                let token = stdout
+                    .split_whitespace()
+                    .next()
+                    .context("`git patch-id` produced no output (empty diff?)")?
+                    .to_string();
+                Ok(token)
+            })
+            .boxed()
+    }
+
+    fn set_upstream(&self, branch: String, upstream: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                git_binary?
+                    .run(&["branch", "-u", &upstream, &branch])
+                    .await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                git_binary?.run(&["tag", "-d", &name]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn push_tag(&self, remote: String, tag: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                git_binary?.run(&["push", &remote, &tag]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn delete_remote_tag(&self, remote: String, tag: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                git_binary?
+                    .run(&["push", &remote, "--delete", &format!("refs/tags/{tag}")])
+                    .await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let output = git
+                    .build_command(&["tag", "--sort=-taggerdate", "--format=%(refname:short)"])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to run `git tag`:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| SharedString::from(l.to_string()))
+                    .collect())
+            })
+            .boxed()
+    }
+
+    fn tag_names(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let output = git
+                    .build_command(&["for-each-ref", "--format=%(refname:short)", "refs/tags"])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to run `git for-each-ref refs/tags`:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| SharedString::from(l.to_string()))
+                    .collect())
+            })
+            .boxed()
+    }
+
+    fn blame(
+        &self,
+        path: RepoPath,
+        content: Rope,
+        line_ending: LineEnding,
+    ) -> BoxFuture<'_, Result<crate::blame::Blame>> {
+        let git = self.git_binary();
+
+        self.executor
+            .spawn(async move {
+                crate::blame::Blame::for_path(&git?, &path, &content, line_ending).await
+>>>>>>> theirs
             })
             .boxed()
     }
@@ -2360,6 +2807,138 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn stash_push(
+        &self,
+        message: Option<String>,
+        include_untracked: bool,
+        keep_index: bool,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+<<<<<<< ours
+        let git = self.git_binary_in_worktree();
+=======
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let mut args: Vec<String> = vec!["stash".into(), "push".into()];
+                if include_untracked {
+                    args.push("--include-untracked".into());
+                }
+                if keep_index {
+                    args.push("--keep-index".into());
+                }
+                if let Some(message) = message
+                    && !message.is_empty()
+                {
+                    args.push("-m".into());
+                    args.push(message);
+                }
+                let output = git.build_command(&args).envs(env.iter()).output().await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to stash push:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn stash_branch(
+        &self,
+        name: String,
+        stash_ref: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let output = git
+                    .build_command(&["stash", "branch", &name, &stash_ref])
+                    .envs(env.iter())
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to stash branch:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn stash_show_patch(
+        &self,
+        stash_ref: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<String>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let output = git
+                    .build_command(&["stash", "show", "-p", "--no-color", &stash_ref])
+                    .envs(env.iter())
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to stash show:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            })
+            .boxed()
+    }
+
+    fn stash_stat(
+        &self,
+        stash_ref: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<StashStat>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let output = git
+                    .build_command(&[
+                        "stash",
+                        "show",
+                        "--stat",
+                        "--include-untracked",
+                        "--no-color",
+                        &stash_ref,
+                    ])
+                    .envs(env.iter())
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if stderr.contains("unknown option") || stderr.contains("--include-untracked") {
+                        let fallback = git
+                            .build_command(&["stash", "show", "--stat", "--no-color", &stash_ref])
+                            .envs(env.iter())
+                            .output()
+                            .await?;
+                        anyhow::ensure!(
+                            fallback.status.success(),
+                            "Failed to stash show --stat:\n{}",
+                            String::from_utf8_lossy(&fallback.stderr)
+                        );
+                        let raw = String::from_utf8_lossy(&fallback.stdout);
+                        return Ok(StashStat::from_stat_output(&raw));
+                    }
+                    anyhow::bail!("Failed to stash show --stat:\n{}", stderr);
+                }
+                let raw = String::from_utf8_lossy(&output.stdout);
+                Ok(StashStat::from_stat_output(&raw))
+            })
+            .boxed()
+    }
+
     fn commit(
         &self,
         message: SharedString,
@@ -2368,12 +2947,17 @@ impl GitRepository for RealGitRepository {
         ask_pass: AskPassDelegate,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
-        let git = self.git_binary_in_worktree();
+        let git_binary = self.git_binary();
+>>>>>>> theirs
         let executor = self.executor.clone();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
+<<<<<<< ours
             let git = git?;
+=======
+            let git = git_binary?;
+>>>>>>> theirs
             let mut cmd = git.build_command(&["commit", "--quiet", "-m"]);
             cmd.envs(env.iter())
                 .arg(&message.to_string())
@@ -2694,6 +3278,195 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn branches_containing(&self, sha: String) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let output = git
+                    .build_command(&[
+                        "branch",
+                        "--list",
+                        "--contains",
+                        &sha,
+                        "--format=%(refname:short)",
+                    ])
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    bail!(
+                        "git branch --contains failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim_end()
+                    );
+                }
+                Ok(parse_contains_output(&String::from_utf8_lossy(
+                    &output.stdout,
+                )))
+            })
+            .boxed()
+    }
+
+    fn tags_containing(&self, sha: String) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let output = git
+                    .build_command(&["tag", "--contains", &sha])
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    bail!(
+                        "git tag --contains failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim_end()
+                    );
+                }
+                Ok(parse_contains_output(&String::from_utf8_lossy(
+                    &output.stdout,
+                )))
+            })
+            .boxed()
+    }
+
+    fn load_commit_against_parent(
+        &self,
+        commit: String,
+        parent_index: usize,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        if parent_index <= 1 {
+            return self.load_commit(commit, cx);
+        }
+        if self.repository.lock().workdir().is_none() {
+            return future::ready(Err(anyhow!("no working directory"))).boxed();
+        }
+        let git_binary = self.git_binary();
+        cx.background_spawn(async move {
+            let git = git_binary?;
+            let parent_ref = format!("{}^{}", commit, parent_index);
+            // Re-use the same `name-status -z` parsing the first-parent path
+            // already exercises, but force the comparison against `<sha>^N`.
+            let show_output = git
+                .build_command(&["diff", "--format=", "-z", "--no-renames", "--name-status"])
+                .arg(&parent_ref)
+                .arg(&commit)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .context("starting git diff process")?;
+            if !show_output.status.success() {
+                bail!(
+                    "git diff <sha>^{}..<sha> failed: {}",
+                    parent_index,
+                    String::from_utf8_lossy(&show_output.stderr).trim_end()
+                );
+            }
+            let show_stdout = String::from_utf8_lossy(&show_output.stdout);
+            let changes = parse_git_diff_name_status(&show_stdout);
+
+            let mut cat_file_process = git
+                .build_command(&["cat-file", "--batch=%(objectsize)"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("starting git cat-file process")?;
+
+            let mut files = Vec::<CommitFile>::new();
+            let mut stdin = BufWriter::with_capacity(512, cat_file_process.stdin.take().unwrap());
+            let mut stdout = BufReader::new(cat_file_process.stdout.take().unwrap());
+            let mut info_line = String::new();
+            let mut newline = [b'\0'];
+            for (path, status_code) in changes {
+                let Some(rel_path) = RelPath::unix(path).log_err() else {
+                    continue;
+                };
+
+                match status_code {
+                    StatusCode::Modified => {
+                        stdin.write_all(commit.as_bytes()).await?;
+                        stdin.write_all(b":").await?;
+                        stdin.write_all(path.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.write_all(parent_ref.as_bytes()).await?;
+                        stdin.write_all(b":").await?;
+                        stdin.write_all(path.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                    }
+                    StatusCode::Added => {
+                        stdin.write_all(commit.as_bytes()).await?;
+                        stdin.write_all(b":").await?;
+                        stdin.write_all(path.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                    }
+                    StatusCode::Deleted => {
+                        stdin.write_all(parent_ref.as_bytes()).await?;
+                        stdin.write_all(b":").await?;
+                        stdin.write_all(path.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                    }
+                    _ => continue,
+                }
+                stdin.flush().await?;
+
+                info_line.clear();
+                stdout.read_line(&mut info_line).await?;
+
+                let len = info_line.trim_end().parse().with_context(|| {
+                    format!("invalid object size output from cat-file {info_line}")
+                })?;
+                let mut text_bytes = vec![0; len];
+                stdout.read_exact(&mut text_bytes).await?;
+                stdout.read_exact(&mut newline).await?;
+
+                let mut old_text = None;
+                let mut new_text = None;
+                let mut is_binary = is_binary_content(&text_bytes);
+                let text = if is_binary {
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(&text_bytes).to_string()
+                };
+
+                match status_code {
+                    StatusCode::Modified => {
+                        info_line.clear();
+                        stdout.read_line(&mut info_line).await?;
+                        let len = info_line.trim_end().parse().with_context(|| {
+                            format!("invalid object size output from cat-file {}", info_line)
+                        })?;
+                        let mut parent_bytes = vec![0; len];
+                        stdout.read_exact(&mut parent_bytes).await?;
+                        stdout.read_exact(&mut newline).await?;
+                        is_binary = is_binary || is_binary_content(&parent_bytes);
+                        if is_binary {
+                            old_text = Some(String::new());
+                            new_text = Some(String::new());
+                        } else {
+                            old_text = Some(String::from_utf8_lossy(&parent_bytes).to_string());
+                            new_text = Some(text);
+                        }
+                    }
+                    StatusCode::Added => new_text = Some(text),
+                    StatusCode::Deleted => old_text = Some(text),
+                    _ => continue,
+                }
+
+                files.push(CommitFile {
+                    path: RepoPath(Arc::from(rel_path)),
+                    old_text,
+                    new_text,
+                    is_binary,
+                });
+            }
+
+            Ok(CommitDiff { files })
+        })
+        .boxed()
+    }
+
     fn checkpoint(&self) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>> {
         let git = self.git_binary_in_worktree();
         self.executor
@@ -2944,6 +3717,17 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn author_history(&self) -> BoxFuture<'_, Result<Vec<AuthorHistoryEntry>>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary?;
+                let stdout = git.run_raw(&["shortlog", "-sne", "--all"]).await?;
+                Ok(parse_shortlog_output(&stdout))
+            })
+            .boxed()
+    }
+
     fn run_hook(
         &self,
         hook: RunHook,
@@ -2999,13 +3783,43 @@ impl GitRepository for RealGitRepository {
         &self,
         log_source: LogSource,
         log_order: LogOrder,
+        extra_args: Vec<String>,
+        extra_paths: Vec<String>,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary();
 
         async move {
+<<<<<<< ours
             let mut git_log_command = vec!["log", GRAPH_COMMIT_FORMAT, log_order.as_arg()];
             git_log_command.extend(log_source.get_args()?);
+=======
+            let git = git_binary?;
+
+            let mut git_log_command: Vec<String> = vec![
+                "log".to_string(),
+                GRAPH_COMMIT_FORMAT.to_string(),
+                log_order.as_arg().to_string(),
+                log_source.get_arg()?.to_string(),
+            ];
+            git_log_command.extend(extra_args);
+
+            // `--` separator is required before any positional path argument.
+            // File-history mode (LogSource::File) and chip-Path filter
+            // (extra_paths) both feed paths on the same `--` block; if both
+            // are present, the file path comes first to preserve historic
+            // ordering.
+            let needs_path_separator =
+                matches!(&log_source, LogSource::File(_)) || !extra_paths.is_empty();
+            if needs_path_separator {
+                git_log_command.push("--".to_string());
+            }
+            if let LogSource::File(file_path) = &log_source {
+                git_log_command.push(file_path.as_unix_str().to_string());
+            }
+            git_log_command.extend(extra_paths);
+
+>>>>>>> theirs
             let mut command = git.build_command(&git_log_command);
             command.stdout(Stdio::piped());
             command.stderr(Stdio::piped());
@@ -3086,7 +3900,14 @@ impl GitRepository for RealGitRepository {
             args.push("--grep");
             args.push(search_args.query.as_str());
 
+<<<<<<< ours
             args.extend(log_source.get_args()?);
+=======
+            if let LogSource::File(file_path) = &log_source {
+                args.extend(["--", file_path.as_unix_str()]);
+            }
+
+>>>>>>> theirs
             let mut command = git.build_command(&args);
             command.stdout(Stdio::piped());
             command.stderr(Stdio::null());
@@ -3189,6 +4010,53 @@ impl GitRepository for RealGitRepository {
     fn is_trusted(&self) -> bool {
         self.is_trusted.load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+/// Parse `git shortlog -sne --all` stdout into one `AuthorHistoryEntry`
+/// per line. Tolerant: blank lines, BOM-prefixed input, and lines that
+/// don't match `<count>\t<name> <<email>>` are logged and skipped — this
+/// runs against arbitrary user-controlled data (commit author names) so
+/// we never panic on malformed rows.
+fn parse_shortlog_output(stdout: &str) -> Vec<AuthorHistoryEntry> {
+    let trimmed = stdout.strip_prefix('\u{feff}').unwrap_or(stdout);
+    let mut entries = Vec::new();
+    for raw in trimmed.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((count_str, rest)) = line.split_once('\t') else {
+            log::warn!("git shortlog: unexpected line (no tab): {raw:?}");
+            continue;
+        };
+        let Ok(commit_count) = count_str.trim().parse::<usize>() else {
+            log::warn!("git shortlog: unparsable count column: {raw:?}");
+            continue;
+        };
+        let Some(email_open) = rest.rfind('<') else {
+            log::warn!("git shortlog: missing '<email>' bracket: {raw:?}");
+            continue;
+        };
+        let Some(email_close) = rest.rfind('>') else {
+            log::warn!("git shortlog: missing closing '>' bracket: {raw:?}");
+            continue;
+        };
+        if email_close <= email_open {
+            log::warn!("git shortlog: malformed email brackets: {raw:?}");
+            continue;
+        }
+        let name = rest[..email_open].trim().to_string();
+        let email = rest[email_open + 1..email_close].trim().to_string();
+        if name.is_empty() && email.is_empty() {
+            continue;
+        }
+        entries.push(AuthorHistoryEntry {
+            name: SharedString::from(name),
+            email: SharedString::from(email),
+            commit_count,
+        });
+    }
+    entries
 }
 
 async fn run_commit_data_reader(
@@ -3798,11 +4666,33 @@ fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
     }))
 }
 
+/// Parse the stdout of `git branch --list --contains <sha> --format=%(refname:short)`
+/// or `git tag --contains <sha>`. Each line is one ref name; an empty line is
+/// skipped, and `git branch` may emit a leading `* ` marker on the current
+/// branch when invoked without `--format` (we pass `--format=%(refname:short)`
+/// to avoid that, but be defensive in case a backend overrides the format).
+pub(crate) fn parse_contains_output(stdout: &str) -> Vec<SharedString> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let trimmed = trimmed.strip_prefix("* ").unwrap_or(trimmed);
+            let trimmed = trimmed.strip_prefix("+ ").unwrap_or(trimmed);
+            let trimmed = trimmed.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(SharedString::from(trimmed.to_string()))
+            }
+        })
+        .collect()
+}
+
 fn checkpoint_author_envs() -> HashMap<String, String> {
     HashMap::from_iter([
-        ("GIT_AUTHOR_NAME".to_string(), "Zed".to_string()),
+        ("GIT_AUTHOR_NAME".to_string(), "SPK Editor".to_string()),
         ("GIT_AUTHOR_EMAIL".to_string(), "hi@zed.dev".to_string()),
-        ("GIT_COMMITTER_NAME".to_string(), "Zed".to_string()),
+        ("GIT_COMMITTER_NAME".to_string(), "SPK Editor".to_string()),
         ("GIT_COMMITTER_EMAIL".to_string(), "hi@zed.dev".to_string()),
     ])
 }
@@ -4274,6 +5164,79 @@ mod tests {
             !output.status.success(),
             "hooksPath should NOT be overridden for trusted repos"
         );
+    }
+
+    #[test]
+    fn test_parse_shortlog_output_basic() {
+        let raw = "    42\tAlice <alice@example.com>\n     1\tBob <bob@example.com>\n";
+        let entries = parse_shortlog_output(raw);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name.as_ref(), "Alice");
+        assert_eq!(entries[0].email.as_ref(), "alice@example.com");
+        assert_eq!(entries[0].commit_count, 42);
+        assert_eq!(entries[1].name.as_ref(), "Bob");
+        assert_eq!(entries[1].commit_count, 1);
+    }
+
+    #[test]
+    fn test_parse_shortlog_output_tolerates_garbage() {
+        let raw = "\u{feff}     5\tCarol <c@x.io>\n\n\t\nbad line no tab\n   \tno count\n   3\tno-brackets\n   7\tDan <d@x.io>\n";
+        let entries = parse_shortlog_output(raw);
+        // Carol + Dan only — every other line is malformed and silently skipped.
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name.as_ref(), "Carol");
+        assert_eq!(entries[0].email.as_ref(), "c@x.io");
+        assert_eq!(entries[0].commit_count, 5);
+        assert_eq!(entries[1].name.as_ref(), "Dan");
+        assert_eq!(entries[1].commit_count, 7);
+    }
+
+    #[test]
+    fn test_parse_shortlog_output_handles_email_with_angle_brackets_in_name() {
+        // Pathological but legal: name contains '<', email is still the
+        // last <...> pair on the line. `rfind` makes us pick the last
+        // pair, which is the canonical email.
+        let raw = "  2\tAlice <weird> <alice@example.com>\n";
+        let entries = parse_shortlog_output(raw);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].email.as_ref(), "alice@example.com");
+    }
+
+    #[test]
+    fn test_parse_contains_output_basic() {
+        let raw = "main\nfeat/foo\n  feat/bar  \n";
+        let names = parse_contains_output(raw);
+        assert_eq!(
+            names,
+            vec![
+                SharedString::from("main"),
+                SharedString::from("feat/foo"),
+                SharedString::from("feat/bar"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_contains_output_strips_current_branch_marker() {
+        // git branch --list (without --format) emits "* current" for HEAD's
+        // branch and "+ name" for branches checked out in a worktree. The
+        // parser drops both prefixes defensively.
+        let raw = "* main\n+ feat/wt\n  feat/regular\n";
+        let names = parse_contains_output(raw);
+        assert_eq!(
+            names,
+            vec![
+                SharedString::from("main"),
+                SharedString::from("feat/wt"),
+                SharedString::from("feat/regular"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_contains_output_empty() {
+        assert!(parse_contains_output("").is_empty());
+        assert!(parse_contains_output("\n\n").is_empty());
     }
 
     #[gpui::test]
@@ -5175,6 +6138,100 @@ mod tests {
             original_repo_path_from_common_dir(Path::new("/.git")),
             Some(PathBuf::from("/"))
         );
+    }
+
+    /// S-CTM low-level helper test — branch_at_sha errors on collision and
+    /// successfully creates a branch on a fresh name. We initialise a tiny
+    /// repo with one commit, branch off it, then try to create the same
+    /// branch again and assert that the second call errors.
+    #[gpui::test]
+    async fn test_branch_at_sha_collision(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo_dir.path()).unwrap();
+        let file_path = repo_dir.path().join("file.txt");
+        smol::fs::write(&file_path, "x").await.unwrap();
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        repo.stage_paths(vec![repo_path("file.txt")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        repo.commit(
+            "init".into(),
+            None,
+            CommitOptions::default(),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(checkpoint_author_envs()),
+        )
+        .await
+        .unwrap();
+
+        let head_sha = repo.head_sha().await.unwrap();
+
+        repo.branch_at_sha("feature".into(), head_sha.clone())
+            .await
+            .expect("first branch_at_sha should succeed");
+
+        let second = repo.branch_at_sha("feature".into(), head_sha.clone()).await;
+        assert!(
+            second.is_err(),
+            "creating an existing branch must error, got: {second:?}"
+        );
+    }
+
+    /// S-CTM low-level helper test — `compute_patch_id` returns a stable
+    /// 40-char SHA-style token over the diff of a single commit. We don't
+    /// pin the exact value (git's patch-id is sensitive to whitespace and
+    /// can shift between versions), only the shape.
+    #[gpui::test]
+    async fn test_compute_patch_id_returns_token(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo_dir.path()).unwrap();
+        let file_path = repo_dir.path().join("hello.txt");
+        smol::fs::write(&file_path, "hello\nworld\n").await.unwrap();
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        repo.stage_paths(vec![repo_path("hello.txt")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        repo.commit(
+            "first".into(),
+            None,
+            CommitOptions::default(),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(checkpoint_author_envs()),
+        )
+        .await
+        .unwrap();
+
+        let head_sha = repo.head_sha().await.unwrap();
+        let patch_id = repo.compute_patch_id(head_sha).await.unwrap();
+        // git patch-id outputs a hex SHA followed by the original SHA;
+        // we keep only the first whitespace-separated token, which should
+        // be 40 lowercase hex chars (or 64 if we ever bump to sha256).
+        assert!(
+            patch_id.chars().all(|c| c.is_ascii_hexdigit()),
+            "patch-id should be hex, got {patch_id:?}"
+        );
+        assert!(!patch_id.is_empty(), "patch-id should be non-empty");
     }
 
     impl RealGitRepository {

@@ -7,10 +7,19 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 async-process.workspace = true
+<<<<<<< ours
+=======
+cfg-if.workspace = true
+>>>>>>> theirs
 crash-handler.workspace = true
 log.workspace = true
 minidumper.workspace = true
 parking_lot.workspace = true
+<<<<<<< ours
+=======
+paths.workspace = true
+release_channel.workspace = true
+>>>>>>> theirs
 serde.workspace = true
 serde_json.workspace = true
 system_specs.workspace = true

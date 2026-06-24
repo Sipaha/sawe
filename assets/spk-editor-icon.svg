@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="SPK Editor">
+  <!--
+    SPK Editor — application icon.
+
+    Concept: four elongated rhombi, all sides equal, sharing a
+    single inner vertex at the centre and pointing NE / SE / SW /
+    NW. Reads as a clean geometric "X" with a hollow midpoint, no
+    curves, two-tone violet / cyan alternating around the cardinal
+    axes.
+
+    Geometry (per rhombus, before rotation):
+        outer tip:     (0, -220)
+        right shoulder:(70, -110)
+        inner tip:     (0,    0)
+        left shoulder: (-70, -110)
+      Side length = sqrt(70² + 110²) ≈ 130 (true rhombus, not kite)
+      Long diagonal = 220, short diagonal = 140 → 1.57 ratio
+
+    Pure flat shapes only — no SVG gradients / filters / radial
+    fills — so every rasterizer in the toolchain (ImageMagick,
+    librsvg, inkscape, browsers, GPUI's own SVG paint) renders the
+    same silhouette.
+
+    To regenerate the editor's app PNGs:
+      convert -background none -resize 512x512  spk-editor-icon.svg crates/zed/resources/app-icon.png
+      convert -background none -resize 1024x1024 spk-editor-icon.svg crates/zed/resources/app-icon@2x.png
+  -->
+
+  <rect width="512" height="512" rx="112" fill="#11102a"/>
+  <g transform="translate(256 256)">
+    <g transform="rotate(-45)">
+      <polygon points="0,-220  70,-110  0,0  -70,-110" fill="#7c3aed"/>
+    </g>
+    <g transform="rotate(45)">
+      <polygon points="0,-220  70,-110  0,0  -70,-110" fill="#22d3ee"/>
+    </g>
+    <g transform="rotate(135)">
+      <polygon points="0,-220  70,-110  0,0  -70,-110" fill="#7c3aed"/>
+    </g>
+    <g transform="rotate(225)">
+      <polygon points="0,-220  70,-110  0,0  -70,-110" fill="#22d3ee"/>
+    </g>
+  </g>
+</svg>

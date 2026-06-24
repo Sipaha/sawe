@@ -2,17 +2,10 @@
 # Rebuild with `cargo xtask workflows`.
 name: extension_auto_bump
 on:
-  push:
-    branches:
-    - main
-    paths:
-    - extensions/**
-    - '!extensions/test-extension/**'
-    - '!extensions/workflows/**'
-    - '!extensions/*.md'
+  workflow_dispatch:
 jobs:
   detect_changed_extensions:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::checkout_repo
@@ -54,7 +47,7 @@ jobs:
   bump_extension_versions:
     needs:
     - detect_changed_extensions
-    if: needs.detect_changed_extensions.outputs.changed_extensions != '[]'
+    if: false # spk-editor: not applicable
     permissions:
       actions: write
       contents: write

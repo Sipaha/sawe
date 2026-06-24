@@ -5,12 +5,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
 on:
-  push:
-    tags:
-    - v*
+  workflow_dispatch:
 jobs:
   run_tests_mac:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-mac-large
     steps:
     - name: steps::checkout_repo
@@ -51,7 +49,7 @@ jobs:
         rm -rf ./../.cargo
     timeout-minutes: 60
   run_tests_linux:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-16x32-ubuntu-2204
     env:
       CC: clang
@@ -107,7 +105,7 @@ jobs:
         - 5432:5432
         options: --health-cmd pg_isready --health-interval 500ms --health-timeout 5s --health-retries 10
   run_tests_windows:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: self-32vcpu-windows-2022
     steps:
     - name: steps::checkout_repo
@@ -147,7 +145,7 @@ jobs:
       shell: pwsh
     timeout-minutes: 60
   clippy_mac:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-mac-large
     steps:
     - name: steps::checkout_repo
@@ -176,7 +174,7 @@ jobs:
       run: sccache --show-stats || true
     timeout-minutes: 60
   clippy_linux:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-16x32-ubuntu-2204
     env:
       CC: clang
@@ -212,7 +210,7 @@ jobs:
       run: sccache --show-stats || true
     timeout-minutes: 60
   clippy_windows:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: self-32vcpu-windows-2022
     steps:
     - name: steps::checkout_repo
@@ -240,7 +238,11 @@ jobs:
       shell: pwsh
     timeout-minutes: 60
   check_scripts:
+<<<<<<< ours
     if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+=======
+    if: false # spk-editor: not applicable
+>>>>>>> theirs
     runs-on: namespace-profile-8x16-ubuntu-2204
     steps:
     - name: steps::checkout_repo
@@ -271,7 +273,7 @@ jobs:
         fi
     timeout-minutes: 60
   create_draft_release:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - id: generate-token
@@ -299,7 +301,7 @@ jobs:
         GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
     timeout-minutes: 60
   compliance_check:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::checkout_repo
@@ -355,6 +357,7 @@ jobs:
     - run_tests_linux
     - clippy_linux
     - check_scripts
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-8x32-ubuntu-2004-arm-m4
     env:
       CARGO_INCREMENTAL: 0
@@ -395,6 +398,7 @@ jobs:
     - run_tests_linux
     - clippy_linux
     - check_scripts
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-32x64-ubuntu-2004
     env:
       CARGO_INCREMENTAL: 0
@@ -435,6 +439,7 @@ jobs:
     - run_tests_mac
     - clippy_mac
     - check_scripts
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-mac-large
     env:
       CARGO_INCREMENTAL: 0
@@ -480,6 +485,7 @@ jobs:
     - run_tests_mac
     - clippy_mac
     - check_scripts
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-mac-large
     env:
       CARGO_INCREMENTAL: 0
@@ -525,6 +531,7 @@ jobs:
     - run_tests_windows
     - clippy_windows
     - check_scripts
+    if: false # spk-editor: not applicable
     runs-on: self-32vcpu-windows-2022
     env:
       CARGO_INCREMENTAL: 0
@@ -570,6 +577,7 @@ jobs:
     - run_tests_windows
     - clippy_windows
     - check_scripts
+    if: false # spk-editor: not applicable
     runs-on: self-32vcpu-windows-2022
     env:
       CARGO_INCREMENTAL: 0
@@ -619,6 +627,7 @@ jobs:
     - bundle_mac_x86_64
     - bundle_windows_aarch64
     - bundle_windows_x86_64
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-4x8-ubuntu-2204
     steps:
     - name: release::download_workflow_artifacts
@@ -650,6 +659,10 @@ jobs:
   validate_release_assets:
     needs:
     - upload_release_assets
+<<<<<<< ours
+=======
+    if: false # spk-editor: not applicable
+>>>>>>> theirs
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: release::validate_release_assets
@@ -674,6 +687,10 @@ jobs:
     needs:
     - upload_release_assets
     - compliance_check
+<<<<<<< ours
+=======
+    if: false # spk-editor: not applicable
+>>>>>>> theirs
     runs-on: namespace-profile-8x16-ubuntu-2204
     steps:
     - name: steps::checkout_repo
@@ -725,7 +742,11 @@ jobs:
     needs:
     - validate_release_assets
     - release_compliance_check
+<<<<<<< ours
     if: startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref, '-pre')
+=======
+    if: false # spk-editor: not applicable
+>>>>>>> theirs
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - id: generate-token
@@ -799,7 +820,7 @@ jobs:
     - bundle_mac_x86_64
     - bundle_windows_aarch64
     - bundle_windows_x86_64
-    if: always()
+    if: false # spk-editor: not applicable
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - id: generate-webhook-message
@@ -845,6 +866,11 @@ jobs:
                 echo ""
             elif [ "$VALIDATE_RESULT" == "failure" ]; then
                 echo "❌ Release validation failed for $TAG: missing assets: $RUN_URL"
+<<<<<<< ours
+=======
+            elif [ "$AUTO_RELEASE_RESULT" == "success" ]; then
+                echo "✅ Release $TAG was auto-released successfully: $RELEASE_URL"
+>>>>>>> theirs
             elif [ "$AUTO_RELEASE_RESULT" == "failure" ]; then
                 echo "❌ Auto release failed for $TAG: $RUN_URL"
             elif [ "$AUTO_RELEASE_RESULT" == "success" ] && [ "$AUTO_RELEASE_PUBLISHED" == "true" ]; then

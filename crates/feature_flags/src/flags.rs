@@ -24,6 +24,17 @@ pub struct AcpBetaFeatureFlag;
 impl FeatureFlag for AcpBetaFeatureFlag {
     const NAME: &'static str = "acp-beta";
     type Value = PresenceFlag;
+
+    // SPK fork: force-enable. The flag gates `SessionUpdate::UsageUpdate`
+    // → `AcpThread::token_usage` plumbing in `acp_thread.rs`, which is
+    // what feeds the per-session token meter in the chat status row
+    // (`solution_agent::status_row::render_status_row`).
+    // Cloud feature flags are unwired in this fork (no telemetry, no
+    // `client.zed.dev`), so without this override the meter would be
+    // permanently stuck at `0 / 1.0M` even for active conversations.
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 register_feature_flag!(AcpBetaFeatureFlag);
 

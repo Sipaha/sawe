@@ -572,6 +572,20 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: Option<String>,
+
+    /// Git Log graph view settings (the `git: open log` view).
+    pub log: Option<GitLogSettings>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct GitLogSettings {
+    /// When a commit has more refs than this threshold, the trailing chips
+    /// collapse into a `+N` badge. Set to a high number (e.g. 1000) to
+    /// effectively disable the compaction.
+    ///
+    /// Default: 2
+    pub compact_refs_threshold: Option<u32>,
 }
 
 #[with_fallible_options]

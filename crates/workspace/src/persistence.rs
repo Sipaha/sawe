@@ -1040,9 +1040,29 @@ impl Domain for WorkspaceDb {
                 ON UPDATE CASCADE
             );
         ),
+<<<<<<< ours
         sql!(
             ALTER TABLE workspaces ADD COLUMN identity_paths TEXT;
             ALTER TABLE workspaces ADD COLUMN identity_paths_order TEXT;
+=======
+        // fork-local: ConsolePanel tab persistence (terminal + chat tabs).
+        // SQL string literals use double quotes because Rust's `sql!` macro
+        // tokenises single-quoted characters as char literals (one codepoint
+        // only). Both forms parse identically in SQLite.
+        sql!(
+            CREATE TABLE IF NOT EXISTS console_panel_state(
+                workspace_id INTEGER NOT NULL,
+                tab_index    INTEGER NOT NULL,
+                kind         TEXT    NOT NULL CHECK(kind IN ("terminal","chat")),
+                item_id      TEXT    NOT NULL,
+                cwd          TEXT,
+                active       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (workspace_id, tab_index),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+            );
+>>>>>>> theirs
         ),
     ];
 
@@ -2643,6 +2663,55 @@ VALUES {placeholders};"#
         pub async fn clear_trusted_worktrees() -> Result<()> {
             DELETE FROM trusted_worktrees
         }
+    }
+
+    // fork-local: ConsolePanel tab persistence. Rows are
+    // (tab_index, kind, item_id, cwd, active).
+    //
+    //   * `kind` is `"terminal"` or `"chat"`.
+    //   * `item_id`: for chat tabs the stringified `SolutionSessionId`; for
+    //     terminal tabs an opaque stable string (currently the cwd as text,
+    //     but the loader only relies on `cwd` for re-spawn so the column is
+    //     informational for terminals).
+    //   * `cwd`: terminal-only — the captured working directory used by
+    //     `TerminalProvider::new_tab` on restore. `NULL` for chat rows.
+    //   * `active`: at most one row per workspace should have `active = 1`.
+    query! {
+        pub fn console_panel_tabs(workspace_id: WorkspaceId) -> Result<Vec<(i64, String, String, Option<String>, bool)>> {
+            SELECT tab_index, kind, item_id, cwd, active
+            FROM console_panel_state
+            WHERE workspace_id = ?
+            ORDER BY tab_index ASC
+        }
+    }
+
+    pub async fn save_console_panel_tabs(
+        &self,
+        workspace_id: WorkspaceId,
+        tabs: Vec<(i64, String, String, Option<String>, bool)>,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            conn.exec_bound(sql!(
+                DELETE FROM console_panel_state WHERE workspace_id = ?1;
+            ))?(workspace_id)
+            .context("clearing old console_panel_state rows")?;
+
+            let mut insert = conn
+                .exec_bound(sql!(
+                    INSERT INTO console_panel_state(
+                        workspace_id, tab_index, kind, item_id, cwd, active
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ))
+                .context("preparing console_panel_state insert")?;
+
+            for (tab_index, kind, item_id, cwd, active) in tabs {
+                insert((workspace_id, tab_index, kind, item_id, cwd, active))
+                    .context("inserting console_panel_state row")?;
+            }
+
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -5939,5 +6008,65 @@ mod tests {
                 "fallback should have found workspace_b, not the excluded workspace_a"
             );
         });
+    }
+
+    // fork-local: round-trip test for the ConsolePanel tab table.
+    // Mirrors the contract used by `console_panel::ConsolePanel::persist` /
+    // `::load`: a DELETE-then-INSERT replacement keyed by `workspace_id`
+    // preserves row order, kind, item_id, cwd, and the single active flag.
+    #[gpui::test]
+    async fn test_console_panel_tabs_round_trip() {
+        zlog::init_test();
+
+        let db = WorkspaceDb::open_test_db("test_console_panel_tabs_round_trip").await;
+        let workspace_id = db.next_id().await.unwrap();
+
+        // Initial save: one terminal + one chat tab, chat active.
+        let initial: Vec<(i64, String, String, Option<String>, bool)> = vec![
+            (
+                0,
+                "terminal".to_string(),
+                "/tmp/work".to_string(),
+                Some("/tmp/work".to_string()),
+                false,
+            ),
+            (1, "chat".to_string(), "abcd1234".to_string(), None, true),
+        ];
+        db.save_console_panel_tabs(workspace_id, initial.clone())
+            .await
+            .unwrap();
+
+        let loaded = db.console_panel_tabs(workspace_id).unwrap();
+        assert_eq!(loaded, initial, "round-trip must preserve all columns");
+
+        // Second save replaces the previous rows: a single terminal row,
+        // no chat row, active flag flipped to terminal.
+        let replacement: Vec<(i64, String, String, Option<String>, bool)> = vec![(
+            0,
+            "terminal".to_string(),
+            "/srv/code".to_string(),
+            Some("/srv/code".to_string()),
+            true,
+        )];
+        db.save_console_panel_tabs(workspace_id, replacement.clone())
+            .await
+            .unwrap();
+
+        let loaded = db.console_panel_tabs(workspace_id).unwrap();
+        assert_eq!(
+            loaded, replacement,
+            "save must DELETE old rows before inserting new ones — \
+             the chat row from the first save must be gone"
+        );
+
+        // Empty save clears all rows for this workspace.
+        db.save_console_panel_tabs(workspace_id, Vec::new())
+            .await
+            .unwrap();
+        let loaded = db.console_panel_tabs(workspace_id).unwrap();
+        assert!(
+            loaded.is_empty(),
+            "saving an empty list must clear the workspace's rows"
+        );
     }
 }

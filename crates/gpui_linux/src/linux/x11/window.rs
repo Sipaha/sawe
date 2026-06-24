@@ -738,6 +738,18 @@ impl X11WindowState {
                     Some((f32::from(size.width) as i32, f32::from(size.height) as i32));
             }
             size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
+            // Tell the WM "the user asked for this position" via the
+            // USPosition hint, otherwise common Linux WMs (Cinnamon /
+            // Mutter / KWin in some configs) ignore the client-set
+            // origin and place the window using their own cascade
+            // policy — which on this fork meant Welcome always opened
+            // in the upper-left corner instead of centred. UserSpecified
+            // is the strong-bind variant (PPosition is the weak one).
+            size_hints.position = Some((
+                x11rb::properties::WmSizeHintsSpecification::UserSpecified,
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+            ));
             check_reply(
                 || {
                     format!(
@@ -1691,6 +1703,10 @@ impl PlatformWindow for X11Window {
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
         }
+    }
+
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        self.0.state.borrow_mut().renderer.render_to_image(scene)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

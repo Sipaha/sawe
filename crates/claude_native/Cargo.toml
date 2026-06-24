@@ -1,0 +1,43 @@
+[package]
+name = "claude_native"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/claude_native.rs"
+doctest = false
+
+[features]
+test-support = []
+
+[dependencies]
+acp_thread.workspace = true
+action_log.workspace = true
+agent_servers.workspace = true
+agent-client-protocol.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+gpui.workspace = true
+log.workspace = true
+project.workspace = true
+scheduler.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+smol.workspace = true
+ui.workspace = true
+util.workspace = true
+uuid.workspace = true
+watch.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+acp_thread = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }

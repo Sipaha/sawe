@@ -25,9 +25,10 @@ use util::ResultExt;
 use crate::{
     client::{CspResult, RequestId, Response},
     types::{
-        CallToolParams, CallToolResponse, ListToolsResponse, Request, Tool, ToolAnnotations,
-        ToolResponseContent,
-        requests::{CallTool, ListTools},
+        CallToolParams, CallToolResponse, Implementation, InitializeResponse,
+        LATEST_PROTOCOL_VERSION, ListToolsResponse, ProtocolVersion, Request, ServerCapabilities,
+        Tool, ToolAnnotations, ToolResponseContent, ToolsCapabilities,
+        requests::{CallTool, Initialize, ListTools, Ping},
     },
 };
 
@@ -35,6 +36,9 @@ pub struct McpServer {
     socket_path: PathBuf,
     tools: Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
     handlers: Rc<RefCell<HashMap<&'static str, RequestHandler>>>,
+    connections: Rc<RefCell<HashMap<u64, UnboundedSender<String>>>>,
+    #[allow(dead_code)]
+    next_connection_id: Rc<RefCell<u64>>,
     _server_task: Task<()>,
 }
 
@@ -65,12 +69,23 @@ impl McpServer {
             let (temp_dir, socket_path, listener) = task.await?;
             let tools = Rc::new(RefCell::new(HashMap::default()));
             let handlers = Rc::new(RefCell::new(HashMap::default()));
+            let connections = Rc::new(RefCell::new(HashMap::default()));
+            let next_connection_id = Rc::new(RefCell::new(0u64));
             let server_task = cx.spawn({
                 let tools = tools.clone();
                 let handlers = handlers.clone();
+                let connections = connections.clone();
+                let next_connection_id = next_connection_id.clone();
                 async move |cx| {
                     while let Ok((stream, _)) = listener.accept().await {
-                        Self::serve_connection(stream, tools.clone(), handlers.clone(), cx);
+                        Self::serve_connection(
+                            stream,
+                            tools.clone(),
+                            handlers.clone(),
+                            connections.clone(),
+                            next_connection_id.clone(),
+                            cx,
+                        );
                     }
                     drop(temp_dir)
                 }
@@ -80,6 +95,8 @@ impl McpServer {
                 _server_task: server_task,
                 tools,
                 handlers,
+                connections,
+                next_connection_id,
             })
         })
     }
@@ -201,11 +218,21 @@ impl McpServer {
         stream: UnixStream,
         tools: Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
         handlers: Rc<RefCell<HashMap<&'static str, RequestHandler>>>,
+        connections: Rc<RefCell<HashMap<u64, UnboundedSender<String>>>>,
+        next_connection_id: Rc<RefCell<u64>>,
         cx: &mut AsyncApp,
     ) {
         let (read, write) = stream.split();
         let (incoming_tx, mut incoming_rx) = unbounded();
         let (outgoing_tx, outgoing_rx) = unbounded();
+
+        let connection_id = {
+            let mut next = next_connection_id.borrow_mut();
+            let id = *next;
+            *next += 1;
+            connections.borrow_mut().insert(id, outgoing_tx.clone());
+            id
+        };
 
         cx.background_spawn(Self::handle_io(outgoing_rx, incoming_tx, write, read))
             .detach();
@@ -221,6 +248,10 @@ impl McpServer {
                         .await;
                 } else if request.method == ListTools::METHOD {
                     Self::handle_list_tools(request.id.unwrap(), &tools, &outgoing_tx);
+                } else if request.method == Initialize::METHOD {
+                    Self::handle_initialize(request_id, &outgoing_tx);
+                } else if request.method == Ping::METHOD {
+                    Self::handle_ping(request_id, &outgoing_tx);
                 } else if let Some(handler) = handlers.borrow().get(&request.method.as_ref()) {
                     let outgoing_tx = outgoing_tx.clone();
 
@@ -238,8 +269,82 @@ impl McpServer {
                     );
                 }
             }
+            connections.borrow_mut().remove(&connection_id);
         })
         .detach();
+    }
+
+    /// Broadcast a JSON-RPC notification (no `id` field) to all connected
+    /// clients. Notification shape:
+    /// `{"jsonrpc": "2.0", "method": method, "params": params}`.
+    /// Failed sends (closed connections) are silently dropped — broadcast is
+    /// best-effort and the connection's read side will deregister it shortly.
+    pub fn broadcast_notification(&self, method: &str, params: serde_json::Value) {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let serialized = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(err) => {
+                log::error!("context_server: failed to serialize notification: {err}");
+                return;
+            }
+        };
+        let connections = self.connections.borrow();
+        for sender in connections.values() {
+            sender.unbounded_send(serialized.clone()).ok();
+        }
+    }
+
+    /// Respond to the MCP `initialize` handshake. Required by the spec
+    /// before any other request — clients (Claude SDK, codex, gemini)
+    /// will refuse to use the server otherwise. We advertise only the
+    /// `tools` capability since this server doesn't ship prompts /
+    /// resources / completions / sampling. `notifications/initialized`
+    /// (the post-handshake follow-up) has no `id` and is silently
+    /// dropped by the request loop's no-id early-continue.
+    fn handle_initialize(request_id: RequestId, outgoing_tx: &UnboundedSender<String>) {
+        let response = InitializeResponse {
+            protocol_version: ProtocolVersion(LATEST_PROTOCOL_VERSION.to_string()),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapabilities {
+                    list_changed: Some(false),
+                }),
+                ..Default::default()
+            },
+            server_info: Implementation {
+                name: "spk-editor".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
+            meta: None,
+        };
+        outgoing_tx
+            .unbounded_send(
+                serde_json::to_string(&Response {
+                    jsonrpc: "2.0",
+                    id: request_id,
+                    value: CspResult::Ok(Some(response)),
+                })
+                .unwrap_or_default(),
+            )
+            .ok();
+    }
+
+    /// Respond to MCP `ping` — used by some clients to keep the
+    /// connection alive. Empty result, no params.
+    fn handle_ping(request_id: RequestId, outgoing_tx: &UnboundedSender<String>) {
+        outgoing_tx
+            .unbounded_send(
+                serde_json::to_string(&Response {
+                    jsonrpc: "2.0",
+                    id: request_id,
+                    value: CspResult::Ok(Some(())),
+                })
+                .unwrap_or_default(),
+            )
+            .ok();
     }
 
     fn handle_list_tools(
@@ -435,4 +540,82 @@ struct RawRequest {
     method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<Box<serde_json::value::RawValue>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{AsyncBufReadExt, AsyncWriteExt, io::BufReader};
+    use gpui::TestAppContext;
+    use net::async_net::UnixStream;
+
+    /// Round-trip the MCP `initialize` handshake against a live server
+    /// over a Unix socket. Regression for the bug that left the SDK
+    /// unable to register the spk-editor MCP server because the server
+    /// answered `-32601 unhandled method initialize`.
+    #[gpui::test]
+    async fn initialize_handshake_succeeds(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let server = cx
+            .update(|cx| McpServer::new(&cx.to_async()))
+            .await
+            .expect("server start");
+        let socket_path = cx.update(|_| server.socket_path().to_path_buf());
+
+        let stream = UnixStream::connect(&socket_path).await.expect("connect");
+        let (read, mut write) = stream.split();
+        let mut reader = BufReader::new(read);
+
+        let init = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": Initialize::METHOD,
+            "params": {
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "0.0.0"},
+            },
+        }))
+        .unwrap();
+        write.write_all(init.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert!(
+            parsed.get("error").is_none(),
+            "unexpected error in initialize response: {parsed}"
+        );
+        let result = parsed.get("result").expect("result missing");
+        assert_eq!(
+            result.get("protocolVersion").and_then(|v| v.as_str()),
+            Some(LATEST_PROTOCOL_VERSION),
+        );
+        assert!(
+            result
+                .get("capabilities")
+                .and_then(|c| c.get("tools"))
+                .is_some(),
+            "tools capability missing: {result}"
+        );
+        assert!(result.get("serverInfo").is_some(), "serverInfo missing");
+
+        // ping after initialize to confirm the second built-in is wired
+        let ping = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": Ping::METHOD,
+        }))
+        .unwrap();
+        write.write_all(ping.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(parsed.get("error").is_none(), "ping error: {parsed}");
+
+        drop(server);
+    }
 }

@@ -3,6 +3,7 @@ pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
 pub mod item;
+pub mod mcp;
 mod modal_layer;
 mod multi_workspace;
 #[cfg(test)]
@@ -64,8 +65,13 @@ use gpui::{
     Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
     PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
+<<<<<<< ours
     SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds, WindowHandle,
     WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
+=======
+    SystemWindowTabController, Task, Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId,
+    WindowOptions, actions, canvas, point, px, relative, size, transparent_black,
+>>>>>>> theirs
 };
 pub use history_manager::*;
 pub use item::{
@@ -139,7 +145,11 @@ use std::{
     time::Duration,
 };
 use task::{DebugScenario, SharedTaskContext, SpawnInTerminal};
+<<<<<<< ours
 use theme::{ActiveTheme, ClientDecorationsExt, SystemAppearance};
+=======
+use theme::ActiveTheme;
+>>>>>>> theirs
 use theme_settings::ThemeSettings;
 pub use toolbar::{
     PaneSearchBarCallbacks, Toolbar, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
@@ -155,8 +165,13 @@ use util::{
 };
 use uuid::Uuid;
 pub use workspace_settings::{
+<<<<<<< ours
     AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, FocusFollowsMouse,
     RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings, WorkspaceSettings,
+=======
+    AutosaveSetting, FocusFollowsMouse, RestoreOnStartupBehavior, StatusBarSettings,
+    TabBarSettings, WorkspaceSettings,
+>>>>>>> theirs
 };
 use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
 
@@ -170,6 +185,31 @@ use crate::{
 };
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
+
+/// Fixed width of the vertical dock toggle strips that flank the workspace
+/// (`render_left_dock_strip` / `render_right_dock_strip`). The strips sit
+/// outside the docks but inside `self.bounds`, so the horizontal dock-resize
+/// math must subtract this to keep the resize handle under the cursor.
+pub(crate) const DOCK_STRIP_WIDTH: Pixels = px(40.);
+
+/// New size for a dock while its resize handle is dragged to `pointer`
+/// (a window-relative position), given the workspace content `bounds`.
+///
+/// The left/right docks are inset from `bounds` by [`DOCK_STRIP_WIDTH`]
+/// (the fixed toggle strips flank them), so that width is subtracted to keep
+/// the handle exactly under the cursor. The bottom dock has no strip below it,
+/// so its height is measured straight from `bounds.bottom()`.
+pub(crate) fn dock_resize_target_size(
+    position: DockPosition,
+    bounds: Bounds<Pixels>,
+    pointer: Point<Pixels>,
+) -> Pixels {
+    match position {
+        DockPosition::Left => pointer.x - bounds.left() - DOCK_STRIP_WIDTH,
+        DockPosition::Right => bounds.right() - pointer.x - DOCK_STRIP_WIDTH,
+        DockPosition::Bottom => bounds.bottom() - pointer.y,
+    }
+}
 
 static ZED_WINDOW_SIZE: LazyLock<Option<Size<Pixels>>> = LazyLock::new(|| {
     env::var("ZED_WINDOW_SIZE")
@@ -769,6 +809,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     theme_preview::init(cx);
     toast_layer::init(cx);
     history_manager::init(app_state.fs.clone(), cx);
+    mcp::register(cx);
 
     cx.on_action(|_: &CloseWindow, cx| Workspace::close_global(cx))
         .on_action(|_: &Reload, cx| reload(cx))
@@ -1362,6 +1403,9 @@ pub struct Workspace {
     left_dock: Entity<Dock>,
     bottom_dock: Entity<Dock>,
     right_dock: Entity<Dock>,
+    left_dock_strip: Entity<PanelButtons>,
+    right_dock_strip: Entity<PanelButtons>,
+    bottom_dock_strip: Entity<PanelButtons>,
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
@@ -1371,6 +1415,9 @@ pub struct Workspace {
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
+    project_toolbar_item: Option<AnyView>,
+    run_config_strip: Option<AnyView>,
+    run_config_controller: Option<AnyEntity>,
     notifications: Notifications,
     suppressed_notifications: HashSet<NotificationId>,
     project: Entity<Project>,
@@ -1665,7 +1712,6 @@ impl Workspace {
                 cx,
             );
             center_pane.set_can_split(Some(Arc::new(|_, _, _, _| true)));
-            center_pane.set_should_display_welcome_page(true);
             center_pane
         });
         cx.subscribe_in(&center_pane, window, Self::handle_pane_event)
@@ -1724,21 +1770,18 @@ impl Workspace {
         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
-        let left_dock_buttons = cx.new(|cx| PanelButtons::new(left_dock.clone(), cx));
-        let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
-        let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
+        // IDEA-style edge strips: vertical PanelButtons living on the workspace
+        // sides (rendered in `Workspace::render`) instead of as small icons in
+        // the status bar.
+        let left_dock_strip = cx.new(|cx| PanelButtons::new_vertical(left_dock.clone(), cx));
+        let bottom_dock_strip = cx.new(|cx| PanelButtons::new_vertical(bottom_dock.clone(), cx));
+        let right_dock_strip = cx.new(|cx| PanelButtons::new_vertical(right_dock.clone(), cx));
         let multi_workspace = window
             .root::<MultiWorkspace>()
             .flatten()
             .map(|mw| mw.downgrade());
-        let status_bar = cx.new(|cx| {
-            let mut status_bar =
-                StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
-            status_bar.add_left_item(left_dock_buttons, window, cx);
-            status_bar.add_right_item(right_dock_buttons, window, cx);
-            status_bar.add_right_item(bottom_dock_buttons, window, cx);
-            status_bar
-        });
+        let status_bar =
+            cx.new(|cx| StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx));
 
         let session_id = app_state.session.read(cx).id().to_owned();
 
@@ -1776,14 +1819,7 @@ impl Workspace {
                 }));
                 cx.notify();
             }),
-            cx.observe_window_appearance(window, |_, window, cx| {
-                let window_appearance = window.appearance();
-
-                *SystemAppearance::global_mut(cx) = SystemAppearance(window_appearance.into());
-
-                theme_settings::reload_theme(cx);
-                theme_settings::reload_icon_theme(cx);
-            }),
+            theme_settings::track_window_appearance(window, cx),
             cx.on_release({
                 let weak_handle = weak_handle.clone();
                 move |this, cx| {
@@ -1818,11 +1854,17 @@ impl Workspace {
             modal_layer,
             toast_layer,
             titlebar_item: None,
+            project_toolbar_item: None,
+            run_config_strip: None,
+            run_config_controller: None,
             notifications: Notifications::default(),
             suppressed_notifications: HashSet::default(),
             left_dock,
             bottom_dock,
             right_dock,
+            left_dock_strip,
+            right_dock_strip,
+            bottom_dock_strip,
             _panels_task: None,
             project: project.clone(),
             follower_states: Default::default(),
@@ -1878,6 +1920,34 @@ impl Workspace {
         open_mode: OpenMode,
         cx: &mut App,
     ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_with_visibility(
+            abs_paths,
+            app_state,
+            requesting_window,
+            env,
+            init,
+            open_mode,
+            true,
+            cx,
+        )
+    }
+
+    /// Like `new_local`, but lets the caller decide whether the
+    /// resulting worktrees show in the project panel. Solutions UI
+    /// uses `visible = false` for the placeholder worktree of an
+    /// "empty" solution — the workspace knows about the solution root
+    /// for path lookups, but the project panel stays clean (just the
+    /// `EmptySolutionPage` CTA).
+    pub fn new_local_with_visibility(
+        abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        env: Option<HashMap<String, String>>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        visible: bool,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
         let project_handle = Project::local(
             app_state.client.clone(),
             app_state.node_runtime.clone(),
@@ -1888,6 +1958,22 @@ impl Workspace {
             Default::default(),
             cx,
         );
+
+        // Hidden worktrees are stored as `Weak` handles by default and
+        // get dropped as soon as the strong handle returned from
+        // `find_or_create_worktree` goes out of scope (see the
+        // `(_, project_entry)` destructure in the path loop below).
+        // For Solutions UI's empty-solution placeholder — opened with
+        // `OpenVisible::None` so the panel stays clean — this killed the
+        // worktree before the workspace could even appear in the tab
+        // strip. Force-retain when the caller asked for hidden paths so
+        // the placeholder lives.
+        if !visible {
+            project_handle
+                .read(cx)
+                .worktree_store()
+                .update(cx, |store, _| store.set_retain_worktrees(true));
+        }
 
         let db = WorkspaceDb::global(cx);
         let kvp = db::kvp::KeyValueStore::global(cx);
@@ -1914,7 +2000,7 @@ impl Workspace {
             for path in paths_to_open.into_iter() {
                 if let Some((_, project_entry)) = cx
                     .update(|cx| {
-                        Workspace::project_path_for_path(project_handle.clone(), &path, true, cx)
+                        Workspace::project_path_for_path(project_handle.clone(), &path, visible, cx)
                     })
                     .await
                     .log_err()
@@ -2022,16 +2108,35 @@ impl Workspace {
                         && let Some(display) = workspace.display
                         && let Some(bounds) = workspace.window_bounds.as_ref()
                     {
-                        // Reopening an existing workspace - restore its saved bounds
+                        // Reopening an existing workspace - restore its saved bounds.
                         (Some(bounds.0), Some(display))
-                    } else if let Some((display, bounds)) =
-                        persistence::read_default_window_bounds(&kvp)
-                    {
-                        // New or empty workspace - use the last known window bounds
-                        (Some(bounds), Some(display))
                     } else {
-                        // New window - let GPUI's default_bounds() handle cascading
-                        (None, None)
+                        // No project-specific bounds: always centre on the
+                        // current display rather than restoring the global
+                        // "last-known" bounds from `read_default_window_bounds`.
+                        // Upstream's behaviour was to retain whatever the
+                        // user last left, which on a fork that frequently
+                        // wipes its profile (debug builds, fresh checkouts)
+                        // pinned the Welcome window to the top-left corner
+                        // every launch. Persisted bounds still apply when
+                        // the path list matches an existing workspace.
+                        let _ = &kvp;
+                        // Compact launcher-shaped default — wider than
+                        // necessary just makes the Welcome / project
+                        // picker feel half-empty. Welcome's content
+                        // column (see `welcome.rs`) is sized to fit
+                        // inside this. Users can resize once they open
+                        // a real project.
+                        let centered = cx.update(|cx| {
+                            gpui::WindowBounds::centered(
+                                gpui::Size {
+                                    width: gpui::px(720.0),
+                                    height: gpui::px(720.0),
+                                },
+                                cx,
+                            )
+                        });
+                        (Some(centered), None)
                     };
 
                     // Use the serialized workspace to construct the new window
@@ -2164,21 +2269,6 @@ impl Workspace {
 
     pub fn bottom_dock(&self) -> &Entity<Dock> {
         &self.bottom_dock
-    }
-
-    pub fn set_bottom_dock_layout(
-        &mut self,
-        layout: BottomDockLayout,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let fs = self.project().read(cx).fs();
-        settings::update_settings_file(fs.clone(), cx, move |content, _cx| {
-            content.workspace.bottom_dock_layout = Some(layout);
-        });
-
-        cx.notify();
-        self.serialize_workspace(window, cx);
     }
 
     pub fn right_dock(&self) -> &Entity<Dock> {
@@ -2315,6 +2405,75 @@ impl Workspace {
                 self.project.read(cx).absolute_path(&project_path, cx)
             })
             .collect()
+    }
+
+    /// Reconcile the project's visible worktrees so that exactly
+    /// `target_paths` are mounted: drop anything not in the set,
+    /// add anything missing. Used by the in-place Solution-switch
+    /// path so panels (which subscribe to the existing
+    /// `Project`/`Workspace` rather than being recreated per Solution)
+    /// keep their dock-state, scroll, expanded items, etc.
+    ///
+    /// Worktrees whose `abs_path` is already in `target_paths`
+    /// are left in place — their `WorktreeId` is preserved across
+    /// the swap, which matters because LSP / panels / cached caches
+    /// hold ids and we don't want gratuitous invalidations.
+    ///
+    /// Each `create_worktree` is awaited; failure on a single new
+    /// member doesn't roll back already-applied removals. On partial
+    /// failure the caller sees a `Project` whose worktrees are a
+    /// subset of the requested list. We don't auto-undo (a re-add
+    /// of a removed worktree is just as likely to fail again, and
+    /// the right user-facing handling — toast + retry — lives at the
+    /// orchestrator layer above).
+    pub fn swap_worktrees_to(
+        &mut self,
+        target_paths: Vec<PathBuf>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let project = self.project.clone();
+        let target_set: std::collections::HashSet<PathBuf> = target_paths.iter().cloned().collect();
+        cx.spawn(async move |_, cx| {
+            // `Entity::update` on `AsyncApp` returns `R` directly
+            // (not `Result<R>`), so no `?` on the wrapping update
+            // calls — only on the inner `Task<Result<…>>` future
+            // we get back from `create_worktree`.
+            let to_remove: Vec<WorktreeId> = project.update(cx, |project, cx| {
+                project
+                    .visible_worktrees(cx)
+                    .filter(|wt| {
+                        let abs: PathBuf = wt.read(cx).abs_path().to_path_buf();
+                        !target_set.contains(&abs)
+                    })
+                    .map(|wt| wt.read(cx).id())
+                    .collect()
+            });
+            for id in to_remove {
+                project.update(cx, |project, cx| project.remove_worktree(id, cx));
+            }
+            // Recompute `existing_paths` after removal — items in
+            // `target_paths` that were already mounted before the
+            // swap should be skipped (`create_worktree` is idempotent
+            // on already-mounted paths but burns time in the
+            // task-await loop).
+            let existing_paths: std::collections::HashSet<PathBuf> =
+                project.update(cx, |project, cx| {
+                    project
+                        .visible_worktrees(cx)
+                        .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                        .collect()
+                });
+            for path in target_paths {
+                if existing_paths.contains(&path) {
+                    continue;
+                }
+                let task =
+                    project.update(cx, |project, cx| project.create_worktree(&path, true, cx));
+                task.await?;
+            }
+            Ok(())
+        })
     }
 
     pub fn dock_at_position(&self, position: DockPosition) -> &Entity<Dock> {
@@ -2951,6 +3110,35 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn set_project_toolbar_item(
+        &mut self,
+        item: AnyView,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_toolbar_item = Some(item);
+        cx.notify();
+    }
+
+    pub fn set_run_config_strip(&mut self, strip: AnyView, cx: &mut Context<Self>) {
+        self.run_config_strip = Some(strip);
+        cx.notify();
+    }
+
+    /// The run-config widget view (set by `run_config_ui`). Read and rendered
+    /// right-aligned in the header by `title_bar`.
+    pub fn run_config_strip(&self) -> Option<&AnyView> {
+        self.run_config_strip.as_ref()
+    }
+
+    pub fn set_run_config_controller(&mut self, controller: AnyEntity) {
+        self.run_config_controller = Some(controller);
+    }
+
+    pub fn run_config_controller(&self) -> Option<&AnyEntity> {
+        self.run_config_controller.as_ref()
+    }
+
     pub fn set_prompt_for_new_path(&mut self, prompt: PromptForNewPath) {
         self.on_prompt_for_new_path = Some(prompt)
     }
@@ -3095,6 +3283,10 @@ impl Workspace {
 
     pub fn titlebar_item(&self) -> Option<AnyView> {
         self.titlebar_item.clone()
+    }
+
+    pub fn project_toolbar_item(&self) -> Option<AnyView> {
+        self.project_toolbar_item.clone()
     }
 
     /// Call the given callback with a workspace whose project is local or remote via WSL (allowing host access).
@@ -6173,6 +6365,16 @@ impl Workspace {
             title.push_str(" ↗");
         }
 
+<<<<<<< ours
+=======
+        // S-SAR — flag snapshot worktrees in the OS title so the user
+        // can tell at a glance that this window is read-only and that
+        // edits will be refused at the buffer layer.
+        if project.has_read_only_root() {
+            title.push_str(" [READ-ONLY]");
+        }
+
+>>>>>>> theirs
         let document_path = active_project_path
             .as_ref()
             .and_then(|path| project.absolute_path(path, cx));
@@ -6192,8 +6394,22 @@ impl Workspace {
         self.last_window_title = Some(title);
     }
 
+<<<<<<< ours
     fn is_window_edited(&self, cx: &App) -> bool {
         !self.project.read(cx).is_disconnected(cx) && !self.dirty_items.is_empty()
+=======
+    /// Force the platform window title to be re-set even if it matches
+    /// what this workspace last wrote. Used by `MultiWorkspace::activate`
+    /// when switching solution tabs: each tab's `Workspace` keeps its
+    /// own `last_window_title` cache, but the X11 / OS window has a
+    /// single title that the leaving tab clobbered with its own value,
+    /// and the de-duplication in `update_window_title` would otherwise
+    /// skip the re-set on tab switch and leave a stale title visible to
+    /// the OS taskbar / window switcher.
+    pub fn refresh_window_title(&mut self, window: &mut Window, cx: &mut App) {
+        self.last_window_title = None;
+        self.update_window_title(window, cx);
+>>>>>>> theirs
     }
 
     fn update_window_edited(&mut self, window: &mut Window, cx: &mut App) {
@@ -7887,6 +8103,12 @@ impl Workspace {
         self.modal_layer.read(cx).active_modal()
     }
 
+    /// Stable kind name of the currently active modal, if any. Surfaced for
+    /// introspection — see `ModalLayer::active_modal_kind`.
+    pub fn active_modal_kind(&self, cx: &App) -> Option<&'static str> {
+        self.modal_layer.read(cx).active_modal_kind(cx)
+    }
+
     /// Toggles a modal of type `V`. If a modal of the same type is currently active,
     /// it will be hidden. If a different modal is active, it will be replaced with the new one.
     /// If no modal is active, the new modal will be shown.
@@ -7949,6 +8171,42 @@ impl Workspace {
             )
     }
 
+    /// Vertical IDEA-style strip pinned to the left edge of the workspace.
+    /// Hosts left-dock toggles at the top and bottom-dock toggles at the
+    /// bottom, separated by a flex spacer so they stick to opposite ends.
+    fn render_left_dock_strip(&self, cx: &mut App) -> Div {
+        let colors = cx.theme().colors();
+        v_flex()
+            .flex_none()
+            .w(DOCK_STRIP_WIDTH)
+            .h_full()
+            .px_1()
+            .py_2()
+            .gap_2()
+            .border_r_1()
+            .border_color(colors.border)
+            .bg(colors.status_bar_background)
+            .child(self.left_dock_strip.clone())
+            .child(div().flex_1())
+            .child(self.bottom_dock_strip.clone())
+    }
+
+    /// Vertical strip pinned to the right edge — hosts right-dock toggles.
+    fn render_right_dock_strip(&self, cx: &mut App) -> Div {
+        let colors = cx.theme().colors();
+        v_flex()
+            .flex_none()
+            .w(DOCK_STRIP_WIDTH)
+            .h_full()
+            .px_1()
+            .py_2()
+            .gap_2()
+            .border_l_1()
+            .border_color(colors.border)
+            .bg(colors.status_bar_background)
+            .child(self.right_dock_strip.clone())
+    }
+
     fn render_dock(
         &self,
         position: DockPosition,
@@ -7970,8 +8228,23 @@ impl Workspace {
             .flex()
             .overflow_hidden()
             .flex_none()
+            .debug_selector(move || {
+                let label = match position {
+                    DockPosition::Left => "left",
+                    DockPosition::Bottom => "bottom",
+                    DockPosition::Right => "right",
+                };
+                format!("{label}-dock-container")
+            })
             .child(dock.clone())
             .children(leader_border);
+
+        // Horizontal docks (Left and Right) live inside a flex-row container that has h_full.
+        // The container must also declare h_full so that the dock's own h_full resolves
+        // to the full workspace-area height rather than collapsing to zero.
+        if position.axis() == Axis::Horizontal {
+            container = container.h_full();
+        }
 
         // Apply sizing only when the dock is open. When closed the dock is still
         // included in the element tree so its focus handle remains mounted — without
@@ -8633,8 +8906,6 @@ impl Render for Workspace {
             .iter()
             .map(|(_, notification)| notification.entity_id())
             .collect::<Vec<_>>();
-        let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
-
         let pane_render_context = PaneRenderContext {
             follower_states: &self.follower_states,
             active_call: self.active_call(),
@@ -8656,6 +8927,7 @@ impl Render for Workspace {
             .text_color(colors.text)
             .overflow_hidden()
             .children(self.titlebar_item.clone())
+            .children(self.project_toolbar_item.clone())
             .on_modifiers_changed(move |_, _, cx| {
                 for &id in &notification_entities {
                     cx.notify(id);
@@ -8730,30 +9002,24 @@ impl Render for Workspace {
                                             workspace.previous_dock_drag_coordinates =
                                                 Some(e.event.position);
 
-                                            match e.drag(cx).0 {
+                                            let position = e.drag(cx).0;
+                                            let target = dock_resize_target_size(
+                                                position,
+                                                workspace.bounds,
+                                                e.event.position,
+                                            );
+                                            match position {
                                                 DockPosition::Left => {
-                                                    workspace.resize_left_dock(
-                                                        e.event.position.x
-                                                            - workspace.bounds.left(),
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    workspace
+                                                        .resize_left_dock(target, window, cx);
                                                 }
                                                 DockPosition::Right => {
-                                                    workspace.resize_right_dock(
-                                                        workspace.bounds.right()
-                                                            - e.event.position.x,
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    workspace
+                                                        .resize_right_dock(target, window, cx);
                                                 }
                                                 DockPosition::Bottom => {
-                                                    workspace.resize_bottom_dock(
-                                                        workspace.bounds.bottom()
-                                                            - e.event.position.y,
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    workspace
+                                                        .resize_bottom_dock(target, window, cx);
                                                 }
                                             };
                                             workspace.serialize_workspace(window, cx);
@@ -8762,245 +9028,55 @@ impl Render for Workspace {
                                 ))
                             })
                             .child({
-                                match bottom_dock_layout {
-                                    BottomDockLayout::Full => div()
-                                        .flex()
-                                        .flex_col()
-                                        .h_full()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .children(self.render_dock(
-                                                    DockPosition::Left,
-                                                    &self.left_dock,
-                                                    window,
-                                                    cx,
-                                                ))
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_col()
-                                                        .flex_1()
-                                                        .overflow_hidden()
-                                                        .child(
-                                                            h_flex()
-                                                                .flex_1()
-                                                                .when_some(paddings.0, |this, p| {
-                                                                    this.child(p.border_r_1())
-                                                                })
-                                                                .child(self.center.render(
-                                                                    self.zoomed.as_ref(),
-                                                                    &pane_render_context,
-                                                                    window,
-                                                                    cx,
-                                                                ))
-                                                                .when_some(
-                                                                    paddings.1,
-                                                                    |this, p| {
-                                                                        this.child(p.border_l_1())
-                                                                    },
-                                                                ),
-                                                        ),
-                                                )
-                                                .children(self.render_dock(
-                                                    DockPosition::Right,
-                                                    &self.right_dock,
-                                                    window,
-                                                    cx,
-                                                )),
-                                        )
-                                        .child(div().w_full().children(self.render_dock(
-                                            DockPosition::Bottom,
-                                            &self.bottom_dock,
-                                            window,
-                                            cx,
-                                        ))),
-
-                                    BottomDockLayout::LeftAligned => div()
-                                        .flex()
-                                        .flex_row()
-                                        .h_full()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .flex_1()
-                                                .h_full()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .flex_1()
-                                                        .children(self.render_dock(
-                                                            DockPosition::Left,
-                                                            &self.left_dock,
-                                                            window,
-                                                            cx,
-                                                        ))
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .flex_1()
-                                                                .overflow_hidden()
-                                                                .child(
-                                                                    h_flex()
-                                                                        .flex_1()
-                                                                        .when_some(
-                                                                            paddings.0,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_r_1(),
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                        .child(self.center.render(
-                                                                            self.zoomed.as_ref(),
-                                                                            &pane_render_context,
-                                                                            window,
-                                                                            cx,
-                                                                        ))
-                                                                        .when_some(
-                                                                            paddings.1,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_l_1(),
-                                                                                )
-                                                                            },
-                                                                        ),
-                                                                ),
-                                                        ),
-                                                )
-                                                .child(div().w_full().children(self.render_dock(
-                                                    DockPosition::Bottom,
-                                                    &self.bottom_dock,
-                                                    window,
-                                                    cx,
-                                                ))),
-                                        )
-                                        .children(self.render_dock(
-                                            DockPosition::Right,
-                                            &self.right_dock,
-                                            window,
-                                            cx,
-                                        )),
-                                    BottomDockLayout::RightAligned => div()
-                                        .flex()
-                                        .flex_row()
-                                        .h_full()
-                                        .children(self.render_dock(
-                                            DockPosition::Left,
-                                            &self.left_dock,
-                                            window,
-                                            cx,
-                                        ))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .flex_1()
-                                                .h_full()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .flex_1()
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .flex_1()
-                                                                .overflow_hidden()
-                                                                .child(
-                                                                    h_flex()
-                                                                        .flex_1()
-                                                                        .when_some(
-                                                                            paddings.0,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_r_1(),
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                        .child(self.center.render(
-                                                                            self.zoomed.as_ref(),
-                                                                            &pane_render_context,
-                                                                            window,
-                                                                            cx,
-                                                                        ))
-                                                                        .when_some(
-                                                                            paddings.1,
-                                                                            |this, p| {
-                                                                                this.child(
-                                                                                    p.border_l_1(),
-                                                                                )
-                                                                            },
-                                                                        ),
-                                                                ),
-                                                        )
-                                                        .children(self.render_dock(
-                                                            DockPosition::Right,
-                                                            &self.right_dock,
-                                                            window,
-                                                            cx,
-                                                        )),
-                                                )
-                                                .child(div().w_full().children(self.render_dock(
-                                                    DockPosition::Bottom,
-                                                    &self.bottom_dock,
-                                                    window,
-                                                    cx,
-                                                ))),
-                                        ),
-                                    BottomDockLayout::Contained => div()
-                                        .flex()
-                                        .flex_row()
-                                        .h_full()
-                                        .children(self.render_dock(
-                                            DockPosition::Left,
-                                            &self.left_dock,
-                                            window,
-                                            cx,
-                                        ))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .child(
-                                                    h_flex()
-                                                        .flex_1()
-                                                        .when_some(paddings.0, |this, p| {
-                                                            this.child(p.border_r_1())
-                                                        })
-                                                        .child(self.center.render(
-                                                            self.zoomed.as_ref(),
-                                                            &pane_render_context,
-                                                            window,
-                                                            cx,
-                                                        ))
-                                                        .when_some(paddings.1, |this, p| {
-                                                            this.child(p.border_l_1())
-                                                        }),
-                                                )
-                                                .children(self.render_dock(
-                                                    DockPosition::Bottom,
-                                                    &self.bottom_dock,
-                                                    window,
-                                                    cx,
-                                                )),
-                                        )
-                                        .children(self.render_dock(
-                                            DockPosition::Right,
-                                            &self.right_dock,
-                                            window,
-                                            cx,
-                                        )),
-                                }
+                                h_flex()
+                                    .h_full()
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .debug_selector(|| "dock-row".into())
+                                    .child(self.render_left_dock_strip(cx))
+                                    .children(self.render_dock(
+                                        DockPosition::Left,
+                                        &self.left_dock,
+                                        window,
+                                        cx,
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .h_full()
+                                            .overflow_hidden()
+                                            .child(
+                                                h_flex()
+                                                    .flex_1()
+                                                    .when_some(paddings.0, |this, p| {
+                                                        this.child(p.border_r_1())
+                                                    })
+                                                    .child(self.center.render(
+                                                        self.zoomed.as_ref(),
+                                                        &pane_render_context,
+                                                        window,
+                                                        cx,
+                                                    ))
+                                                    .when_some(paddings.1, |this, p| {
+                                                        this.child(p.border_l_1())
+                                                    }),
+                                            )
+                                            .children(self.render_dock(
+                                                DockPosition::Bottom,
+                                                &self.bottom_dock,
+                                                window,
+                                                cx,
+                                            )),
+                                    )
+                                    .children(self.render_dock(
+                                        DockPosition::Right,
+                                        &self.right_dock,
+                                        window,
+                                        cx,
+                                    ))
+                                    .child(self.render_right_dock_strip(cx))
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
                                 let zoomed_view = view.upgrade()?;
@@ -10148,15 +10224,23 @@ pub fn open_paths(
             } else {
                 None
             };
+            // Honor `OpenVisible::None` when the caller wants the
+            // worktrees attached to the workspace but hidden from the
+            // project panel — Solutions UI uses this for the empty-
+            // solution placeholder so the user only sees the
+            // `EmptySolutionPage` CTA, not the otherwise-empty
+            // solution root directory.
+            let visible = !matches!(open_options.visible, Some(OpenVisible::None));
             let result = cx
                 .update(move |cx| {
-                    Workspace::new_local(
+                    Workspace::new_local_with_visibility(
                         abs_paths,
                         app_state.clone(),
                         open_options.requesting_window,
                         open_options.env,
                         init,
                         open_options.open_mode,
+                        visible,
                         cx,
                     )
                 })
@@ -11213,6 +11297,34 @@ mod tests {
     use util::path;
     use util::rel_path::rel_path;
 
+    #[test]
+    fn test_dock_resize_handle_tracks_cursor() {
+        // Workspace content area with a non-zero origin so a missing
+        // `bounds.left()` term would be caught.
+        let bounds = Bounds {
+            origin: point(px(10.), px(20.)),
+            size: size(px(1000.), px(800.)),
+        };
+
+        // For each dock the resize handle must land exactly under the cursor
+        // (the bug was a `DOCK_STRIP_WIDTH` gap between edge and cursor). The
+        // dock occupies the span from its inner edge to the strip-inset outer
+        // edge; the handle is at `outer_edge -/+ size`.
+        let left_pointer = point(px(300.), px(400.));
+        let left_size = dock_resize_target_size(DockPosition::Left, bounds, left_pointer);
+        assert_eq!(bounds.left() + DOCK_STRIP_WIDTH + left_size, left_pointer.x);
+
+        let right_pointer = point(px(700.), px(400.));
+        let right_size = dock_resize_target_size(DockPosition::Right, bounds, right_pointer);
+        assert_eq!(bounds.right() - DOCK_STRIP_WIDTH - right_size, right_pointer.x);
+
+        // The bottom dock has no strip beneath it, so its handle is measured
+        // straight from `bounds.bottom()`.
+        let bottom_pointer = point(px(400.), px(600.));
+        let bottom_size = dock_resize_target_size(DockPosition::Bottom, bounds, bottom_pointer);
+        assert_eq!(bounds.bottom() - bottom_size, bottom_pointer.y);
+    }
+
     #[gpui::test]
     async fn test_tab_disambiguation(cx: &mut TestAppContext) {
         init_test(cx);
@@ -11358,6 +11470,89 @@ mod tests {
 
     #[gpui::test]
     async fn test_document_path_updates_with_active_item(cx: &mut TestAppContext) {
+<<<<<<< ours
+=======
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "one.txt": "",
+                "two.txt": "",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, ["root".as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let item1 = cx.new(|cx| {
+            TestItem::new(cx).with_project_items(&[new_test_project_item(
+                1,
+                "one.txt",
+                worktree_id,
+                cx,
+            )])
+        });
+        let item2 = cx.new(|cx| {
+            TestItem::new(cx).with_project_items(&[new_test_project_item(
+                2,
+                "two.txt",
+                worktree_id,
+                cx,
+            )])
+        });
+
+        // Initially no document path
+        assert_eq!(cx.document_path(), None);
+
+        // Add an item - document path should be set
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item1), None, true, window, cx)
+        });
+        assert_eq!(
+            cx.document_path(),
+            Some(std::path::PathBuf::from("root/one.txt"))
+        );
+
+        // Add a second item - document path should update
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item2), None, true, window, cx)
+        });
+        assert_eq!(
+            cx.document_path(),
+            Some(std::path::PathBuf::from("root/two.txt"))
+        );
+
+        // Close the active item - document path should revert to first item
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&Default::default(), window, cx)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cx.document_path(),
+            Some(std::path::PathBuf::from("root/one.txt"))
+        );
+
+        // Close all items - document path should be cleared
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&Default::default(), window, cx)
+        })
+        .await
+        .unwrap();
+        assert_eq!(cx.document_path(), None);
+    }
+
+    #[gpui::test]
+    async fn test_close_window(cx: &mut TestAppContext) {
+>>>>>>> theirs
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -13718,6 +13913,10 @@ mod tests {
                 workspace.resize_left_dock(px(350.), window, cx);
             });
 
+            // KVP persistence is debounced (200 ms trailing edge) so that
+            // mouse-drag doesn't pummel SQLite at 60 Hz; advance past the
+            // window before asserting the row was written.
+            cx.executor().advance_clock(Duration::from_millis(250));
             cx.run_until_parked();
 
             let persisted = workspace.read_with(cx, |workspace, cx| {
@@ -13779,6 +13978,7 @@ mod tests {
                 workspace.resize_right_dock(px(300.), window, cx);
             });
 
+            cx.executor().advance_clock(Duration::from_millis(250));
             cx.run_until_parked();
 
             let persisted = workspace
@@ -16205,6 +16405,7 @@ mod tests {
     }
 
     #[gpui::test]
+<<<<<<< ours
     async fn test_open_url_or_file_routes_urls(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -16247,5 +16448,139 @@ mod tests {
             workspace.open_url_or_file("nonexistent.txt", None, window, cx);
         });
         assert_eq!(cx.opened_url(), Some("nonexistent.txt".to_string()));
+=======
+    async fn swap_worktrees_to_replaces_old_with_new(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/old"), json!({ "a.txt": "" })).await;
+        fs.insert_tree(path!("/new1"), json!({ "b.txt": "" })).await;
+        fs.insert_tree(path!("/new2"), json!({ "c.txt": "" })).await;
+        let project = Project::test(fs.clone(), [path!("/old").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let task = workspace.update_in(cx, |w, window, cx| {
+            w.swap_worktrees_to(
+                vec![PathBuf::from(path!("/new1")), PathBuf::from(path!("/new2"))],
+                window,
+                cx,
+            )
+        });
+        task.await.expect("swap_worktrees_to");
+        cx.run_until_parked();
+        let mounted: Vec<PathBuf> = project.read_with(cx, |p, cx| {
+            p.visible_worktrees(cx)
+                .map(|w| w.read(cx).abs_path().to_path_buf())
+                .collect()
+        });
+        let mounted_strs: Vec<String> = mounted
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !mounted_strs.iter().any(|p| p.ends_with("old")),
+            "/old should have been removed: {mounted_strs:?}"
+        );
+        assert!(
+            mounted_strs.iter().any(|p| p.ends_with("new1"))
+                && mounted_strs.iter().any(|p| p.ends_with("new2")),
+            "both /new1 and /new2 should be mounted: {mounted_strs:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn swap_worktrees_to_preserves_overlap(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/keep"), json!({ "k.txt": "" })).await;
+        fs.insert_tree(path!("/drop"), json!({ "d.txt": "" })).await;
+        fs.insert_tree(path!("/new"), json!({ "n.txt": "" })).await;
+        let project = Project::test(
+            fs.clone(),
+            [path!("/keep").as_ref(), path!("/drop").as_ref()],
+            cx,
+        )
+        .await;
+        let kept_id: WorktreeId = project.read_with(cx, |p, cx| {
+            p.visible_worktrees(cx)
+                .find(|w| w.read(cx).abs_path().ends_with("keep"))
+                .map(|w| w.read(cx).id())
+                .expect("/keep mounted")
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let task = workspace.update_in(cx, |w, window, cx| {
+            w.swap_worktrees_to(
+                vec![PathBuf::from(path!("/keep")), PathBuf::from(path!("/new"))],
+                window,
+                cx,
+            )
+        });
+        task.await.expect("swap_worktrees_to");
+        cx.run_until_parked();
+        let still_kept = project.read_with(cx, |p, cx| {
+            p.visible_worktrees(cx).any(|w| w.read(cx).id() == kept_id)
+        });
+        assert!(
+            still_kept,
+            "/keep WorktreeId must be preserved across the swap so panels don't invalidate"
+        );
+    }
+
+    /// Guard against regressions in the dock layout introduced in A1–A3:
+    /// - Right Dock container spans the full workspace-area height.
+    /// - Bottom Dock container's right edge meets the Right Dock's left edge.
+    #[gpui::test]
+    async fn right_dock_spans_full_workspace_height(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        // Register a panel in each of the two docks so they can be opened.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let right_panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(right_panel, window, cx);
+
+            let bottom_panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(bottom_panel, window, cx);
+
+            workspace
+                .right_dock()
+                .update(cx, |dock, cx| dock.set_open(true, window, cx));
+            workspace
+                .bottom_dock()
+                .update(cx, |dock, cx| dock.set_open(true, window, cx));
+        });
+        cx.run_until_parked();
+
+        // dock-row is the h_flex that contains all three dock containers and the center
+        // pane column. Its bounds define the true content-area extents (inside the border).
+        let dock_row = cx
+            .debug_bounds("dock-row")
+            .expect("dock-row element should be rendered");
+        let right_dock = cx
+            .debug_bounds("right-dock-container")
+            .expect("right-dock-container should be rendered when right dock is open");
+        let bottom_dock = cx
+            .debug_bounds("bottom-dock-container")
+            .expect("bottom-dock-container should be rendered when bottom dock is open");
+
+        assert_eq!(
+            right_dock.origin.y, dock_row.origin.y,
+            "right dock top should equal dock-row top"
+        );
+        assert_eq!(
+            right_dock.origin.y + right_dock.size.height,
+            dock_row.origin.y + dock_row.size.height,
+            "right dock bottom should equal dock-row bottom"
+        );
+        assert_eq!(
+            bottom_dock.origin.x + bottom_dock.size.width,
+            right_dock.origin.x,
+            "bottom dock right edge should meet right dock left edge"
+        );
+>>>>>>> theirs
     }
 }

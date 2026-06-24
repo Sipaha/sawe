@@ -448,8 +448,14 @@ impl LanguageModel for OpenAiLanguageModel {
             | Model::FivePointFourPro
             | Model::FivePointFive
             | Model::FivePointFivePro
+<<<<<<< ours
             | Model::O3 => true,
             Model::Four => false,
+=======
+            | Model::O1
+            | Model::O3 => true,
+            Model::ThreePointFiveTurbo | Model::Four | Model::FourTurbo | Model::O3Mini => false,
+>>>>>>> theirs
             Model::Custom {
                 supports_images, ..
             } => *supports_images,

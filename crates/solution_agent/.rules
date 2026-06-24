@@ -1,0 +1,43 @@
+# solution_agent — traps to avoid
+
+These came up multiple times during initial implementation. Each is **non-obvious**, **repeatedly encountered**, and **specific**. See repo-root `FORK.md` for architecture context.
+
+## ACP type imports
+
+- `use agent_client_protocol::schema as acp;` — **NOT** `use agent_client_protocol as acp;`. The schema types (`SessionId`, `PromptRequest`, `ContentBlock`, `StopReason`, `ToolCallId`, `AuthMethod`, `AuthMethodId`, `PromptResponse`, `SessionModeId`, etc.) live in the `::schema` submodule, not at the crate root. The bare alias compiles for some types but fails on `SessionId` and friends.
+- `acp::SessionId::new(s)` — the type is `#[non_exhaustive]`, so tuple-style construction `acp::SessionId(s.into())` does **not** compile from outside the schema crate. Same applies to `acp::ToolCallId::new(...)`.
+
+## AcpThread / AgentConnection types
+
+- `AgentConnection::agent_id()` returns `project::AgentId`, **not** `acp_thread::AgentId`. The trait imports `use project::{AgentId, Project};` — mock impls must follow.
+- `AgentConnection::new_session(...)` takes `util::path_list::PathList`, **not** `project::PathList`. Re-exported via `util`.
+- `AcpThread::title()` returns `Option<SharedString>` — handle the None case explicitly.
+- `AgentThreadEntry` is `Debug` only, **NOT** `Clone`. Render entries inline inside the `read(cx)` borrow rather than collecting/cloning.
+- `acp::PromptRequest` does not implement `Default` and is `#[non_exhaustive]`. Use `acp::PromptRequest::new(session_id, blocks)`. `ContentBlock::Text` is tuple-style: `acp::ContentBlock::Text(acp::TextContent::new(text))`.
+
+## sqlez
+
+- `Connection::exec` prepares a single statement at a time. Multi-statement schema strings (e.g. `CREATE TABLE …; CREATE INDEX …;`) silently drop everything after the first `;`. Split into separate exec calls per statement, or use a real migration. The reference pattern is in `crates/agent/src/db.rs`.
+- `select_bound::<Args, (Col1, Col2, …)>(SQL)` returns a closure; invoke it with the bound args to get `Vec<tuple>`. Map to your domain type after.
+
+## Cargo dev-deps gotcha
+
+- This crate's dev-deps enable `project/test-support`, which transitively pulls `remote/test-support`, which adds the `RemoteConnectionIdentity::Mock` enum variant. `crates/workspace/src/persistence.rs` only handles that variant under its own `#[cfg(any(test, feature = "test-support"))]` gate. Without `workspace/test-support` enabled too, `cargo test -p solution_agent` fails to compile the `workspace` crate. Workaround: keep `workspace = { workspace = true, features = ["test-support"] }` in `[dev-dependencies]`. This is an upstream-or-fork bug — not specific to this crate.
+
+## Sessions and the pool
+
+- The pool key is `(SolutionId, AgentServerId)`, **not** per-session. Sessions multiplex over one subprocess via ACP `SessionId`. See `pool.rs::SHUTDOWN_DEBOUNCE` (60 s).
+- `Rc<dyn AgentConnection>` is `!Send`. `cx.background_executor().spawn(...)` won't compile when crossing the connection — use foreground `cx.spawn` instead. The pool lives on the foreground thread.
+- `SolutionSession.acp_thread` is `Option<Entity<AcpThread>>`, **not** `Entity<AcpThread>`. The lazy ACP `new_session` future means there's a real "session exists, thread not yet built" window.
+- `create_session(solution_id, agent_id, project, cx)` takes the `project` as a parameter (Plan B from spec). Pass the workspace's project — synthetic single-worktree projects per session were rejected as too coupled to `Arc<Client>` / `UserStore` / etc.
+
+## MCP
+
+- Tool imports come from `context_server::listener::{McpServerTool, ToolResponse}` and `context_server::types::ToolResponseContent`, **not** `editor_mcp::*`. `editor_mcp` only re-exports `register_tool` + `emit_notification` + the `set_runtime_dir_for_test` helpers.
+- `AsyncApp::update(...)` returns `R` directly, **not** `Result<R>`. Don't `?` it. (`WeakEntity::update` does return `Result<R>` — be careful which one you have.)
+- Empty-input MCP tools need a custom `Deserialize` that tolerates a missing or `null` `arguments` field. See `ListSessionsParams` for the canonical pattern (delegate to a private `Helper` struct, default on parse error).
+- E2E tests **must** call `editor_mcp::set_runtime_dir_for_test(tempdir)` before `editor_mcp::init` and `start_server`. Without it, tests collide with the user's real `~/.config/spk-editor/mcp.{lock,sock}`. Cargo's `tests/` convention runs each `tests/*.rs` as a separate binary — keep one e2e scenario per file because `start_server` binds the runtime-dir socket once per process.
+
+## Event prefixes
+
+- All MCP events from this crate use `agent_session_*`, **not** `session_*`. Defensive namespacing against future subsystems emitting similar event names.

@@ -3,11 +3,23 @@ use settings::{RegisterSetting, Settings, SettingsContent};
 
 #[derive(Copy, Clone, Debug, RegisterSetting)]
 pub struct TitleBarSettings {
+    // SPK Editor fork: the project-info chain (project name +
+    // worktree/branch) is replaced by the solution-tab strip in the
+    // title bar (see Phase 2 Task 8) and by the active-solution +
+    // branch surface in the fork status bar (Phase 2 Task 9). These
+    // settings no longer have a render site to gate, but we keep
+    // them on the struct to avoid breaking users' existing
+    // `settings.json` `title_bar` blocks.
+    #[allow(dead_code)]
     pub show_branch_status_icon: bool,
     pub show_onboarding_banner: bool,
     pub show_user_picture: bool,
+    #[allow(dead_code)]
     pub show_branch_name: bool,
+    #[allow(dead_code)]
     pub show_project_items: bool,
+    // Sign-in UI is hidden in spk-editor — Zed accounts are not used.
+    #[allow(dead_code)]
     pub show_sign_in: bool,
     pub show_user_menu: bool,
     pub show_menus: bool,

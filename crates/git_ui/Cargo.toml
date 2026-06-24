@@ -25,8 +25,10 @@ buffer_diff.workspace = true
 call = { workspace = true, optional = true }
 collections.workspace = true
 component.workspace = true
+context_server.workspace = true
 db.workspace = true
 editor.workspace = true
+editor_mcp.workspace = true
 file_icons.workspace = true
 fs.workspace = true
 futures.workspace = true
@@ -34,10 +36,12 @@ futures-lite.workspace = true
 fuzzy.workspace = true
 fuzzy_nucleo.workspace = true
 git.workspace = true
+git_conflict_ui.workspace = true
+paths.workspace = true
 gpui.workspace = true
 itertools.workspace = true
 language.workspace = true
-language_model.workspace = true
+lsp.workspace = true
 linkify.workspace = true
 log.workspace = true
 markdown.workspace = true
@@ -45,12 +49,17 @@ menu.workspace = true
 multi_buffer.workspace = true
 notifications.workspace = true
 panel.workspace = true
+parking_lot.workspace = true
 picker.workspace = true
 project.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
 rand.workspace = true
+<<<<<<< ours
 release_channel.workspace = true
+=======
+regex.workspace = true
+>>>>>>> theirs
 remote_connection.workspace = true
 remote.workspace = true
 schemars.workspace = true
@@ -59,9 +68,18 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 smallvec.workspace = true
+<<<<<<< ours
 strum.workspace = true
 sysinfo.workspace = true
 task.workspace = true
+=======
+solution_agent.workspace = true
+solutions.workspace = true
+solutions_ui.workspace = true
+strum.workspace = true
+task.workspace = true
+tempfile.workspace = true
+>>>>>>> theirs
 telemetry.workspace = true
 terminal.workspace = true
 theme.workspace = true
@@ -77,13 +95,22 @@ zed_actions.workspace = true
 zeroize.workspace = true
 ztracing.workspace = true
 tracing.workspace = true
+<<<<<<< ours
 
+=======
+uuid.workspace = true
+>>>>>>> theirs
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
 [dev-dependencies]
 ctor.workspace = true
 db = { workspace = true, features = ["test-support"] }
+<<<<<<< ours
+=======
+git_hosting_providers.workspace = true
+tempfile.workspace = true
+>>>>>>> theirs
 editor = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 git = { workspace = true, features = ["test-support"] }
@@ -93,7 +120,11 @@ pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
 rand.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+<<<<<<< ours
 task.workspace = true
+=======
+smol.workspace = true
+>>>>>>> theirs
 unindent.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
 zlog.workspace = true

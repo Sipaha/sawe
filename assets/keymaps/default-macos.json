@@ -149,8 +149,14 @@
       "cmd-'": "editor::ToggleSelectedDiffHunks",
       "cmd-\"": "editor::ExpandAllDiffHunks",
       "cmd-alt-g b": "git::Blame",
+      // S-ANN — second binding, IDEA-style. The `cmd-alt-a` chord is
+      // also bound to `agent::OpenPermissionDropdown` but only inside
+      // the `AgentPanel` context, so the editor-level binding here
+      // doesn't shadow anything practical.
+      "cmd-alt-a": "git::Blame",
       "cmd-alt-g m": "git::OpenModifiedFiles",
       "cmd-alt-g r": "git::ReviewDiff",
+      "cmd-k cmd-h": "git::FileHistory",
       "cmd-i": "editor::ShowSignatureHelp",
       "f9": "editor::ToggleBreakpoint",
       "shift-f9": "editor::EditLogBreakpoint",
@@ -286,6 +292,16 @@
       "escape": "menu::Cancel",
       "enter": "menu::Confirm",
       "alt-enter": "editor::Newline",
+    },
+  },
+  {
+    // See linux keymap: Enter sends, Shift+Enter newlines in the Solution-agent
+    // chat compose box.
+    "context": "SolutionSessionView > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "menu::Confirm",
+      "shift-enter": "editor::Newline",
     },
   },
   {
@@ -672,6 +688,7 @@
       "ctrl-cmd-o": ["projects::OpenRemote", { "from_existing_connection": false }],
       "ctrl-cmd-shift-o": ["projects::OpenRemote", { "from_existing_connection": true }],
       "cmd-ctrl-b": "branches::OpenRecent",
+      "cmd-shift-`": "git::BranchesPopupOpen",
       "cmd-ctrl-w": "git::Worktree",
       "ctrl-~": "workspace::NewTerminal",
       "cmd-s": "workspace::Save",
@@ -679,7 +696,7 @@
       "alt-shift-enter": "toast::RunAction",
       "cmd-shift-s": "workspace::SaveAs",
       "cmd-shift-n": "workspace::NewWindow",
-      "ctrl-`": "terminal_panel::Toggle",
+      "ctrl-`": "console_panel::ToggleFocus",
       "cmd-1": ["workspace::ActivatePane", 0],
       "cmd-2": ["workspace::ActivatePane", 1],
       "cmd-3": ["workspace::ActivatePane", 2],
@@ -691,6 +708,7 @@
       "cmd-9": ["workspace::ActivatePane", 8],
       "cmd-b": "workspace::ToggleLeftDock",
       "cmd-alt-b": "workspace::ToggleRightDock",
+      "cmd-alt-o": "solutions::OpenSolution",
       "cmd-r": "workspace::ToggleRightDock",
       "cmd-j": "workspace::ToggleBottomDock",
       "cmd-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
@@ -737,6 +755,11 @@
       "cmd-shift-x": "zed::Extensions",
       "f5": "debugger::Rerun",
       "cmd-w": "workspace::CloseActiveDock",
+      // Run configurations (IntelliJ-style; alt-shift variants avoid conflicts
+      // with shift-f9/cmd-f2 which are already bound in Editor context).
+      "alt-shift-f10": "run_config::Run",
+      "alt-shift-f9": "run_config::Debug",
+      "alt-shift-f2": "run_config::Stop",
     },
   },
   {
@@ -1459,7 +1482,6 @@
       "cmd-0": ["zed::ResetUiFontSize", { "persist": false }],
       "cmd-enter": "onboarding::Finish",
       "alt-tab": "onboarding::SignIn",
-      "alt-shift-a": "onboarding::OpenAccount",
     },
   },
   {
@@ -1471,11 +1493,6 @@
       "cmd-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "cmd--": ["zed::DecreaseUiFontSize", { "persist": false }],
       "cmd-0": ["zed::ResetUiFontSize", { "persist": false }],
-      "cmd-1": ["welcome::OpenRecentProject", 0],
-      "cmd-2": ["welcome::OpenRecentProject", 1],
-      "cmd-3": ["welcome::OpenRecentProject", 2],
-      "cmd-4": ["welcome::OpenRecentProject", 3],
-      "cmd-5": ["welcome::OpenRecentProject", 4],
     },
   },
   {
@@ -1637,6 +1654,7 @@
     },
   },
   {
+<<<<<<< ours
     "context": "GitGraph",
     "bindings": {
       "tab": "git_graph::FocusNextTabStop",
@@ -1668,6 +1686,22 @@
       "cmd-enter": "skill_creator::SaveSkill",
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
+=======
+    "context": "SolutionSessionView",
+    "bindings": {
+      "cmd-f": "solution_agent::FindInSession",
+      "cmd-shift-v": "solution_agent::PasteWithoutFormatting",
+      "escape": "solution_agent::StopResponse",
+    },
+  },
+  {
+    "context": "SolutionSessionFindEditor",
+    "bindings": {
+      "enter": "solution_agent::FindNextMatch",
+      "shift-enter": "solution_agent::FindPreviousMatch",
+      "escape": "solution_agent::FindClose",
+      "cmd-f": "solution_agent::FindInSession",
+>>>>>>> theirs
     },
   },
 ]
