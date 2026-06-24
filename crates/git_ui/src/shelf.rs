@@ -56,7 +56,7 @@ pub struct ShelfView {
 impl ShelfView {
     pub fn deploy(
         workspace: &mut Workspace,
-        _: &git::Shelf,
+        _: &crate::fork_actions::Shelf,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {

@@ -19,6 +19,10 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: platform_default
     pub text_rendering_mode: Option<TextRenderingMode>,
+    /// Layout mode for the bottom dock
+    ///
+    /// Default: contained
+    pub bottom_dock_layout: Option<BottomDockLayout>,
     /// Direction to split horizontally.
     ///
     /// Default: "up"
@@ -300,6 +304,32 @@ pub struct ActivePaneModifiers {
     /// Default: `1.0`
     #[schemars(range(min = 0.0, max = 1.0))]
     pub inactive_opacity: Option<InactiveOpacity>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BottomDockLayout {
+    /// Contained between the left and right docks
+    #[default]
+    Contained,
+    /// Takes up the full width of the window
+    Full,
+    /// Extends under the left dock while snapping to the right dock
+    LeftAligned,
+    /// Extends under the right dock while snapping to the left dock
+    RightAligned,
 }
 
 #[derive(

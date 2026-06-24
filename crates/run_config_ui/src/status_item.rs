@@ -1,10 +1,10 @@
-use gpui::{Context, Entity, IntoElement, Render, SharedString, Subscription, Window};
+use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Subscription, Window};
 use run_config::{RunConfigId, RunConfigStore};
 use ui::{
     Button, ButtonStyle, ContextMenu, Icon, IconName, IconSize, PopoverMenu, PopoverMenuHandle,
     prelude::*,
 };
-use workspace::{StatusItemView, item::ItemHandle};
+use workspace::{HideStatusItem, StatusItemView, item::ItemHandle};
 
 use crate::run_controller::{ActiveRunKind, RunController, RunControllerEvent};
 
@@ -100,6 +100,10 @@ impl StatusItemView for RunStatusItem {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        None
     }
 }
 

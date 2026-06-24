@@ -25,7 +25,7 @@ mod editor_settings;
 mod element;
 mod fold;
 mod folding_ranges;
-mod git;
+pub mod git;
 mod highlight_matching_bracket;
 pub mod hover_links;
 pub mod hover_popover;

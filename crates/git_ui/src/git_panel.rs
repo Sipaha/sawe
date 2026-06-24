@@ -47,7 +47,8 @@ use language::{Buffer, File};
 use menu;
 use multi_buffer::ExcerptBoundaryInfo;
 use notifications::status_toast::StatusToast;
-use panel::{PanelHeader, panel_button, panel_filled_button, panel_icon_button};
+use crate::panel_buttons::{panel_button, panel_filled_button, panel_icon_button};
+use panel::PanelHeader;
 use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
@@ -5628,7 +5629,7 @@ impl GitPanel {
         // Kick off the git log fetch so data is ready when the user switches to History.
         // graph_data() is idempotent — if already loading/loaded, this is a no-op.
         active_repository.update(cx, |repository, cx| {
-            repository.graph_data(log_source, log_order, 0..0, cx);
+            repository.graph_data(log_source, log_order, Vec::new(), Vec::new(), 0..0, cx);
         });
     }
 
@@ -5671,7 +5672,8 @@ impl GitPanel {
         let log_order = LogOrder::DateOrder;
 
         self.commit_history_shas = Some(active_repository.update(cx, |repository, cx| {
-            let response = repository.graph_data(log_source, log_order, 0..usize::MAX, cx);
+            let response =
+                repository.graph_data(log_source, log_order, Vec::new(), Vec::new(), 0..usize::MAX, cx);
             response.commits.iter().map(|commit| commit.sha).collect()
         }));
     }

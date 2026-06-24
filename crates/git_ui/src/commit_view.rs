@@ -1468,6 +1468,10 @@ impl Item for CommitView {
                 let project = project.clone();
                 let workspace_entity = workspace_entity.clone();
                 let multibuffer = multibuffer.clone();
+                // Reborrow `window` so the `move` closure consumes the reborrow
+                // (which ends when `cx.new` returns) rather than the caller's
+                // `&mut Window`, leaving it usable afterwards.
+                let window = &mut *window;
                 move |cx| {
                     let editor = SplittableEditor::new(
                         diff_view_style,
@@ -1548,13 +1552,13 @@ impl Render for CommitView {
         // Single-file diff mode — just the diff editor, no commit metadata.
         if self.single_file.is_some() {
             return base.when(!self.editor.read(cx).rhs_editor().read(cx).is_empty(cx), |this| {
-                this.child(div().flex_grow().child(self.editor.clone()))
+                this.child(div().flex_grow(1.).child(self.editor.clone()))
             });
         }
 
         base.child(self.render_metadata_panel(window, cx))
             .when(!self.editor.read(cx).rhs_editor().read(cx).is_empty(cx), |this| {
-                this.child(div().flex_grow().child(self.editor.clone()))
+                this.child(div().flex_grow(1.).child(self.editor.clone()))
             })
             .child(self.render_inline_footer(cx))
     }

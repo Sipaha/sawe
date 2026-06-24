@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context as _, Result, anyhow};
-use gpui::{App, AppContext as _, Context, Entity, Task, WindowHandle};
+use gpui::{App, AppContext as _, Context, Entity, Task, TaskExt as _, WindowHandle};
 use project::git_store::Repository;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -87,7 +87,11 @@ pub fn show_at_revision(
 ) -> Task<Result<WindowHandle<MultiWorkspace>>> {
     let app_state = workspace.app_state().clone();
     let source_repo_path = repo.read(cx).work_directory_abs_path.to_path_buf();
-    let original_repo_path = repo.read(cx).original_repo_abs_path.to_path_buf();
+    // The re-fork's `Repository` no longer carries the donor's
+    // `original_repo_abs_path` field; for a normal checkout it equalled
+    // `work_directory_abs_path`, which is all we need to derive the
+    // snapshot's display name.
+    let original_repo_path = source_repo_path.clone();
 
     cx.spawn(async move |_workspace_handle, cx| {
         // Pre-check: bare-repo source. `git worktree add` against a
@@ -311,7 +315,7 @@ pub fn cleanup_orphan_worktrees_in(root: &Path, older_than_hours: u32) {
     }
 }
 
-/// Workspace action handler for `git::ShowAtRevision { sha }`. Picks
+/// Workspace action handler for `crate::fork_actions::ShowAtRevision { sha }`. Picks
 /// the workspace's active repository and dispatches to
 /// [`show_at_revision`].
 pub fn show_at_revision_action(
@@ -322,7 +326,7 @@ pub fn show_at_revision_action(
 ) {
     let project = workspace.project().clone();
     let Some(repo) = project.read(cx).active_repository(cx) else {
-        log::warn!("git::ShowAtRevision: no active repository");
+        log::warn!("crate::fork_actions::ShowAtRevision: no active repository");
         return;
     };
     show_at_revision(workspace, repo, sha, window, cx).detach_and_log_err(cx);

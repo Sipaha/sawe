@@ -4,7 +4,7 @@
 use gpui::{AnyElement, ParentElement, Styled, Window, prelude::*};
 use ui::{Tooltip, prelude::*};
 
-use crate::git_panel::OpenAtCommit;
+use crate::git_graph::OpenAtCommit;
 
 pub(crate) fn render_parents_bar(parents: &[SharedString]) -> Option<AnyElement> {
     if parents.is_empty() {

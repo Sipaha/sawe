@@ -285,7 +285,8 @@ fn delete_branch(ctx: BranchContext, cx: &mut App) {
         // `Repository::delete_branch` path — we don't backup-ref remote
         // refs, since the remote retains them.
         cx.spawn(async move |cx| {
-            let recv = repo.update(cx, |repo, _| repo.delete_branch(true, branch.to_string()));
+            let recv =
+                repo.update(cx, |repo, _| repo.delete_branch(true, branch.to_string(), false));
             recv.await??;
             anyhow::Ok(())
         })

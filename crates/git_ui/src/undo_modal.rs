@@ -1,6 +1,6 @@
 //! S-BAK undo modal — list recent destructive ops + offer one-click rollback.
 //!
-//! Triggered by the `git::UndoLast` action (registered on `Workspace`).
+//! Triggered by the `crate::fork_actions::UndoLast` action (registered on `Workspace`).
 //! Reads from [`git::undo_registry`], filtered to entries from the active
 //! repository in the last 24 hours.
 
@@ -229,14 +229,14 @@ fn format_relative(seconds_ago: i64) -> String {
 }
 
 pub fn register(workspace: &mut Workspace) {
-    workspace.register_action(|workspace, _: &git::UndoLast, window, cx| {
+    workspace.register_action(|workspace, _: &crate::fork_actions::UndoLast, window, cx| {
         let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
-            log::info!("git::UndoLast: no active repository");
+            log::info!("crate::fork_actions::UndoLast: no active repository");
             return;
         };
         workspace.toggle_modal(window, cx, |window, cx| UndoModal::new(repo, window, cx));
     });
-    workspace.register_action(|workspace, action: &git::CleanupBackups, _window, cx| {
+    workspace.register_action(|workspace, action: &crate::fork_actions::CleanupBackups, _window, cx| {
         let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
             return;
         };
@@ -244,8 +244,8 @@ pub fn register(workspace: &mut Workspace) {
         let days = action.older_than_days;
         cx.background_spawn(async move {
             match git::backup::cleanup(&work_dir, days) {
-                Ok(n) => log::info!("git::CleanupBackups: removed {n} backup-refs"),
-                Err(err) => log::warn!("git::CleanupBackups: {err}"),
+                Ok(n) => log::info!("crate::fork_actions::CleanupBackups: removed {n} backup-refs"),
+                Err(err) => log::warn!("crate::fork_actions::CleanupBackups: {err}"),
             }
         })
         .detach();

@@ -11,6 +11,8 @@ use workspace::{Toast, notifications::NotificationId};
 mod backup_mcp;
 mod blame_ui;
 pub mod clone;
+pub mod fork_actions;
+mod panel_buttons;
 pub mod commit_context_menu;
 pub mod credentials;
 pub mod handlers;
@@ -117,13 +119,13 @@ pub fn init(cx: &mut App) {
         shelf::register(workspace);
 
         workspace.register_action(
-            |workspace, action: &git::InteractiveRebaseFromHere, window, cx| {
+            |workspace, action: &crate::fork_actions::InteractiveRebaseFromHere, window, cx| {
                 interactive_rebase_action(workspace, action.sha.clone(), window, cx);
             },
         );
         // S-SAR — open a snapshot of the active repository at `sha`
         // in a new top-level workspace window.
-        workspace.register_action(|workspace, action: &git::ShowAtRevision, window, cx| {
+        workspace.register_action(|workspace, action: &crate::fork_actions::ShowAtRevision, window, cx| {
             handlers::show_at_revision::show_at_revision_action(
                 workspace,
                 action.sha.clone(),
@@ -131,10 +133,10 @@ pub fn init(cx: &mut App) {
                 cx,
             );
         });
-        workspace.register_action(|workspace, _: &git::ApplyPatchFromFile, window, cx| {
+        workspace.register_action(|workspace, _: &crate::fork_actions::ApplyPatchFromFile, window, cx| {
             handlers::patch::apply_patch_from_file_action(workspace, window, cx);
         });
-        workspace.register_action(|workspace, _: &git::ApplyPatchFromClipboard, window, cx| {
+        workspace.register_action(|workspace, _: &crate::fork_actions::ApplyPatchFromClipboard, window, cx| {
             handlers::patch::apply_patch_from_clipboard_action(workspace, window, cx);
         });
         workspace.register_action(
@@ -359,7 +361,7 @@ fn interactive_rebase_action(
 ) {
     let project = workspace.project().clone();
     let Some(repo) = project.read(cx).active_repository(cx) else {
-        log::warn!("git::InteractiveRebaseFromHere: no active repository");
+        log::warn!("crate::fork_actions::InteractiveRebaseFromHere: no active repository");
         return;
     };
     let workspace_handle = cx.entity();
@@ -372,7 +374,7 @@ fn interactive_rebase_action(
             })
             .await;
         if let Err(err) = ancestry {
-            log::warn!("git::InteractiveRebaseFromHere: refused — {err}");
+            log::warn!("crate::fork_actions::InteractiveRebaseFromHere: refused — {err}");
             return Ok(());
         }
         cx.update(|window, cx| {

@@ -354,7 +354,7 @@ fn build_show_submenu(menu: ContextMenu, ctx: CommitContext) -> ContextMenu {
     } else {
         menu.entry("Show Repository at Revision", None, move |window, cx| {
             window.dispatch_action(
-                Box::new(git::ShowAtRevision {
+                Box::new(crate::fork_actions::ShowAtRevision {
                     sha: sha_for_sar.clone(),
                 }),
                 cx,
@@ -543,7 +543,9 @@ fn run_delete_branch(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let recv = repo.update(cx, |repo, _| repo.delete_branch(false, branch.to_string()));
+    let recv = repo.update(cx, |repo, _| {
+        repo.delete_branch(false, branch.to_string(), false)
+    });
     await_repo_recv(
         recv,
         "delete branch was canceled",
@@ -966,7 +968,7 @@ fn run_fixup_with_previous(ctx: CommitContext, window: &mut Window, cx: &mut App
 
 fn open_interactive_rebase(ctx: CommitContext, window: &mut Window, cx: &mut App) {
     let sha = ctx.sha.to_string();
-    window.dispatch_action(Box::new(git::InteractiveRebaseFromHere { sha }), cx);
+    window.dispatch_action(Box::new(crate::fork_actions::InteractiveRebaseFromHere { sha }), cx);
 }
 
 fn open_edit_message_prompt(ctx: CommitContext, window: &mut Window, cx: &mut App) {

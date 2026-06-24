@@ -78,11 +78,11 @@ pub struct StashesView {
 }
 
 impl StashesView {
-    /// Action handler for `git::Stashes` — finds (or creates) the
+    /// Action handler for `crate::fork_actions::Stashes` — finds (or creates) the
     /// Stashes pane item in the active pane and activates it.
     pub fn deploy(
         workspace: &mut Workspace,
-        _: &git::Stashes,
+        _: &crate::fork_actions::Stashes,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {

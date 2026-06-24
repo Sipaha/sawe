@@ -6,7 +6,10 @@ use anyhow::anyhow;
 use collections::{HashMap, HashSet};
 use console_panel::ConsolePanel;
 use dap::client::SessionId;
-use gpui::{Action as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window};
+use gpui::{
+    Action as _, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _, WeakEntity,
+    Window,
+};
 use project::Project;
 use project::debugger::dap_store::{DapStore, DapStoreEvent};
 use run_config::{
@@ -700,7 +703,7 @@ impl RunController {
         log::error!("run configuration error: {message}");
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
-                workspace.show_error(&anyhow!(message), cx);
+                workspace.show_error(anyhow!(message), cx);
             });
         }
     }

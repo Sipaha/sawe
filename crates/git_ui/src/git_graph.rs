@@ -1575,7 +1575,7 @@ impl GitGraph {
         cx: &mut Context<Self>,
     ) {
         match event {
-            RepositoryEvent::GraphEvent((source, order), event)
+            RepositoryEvent::GraphEvent((source, order, _extra_args, _extra_paths), event)
                 if source == &self.log_source && order == &self.log_order =>
             {
                 match event {
@@ -1584,7 +1584,7 @@ impl GitGraph {
                             self.pending_select_sha.take().and_then(|oid| {
                                 repository
                                     .read(cx)
-                                    .get_graph_data(source.clone(), *order)
+                                    .get_graph_data(source.clone(), *order, &[], &[])
                                     .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
                             })
                         {
@@ -1614,13 +1614,15 @@ impl GitGraph {
                                 } = repository.graph_data(
                                     source.clone(),
                                     *order,
+                                    Vec::new(),
+                                    Vec::new(),
                                     old_count..*commit_count,
                                     cx,
                                 );
                                 self.graph_data.add_commits(commits);
 
                                 let pending_sha_index = self.pending_select_sha.and_then(|oid| {
-                                    repository.get_graph_data(source.clone(), *order).and_then(
+                                    repository.get_graph_data(source.clone(), *order, &[], &[]).and_then(
                                         |data| data.commit_oid_to_index.get(&oid).copied(),
                                     )
                                 });
@@ -1665,7 +1667,7 @@ impl GitGraph {
         if let Some(repository) = self.get_repository(cx) {
             repository.update(cx, |repository, cx| {
                 let commits = repository
-                    .graph_data(self.log_source.clone(), self.log_order, 0..usize::MAX, cx)
+                    .graph_data(self.log_source.clone(), self.log_order, Vec::new(), Vec::new(), 0..usize::MAX, cx)
                     .commits;
                 self.graph_data.add_commits(commits);
             });
@@ -2263,7 +2265,7 @@ impl GitGraph {
 
             let Some(index) = selected_repository
                 .read(cx)
-                .get_graph_data(this.log_source.clone(), this.log_order)
+                .get_graph_data(this.log_source.clone(), this.log_order, &[], &[])
                 .and_then(|data| data.commit_oid_to_index.get(&oid))
                 .copied()
             else {
@@ -3651,7 +3653,7 @@ impl GitGraph {
                     .map(|repository| {
                         repository.update(cx, |repository, cx| {
                             repository
-                                .graph_data(self.log_source.clone(), self.log_order, 0..0, cx)
+                                .graph_data(self.log_source.clone(), self.log_order, Vec::new(), Vec::new(), 0..0, cx)
                                 .is_loading
                         })
                     })
@@ -3670,6 +3672,8 @@ impl GitGraph {
                         } = repository.graph_data(
                             self.log_source.clone(),
                             self.log_order,
+                            Vec::new(),
+                            Vec::new(),
                             0..usize::MAX,
                             cx,
                         );
@@ -3732,7 +3736,7 @@ impl Render for GitGraph {
 
         let error = self.get_repository(cx).and_then(|repo| {
             repo.read(cx)
-                .get_graph_data(self.log_source.clone(), self.log_order)
+                .get_graph_data(self.log_source.clone(), self.log_order, &[], &[])
                 .and_then(|data| data.error.clone())
         });
 
@@ -5210,12 +5214,12 @@ mod tests {
         });
 
         repository.update(cx, |repo, cx| {
-            repo.graph_data(LogSource::default(), LogOrder::default(), 0..usize::MAX, cx);
+            repo.graph_data(LogSource::default(), LogOrder::default(), Vec::new(), Vec::new(), 0..usize::MAX, cx);
         });
         cx.run_until_parked();
 
         let graph_commits: Vec<Arc<InitialGraphCommitData>> = repository.update(cx, |repo, cx| {
-            repo.graph_data(LogSource::default(), LogOrder::default(), 0..usize::MAX, cx)
+            repo.graph_data(LogSource::default(), LogOrder::default(), Vec::new(), Vec::new(), 0..usize::MAX, cx)
                 .commits
                 .to_vec()
         });
@@ -5328,7 +5332,7 @@ mod tests {
         });
 
         repository.update(cx, |repo, cx| {
-            repo.graph_data(LogSource::default(), LogOrder::default(), 0..usize::MAX, cx);
+            repo.graph_data(LogSource::default(), LogOrder::default(), Vec::new(), Vec::new(), 0..usize::MAX, cx);
         });
 
         project
@@ -5346,7 +5350,7 @@ mod tests {
             "initial repository scan should emit HeadChanged"
         );
         let commit_count_after = repository.read_with(cx, |repo, _| {
-            repo.get_graph_data(LogSource::default(), LogOrder::default())
+            repo.get_graph_data(LogSource::default(), LogOrder::default(), &[], &[])
                 .map(|data| data.commit_data.len())
                 .unwrap()
         });
@@ -5385,13 +5389,13 @@ mod tests {
         });
 
         repository.update(cx, |repo, cx| {
-            repo.graph_data(LogSource::default(), LogOrder::default(), 0..usize::MAX, cx);
+            repo.graph_data(LogSource::default(), LogOrder::default(), Vec::new(), Vec::new(), 0..usize::MAX, cx);
         });
 
         cx.run_until_parked();
 
         let error = repository.read_with(cx, |repo, _| {
-            repo.get_graph_data(LogSource::default(), LogOrder::default())
+            repo.get_graph_data(LogSource::default(), LogOrder::default(), &[], &[])
                 .and_then(|data| data.error.clone())
         });
 
