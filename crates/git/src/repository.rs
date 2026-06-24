@@ -6,6 +6,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::Sender;
 use collections::HashMap;
 use futures::channel::oneshot;
+use futures::future;
 use futures::future::BoxFuture;
 use futures::io::BufWriter;
 use futures::{AsyncWriteExt, FutureExt as _, select_biased};
@@ -2358,7 +2359,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                git_binary?.run(&["branch", &name, &sha]).await?;
+                git_binary.run(&["branch", &name, &sha]).await?;
                 anyhow::Ok(())
             })
             .boxed()
@@ -2373,7 +2374,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 if let Some(message) = message {
                     git.run(&["tag", "-a", "-m", &message, &name, &sha]).await?;
                 } else {
@@ -2388,7 +2389,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                git_binary?.run(&["checkout", &sha]).await?;
+                git_binary.run(&["checkout", &sha]).await?;
                 anyhow::Ok(())
             })
             .boxed()
@@ -2398,7 +2399,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let output = git_binary?.run(&["status", "--porcelain"]).await?;
+                let output = git_binary.run(&["status", "--porcelain"]).await?;
                 Ok(!output.trim().is_empty())
             })
             .boxed()
@@ -2408,7 +2409,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 // Step 1: capture `git show <sha>`. We don't pipe directly
                 // into `git patch-id`'s stdin because `util::command::Child`
                 // smol-process stdout is not `Into<Stdio>` on all targets.
@@ -2460,7 +2461,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                git_binary?
+                git_binary
                     .run(&["branch", "-u", &upstream, &branch])
                     .await?;
                 anyhow::Ok(())
@@ -2472,7 +2473,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                git_binary?.run(&["tag", "-d", &name]).await?;
+                git_binary.run(&["tag", "-d", &name]).await?;
                 anyhow::Ok(())
             })
             .boxed()
@@ -2482,7 +2483,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                git_binary?.run(&["push", &remote, &tag]).await?;
+                git_binary.run(&["push", &remote, &tag]).await?;
                 anyhow::Ok(())
             })
             .boxed()
@@ -2492,7 +2493,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                git_binary?
+                git_binary
                     .run(&["push", &remote, "--delete", &format!("refs/tags/{tag}")])
                     .await?;
                 anyhow::Ok(())
@@ -2504,7 +2505,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let output = git
                     .build_command(&["tag", "--sort=-taggerdate", "--format=%(refname:short)"])
                     .output()
@@ -2527,7 +2528,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let output = git
                     .build_command(&["for-each-ref", "--format=%(refname:short)", "refs/tags"])
                     .output()
@@ -2786,7 +2787,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let mut args: Vec<String> = vec!["stash".into(), "push".into()];
                 if include_untracked {
                     args.push("--include-untracked".into());
@@ -2820,7 +2821,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let output = git
                     .build_command(&["stash", "branch", &name, &stash_ref])
                     .envs(env.iter())
@@ -2844,7 +2845,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let output = git
                     .build_command(&["stash", "show", "-p", "--no-color", &stash_ref])
                     .envs(env.iter())
@@ -2868,7 +2869,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let output = git
                     .build_command(&[
                         "stash",
@@ -3243,7 +3244,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let output = git
                     .build_command(&[
                         "branch",
@@ -3271,7 +3272,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let output = git
                     .build_command(&["tag", "--contains", &sha])
                     .output()
@@ -3298,12 +3299,12 @@ impl GitRepository for RealGitRepository {
         if parent_index <= 1 {
             return self.load_commit(commit, cx);
         }
-        if self.repository.lock().workdir().is_none() {
+        if self.working_directory.is_none() {
             return future::ready(Err(anyhow!("no working directory"))).boxed();
         }
         let git_binary = self.git_binary();
         cx.background_spawn(async move {
-            let git = git_binary?;
+            let git = git_binary;
             let parent_ref = format!("{}^{}", commit, parent_index);
             // Re-use the same `name-status -z` parsing the first-parent path
             // already exercises, but force the comparison against `<sha>^N`.
@@ -3682,7 +3683,7 @@ impl GitRepository for RealGitRepository {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
-                let git = git_binary?;
+                let git = git_binary;
                 let stdout = git.run_raw(&["shortlog", "-sne", "--all"]).await?;
                 Ok(parse_shortlog_output(&stdout))
             })

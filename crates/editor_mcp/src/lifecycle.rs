@@ -2,7 +2,7 @@
 use anyhow::{Context as _, Result};
 use context_server::listener::McpServer;
 use fs2::FileExt;
-use gpui::{App, AppContext as _, Entity, Global};
+use gpui::{App, AppContext as _, Entity, Global, TaskExt as _};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

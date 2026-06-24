@@ -38,7 +38,6 @@ impl FsWatcher {
         executor: BackgroundExecutor,
         tx: async_channel::Sender<()>,
         pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
-        mode: WatcherMode,
     ) -> Self {
         Self {
             executor,
@@ -521,7 +520,7 @@ fn is_covered_rescan(kind: Option<PathEventKind>, path: &Path, ancestor: &Path) 
 pub struct WatcherRegistrationId(u32);
 
 struct WatcherRegistrationState {
-    callback: Arc<dyn for<'a> Fn(Result<&'a notify::Event, &'a notify::Error>) + Send + Sync>,
+    callback: Arc<dyn Fn(&notify::Event) + Send + Sync>,
     path: Arc<std::path::Path>,
     mode: WatcherMode,
 }

@@ -48,6 +48,14 @@ impl PlatformHeadlessRenderer for WgpuHeadlessRenderer {
         self.inner.render_to_image(scene)
     }
 
+    fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
+        // Grow the offscreen target to the caller's size (matching
+        // `render_scene_to_image`), then encode + submit the scene without
+        // reading the pixels back.
+        self.inner.update_drawable_size(size);
+        self.inner.render_scene(scene)
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.inner.sprite_atlas().clone()
     }

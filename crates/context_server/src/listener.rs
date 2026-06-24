@@ -316,7 +316,9 @@ impl McpServer {
             },
             server_info: Implementation {
                 name: "spk-editor".into(),
+                title: None,
                 version: env!("CARGO_PKG_VERSION").into(),
+                description: None,
             },
             meta: None,
         };

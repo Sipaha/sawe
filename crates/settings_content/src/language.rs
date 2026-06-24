@@ -309,32 +309,6 @@ pub enum EditPredictionDataCollectionChoice {
     No,
 }
 
-/// Controls whether Zed collects training data when using Zed's Edit Predictions.
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Default,
-    Eq,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    JsonSchema,
-    MergeFrom,
-    strum::VariantArray,
-    strum::VariantNames,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum EditPredictionDataCollectionChoice {
-    /// Use the preference previously set via the status-bar toggle, or false
-    /// if no preference has been stored.
-    #[default]
-    Default,
-    /// Allow Zed to collect training data from open-source projects.
-    Yes,
-    /// Never allow training data collection.
-    No,
-}
 
 /// The mode in which edit predictions should be displayed.
 #[derive(
