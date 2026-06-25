@@ -705,6 +705,7 @@ mod tests {
                 acp_thread::AgentThreadEntry::AssistantMessage(_) => "assistant",
                 acp_thread::AgentThreadEntry::ToolCall(_) => "tool_call",
                 acp_thread::AgentThreadEntry::CompletedPlan(_) => "plan",
+                acp_thread::AgentThreadEntry::ContextCompaction(_) => "compaction",
             })
             .collect();
         assert_eq!(roles, vec!["user", "assistant"]);

@@ -11,7 +11,8 @@ use git::{
     Oid, RunHook,
     blame::Blame,
     repository::{
-        AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
+        AskPassDelegate, AuthorHistoryEntry, Branch, CommitData, CommitDataReader, CommitDetails,
+        CommitOptions,
         CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
         GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
         PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
@@ -1431,10 +1432,16 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn author_history(&self) -> BoxFuture<'_, Result<Vec<AuthorHistoryEntry>>> {
+        async move { Ok(Vec::new()) }.boxed()
+    }
+
     fn initial_graph_data(
         &self,
         _log_source: LogSource,
         _log_order: LogOrder,
+        _extra_args: Vec<String>,
+        _extra_paths: Vec<String>,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
         let fs = self.fs.clone();

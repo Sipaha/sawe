@@ -657,7 +657,12 @@ async fn send_while_waiting_for_confirmation_unblocks_the_turn(cx: &mut TestAppC
                 ),
             ]);
             thread
-                .request_tool_call_authorization(update, options, cx)
+                .request_tool_call_authorization(
+                    update,
+                    options,
+                    acp_thread::AuthorizationKind::PermissionGrant,
+                    cx,
+                )
                 .expect("stage waiting-for-confirmation")
         })
     });
@@ -3179,7 +3184,7 @@ async fn send_during_running_on_native_connection_routes_to_queue(cx: &mut TestA
     let connection: Rc<dyn acp_thread::AgentConnection> = cx
         .update(|cx| {
             let store = project.read(cx).agent_server_store().clone();
-            let delegate = AgentServerDelegate::new(store, None);
+            let delegate = AgentServerDelegate::new(store, None, None);
             AgentServer::connect(server.as_ref(), delegate, project.clone(), cx)
         })
         .await
@@ -3325,7 +3330,7 @@ async fn registered_store_pull_drains_queue_and_returns_followup_text(cx: &mut T
     let connection: Rc<dyn acp_thread::AgentConnection> = cx
         .update(|cx| {
             let store = project.read(cx).agent_server_store().clone();
-            let delegate = AgentServerDelegate::new(store, None);
+            let delegate = AgentServerDelegate::new(store, None, None);
             AgentServer::connect(server.as_ref(), delegate, project.clone(), cx)
         })
         .await

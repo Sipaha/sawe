@@ -207,7 +207,7 @@ async fn connect_mock(
     let server =
         ClaudeNativeAgentServer::with_binary(AgentId::new("claude-acp"), mock_binary(), extra_env);
     let store = project.read_with(cx, |project, _| project.agent_server_store().clone());
-    let delegate = AgentServerDelegate::new(store, None);
+    let delegate = AgentServerDelegate::new(store, None, None);
     let connection = cx
         .update(|cx| AgentServer::connect(&server, delegate, project.clone(), cx))
         .await

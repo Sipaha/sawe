@@ -11618,7 +11618,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_close_window(cx: &mut TestAppContext) {
+    async fn test_close_window_prompts_to_save_dirty_items(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());

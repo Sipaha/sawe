@@ -92,14 +92,26 @@ mod tests {
     use super::*;
     use git::Oid;
 
+    fn zero_oid() -> Oid {
+        Oid::from_bytes(&[0; 20]).unwrap()
+    }
+
     fn entry(email: &str, author: &str) -> BlameEntry {
         BlameEntry {
-            sha: Oid::default(),
+            sha: zero_oid(),
             range: 0..1,
             original_line_number: 1,
             author: Some(author.to_string()),
             author_mail: Some(email.to_string()),
-            ..Default::default()
+            author_time: None,
+            author_tz: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+            committer_tz: None,
+            summary: None,
+            previous: None,
+            filename: String::new(),
         }
     }
 
@@ -147,12 +159,20 @@ mod tests {
         let mut filter = AuthorFilter::default();
         filter.toggle("a@b.com");
         let entry_no_email = BlameEntry {
-            sha: Oid::default(),
+            sha: zero_oid(),
             range: 0..1,
             original_line_number: 1,
             author: Some("X".to_string()),
             author_mail: None,
-            ..Default::default()
+            author_time: None,
+            author_tz: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+            committer_tz: None,
+            summary: None,
+            previous: None,
+            filename: String::new(),
         };
         assert!(!filter.matches(&entry_no_email));
     }

@@ -278,7 +278,7 @@ async fn test_file_history_action_uses_focused_project_panel_selection(
 
     workspace.read_with(&*cx, |workspace, cx| {
         let graphs = workspace
-            .items_of_type::<git_ui::git_graph::GitGraph>(cx)
+            .items_of_type::<git_graph::GitGraph>(cx)
             .collect::<Vec<_>>();
         assert_eq!(graphs.len(), 1);
         assert_eq!(
@@ -413,7 +413,7 @@ async fn test_file_history_action_does_not_fall_back_to_editor_when_focused_proj
     workspace.read_with(&*cx, |workspace, cx| {
         assert_eq!(
             workspace
-                .items_of_type::<git_ui::git_graph::GitGraph>(cx)
+                .items_of_type::<git_graph::GitGraph>(cx)
                 .count(),
             0
         );

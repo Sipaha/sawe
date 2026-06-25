@@ -6012,7 +6012,13 @@ mod tests {
 
         let graph_commits = async || {
             let (tx, rx) = smol::channel::unbounded();
-            repo.initial_graph_data(LogSource::All, LogOrder::DateOrder, tx)
+            repo.initial_graph_data(
+                LogSource::All,
+                LogOrder::DateOrder,
+                Vec::new(),
+                Vec::new(),
+                tx,
+            )
                 .await
                 .unwrap();
             let mut commits = std::collections::HashSet::new();

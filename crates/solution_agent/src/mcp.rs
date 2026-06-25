@@ -5536,7 +5536,12 @@ mod tests {
                     ),
                 ]);
                 thread
-                    .request_tool_call_authorization(update, options, cx)
+                    .request_tool_call_authorization(
+                        update,
+                        options,
+                        acp_thread::AuthorizationKind::PermissionGrant,
+                        cx,
+                    )
                     .expect("stage waiting-for-confirmation")
             })
         });
