@@ -98,13 +98,14 @@ impl Default for SolutionsSettings {
     }
 }
 
-/// Default solutions storage root: `<base_dir>/solutions`. The base
-/// directory comes from `paths::base_dir()` (single-folder profile —
-/// `~/sawe` for release, `~/sawe-dev` for debug, or any
-/// `set_custom_data_dir` override) so all per-profile state lives in
-/// one place.
+/// Default solutions storage root: `<base_dir>/ss` (short for "solutions" —
+/// kept terse because it prefixes every member project's on-disk path). The
+/// base directory comes from `paths::base_dir()` (single-folder profile —
+/// `~/.spk/sawe` for release, `~/.spk/sawe-dev` for debug, or any
+/// `set_custom_data_dir` override) so all per-profile state lives in one
+/// place.
 fn default_root() -> PathBuf {
-    paths::base_dir().join("solutions")
+    paths::base_dir().join("ss")
 }
 
 impl Settings for SolutionsSettings {
