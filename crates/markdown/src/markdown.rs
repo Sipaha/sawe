@@ -389,6 +389,10 @@ pub struct Markdown {
     code_block_scroll_handles: BTreeMap<usize, ScrollHandle>,
     context_menu_link: Option<SharedString>,
     context_menu_selected_text: Option<String>,
+    /// Selection range snapshotted at right-click, so the context-menu
+    /// "Copy" still has a selection to copy after the menu-item left-click
+    /// clears the live `selection` (the not-hovered Left handler resets it).
+    context_menu_selection: Option<Range<usize>>,
     search_highlights: Vec<Range<usize>>,
     active_search_highlight: Option<usize>,
 }
@@ -581,6 +585,7 @@ impl Markdown {
             code_block_scroll_handles: BTreeMap::default(),
             context_menu_link: None,
             context_menu_selected_text: None,
+            context_menu_selection: None,
             search_highlights: Vec::new(),
             active_search_highlight: None,
         };
@@ -837,11 +842,19 @@ impl Markdown {
         self.active_search_highlight
     }
 
-    fn copy(&self, text: &RenderedText, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selection.end <= self.selection.start {
+    fn copy(&mut self, text: &RenderedText, _: &mut Window, cx: &mut Context<Self>) {
+        // Prefer the range snapshotted at right-click: the menu-item click
+        // clears the live `selection` before this action fires (see
+        // `capture_for_context_menu`). Fall back to the live selection for
+        // the keyboard-shortcut path, where no context menu was involved.
+        let range = self.context_menu_selection.take().or_else(|| {
+            (self.selection.end > self.selection.start)
+                .then(|| self.selection.start..self.selection.end)
+        });
+        let Some(range) = range else {
             return;
-        }
-        let text = text.text_for_range(self.selection.start..self.selection.end);
+        };
+        let text = text.text_for_range(range);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
@@ -859,6 +872,8 @@ impl Markdown {
 
     fn capture_for_context_menu(&mut self, link: Option<SharedString>) {
         self.context_menu_selected_text = self.selected_text();
+        self.context_menu_selection = (self.selection.end > self.selection.start)
+            .then(|| self.selection.start..self.selection.end);
         self.context_menu_link = link;
     }
 
