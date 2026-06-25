@@ -198,7 +198,9 @@ impl Render for SolutionTabStrip {
         // reliable, discoverable target. The end slot is the last tab's
         // index (`tab_count - 1`), matching what the last tab's own drop uses.
         let tab_count = tabs.len();
-        let end_drop = (tab_count > 1).then(|| {
+        // Only present while a tab drag is in flight — otherwise this empty
+        // catch area just reads as dead space to the right of the tabs.
+        let end_drop = (tab_count > 1 && cx.has_active_drag()).then(|| {
             let multi_workspace = weak_multi_workspace.clone();
             let target = tab_count - 1;
             div()
@@ -238,6 +240,14 @@ impl Render for SolutionTabStrip {
                 },
             ))
             .when_some(end_drop, |this, zone| this.child(zone))
+            // Delimiter separating the tab zone from the trailing `+`.
+            .child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .mx_1()
+                    .bg(cx.theme().colors().border_variant),
+            )
             .child(div().px_1().child(plus_popover))
             .into_any_element()
     }

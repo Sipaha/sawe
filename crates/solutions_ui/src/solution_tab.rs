@@ -125,7 +125,7 @@ impl RenderOnce for SolutionTab {
             .gap_2()
             // Match the Console panel chat-tab sizing (panel.rs render_tab_strip)
             // so the title-bar solution tabs read at the same width.
-            .min_w(px(140.0))
+            .min_w(px(96.0))
             .max_w(px(220.0))
             .items_center()
             .when_some(active_bg, |this, bg| this.bg(bg))

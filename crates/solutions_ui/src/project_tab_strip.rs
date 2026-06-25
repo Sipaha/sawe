@@ -202,7 +202,9 @@ impl Render for ProjectTabStrip {
         // Only meaningful with at least two members. `flex_1` lets it absorb
         // any slack to the right of the last tab as a generous catch area;
         // `min_w` keeps it hittable even when the tabs already fill the strip.
-        let end_drop = (members.len() > 1).then(|| {
+        // Only present while a tab drag is in flight — otherwise this empty
+        // catch area just reads as dead space to the right of the tabs.
+        let end_drop = (members.len() > 1 && cx.has_active_drag()).then(|| {
             let solution_id = solution_id.clone();
             let order = order.clone();
             div()
@@ -234,6 +236,14 @@ impl Render for ProjectTabStrip {
             .when_some(overflow_popover, |this, popover| {
                 this.child(div().px_1().child(popover))
             })
+            // Delimiter separating the tab zone from the trailing `+`.
+            .child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .mx_1()
+                    .bg(cx.theme().colors().border_variant),
+            )
             .child(div().px_1().child(plus_popover))
             .into_any_element()
     }

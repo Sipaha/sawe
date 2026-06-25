@@ -114,7 +114,7 @@ impl RenderOnce for ProjectTab {
             .h_full()
             .px_3()
             .gap_2()
-            .min_w(px(120.0))
+            .min_w(px(80.0))
             .max_w(px(200.0))
             .items_center()
             .when_some(active_bg, |this, bg| this.bg(bg))
