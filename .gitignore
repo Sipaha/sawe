@@ -62,3 +62,7 @@ crates/docs_preprocessor/actions.json
 
 # Personal agent plans / specs (kept locally, not committed)
 /docs/superpowers/
+
+# Local run.sh wrapper log (editor log lives in ~/.spk/sawe/logs/)
+/run.log
+/sawe.log

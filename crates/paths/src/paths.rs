@@ -199,16 +199,16 @@ pub fn remote_server_state_dir() -> &'static PathBuf {
     REMOTE_SERVER_STATE.get_or_init(|| data_dir().join("server_state"))
 }
 
-/// Returns the path to the `Sawe.log` file.
+/// Returns the path to the `sawe.log` file.
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    LOG_FILE.get_or_init(|| logs_dir().join("Sawe.log"))
+    LOG_FILE.get_or_init(|| logs_dir().join("sawe.log"))
 }
 
-/// Returns the path to the `Sawe.log.old` file.
+/// Returns the path to the `sawe.log.old` file.
 pub fn old_log_file() -> &'static PathBuf {
     static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    OLD_LOG_FILE.get_or_init(|| logs_dir().join("Sawe.log.old"))
+    OLD_LOG_FILE.get_or_init(|| logs_dir().join("sawe.log.old"))
 }
 
 /// Returns the path to the database directory.
