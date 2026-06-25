@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
-# Launch the release-fast `sawe` editor with file logging enabled.
+# Launch the release-fast `sawe` editor so it logs to its own file.
 #
-# Why the redirect matters: sawe logs to stdout ONLY when stdout is a TTY
-# (crates/zed/src/main.rs — `if stdout_is_a_pty()`). Run bare from a terminal,
-# every log line goes to the console and NOTHING to a file. Redirecting
-# stdout/stderr (the `exec` below) makes stdout a non-TTY, so the editor
-# switches to its file sink and writes a clean (ansi-free), rotated, structured
-# log to:
-#     ~/.spk/sawe/logs/sawe.log      (+ sawe.log.old — 1 MB ring, 2 files)
-# That file is the one to read / analyze.
-#
-# This wrapper's own log (run.log) only catches panics, pre-logger boot output,
-# and the "could not open log file -> defaulting to stdout" fallback.
+# sawe logs to stdout ONLY when stdout is a TTY (main.rs: `stdout_is_a_pty()`).
+# Launched bare from a terminal, every log line goes to the console and nothing
+# to a file. Sending stdout to /dev/null makes it a non-TTY, so the editor uses
+# its standard file sink — a clean (ansi-free), rotated log at:
+#     ~/.spk/sawe/logs/sawe.log      (+ sawe.log.old — 1 MB ring)
+# Read / analyze THAT file (`tail -F`). The /dev/null redirect only flips the
+# TTY check; we deliberately do NOT capture stdout (it's ansi-colored — the
+# file sink is the clean source of truth).
 #
 # Usage:  ./run.sh [extra sawe args...]
-# Env:    SAWE_RUN_LOG  override the wrapper log path (default <repo>/run.log)
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$DIR/target/release-fast/sawe"
-RUN_LOG="${SAWE_RUN_LOG:-$DIR/run.log}"
 EDITOR_LOG="$HOME/.spk/sawe/logs/sawe.log"
 
 if [[ ! -x "$BIN" ]]; then
@@ -29,9 +24,8 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 echo "launching: $BIN $*" >&2
-echo "editor log (analyze this): $EDITOR_LOG" >&2
-echo "wrapper log (panics/boot): $RUN_LOG" >&2
+echo "log -> $EDITOR_LOG  (tail -F to follow)" >&2
 
-# Redirect both streams: stdout becomes a non-TTY (so sawe enables its file
-# sink) and panics / early-boot output land in RUN_LOG.
-exec "$BIN" "$@" >"$RUN_LOG" 2>&1
+# Redirect to /dev/null ONLY so stdout is not a TTY -> editor enables its file
+# sink. The logs themselves go to $EDITOR_LOG via the editor's own mechanism.
+exec "$BIN" "$@" >/dev/null 2>&1
