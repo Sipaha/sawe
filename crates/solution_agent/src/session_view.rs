@@ -2860,8 +2860,24 @@ impl Render for SolutionSessionView {
                 // catch-up the virtualized list would clamp to its
                 // previous size and silently drop the tail.
                 if is_drill_in && self.list_state.item_count() != entries_count {
-                    self.list_state.reset(entries_count);
-                    self.list_state.set_follow_mode(FollowMode::Tail);
+                    let current = self.list_state.item_count();
+                    if entries_count > current {
+                        // Growth (streaming new drill-in rows) — append the
+                        // delta instead of `reset()`. `reset()` nulls
+                        // `logical_scroll_top`, which on the Bottom-aligned list
+                        // snaps a scrolled-up reader back to the bottom on every
+                        // tick (the subagent-tab "scroll bounces back" bug).
+                        // Splicing at the tail preserves the scroll anchor (and
+                        // tail-follow keeps the bottom glued only when the user
+                        // hasn't scrolled away), exactly like the parent thread's
+                        // `on_thread_event` path.
+                        self.list_state.splice(current..current, entries_count - current);
+                    } else {
+                        // Shrank (rows removed / source replaced with fewer
+                        // entries) — rebuild fresh and start at the tail.
+                        self.list_state.reset(entries_count);
+                        self.list_state.set_follow_mode(FollowMode::Tail);
+                    }
                 }
 
                 let conversation_body: AnyElement = if entries_count == 0 {
