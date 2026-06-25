@@ -6,7 +6,7 @@ use gpui::{
     Context, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 use ui::prelude::*;
-use ui::{ButtonSize, CommonAnimationExt, ContextMenu, IconName, Label, LabelSize, PopoverMenu};
+use ui::{CommonAnimationExt, ContextMenu, IconName, Label, LabelSize, PopoverMenu};
 use util::ResultExt as _;
 
 use crate::compact::{
@@ -725,22 +725,26 @@ pub(crate) fn render_status_row(
             // queued follow-ups. While stopping, the badge itself reads
             // "Stopping", so no separate button is shown.
             .when(is_running, |this| {
+                // A bare clickable icon, not an IconButton: the button's box +
+                // padding made the gap to the following "·" wider than the
+                // other `gap_2` separators and pushed the glyph off the row's
+                // vertical center. A plain `Icon` is exactly icon-sized, so the
+                // surrounding `gap_2` stays symmetric and `items_center` lines
+                // it up with the dots and labels.
                 this.child(
-                    div().flex_none().child(
-                        ui::IconButton::new("solution-status-stop", IconName::Stop)
-                            .icon_size(IconSize::Small)
-                            // Trim the button's horizontal padding (None → px_px)
-                            // and drop its box height to ~16px so it lines up
-                            // with the small-label status row rather than
-                            // towering over it. The row is items_center, so the
-                            // tighter box also reads as vertically centered.
-                            .size(ButtonSize::None)
-                            .icon_color(Color::Error)
-                            .tooltip(ui::Tooltip::text(
-                                "Stop response (Esc) — clears queued follow-ups",
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_turn(cx))),
-                    ),
+                    div()
+                        .id("solution-status-stop")
+                        .flex_none()
+                        .cursor_pointer()
+                        .child(
+                            ui::Icon::new(IconName::Stop)
+                                .size(IconSize::Small)
+                                .color(Color::Error),
+                        )
+                        .tooltip(ui::Tooltip::text(
+                            "Stop response (Esc) — clears queued follow-ups",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_turn(cx))),
                 )
             })
             .when_some(activity_badge, |this, badge| {
