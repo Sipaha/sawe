@@ -16,9 +16,11 @@ use gpui::{
     Window, div, px,
 };
 use solutions::{CatalogId, SolutionId, SolutionStore};
-use ui::prelude::*;
+use std::cell::RefCell;
+use ui::{ContextMenu, prelude::*, right_click_menu};
 use util::ResultExt as _;
 
+use crate::actions::RemoveMember;
 use crate::solution_tab::dot_color_for_str;
 
 #[derive(IntoElement)]
@@ -99,8 +101,15 @@ impl RenderOnce for ProjectTab {
 
         let solution_for_click = self.solution_id.clone();
         let catalog_for_click = self.catalog_id.clone();
+        // Captured up front (the chain below partially moves `self.order`).
+        let menu_id = ElementId::from(SharedString::from(format!(
+            "project-tab-menu-{}",
+            self.catalog_id.0
+        )));
+        let solution_for_menu = self.solution_id.0.clone();
+        let catalog_for_menu = self.catalog_id.0.clone();
 
-        h_flex()
+        let row = h_flex()
             .id(row_id)
             .h_full()
             .px_3()
@@ -161,7 +170,37 @@ impl RenderOnce for ProjectTab {
                         })
                         .log_err();
                 }
+            });
+
+        // Right-click menu. At minimum a destructive "remove from solution"
+        // entry, mirroring the solution tab's menu. `RemoveMember` opens the
+        // confirmation modal that, on confirm, calls
+        // `SolutionStore::remove_member` and rm-rfs the member's folder — the
+        // handler is registered as a workspace action in `solutions_ui`. The
+        // `RefCell` take-once dance matches `solution_tab`: `right_click_menu`
+        // wants an `Fn` trigger but the row element can only be consumed once.
+        let row_cell = RefCell::new(Some(row.into_any_element()));
+        right_click_menu(menu_id)
+            .trigger(move |_, _, _| {
+                row_cell
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_else(|| div().into_any_element())
             })
+            .menu(move |window, cx| {
+                let solution_id = solution_for_menu.clone();
+                let catalog_id = catalog_for_menu.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.action(
+                        "Remove from Solution…",
+                        Box::new(RemoveMember {
+                            solution_id: solution_id.clone(),
+                            catalog_id: catalog_id.clone(),
+                        }),
+                    )
+                })
+            })
+            .into_any_element()
     }
 }
 
