@@ -539,15 +539,20 @@ impl SolutionSessionView {
             resize_start_height: px(DEFAULT_COMPOSE_HEIGHT),
             markdown_cache: HashMap::new(),
             list_state: {
-                // Match upstream `agent_ui` chat configuration: `Top`
-                // alignment + `FollowMode::Tail`. `Top` is the standard
-                // chat layout (entries flow top-to-bottom, viewport
-                // scrolls down) and `Tail` keeps the viewport glued to
-                // the latest entry until the user scrolls upward.
-                // `Bottom` alignment paired with `Auto` sizing also
-                // worked in isolation, but mis-laid-out the very first
-                // message when the wrapper isn't a flex container —
-                // safer to mirror the upstream invariant.
+                // `Bottom` alignment + `FollowMode::Tail`. Bottom anchors a
+                // conversation to the bottom of the viewport — short chats
+                // sit at the bottom (messenger-style) and new entries grow
+                // upward from there, which is the right model for a dialog.
+                // `Tail` keeps the viewport glued to the latest entry until
+                // the user scrolls upward.
+                //
+                // Upstream `agent_ui` uses `Top` because an earlier attempt at
+                // `Bottom` mis-laid-out the very first message — but that only
+                // happened when the list's wrapper wasn't a flex container.
+                // Here the wrapper is a `v_flex().flex_1().min_h_0()` (see the
+                // conversation container in `render`), so Bottom lays out
+                // correctly. (Re-verify the first message of a fresh chat if
+                // that wrapper ever changes.)
                 //
                 // `measure_last(MEASURE_TAIL_LEN)` pre-measures the most
                 // recent entries on the first layout pass so scrolling
@@ -556,7 +561,7 @@ impl SolutionSessionView {
                 // window) stay `Unmeasured` and get measured lazily on
                 // the regular visible-band path — bounding the cold-load
                 // cost on long-resumed conversations.
-                let state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX))
+                let state = ListState::new(0, ListAlignment::Bottom, px(LIST_OVERDRAW_PX))
                     .measure_last(MEASURE_TAIL_LEN);
                 state.set_follow_mode(FollowMode::Tail);
                 state

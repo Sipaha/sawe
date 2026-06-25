@@ -73,6 +73,10 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    /// One-shot: set by a user wheel scroll, consumed by the next layout pass
+    /// to decide whether to re-arm tail-follow. Keeps the re-engage check off
+    /// the every-frame layout path (see `layout_items`).
+    reengage_check_pending: bool,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -402,6 +406,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            reengage_check_pending: false,
         })));
         this.splice(0..0, item_count);
         this
@@ -982,6 +987,9 @@ impl StateInner {
         if delta.y > px(0.) {
             self.follow_state.stop_following();
         }
+        // A real user scroll just moved the offset; let the next layout pass
+        // evaluate whether we've landed back at the bottom (and only then).
+        self.reengage_check_pending = true;
 
         if let Some(handler) = self.scroll_handler.as_mut() {
             let visible_range = Self::visible_range(&self.items, height, scroll_top);
@@ -1332,14 +1340,25 @@ impl StateInner {
 
         // If follow_tail mode is on but the user scrolled away
         // (is_following is false), check whether the current scroll
-        // position has returned to the bottom.
-        if self.follow_state.has_stopped_following() {
-            let padding = self.last_padding.unwrap_or_default();
-            let total_height = self.items.summary().height + padding.top + padding.bottom;
-            let scroll_offset = self.scroll_top(&scroll_top);
-            if scroll_offset + available_height >= total_height - px(1.0) {
-                self.follow_state.start_following();
+        // position has returned to the bottom — but ONLY in response to an
+        // actual user scroll, which sets `reengage_check_pending` (wheel via
+        // `scroll`; the scrollbar path re-engages itself in
+        // `set_offset_from_scrollbar`). Running this on every layout pass
+        // re-armed following on each streaming-driven `cx.notify()` — the
+        // Top-alignment scroll-top recompute above keeps nudging the offset
+        // into the bottom band, so the view snapped back down the instant the
+        // user scrolled up (the AI chat "bounce back" bug). The flag is
+        // one-shot: consumed by the first layout after the scroll.
+        if self.reengage_check_pending {
+            if self.follow_state.has_stopped_following() {
+                let padding = self.last_padding.unwrap_or_default();
+                let total_height = self.items.summary().height + padding.top + padding.bottom;
+                let scroll_offset = self.scroll_top(&scroll_top);
+                if scroll_offset + available_height >= total_height - px(1.0) {
+                    self.follow_state.start_following();
+                }
             }
+            self.reengage_check_pending = false;
         }
 
         // If none of the visible items are focused, check if an off-screen item is focused
