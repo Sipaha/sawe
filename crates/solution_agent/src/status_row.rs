@@ -6,7 +6,7 @@ use gpui::{
     Context, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 use ui::prelude::*;
-use ui::{CommonAnimationExt, ContextMenu, IconName, Label, LabelSize, PopoverMenu};
+use ui::{ButtonSize, CommonAnimationExt, ContextMenu, IconName, Label, LabelSize, PopoverMenu};
 use util::ResultExt as _;
 
 use crate::compact::{
@@ -729,6 +729,12 @@ pub(crate) fn render_status_row(
                     div().flex_none().child(
                         ui::IconButton::new("solution-status-stop", IconName::Stop)
                             .icon_size(IconSize::Small)
+                            // Trim the button's horizontal padding (None → px_px)
+                            // and drop its box height to ~16px so it lines up
+                            // with the small-label status row rather than
+                            // towering over it. The row is items_center, so the
+                            // tighter box also reads as vertically centered.
+                            .size(ButtonSize::None)
                             .icon_color(Color::Error)
                             .tooltip(ui::Tooltip::text(
                                 "Stop response (Esc) — clears queued follow-ups",
