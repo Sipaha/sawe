@@ -184,6 +184,43 @@ const GLOBAL_TOOLS: &[&str] = &[
     "windows.hover_at",
     "windows.hover_id",
     "windows.dump_visual_structure",
+    // Remote Control surface. Every tool the Android client can reach through
+    // `remote_control::allow_list` MUST live on the global socket: the mobile
+    // proxy (`remote_control::proxy::connect`) dials `editor_mcp::socket_path()`
+    // — the GLOBAL socket — not a per-solution one. These were previously
+    // solution-scoped, so the split moved them off the global socket and every
+    // `remote.workspace.*` / `remote.solution_agent.*` call came back as
+    // "Tool not found". They are ALSO in SHARED_TOOLS, so per-solution sockets
+    // keep them for scoped subagents (with `solution_id` injected where the
+    // tool declares it; cross-solution tools like `workspace.snapshot` carry no
+    // `solution_id` and are left untouched by the bound-solution injection).
+    "workspace.snapshot",
+    "workspace.list_solutions",
+    "workspace.open_solution",
+    "workspace.close_solution",
+    "workspace.open_session",
+    "workspace.close_session",
+    "solution_agent.list_agents",
+    "solution_agent.list_sessions",
+    "solution_agent.get_session",
+    "solution_agent.get_session_entry",
+    "solution_agent.create_session",
+    "solution_agent.delete_session",
+    "solution_agent.send_message",
+    "solution_agent.send_message_blocks",
+    "solution_agent.cancel_turn",
+    "solution_agent.authorize_tool_call",
+    "solution_agent.get_session_children",
+    "solution_agent.get_session_background_shells",
+    "solution_agent.get_session_background_agents",
+    "solution_agent.rename_session",
+    "solution_agent.restart_agent",
+    "solution_agent.reset_context",
+    "solution_agent.start_compact",
+    "solution_agent.upload_init",
+    "solution_agent.upload_status",
+    "solution_agent.upload_finish",
+    "solution_agent.upload_abort",
 ];
 
 fn is_global_tool(name: &str) -> bool {
@@ -198,6 +235,38 @@ const SHARED_TOOLS: &[&str] = &[
     "solutions.add_member",
     "solutions.add_empty_member",
     "solutions.remove_member",
+    // Remote Control tools (see GLOBAL_TOOLS): kept on the global socket for
+    // the mobile proxy AND cloned into each per-solution socket so scoped
+    // subagents retain them. `solution_id` is force-injected only into the
+    // tools whose schema declares it (per-solution sockets); the global socket
+    // never injects, so the mobile passes ids explicitly.
+    "workspace.snapshot",
+    "workspace.list_solutions",
+    "workspace.open_solution",
+    "workspace.close_solution",
+    "workspace.open_session",
+    "workspace.close_session",
+    "solution_agent.list_agents",
+    "solution_agent.list_sessions",
+    "solution_agent.get_session",
+    "solution_agent.get_session_entry",
+    "solution_agent.create_session",
+    "solution_agent.delete_session",
+    "solution_agent.send_message",
+    "solution_agent.send_message_blocks",
+    "solution_agent.cancel_turn",
+    "solution_agent.authorize_tool_call",
+    "solution_agent.get_session_children",
+    "solution_agent.get_session_background_shells",
+    "solution_agent.get_session_background_agents",
+    "solution_agent.rename_session",
+    "solution_agent.restart_agent",
+    "solution_agent.reset_context",
+    "solution_agent.start_compact",
+    "solution_agent.upload_init",
+    "solution_agent.upload_status",
+    "solution_agent.upload_finish",
+    "solution_agent.upload_abort",
 ];
 
 fn is_shared_tool(name: &str) -> bool {
