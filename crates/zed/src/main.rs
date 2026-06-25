@@ -909,6 +909,12 @@ fn main() {
         // since it has nothing to do with collab and is required for window decorations.
         title_bar::init(cx);
         git_ui::init(cx);
+        // git_graph was extracted into its own crate during the re-fork; its
+        // init (serializable-item + `git_graph::Open` action renderer
+        // registration) must run for the "Open Git Graph" affordances in
+        // git_ui to actually open the tab. Missing this call is why the graph
+        // silently didn't open.
+        git_graph::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
         csv_preview::init(cx);

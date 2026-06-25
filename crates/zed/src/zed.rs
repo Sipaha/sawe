@@ -808,7 +808,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             // upstream's AgentPanel registered creates a parallel, unconfigured
             // AI surface that confuses users about where to find AI features.
             // agent_ui::init still runs because other subsystems depend on it
-            // (inline_assistant, rules_library, ConfigureContextServerModal).
+            // (inline_assistant, ConfigureContextServerModal).
             // initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
         );
         let _ = workspace_handle;
