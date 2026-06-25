@@ -3265,9 +3265,12 @@ impl SolutionAgentStore {
 
     /// Bring a previously-closed session back into the strip. Clears the
     /// `closed_at` marker so `hydrate_all_for_solution` stops skipping it,
-    /// hydrates it into memory as a cold tab, then pins it. Reuses the
-    /// existing restore + pin machinery rather than reconstructing the
-    /// session inline.
+    /// AND clears the stale `tab_order` (see [`SolutionAgentDb::reopen_session`])
+    /// so the freshly-hydrated session is not mistaken for an already-pinned
+    /// tab — without that, `open_session_in_strip` early-returns on its
+    /// `already_pinned` guard and the tab never reappears. Hydrates it into
+    /// memory as a cold tab, then pins it. Reuses the existing restore + pin
+    /// machinery rather than reconstructing the session inline.
     pub fn reopen_closed_session(
         &mut self,
         id: SolutionSessionId,
@@ -3278,7 +3281,7 @@ impl SolutionAgentStore {
             return Task::ready(Err(anyhow!("no persistence backend")));
         };
         cx.spawn(async move |this, cx| {
-            db.mark_closed(id, None).await?;
+            db.reopen_session(id).await?;
             let hydrate = this.update(cx, |this, cx| {
                 this.hydrate_all_for_solution(solution_id.clone(), cx)
             })?;

@@ -347,6 +347,29 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Reopen a previously-closed session: clear `closed_at` (it's live
+    /// again) AND `tab_order` (detach it from any stale strip slot).
+    ///
+    /// Clearing `tab_order` is the load-bearing half. [`close_session`]
+    /// marks `closed_at` but leaves `tab_order` intact, so a closed row
+    /// keeps a dangling strip position. If reopen only cleared `closed_at`,
+    /// the row would immediately satisfy [`select_open_tabs`]
+    /// (`tab_order IS NOT NULL AND closed_at IS NULL`), so
+    /// `hydrate_all_for_solution` would re-stamp the stale `tab_order` onto
+    /// the session — and `open_session_in_strip` would then early-return on
+    /// its `already_pinned` guard without ever emitting `TabsChanged`,
+    /// leaving the user with a reopened-but-invisible tab. Nulling
+    /// `tab_order` here forces a fresh pin.
+    ///
+    /// [`close_session`]: crate::store::SolutionAgentStore::close_session
+    pub fn reopen_session(&self, id: SolutionSessionId) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            reopen_session_by_id(&connection, id)
+        })
+    }
+
     /// Looks up the closed_at timestamp for `id`. `None` means the row
     /// is live (or doesn't exist — the two are indistinguishable here;
     /// callers that care about distinguishing should also check the
@@ -607,6 +630,14 @@ fn mark_closed_by_id(
         UPDATE solution_sessions SET closed_at = ?1 WHERE id = ?2
     "})?;
     update((closed_at.map(|ts| ts.timestamp_millis()), id.to_string()))?;
+    Ok(())
+}
+
+fn reopen_session_by_id(connection: &Connection, id: SolutionSessionId) -> Result<()> {
+    let mut update = connection.exec_bound::<String>(indoc! {"
+        UPDATE solution_sessions SET closed_at = NULL, tab_order = NULL WHERE id = ?
+    "})?;
+    update(id.to_string())?;
     Ok(())
 }
 
@@ -1147,6 +1178,59 @@ mod tests {
         assert_eq!(
             db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
             vec![m2.id]
+        );
+    }
+
+    #[gpui::test]
+    async fn reopen_session_clears_stale_tab_order(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let m = make_meta(1, "sol-a");
+        db.save_metadata(m.clone()).await.unwrap();
+
+        // Pin the session into the strip, then close it. `close_session` marks
+        // `closed_at` but deliberately leaves `tab_order` set, so a closed row
+        // keeps a dangling strip slot — reproduced here directly.
+        db.update_tab_orders(SolutionId("sol-a".into()), vec![m.id])
+            .await
+            .unwrap();
+        let closed_at = Utc.timestamp_millis_opt(1_700_000_500_000).unwrap();
+        db.mark_closed(m.id, Some(closed_at)).await.unwrap();
+
+        // While closed it is excluded from the open-tab strip (the closed_at
+        // filter), even though its tab_order is still set.
+        assert!(
+            db.list_open_tabs(SolutionId("sol-a".into()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Reopen. This must clear `closed_at` (live again) AND the stale
+        // `tab_order`. If it only cleared `closed_at`, the row would
+        // immediately satisfy `list_open_tabs` (`tab_order IS NOT NULL AND
+        // closed_at IS NULL`); hydration would re-stamp the stale order, and
+        // `open_session_in_strip` would early-return on its `already_pinned`
+        // guard without emitting `TabsChanged` — the reopened-but-invisible
+        // tab bug.
+        db.reopen_session(m.id).await.unwrap();
+
+        // Live again:
+        assert_eq!(
+            db.list_open_session_ids(SolutionId("sol-a".into()))
+                .await
+                .unwrap(),
+            vec![m.id]
+        );
+        // …but NOT pinned: the strip set is empty, so the reopen path re-pins
+        // it fresh via `open_session_in_strip` and emits `TabsChanged`.
+        assert!(
+            db.list_open_tabs(SolutionId("sol-a".into()))
+                .await
+                .unwrap()
+                .is_empty(),
+            "reopen must clear the stale tab_order so the session re-pins fresh"
         );
     }
 
