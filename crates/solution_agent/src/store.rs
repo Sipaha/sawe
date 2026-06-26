@@ -511,6 +511,37 @@ pub(crate) fn cold_entries_from_persisted(
     (cold_entries, restored_created_ms)
 }
 
+/// Decode per-entry DB rows (Phase 4 `solution_session_entries`) into the
+/// store's `SessionEntry` shape. Rows arrive `ORDER BY idx`; each `payload`
+/// is the JSON-encoded `SessionEntryKind` and the meta (`mod_seq`,
+/// `created_ms`, `subagent_id`) comes straight from columns. A row whose
+/// payload fails to decode is SKIPPED with a `log::warn` — a single corrupt
+/// row must never blank the whole transcript.
+pub(crate) fn entries_from_rows(
+    rows: Vec<crate::db::EntryRow>,
+) -> Vec<crate::session_entry::SessionEntry> {
+    rows.into_iter()
+        .filter_map(
+            |r| match crate::session_entry::kind_from_payload(&r.payload) {
+                Ok(kind) => Some(crate::session_entry::SessionEntry {
+                    created_ms: r.created_ms,
+                    mod_seq: r.mod_seq as u64,
+                    subagent_id: r.subagent_id.map(SharedString::from),
+                    kind,
+                }),
+                Err(e) => {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "skipping undecodable entry row idx={}: {e}",
+                        r.idx
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
 /// On-disk snapshot of a session. Persisted as a JSON blob in the
 /// `acp_thread_blob` column so MCP / future archive UIs can rehydrate
 /// the conversation transcript even after the session was closed.
@@ -1558,7 +1589,35 @@ impl SolutionAgentStore {
             // already paid for above. Errors are logged and treated as
             // "no blob": worst case the user sees an empty conversation,
             // which is exactly what was happening BEFORE this fix.
-            let preloaded_persisted: Option<PersistedSession> = {
+            // Phase 4: prefer per-entry rows. Load rows + epoch off the
+            // foreground thread; only load+deserialize the legacy transcript
+            // blob when there are no rows yet (the fresh-entity branch below
+            // then lazily migrates the blob to rows).
+            let (preloaded_rows, preloaded_epoch) = {
+                let tasks = this.update(cx, |store, _| {
+                    store
+                        .persistence()
+                        .map(|db| (db.load_entries(meta.id), db.load_epoch(meta.id)))
+                })?;
+                match tasks {
+                    Some((rows_task, epoch_task)) => {
+                        let rows = rows_task.await.unwrap_or_else(|err| {
+                            log::warn!(
+                                target: "solution_agent::resume",
+                                "session={} entry-row load failed on reopen: {err}",
+                                meta.id
+                            );
+                            Vec::new()
+                        });
+                        let epoch = epoch_task.await.ok().flatten().unwrap_or(0);
+                        (rows, epoch)
+                    }
+                    None => (Vec::new(), 0),
+                }
+            };
+            let preloaded_persisted: Option<PersistedSession> = if !preloaded_rows.is_empty() {
+                None
+            } else {
                 let load_task = this.update(cx, |store, _| {
                     store.persistence().map(|db| db.load_blob(meta.id))
                 })?;
@@ -1656,27 +1715,36 @@ impl SolutionAgentStore {
                         cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
                     }
                 } else {
-                    // Hydrate cold prefix from the preloaded blob
-                    // BEFORE attaching the live thread. claude --resume
-                    // does NOT re-emit the transcript through
-                    // stream-json, and `build_entries` concatenates
-                    // cold + live: skipping this seeds an empty
-                    // conversation visually even though the agent
-                    // subprocess will happily continue from where it
-                    // left off in the background (the close→reopen
-                    // empty-history bug).
-                    let (cold_entries, restored_created_ms) =
-                        cold_entries_from_persisted(preloaded_persisted, cx);
-                    // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
-                    // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
-                    // are also captured. For v2 blobs this is equivalent to cloning
-                    // entries_v2 directly; for legacy blobs it now preserves the history
-                    // that was previously silently dropped on the next snapshot.
-                    let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
-                        cold_entries
-                            .iter()
-                            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
-                            .collect();
+                    // Hydrate cold prefix BEFORE attaching the live thread.
+                    // claude --resume does NOT re-emit the transcript through
+                    // stream-json, and `build_entries` concatenates cold + live:
+                    // skipping this seeds an empty conversation visually even
+                    // though the agent subprocess will happily continue from
+                    // where it left off (the close→reopen empty-history bug).
+                    //
+                    // Phase 4: prefer the per-entry rows (no epoch bump — read
+                    // the persisted generation). Fall back to the legacy blob
+                    // only when there are no rows, then lazily migrate it.
+                    let migrating = preloaded_rows.is_empty();
+                    let (entries, cold_persisted_v2) = if !preloaded_rows.is_empty() {
+                        (entries_from_rows(preloaded_rows), Vec::new())
+                    } else {
+                        let (cold_entries, restored_created_ms) =
+                            cold_entries_from_persisted(preloaded_persisted, cx);
+                        let entries = crate::session_entry::rebuild_entries(
+                            &cold_entries,
+                            &[],
+                            &restored_created_ms,
+                            0,
+                            cx,
+                        );
+                        let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
+                            cold_entries
+                                .iter()
+                                .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+                                .collect();
+                        (entries, cold_persisted_v2)
+                    };
                     let entity = cx.new(|cx| {
                         let mut s = SolutionSession::new_idle(
                             session_id,
@@ -1694,20 +1762,23 @@ impl SolutionAgentStore {
                         s.cwd = resume_cwd.clone();
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
-                        s.entries = crate::session_entry::rebuild_entries(
-                            &cold_entries,
-                            &[],
-                            &restored_created_ms,
-                            0,
-                            cx,
-                        );
+                        s.entries = entries;
                         s.init_change_seq_from_entries();
-                        s.bump_epoch();
+                        if migrating {
+                            s.bump_epoch();
+                        } else {
+                            s.epoch = preloaded_epoch as u64;
+                        }
                         s.cold_persisted_v2 = cold_persisted_v2;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
                         s
                     });
                     store.sessions.insert(session_id, entity);
+                    // Legacy → rows lazy migration (idempotent; guarded by
+                    // rows-empty). Blob is kept (model/effort fallback; Task 5).
+                    if migrating {
+                        store.persist_all_rows(session_id, cx);
+                    }
                 }
                 let by_sol = store
                     .by_solution
@@ -2283,18 +2354,31 @@ impl SolutionAgentStore {
             let metas = db.list_for_solution(solution_id.clone()).await?;
             let by_id: std::collections::HashMap<SolutionSessionId, SolutionSessionMetadata> =
                 metas.into_iter().map(|m| (m.id, m)).collect();
-            // Load blobs for all rows we'll hydrate (skip ones already in
-            // the in-memory store — they're already live or being
-            // resumed).
+            // Phase 4: prefer per-entry rows. Load rows + epoch for every id
+            // we'll hydrate; only fall back to (and deserialize) the legacy
+            // transcript blob when a session has no rows yet — that blob path
+            // also triggers a lazy row migration in the foreground block below.
+            let mut rows_per_session: std::collections::HashMap<
+                SolutionSessionId,
+                Vec<crate::db::EntryRow>,
+            > = std::collections::HashMap::new();
+            let mut epoch_per_session: std::collections::HashMap<SolutionSessionId, i64> =
+                std::collections::HashMap::new();
             let mut blobs: std::collections::HashMap<SolutionSessionId, Vec<u8>> =
                 std::collections::HashMap::new();
             for id in &ordered_ids {
                 if already_open.contains(id) {
                     continue;
                 }
-                let blob = db.load_blob(*id).await?;
-                if let Some(bytes) = blob {
-                    blobs.insert(*id, bytes);
+                let rows = db.load_entries(*id).await?;
+                let epoch = db.load_epoch(*id).await?.unwrap_or(0);
+                epoch_per_session.insert(*id, epoch);
+                if rows.is_empty() {
+                    if let Some(bytes) = db.load_blob(*id).await? {
+                        blobs.insert(*id, bytes);
+                    }
+                } else {
+                    rows_per_session.insert(*id, rows);
                 }
             }
             // Apply on the foreground thread so the cx.new + emit
@@ -2323,22 +2407,28 @@ impl SolutionAgentStore {
                         log::warn!("restore_open_tabs: orphaned tab_order for {id}");
                         continue;
                     };
-                    // Reconstruct the persisted dialog as live-shape
-                    // `AgentThreadEntry`s so the cold-tab render goes
-                    // through the same virtualized list path as a real
-                    // session. Prefer the structured v2 payload when
-                    // present; legacy v1 / pre-v1 blobs degrade
-                    // gracefully to a single Assistant-shaped entry
-                    // per row containing the flat markdown summary
-                    // (no bubbles for User vs Assistant, but at least
-                    // the text shows up — not worth a full migration
-                    // round-trip just to recolour archived sessions).
-                    let persisted = blobs
-                        .remove(id)
-                        .and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
+                    // Phase 4: row-native sessions load their transcript from
+                    // the per-entry rows and READ the persisted epoch (no bump —
+                    // a restart loading the same transcript must not look like a
+                    // new generation to the mobile delta client). Legacy sessions
+                    // (no rows) keep the blob path verbatim and lazily migrate to
+                    // rows afterwards.
+                    let epoch = epoch_per_session.get(id).copied().unwrap_or(0);
+                    let rows = rows_per_session.remove(id);
+                    // Only deserialize the blob in the legacy (no-rows) branch.
+                    let persisted = if rows.is_some() {
+                        None
+                    } else {
+                        blobs.remove(id).and_then(|bytes| {
+                            serde_json::from_slice::<PersistedSession>(&bytes).ok()
+                        })
+                    };
+                    let migrating = rows.is_none();
                     // Read model/effort/cached_models from metadata columns first
                     // (Task 3a); fall back to the blob for legacy rows written
-                    // before these columns existed (NULL = not yet migrated).
+                    // before these columns existed (NULL = not yet migrated). In
+                    // the rows branch `persisted` is None, so the fallback degrades
+                    // to column-only — Task 5 owns the model/effort→column backfill.
                     let restored_available_models = if !meta.cached_models.is_empty() {
                         meta.cached_models.clone()
                     } else {
@@ -2353,20 +2443,29 @@ impl SolutionAgentStore {
                     let restored_desired_effort = meta.desired_effort.clone().or_else(|| {
                         persisted.as_ref().and_then(|p| p.desired_effort.clone())
                     });
-                    let (cold_entries, restored_created_ms) =
-                        cold_entries_from_persisted(persisted, cx);
-                    let cold_entries_for_entries =
-                        crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, 0, cx);
-                    // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
-                    // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
-                    // are also captured. For v2 blobs this is equivalent to cloning
-                    // entries_v2 directly; for legacy blobs it now preserves the history
-                    // that was previously silently dropped on the next snapshot.
-                    let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
-                        cold_entries
-                            .iter()
-                            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
-                            .collect();
+                    let (entries, cold_persisted_v2) = if let Some(rows) = rows {
+                        (entries_from_rows(rows), Vec::new())
+                    } else {
+                        // Reconstruct the persisted dialog as live-shape
+                        // `AgentThreadEntry`s. Prefer the structured v2 payload;
+                        // legacy v1 / pre-v1 blobs degrade to a single
+                        // Assistant-shaped entry per flat markdown summary.
+                        let (cold_entries, restored_created_ms) =
+                            cold_entries_from_persisted(persisted, cx);
+                        let entries = crate::session_entry::rebuild_entries(
+                            &cold_entries,
+                            &[],
+                            &restored_created_ms,
+                            0,
+                            cx,
+                        );
+                        let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
+                            cold_entries
+                                .iter()
+                                .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+                                .collect();
+                        (entries, cold_persisted_v2)
+                    };
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
@@ -2379,9 +2478,13 @@ impl SolutionAgentStore {
                         s.last_activity_at = meta.last_activity_at;
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
-                        s.entries = cold_entries_for_entries;
+                        s.entries = entries;
                         s.init_change_seq_from_entries();
-                        s.bump_epoch();
+                        if migrating {
+                            s.bump_epoch();
+                        } else {
+                            s.epoch = epoch as u64;
+                        }
                         s.cold_persisted_v2 = cold_persisted_v2;
                         // Seed from the persisted metadata so the
                         // status-row meter shows the last-known total
@@ -2397,6 +2500,14 @@ impl SolutionAgentStore {
                         s
                     });
                     this.sessions.insert(meta.id, entity);
+                    // Legacy → rows lazy migration: write the freshly-built
+                    // transcript out as rows so the next restore takes the rows
+                    // branch. Blob is intentionally kept (model/effort fallback;
+                    // Task 5 owns blob removal + the column backfill that precedes
+                    // it). Idempotent: guarded by the rows-empty check above.
+                    if migrating {
+                        this.persist_all_rows(meta.id, cx);
+                    }
                     this.by_solution
                         .entry(solution_id.clone())
                         .or_default()
@@ -2512,15 +2623,29 @@ impl SolutionAgentStore {
             if to_hydrate.is_empty() {
                 return Ok(Vec::new());
             }
-            // Load every blob first off the foreground thread. Missing
-            // blobs (NULL acp_thread_blob) just mean the session has
-            // never had any conversation content — those still get
-            // hydrated, just with an empty cold_entries vec.
+            // Phase 4: prefer per-entry rows. Load rows + epoch for every
+            // session; only load+deserialize the legacy transcript blob when a
+            // session has no rows yet (the foreground block then lazily migrates
+            // that blob to rows). Missing rows AND blob just mean the session
+            // never had conversation content — hydrates with empty entries.
+            let mut rows_per_session: std::collections::HashMap<
+                SolutionSessionId,
+                Vec<crate::db::EntryRow>,
+            > = std::collections::HashMap::new();
+            let mut epoch_per_session: std::collections::HashMap<SolutionSessionId, i64> =
+                std::collections::HashMap::new();
             let mut blobs: std::collections::HashMap<SolutionSessionId, Vec<u8>> =
                 std::collections::HashMap::new();
             for meta in &to_hydrate {
-                if let Some(bytes) = db.load_blob(meta.id).await? {
-                    blobs.insert(meta.id, bytes);
+                let rows = db.load_entries(meta.id).await?;
+                let epoch = db.load_epoch(meta.id).await?.unwrap_or(0);
+                epoch_per_session.insert(meta.id, epoch);
+                if rows.is_empty() {
+                    if let Some(bytes) = db.load_blob(meta.id).await? {
+                        blobs.insert(meta.id, bytes);
+                    }
+                } else {
+                    rows_per_session.insert(meta.id, rows);
                 }
             }
             // Pre-load background_agent rows for every session about to
@@ -2544,32 +2669,38 @@ impl SolutionAgentStore {
                     if this.sessions.contains_key(&meta.id) {
                         continue;
                     }
-                    let persisted = blobs
-                        .remove(&meta.id)
-                        .and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
-                    let restored_created_ms = persisted
-                        .as_ref()
-                        .map(|p| p.entry_created_ms.clone())
-                        .unwrap_or_default();
-                    let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
+                    // Phase 4: row-native sessions load from rows + read the
+                    // persisted epoch (no bump). Legacy sessions (no rows) keep
+                    // the blob path verbatim, then lazily migrate to rows.
+                    let epoch = epoch_per_session.get(&meta.id).copied().unwrap_or(0);
+                    let rows = rows_per_session.remove(&meta.id);
+                    let migrating = rows.is_none();
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
-                    let cold_entries_for_entries = crate::session_entry::rebuild_entries(
-                        &cold_entries,
-                        &[],
-                        &restored_created_ms,
-                        0,
-                        cx,
-                    );
-                    // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
-                    // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
-                    // are also captured. For v2 blobs this is equivalent to cloning
-                    // entries_v2 directly; for legacy blobs it now preserves the history
-                    // that was previously silently dropped on the next snapshot.
-                    let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
-                        cold_entries
-                            .iter()
-                            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
-                            .collect();
+                    let (entries, cold_persisted_v2) = if let Some(rows) = rows {
+                        (entries_from_rows(rows), Vec::new())
+                    } else {
+                        let persisted = blobs.remove(&meta.id).and_then(|bytes| {
+                            serde_json::from_slice::<PersistedSession>(&bytes).ok()
+                        });
+                        let restored_created_ms = persisted
+                            .as_ref()
+                            .map(|p| p.entry_created_ms.clone())
+                            .unwrap_or_default();
+                        let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
+                        let entries = crate::session_entry::rebuild_entries(
+                            &cold_entries,
+                            &[],
+                            &restored_created_ms,
+                            0,
+                            cx,
+                        );
+                        let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
+                            cold_entries
+                                .iter()
+                                .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+                                .collect();
+                        (entries, cold_persisted_v2)
+                    };
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
@@ -2582,9 +2713,13 @@ impl SolutionAgentStore {
                         s.last_activity_at = meta.last_activity_at;
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
-                        s.entries = cold_entries_for_entries;
+                        s.entries = entries;
                         s.init_change_seq_from_entries();
-                        s.bump_epoch();
+                        if migrating {
+                            s.bump_epoch();
+                        } else {
+                            s.epoch = epoch as u64;
+                        }
                         s.cold_persisted_v2 = cold_persisted_v2;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
@@ -2608,6 +2743,11 @@ impl SolutionAgentStore {
                     // the navigator's own open_session path will add
                     // it to by_solution at that point.
                     this.sessions.insert(meta.id, entity);
+                    // Legacy → rows lazy migration (idempotent; guarded by
+                    // rows-empty). Blob kept (model/effort fallback; Task 5).
+                    if migrating {
+                        this.persist_all_rows(meta.id, cx);
+                    }
                     hydrated.push(meta.id);
                 }
                 // Task 13: restore persisted background_agents per session.
@@ -2859,41 +2999,69 @@ impl SolutionAgentStore {
         cx: &mut AsyncApp,
         session_id: SolutionSessionId,
     ) {
-        let blob = db.load_blob(session_id).await.unwrap_or(None);
+        // Phase 4: prefer per-entry rows. Load rows + epoch; only load+
+        // deserialize the legacy blob when there are no rows (then lazily
+        // migrate it below).
+        let rows = db.load_entries(session_id).await.unwrap_or_default();
+        let epoch = db.load_epoch(session_id).await.ok().flatten().unwrap_or(0);
+        let blob = if rows.is_empty() {
+            db.load_blob(session_id).await.unwrap_or(None)
+        } else {
+            None
+        };
         let bg_rows = db
             .load_background_agents(session_id.to_string())
             .await
             .unwrap_or_default();
         this.update(cx, |this, cx| {
-            let persisted =
-                blob.and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
+            let migrating = rows.is_empty();
+            let persisted = if migrating {
+                blob.and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok())
+            } else {
+                None
+            };
+            let mut rows = Some(rows);
             if let Some(entity) = this.sessions.get(&session_id).cloned() {
                 entity.update(cx, |session, cx| {
-                    let (cold_entries, created_ms) = cold_entries_from_persisted(persisted, cx);
-                    session.entries = crate::session_entry::rebuild_entries(
-                        &cold_entries,
-                        &[],
-                        &created_ms,
-                        0,
-                        cx,
-                    );
+                    let (entries, cold_persisted_v2) = if let Some(rows) =
+                        rows.take().filter(|r| !r.is_empty())
+                    {
+                        (entries_from_rows(rows), Vec::new())
+                    } else {
+                        let (cold_entries, created_ms) =
+                            cold_entries_from_persisted(persisted, cx);
+                        let entries = crate::session_entry::rebuild_entries(
+                            &cold_entries,
+                            &[],
+                            &created_ms,
+                            0,
+                            cx,
+                        );
+                        let cold_persisted_v2 = cold_entries
+                            .iter()
+                            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+                            .collect();
+                        (entries, cold_persisted_v2)
+                    };
+                    session.entries = entries;
                     session.init_change_seq_from_entries();
-                    session.bump_epoch();
-                    // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
-                    // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
-                    // are also captured. For v2 blobs this is equivalent to cloning
-                    // entries_v2 directly; for legacy blobs it now preserves the history
-                    // that was previously silently dropped on the next snapshot.
-                    session.cold_persisted_v2 = cold_entries
-                        .iter()
-                        .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
-                        .collect();
+                    if migrating {
+                        session.bump_epoch();
+                    } else {
+                        session.epoch = epoch as u64;
+                    }
+                    session.cold_persisted_v2 = cold_persisted_v2;
                     session.hydrating = false;
                     // Drives the session view's `cx.observe(&session)` →
                     // re-render → cold-list resize catch-up so the freshly
                     // loaded transcript paints.
                     cx.notify();
                 });
+                // Legacy → rows lazy migration (idempotent; guarded by
+                // rows-empty). Blob kept (model/effort fallback; Task 5).
+                if migrating {
+                    this.persist_all_rows(session_id, cx);
+                }
             }
             if !bg_rows.is_empty() {
                 this.reconcile_background_agents_for(session_id, bg_rows, cx);

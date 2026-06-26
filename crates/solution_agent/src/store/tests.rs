@@ -2066,6 +2066,437 @@ async fn legacy_blob_cold_history_survives_snapshot(cx: &mut TestAppContext) {
     );
 }
 
+// ----- Task 4: row-based cold load + lazy blob→rows migration -----
+
+/// `entries_from_rows` unit test: a corrupt-payload row is skipped (log::warn,
+/// not a panic) while every well-formed row decodes IN ORDER, preserving the
+/// per-row meta (mod_seq / created_ms / subagent_id).
+#[test]
+fn entries_from_rows_skips_corrupt_and_preserves_order() {
+    let good_user = crate::session_entry::SessionEntryKind::UserMessage {
+        id: None,
+        content_md: "hello".into(),
+        chunks: vec![],
+    };
+    let good_assistant = crate::session_entry::SessionEntryKind::AssistantMessage {
+        chunks: vec![crate::session_entry::AssistantChunk::Message("hi".into())],
+    };
+    let rows = vec![
+        crate::db::EntryRow {
+            idx: 0,
+            mod_seq: 1,
+            created_ms: 1_700_000_000_000,
+            subagent_id: None,
+            payload: serde_json::to_vec(&good_user).unwrap(),
+        },
+        crate::db::EntryRow {
+            idx: 1,
+            mod_seq: 2,
+            created_ms: 1_700_000_001_000,
+            subagent_id: None,
+            payload: b"{not valid json".to_vec(),
+        },
+        crate::db::EntryRow {
+            idx: 2,
+            mod_seq: 3,
+            created_ms: 1_700_000_002_000,
+            subagent_id: Some("sub-7".into()),
+            payload: serde_json::to_vec(&good_assistant).unwrap(),
+        },
+    ];
+
+    let entries = crate::store::entries_from_rows(rows);
+    assert_eq!(entries.len(), 2, "the corrupt middle row must be dropped");
+    assert!(matches!(
+        entries[0].kind,
+        crate::session_entry::SessionEntryKind::UserMessage { .. }
+    ));
+    assert_eq!(entries[0].mod_seq, 1);
+    assert_eq!(entries[0].created_ms, 1_700_000_000_000);
+    assert_eq!(entries[0].subagent_id, None);
+    assert!(matches!(
+        entries[1].kind,
+        crate::session_entry::SessionEntryKind::AssistantMessage { .. }
+    ));
+    assert_eq!(entries[1].mod_seq, 3);
+    assert_eq!(entries[1].created_ms, 1_700_000_002_000);
+    assert_eq!(
+        entries[1].subagent_id,
+        Some(SharedString::from("sub-7")),
+        "subagent_id column must carry over"
+    );
+}
+
+/// (a) A session whose transcript is already stored as ROWS (no blob touched)
+/// cold-restores from those rows and reads the persisted epoch verbatim
+/// (NO bump — a restart loading the same transcript must not look like a new
+/// generation to the mobile delta client).
+#[gpui::test]
+async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    let id_a = crate::model::SolutionSessionId::new();
+    let agent_id = SharedString::from("claude-acp");
+    let now = Utc::now();
+    let meta_a = crate::model::SolutionSessionMetadata {
+        id: id_a,
+        solution_id: solution_id.clone(),
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        title: SharedString::from("session A"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+    };
+    db.save_metadata(meta_a).await.expect("meta a");
+
+    // Write rows directly (the row-native shape) + a non-trivial epoch.
+    let user = crate::session_entry::SessionEntryKind::UserMessage {
+        id: None,
+        content_md: "first prompt".into(),
+        chunks: vec![],
+    };
+    let assistant = crate::session_entry::SessionEntryKind::AssistantMessage {
+        chunks: vec![crate::session_entry::AssistantChunk::Message("reply".into())],
+    };
+    db.upsert_entry(
+        id_a,
+        0,
+        1,
+        1_700_000_000_000,
+        None,
+        serde_json::to_vec(&user).unwrap(),
+    )
+    .await
+    .expect("row 0");
+    db.upsert_entry(
+        id_a,
+        1,
+        2,
+        1_700_000_001_000,
+        None,
+        serde_json::to_vec(&assistant).unwrap(),
+    )
+    .await
+    .expect("row 1");
+    db.save_epoch(id_a, 7).await.expect("epoch");
+    db.update_tab_orders(solution_id.clone(), vec![id_a])
+        .await
+        .expect("tab order");
+
+    let ordered = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.restore_open_tabs(solution_id.clone(), cx)
+            })
+        })
+        .await
+        .expect("restore");
+    assert_eq!(ordered, vec![id_a]);
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("session A restored");
+            sa.read_with(cx, |s, _| {
+                assert_eq!(s.entries.len(), 2, "entries must come from the 2 rows");
+                assert!(matches!(
+                    s.entries[0].kind,
+                    crate::session_entry::SessionEntryKind::UserMessage { .. }
+                ));
+                assert!(matches!(
+                    s.entries[1].kind,
+                    crate::session_entry::SessionEntryKind::AssistantMessage { .. }
+                ));
+                assert_eq!(s.entries[0].mod_seq, 1);
+                assert_eq!(s.entries[1].mod_seq, 2);
+                assert_eq!(s.entries[0].created_ms, 1_700_000_000_000);
+                assert_eq!(s.entries[1].created_ms, 1_700_000_001_000);
+                assert_eq!(
+                    s.epoch, 7,
+                    "rows branch must READ the persisted epoch, not bump it"
+                );
+            });
+        });
+    });
+}
+
+/// (b) A v2 blob with NO rows migrates to rows on cold-restore: `entries`
+/// matches the blob, `db.load_entries` becomes non-empty, and a SECOND
+/// cold-restore returns the same entries straight from rows (idempotent — no
+/// double-migrate, the blob is preserved as the model/effort fallback).
+#[gpui::test]
+async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
+    use crate::cold_persistence::{
+        PersistedAssistantChunk, PersistedAssistantMessage, PersistedEntryV2, PersistedUserMessage,
+    };
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    let id_a = crate::model::SolutionSessionId::new();
+    let agent_id = SharedString::from("claude-acp");
+    let now = Utc::now();
+    let meta_a = crate::model::SolutionSessionMetadata {
+        id: id_a,
+        solution_id: solution_id.clone(),
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        title: SharedString::from("session A"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+    };
+    db.save_metadata(meta_a).await.expect("meta a");
+
+    let blob_a = serde_json::to_vec(&PersistedSession {
+        title: "session A".into(),
+        entries: vec![],
+        entry_summaries: vec![],
+        entries_v2: vec![
+            PersistedEntryV2::User(PersistedUserMessage {
+                id: None,
+                content_md: "first prompt".into(),
+                chunks: vec![],
+            }),
+            PersistedEntryV2::Assistant(PersistedAssistantMessage {
+                chunks: vec![PersistedAssistantChunk::Message("reply".into())],
+            }),
+        ],
+        entry_created_ms: vec![1_700_000_000_000, 1_700_000_001_000],
+        available_models: vec![],
+        desired_model: None,
+        desired_effort: None,
+    })
+    .unwrap();
+    db.save_blob(id_a, blob_a).await.expect("blob a");
+    // No rows written: this is the lazy-migration trigger.
+    assert!(
+        db.load_entries(id_a).await.expect("load rows").is_empty(),
+        "precondition: no rows before migration"
+    );
+    db.update_tab_orders(solution_id.clone(), vec![id_a])
+        .await
+        .expect("tab order");
+
+    let ordered = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.restore_open_tabs(solution_id.clone(), cx)
+            })
+        })
+        .await
+        .expect("restore");
+    assert_eq!(ordered, vec![id_a]);
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("session A restored");
+            sa.read_with(cx, |s, _| {
+                assert_eq!(s.entries.len(), 2, "entries must match the v2 blob");
+                assert!(matches!(
+                    s.entries[0].kind,
+                    crate::session_entry::SessionEntryKind::UserMessage { .. }
+                ));
+                assert!(matches!(
+                    s.entries[1].kind,
+                    crate::session_entry::SessionEntryKind::AssistantMessage { .. }
+                ));
+            });
+        });
+    });
+
+    // The migration (persist_all_rows) is spawned + detached; let it land.
+    cx.run_until_parked();
+
+    let rows = db.load_entries(id_a).await.expect("load rows after migrate");
+    assert_eq!(rows.len(), 2, "migration must have written rows");
+
+    // Second cold-restore: drop the in-memory session, restore again — now the
+    // rows branch must serve the same entries (idempotent, no double-migrate).
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.sessions.remove(&id_a);
+            store.by_solution.remove(&solution_id);
+        });
+    });
+    let ordered2 = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.restore_open_tabs(solution_id.clone(), cx)
+            })
+        })
+        .await
+        .expect("restore 2");
+    assert_eq!(ordered2, vec![id_a]);
+    cx.run_until_parked();
+
+    let rows_after = db
+        .load_entries(id_a)
+        .await
+        .expect("load rows after 2nd restore");
+    assert_eq!(
+        rows_after.len(),
+        2,
+        "second restore must NOT double-migrate (still exactly 2 rows)"
+    );
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("session A re-restored");
+            sa.read_with(cx, |s, _| {
+                assert_eq!(s.entries.len(), 2, "2nd restore loads same entries from rows");
+            });
+        });
+    });
+}
+
+/// (c) MANDATORY Phase-2 regression guard: a LEGACY v1 blob (entries_v2 EMPTY,
+/// entry_summaries populated) migrates losslessly — `entries` carries the
+/// summary text (history NOT lost) and rows are written. This is the exact
+/// regression Phase 2 fixed; it must stay fixed.
+#[gpui::test]
+async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    let id_a = crate::model::SolutionSessionId::new();
+    let agent_id = SharedString::from("claude-acp");
+    let now = Utc::now();
+    let meta_a = crate::model::SolutionSessionMetadata {
+        id: id_a,
+        solution_id: solution_id.clone(),
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        title: SharedString::from("legacy session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+    };
+    db.save_metadata(meta_a).await.expect("meta a");
+
+    // Legacy v1 shape: entries_v2 EMPTY, history only in entry_summaries.
+    let blob_a = serde_json::to_vec(&PersistedSession {
+        title: "legacy session".into(),
+        entries: vec![],
+        entry_summaries: vec![
+            "user said hello".to_string(),
+            "assistant replied hi".to_string(),
+        ],
+        entries_v2: vec![],
+        entry_created_ms: vec![],
+        available_models: vec![],
+        desired_model: None,
+        desired_effort: None,
+    })
+    .unwrap();
+    db.save_blob(id_a, blob_a).await.expect("blob a");
+    db.update_tab_orders(solution_id.clone(), vec![id_a])
+        .await
+        .expect("tab order");
+
+    let ordered = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.restore_open_tabs(solution_id.clone(), cx)
+            })
+        })
+        .await
+        .expect("restore");
+    assert_eq!(ordered, vec![id_a]);
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("legacy session restored");
+            sa.read_with(cx, |s, _| {
+                assert_eq!(
+                    s.entries.len(),
+                    2,
+                    "legacy v1 history must NOT be lost (Phase-2 regression guard)"
+                );
+                // Legacy summaries hydrate as Assistant-shaped entries carrying
+                // the flat markdown text.
+                let carries_text = s.entries.iter().any(|e| {
+                    matches!(
+                        &e.kind,
+                        crate::session_entry::SessionEntryKind::AssistantMessage { chunks }
+                            if chunks.iter().any(|c| matches!(
+                                c,
+                                crate::session_entry::AssistantChunk::Message(m)
+                                    if m.contains("user said hello")
+                            ))
+                    )
+                });
+                assert!(carries_text, "summary text must survive into entries");
+            });
+        });
+    });
+
+    // Migration writes rows.
+    cx.run_until_parked();
+    let rows = db.load_entries(id_a).await.expect("load rows after migrate");
+    assert_eq!(
+        rows.len(),
+        2,
+        "legacy migration must write rows so the next restore is row-native"
+    );
+    // Blob must be PRESERVED (Task 5 owns blob removal + model/effort backfill).
+    assert!(
+        db.load_blob(id_a).await.expect("load blob").is_some(),
+        "migration must NOT null the blob (model/effort fallback safety net)"
+    );
+}
+
 /// `EntriesRemoved` covers thread-local truncation; the `cleared` arm
 /// fires when `entries()` is empty after the event (the only in-tree
 /// producer is rewind-to-zero from refusal-truncation). This test pins
