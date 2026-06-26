@@ -23,6 +23,15 @@ pub struct BackgroundAgentRow {
     pub stop_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntryRow {
+    pub idx: i64,
+    pub mod_seq: i64,
+    pub created_ms: i64,
+    pub subagent_id: Option<String>,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundShellRow {
     pub solution_session_id: String,
@@ -351,6 +360,66 @@ impl SolutionAgentDb {
         self.executor.spawn(async move {
             let connection = connection.lock();
             delete_background_shells_for_session(&connection, &solution_session_id)
+        })
+    }
+
+    pub fn upsert_entry(
+        &self,
+        session_id: SolutionSessionId,
+        idx: i64,
+        mod_seq: i64,
+        created_ms: i64,
+        subagent_id: Option<String>,
+        payload: Vec<u8>,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            insert_or_update_entry(&connection, &session_id.to_string(), idx, mod_seq, created_ms, subagent_id, payload)
+        })
+    }
+
+    pub fn load_entries(&self, session_id: SolutionSessionId) -> Task<Result<Vec<EntryRow>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            select_entries_for_session(&connection, &session_id.to_string())
+        })
+    }
+
+    pub fn delete_entries_from(
+        &self,
+        session_id: SolutionSessionId,
+        from_idx: i64,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            delete_entries_from_idx(&connection, &session_id.to_string(), from_idx)
+        })
+    }
+
+    pub fn delete_entries_for_session(&self, session_id: SolutionSessionId) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            delete_all_entries_for_session(&connection, &session_id.to_string())
+        })
+    }
+
+    pub fn save_epoch(&self, session_id: SolutionSessionId, epoch: i64) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            update_epoch(&connection, &session_id.to_string(), epoch)
+        })
+    }
+
+    pub fn load_epoch(&self, session_id: SolutionSessionId) -> Task<Result<Option<i64>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            select_epoch(&connection, &session_id.to_string())
         })
     }
 
@@ -871,6 +940,90 @@ fn delete_background_shells_for_session(
     "})?;
     stmt(solution_session_id.to_string())?;
     Ok(())
+}
+
+fn insert_or_update_entry(
+    connection: &Connection,
+    session_id: &str,
+    idx: i64,
+    mod_seq: i64,
+    created_ms: i64,
+    subagent_id: Option<String>,
+    payload: Vec<u8>,
+) -> Result<()> {
+    let mut stmt = connection.exec_bound::<(String, i64, i64, i64, Option<String>, Vec<u8>)>(indoc! {"
+        INSERT INTO solution_session_entries
+            (session_id, idx, mod_seq, created_ms, subagent_id, payload)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, idx) DO UPDATE SET
+            mod_seq     = excluded.mod_seq,
+            created_ms  = excluded.created_ms,
+            subagent_id = excluded.subagent_id,
+            payload     = excluded.payload
+    "})?;
+    stmt((session_id.to_string(), idx, mod_seq, created_ms, subagent_id, payload))?;
+    Ok(())
+}
+
+fn select_entries_for_session(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<EntryRow>> {
+    let mut stmt = connection.select_bound::<String, (i64, i64, i64, Option<String>, Vec<u8>)>(indoc! {"
+        SELECT idx, mod_seq, created_ms, subagent_id, payload
+        FROM   solution_session_entries
+        WHERE  session_id = ?
+        ORDER BY idx ASC
+    "})?;
+    let rows = stmt(session_id.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(idx, mod_seq, created_ms, subagent_id, payload)| EntryRow {
+            idx,
+            mod_seq,
+            created_ms,
+            subagent_id,
+            payload,
+        })
+        .collect())
+}
+
+fn delete_entries_from_idx(
+    connection: &Connection,
+    session_id: &str,
+    from_idx: i64,
+) -> Result<()> {
+    let mut stmt = connection.exec_bound::<(String, i64)>(indoc! {"
+        DELETE FROM solution_session_entries
+        WHERE session_id = ? AND idx >= ?
+    "})?;
+    stmt((session_id.to_string(), from_idx))?;
+    Ok(())
+}
+
+fn delete_all_entries_for_session(connection: &Connection, session_id: &str) -> Result<()> {
+    let mut stmt = connection.exec_bound::<String>(indoc! {"
+        DELETE FROM solution_session_entries
+        WHERE session_id = ?
+    "})?;
+    stmt(session_id.to_string())?;
+    Ok(())
+}
+
+fn update_epoch(connection: &Connection, session_id: &str, epoch: i64) -> Result<()> {
+    let mut stmt = connection.exec_bound::<(i64, String)>(indoc! {"
+        UPDATE solution_sessions SET epoch = ?1 WHERE id = ?2
+    "})?;
+    stmt((epoch, session_id.to_string()))?;
+    Ok(())
+}
+
+fn select_epoch(connection: &Connection, session_id: &str) -> Result<Option<i64>> {
+    let mut stmt = connection.select_bound::<String, Option<i64>>(indoc! {"
+        SELECT epoch FROM solution_sessions WHERE id = ? LIMIT 1
+    "})?;
+    let rows = stmt(session_id.to_string())?;
+    Ok(rows.into_iter().next().flatten())
 }
 
 fn delete_by_solution(connection: &Connection, solution_id: &SolutionId) -> Result<()> {
@@ -1461,5 +1614,117 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[gpui::test]
+    async fn entry_upsert_and_load_ordered_by_idx(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let session_id = SolutionSessionId::new();
+        db.upsert_entry(session_id, 1, 10, 1_000, None, b"second".to_vec())
+            .await
+            .unwrap();
+        db.upsert_entry(session_id, 0, 5, 500, Some("agent-a".into()), b"first".to_vec())
+            .await
+            .unwrap();
+
+        let rows = db.load_entries(session_id).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].idx, 0);
+        assert_eq!(rows[0].payload, b"first".to_vec());
+        assert_eq!(rows[0].subagent_id, Some("agent-a".into()));
+        assert_eq!(rows[1].idx, 1);
+        assert_eq!(rows[1].payload, b"second".to_vec());
+        assert_eq!(rows[1].subagent_id, None);
+    }
+
+    #[gpui::test]
+    async fn entry_upsert_same_idx_updates_in_place(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let session_id = SolutionSessionId::new();
+        db.upsert_entry(session_id, 0, 1, 100, None, b"original".to_vec())
+            .await
+            .unwrap();
+        db.upsert_entry(session_id, 0, 2, 200, Some("sub".into()), b"updated".to_vec())
+            .await
+            .unwrap();
+
+        let rows = db.load_entries(session_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].idx, 0);
+        assert_eq!(rows[0].mod_seq, 2);
+        assert_eq!(rows[0].created_ms, 200);
+        assert_eq!(rows[0].subagent_id, Some("sub".into()));
+        assert_eq!(rows[0].payload, b"updated".to_vec());
+    }
+
+    #[gpui::test]
+    async fn delete_entries_from_leaves_earlier_rows(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let session_id = SolutionSessionId::new();
+        for i in 0i64..3 {
+            db.upsert_entry(session_id, i, i, i * 100, None, vec![i as u8])
+                .await
+                .unwrap();
+        }
+
+        db.delete_entries_from(session_id, 1).await.unwrap();
+
+        let rows = db.load_entries(session_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].idx, 0);
+    }
+
+    #[gpui::test]
+    async fn save_and_load_epoch_roundtrips(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        // epoch lives on solution_sessions, so the row must exist first.
+        let meta = make_meta(1, "sol-epoch");
+        db.save_metadata(meta.clone()).await.unwrap();
+
+        // Before setting it, load_epoch returns None.
+        let before = db.load_epoch(meta.id).await.unwrap();
+        assert_eq!(before, None);
+
+        db.save_epoch(meta.id, 42).await.unwrap();
+        let after = db.load_epoch(meta.id).await.unwrap();
+        assert_eq!(after, Some(42));
+
+        // Update to a new value.
+        db.save_epoch(meta.id, 99).await.unwrap();
+        let updated = db.load_epoch(meta.id).await.unwrap();
+        assert_eq!(updated, Some(99));
+    }
+
+    #[gpui::test]
+    async fn delete_entries_for_session_removes_all_rows(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let session_a = SolutionSessionId::new();
+        let session_b = SolutionSessionId::new();
+
+        for i in 0i64..3 {
+            db.upsert_entry(session_a, i, i, i * 100, None, vec![i as u8])
+                .await
+                .unwrap();
+        }
+        db.upsert_entry(session_b, 0, 0, 0, None, b"keep".to_vec())
+            .await
+            .unwrap();
+
+        db.delete_entries_for_session(session_a).await.unwrap();
+
+        let rows_a = db.load_entries(session_a).await.unwrap();
+        assert!(rows_a.is_empty());
+        let rows_b = db.load_entries(session_b).await.unwrap();
+        assert_eq!(rows_b.len(), 1);
     }
 }
