@@ -127,15 +127,17 @@ impl SolutionSessionView {
         // Emit a state-changed event so any listeners (navigator tab indicator,
         // status row, …) refresh from the new state — the bundle just moved
         // out of `pending_messages`.
-        SolutionAgentStore::global(cx).update(cx, |_store, cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            // `SolutionSession.state` is unchanged here (only the queue moved) —
+            // emit the bare `SessionStateChanged` for the desktop re-render
+            // without bumping `state_seq`. The queue change is carried by
+            // `mark_queue_changed` below.
             cx.emit(crate::store::SolutionAgentStoreEvent::SessionStateChanged(
                 session_id,
             ));
             // The bundle just left `pending_messages` — broadcast so
             // paired clients (mobile) drop the matching Queued bubble.
-            cx.emit(crate::store::SolutionAgentStoreEvent::SessionQueueChanged(
-                session_id,
-            ));
+            store.mark_queue_changed(session_id, cx);
         });
         cx.stop_propagation();
         cx.notify();

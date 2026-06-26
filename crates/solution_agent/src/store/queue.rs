@@ -541,13 +541,17 @@ impl SolutionAgentStore {
                 target: "solution_agent::queue",
                 "session={session_id} enqueued (merged={merged}, queue_len={queue_len}) preview={blocks_text_summary}",
             );
+            // State discriminant is unchanged here (the session was already
+            // Running) — re-emit the bare `SessionStateChanged` for the desktop
+            // re-render WITHOUT moving `state_seq` (the delta's state section is
+            // derived purely from `SolutionSession.state`, which didn't change).
             cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
             // External MCP consumers (the mobile client) render queued
             // bundles as Queued bubbles in real time off this event —
             // without it a desktop-typed follow-up to a busy session
             // would stay invisible on a paired mobile until the
             // eventual flush.
-            cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
+            self.mark_queue_changed(session_id, cx);
             cx.notify();
             return Task::ready(Ok(()));
         }
@@ -581,7 +585,7 @@ impl SolutionAgentStore {
             s.last_activity_at = Utc::now();
             s.last_turn_duration = None;
         });
-        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
+        self.mark_state_changed(session_id, cx);
         cx.notify();
 
         let Some(acp_thread) = session_entity.read(cx).acp_thread().cloned() else {
@@ -636,7 +640,7 @@ impl SolutionAgentStore {
                             s.update(cx, |s, _| {
                                 s.state = SessionState::Errored(err_message.clone());
                             });
-                            cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
+                            store.mark_state_changed(session_id, cx);
                             cx.notify();
                         }
                     })?;
@@ -696,7 +700,7 @@ impl SolutionAgentStore {
                                 })
                                 .unwrap_or_default();
                             if !main_blocks.is_empty() {
-                                cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
+                                store.mark_queue_changed(session_id, cx);
                                 let mut with_hint =
                                     Vec::with_capacity(main_blocks.len() + 1);
                                 with_hint.push(acp::ContentBlock::Text(

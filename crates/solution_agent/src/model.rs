@@ -490,6 +490,18 @@ pub struct SolutionSession {
     /// uses this to force a full reload when the transcript history changes
     /// structurally.
     pub epoch: u64,
+    /// `change_seq` at this section's last change; ephemeral (rebuilt on restart
+    /// per `init_change_seq_from_entries`). The mobile delta omits the section
+    /// when `watermark <= since_seq`. Tracks `pending_messages` (the queue).
+    pub queue_seq: u64,
+    /// `change_seq` at this section's last change; ephemeral (rebuilt on restart
+    /// per `init_change_seq_from_entries`). The mobile delta omits the section
+    /// when `watermark <= since_seq`. Tracks `active_subagents`.
+    pub subagents_seq: u64,
+    /// `change_seq` at this section's last change; ephemeral (rebuilt on restart
+    /// per `init_change_seq_from_entries`). The mobile delta omits the section
+    /// when `watermark <= since_seq`. Tracks `state`.
+    pub state_seq: u64,
 }
 
 impl SolutionSession {
@@ -546,6 +558,9 @@ impl SolutionSession {
             tab_order: None,
             change_seq: 0,
             epoch: 0,
+            queue_seq: 0,
+            subagents_seq: 0,
+            state_seq: 0,
         }
     }
 
@@ -595,9 +610,22 @@ impl SolutionSession {
     }
 
     /// Re-seat `change_seq` above the highest stamped entry after a cold restore so
-    /// new stamps never collide with restored `mod_seq` values.
+    /// new stamps never collide with restored `mod_seq` values, then seed the three
+    /// section watermarks STRICTLY ABOVE that point.
+    ///
+    /// The queue and subagents sections are not persisted, so after a desktop
+    /// restart they are empty while a paired mobile client may still hold a stale
+    /// non-empty cache pinned at `since_seq = max(mod_seq)`. Bumping all three
+    /// watermarks above `max(mod_seq)` forces the next delta to re-send exactly
+    /// the three ephemeral sections (now correct/empty) while entries
+    /// (`mod_seq <= max`) are NOT re-sent — the sections self-heal without a full
+    /// transcript reload. Folded into this method (rather than a separate call) so
+    /// the cold-restore call sites can never forget it.
     pub fn init_change_seq_from_entries(&mut self) {
         self.change_seq = self.entries.iter().map(|e| e.mod_seq).max().unwrap_or(0);
+        self.queue_seq = self.bump_change_seq();
+        self.subagents_seq = self.bump_change_seq();
+        self.state_seq = self.bump_change_seq();
     }
 
     /// Bump the transcript generation (cleared/replaced wholesale: /clear, compact,
@@ -705,6 +733,9 @@ mod tests {
             tab_order: None,
             change_seq: 0,
             epoch: 0,
+            queue_seq: 0,
+            subagents_seq: 0,
+            state_seq: 0,
         }
     }
 
@@ -798,6 +829,40 @@ mod tests {
             let e0 = s.epoch;
             s.bump_epoch();
             assert_eq!(s.epoch, e0 + 1);
+        });
+    }
+
+    /// Cold restore must reseat `change_seq = max(mod_seq)` AND seed the three
+    /// section watermarks strictly above it (decision 3): queue/subagents/state
+    /// are ephemeral and must re-send on the first post-restart delta.
+    #[gpui::test]
+    fn init_change_seq_seeds_section_watermarks_above_max(cx: &mut TestAppContext) {
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            // Three restored entries stamped mod_seq 1..=3 (N = 3).
+            let entries = (1..=3u64)
+                .map(|mod_seq| SessionEntry {
+                    created_ms: 0,
+                    mod_seq,
+                    subagent_id: None,
+                    kind: crate::session_entry::SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: "x".into(),
+                        chunks: vec![],
+                    },
+                })
+                .collect::<Vec<_>>();
+            s.set_entries(entries, cx);
+            s.init_change_seq_from_entries();
+
+            // change_seq advanced to N + 3, watermarks each distinct and > N.
+            assert_eq!(s.change_seq, 6, "change_seq must be max(mod_seq) + 3");
+            assert_eq!(s.queue_seq, 4, "queue_seq = N + 1");
+            assert_eq!(s.subagents_seq, 5, "subagents_seq = N + 2");
+            assert_eq!(s.state_seq, 6, "state_seq = N + 3");
+            for w in [s.queue_seq, s.subagents_seq, s.state_seq] {
+                assert!(w > 3, "watermark {w} must be strictly above max(mod_seq)=3");
+            }
         });
     }
 }

@@ -6277,13 +6277,19 @@ async fn mod_seq_stamped_on_live_mutations(cx: &mut TestAppContext) {
         let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
         assert_eq!(s.entries.len(), 2, "two NewEntry events → two entries");
+        // The first NewEntry flips Idle→Running through `mutate_state`, which now
+        // consumes one `change_seq` for the `state_seq` watermark (decision 1:
+        // entry mod_seq and section watermarks share one monotonic clock). So the
+        // first entry stamps mod_seq 2 (seq 1 went to the state flip); the second
+        // NewEntry finds the session already Running (no flip, no extra bump) and
+        // stamps mod_seq 3.
         assert_eq!(
-            s.entries[0].mod_seq, 1,
-            "entry0.mod_seq must be 1 after first NewEntry"
+            s.entries[0].mod_seq, 2,
+            "entry0.mod_seq must be 2 (seq 1 consumed by the Idle→Running state flip)"
         );
         assert_eq!(
-            s.entries[1].mod_seq, 2,
-            "entry1.mod_seq must be 2 after second NewEntry"
+            s.entries[1].mod_seq, 3,
+            "entry1.mod_seq must be 3 after second NewEntry"
         );
         s.entries[0].created_ms
     });
@@ -6306,12 +6312,12 @@ async fn mod_seq_stamped_on_live_mutations(cx: &mut TestAppContext) {
             "EntryUpdated must not change entries count"
         );
         assert_eq!(
-            s.entries[0].mod_seq, 3,
-            "entry0.mod_seq must advance to 3 after EntryUpdated(0)"
+            s.entries[0].mod_seq, 4,
+            "entry0.mod_seq must advance to 4 after EntryUpdated(0)"
         );
         assert_eq!(
-            s.entries[1].mod_seq, 2,
-            "entry1.mod_seq must remain 2 (unchanged by EntryUpdated on entry0)"
+            s.entries[1].mod_seq, 3,
+            "entry1.mod_seq must remain 3 (unchanged by EntryUpdated on entry0)"
         );
         assert_eq!(
             s.entries[0].created_ms,
@@ -6483,7 +6489,10 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
     });
     cx.executor().run_until_parked();
 
-    // Assert: mod_seq stamped 1..=2, change_seq re-seated to 2.
+    // Assert: mod_seq stamped 1..=2 (N = 2); `init_change_seq_from_entries`
+    // re-seats change_seq to max(mod_seq) then seeds the three section
+    // watermarks above it (decision 3), so change_seq lands at N + 3 = 5 and the
+    // watermarks are N+1, N+2, N+3, each strictly above the restored entries.
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session");
@@ -6498,12 +6507,20 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
             "cold entry[1].mod_seq must be 2"
         );
         assert_eq!(
-            s.change_seq, 2,
-            "change_seq must be re-seated to 2 after cold restore"
+            s.change_seq, 5,
+            "change_seq must be max(mod_seq)=2 + 3 watermark bumps after cold restore"
         );
+        assert_eq!(s.queue_seq, 3, "queue_seq = N + 1");
+        assert_eq!(s.subagents_seq, 4, "subagents_seq = N + 2");
+        assert_eq!(s.state_seq, 5, "state_seq = N + 3");
+        for w in [s.queue_seq, s.subagents_seq, s.state_seq] {
+            assert!(w > 2, "section watermark {w} must be > max(mod_seq)=2");
+        }
     });
 
-    // Fire one live NewEntry; it must receive mod_seq == 3.
+    // Fire one live NewEntry. The session is Idle, so the NewEntry first flips
+    // Idle→Running through `mutate_state` (consuming seq 6 for the `state_seq`
+    // watermark — shared clock, decision 1), then stamps the entry at seq 7.
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
@@ -6523,13 +6540,142 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
         let s = session.read(cx);
         assert_eq!(s.entries.len(), 3, "entries must be cold(2) + live(1) = 3");
         assert_eq!(
-            s.entries[2].mod_seq, 3,
-            "first live NewEntry must stamp mod_seq == 3"
+            s.entries[2].mod_seq, 7,
+            "first live NewEntry stamps mod_seq == 7 (3 restore watermark bumps + 1 \
+             Idle→Running state-flip bump precede it)"
         );
         assert!(
             matches!(s.entries[2].kind, SessionEntryKind::UserMessage { .. }),
             "live entry must be UserMessage"
         );
+    });
+}
+
+/// Phase 5, Task 5.1: enqueuing a follow-up onto a Running session emits
+/// `SessionQueueChanged` and must move `queue_seq` to the freshly-allocated
+/// `change_seq` (and to a value > 0). The state watermark also advances because
+/// the enqueue funnel re-emits `SessionStateChanged` for the live Queued bubble.
+#[gpui::test]
+async fn enqueue_bumps_queue_watermark(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session exists");
+            // Force Running so send_message_blocks takes the queueing branch
+            // (the branch that emits SessionQueueChanged).
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+            });
+            let queue_seq_before = session.read(cx).queue_seq;
+            assert_eq!(queue_seq_before, 0, "fresh session starts with queue_seq 0");
+            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
+                agent_client_protocol::schema::TextContent::new("follow-up".to_string()),
+            )];
+            store
+                .send_message_blocks(session_id, blocks, cx)
+                .detach_and_log_err(cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert_eq!(s.pending_messages.len(), 1, "message queued");
+        assert!(s.queue_seq > 0, "queue_seq must advance off zero");
+        assert_eq!(
+            s.queue_seq, s.change_seq,
+            "queue_seq must equal the freshly-allocated change_seq"
+        );
+    });
+}
+
+/// Phase 5, Task 5.1: registering a subagent tab emits `SessionSubagentsChanged`
+/// and must move `subagents_seq` to the freshly-allocated `change_seq`.
+#[gpui::test]
+async fn subagent_spawn_bumps_subagents_watermark(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let subagents_seq_before = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store
+            .read(cx)
+            .session(session_id)
+            .expect("session")
+            .read(cx)
+            .subagents_seq
+    });
+    assert_eq!(subagents_seq_before, 0, "fresh session starts at 0");
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.upsert_tool_call(
+                make_task_tool_call(
+                    "toolu_wm_1",
+                    "Task",
+                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    Some("Worker"),
+                    None,
+                ),
+                cx,
+            )
+            .expect("upsert task");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert_eq!(s.active_subagents.len(), 1, "one subagent tracked");
+        assert!(s.subagents_seq > 0, "subagents_seq must advance off zero");
+        assert_eq!(
+            s.subagents_seq, s.change_seq,
+            "subagents_seq must equal the freshly-allocated change_seq"
+        );
+    });
+}
+
+/// Phase 5, Task 5.1: a discriminant-changing transition through `mutate_state`
+/// (Idle → Running) emits `SessionStateChanged` and must move `state_seq` to the
+/// freshly-allocated `change_seq`.
+#[gpui::test]
+async fn mutate_state_bumps_state_watermark(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Pin to Idle so the Idle → Running flip is a real discriminant change.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, _| s.state = SessionState::Idle);
+            let state_seq_before = session.read(cx).state_seq;
+            store.mutate_state(
+                session_id,
+                |state| {
+                    *state = SessionState::Running {
+                        started_at: std::time::Instant::now(),
+                        notified: false,
+                    };
+                },
+                cx,
+            );
+            let s = session.read(cx);
+            assert!(
+                s.state_seq > state_seq_before,
+                "state_seq must advance on a discriminant-changing transition"
+            );
+            assert_eq!(
+                s.state_seq, s.change_seq,
+                "state_seq must equal the freshly-allocated change_seq"
+            );
+        });
     });
 }
 
@@ -6589,6 +6735,68 @@ async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
         epoch_before,
         epoch_after_reset
     );
+}
+
+/// Phase 5, Task 5.1: `/clear` (`reset_context`) with a non-empty queue must bump
+/// `epoch` AND move the queue watermark, because the queued bundle is dropped —
+/// a paired mobile holding the stale Queued bubble needs the section re-sent
+/// (now empty). Mirrors `reset_context_bumps_epoch` but seeds a pending message.
+#[gpui::test]
+async fn reset_context_with_queue_bumps_epoch_and_queue_watermark(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Queue a follow-up onto a Running session so reset_context has pending
+    // bundles to drop (the `had_pending` branch that moves the queue watermark).
+    let (epoch_before, queue_seq_before) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+            });
+            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
+                agent_client_protocol::schema::TextContent::new("queued".to_string()),
+            )];
+            store
+                .send_message_blocks(session_id, blocks, cx)
+                .detach_and_log_err(cx);
+            let s = session.read(cx);
+            assert_eq!(s.pending_messages.len(), 1, "one bundle queued before /clear");
+            (s.epoch, s.queue_seq)
+        })
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.reset_context(session_id, cx))
+    })
+    .await
+    .expect("reset_context");
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert_eq!(
+            s.epoch,
+            epoch_before + 1,
+            "reset_context must bump epoch by exactly 1"
+        );
+        assert!(
+            s.pending_messages.is_empty(),
+            "reset_context drops the queued bundle"
+        );
+        assert!(
+            s.queue_seq > queue_seq_before,
+            "reset_context must move the queue watermark when it drops a pending bundle \
+             (was {queue_seq_before}, got {})",
+            s.queue_seq
+        );
+    });
 }
 
 /// Phase 4 Task 3 (follow-up): `/clear` (reset_context) must not only wipe

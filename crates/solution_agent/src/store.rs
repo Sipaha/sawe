@@ -1577,7 +1577,7 @@ impl SolutionAgentStore {
                         had_pending
                     });
                     if had_pending {
-                        cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
+                        store.mark_queue_changed(session_id, cx);
                     }
                 } else {
                     // Hydrate cold prefix BEFORE attaching the live thread.
@@ -2126,7 +2126,7 @@ impl SolutionAgentStore {
                 thread.push_user_message_entry(None, combined, cx);
             });
         }
-        cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
+        self.mark_queue_changed(session_id, cx);
         cx.notify();
 
         Some(text)
@@ -3080,8 +3080,7 @@ impl SolutionAgentStore {
         session.update(cx, |s, _| {
             s.state = SessionState::Errored(SharedString::from("restarting…"));
         });
-        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
-        self.emit_session_state_changed_workspace(&session_id, cx);
+        self.mark_state_changed(session_id, cx);
         // Best-effort close of the old session; we still spawn the new
         // one even if removal fails so the user isn't stranded.
         if let Err(err) = self.close_session(session_id, cx) {
@@ -3224,8 +3223,7 @@ impl SolutionAgentStore {
                 // idx>0 rows) so the next cold load doesn't see new idx 0 + stale
                 // idx 1..N. Targeted upserts alone would leak the old rows.
                 store.persist_all_rows(session_id, cx);
-                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
-                store.emit_session_state_changed_workspace(&session_id, cx);
+                store.mark_state_changed(session_id, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionContextReset {
                     id: session_id,
                     context_count: new_count,
@@ -3390,14 +3388,13 @@ impl SolutionAgentStore {
                 // `rotate_context` does), so read the current value to
                 // forward as-is on the wire.
                 let context_count = session_entity.read(cx).context_count;
-                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
-                store.emit_session_state_changed_workspace(&session_id, cx);
+                store.mark_state_changed(session_id, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionContextReset {
                     id: session_id,
                     context_count,
                 });
                 if had_pending {
-                    cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
+                    store.mark_queue_changed(session_id, cx);
                 }
                 cx.notify();
             })?;
@@ -4154,7 +4151,7 @@ impl SolutionAgentStore {
         };
 
         if changed {
-            cx.emit(SolutionAgentStoreEvent::SessionSubagentsChanged(session_id));
+            self.mark_subagents_changed(session_id, cx);
         }
 
         // Managed-agent registration (Task 8 of the Background Agents Strip
@@ -5284,7 +5281,7 @@ impl SolutionAgentStore {
                             false
                         };
                         if had_pending {
-                            cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
+                            self.mark_queue_changed(session_id, cx);
                         }
                     } else {
                         // Idle / flush-after-cancel. Deliver the MAIN-targeted
@@ -5337,7 +5334,7 @@ impl SolutionAgentStore {
                         }
                         let had_pending = !main_blocks.is_empty() || !dropped_subagent.is_empty();
                         if had_pending {
-                            cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
+                            self.mark_queue_changed(session_id, cx);
                         }
                         if !main_blocks.is_empty() {
                             log::info!(
@@ -5630,6 +5627,49 @@ impl SolutionAgentStore {
         cx.notify();
     }
 
+    /// Move the `state_seq` section watermark to a fresh `change_seq` and emit
+    /// the `SessionStateChanged` signal (both the internal store event and the
+    /// sequenced workspace notification). Centralizes the watermark+emit pair so
+    /// the mobile delta's "state section changed iff `state_seq > since_seq`"
+    /// invariant can never drift from an emit (decision 2).
+    pub(crate) fn mark_state_changed(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.sessions.get(&session_id).cloned() {
+            session.update(cx, |s, _| s.state_seq = s.bump_change_seq());
+        }
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
+        self.emit_session_state_changed_workspace(&session_id, cx);
+    }
+
+    /// Move the `queue_seq` section watermark to a fresh `change_seq` and emit
+    /// `SessionQueueChanged`. See [`Self::mark_state_changed`] for the invariant.
+    pub(crate) fn mark_queue_changed(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.sessions.get(&session_id).cloned() {
+            session.update(cx, |s, _| s.queue_seq = s.bump_change_seq());
+        }
+        cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
+    }
+
+    /// Move the `subagents_seq` section watermark to a fresh `change_seq` and
+    /// emit `SessionSubagentsChanged`. See [`Self::mark_state_changed`].
+    pub(crate) fn mark_subagents_changed(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.sessions.get(&session_id).cloned() {
+            session.update(cx, |s, _| s.subagents_seq = s.bump_change_seq());
+        }
+        cx.emit(SolutionAgentStoreEvent::SessionSubagentsChanged(session_id));
+    }
+
     /// Emit a sequenced `workspace.session_state_changed` notification for
     /// `session_id`. Reads the current session state from `self.sessions`
     /// and builds the wire payload using the same `session_summary` helper
@@ -5682,8 +5722,7 @@ impl SolutionAgentStore {
         session.update(cx, |s, _| f(&mut s.state));
         let next = session.read(cx).state.clone();
         if std::mem::discriminant(&previous) != std::mem::discriminant(&next) {
-            cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
-            self.emit_session_state_changed_workspace(&session_id, cx);
+            self.mark_state_changed(session_id, cx);
         }
         // Drop the Stopping safety-net task whenever the session leaves
         // Stopping by any path (Stopped event handler, Error handler,
