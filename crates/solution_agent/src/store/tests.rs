@@ -1980,6 +1980,83 @@ fn persisted_session_legacy_blob_decodes_with_empty_entries() {
     );
 }
 
+/// Regression: restoring a legacy blob (entries_v2 empty, entry_summaries populated)
+/// must populate cold_persisted_v2 so that serializable_snapshot preserves the cold
+/// history in subsequent persists. Before the fix, cold_persisted_v2 was set from
+/// persisted.entries_v2 (empty for legacy blobs), causing the cold prefix to be
+/// silently dropped from the blob on the next save.
+#[gpui::test]
+async fn legacy_blob_cold_history_survives_snapshot(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    // Build a legacy-shaped PersistedSession: entries_v2 is empty, history lives in
+    // entry_summaries (the older flat-markdown format).
+    let legacy = PersistedSession {
+        title: "legacy session".into(),
+        entries: vec![],
+        entry_summaries: vec![
+            "user said hello".to_string(),
+            "assistant replied hi".to_string(),
+        ],
+        entries_v2: vec![],
+        entry_created_ms: vec![],
+        available_models: vec![],
+        desired_model: None,
+        desired_effort: None,
+    };
+
+    // Simulate what each restore site does: call cold_entries_from_persisted, then
+    // build cold_persisted_v2 from the resulting cold_entries via to_persisted.
+    let (cold_entries, _created_ms) =
+        cx.update(|cx| crate::store::cold_entries_from_persisted(Some(legacy), cx));
+    assert_eq!(cold_entries.len(), 2, "legacy blob must restore 2 entries");
+
+    // Build a minimal SolutionSession with cold_persisted_v2 populated from cold_entries,
+    // mirroring the fixed restore-site pattern.
+    let session_id = crate::model::SolutionSessionId::new();
+    let (session_bytes, cold_v2_len) = cx.update(|cx| {
+        let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> = cold_entries
+            .iter()
+            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+            .collect();
+        let cold_v2_len = cold_persisted_v2.len();
+        // Rebuild session entries before moving cold_persisted_v2 and cold_entries.
+        let session_entries =
+            crate::session_entry::rebuild_entries(&cold_entries, &[], &[], cx);
+        let session = cx.new(|_| {
+            let mut s = crate::model::SolutionSession::new_idle(
+                session_id,
+                solutions::SolutionId("sol-legacy".into()),
+                SharedString::from("claude-acp"),
+                agent_client_protocol::schema::SessionId::new("acp-legacy"),
+            );
+            s.title = SharedString::from("legacy session");
+            s.cold_persisted_v2 = cold_persisted_v2;
+            s.entries = session_entries;
+            s
+        });
+        let bytes = session.read_with(cx, |s, cx| serializable_snapshot(s, cx));
+        (bytes, cold_v2_len)
+    });
+
+    assert_eq!(
+        cold_v2_len, 2,
+        "cold_persisted_v2 must be populated from cold_entries, not from the empty entries_v2"
+    );
+
+    let decoded: PersistedSession = serde_json::from_slice(&session_bytes).unwrap();
+    assert_eq!(
+        decoded.entries_v2.len(),
+        2,
+        "serializable_snapshot must emit the legacy cold entries into entries_v2 (was 0 before fix)"
+    );
+    assert!(
+        !decoded.entry_summaries.is_empty(),
+        "entry_summaries must be populated for legacy entries"
+    );
+}
+
 /// `EntriesRemoved` covers thread-local truncation; the `cleared` arm
 /// fires when `entries()` is empty after the event (the only in-tree
 /// producer is rewind-to-zero from refusal-truncation). This test pins

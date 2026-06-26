@@ -1662,12 +1662,18 @@ impl SolutionAgentStore {
                     // subprocess will happily continue from where it
                     // left off in the background (the close→reopen
                     // empty-history bug).
-                    let raw_v2 = preloaded_persisted
-                        .as_ref()
-                        .map(|p| p.entries_v2.clone())
-                        .unwrap_or_default();
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(preloaded_persisted, cx);
+                    // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
+                    // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
+                    // are also captured. For v2 blobs this is equivalent to cloning
+                    // entries_v2 directly; for legacy blobs it now preserves the history
+                    // that was previously silently dropped on the next snapshot.
+                    let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
+                        cold_entries
+                            .iter()
+                            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+                            .collect();
                     let entity = cx.new(|cx| {
                         let mut s = SolutionSession::new_idle(
                             session_id,
@@ -1691,7 +1697,7 @@ impl SolutionAgentStore {
                             &restored_created_ms,
                             cx,
                         );
-                        s.cold_persisted_v2 = raw_v2;
+                        s.cold_persisted_v2 = cold_persisted_v2;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
                         s
                     });
@@ -2336,14 +2342,20 @@ impl SolutionAgentStore {
                     let restored_desired_effort = persisted
                         .as_ref()
                         .and_then(|p| p.desired_effort.clone());
-                    let raw_v2 = persisted
-                        .as_ref()
-                        .map(|p| p.entries_v2.clone())
-                        .unwrap_or_default();
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(persisted, cx);
                     let cold_entries_for_entries =
                         crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, cx);
+                    // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
+                    // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
+                    // are also captured. For v2 blobs this is equivalent to cloning
+                    // entries_v2 directly; for legacy blobs it now preserves the history
+                    // that was previously silently dropped on the next snapshot.
+                    let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
+                        cold_entries
+                            .iter()
+                            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+                            .collect();
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
@@ -2357,7 +2369,7 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
-                        s.cold_persisted_v2 = raw_v2;
+                        s.cold_persisted_v2 = cold_persisted_v2;
                         // Seed from the persisted metadata so the
                         // status-row meter shows the last-known total
                         // for cold tabs (no live thread → no
@@ -2526,10 +2538,6 @@ impl SolutionAgentStore {
                         .as_ref()
                         .map(|p| p.entry_created_ms.clone())
                         .unwrap_or_default();
-                    let raw_v2 = persisted
-                        .as_ref()
-                        .map(|p| p.entries_v2.clone())
-                        .unwrap_or_default();
                     let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
                     let cold_entries_for_entries = crate::session_entry::rebuild_entries(
@@ -2538,6 +2546,16 @@ impl SolutionAgentStore {
                         &restored_created_ms,
                         cx,
                     );
+                    // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
+                    // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
+                    // are also captured. For v2 blobs this is equivalent to cloning
+                    // entries_v2 directly; for legacy blobs it now preserves the history
+                    // that was previously silently dropped on the next snapshot.
+                    let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
+                        cold_entries
+                            .iter()
+                            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+                            .collect();
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
@@ -2551,7 +2569,7 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
-                        s.cold_persisted_v2 = raw_v2;
+                        s.cold_persisted_v2 = cold_persisted_v2;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
                         s.tab_order = session_tab_order;
@@ -2835,10 +2853,6 @@ impl SolutionAgentStore {
                 blob.and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
             if let Some(entity) = this.sessions.get(&session_id).cloned() {
                 entity.update(cx, |session, cx| {
-                    let raw_v2 = persisted
-                        .as_ref()
-                        .map(|p| p.entries_v2.clone())
-                        .unwrap_or_default();
                     let (cold_entries, created_ms) = cold_entries_from_persisted(persisted, cx);
                     session.entries = crate::session_entry::rebuild_entries(
                         &cold_entries,
@@ -2846,7 +2860,15 @@ impl SolutionAgentStore {
                         &created_ms,
                         cx,
                     );
-                    session.cold_persisted_v2 = raw_v2;
+                    // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
+                    // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
+                    // are also captured. For v2 blobs this is equivalent to cloning
+                    // entries_v2 directly; for legacy blobs it now preserves the history
+                    // that was previously silently dropped on the next snapshot.
+                    session.cold_persisted_v2 = cold_entries
+                        .iter()
+                        .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
+                        .collect();
                     session.hydrating = false;
                     // Drives the session view's `cx.observe(&session)` →
                     // re-render → cold-list resize catch-up so the freshly
@@ -4909,23 +4931,16 @@ impl SolutionAgentStore {
                     let current_len = s.entries.len();
                     let mut additions: Vec<crate::session_entry::SessionEntry> = Vec::new();
                     // Fill any gap between the current entries length and the new index.
+                    // After unification (Phase 2), cold restore guarantees entries.len() ==
+                    // live_base, so gap indices are always in live space — the cold branch
+                    // below is unreachable and has been removed to prevent accidental
+                    // duplication of cold entries.
+                    let live_base = s.live_base;
                     for gap_idx in current_len..global_entry_index {
                         // These are pre-existing entries whose creation time was never
-                        // captured; convert from cold or live and stamp with the sentinel.
-                        let live_base = s.live_base;
-                        let entry = if gap_idx < live_base {
-                            // Already materialized as a SessionEntry during cold restore.
-                            let Some(e) = s.entries.get(gap_idx) else {
-                                log::warn!(
-                                    "solution_agent NewEntry gap-fill: cold entry at idx {} missing (entries.len={})",
-                                    gap_idx,
-                                    s.entries.len(),
-                                );
-                                continue;
-                            };
-                            e.clone()
-                        } else {
-                            let local = gap_idx - live_base;
+                        // captured; convert from live and stamp with the sentinel.
+                        let local = gap_idx - live_base;
+                        let entry = {
                             let Some(e) = live.get(local) else {
                                 log::warn!(
                                     "solution_agent NewEntry gap-fill: live entry at local idx {} missing (live.len={})",
