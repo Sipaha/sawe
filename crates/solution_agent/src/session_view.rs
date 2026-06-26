@@ -14,7 +14,9 @@ use gpui::{
 };
 use markdown::{Markdown, MarkdownFont, MarkdownStyle};
 use ui::prelude::*;
-use ui::{IconButton, IconName, Label, ScrollAxes, Scrollbars, Tooltip, WithScrollbar};
+use ui::{
+    CommonAnimationExt, IconButton, IconName, Label, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+};
 use workspace::{
     Workspace,
     notifications::{NotificationId, simple_message_notification::MessageNotification},
@@ -647,15 +649,28 @@ impl SolutionSessionView {
             return;
         }
         // Per-entry caches were keyed against the old thread's `(entry_idx,
-        // sub_idx)` coordinates; the new thread reuses those same indices for
-        // unrelated entries, so without clearing the cache we'd paint stale
-        // markdown from the old conversation. find/rewind state is also
+        // sub_idx)` coordinates; a different thread reuses those same indices
+        // for unrelated entries, so without clearing the cache we'd paint
+        // stale markdown from the old conversation. find/rewind state is also
         // entry-index-scoped.
-        self.markdown_cache.clear();
-        self.markdown_for_render.clear();
-        self.rewind_table.clear();
-        if let Some(find) = self.find.as_mut() {
-            find.matches.clear();
+        //
+        // EXCEPTION — the cold→live promotion (`last_thread_entity_id` was
+        // `None`, a live thread now attached on wake): the cold entries keep
+        // their indices `[0..cold_count)` (the live thread only appends at
+        // `cold_count`), so their cached `Markdown` entities are still valid.
+        // Clearing them here forced a full rebuild on the first post-wake
+        // frame — the visible "tool headers (done badges) paint first, then
+        // the message bodies pop in a frame later" double-relayout the user
+        // sees. Preserve the cache across this promotion; the appended live
+        // entries simply have no cache entry yet and get built on demand.
+        let cold_to_live = self.last_thread_entity_id.is_none() && thread_opt.is_some();
+        if !cold_to_live {
+            self.markdown_cache.clear();
+            self.markdown_for_render.clear();
+            self.rewind_table.clear();
+            if let Some(find) = self.find.as_mut() {
+                find.matches.clear();
+            }
         }
         match thread_opt {
             None => {
@@ -682,7 +697,27 @@ impl SolutionSessionView {
                 // after editor restart cleared the conversation).
                 let cold_count = self.session.read(cx).cold_entries.len();
                 let count = cold_count + thread.read(cx).entries().len();
-                self.list_state.reset(count);
+                let current = self.list_state.item_count();
+                // Cold→live promotion: the list already holds exactly the
+                // `cold_count` history rows (cold mode sized it to that). The
+                // live thread is attaching with zero-or-few fresh entries, so
+                // GROW the existing list via `splice` instead of `reset`.
+                // `reset` rebuilds the whole virtualized list — every history
+                // row is torn down and re-laid-out, which is the visible
+                // "the entire conversation is thrown out and refilled" jump on
+                // the first message after waking a restored session. Splice
+                // appends only the new rows and preserves the rendered cold
+                // rows + scroll anchor (same reason the drill-in growth path
+                // splices — see the `splice` call later in `render`). Fall
+                // back to a full reset only on a genuine swap to a different
+                // thread whose current size isn't a cold→live growth.
+                if current == cold_count && count >= current {
+                    if count > current {
+                        self.list_state.splice(current..current, count - current);
+                    }
+                } else {
+                    self.list_state.reset(count);
+                }
                 self.list_state.set_follow_mode(FollowMode::Tail);
                 // With `ListAlignment::Top`, the default post-reset
                 // scroll position is the head of the conversation —
@@ -2880,12 +2915,62 @@ impl Render for SolutionSessionView {
                     }
                 }
 
+                // Cold-tab catch-up: a lazily-hydrated placeholder tab starts
+                // with `cold_entries` empty and `list_state` sized to 0; when
+                // its `acp_thread_blob` finishes loading on a background task
+                // `cold_entries` grows, but `sync_thread_subscription`
+                // early-returns (the thread entity id is still `None` →
+                // unchanged), so the virtualized list would stay at 0 rows and
+                // render nothing. Resize to the cold count here whenever there's
+                // no live thread and the counts diverge. Skipped for drill-in
+                // (handled just above) and once a live thread attaches (that
+                // path owns sizing via `sync_thread_subscription` /
+                // `on_thread_event`).
+                if !is_drill_in
+                    && session.acp_thread().is_none()
+                    && self.list_state.item_count() != entries_count
+                {
+                    self.list_state.reset(entries_count);
+                    self.list_state.set_follow_mode(FollowMode::Tail);
+                    self.list_state.scroll_to_end();
+                }
+
                 let conversation_body: AnyElement = if entries_count == 0 {
-                    div()
-                        .px_2()
-                        .py_1()
-                        .child(Label::new("(no messages yet)").size(LabelSize::Default))
-                        .into_any_element()
+                    if !is_drill_in && session.hydrating && session.acp_thread().is_none() {
+                        // Lazily-hydrated background tab whose transcript blob
+                        // hasn't landed yet — show a spinner, not
+                        // "(no messages yet)", so the tab reads as "loading"
+                        // rather than "this conversation is empty". Same
+                        // rotating-⟳ vocabulary the status row uses for
+                        // "Resuming…".
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        ui::Icon::new(IconName::ArrowCircle)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted)
+                                            .with_rotate_animation(2),
+                                    )
+                                    .child(
+                                        Label::new("Loading conversation…")
+                                            .size(LabelSize::Default)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .into_any_element()
+                    } else {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .child(Label::new("(no messages yet)").size(LabelSize::Default))
+                            .into_any_element()
+                    }
                 } else {
                     list(
                         self.list_state.clone(),
