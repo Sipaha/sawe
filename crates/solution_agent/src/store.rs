@@ -1162,6 +1162,25 @@ impl SolutionAgentStore {
         db.save_metadata(meta).detach_and_log_err(cx);
     }
 
+    /// Flush just the session's current `change_seq` to its persisted column.
+    /// Used by the section `mark_*` helpers, which advance `change_seq` (via a
+    /// watermark bump) WITHOUT touching any entry row, so the entry-persist
+    /// helpers don't cover them. INVARIANT (Task 5.1b): the durable `change_seq`
+    /// must be >= every value ever handed to a delta client as `current_seq`, so
+    /// each watermark advance is flushed here before the matching section event
+    /// is emitted (and thus before any subsequent read could expose it).
+    fn persist_change_seq(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
+        let Some(db) = self.persistence.clone() else {
+            return;
+        };
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let change_seq = session.read(cx).change_seq as i64;
+        db.save_change_seq(session_id, change_seq)
+            .detach_and_log_err(cx);
+    }
+
     /// Resume a session from its persisted metadata: spawns / reuses the
     /// pooled connection and asks the agent to attach to the saved
     /// `acp_session_id`. Falls back to `resume_session` (history-less
@@ -1458,14 +1477,18 @@ impl SolutionAgentStore {
             // foreground thread; only load+deserialize the legacy transcript
             // blob when there are no rows yet (the fresh-entity branch below
             // then lazily migrates the blob to rows).
-            let (preloaded_rows, preloaded_epoch) = {
+            let (preloaded_rows, preloaded_epoch, preloaded_change_seq) = {
                 let tasks = this.update(cx, |store, _| {
-                    store
-                        .persistence()
-                        .map(|db| (db.load_entries(meta.id), db.load_epoch(meta.id)))
+                    store.persistence().map(|db| {
+                        (
+                            db.load_entries(meta.id),
+                            db.load_epoch(meta.id),
+                            db.load_change_seq(meta.id),
+                        )
+                    })
                 })?;
                 match tasks {
-                    Some((rows_task, epoch_task)) => {
+                    Some((rows_task, epoch_task, change_seq_task)) => {
                         let rows = rows_task.await.unwrap_or_else(|err| {
                             log::warn!(
                                 target: "solution_agent::resume",
@@ -1475,9 +1498,11 @@ impl SolutionAgentStore {
                             Vec::new()
                         });
                         let epoch = epoch_task.await.ok().flatten().unwrap_or(0);
-                        (rows, epoch)
+                        let change_seq =
+                            change_seq_task.await.ok().flatten().map(|v| v as u64);
+                        (rows, epoch, change_seq)
                     }
-                    None => (Vec::new(), 0),
+                    None => (Vec::new(), 0, None),
                 }
             };
             let preloaded_persisted: Option<PersistedSession> = if !preloaded_rows.is_empty() {
@@ -1625,7 +1650,13 @@ impl SolutionAgentStore {
                         s.desired_effort = meta.desired_effort.clone();
                         s.cached_models = meta.cached_models.clone();
                         s.entries = entries;
-                        s.init_change_seq_from_entries();
+                        // Legacy/migrating rows have no persisted change_seq and no
+                        // pre-restart delta client → fall back to max(mod_seq).
+                        s.restore_change_seq(if migrating {
+                            None
+                        } else {
+                            preloaded_change_seq
+                        });
                         if migrating {
                             s.bump_epoch();
                         } else {
@@ -2225,6 +2256,10 @@ impl SolutionAgentStore {
             > = std::collections::HashMap::new();
             let mut epoch_per_session: std::collections::HashMap<SolutionSessionId, i64> =
                 std::collections::HashMap::new();
+            let mut change_seq_per_session: std::collections::HashMap<
+                SolutionSessionId,
+                Option<u64>,
+            > = std::collections::HashMap::new();
             let mut blobs: std::collections::HashMap<SolutionSessionId, Vec<u8>> =
                 std::collections::HashMap::new();
             for id in &ordered_ids {
@@ -2234,6 +2269,8 @@ impl SolutionAgentStore {
                 let rows = db.load_entries(*id).await?;
                 let epoch = db.load_epoch(*id).await?.unwrap_or(0);
                 epoch_per_session.insert(*id, epoch);
+                change_seq_per_session
+                    .insert(*id, db.load_change_seq(*id).await?.map(|v| v as u64));
                 if rows.is_empty() {
                     if let Some(bytes) = db.load_blob(*id).await? {
                         blobs.insert(*id, bytes);
@@ -2275,6 +2312,8 @@ impl SolutionAgentStore {
                     // (no rows) keep the blob path verbatim and lazily migrate to
                     // rows afterwards.
                     let epoch = epoch_per_session.get(id).copied().unwrap_or(0);
+                    let restored_change_seq =
+                        change_seq_per_session.get(id).copied().flatten();
                     let rows = rows_per_session.remove(id);
                     // Only deserialize the blob in the legacy (no-rows) branch.
                     let persisted = if rows.is_some() {
@@ -2336,7 +2375,11 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = entries;
-                        s.init_change_seq_from_entries();
+                        s.restore_change_seq(if migrating {
+                            None
+                        } else {
+                            restored_change_seq
+                        });
                         if migrating {
                             s.bump_epoch();
                         } else {
@@ -2492,12 +2535,18 @@ impl SolutionAgentStore {
             > = std::collections::HashMap::new();
             let mut epoch_per_session: std::collections::HashMap<SolutionSessionId, i64> =
                 std::collections::HashMap::new();
+            let mut change_seq_per_session: std::collections::HashMap<
+                SolutionSessionId,
+                Option<u64>,
+            > = std::collections::HashMap::new();
             let mut blobs: std::collections::HashMap<SolutionSessionId, Vec<u8>> =
                 std::collections::HashMap::new();
             for meta in &to_hydrate {
                 let rows = db.load_entries(meta.id).await?;
                 let epoch = db.load_epoch(meta.id).await?.unwrap_or(0);
                 epoch_per_session.insert(meta.id, epoch);
+                change_seq_per_session
+                    .insert(meta.id, db.load_change_seq(meta.id).await?.map(|v| v as u64));
                 if rows.is_empty() {
                     if let Some(bytes) = db.load_blob(meta.id).await? {
                         blobs.insert(meta.id, bytes);
@@ -2531,6 +2580,8 @@ impl SolutionAgentStore {
                     // persisted epoch (no bump). Legacy sessions (no rows) keep
                     // the blob path verbatim, then lazily migrate to rows.
                     let epoch = epoch_per_session.get(&meta.id).copied().unwrap_or(0);
+                    let restored_change_seq =
+                        change_seq_per_session.get(&meta.id).copied().flatten();
                     let rows = rows_per_session.remove(&meta.id);
                     let migrating = rows.is_none();
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
@@ -2566,7 +2617,11 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = entries;
-                        s.init_change_seq_from_entries();
+                        s.restore_change_seq(if migrating {
+                            None
+                        } else {
+                            restored_change_seq
+                        });
                         if migrating {
                             s.bump_epoch();
                         } else {
@@ -2855,6 +2910,12 @@ impl SolutionAgentStore {
         // migrate it below).
         let rows = db.load_entries(session_id).await.unwrap_or_default();
         let epoch = db.load_epoch(session_id).await.ok().flatten().unwrap_or(0);
+        let restored_change_seq = db
+            .load_change_seq(session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v as u64);
         let blob = if rows.is_empty() {
             db.load_blob(session_id).await.unwrap_or(None)
         } else {
@@ -2890,7 +2951,11 @@ impl SolutionAgentStore {
                         )
                     };
                     session.entries = entries;
-                    session.init_change_seq_from_entries();
+                    session.restore_change_seq(if migrating {
+                        None
+                    } else {
+                        restored_change_seq
+                    });
                     if migrating {
                         session.bump_epoch();
                     } else {
@@ -3660,7 +3725,7 @@ impl SolutionAgentStore {
             return;
         };
         cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let (rows, len, epoch) = cx.update(|cx| {
+            let (rows, len, epoch, change_seq) = cx.update(|cx| {
                 let s = session.read(cx);
                 let rows: Vec<_> = s
                     .entries
@@ -3668,7 +3733,12 @@ impl SolutionAgentStore {
                     .enumerate()
                     .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
                     .collect();
-                (rows, s.entries.len() as i64, s.epoch as i64)
+                (
+                    rows,
+                    s.entries.len() as i64,
+                    s.epoch as i64,
+                    s.change_seq as i64,
+                )
             });
             for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
                 if payload.is_empty() {
@@ -3684,6 +3754,7 @@ impl SolutionAgentStore {
             }
             db.delete_entries_from(session_id, len).await.log_err();
             db.save_epoch(session_id, epoch).await.log_err();
+            db.save_change_seq(session_id, change_seq).await.log_err();
         })
         .detach();
     }
@@ -3703,7 +3774,7 @@ impl SolutionAgentStore {
             return;
         };
         cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let (rows, epoch) = cx.update(|cx| {
+            let (rows, epoch, change_seq) = cx.update(|cx| {
                 let s = session.read(cx);
                 let rows: Vec<_> = s
                     .entries
@@ -3712,7 +3783,7 @@ impl SolutionAgentStore {
                     .skip(start_idx)
                     .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
                     .collect();
-                (rows, s.epoch as i64)
+                (rows, s.epoch as i64, s.change_seq as i64)
             });
             for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
                 if payload.is_empty() {
@@ -3727,6 +3798,7 @@ impl SolutionAgentStore {
                     .log_err();
             }
             db.save_epoch(session_id, epoch).await.log_err();
+            db.save_change_seq(session_id, change_seq).await.log_err();
         })
         .detach();
     }
@@ -3749,13 +3821,14 @@ impl SolutionAgentStore {
             let row = cx.update(|cx| {
                 let s = session.read(cx);
                 let epoch = s.epoch as i64;
+                let change_seq = s.change_seq as i64;
                 let row = s
                     .entries
                     .get(global_idx)
                     .map(|entry| Self::entry_row_tuple(global_idx, entry));
-                (row, epoch)
+                (row, epoch, change_seq)
             });
-            let (row, epoch) = row;
+            let (row, epoch, change_seq) = row;
             if let Some((idx, mod_seq, created_ms, subagent_id, payload)) = row {
                 if payload.is_empty() {
                     log::warn!(
@@ -3769,6 +3842,7 @@ impl SolutionAgentStore {
                 }
             }
             db.save_epoch(session_id, epoch).await.log_err();
+            db.save_change_seq(session_id, change_seq).await.log_err();
         })
         .detach();
     }
@@ -3788,11 +3862,13 @@ impl SolutionAgentStore {
             return;
         };
         cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let epoch = cx.update(|cx| session.read(cx).epoch as i64);
+            let (epoch, change_seq) =
+                cx.update(|cx| (session.read(cx).epoch as i64, session.read(cx).change_seq as i64));
             db.delete_entries_from(session_id, from_idx as i64)
                 .await
                 .log_err();
             db.save_epoch(session_id, epoch).await.log_err();
+            db.save_change_seq(session_id, change_seq).await.log_err();
         })
         .detach();
     }
@@ -5640,6 +5716,7 @@ impl SolutionAgentStore {
         if let Some(session) = self.sessions.get(&session_id).cloned() {
             session.update(cx, |s, _| s.state_seq = s.bump_change_seq());
         }
+        self.persist_change_seq(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
         self.emit_session_state_changed_workspace(&session_id, cx);
     }
@@ -5654,6 +5731,7 @@ impl SolutionAgentStore {
         if let Some(session) = self.sessions.get(&session_id).cloned() {
             session.update(cx, |s, _| s.queue_seq = s.bump_change_seq());
         }
+        self.persist_change_seq(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
     }
 
@@ -5667,6 +5745,7 @@ impl SolutionAgentStore {
         if let Some(session) = self.sessions.get(&session_id).cloned() {
             session.update(cx, |s, _| s.subagents_seq = s.bump_change_seq());
         }
+        self.persist_change_seq(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionSubagentsChanged(session_id));
     }
 

@@ -154,6 +154,14 @@ impl SolutionAgentDb {
         // (e.g. context compaction that discards old entries). NULL = pre-phase-4
         // rows; Tasks 2-5 populate it.
         apply_idempotent_add_column(&connection, "epoch INTEGER");
+        // Phase 5 Task 5.1b: persist the session's `change_seq` cursor so it is
+        // monotonic across desktop restarts. Section bumps advance change_seq
+        // above max(mod_seq) WITHOUT creating an entry, and the mobile delta
+        // hands the client `current_seq = change_seq` as its `since_seq` cursor;
+        // if change_seq reseated to max(mod_seq) on cold load it would drop below
+        // a cursor already issued, silently losing new entries. NULL = legacy
+        // rows pre-dating this feature (restore falls back to max(mod_seq)).
+        apply_idempotent_add_column(&connection, "change_seq INTEGER");
         // Phase 4 Task 3a: persist model/effort/cached_models as columns so they
         // survive the removal of the transcript blob (Task 5). NULL = not set or
         // pre-Task-3a rows; read column-first then blob-fallback in restore_open_tabs.
@@ -426,6 +434,26 @@ impl SolutionAgentDb {
         self.executor.spawn(async move {
             let connection = connection.lock();
             select_epoch(&connection, &session_id.to_string())
+        })
+    }
+
+    pub fn save_change_seq(
+        &self,
+        session_id: SolutionSessionId,
+        change_seq: i64,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            update_change_seq(&connection, &session_id.to_string(), change_seq)
+        })
+    }
+
+    pub fn load_change_seq(&self, session_id: SolutionSessionId) -> Task<Result<Option<i64>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            select_change_seq(&connection, &session_id.to_string())
         })
     }
 
@@ -1040,6 +1068,22 @@ fn update_epoch(connection: &Connection, session_id: &str, epoch: i64) -> Result
 fn select_epoch(connection: &Connection, session_id: &str) -> Result<Option<i64>> {
     let mut stmt = connection.select_bound::<String, Option<i64>>(indoc! {"
         SELECT epoch FROM solution_sessions WHERE id = ? LIMIT 1
+    "})?;
+    let rows = stmt(session_id.to_string())?;
+    Ok(rows.into_iter().next().flatten())
+}
+
+fn update_change_seq(connection: &Connection, session_id: &str, change_seq: i64) -> Result<()> {
+    let mut stmt = connection.exec_bound::<(i64, String)>(indoc! {"
+        UPDATE solution_sessions SET change_seq = ?1 WHERE id = ?2
+    "})?;
+    stmt((change_seq, session_id.to_string()))?;
+    Ok(())
+}
+
+fn select_change_seq(connection: &Connection, session_id: &str) -> Result<Option<i64>> {
+    let mut stmt = connection.select_bound::<String, Option<i64>>(indoc! {"
+        SELECT change_seq FROM solution_sessions WHERE id = ? LIMIT 1
     "})?;
     let rows = stmt(session_id.to_string())?;
     Ok(rows.into_iter().next().flatten())
@@ -1740,6 +1784,29 @@ mod tests {
         db.save_epoch(meta.id, 99).await.unwrap();
         let updated = db.load_epoch(meta.id).await.unwrap();
         assert_eq!(updated, Some(99));
+    }
+
+    #[gpui::test]
+    async fn save_and_load_change_seq_roundtrips(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        // change_seq lives on solution_sessions, so the row must exist first.
+        let meta = make_meta(1, "sol-change-seq");
+        db.save_metadata(meta.clone()).await.unwrap();
+
+        // Before setting it, load_change_seq returns None (legacy/unset).
+        let before = db.load_change_seq(meta.id).await.unwrap();
+        assert_eq!(before, None);
+
+        db.save_change_seq(meta.id, 7).await.unwrap();
+        let after = db.load_change_seq(meta.id).await.unwrap();
+        assert_eq!(after, Some(7));
+
+        // Update to a new (higher) value.
+        db.save_change_seq(meta.id, 42).await.unwrap();
+        let updated = db.load_change_seq(meta.id).await.unwrap();
+        assert_eq!(updated, Some(42));
     }
 
     #[gpui::test]

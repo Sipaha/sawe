@@ -2120,6 +2120,215 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
     });
 }
 
+/// Phase 5, Task 5.1b core regression: a session whose `change_seq` advanced
+/// PAST `max(mod_seq)` via section bumps (state/queue/subagents) — without
+/// creating an entry — persists that `change_seq` and, on cold restore, anchors
+/// on the PERSISTED value (NOT `max(mod_seq)`), seeding the three watermarks
+/// above it. Pre-fix the cursor reseated to `max(mod_seq)`, dropping below an
+/// already-issued client cursor and silently losing every new entry.
+#[gpui::test]
+async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    let id_a = crate::model::SolutionSessionId::new();
+    let agent_id = SharedString::from("claude-acp");
+    let now = Utc::now();
+    let meta_a = crate::model::SolutionSessionMetadata {
+        id: id_a,
+        solution_id: solution_id.clone(),
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        title: SharedString::from("session A"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+    };
+    db.save_metadata(meta_a).await.expect("meta a");
+
+    // 2 entries → max(mod_seq) = 2. The persisted change_seq is 9: it advanced
+    // past max(mod_seq) via section watermark bumps (state/queue/subagents
+    // transitions) that allocate change_seq without stamping an entry.
+    let user = crate::session_entry::SessionEntryKind::UserMessage {
+        id: None,
+        content_md: "first prompt".into(),
+        chunks: vec![],
+    };
+    let assistant = crate::session_entry::SessionEntryKind::AssistantMessage {
+        chunks: vec![crate::session_entry::AssistantChunk::Message("reply".into())],
+    };
+    db.upsert_entry(id_a, 0, 1, 1_700_000_000_000, None, serde_json::to_vec(&user).unwrap())
+        .await
+        .expect("row 0");
+    db.upsert_entry(id_a, 1, 2, 1_700_000_001_000, None, serde_json::to_vec(&assistant).unwrap())
+        .await
+        .expect("row 1");
+    const PERSISTED_CHANGE_SEQ: i64 = 9;
+    db.save_change_seq(id_a, PERSISTED_CHANGE_SEQ)
+        .await
+        .expect("change_seq");
+    db.update_tab_orders(solution_id.clone(), vec![id_a])
+        .await
+        .expect("tab order");
+
+    let ordered = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.restore_open_tabs(solution_id.clone(), cx)
+            })
+        })
+        .await
+        .expect("restore");
+    assert_eq!(ordered, vec![id_a]);
+
+    let next_live_mod_seq = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("session A restored");
+            sa.update(cx, |s, _| {
+                assert_eq!(s.entries.len(), 2, "entries restored from rows");
+                // Anchored on the PERSISTED change_seq (9), then the 3 section
+                // watermarks are allocated off the shared clock above it, so
+                // change_seq lands at anchor + 3 = 12. The discriminating fact:
+                // had it reseated from max(mod_seq)=2 (the pre-fix behavior) it
+                // would be 5, not 12 — so 12 proves the persisted anchor was used.
+                assert_eq!(
+                    s.change_seq, 12,
+                    "change_seq = persisted anchor 9 + 3 watermark bumps; NOT the \
+                     max(mod_seq)=2 → 5 the pre-fix path would produce"
+                );
+                assert!(
+                    s.change_seq >= PERSISTED_CHANGE_SEQ as u64,
+                    "restored change_seq must stay >= the persisted cursor (monotonic)"
+                );
+                // The three section watermarks seed strictly above the anchor.
+                assert_eq!(s.queue_seq, 10, "queue_seq = anchor + 1");
+                assert_eq!(s.subagents_seq, 11, "subagents_seq = anchor + 2");
+                assert_eq!(s.state_seq, 12, "state_seq = anchor + 3");
+                for w in [s.queue_seq, s.subagents_seq, s.state_seq] {
+                    assert!(
+                        w > PERSISTED_CHANGE_SEQ as u64,
+                        "watermark {w} must exceed the persisted cursor"
+                    );
+                }
+                // Lost-entry guard: a fresh live NewEntry stamps the NEXT
+                // change_seq, which must exceed the cursor a delta client was
+                // already handed (= the restored change_seq, 9). If the cursor
+                // had reseated to max(mod_seq)=2, this stamp would be < 9 and the
+                // entry would silently drop out of every delta with since_seq=9.
+                s.bump_change_seq()
+            })
+        })
+    });
+    assert!(
+        next_live_mod_seq > PERSISTED_CHANGE_SEQ as u64,
+        "a new live entry's mod_seq ({next_live_mod_seq}) must exceed the previously \
+         issued client cursor ({PERSISTED_CHANGE_SEQ}) — lost-entry guard"
+    );
+}
+
+/// Phase 5, Task 5.1b legacy fallback: a session row with a NULL `change_seq`
+/// column (predates the feature; no delta client could have been issued a
+/// cursor) cold-restores with `change_seq` anchored on `max(mod_seq)`.
+#[gpui::test]
+async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    let id_a = crate::model::SolutionSessionId::new();
+    let agent_id = SharedString::from("claude-acp");
+    let now = Utc::now();
+    let meta_a = crate::model::SolutionSessionMetadata {
+        id: id_a,
+        solution_id: solution_id.clone(),
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-legacy"),
+        title: SharedString::from("legacy session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+    };
+    db.save_metadata(meta_a).await.expect("meta a");
+
+    let user = crate::session_entry::SessionEntryKind::UserMessage {
+        id: None,
+        content_md: "first prompt".into(),
+        chunks: vec![],
+    };
+    let assistant = crate::session_entry::SessionEntryKind::AssistantMessage {
+        chunks: vec![crate::session_entry::AssistantChunk::Message("reply".into())],
+    };
+    db.upsert_entry(id_a, 0, 1, 1_700_000_000_000, None, serde_json::to_vec(&user).unwrap())
+        .await
+        .expect("row 0");
+    db.upsert_entry(id_a, 1, 2, 1_700_000_001_000, None, serde_json::to_vec(&assistant).unwrap())
+        .await
+        .expect("row 1");
+    // Intentionally do NOT call save_change_seq → column stays NULL.
+    db.update_tab_orders(solution_id.clone(), vec![id_a])
+        .await
+        .expect("tab order");
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.restore_open_tabs(solution_id.clone(), cx))
+    })
+    .await
+    .expect("restore");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("session A restored");
+            sa.read_with(cx, |s, _| {
+                // Legacy fallback: anchor = max(mod_seq) = 2, then +3 watermark
+                // bumps → change_seq 5, watermarks 3/4/5 (identical to the
+                // pre-Task-5.1b `init_change_seq_from_entries` behavior).
+                assert_eq!(
+                    s.change_seq, 5,
+                    "NULL change_seq column must fall back to the max(mod_seq)=2 anchor \
+                     (→ change_seq 5 after the 3 watermark bumps)"
+                );
+                assert_eq!(s.queue_seq, 3);
+                assert_eq!(s.subagents_seq, 4);
+                assert_eq!(s.state_seq, 5);
+            });
+        });
+    });
+}
+
 /// (b) A v2 blob with NO rows migrates to rows on cold-restore: `entries`
 /// matches the blob, `db.load_entries` becomes non-empty, and a SECOND
 /// cold-restore returns the same entries straight from rows (idempotent — no
@@ -6553,8 +6762,10 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
 
 /// Phase 5, Task 5.1: enqueuing a follow-up onto a Running session emits
 /// `SessionQueueChanged` and must move `queue_seq` to the freshly-allocated
-/// `change_seq` (and to a value > 0). The state watermark also advances because
-/// the enqueue funnel re-emits `SessionStateChanged` for the live Queued bubble.
+/// `change_seq` (and to a value > 0). Only the queue watermark advances — the
+/// enqueue path emits a bare `SessionStateChanged` for the live Queued bubble
+/// WITHOUT a `state_seq` bump (it does not route through `mark_state_changed`),
+/// so the state watermark is intentionally left untouched here.
 #[gpui::test]
 async fn enqueue_bumps_queue_watermark(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;

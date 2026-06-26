@@ -609,23 +609,45 @@ impl SolutionSession {
         self.change_seq
     }
 
-    /// Re-seat `change_seq` above the highest stamped entry after a cold restore so
-    /// new stamps never collide with restored `mod_seq` values, then seed the three
-    /// section watermarks STRICTLY ABOVE that point.
+    /// Seat `change_seq` at `anchor`, then seed the three section watermarks
+    /// STRICTLY ABOVE it (each a fresh `bump_change_seq()`).
     ///
     /// The queue and subagents sections are not persisted, so after a desktop
     /// restart they are empty while a paired mobile client may still hold a stale
-    /// non-empty cache pinned at `since_seq = max(mod_seq)`. Bumping all three
-    /// watermarks above `max(mod_seq)` forces the next delta to re-send exactly
+    /// non-empty cache pinned at `since_seq = anchor`. Bumping all three
+    /// watermarks above the anchor forces the next delta to re-send exactly
     /// the three ephemeral sections (now correct/empty) while entries
-    /// (`mod_seq <= max`) are NOT re-sent — the sections self-heal without a full
-    /// transcript reload. Folded into this method (rather than a separate call) so
-    /// the cold-restore call sites can never forget it.
-    pub fn init_change_seq_from_entries(&mut self) {
-        self.change_seq = self.entries.iter().map(|e| e.mod_seq).max().unwrap_or(0);
+    /// (`mod_seq <= anchor`) are NOT re-sent — the sections self-heal without a
+    /// full transcript reload. The caller picks the anchor: the persisted
+    /// `change_seq` (restart-monotonic cursor) when available, else
+    /// `max(mod_seq)` for legacy rows (see [`Self::restore_change_seq`]).
+    pub fn seed_change_seq(&mut self, anchor: u64) {
+        self.change_seq = anchor;
         self.queue_seq = self.bump_change_seq();
         self.subagents_seq = self.bump_change_seq();
         self.state_seq = self.bump_change_seq();
+    }
+
+    /// Re-seat `change_seq` above the highest stamped entry after a cold restore,
+    /// then seed the section watermarks above it. Legacy fallback for rows whose
+    /// `change_seq` column predates Task 5.1b — see [`Self::seed_change_seq`].
+    pub fn init_change_seq_from_entries(&mut self) {
+        let max_mod_seq = self.entries.iter().map(|e| e.mod_seq).max().unwrap_or(0);
+        self.seed_change_seq(max_mod_seq);
+    }
+
+    /// Cold-load anchor for `change_seq`: when the session row carried a persisted
+    /// `change_seq` (Task 5.1b), restore from it so the cursor stays monotonic
+    /// across restarts (otherwise new entries that fall below an already-issued
+    /// client cursor silently drop out of the mobile delta). The persisted value
+    /// is always >= `max(mod_seq)` (it was bumped to produce those mod_seqs), so
+    /// restored entries never collide. A NULL column means a legacy row with no
+    /// pre-restart delta client — fall back to `max(mod_seq)`.
+    pub fn restore_change_seq(&mut self, persisted: Option<u64>) {
+        match persisted {
+            Some(anchor) => self.seed_change_seq(anchor),
+            None => self.init_change_seq_from_entries(),
+        }
     }
 
     /// Bump the transcript generation (cleared/replaced wholesale: /clear, compact,
