@@ -123,7 +123,42 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
                 SessionEntryKind::AssistantMessage { chunks },
             )
         }
-        // ToolCall / CompletedPlan / ContextCompaction implemented in Tasks 3-4.
+        AgentThreadEntry::ToolCall(call) => {
+            let status = match call.status {
+                acp_thread::ToolCallStatus::Pending => ToolStatus::Pending,
+                acp_thread::ToolCallStatus::WaitingForConfirmation { .. } => {
+                    ToolStatus::WaitingForConfirmation
+                }
+                acp_thread::ToolCallStatus::InProgress => ToolStatus::InProgress,
+                acp_thread::ToolCallStatus::Completed => ToolStatus::Completed,
+                acp_thread::ToolCallStatus::Failed => ToolStatus::Failed,
+                acp_thread::ToolCallStatus::Rejected => ToolStatus::Rejected,
+                acp_thread::ToolCallStatus::Canceled => ToolStatus::Canceled,
+            };
+            let content_md = call
+                .content
+                .iter()
+                .map(|content| {
+                    crate::conversation_render::tool_call_content_summary(call, content, cx)
+                })
+                .collect();
+            (
+                call.subagent_id.clone(),
+                SessionEntryKind::ToolCall {
+                    id: call.id.0.to_string(),
+                    label_md: call.label.read(cx).source().to_string(),
+                    kind: call.kind,
+                    status,
+                    content_md,
+                    raw_input: call.raw_input.clone(),
+                    raw_output: call.raw_output.clone(),
+                    tool_name: call.tool_name.as_ref().map(|s| s.to_string()),
+                    locations: call.locations.clone(),
+                    status_started_at: call.status_started_at.map(|t| t.timestamp_millis()),
+                },
+            )
+        }
+        // CompletedPlan / ContextCompaction implemented in Task 4.
         _ => unimplemented!("converted in Tasks 3-4"),
     };
     SessionEntry {
@@ -205,6 +240,40 @@ mod tests {
                     assert!(matches!(&chunks[0], AssistantChunk::Message(m) if m == "hi there"));
                 }
                 _ => panic!("expected AssistantMessage"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn converts_in_flight_tool_call(cx: &mut TestAppContext) {
+        use acp_thread::{AgentThreadEntry, ToolCall, ToolCallStatus};
+        cx.update(|cx| {
+            let call = AgentThreadEntry::ToolCall(ToolCall {
+                id: acp::ToolCallId::new("tc_9".to_string()),
+                label: cx.new(|cx| markdown::Markdown::new("Edit file".into(), None, None, cx)),
+                kind: acp::ToolKind::Edit,
+                content: Vec::new(),
+                status: ToolCallStatus::InProgress,
+                locations: Vec::new(),
+                resolved_locations: Vec::new(),
+                raw_input: None,
+                raw_input_markdown: None,
+                raw_output: None,
+                tool_name: Some("edit".into()),
+                subagent_session_info: None,
+                subagent_id: Some("toolu_p".into()),
+                sandbox_authorization_details: None,
+                status_started_at: None,
+            });
+            let entry = to_session_entry(&call, cx);
+            assert_eq!(entry.subagent_id.as_deref(), Some("toolu_p"));
+            match entry.kind {
+                SessionEntryKind::ToolCall { status, id, kind, .. } => {
+                    assert!(matches!(status, ToolStatus::InProgress));
+                    assert_eq!(id, "tc_9");
+                    assert!(matches!(kind, acp::ToolKind::Edit));
+                }
+                _ => panic!("expected ToolCall"),
             }
         });
     }
