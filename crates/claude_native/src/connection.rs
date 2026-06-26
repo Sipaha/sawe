@@ -1583,14 +1583,34 @@ async fn run_update_pump(
         // so depending solely on `apply_usage(result)` makes the meter
         // collapse on cached turns. See translate::assistant_usage_update.
         if let OutputMessage::Assistant(m) = &message
-            && m.parent_tool_use_id.is_none()
             && let Some(update) = assistant_usage_update(m, shared.sticky_window.get())
         {
-            thread
-                .update(cx, |thread, cx| {
-                    thread.handle_session_update(update, cx).log_err();
-                })
-                .ok();
+            match &m.parent_tool_use_id {
+                // Top-level assistant usage drives the parent session meter.
+                None => {
+                    thread
+                        .update(cx, |thread, cx| {
+                            thread.handle_session_update(update, cx).log_err();
+                        })
+                        .ok();
+                }
+                // Feature B: a Task subagent's usage is NOT folded into the
+                // parent meter (it's a separate context window), but it is
+                // forwarded keyed by the subagent's parent tool-use id so the
+                // status row can show the Task's own context when the user
+                // drills into its tab. `assistant_usage_update` always yields a
+                // `UsageUpdate`; the match guard is belt-and-suspenders.
+                Some(parent) => {
+                    if let acp::SessionUpdate::UsageUpdate(u) = update {
+                        let parent = parent.clone();
+                        thread
+                            .update(cx, |thread, cx| {
+                                thread.update_subagent_token_usage(parent, u.used, u.size, cx);
+                            })
+                            .ok();
+                    }
+                }
+            }
         }
 
         // Diagnostic: dump every top-level assistant message's content

@@ -1485,6 +1485,15 @@ pub struct AcpThread {
     running_turn: Option<RunningTurn>,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
+    /// Per-Task-subagent context usage, keyed by the subagent's parent
+    /// `tool_use_id` (the same value `_meta.claudeCode.parentToolUseId`
+    /// carries and `SubagentView::Task(id)` selects on). A Task runs as a
+    /// separate agent with its own context window, so its usage is tracked
+    /// apart from the parent `token_usage` — the status row shows THIS when
+    /// the user drills into the Task tab instead of the parent's meter.
+    /// Driven by the claude_native subagent assistant-usage path; read by
+    /// `solution_agent`'s status row.
+    subagent_token_usage: HashMap<String, TokenUsage>,
     cost: Option<SessionCost>,
     prompt_capabilities: acp::PromptCapabilities,
     available_commands: Vec<acp::AvailableCommand>,
@@ -1694,6 +1703,7 @@ impl AcpThread {
             connection,
             session_id,
             token_usage: None,
+            subagent_token_usage: HashMap::default(),
             cost: None,
             prompt_capabilities,
             available_commands: Vec::new(),
@@ -1848,6 +1858,14 @@ impl AcpThread {
 
     pub fn token_usage(&self) -> Option<&TokenUsage> {
         self.token_usage.as_ref()
+    }
+
+    /// Live context usage for an in-flight Task subagent, keyed by its
+    /// parent `tool_use_id`. `None` until the subagent's first assistant
+    /// message with a usage block arrives. See [`Self::subagent_token_usage`]
+    /// (the field) for why this is tracked separately from `token_usage`.
+    pub fn subagent_token_usage(&self, parent_tool_use_id: &str) -> Option<&TokenUsage> {
+        self.subagent_token_usage.get(parent_tool_use_id)
     }
 
     pub fn cost(&self) -> Option<&SessionCost> {
@@ -2424,6 +2442,27 @@ impl AcpThread {
             self.cost = None;
         }
         self.token_usage = usage;
+        cx.emit(AcpThreadEvent::TokenUsageUpdated);
+    }
+
+    /// Record a Task subagent's current context usage, keyed by its parent
+    /// `tool_use_id`. Emits `TokenUsageUpdated` so a status row pinned to the
+    /// Task tab repaints, exactly as the parent meter does. `max_tokens == 0`
+    /// is preserved as-is — the status row resolves the denominator against
+    /// the parent session's cached model window (a Task inherits the model).
+    pub fn update_subagent_token_usage(
+        &mut self,
+        parent_tool_use_id: String,
+        used_tokens: u64,
+        max_tokens: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let usage = self
+            .subagent_token_usage
+            .entry(parent_tool_use_id)
+            .or_default();
+        usage.used_tokens = used_tokens;
+        usage.max_tokens = max_tokens;
         cx.emit(AcpThreadEvent::TokenUsageUpdated);
     }
 
@@ -5755,6 +5794,41 @@ mod tests {
             } else {
                 panic!("Expected ToolCall entry, got: {:?}", thread.entries[0]);
             }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_subagent_token_usage_tracked_per_parent_tool_use_id(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            // Unknown id => None until a subagent reports usage.
+            assert!(thread.subagent_token_usage("toolu_a").is_none());
+
+            thread.update_subagent_token_usage("toolu_a".into(), 1_000, 200_000, cx);
+            thread.update_subagent_token_usage("toolu_b".into(), 5_000, 1_000_000, cx);
+
+            let a = thread.subagent_token_usage("toolu_a").unwrap();
+            assert_eq!(a.used_tokens, 1_000);
+            assert_eq!(a.max_tokens, 200_000);
+            assert_eq!(thread.subagent_token_usage("toolu_b").unwrap().used_tokens, 5_000);
+
+            // A later update for the same subagent replaces (not accumulates).
+            thread.update_subagent_token_usage("toolu_a".into(), 1_500, 200_000, cx);
+            assert_eq!(thread.subagent_token_usage("toolu_a").unwrap().used_tokens, 1_500);
+
+            // Subagent usage must stay out of the parent meter.
+            assert!(thread.token_usage().is_none());
         });
     }
 

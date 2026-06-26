@@ -225,15 +225,28 @@ pub(crate) fn render_status_row(
     // `TokenUsageUpdated`. Without this fallback the meter showed
     // "0 / 1.0M · 0.0%" for any restored conversation, which
     // looked like the editor lost the agent's context.
-    let usage = s
-        .acp_thread()
-        .and_then(|thread| thread.read(cx).token_usage().cloned())
-        .or_else(|| {
-            s.cached_total_tokens.map(|used| acp_thread::TokenUsage {
-                used_tokens: used,
-                ..Default::default()
+    // On a Task subagent tab the meter shows the SUBAGENT's own context, not
+    // the parent's — a Task is a separate agent with its own window. The id is
+    // the parent `tool_use_id` the subagent usage is keyed by. `None` here =>
+    // Main tab (parent meter, as before). Background/Shell tabs hide the meter
+    // entirely (handled via `is_subagent_tab` below), so they never reach here.
+    let task_subagent_id: Option<SharedString> = match &view.selected_subagent {
+        crate::store::SubagentView::Task(id) => Some(id.clone()),
+        _ => None,
+    };
+    let usage = if let Some(task_id) = task_subagent_id.as_ref() {
+        s.acp_thread()
+            .and_then(|thread| thread.read(cx).subagent_token_usage(task_id).cloned())
+    } else {
+        s.acp_thread()
+            .and_then(|thread| thread.read(cx).token_usage().cloned())
+            .or_else(|| {
+                s.cached_total_tokens.map(|used| acp_thread::TokenUsage {
+                    used_tokens: used,
+                    ..Default::default()
+                })
             })
-        });
+    };
     // Synchronous read of the agent's current session mode
     // ("default", "plan", …). Claude exposes this via ACP — when
     // the connection doesn't implement modes (e.g. mock test
@@ -306,11 +319,19 @@ pub(crate) fn render_status_row(
         .or_else(|| selected_value.clone().map(SharedString::from));
 
     let raw_used = usage.as_ref().map(|u| u.used_tokens).unwrap_or(0);
-    let peak = view.status_peak_used_tokens;
-    let used = smooth_used_tokens(raw_used, peak);
-    if used != peak {
-        view.status_peak_used_tokens = used;
-    }
+    let used = if task_subagent_id.is_some() {
+        // A subagent's meter isn't ratcheted through the parent view's peak
+        // state (`status_peak_used_tokens` belongs to the Main session); show
+        // its raw latest context so switching tabs can't pollute either peak.
+        raw_used
+    } else {
+        let peak = view.status_peak_used_tokens;
+        let used = smooth_used_tokens(raw_used, peak);
+        if used != peak {
+            view.status_peak_used_tokens = used;
+        }
+        used
+    };
     // claude-acp doesn't always populate `max_tokens` (it's gated by an
     // upstream beta flag). Once a real limit has been seen for this session
     // we keep it (cached below) so a later 0/missing update never downgrades
@@ -318,7 +339,12 @@ pub(crate) fn render_status_row(
     // Opus 4 window is the fallback only until a real value first arrives.
     let advertised_max = usage.as_ref().map(|u| u.max_tokens);
     let (max, new_cached_max) = resolve_max_tokens(advertised_max, view.status_cached_max_tokens);
-    if let Some(cached) = new_cached_max {
+    // A Task subagent inherits the parent's model, so its meter borrows the
+    // parent's resolved window as the denominator — but it must NOT write back
+    // into the parent's cache (the subagent may advertise 0/a different value).
+    if task_subagent_id.is_none()
+        && let Some(cached) = new_cached_max
+    {
         view.status_cached_max_tokens = Some(cached);
     }
     // Display clamp: tokens-in-context can never legitimately exceed the
@@ -555,17 +581,20 @@ pub(crate) fn render_status_row(
         }
     };
     let is_subagent_tab = subagent_status.is_some();
+    // A Task tab shows the subagent's meter but no parent-session controls
+    // (compact/clear/model/effort all act on the Main session, not the Task).
+    let is_task_tab = task_subagent_id.is_some();
     // Block model switching while the agent is mid-turn (or resuming) — a
     // `set_model` then only lands on the *next* turn and reads as a no-op.
     let model_select_enabled = !is_running && !is_resuming;
     let show_model_dropdown =
-        !is_subagent_tab && !model_options.is_empty() && model_select_enabled;
+        !is_subagent_tab && !is_task_tab && !model_options.is_empty() && model_select_enabled;
 
     let effort_value = store.read(cx).selected_effort(view.session_id(), cx);
     // Effort always has a fixed option list, so the dropdown shows whenever the
     // model dropdown would (main tab, not running/resuming). It does NOT depend
     // on a captured list.
-    let show_effort_dropdown = !is_subagent_tab && model_select_enabled;
+    let show_effort_dropdown = !is_subagent_tab && !is_task_tab && model_select_enabled;
     // Claude doesn't stream the current effort level (unlike the model, which
     // it reports every turn), so when the user hasn't set an explicit override
     // we show "auto" — i.e. Claude Code's own default effort, no override —
@@ -756,6 +785,10 @@ pub(crate) fn render_status_row(
             // on a subagent tab (we don't track a background agent's own
             // tokens, and you don't compact a subagent). The `·` above stays
             // as the separator before the agent/cwd labels either way.
+            // Meter (text + bar) shows on Main AND Task tabs — on a Task tab
+            // its data is the subagent's own context (sourced above). Hidden
+            // only on Background/Shell tabs (`is_subagent_tab`), where we don't
+            // track the agent's own tokens.
             .when(!is_subagent_tab, |this| {
                 this.child(
                     div().flex_none().child(
@@ -779,7 +812,11 @@ pub(crate) fn render_status_row(
                                 .bg(bar_color),
                         ),
                 )
-                .child(div().flex_none().child(cleanup_button))
+            })
+            // Compact/clear act on the Main session only — not on a Task
+            // subagent (you don't compact a subagent's borrowed context).
+            .when(!is_subagent_tab && !is_task_tab, |this| {
+                this.child(div().flex_none().child(cleanup_button))
             })
             .child(
                 Label::new(agent_id)
