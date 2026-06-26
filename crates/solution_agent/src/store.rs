@@ -2919,7 +2919,7 @@ impl SolutionAgentStore {
         // later "Reopen Closed Chat" restores the full conversation; the
         // cancel keeps the pooled subprocess from churning on a session the
         // user just dismissed. Both must run before the `remove` below.
-        self.persist_session_blob(id, cx);
+        self.persist_all_rows(id, cx);
         if let Some(entity) = self.sessions.get(&id)
             && matches!(entity.read(cx).state, SessionState::Running { .. })
         {
@@ -3215,6 +3215,11 @@ impl SolutionAgentStore {
                 let new_sub = store.subscribe_to_session(session_id, new_thread, cx);
                 session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
                 store.persist_session_row(session_id, cx);
+                // /compact cleared+rebuilt `entries` and bumped the epoch above.
+                // Rewrite the rows wholesale (deleting the now-stale pre-rotation
+                // idx>0 rows) so the next cold load doesn't see new idx 0 + stale
+                // idx 1..N. Targeted upserts alone would leak the old rows.
+                store.persist_all_rows(session_id, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
                 store.emit_session_state_changed_workspace(&session_id, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionContextReset {
@@ -3372,6 +3377,12 @@ impl SolutionAgentStore {
                 let new_sub = store.subscribe_to_session(session_id, new_thread, cx);
                 session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
                 store.persist_session_row(session_id, cx);
+                // /clear cleared `entries` and bumped the epoch above. Rewrite
+                // the rows wholesale (here that deletes ALL rows + saves the
+                // bumped epoch) so the next cold load doesn't replay the stale
+                // pre-clear transcript. Targeted upserts can't delete; this must
+                // run on the empty-entries clear path.
+                store.persist_all_rows(session_id, cx);
                 // `reset_context` does not bump `context_count` (only
                 // `rotate_context` does), so read the current value to
                 // forward as-is on the wire.
@@ -3639,6 +3650,173 @@ impl SolutionAgentStore {
             if !blob.is_empty() {
                 db.save_blob(session_id, blob).await.log_err();
             }
+        })
+        .detach();
+    }
+
+    /// Phase 4 row tuple: `(idx, mod_seq, created_ms, subagent_id, payload)`
+    /// in the casts `upsert_entry` expects. An empty `payload` signals a serde
+    /// failure in `to_payload()` — callers MUST skip persisting it.
+    fn entry_row_tuple(
+        global_idx: usize,
+        entry: &crate::session_entry::SessionEntry,
+    ) -> (i64, i64, i64, Option<String>, Vec<u8>) {
+        (
+            global_idx as i64,
+            entry.mod_seq as i64,
+            entry.created_ms,
+            entry.subagent_id.as_ref().map(|s| s.to_string()),
+            entry.to_payload(),
+        )
+    }
+
+    /// Flush the WHOLE transcript as rows: upsert every current entry, delete
+    /// any stale trailing rows beyond `entries.len()`, and save the epoch.
+    /// This is the path that handles clears/compactions and close — targeted
+    /// upserts alone would leave orphaned idx>len rows that corrupt the next
+    /// cold load. On empty `entries` it degrades to "delete all rows + save
+    /// epoch".
+    pub fn persist_all_rows(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(&session_id).cloned() else {
+            return;
+        };
+        let Some(db) = self.persistence.clone() else {
+            return;
+        };
+        cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            let (rows, len, epoch) = cx.update(|cx| {
+                let s = session.read(cx);
+                let rows: Vec<_> = s
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
+                    .collect();
+                (rows, s.entries.len() as i64, s.epoch as i64)
+            });
+            for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
+                if payload.is_empty() {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "skipping empty-payload upsert for session={session_id} idx={idx}",
+                    );
+                    continue;
+                }
+                db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
+                    .await
+                    .log_err();
+            }
+            db.delete_entries_from(session_id, len).await.log_err();
+            db.save_epoch(session_id, epoch).await.log_err();
+        })
+        .detach();
+    }
+
+    /// Upsert `entries[start_idx..]` (used by `NewEntry`, which can append more
+    /// than one entry via gap-fill) + save the epoch.
+    pub fn persist_upsert_range(
+        &self,
+        session_id: SolutionSessionId,
+        start_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get(&session_id).cloned() else {
+            return;
+        };
+        let Some(db) = self.persistence.clone() else {
+            return;
+        };
+        cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            let (rows, epoch) = cx.update(|cx| {
+                let s = session.read(cx);
+                let rows: Vec<_> = s
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .skip(start_idx)
+                    .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
+                    .collect();
+                (rows, s.epoch as i64)
+            });
+            for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
+                if payload.is_empty() {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "skipping empty-payload upsert for session={session_id} idx={idx}",
+                    );
+                    continue;
+                }
+                db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
+                    .await
+                    .log_err();
+            }
+            db.save_epoch(session_id, epoch).await.log_err();
+        })
+        .detach();
+    }
+
+    /// Upsert exactly `entries[global_idx]` (used by `EntryUpdated`) + save the
+    /// epoch.
+    pub fn persist_upsert_entry(
+        &self,
+        session_id: SolutionSessionId,
+        global_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get(&session_id).cloned() else {
+            return;
+        };
+        let Some(db) = self.persistence.clone() else {
+            return;
+        };
+        cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            let row = cx.update(|cx| {
+                let s = session.read(cx);
+                let epoch = s.epoch as i64;
+                let row = s
+                    .entries
+                    .get(global_idx)
+                    .map(|entry| Self::entry_row_tuple(global_idx, entry));
+                (row, epoch)
+            });
+            let (row, epoch) = row;
+            if let Some((idx, mod_seq, created_ms, subagent_id, payload)) = row {
+                if payload.is_empty() {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "skipping empty-payload upsert for session={session_id} idx={idx}",
+                    );
+                } else {
+                    db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
+                        .await
+                        .log_err();
+                }
+            }
+            db.save_epoch(session_id, epoch).await.log_err();
+        })
+        .detach();
+    }
+
+    /// Delete rows `idx >= from_idx` (used by `EntriesRemoved`) + save the
+    /// epoch.
+    pub fn persist_delete_from(
+        &self,
+        session_id: SolutionSessionId,
+        from_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get(&session_id).cloned() else {
+            return;
+        };
+        let Some(db) = self.persistence.clone() else {
+            return;
+        };
+        cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            let epoch = cx.update(|cx| session.read(cx).epoch as i64);
+            db.delete_entries_from(session_id, from_idx as i64)
+                .await
+                .log_err();
+            db.save_epoch(session_id, epoch).await.log_err();
         })
         .detach();
     }
@@ -4917,12 +5095,6 @@ impl SolutionAgentStore {
                 // First user message appends a NewEntry — refresh DB so the
                 // History popover preview stops being NULL.
                 self.persist_session_row(session_id, cx);
-                // Also flush the transcript blob: a mid-Running crash/restart
-                // used to lose every entry added since the last successful
-                // turn end (`persist_session_blob` was called only from the
-                // queue's success path). Re-snapshot on every new entry so a
-                // resume after a crash shows up-to-date history.
-                self.persist_session_blob(session_id, cx);
                 // `entry_index` on AcpThreadEvent is LOCAL to the live thread's
                 // entries vector. The global index counts the cold prefix first.
                 // Without the offset, the first live entry after a cold→live
@@ -4988,8 +5160,11 @@ impl SolutionAgentStore {
                     }
                     additions
                 };
+                // Pre-extend length is the first index the upsert range must
+                // cover; captured before the closure so it survives for the
+                // post-update `persist_upsert_range` call.
+                let first_new = session_entity.read(cx).entries.len();
                 session_entity.update(cx, |s, cx| {
-                    let first_new = s.entries.len();
                     s.entries.extend(new_entries);
                     let new_count = s.entries.len() - first_new;
                     let seqs: Vec<u64> = (0..new_count).map(|_| s.bump_change_seq()).collect();
@@ -4998,6 +5173,8 @@ impl SolutionAgentStore {
                     }
                     cx.notify();
                 });
+                // Persist the newly-appended entries (+ any gap-fill) as rows.
+                self.persist_upsert_range(session_id, first_new, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
                     session_id,
                     global_entry_index,
@@ -5321,6 +5498,10 @@ impl SolutionAgentStore {
                     s.bump_change_seq();
                     cx.notify();
                 });
+                // A rewind drops the removed rows: targeted delete keeps the
+                // persisted transcript in lockstep so a stale idx>=truncate row
+                // can't corrupt the next cold load.
+                self.persist_delete_from(session_id, global_truncate, cx);
                 // The user-facing `/clear` does NOT reach this branch:
                 // it's intercepted client-side and routed through
                 // `reset_context` (which spawns a brand-new `AcpThread`
@@ -5405,10 +5586,6 @@ impl SolutionAgentStore {
                     cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
                         session_id, *idx,
                     ));
-                    // Crash-recovery: flush the transcript blob on the same
-                    // trailing-edge so a mid-Running restart doesn't lose
-                    // streamed text since the last NewEntry persist.
-                    self.persist_session_blob(session_id, cx);
                 } else {
                     let first_dirty_at = existing_first_dirty_at.unwrap_or(now);
                     let entry_index = *idx;
@@ -5422,7 +5599,6 @@ impl SolutionAgentStore {
                                     session_id,
                                     entry_index,
                                 ));
-                                this.persist_session_blob(session_id, cx);
                             }
                         })
                         .ok();
@@ -5464,6 +5640,10 @@ impl SolutionAgentStore {
                         }
                         cx.notify();
                     });
+                    // Row upsert happens unconditionally on the in-memory update
+                    // (one cheap row); the 500ms/2s throttle above governs only
+                    // the MCP `SessionMessageAppended` emit, NOT this persist.
+                    self.persist_upsert_entry(session_id, global_idx, cx);
                 }
             }
             _ => {}
@@ -5633,7 +5813,7 @@ impl SolutionAgentStore {
         // saves usually have the latest state already; this captures any
         // un-debounced tail so a reopen restores the full conversation.
         for id in &session_ids {
-            self.persist_session_blob(*id, cx);
+            self.persist_all_rows(*id, cx);
         }
         self.by_solution.remove(solution_id);
         for id in &session_ids {

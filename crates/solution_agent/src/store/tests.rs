@@ -2816,6 +2816,113 @@ async fn append_stamps_entry_created_ms_once_per_index(cx: &mut TestAppContext) 
     });
 }
 
+/// Phase 4 Task 3: each transcript mutation must write the matching
+/// `solution_session_entries` rows incrementally (not a wholesale blob).
+/// Drives NewEntry×2, EntryUpdated(last), then EntriesRemoved and asserts
+/// `db.load_entries(session_id)` mirrors `session.entries` after every step:
+/// same count, ascending idx 0..n, mod_seq parity, and the payload decoding
+/// back to the entry's kind.
+#[gpui::test]
+async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    // Assert the persisted rows match the in-memory entries exactly.
+    async fn assert_rows_match(
+        cx: &mut TestAppContext,
+        db: &crate::db::SolutionAgentDb,
+        session_id: SolutionSessionId,
+    ) {
+        let entries = cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).expect("session exists");
+            session.read(cx).entries.clone()
+        });
+        let rows = db.load_entries(session_id).await.expect("load entries");
+        assert_eq!(
+            rows.len(),
+            entries.len(),
+            "row count must match in-memory entries"
+        );
+        for (idx, (row, entry)) in rows.iter().zip(entries.iter()).enumerate() {
+            assert_eq!(row.idx, idx as i64, "rows must be in ascending idx order");
+            assert_eq!(
+                row.mod_seq, entry.mod_seq as i64,
+                "row mod_seq must mirror the entry's mod_seq"
+            );
+            let kind = crate::session_entry::kind_from_payload(&row.payload)
+                .expect("payload decodes to a kind");
+            assert_eq!(kind, entry.kind, "row payload must decode to the entry kind");
+        }
+    }
+
+    // NewEntry #1 (user message).
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_rows_match(cx, &db, session_id).await;
+
+    // NewEntry #2 (assistant message — distinct entry).
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_rows_match(cx, &db, session_id).await;
+
+    // EntryUpdated on the last (assistant) entry — streaming more text into
+    // the existing entry emits EntryUpdated, not NewEntry. The row at that
+    // idx must be re-upserted with the new payload + bumped mod_seq.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(" more".to_string()),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_rows_match(cx, &db, session_id).await;
+
+    // EntriesRemoved(1..2) — drop the last entry. The persisted rows must
+    // shrink in lockstep so a stale idx-1 row can't corrupt a cold load.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::EntriesRemoved(1..2));
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_rows_match(cx, &db, session_id).await;
+    let remaining = db.load_entries(session_id).await.expect("load entries");
+    assert_eq!(remaining.len(), 1, "EntriesRemoved must delete the trailing row");
+}
+
 #[gpui::test]
 async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut TestAppContext) {
     use crate::model::NO_TIMESTAMP_MS;
