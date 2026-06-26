@@ -740,11 +740,13 @@ fn serializable_snapshot(session: &SolutionSession, cx: &App) -> Vec<u8> {
             });
             entry_summaries.push(markdown);
             entries_v2.push(persisted);
+            // Read the creation time from `session.entries` at the same global
+            // index — that's where `created_ms` now lives per entry.
             entry_created_ms.push(
                 session
-                    .entry_created_ms
+                    .entries
                     .get(*global_index)
-                    .copied()
+                    .map(|e| e.created_ms)
                     .unwrap_or(crate::model::NO_TIMESTAMP_MS),
             );
         }
@@ -1633,7 +1635,6 @@ impl SolutionAgentStore {
                             cx,
                         );
                         s.cold_entries = cold_entries;
-                        s.entry_created_ms = restored_created_ms;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
                         s
                     });
@@ -2296,7 +2297,6 @@ impl SolutionAgentStore {
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
                         s.cold_entries = cold_entries;
-                        s.entry_created_ms = restored_created_ms;
                         // Seed from the persisted metadata so the
                         // status-row meter shows the last-known total
                         // for cold tabs (no live thread → no
@@ -2525,7 +2525,6 @@ impl SolutionAgentStore {
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
                         s.cold_entries = cold_entries;
-                        s.entry_created_ms = restored_created_ms;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
                         s.tab_order = session_tab_order;
@@ -2715,7 +2714,6 @@ impl SolutionAgentStore {
                         // background pass below. `hydrating` flips the
                         // session view's empty state to a spinner.
                         s.cold_entries = Vec::new();
-                        s.entry_created_ms = Vec::new();
                         s.hydrating = true;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
@@ -2819,7 +2817,6 @@ impl SolutionAgentStore {
                         cx,
                     );
                     session.cold_entries = cold_entries;
-                    session.entry_created_ms = created_ms;
                     session.hydrating = false;
                     // Drives the session view's `cx.observe(&session)` →
                     // re-render → cold-list resize catch-up so the freshly
@@ -3125,7 +3122,6 @@ impl SolutionAgentStore {
                     // hint should not survive past the rotation).
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
-                    s.entry_created_ms.clear();
                     // Compact archives the prior context and continues
                     // in a fresh ACP session under the same tab. The
                     // render path concatenates `cold_entries` ahead of
@@ -3290,7 +3286,6 @@ impl SolutionAgentStore {
                     s.last_turn_duration = None;
                     s.cold_entries.clear();
                     s.entries.clear();
-                    s.entry_created_ms.clear();
                     // Cache the (possibly freshly-built headless) project so
                     // a subsequent reset/restart on this now-live session
                     // doesn't have to rebuild it.
@@ -4855,60 +4850,71 @@ impl SolutionAgentStore {
                 // queue's success path). Re-snapshot on every new entry so a
                 // resume after a crash shows up-to-date history.
                 self.persist_session_blob(session_id, cx);
-                // `entry_index` on AcpThreadEvent is LOCAL to the live
-                // thread's entries vector. `entry_created_ms` is sized
-                // over the GLOBAL cold+live concatenation (mirrors the
-                // virtualized list, the persisted blob, and the render
-                // path), so we offset by `cold_count` before stamping.
-                // Without the offset, the first live entry after a
-                // cold→live transition would land on the cold[0] slot,
-                // overwriting the persisted timestamp of the first
-                // cold message.
-                let (cold_count, entry_index) = {
+                // `entry_index` on AcpThreadEvent is LOCAL to the live thread's
+                // entries vector. The global index counts the cold prefix first.
+                // Without the offset, the first live entry after a cold→live
+                // transition would overwrite a cold entry in `session.entries`.
+                let (cold_count, live_last_local) = {
                     let session = session_entity.read(cx);
                     let cold = session.cold_entries.len();
                     let live_last = session
                         .acp_thread()
                         .map(|thread| thread.read(cx).entries().len().saturating_sub(1))
                         .unwrap_or(0);
-                    (cold, cold + live_last)
+                    (cold, live_last)
                 };
-                let _ = cold_count; // recorded for clarity; the global index already folds it in
-                // Stamp creation time the first time an absolute index appears. The
-                // vector length is the high-water mark: a streamed in-place
-                // EntryUpdated reuses an existing index and must not grow or
-                // rewrite the vector.
+                let global_entry_index = cold_count + live_last_local;
+                // Incremental NewEntry: convert just the new live entry and push
+                // it onto `session.entries`, stamping `created_ms = now_ms`.
+                // Fill any gap below the new global index with sentinel entries
+                // (a resumed pre-feature session whose cold timestamps were never
+                // captured). The genuinely-new entry at `global_entry_index`
+                // gets `now_ms`; entries already present are left untouched.
                 let now_ms = Utc::now().timestamp_millis();
-                session_entity.update(cx, |s, _| {
-                    // Fill any gap below the new index with the absent sentinel: those are
-                    // pre-existing entries (e.g. a resumed pre-feature session's history) whose
-                    // real creation time we never captured — we must not fabricate it. Only the
-                    // genuinely-new entry that just arrived at `entry_index` gets `now_ms`.
-                    while s.entry_created_ms.len() < entry_index {
-                        s.entry_created_ms.push(crate::model::NO_TIMESTAMP_MS);
-                    }
-                    if s.entry_created_ms.len() == entry_index {
-                        s.entry_created_ms.push(now_ms);
-                    }
-                    // len > entry_index → in-place EntryUpdated on an existing entry: leave it.
-                });
-                // Rebuild the unified cold+live entry list now that entry_created_ms is
-                // up-to-date. Read cold_entries, entry_created_ms, and live entries in one
-                // immutable block → owned Vec<SessionEntry> → then update.
-                let entries = {
+                let new_entries = {
                     let s = session_entity.read(cx);
                     let live = s.acp_thread().map(|t| t.read(cx).entries()).unwrap_or(&[]);
-                    crate::session_entry::rebuild_entries(
-                        &s.cold_entries,
-                        live,
-                        &s.entry_created_ms,
-                        cx,
-                    )
+                    // Gap entries: existing cold entries beyond what `entries` already
+                    // holds (pre-feature sessions restored without timestamps).
+                    let current_len = s.entries.len();
+                    let mut additions: Vec<crate::session_entry::SessionEntry> = Vec::new();
+                    // Fill any gap between the current entries length and the new index.
+                    for gap_idx in current_len..global_entry_index {
+                        // These are pre-existing entries whose creation time was never
+                        // captured; convert from cold or live and stamp with the sentinel.
+                        let entry = if gap_idx < s.cold_entries.len() {
+                            crate::session_entry::to_session_entry(&s.cold_entries[gap_idx], cx)
+                        } else {
+                            let local = gap_idx - s.cold_entries.len();
+                            if let Some(e) = live.get(local) {
+                                crate::session_entry::to_session_entry(e, cx)
+                            } else {
+                                continue;
+                            }
+                        };
+                        let mut gap_entry = entry;
+                        gap_entry.created_ms = crate::model::NO_TIMESTAMP_MS;
+                        additions.push(gap_entry);
+                    }
+                    // The new entry at global_entry_index, stamped with now_ms.
+                    if current_len + additions.len() == global_entry_index {
+                        let local = global_entry_index - s.cold_entries.len();
+                        if let Some(live_entry) = live.get(local) {
+                            let mut new_entry =
+                                crate::session_entry::to_session_entry(live_entry, cx);
+                            new_entry.created_ms = now_ms;
+                            additions.push(new_entry);
+                        }
+                    }
+                    additions
                 };
-                session_entity.update(cx, |s, cx| s.set_entries(entries, cx));
+                session_entity.update(cx, |s, cx| {
+                    s.entries.extend(new_entries);
+                    cx.notify();
+                });
                 cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
                     session_id,
-                    entry_index,
+                    global_entry_index,
                 ));
                 // Subagent-tab lifecycle: a brand-new Task/Agent ToolCall in
                 // InProgress is a spawn signal. The `local_entry_index` here is
@@ -5218,10 +5224,15 @@ impl SolutionAgentStore {
                 cx.emit(SolutionAgentStoreEvent::SessionTitleChanged(session_id));
             }
             acp_thread::AcpThreadEvent::EntriesRemoved(range) => {
-                // Keep the parallel timestamp vector aligned: a rewind truncates the
-                // thread to `range.start`, so drop every stamp at or after it.
-                session_entity.update(cx, |s, _| {
-                    s.entry_created_ms.truncate(range.start);
+                // Truncate `session.entries` to match: a rewind removes all
+                // entries from `range.start` onward (in global index space).
+                // Cold entries are never removed by a live-thread rewind, so
+                // the truncation point is `cold_count + range.start`.
+                let cold_count = session_entity.read(cx).cold_entries.len();
+                let global_truncate = cold_count + range.start;
+                session_entity.update(cx, |s, cx| {
+                    s.entries.truncate(global_truncate);
+                    cx.notify();
                 });
                 // The user-facing `/clear` does NOT reach this branch:
                 // it's intercepted client-side and routed through
@@ -5257,18 +5268,6 @@ impl SolutionAgentStore {
                     });
                     self.persist_session_row(session_id, cx);
                 }
-                // Rebuild entries to reflect the truncated state.
-                let entries = {
-                    let s = session_entity.read(cx);
-                    let live = s.acp_thread().map(|t| t.read(cx).entries()).unwrap_or(&[]);
-                    crate::session_entry::rebuild_entries(
-                        &s.cold_entries,
-                        live,
-                        &s.entry_created_ms,
-                        cx,
-                    )
-                };
-                session_entity.update(cx, |s, cx| s.set_entries(entries, cx));
             }
             acp_thread::AcpThreadEvent::EntryUpdated(idx) => {
                 // Subagent-tab lifecycle: a tracked Task/Agent ToolCall that
@@ -5349,19 +5348,34 @@ impl SolutionAgentStore {
                         },
                     );
                 }
-                // Rebuild entries so an in-place update (streaming text,
-                // tool-status flip) is reflected in the mobile-sync list.
-                let entries = {
+                // Incremental EntryUpdated: reconvert only the changed entry and
+                // replace it in `session.entries`, preserving its `created_ms`
+                // (no restamp — the creation time is fixed at first append).
+                let cold_count = session_entity.read(cx).cold_entries.len();
+                let global_idx = cold_count + *idx;
+                let updated_entry = {
                     let s = session_entity.read(cx);
                     let live = s.acp_thread().map(|t| t.read(cx).entries()).unwrap_or(&[]);
-                    crate::session_entry::rebuild_entries(
-                        &s.cold_entries,
-                        live,
-                        &s.entry_created_ms,
-                        cx,
-                    )
+                    live.get(*idx).map(|live_entry| {
+                        let mut entry =
+                            crate::session_entry::to_session_entry(live_entry, cx);
+                        // Preserve the creation time stamped at first append.
+                        entry.created_ms = s
+                            .entries
+                            .get(global_idx)
+                            .map(|e| e.created_ms)
+                            .unwrap_or(crate::model::NO_TIMESTAMP_MS);
+                        entry
+                    })
                 };
-                session_entity.update(cx, |s, cx| s.set_entries(entries, cx));
+                if let Some(entry) = updated_entry {
+                    session_entity.update(cx, |s, cx| {
+                        if let Some(slot) = s.entries.get_mut(global_idx) {
+                            *slot = entry;
+                        }
+                        cx.notify();
+                    });
+                }
             }
             _ => {}
         }

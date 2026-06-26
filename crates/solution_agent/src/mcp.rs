@@ -1361,9 +1361,9 @@ impl McpServerTool for GetSessionTool {
                         && before.map_or(true, |b| index < b);
                     if in_range {
                         let created_ms = session
-                            .entry_created_ms
+                            .entries
                             .get(index)
-                            .copied()
+                            .map(|e| e.created_ms)
                             .filter(|&ms| ms > 0);
                         kept.push(summarize_entry(
                             entry,
@@ -1858,9 +1858,9 @@ impl McpServerTool for GetSessionEntryTool {
                 .get(want_index)
                 .ok_or_else(|| anyhow!("entry vanished mid-read"))?;
             let created_ms = session
-                .entry_created_ms
+                .entries
                 .get(want_index)
-                .copied()
+                .map(|e| e.created_ms)
                 .filter(|&ms| ms > 0);
             let summary = summarize_entry(
                 entry,
@@ -5377,17 +5377,14 @@ mod tests {
     // A6: created_ms on wire EntrySummary
     // -----------------------------------------------------------------
 
-    /// Verifies that `GetSessionTool` propagates `entry_created_ms` from the
-    /// session model to `EntrySummary.created_ms`:
+    /// Verifies that `GetSessionTool` propagates `created_ms` from the
+    /// session's `entries` list to `EntrySummary.created_ms`:
     /// - entries with a real positive stamp → `Some(ms)` with `ms > 0`
     /// - entries whose stamp is the absent-sentinel → `None`
     ///
-    /// `seed_session_with_n_entries` pushes all entries in a single batched
-    /// `cx.update`, so the store's `NewEntry` subscription sees the final
-    /// thread length each time and only stamps the last entry. We bypass that
-    /// by directly writing `entry_created_ms` on the session entity — the
-    /// same pattern used by the store's own unit tests (see
-    /// `store/tests.rs::append_stamps_entry_created_ms_once_per_index`).
+    /// We bypass the store's stamping by directly writing `entries[i].created_ms`
+    /// on the session entity — the same pattern used by the store's own unit
+    /// tests (see `store/tests.rs::entry_updated_preserves_created_ms`).
     #[gpui::test]
     async fn get_session_entries_carry_created_ms(cx: &mut gpui::TestAppContext) {
         use crate::model::NO_TIMESTAMP_MS;
@@ -5400,7 +5397,15 @@ mod tests {
             let store = SolutionAgentStore::global(cx);
             let session_entity = store.read(cx).session(session_id).expect("session exists");
             session_entity.update(cx, |s, _| {
-                s.entry_created_ms = vec![fake_ms, NO_TIMESTAMP_MS, fake_ms + 1];
+                if let Some(e) = s.entries.get_mut(0) {
+                    e.created_ms = fake_ms;
+                }
+                if let Some(e) = s.entries.get_mut(1) {
+                    e.created_ms = NO_TIMESTAMP_MS;
+                }
+                if let Some(e) = s.entries.get_mut(2) {
+                    e.created_ms = fake_ms + 1;
+                }
             });
         });
 
@@ -5451,7 +5456,12 @@ mod tests {
             let store = SolutionAgentStore::global(cx);
             let session_entity = store.read(cx).session(session_id).expect("session exists");
             session_entity.update(cx, |s, _| {
-                s.entry_created_ms = vec![fake_ms, NO_TIMESTAMP_MS];
+                if let Some(e) = s.entries.get_mut(0) {
+                    e.created_ms = fake_ms;
+                }
+                if let Some(e) = s.entries.get_mut(1) {
+                    e.created_ms = NO_TIMESTAMP_MS;
+                }
             });
         });
 

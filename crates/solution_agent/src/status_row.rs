@@ -262,12 +262,11 @@ pub(crate) fn render_status_row(
             .map(|m| SharedString::from(m.name))
             .or_else(|| Some(SharedString::from(current.0.to_string())))
     });
-    // Newest entry's server-stamped time, if it has a real one. The
-    // newest entry is the last element of `entry_created_ms` (index-
-    // aligned with entries); `> 0` filters out the NO_TIMESTAMP_MS
-    // sentinel and 0/missing. An all-historical or empty session has
-    // no real newest time → we render no relative label at all.
-    let last_activity_ms = s.entry_created_ms.last().copied().filter(|&ms| ms > 0);
+    // Newest entry's server-stamped time, if it has a real one. The newest
+    // entry is the last element of `entries`; `> 0` filters out the
+    // NO_TIMESTAMP_MS sentinel and 0/missing. An all-historical or empty
+    // session has no real newest time → we render no relative label at all.
+    let last_activity_ms = s.entries.last().map(|e| e.created_ms).filter(|&ms| ms > 0);
     let _ = s;
     // While the active session is in `Running`, drive a 1 Hz tick
     // so the elapsed counter ("Thinking… Ns") in `state_text`

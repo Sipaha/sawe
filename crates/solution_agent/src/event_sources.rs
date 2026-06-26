@@ -171,9 +171,9 @@ pub(crate) fn build_message_appended_payload(
             let session = store.session(session_id)?;
             let session_ref = session.read(cx);
             let created_ms = session_ref
-                .entry_created_ms
+                .entries
                 .get(entry_index)
-                .copied()
+                .map(|e| e.created_ms)
                 .filter(|&ms| ms > 0);
             let thread = session_ref.acp_thread()?;
             let thread_ref = thread.read(cx);
@@ -786,7 +786,7 @@ mod tests {
             crate::store::tests::create_session_with_thread(cx).await;
 
         // Append a user entry; `run_until_parked` lets the store handle the
-        // `AcpThreadEvent::NewEntry` and stamp `entry_created_ms[0]`.
+        // `AcpThreadEvent::NewEntry` and stamp `entries[0].created_ms`.
         cx.update(|cx| {
             let thread = {
                 let store = SolutionAgentStore::global(cx);
@@ -819,8 +819,8 @@ mod tests {
             );
         });
 
-        // Absent case: when the index is beyond `entry_created_ms` (no stamp
-        // captured), the key must be omitted entirely.
+        // Absent case: when the index is beyond `entries` (no entry present),
+        // the key must be omitted entirely.
         cx.update(|cx| {
             // Index 99 has no entry and no stamp.
             let payload = build_message_appended_payload(session_id, 99, cx);
@@ -838,7 +838,9 @@ mod tests {
             let store = SolutionAgentStore::global(cx);
             let session = store.read(cx).session(session_id).expect("session");
             session.update(cx, |s, _| {
-                s.entry_created_ms[0] = NO_TIMESTAMP_MS;
+                if let Some(e) = s.entries.get_mut(0) {
+                    e.created_ms = NO_TIMESTAMP_MS;
+                }
             });
         });
         cx.update(|cx| {

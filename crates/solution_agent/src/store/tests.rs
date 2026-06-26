@@ -2586,23 +2586,23 @@ async fn append_stamps_entry_created_ms_once_per_index(cx: &mut TestAppContext) 
     });
     cx.executor().run_until_parked();
 
-    let stamps = cx.update(|cx| {
+    let (stamp0, stamp1) = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store
+        let session = store
             .read(cx)
             .session(session_id)
-            .expect("session exists")
-            .read(cx)
-            .entry_created_ms
-            .clone()
+            .expect("session exists");
+        let s = session.read(cx);
+        assert_eq!(s.entries.len(), 2, "two appends → two entries");
+        (s.entries[0].created_ms, s.entries[1].created_ms)
     });
-    assert_eq!(stamps.len(), 2, "two appends → two timestamps");
-    assert!(stamps[1] >= stamps[0], "timestamps are non-decreasing");
+    assert!(stamp0 > 0, "first stamp must be positive");
+    assert!(stamp1 >= stamp0, "timestamps are non-decreasing");
 
     // Now drive an in-place EntryUpdated on the last entry (streaming more
     // text into the existing assistant message). `push_assistant_content_block`
     // with an existing assistant entry as the last entry emits `EntryUpdated`,
-    // NOT `NewEntry` — so the vector must NOT grow or change.
+    // NOT `NewEntry` — so the entries count and stamps must NOT change.
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
@@ -2616,18 +2616,19 @@ async fn append_stamps_entry_created_ms_once_per_index(cx: &mut TestAppContext) 
     });
     cx.executor().run_until_parked();
 
-    let after = cx.update(|cx| {
+    cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store
+        let session = store
             .read(cx)
             .session(session_id)
-            .expect("session exists")
-            .read(cx)
-            .entry_created_ms
-            .clone()
+            .expect("session exists");
+        let s = session.read(cx);
+        assert_eq!(s.entries.len(), 2, "in-place update must not add an entry");
+        assert_eq!(
+            s.entries[1].created_ms, stamp1,
+            "existing stamp must be unchanged after EntryUpdated"
+        );
     });
-    assert_eq!(after.len(), 2, "in-place update must not add a timestamp");
-    assert_eq!(after[1], stamps[1], "existing timestamp must be unchanged");
 }
 
 #[gpui::test]
@@ -2663,18 +2664,23 @@ async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut Test
     });
     cx.executor().run_until_parked();
 
-    // Simulate a resumed pre-feature session: the legacy blob carried no
-    // timestamps, so the restore path leaves `entry_created_ms` empty even
-    // though the live thread already holds historical entries. Force that
-    // state directly — empty vector under a populated (2-entry) thread.
+    // Simulate a resumed pre-feature session: force the two existing entries'
+    // created_ms to the absent sentinel — as if they were loaded from a legacy
+    // blob that had no timestamps. The next NewEntry must NOT overwrite these
+    // (no restamp on pre-existing entries) and must give the new entry a real
+    // positive stamp.
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
-        session.update(cx, |s, _| s.entry_created_ms.clear());
+        session.update(cx, |s, _| {
+            for e in s.entries.iter_mut() {
+                e.created_ms = NO_TIMESTAMP_MS;
+            }
+        });
     });
 
     // Now the user sends a new message → a genuinely-new entry arrives at
-    // `entry_index == 2` (the thread already has 2 historical entries).
+    // `global_entry_index == 2` (the thread already has 2 historical entries).
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
@@ -2688,38 +2694,32 @@ async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut Test
     });
     cx.executor().run_until_parked();
 
-    let stamps = cx.update(|cx| {
+    cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store
+        let session = store
             .read(cx)
             .session(session_id)
-            .expect("session exists")
-            .read(cx)
-            .entry_created_ms
-            .clone()
-    });
+            .expect("session exists");
+        let s = session.read(cx);
 
-    // The vector must stay 1:1 with the thread's 3 entries.
-    assert_eq!(
-        stamps.len(),
-        3,
-        "gap-fill must keep the vector index-aligned"
-    );
-    // The two historical (gap-filled) indices must NOT be fabricated.
-    assert_eq!(
-        stamps[0], NO_TIMESTAMP_MS,
-        "historical gap entry must be marked absent, not fabricated"
-    );
-    assert_eq!(
-        stamps[1], NO_TIMESTAMP_MS,
-        "historical gap entry must be marked absent, not fabricated"
-    );
-    // Only the just-appended entry gets a real positive timestamp.
-    assert!(
-        stamps[2] > 0,
-        "the genuinely-new entry must hold a real positive timestamp, got {}",
-        stamps[2]
-    );
+        // All three entries must be present (2 historical + 1 new).
+        assert_eq!(s.entries.len(), 3, "gap-fill must keep entries aligned");
+        // The two historical (pre-existing) entries keep their sentinel.
+        assert_eq!(
+            s.entries[0].created_ms, NO_TIMESTAMP_MS,
+            "historical entry must keep sentinel, not be restamped"
+        );
+        assert_eq!(
+            s.entries[1].created_ms, NO_TIMESTAMP_MS,
+            "historical entry must keep sentinel, not be restamped"
+        );
+        // Only the just-appended entry gets a real positive timestamp.
+        assert!(
+            s.entries[2].created_ms > 0,
+            "the genuinely-new entry must hold a real positive timestamp, got {}",
+            s.entries[2].created_ms
+        );
+    });
 }
 
 #[gpui::test]
@@ -2756,19 +2756,24 @@ async fn entry_created_ms_survives_persist_roundtrip(cx: &mut TestAppContext) {
     // (a) Roundtrip: produce the real persisted blob via the same path the
     // store writes, decode it, and assert the timestamps survive intact and
     // stay index-aligned with the persisted entries.
-    let (original_stamps, decoded) = cx.update(|cx| {
+    let (original_stamp0, original_stamp1, decoded) = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
         let session = session.read(cx);
-        let original_stamps = session.entry_created_ms.clone();
+        let stamp0 = session.entries[0].created_ms;
+        let stamp1 = session.entries[1].created_ms;
         let bytes = serializable_snapshot(session, cx);
         let decoded: PersistedSession = serde_json::from_slice(&bytes).unwrap();
-        (original_stamps, decoded)
+        (stamp0, stamp1, decoded)
     });
-    assert_eq!(original_stamps.len(), 2, "two appends → two hot stamps");
+    assert_eq!(decoded.entry_created_ms.len(), 2, "two appends → two persisted stamps");
     assert_eq!(
-        decoded.entry_created_ms, original_stamps,
-        "persisted timestamps must roundtrip unchanged"
+        decoded.entry_created_ms[0], original_stamp0,
+        "persisted stamp[0] must roundtrip unchanged"
+    );
+    assert_eq!(
+        decoded.entry_created_ms[1], original_stamp1,
+        "persisted stamp[1] must roundtrip unchanged"
     );
     assert_eq!(
         decoded.entry_created_ms.len(),
@@ -2776,7 +2781,7 @@ async fn entry_created_ms_survives_persist_roundtrip(cx: &mut TestAppContext) {
         "timestamp vector must stay index-aligned with entries_v2"
     );
 
-    // (b) Absent sentinel roundtrips: force the first hot stamp to
+    // (b) Absent sentinel roundtrips: force the first entry's stamp to
     // NO_TIMESTAMP_MS (an entry whose creation time was never captured) and
     // confirm `serializable_snapshot` + serde preserves it rather than turning
     // it into 0 or dropping it, and that the vector stays index-aligned.
@@ -2784,7 +2789,11 @@ async fn entry_created_ms_survives_persist_roundtrip(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
-        session.update(cx, |s, _| s.entry_created_ms[0] = NO_TIMESTAMP_MS);
+        session.update(cx, |s, _| {
+            if let Some(e) = s.entries.get_mut(0) {
+                e.created_ms = NO_TIMESTAMP_MS;
+            }
+        });
     });
     let decoded_sentinel = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -2815,10 +2824,10 @@ async fn entry_created_ms_survives_persist_roundtrip(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn reset_context_clears_entry_created_ms(cx: &mut TestAppContext) {
+async fn reset_context_clears_entries(cx: &mut TestAppContext) {
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
-    // Append one user entry so entry_created_ms is non-empty.
+    // Append one user entry so `entries` is non-empty.
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
@@ -2839,10 +2848,10 @@ async fn reset_context_clears_entry_created_ms(cx: &mut TestAppContext) {
             .session(session_id)
             .expect("session exists")
             .read(cx)
-            .entry_created_ms
+            .entries
             .len()
     });
-    assert_eq!(len_before, 1, "one append → one timestamp before reset");
+    assert_eq!(len_before, 1, "one append → one entry before reset");
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -2858,25 +2867,22 @@ async fn reset_context_clears_entry_created_ms(cx: &mut TestAppContext) {
             .session(session_id)
             .expect("session exists")
             .read(cx)
-            .entry_created_ms
+            .entries
             .len()
     });
-    assert_eq!(
-        len_after, 0,
-        "reset_context clears the timestamp vector with the entries"
-    );
+    assert_eq!(len_after, 0, "reset_context clears entries");
 }
 
-/// `EntriesRemoved` must truncate `entry_created_ms` at `range.start`,
+/// `EntriesRemoved` must truncate `session.entries` at `cold_count + range.start`,
 /// keeping the surviving prefix aligned with the surviving thread entries.
-/// This exercises the actual truncation path on a populated vector;
+/// This exercises the actual truncation path on a populated entries list;
 /// `entries_removed_partial_rewind_preserves_token_state` covers the token
 /// state side independently.
 #[gpui::test]
-async fn entries_removed_truncates_entry_created_ms(cx: &mut TestAppContext) {
+async fn entries_removed_truncates_entries(cx: &mut TestAppContext) {
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
-    // Append two entries so entry_created_ms.len() == 2.
+    // Append two entries so entries.len() == 2.
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
@@ -2903,26 +2909,21 @@ async fn entries_removed_truncates_entry_created_ms(cx: &mut TestAppContext) {
     });
     cx.executor().run_until_parked();
 
-    let stamps = cx.update(|cx| {
+    let stamp0 = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store
+        let session = store
             .read(cx)
             .session(session_id)
-            .expect("session exists")
-            .read(cx)
-            .entry_created_ms
-            .clone()
+            .expect("session exists");
+        let s = session.read(cx);
+        assert_eq!(s.entries.len(), 2, "two appends → two entries before removal");
+        s.entries[0].created_ms
     });
-    assert_eq!(
-        stamps.len(),
-        2,
-        "two appends → two timestamps before removal"
-    );
 
     // Emit EntriesRemoved(1..2) — removes the last entry. The live thread
     // still has one surviving entry (the user message), so this is a
-    // partial rewind: the handler truncates entry_created_ms to length 1
-    // but does NOT reset token state.
+    // partial rewind: the handler truncates entries to length 1 (cold=0 +
+    // range.start=1) but does NOT reset token state.
     cx.update(|cx| {
         acp_thread.update(cx, |_t, cx| {
             cx.emit(acp_thread::AcpThreadEvent::EntriesRemoved(1..2));
@@ -2930,35 +2931,32 @@ async fn entries_removed_truncates_entry_created_ms(cx: &mut TestAppContext) {
     });
     cx.executor().run_until_parked();
 
-    let after = cx.update(|cx| {
+    cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store
+        let session = store
             .read(cx)
             .session(session_id)
-            .expect("session exists")
-            .read(cx)
-            .entry_created_ms
-            .clone()
+            .expect("session exists");
+        let s = session.read(cx);
+        assert_eq!(
+            s.entries.len(),
+            1,
+            "EntriesRemoved(1..2) must truncate entries to length 1"
+        );
+        assert_eq!(
+            s.entries[0].created_ms, stamp0,
+            "surviving entry's created_ms must be unchanged"
+        );
     });
-    assert_eq!(
-        after.len(),
-        1,
-        "EntriesRemoved(1..2) must truncate entry_created_ms to length 1"
-    );
-    assert_eq!(
-        after[0], stamps[0],
-        "surviving stamp at index 0 must be unchanged"
-    );
 }
 
-/// `rotate_context` swaps the underlying ACP thread and clears
-/// `entry_created_ms`. Without this, timestamps from the old thread
-/// would bleed into the new context.
+/// `rotate_context` swaps the underlying ACP thread and clears `entries`.
+/// Without this, entries from the old thread would bleed into the new context.
 #[gpui::test]
-async fn rotate_context_clears_entry_created_ms(cx: &mut TestAppContext) {
+async fn rotate_context_clears_entries(cx: &mut TestAppContext) {
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
-    // Append one user entry so entry_created_ms is non-empty before rotation.
+    // Append one user entry so `entries` is non-empty before rotation.
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
@@ -2979,10 +2977,10 @@ async fn rotate_context_clears_entry_created_ms(cx: &mut TestAppContext) {
             .session(session_id)
             .expect("session exists")
             .read(cx)
-            .entry_created_ms
+            .entries
             .len()
     });
-    assert_eq!(len_before, 1, "one append → one timestamp before rotation");
+    assert_eq!(len_before, 1, "one append → one entry before rotation");
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -2998,13 +2996,10 @@ async fn rotate_context_clears_entry_created_ms(cx: &mut TestAppContext) {
             .session(session_id)
             .expect("session exists")
             .read(cx)
-            .entry_created_ms
+            .entries
             .len()
     });
-    assert_eq!(
-        len_after, 0,
-        "rotate_context clears the timestamp vector with the entries"
-    );
+    assert_eq!(len_after, 0, "rotate_context clears entries");
 }
 
 /// The `AcpThreadEvent::EntryUpdated` handler debounces re-emits of
@@ -5563,6 +5558,86 @@ async fn new_entry_rebuilds_session_entries(cx: &mut TestAppContext) {
             matches!(s.entries.last().unwrap().kind, SessionEntryKind::AssistantMessage { .. }),
             "last entries element must be AssistantMessage, got {:?}",
             s.entries.last().unwrap().kind
+        );
+    });
+}
+
+/// Phase 2, Task 4: after two `NewEntry` events followed by an `EntryUpdated`
+/// on the first entry, the first entry's `created_ms` must NOT change (no
+/// restamp on in-place updates), and the second entry must still exist.
+#[gpui::test]
+async fn entry_updated_preserves_created_ms(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // First NewEntry: user message.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Second NewEntry: assistant message.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Capture the created_ms for entry 0 and verify both entries are present.
+    let original_entry0_created_ms = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session exists");
+        let s = session.read(cx);
+        assert_eq!(s.entries.len(), 2, "two NewEntry events → two entries");
+        assert!(
+            s.entries[0].created_ms > 0,
+            "entry 0 must have a real positive created_ms after NewEntry"
+        );
+        s.entries[0].created_ms
+    });
+
+    // EntryUpdated on entry 0 (the user message at local index 0 — emit directly).
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::EntryUpdated(0));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session exists");
+        let s = session.read(cx);
+        // Both entries must still be present.
+        assert_eq!(
+            s.entries.len(),
+            2,
+            "EntryUpdated must not change entries count"
+        );
+        // Entry 0's created_ms must be unchanged (no restamp on update).
+        assert_eq!(
+            s.entries[0].created_ms,
+            original_entry0_created_ms,
+            "EntryUpdated must not restamp entry 0's created_ms"
+        );
+        // Entry 1 must still exist.
+        assert!(
+            s.entries[1].created_ms > 0,
+            "entry 1 must retain its positive created_ms after update on entry 0"
         );
     });
 }

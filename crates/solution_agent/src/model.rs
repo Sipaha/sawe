@@ -371,18 +371,6 @@ pub struct SolutionSession {
     /// background tab reads as "loading", not "empty". Always `false` for
     /// fresh/live sessions and for tabs hydrated synchronously.
     pub hydrating: bool,
-    /// Unix-millis creation time per thread entry, index-aligned with the
-    /// live thread's absolute entry indices (and with `cold_entries` when
-    /// the session is cold). Stamped once at first append — never restamped
-    /// on in-place streaming updates. Truncated in lockstep with the
-    /// entries on rewind/reset so index alignment holds. A length shorter
-    /// than the entries means "trailing entries are absent". An absent entry
-    /// at any index holds [`NO_TIMESTAMP_MS`] — e.g. entries that predate this
-    /// feature, surfaced through a resumed pre-feature session whose history
-    /// gap is filled with the sentinel so the vector stays 1:1 with the
-    /// entries. Callers surface absent entries as no timestamp rather than
-    /// fabricating one.
-    pub entry_created_ms: Vec<i64>,
     /// Wall-clock duration of the most recently completed turn (set on
     /// `Running → Idle`). The status row reads this to render
     /// "Done in 2m15s" instead of a bare "Idle" so the user has an
@@ -535,7 +523,6 @@ impl SolutionSession {
             cold_entries: Vec::new(),
             entries: Vec::new(),
             hydrating: false,
-            entry_created_ms: Vec::new(),
             last_turn_duration: None,
             cached_total_tokens: None,
             cached_max_tokens: None,
@@ -664,7 +651,6 @@ mod tests {
             cold_entries: Vec::new(),
             entries: Vec::new(),
             hydrating: false,
-            entry_created_ms: Vec::new(),
             last_turn_duration: None,
             cached_total_tokens: None,
             cached_max_tokens: None,
