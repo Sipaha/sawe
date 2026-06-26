@@ -330,6 +330,40 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn assistant_markdown_matches_persisted(cx: &mut TestAppContext) {
+        use acp_thread::{AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock};
+        cx.update(|cx| {
+            let entry = AgentThreadEntry::AssistantMessage(AssistantMessage {
+                chunks: vec![AssistantMessageChunk::Message {
+                    block: ContentBlock::Markdown {
+                        markdown: cx.new(|cx| markdown::Markdown::new("**bold**".into(), None, None, cx)),
+                    },
+                }],
+                indented: false,
+                is_subagent_output: false,
+                subagent_id: None,
+            });
+            let sawe = to_session_entry(&entry, cx);
+            let persisted = crate::cold_persistence::to_persisted(&entry, cx).unwrap();
+            let sawe_md = match sawe.kind {
+                SessionEntryKind::AssistantMessage { chunks } => match &chunks[0] {
+                    AssistantChunk::Message(m) => m.clone(),
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            };
+            let persisted_md = match persisted {
+                crate::cold_persistence::PersistedEntryV2::Assistant(a) => match &a.chunks[0] {
+                    crate::cold_persistence::PersistedAssistantChunk::Message(m) => m.clone(),
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            };
+            assert_eq!(sawe_md, persisted_md);
+        });
+    }
+
     #[test]
     fn session_entry_serde_round_trips() {
         let entry = sample_tool();
