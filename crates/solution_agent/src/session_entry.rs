@@ -192,6 +192,27 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
     }
 }
 
+/// Rebuild the unified entry list from a cold prefix and a live thread slice.
+///
+/// Converts `cold` then `live` in order via [`to_session_entry`], stamping
+/// each result's `created_ms` from the index-aligned `created_ms` slice (0
+/// when absent). The global index counts across cold then live so the
+/// alignment matches `entry_created_ms` in the store.
+pub fn rebuild_entries(
+    cold: &[AgentThreadEntry],
+    live: &[AgentThreadEntry],
+    created_ms: &[i64],
+    cx: &App,
+) -> Vec<SessionEntry> {
+    let mut entries = Vec::with_capacity(cold.len() + live.len());
+    for (global_idx, entry) in cold.iter().chain(live.iter()).enumerate() {
+        let mut session_entry = to_session_entry(entry, cx);
+        session_entry.created_ms = created_ms.get(global_idx).copied().unwrap_or(0);
+        entries.push(session_entry);
+    }
+    entries
+}
+
 fn user_message_id_to_string(id: &UserMessageId) -> String {
     serde_json::to_value(id)
         .ok()

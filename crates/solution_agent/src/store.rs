@@ -1626,6 +1626,12 @@ impl SolutionAgentStore {
                         s.cwd = resume_cwd.clone();
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
+                        s.entries = crate::session_entry::rebuild_entries(
+                            &cold_entries,
+                            &[],
+                            &restored_created_ms,
+                            cx,
+                        );
                         s.cold_entries = cold_entries;
                         s.entry_created_ms = restored_created_ms;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
@@ -2274,6 +2280,8 @@ impl SolutionAgentStore {
                         .and_then(|p| p.desired_effort.clone());
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(persisted, cx);
+                    let cold_entries_for_entries =
+                        crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, cx);
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
@@ -2286,6 +2294,7 @@ impl SolutionAgentStore {
                         s.last_activity_at = meta.last_activity_at;
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
+                        s.entries = cold_entries_for_entries;
                         s.cold_entries = cold_entries;
                         s.entry_created_ms = restored_created_ms;
                         // Seed from the persisted metadata so the
@@ -2496,6 +2505,12 @@ impl SolutionAgentStore {
                         })
                         .unwrap_or_default();
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
+                    let cold_entries_for_entries = crate::session_entry::rebuild_entries(
+                        &cold_entries,
+                        &[],
+                        &restored_created_ms,
+                        cx,
+                    );
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
@@ -2508,6 +2523,7 @@ impl SolutionAgentStore {
                         s.last_activity_at = meta.last_activity_at;
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
+                        s.entries = cold_entries_for_entries;
                         s.cold_entries = cold_entries;
                         s.entry_created_ms = restored_created_ms;
                         s.cached_total_tokens = meta.total_tokens;
@@ -2796,6 +2812,12 @@ impl SolutionAgentStore {
             if let Some(entity) = this.sessions.get(&session_id).cloned() {
                 entity.update(cx, |session, cx| {
                     let (cold_entries, created_ms) = cold_entries_from_persisted(persisted, cx);
+                    session.entries = crate::session_entry::rebuild_entries(
+                        &cold_entries,
+                        &[],
+                        &created_ms,
+                        cx,
+                    );
                     session.cold_entries = cold_entries;
                     session.entry_created_ms = created_ms;
                     session.hydrating = false;
@@ -3113,6 +3135,7 @@ impl SolutionAgentStore {
                     // wiped together so the post-rotate UI starts from
                     // the (empty) live thread only.
                     s.cold_entries.clear();
+                    s.entries.clear();
                     // `set_acp_thread` emits ThreadReplaced + notify;
                     // last so SessionView re-attaches against a fully
                     // updated session struct.
@@ -3266,6 +3289,7 @@ impl SolutionAgentStore {
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
                     s.cold_entries.clear();
+                    s.entries.clear();
                     s.entry_created_ms.clear();
                     // Cache the (possibly freshly-built headless) project so
                     // a subsequent reset/restart on this now-live session
@@ -4868,6 +4892,20 @@ impl SolutionAgentStore {
                     }
                     // len > entry_index → in-place EntryUpdated on an existing entry: leave it.
                 });
+                // Rebuild the unified cold+live entry list now that entry_created_ms is
+                // up-to-date. Read cold_entries, entry_created_ms, and live entries in one
+                // immutable block → owned Vec<SessionEntry> → then update.
+                let entries = {
+                    let s = session_entity.read(cx);
+                    let live = s.acp_thread().map(|t| t.read(cx).entries()).unwrap_or(&[]);
+                    crate::session_entry::rebuild_entries(
+                        &s.cold_entries,
+                        live,
+                        &s.entry_created_ms,
+                        cx,
+                    )
+                };
+                session_entity.update(cx, |s, cx| s.set_entries(entries, cx));
                 cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
                     session_id,
                     entry_index,
@@ -5219,6 +5257,18 @@ impl SolutionAgentStore {
                     });
                     self.persist_session_row(session_id, cx);
                 }
+                // Rebuild entries to reflect the truncated state.
+                let entries = {
+                    let s = session_entity.read(cx);
+                    let live = s.acp_thread().map(|t| t.read(cx).entries()).unwrap_or(&[]);
+                    crate::session_entry::rebuild_entries(
+                        &s.cold_entries,
+                        live,
+                        &s.entry_created_ms,
+                        cx,
+                    )
+                };
+                session_entity.update(cx, |s, cx| s.set_entries(entries, cx));
             }
             acp_thread::AcpThreadEvent::EntryUpdated(idx) => {
                 // Subagent-tab lifecycle: a tracked Task/Agent ToolCall that
@@ -5299,6 +5349,19 @@ impl SolutionAgentStore {
                         },
                     );
                 }
+                // Rebuild entries so an in-place update (streaming text,
+                // tool-status flip) is reflected in the mobile-sync list.
+                let entries = {
+                    let s = session_entity.read(cx);
+                    let live = s.acp_thread().map(|t| t.read(cx).entries()).unwrap_or(&[]);
+                    crate::session_entry::rebuild_entries(
+                        &s.cold_entries,
+                        live,
+                        &s.entry_created_ms,
+                        cx,
+                    )
+                };
+                session_entity.update(cx, |s, cx| s.set_entries(entries, cx));
             }
             _ => {}
         }

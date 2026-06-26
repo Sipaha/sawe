@@ -5506,3 +5506,63 @@ fn session_models_falls_back_to_global_agent_cache(cx: &mut TestAppContext) {
         });
     });
 }
+
+/// Phase 2, Task 2: after a `NewEntry` event the session's `entries` list is
+/// rebuilt and reflects the full cold+live entry count. Mirrors the harness
+/// from `append_stamps_entry_created_ms_once_per_index`.
+#[gpui::test]
+async fn new_entry_rebuilds_session_entries(cx: &mut TestAppContext) {
+    use crate::session_entry::SessionEntryKind;
+
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Append a user entry → NewEntry fires → entries should be rebuilt.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Append an assistant entry → second NewEntry.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store
+            .read(cx)
+            .session(session_id)
+            .expect("session exists");
+        let s = session.read(cx);
+        // Cold is empty for a fresh session; live has 2 entries → entries must be 2.
+        assert_eq!(
+            s.entries.len(),
+            2,
+            "entries must equal cold({}) + live(2) after two NewEntry events",
+            s.cold_entries.len()
+        );
+        // The last entry must be the assistant message we just appended.
+        assert!(
+            matches!(s.entries.last().unwrap().kind, SessionEntryKind::AssistantMessage { .. }),
+            "last entries element must be AssistantMessage, got {:?}",
+            s.entries.last().unwrap().kind
+        );
+    });
+}
