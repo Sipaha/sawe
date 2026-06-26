@@ -5,8 +5,9 @@
 //! entry paints identically to a live one. Replaces the lossy
 //! `cold_persistence::PersistedEntryV2` once Phases 2-3 land.
 
+use acp_thread::{AgentThreadEntry, AssistantMessageChunk, UserMessageId};
 use agent_client_protocol::schema as acp;
-use gpui::SharedString;
+use gpui::{App, AppContext as _, SharedString};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -89,10 +90,62 @@ pub enum CompactionStatus {
     Canceled,
 }
 
+/// Project a live `AgentThreadEntry` onto the owned `SessionEntry`. The ONLY
+/// place `acp_thread::AgentThreadEntry` is read. Total (never drops): unlike
+/// `cold_persistence::to_persisted` it keeps in-flight tool calls and
+/// context-compaction. `created_ms` / `mod_seq` are left 0 for the store to
+/// stamp; `subagent_id` is lifted from the entry where present.
+pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
+    let (subagent_id, kind) = match entry {
+        AgentThreadEntry::UserMessage(msg) => (
+            None,
+            SessionEntryKind::UserMessage {
+                id: msg.id.as_ref().map(user_message_id_to_string),
+                content_md: msg.content.to_markdown(cx).to_string(),
+                chunks: msg.chunks.clone(),
+            },
+        ),
+        AgentThreadEntry::AssistantMessage(msg) => {
+            let chunks = msg
+                .chunks
+                .iter()
+                .map(|chunk| match chunk {
+                    AssistantMessageChunk::Message { block } => {
+                        AssistantChunk::Message(block.to_markdown(cx).to_string())
+                    }
+                    AssistantMessageChunk::Thought { block } => {
+                        AssistantChunk::Thought(block.to_markdown(cx).to_string())
+                    }
+                })
+                .collect();
+            (
+                msg.subagent_id.clone(),
+                SessionEntryKind::AssistantMessage { chunks },
+            )
+        }
+        // ToolCall / CompletedPlan / ContextCompaction implemented in Tasks 3-4.
+        _ => unimplemented!("converted in Tasks 3-4"),
+    };
+    SessionEntry {
+        created_ms: 0,
+        mod_seq: 0,
+        subagent_id,
+        kind,
+    }
+}
+
+fn user_message_id_to_string(id: &UserMessageId) -> String {
+    serde_json::to_value(id)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_client_protocol::schema as acp;
+    use gpui::{AppContext as _, TestAppContext};
 
     fn sample_tool() -> SessionEntry {
         SessionEntry {
@@ -112,6 +165,48 @@ mod tests {
                 status_started_at: Some(1_700_000_000_500),
             },
         }
+    }
+
+    #[gpui::test]
+    fn converts_user_and_assistant_messages(cx: &mut TestAppContext) {
+        use acp_thread::{
+            AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock,
+        };
+        cx.update(|cx| {
+            let user = AgentThreadEntry::UserMessage(acp_thread::UserMessage {
+                id: None,
+                content: ContentBlock::Markdown {
+                    markdown: cx.new(|cx| markdown::Markdown::new("hello".into(), None, None, cx)),
+                },
+                chunks: Vec::new(),
+                checkpoint: None,
+                indented: false,
+            });
+            let entry = to_session_entry(&user, cx);
+            match entry.kind {
+                SessionEntryKind::UserMessage { content_md, .. } => assert_eq!(content_md, "hello"),
+                _ => panic!("expected UserMessage"),
+            }
+
+            let assistant = AgentThreadEntry::AssistantMessage(AssistantMessage {
+                chunks: vec![AssistantMessageChunk::Message {
+                    block: ContentBlock::Markdown {
+                        markdown: cx.new(|cx| markdown::Markdown::new("hi there".into(), None, None, cx)),
+                    },
+                }],
+                indented: false,
+                is_subagent_output: false,
+                subagent_id: Some("toolu_x".into()),
+            });
+            let entry = to_session_entry(&assistant, cx);
+            assert_eq!(entry.subagent_id.as_deref(), Some("toolu_x"));
+            match entry.kind {
+                SessionEntryKind::AssistantMessage { chunks } => {
+                    assert!(matches!(&chunks[0], AssistantChunk::Message(m) if m == "hi there"));
+                }
+                _ => panic!("expected AssistantMessage"),
+            }
+        });
     }
 
     #[test]
