@@ -1621,6 +1621,9 @@ impl SolutionAgentStore {
                         s.cwd = resume_cwd.clone();
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
+                        s.desired_model = meta.desired_model.clone();
+                        s.desired_effort = meta.desired_effort.clone();
+                        s.cached_models = meta.cached_models.clone();
                         s.entries = entries;
                         s.init_change_seq_from_entries();
                         if migrating {
@@ -1633,8 +1636,7 @@ impl SolutionAgentStore {
                     });
                     store.sessions.insert(session_id, entity);
                     // Legacy → rows lazy migration (idempotent; guarded by
-                    // rows-empty). Blob kept until Task 5 removes it; model/effort
-                    // flushed to columns during migration.
+                    // rows-empty). Blob kept until Task 5 removes it.
                     if migrating {
                         store.persist_all_rows(session_id, cx);
                     }
@@ -2901,8 +2903,7 @@ impl SolutionAgentStore {
                     cx.notify();
                 });
                 // Legacy → rows lazy migration (idempotent; guarded by
-                // rows-empty). Blob kept until Task 5 removes it; model/effort
-                // flushed to columns during migration.
+                // rows-empty). Blob kept until Task 5 removes it.
                 if migrating {
                     this.persist_all_rows(session_id, cx);
                 }

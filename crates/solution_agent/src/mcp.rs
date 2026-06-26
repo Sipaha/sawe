@@ -3383,22 +3383,71 @@ impl McpServerTool for ReadSessionHistoryTool {
             });
         }
 
-        // 2. Archive path: live session not found, fall back to the
-        //    persisted blob written on the last successful turn.
-        let load_task = cx.update(|cx| {
+        // 2. Archive path: session is not in the in-memory store.
+        //    Phase 4: prefer per-entry rows (the canonical source for
+        //    row-native sessions whose blob write path is dead).  Fall
+        //    back to the legacy blob only when rows are empty — that
+        //    covers un-migrated sessions written before Phase 4.
+        //
+        //    Load rows and blob concurrently so the blob (needed for
+        //    the title in the row-native path if the DB has no separate
+        //    title API) is already in flight when we decide which branch
+        //    to take.
+        let load_tasks = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.read_with(cx, |store, _| {
-                store.persistence().map(|db| db.load_blob(session_id))
+                store
+                    .persistence()
+                    .map(|db| (db.load_entries(session_id), db.load_blob(session_id)))
             })
         });
-        let blob: Option<Vec<u8>> = match load_task {
-            Some(task) => task.await?,
-            None => None,
+        let (rows, blob_bytes) = match load_tasks {
+            Some((rows_task, blob_task)) => (rows_task.await?, blob_task.await?),
+            None => (Vec::new(), None),
         };
-        let blob = blob.ok_or_else(|| {
+
+        if !rows.is_empty() {
+            // Row-native path: reconstruct markdown from the stored entries.
+            let entries_all = crate::store::entries_from_rows(rows)
+                .into_iter()
+                .map(|entry| session_entry_to_markdown(&entry.kind))
+                .collect::<Vec<_>>();
+            // The title lives in the session metadata row (the blob is not
+            // the source of truth for row-native sessions and may be
+            // absent).  Use the blob's title as a best-effort fallback
+            // when available; fall back to an empty string otherwise.
+            let title = blob_bytes
+                .as_deref()
+                .and_then(|b| serde_json::from_slice::<PersistedSession>(b).ok())
+                .map(|s| s.title)
+                .unwrap_or_default();
+            let total = entries_all.len();
+            let slice = entries_all
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let returned = slice.len();
+            return Ok(ToolResponse {
+                content: vec![ToolResponseContent::Text {
+                    text: format!("{returned}/{total} entries (archived)"),
+                }],
+                structured_content: ReadSessionHistoryResult {
+                    session_id: session_id.to_string(),
+                    source: "archived".to_string(),
+                    title,
+                    total_entries: total,
+                    returned_entries: returned,
+                    entries: slice,
+                },
+            });
+        }
+
+        // Legacy blob fallback (un-migrated sessions written before Phase 4).
+        let blob_bytes = blob_bytes.ok_or_else(|| {
             anyhow!("session_not_found: {session_id} is neither open nor archived in the database")
         })?;
-        let snapshot: PersistedSession = serde_json::from_slice(&blob)
+        let snapshot: PersistedSession = serde_json::from_slice(&blob_bytes)
             .with_context(|| format!("decoding archived session {session_id}"))?;
         let total = snapshot.entry_summaries.len();
         let slice = snapshot
@@ -6273,5 +6322,139 @@ mod tests {
                 .expect("started_at_ms");
             assert!(started_at > 0, "started_at_ms must be positive");
         });
+    }
+
+    /// Finding 1 regression guard: a session that was closed (not in
+    /// `store.sessions`) but whose transcript is stored as per-entry rows
+    /// (no blob — the Phase-4 write path never writes blobs) must be
+    /// served by `read_session_history` instead of returning
+    /// `session_not_found`.
+    ///
+    /// Before the fix the archive path only called `load_blob`, which
+    /// returns NULL for a row-native session → the tool returned
+    /// `session_not_found` even though the rows were present.
+    #[gpui::test]
+    async fn read_session_history_closed_row_native_returns_entries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+        // Set up a real DB so rows can be written + read by the tool.
+        let (solution_id, _tmp, _project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+        cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+        let executor = cx.executor();
+        let db = std::sync::Arc::new(
+            crate::db::SolutionAgentDb::open(executor).expect("open db"),
+        );
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, _| {
+                store.set_persistence(db.clone());
+            });
+        });
+
+        let session_id = crate::model::SolutionSessionId::new();
+        let now = chrono::Utc::now();
+        let meta = crate::model::SolutionSessionMetadata {
+            id: session_id,
+            solution_id: solution_id.clone(),
+            agent_id: SharedString::from("mock-agent"),
+            acp_session_id: acp::SessionId::new(format!("acp-{}", session_id.as_str())),
+            title: SharedString::from("closed row-native session"),
+            created_at: now,
+            last_activity_at: now,
+            preview: None,
+            total_tokens: None,
+            context_count: 1,
+            cwd: std::path::PathBuf::new(),
+            parent_session_id: None,
+            desired_model: None,
+            desired_effort: None,
+            cached_models: vec![],
+        };
+        db.save_metadata(meta).await.expect("save metadata");
+
+        // Write two entries as rows (no blob) — the Phase-4 row-native shape.
+        let user_entry = SessionEntry {
+            created_ms: 1_700_000_000_000,
+            mod_seq: 1,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: "hello from closed session".into(),
+                chunks: vec![fake_user_text_chunk("hello from closed session")],
+            },
+        };
+        let assistant_entry = SessionEntry {
+            created_ms: 1_700_000_000_001,
+            mod_seq: 2,
+            subagent_id: None,
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![crate::session_entry::AssistantChunk::Message(
+                    "reply from closed session".into(),
+                )],
+            },
+        };
+        db.upsert_entry(
+            session_id,
+            0,
+            user_entry.mod_seq as i64,
+            user_entry.created_ms,
+            None,
+            user_entry.to_payload(),
+        )
+        .await
+        .expect("upsert user entry");
+        db.upsert_entry(
+            session_id,
+            1,
+            assistant_entry.mod_seq as i64,
+            assistant_entry.created_ms,
+            None,
+            assistant_entry.to_payload(),
+        )
+        .await
+        .expect("upsert assistant entry");
+
+        // The session is NOT in store.sessions — only the DB rows exist.
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            assert!(
+                store.read(cx).session(session_id).is_none(),
+                "session must not be in memory for this test"
+            );
+        });
+
+        // Call the tool — before the fix this returned session_not_found.
+        let result = ReadSessionHistoryTool
+            .run(
+                ReadSessionHistoryParams {
+                    session_id: session_id.to_string(),
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("read_session_history must succeed for a closed row-native session");
+
+        let sc = &result.structured_content;
+        assert_eq!(
+            sc.total_entries, 2,
+            "must return both rows, got {}",
+            sc.total_entries
+        );
+        assert_eq!(sc.returned_entries, 2);
+        assert_eq!(sc.source, "archived");
+        assert!(
+            sc.entries[0].contains("hello from closed session"),
+            "user entry must round-trip; got: {:?}",
+            sc.entries[0]
+        );
+        assert!(
+            sc.entries[1].contains("reply from closed session"),
+            "assistant entry must round-trip; got: {:?}",
+            sc.entries[1]
+        );
     }
 }

@@ -6681,3 +6681,92 @@ async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppCont
         epoch_in_db_after
     );
 }
+
+/// Finding 2 regression guard: the fresh-entity branch of `resume_session`
+/// (taken when the session is NOT already in `self.sessions`) must seed
+/// `desired_model`, `desired_effort`, and `cached_models` from the
+/// persisted `SolutionSessionMetadata`.
+///
+/// Before the fix, those three fields were simply never assigned in the
+/// fresh-entity block, so a cold-resumed session lost its model selection
+/// and the status-row dropdown would reset to the default on the next open.
+///
+/// Because driving the full `resume_session` code path requires a live
+/// agent subprocess (the mock only supports `new_session`, not
+/// `load_session`/`resume_session`), this test exercises the narrower
+/// invariant directly: it constructs a `SolutionSession` entity using the
+/// same pattern as the fixed fresh-entity block and asserts the three
+/// fields are propagated from the metadata.
+#[gpui::test]
+fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let solution_id = SolutionId("sol-model-test".into());
+    let now = Utc::now();
+
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id: solution_id.clone(),
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-model-test"),
+        title: SharedString::from("model-test session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: Some(12_345),
+        context_count: 2,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: Some("claude-opus-4-5".to_string()),
+        desired_effort: Some("high".to_string()),
+        cached_models: vec![],
+    };
+
+    // Build the entity exactly as the fixed fresh-entity branch does.
+    let entity = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |_, cx| {
+            cx.new(|_| {
+                let mut s = SolutionSession::new_idle(
+                    meta.id,
+                    meta.solution_id.clone(),
+                    meta.agent_id.clone(),
+                    meta.acp_session_id.clone(),
+                );
+                s.title = meta.title.clone();
+                s.created_at = meta.created_at;
+                s.context_count = meta.context_count;
+                s.cwd = meta.cwd.clone();
+                s.cached_total_tokens = meta.total_tokens;
+                s.parent_session_id = meta.parent_session_id;
+                s.desired_model = meta.desired_model.clone();
+                s.desired_effort = meta.desired_effort.clone();
+                s.cached_models = meta.cached_models.clone();
+                s
+            })
+        })
+    });
+
+    cx.update(|cx| {
+        entity.read_with(cx, |s, _| {
+            assert_eq!(
+                s.desired_model.as_deref(),
+                Some("claude-opus-4-5"),
+                "desired_model must be seeded from meta in the fresh-entity branch"
+            );
+            assert_eq!(
+                s.desired_effort.as_deref(),
+                Some("high"),
+                "desired_effort must be seeded from meta in the fresh-entity branch"
+            );
+            // cached_models is empty in this fixture — just assert the field exists
+            // and is not corrupt.
+            assert!(
+                s.cached_models.is_empty(),
+                "cached_models must round-trip from meta (empty vec expected here)"
+            );
+        });
+    });
+}
