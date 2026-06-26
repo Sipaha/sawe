@@ -1391,9 +1391,11 @@ impl McpServerTool for GetSessionTool {
             };
             let summary = session_summary(session, cx);
             let pending_bundles = build_pending_bundle_summaries(session, cx);
-            // Pure-read delta-cursor seed (Phase 5): `change_seq` is durable
-            // before readout (Task 5.1b), so handing it to the client never
-            // outruns persistence.
+            // Pure-read delta-cursor seed (Phase 5): persistence of `change_seq`
+            // is *scheduled* before the matching section event (Task 5.1b); the
+            // detached write may land slightly later, but the `max()`-guarded
+            // UPDATE plus the deterministic restore seed absorb the residual
+            // crash/reorder window, so the issued cursor stays restart-safe.
             let epoch = session.epoch;
             let current_seq = session.change_seq;
             Ok(GetSessionResult {
@@ -1503,6 +1505,12 @@ pub struct GetSessionChangesResult {
     /// `since_seq`). The client sets its list length to this after upserting
     /// `changed_entries`, which drops any tail beyond the new count — the
     /// shrink-detection signal under the tail-truncate model. Always sent.
+    ///
+    /// PARITY CONTRACT: `EntrySummary.index` is the ABSOLUTE (unfiltered)
+    /// position while `total_count` is the FILTERED length — exactly the shape
+    /// `get_session` returns. Both the delta applier and the full-load applier
+    /// in the mobile client rely on this being identical across the two RPCs;
+    /// keep this field's semantics in lockstep with `GetSessionResult::total_count`.
     pub total_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_entries: Vec<EntrySummary>,
@@ -1553,8 +1561,11 @@ impl McpServerTool for GetSessionChangesTool {
             let session = entity.read(cx);
 
             let epoch = session.epoch;
-            // Pure-read cursor: `change_seq` was made durable-before-readout in
-            // Task 5.1b, so handing it to the client never outruns persistence.
+            // Pure-read cursor: `change_seq` persistence is *scheduled* before
+            // the matching section event (Task 5.1b); the detached write may
+            // land slightly later, but the `max()`-guarded UPDATE and the
+            // deterministic restore seed absorb the residual window, so the
+            // cursor handed out stays restart-safe.
             let current_seq = session.change_seq;
 
             // Subagent filter gate — identical to `get_session` so a tab's
