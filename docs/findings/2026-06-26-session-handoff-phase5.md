@@ -7,22 +7,21 @@ jumps, redundant requests) by rebuilding the sync/persistence stack. Spec:
 `.superpowers/sdd/progress.md` (bottom). Prior handoff (Phase 4):
 `docs/findings/2026-06-26-session-handoff.md`.
 
-Work is **NOT pushed**, commit-per-task, **no `Co-Authored-By`**, executed via
-subagent-driven-development (TDD implementer + per-task opus review + whole-phase opus review).
+Commit-per-task, **no `Co-Authored-By`**, executed via subagent-driven-development (TDD
+implementer + per-task opus review + whole-phase opus review).
 
-## ⚠️ Branch reality (surfaced this session — decide with user)
-The active working branch is **`task-5a-mcp-session-reads`**, NOT `main` as every prior
-handoff claimed. Local `main` is **stale at `c4e1e19ed2`** (mid-Phase-4, 25 commits behind).
-`task-5a-mcp-session-reads` carries the full correct chain (Phase-4 head `f831cb5975` →
-all of Phase 5). `main` is a strict ANCESTOR → a fast-forward (`git branch -f main <head>`)
-is available anytime, no merge. The prior session's "on main" was imprecise. **Open question
-for the user:** fast-forward `main` to the work / rename the branch, or keep building here.
+## Branch / push status (RESOLVED end of session)
+The session originally ran on branch `task-5a-mcp-session-reads` (the prior "on main" was
+imprecise; local `main` had lagged at `c4e1e19ed2`). Per user, `main` was **fast-forwarded** to the
+work head `d6ec340db4` and **PUSHED to `origin/main`** (GitHub `Sipaha/sawe`,
+`583521c9a8..d6ec340db4`). `main` is now the home branch and synced with origin; the stray
+`task-5a-mcp-session-reads` pointer remains at the same commit (offer to delete). **Resume on `main`.**
 
 ## Phase numbering (spec reordered in execution)
 my Phase 3 = seq-stamping · Phase 4 = transcript-as-DB-rows · **Phase 5 = delta RPC
 `get_session_changes` (THIS session, COMPLETE)** · Phase 6 = Kotlin mobile client (NEXT).
 
-## Commit chain this session (all reviewed, NOT pushed)
+## Commit chain this session (all reviewed; merged to `main` + pushed to `origin/main`)
 ```
 9e4cb7deaa correct the change_seq durability comments        (whole-phase review fixes)
 a1091efdaa expose the delta cursor and RPC                    (5.3: GetSessionResult epoch/current_seq + GLOBAL_TOOLS/allow_list wiring + reset-event)
