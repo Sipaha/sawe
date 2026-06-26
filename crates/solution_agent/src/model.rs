@@ -12,6 +12,7 @@ use solutions::SolutionId;
 
 use crate::background_agent;
 use crate::background_shell;
+use crate::session_entry::SessionEntry;
 
 /// Length of a `SolutionSessionId` in ASCII characters. 8 chars over a
 /// 36-char alphabet ≈ 36⁸ ≈ 2.8 × 10¹² combinations — comfortably
@@ -357,6 +358,9 @@ pub struct SolutionSession {
     /// paints identically to its live form. Cleared once
     /// `resume_session` attaches a real `AcpThread`.
     pub cold_entries: Vec<acp_thread::AgentThreadEntry>,
+    /// Store-maintained list of owned session entries for mobile delta-sync
+    /// (Phase 2+). Mutated only through `set_entries` setter.
+    pub entries: Vec<SessionEntry>,
     /// `true` while a restored tab's `acp_thread_blob` is still being
     /// deserialised on a background task. Set by the lazy-hydration path
     /// ([`SolutionAgentStore::restore_open_tabs_lazy`]) when a placeholder
@@ -529,6 +533,7 @@ impl SolutionSession {
             pending_messages: VecDeque::new(),
             flush_after_cancel: false,
             cold_entries: Vec::new(),
+            entries: Vec::new(),
             hydrating: false,
             entry_created_ms: Vec::new(),
             last_turn_duration: None,
@@ -576,6 +581,13 @@ impl SolutionSession {
     pub fn set_acp_thread(&mut self, thread: Option<Entity<AcpThread>>, cx: &mut Context<Self>) {
         self.acp_thread = thread;
         cx.emit(SolutionSessionEvent::ThreadReplaced);
+        cx.notify();
+    }
+
+    /// Store the given session entries and notify observers. Used by
+    /// the store to maintain the mobile delta-sync payload (Phase 2+).
+    pub fn set_entries(&mut self, entries: Vec<SessionEntry>, cx: &mut Context<Self>) {
+        self.entries = entries;
         cx.notify();
     }
 }
@@ -650,6 +662,7 @@ mod tests {
             pending_messages: VecDeque::new(),
             flush_after_cancel: false,
             cold_entries: Vec::new(),
+            entries: Vec::new(),
             hydrating: false,
             entry_created_ms: Vec::new(),
             last_turn_duration: None,
@@ -718,5 +731,34 @@ mod tests {
             1,
             "set_acp_thread must wake cx.observe subscribers via cx.notify()"
         );
+    }
+
+    #[gpui::test]
+    fn set_entries_stores_and_notifies(cx: &mut TestAppContext) {
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        let notified = std::rc::Rc::new(std::cell::Cell::new(false));
+        let _sub = cx.update(|cx| {
+            let n = notified.clone();
+            cx.observe(&session, move |_, _| n.set(true))
+        });
+        session.update(cx, |s, cx| {
+            assert!(s.entries.is_empty());
+            s.set_entries(
+                vec![SessionEntry {
+                    created_ms: 0,
+                    mod_seq: 0,
+                    subagent_id: None,
+                    kind: crate::session_entry::SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: "x".into(),
+                        chunks: vec![],
+                    },
+                }],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(notified.get());
+        session.read_with(cx, |s, _| assert_eq!(s.entries.len(), 1));
     }
 }
