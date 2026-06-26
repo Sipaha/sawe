@@ -1775,7 +1775,8 @@ impl SolutionAgentStore {
                     });
                     store.sessions.insert(session_id, entity);
                     // Legacy → rows lazy migration (idempotent; guarded by
-                    // rows-empty). Blob is kept (model/effort fallback; Task 5).
+                    // rows-empty). Blob kept until Task 5 removes it; model/effort
+                    // flushed to columns during migration.
                     if migrating {
                         store.persist_all_rows(session_id, cx);
                     }
@@ -2427,8 +2428,10 @@ impl SolutionAgentStore {
                     // Read model/effort/cached_models from metadata columns first
                     // (Task 3a); fall back to the blob for legacy rows written
                     // before these columns existed (NULL = not yet migrated). In
-                    // the rows branch `persisted` is None, so the fallback degrades
-                    // to column-only — Task 5 owns the model/effort→column backfill.
+                    // the rows branch `persisted` is None so the fallback degrades
+                    // to column-only. For the migrate branch, persist_session_row
+                    // below flushes the recovered model/effort to columns so the
+                    // next cold-restore (rows branch) retains them.
                     let restored_available_models = if !meta.cached_models.is_empty() {
                         meta.cached_models.clone()
                     } else {
@@ -2502,11 +2505,13 @@ impl SolutionAgentStore {
                     this.sessions.insert(meta.id, entity);
                     // Legacy → rows lazy migration: write the freshly-built
                     // transcript out as rows so the next restore takes the rows
-                    // branch. Blob is intentionally kept (model/effort fallback;
-                    // Task 5 owns blob removal + the column backfill that precedes
-                    // it). Idempotent: guarded by the rows-empty check above.
+                    // branch. Blob is kept until Task 5 removes it; model/effort
+                    // flushed to columns during migration so the next cold-restore
+                    // (rows branch, no blob read) retains them. Idempotent:
+                    // guarded by the rows-empty check above.
                     if migrating {
                         this.persist_all_rows(meta.id, cx);
+                        this.persist_session_row(meta.id, cx);
                     }
                     this.by_solution
                         .entry(solution_id.clone())
@@ -3058,7 +3063,8 @@ impl SolutionAgentStore {
                     cx.notify();
                 });
                 // Legacy → rows lazy migration (idempotent; guarded by
-                // rows-empty). Blob kept (model/effort fallback; Task 5).
+                // rows-empty). Blob kept until Task 5 removes it; model/effort
+                // flushed to columns during migration.
                 if migrating {
                     this.persist_all_rows(session_id, cx);
                 }

@@ -2384,6 +2384,150 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     });
 }
 
+/// Regression guard: a v2 blob with `desired_model` set migrates on the first
+/// restore (MIGRATE branch recovers model from blob and writes rows). On the
+/// SECOND cold-restore (ROWS branch — no blob deserialization), the session
+/// must still carry the same `desired_model`. This proves that
+/// `persist_session_row` is called during migration, flushing the recovered
+/// model/effort to the metadata columns before the blob path is bypassed.
+#[gpui::test]
+async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContext) {
+    use crate::cold_persistence::{PersistedEntryV2, PersistedUserMessage};
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    let id_a = crate::model::SolutionSessionId::new();
+    let agent_id = SharedString::from("claude-acp");
+    let now = chrono::Utc::now();
+    let meta_a = crate::model::SolutionSessionMetadata {
+        id: id_a,
+        solution_id: solution_id.clone(),
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        title: SharedString::from("model session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        // No model in the DB metadata column yet — simulates pre-Task-3a row.
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+    };
+    db.save_metadata(meta_a).await.expect("meta a");
+
+    // Write a v2 blob that carries desired_model; no rows yet (migration trigger).
+    let blob_a = serde_json::to_vec(&PersistedSession {
+        title: "model session".into(),
+        entries: vec![],
+        entry_summaries: vec![],
+        entries_v2: vec![PersistedEntryV2::User(PersistedUserMessage {
+            id: None,
+            content_md: "hello".into(),
+            chunks: vec![],
+        })],
+        entry_created_ms: vec![1_700_000_000_000],
+        available_models: vec![],
+        desired_model: Some("some-model".into()),
+        desired_effort: None,
+    })
+    .unwrap();
+    db.save_blob(id_a, blob_a).await.expect("blob a");
+    assert!(
+        db.load_entries(id_a).await.expect("load rows").is_empty(),
+        "precondition: no rows before first restore"
+    );
+    db.update_tab_orders(solution_id.clone(), vec![id_a])
+        .await
+        .expect("tab order");
+
+    // First restore — MIGRATE branch: recovers desired_model from blob.
+    let ordered = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.restore_open_tabs(solution_id.clone(), cx)
+            })
+        })
+        .await
+        .expect("first restore");
+    assert_eq!(ordered, vec![id_a]);
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("session restored");
+            sa.read_with(cx, |s, _| {
+                assert_eq!(
+                    s.desired_model.as_deref(),
+                    Some("some-model"),
+                    "migrate branch must recover desired_model from blob"
+                );
+            });
+        });
+    });
+
+    // Let persist_all_rows + persist_session_row tasks land.
+    cx.run_until_parked();
+
+    // Confirm rows were written and metadata column was backfilled.
+    let rows = db.load_entries(id_a).await.expect("load rows after migrate");
+    assert_eq!(rows.len(), 1, "migration must have written 1 row");
+    let metas = db
+        .list_for_solution(solution_id.clone())
+        .await
+        .expect("list metas");
+    let db_meta = metas.iter().find(|m| m.id == id_a).expect("meta in db");
+    assert_eq!(
+        db_meta.desired_model.as_deref(),
+        Some("some-model"),
+        "persist_session_row must have written desired_model to the metadata column"
+    );
+
+    // Drop the in-memory session so the second restore starts cold.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.sessions.remove(&id_a);
+            store.by_solution.remove(&solution_id);
+        });
+    });
+
+    // Second restore — ROWS branch: no blob deserialization, reads columns only.
+    let ordered2 = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.restore_open_tabs(solution_id.clone(), cx)
+            })
+        })
+        .await
+        .expect("second restore");
+    assert_eq!(ordered2, vec![id_a]);
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("session re-restored");
+            sa.read_with(cx, |s, _| {
+                assert_eq!(
+                    s.desired_model.as_deref(),
+                    Some("some-model"),
+                    "second restore (rows branch) must retain desired_model from column"
+                );
+            });
+        });
+    });
+}
+
 /// (c) MANDATORY Phase-2 regression guard: a LEGACY v1 blob (entries_v2 EMPTY,
 /// entry_summaries populated) migrates losslessly — `entries` carries the
 /// summary text (history NOT lost) and rows are written. This is the exact
