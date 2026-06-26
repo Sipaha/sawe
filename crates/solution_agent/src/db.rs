@@ -140,6 +140,11 @@ impl SolutionAgentDb {
         // memory store + the create_session validation enforce the
         // same-solution constraint at write time.
         apply_idempotent_add_column(&connection, "parent_session_id TEXT");
+        // Phase 4: epoch counter — monotonically-increasing generation that the
+        // mobile delta-sync protocol uses to detect a full-transcript reset
+        // (e.g. context compaction that discards old entries). NULL = pre-phase-4
+        // rows; Tasks 2-5 populate it.
+        apply_idempotent_add_column(&connection, "epoch INTEGER");
 
         connection.exec(indoc! {"
             CREATE TABLE IF NOT EXISTS solution_session_background_agent (
@@ -191,6 +196,28 @@ impl SolutionAgentDb {
                 ON solution_session_background_shell (solution_session_id)
         "})?()
         .map_err(|e| anyhow!("Failed to create idx_bg_shell_by_session: {}", e))?;
+
+        // Phase 4: per-entry transcript rows. Each row stores one
+        // `SessionEntry` kind as a JSON blob; `mod_seq` drives
+        // mobile-delta queries (Tasks 2-5 consume this table).
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS solution_session_entries (
+                session_id   TEXT    NOT NULL,
+                idx          INTEGER NOT NULL,
+                mod_seq      INTEGER NOT NULL,
+                created_ms   INTEGER NOT NULL,
+                subagent_id  TEXT,
+                payload      BLOB    NOT NULL,
+                PRIMARY KEY (session_id, idx)
+            )
+        "})?()
+        .map_err(|e| anyhow!("Failed to create solution_session_entries table: {}", e))?;
+
+        connection.exec(indoc! {"
+            CREATE INDEX IF NOT EXISTS idx_session_entry_modseq
+                ON solution_session_entries (session_id, mod_seq)
+        "})?()
+        .map_err(|e| anyhow!("Failed to create idx_session_entry_modseq: {}", e))?;
 
         connection.exec(indoc! {"
             CREATE INDEX IF NOT EXISTS idx_session_by_solution
@@ -1370,6 +1397,43 @@ mod tests {
         let ses2 = db.load_background_shells("ses-2".into()).await.unwrap();
         assert_eq!(ses2.len(), 1);
         assert_eq!(ses2[0].shell_id, "shell-c");
+    }
+
+    #[gpui::test]
+    async fn solution_session_entries_table_and_index_exist(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+        let connection = db.connection.lock();
+
+        // Check table exists
+        let mut tables = connection
+            .select::<String>(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='solution_session_entries'",
+            )
+            .unwrap();
+        let table_names = tables().unwrap();
+        assert!(
+            table_names.iter().any(|n| n == "solution_session_entries"),
+            "solution_session_entries table must exist"
+        );
+
+        // Check index exists
+        let mut indexes = connection
+            .select::<String>(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_session_entry_modseq'",
+            )
+            .unwrap();
+        let index_names = indexes().unwrap();
+        assert!(
+            index_names.iter().any(|n| n == "idx_session_entry_modseq"),
+            "idx_session_entry_modseq index must exist"
+        );
+
+        // Check epoch column exists on solution_sessions
+        assert!(
+            column_exists(&connection, "solution_sessions", "epoch"),
+            "epoch column must exist on solution_sessions"
+        );
     }
 
     #[gpui::test]

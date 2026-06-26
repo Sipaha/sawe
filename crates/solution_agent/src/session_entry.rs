@@ -220,6 +220,23 @@ pub fn rebuild_entries(
     entries
 }
 
+impl SessionEntry {
+    /// Encode the entry's `kind` as a JSON blob for storage in the
+    /// `solution_session_entries.payload` column. `SessionEntryKind` is a
+    /// derived-`Serialize` enum whose variants all contain only JSON-compatible
+    /// types, so serialisation cannot fail in practice; `.unwrap_or_default()`
+    /// preserves the no-panic contract while keeping the return type simple.
+    pub fn to_payload(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.kind).unwrap_or_default()
+    }
+}
+
+/// Decode a `payload` blob back into a `SessionEntryKind`. Returns an error
+/// on malformed JSON or unrecognised variant tags.
+pub fn kind_from_payload(bytes: &[u8]) -> anyhow::Result<SessionEntryKind> {
+    serde_json::from_slice(bytes).map_err(Into::into)
+}
+
 fn user_message_id_to_string(id: &UserMessageId) -> String {
     serde_json::to_value(id)
         .ok()
@@ -407,5 +424,14 @@ mod tests {
             }
             _ => panic!("variant changed across round-trip"),
         }
+    }
+
+    #[test]
+    fn payload_codec_round_trips_kind() {
+        let entry = sample_tool();
+        let bytes = entry.to_payload();
+        assert!(!bytes.is_empty());
+        let decoded = kind_from_payload(&bytes).expect("kind_from_payload should succeed");
+        assert_eq!(decoded, entry.kind);
     }
 }
