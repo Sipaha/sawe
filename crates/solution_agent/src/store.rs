@@ -1699,6 +1699,7 @@ impl SolutionAgentStore {
                             cx,
                         );
                         s.init_change_seq_from_entries();
+                        s.bump_epoch();
                         s.cold_persisted_v2 = cold_persisted_v2;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
                         s
@@ -2372,6 +2373,7 @@ impl SolutionAgentStore {
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
                         s.init_change_seq_from_entries();
+                        s.bump_epoch();
                         s.cold_persisted_v2 = cold_persisted_v2;
                         // Seed from the persisted metadata so the
                         // status-row meter shows the last-known total
@@ -2574,6 +2576,7 @@ impl SolutionAgentStore {
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
                         s.init_change_seq_from_entries();
+                        s.bump_epoch();
                         s.cold_persisted_v2 = cold_persisted_v2;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
@@ -2867,6 +2870,7 @@ impl SolutionAgentStore {
                         cx,
                     );
                     session.init_change_seq_from_entries();
+                    session.bump_epoch();
                     // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
                     // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
                     // are also captured. For v2 blobs this is equivalent to cloning
@@ -3191,6 +3195,7 @@ impl SolutionAgentStore {
                     // the (empty) live thread only.
                     s.cold_persisted_v2.clear();
                     s.entries.clear();
+                    s.bump_epoch();
                     // `set_acp_thread` emits ThreadReplaced + notify;
                     // last so SessionView re-attaches against a fully
                     // updated session struct.
@@ -3345,6 +3350,7 @@ impl SolutionAgentStore {
                     s.last_turn_duration = None;
                     s.cold_persisted_v2.clear();
                     s.entries.clear();
+                    s.bump_epoch();
                     // Cache the (possibly freshly-built headless) project so
                     // a subsequent reset/restart on this now-live session
                     // doesn't have to rebuild it.

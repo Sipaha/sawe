@@ -6115,3 +6115,61 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
         );
     });
 }
+
+/// Phase 3, Task 4: `reset_context` (/clear) must increment `epoch` by exactly 1,
+/// because it replaces the transcript wholesale. A plain `NewEntry` must NOT bump
+/// `epoch` (only `change_seq` / `mod_seq` advance on live appends).
+#[gpui::test]
+async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Record the epoch before any reset.
+    let epoch_before = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read(cx).session(session_id).expect("session").read(cx).epoch
+    });
+
+    // Fire a plain NewEntry — must NOT bump epoch.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let epoch_after_entry = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read(cx).session(session_id).expect("session").read(cx).epoch
+    });
+    assert_eq!(
+        epoch_after_entry, epoch_before,
+        "a plain NewEntry must not bump epoch (got {} → {})",
+        epoch_before, epoch_after_entry
+    );
+
+    // Now call reset_context — epoch must advance by exactly 1.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.reset_context(session_id, cx))
+    })
+    .await
+    .expect("reset_context");
+
+    let epoch_after_reset = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read(cx).session(session_id).expect("session").read(cx).epoch
+    });
+    assert_eq!(
+        epoch_after_reset,
+        epoch_before + 1,
+        "reset_context must bump epoch by exactly 1 (was {}, got {})",
+        epoch_before,
+        epoch_after_reset
+    );
+}
