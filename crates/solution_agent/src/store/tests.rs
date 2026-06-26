@@ -3016,6 +3016,17 @@ async fn reset_context_emits_session_context_reset(cx: &mut TestAppContext) {
         })
     });
 
+    // Phase 5 Task 5.3 Part C: confirm /clear bumps the transcript epoch.
+    // The `agent_session_context_reset` push (forwarded from this very
+    // SessionContextReset event by `event_sources`) is what tells the
+    // cache-first mobile client to full-reload — it must coincide with an
+    // epoch bump so the client's `(epoch, current_seq)` cursor invalidates.
+    let epoch_before = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session exists");
+        session.read(cx).epoch
+    });
+
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| store.reset_context(session_id, cx))
@@ -3029,6 +3040,17 @@ async fn reset_context_emits_session_context_reset(cx: &mut TestAppContext) {
         collected,
         vec![stamped_count],
         "/clear must fire exactly one SessionContextReset with the unchanged context_count",
+    );
+
+    let epoch_after = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session exists");
+        session.read(cx).epoch
+    });
+    assert_eq!(
+        epoch_after,
+        epoch_before + 1,
+        "/clear must bump the session epoch so the mobile delta cursor invalidates",
     );
 }
 

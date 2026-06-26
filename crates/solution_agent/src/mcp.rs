@@ -1252,6 +1252,14 @@ pub struct GetSessionResult {
     /// are currently in-flight.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_subagents: Vec<SubagentDto>,
+    /// Phase 5: the session's transcript epoch at load time. The cache-first
+    /// mobile client seeds its delta cursor `(epoch, current_seq)` from this
+    /// full load, then polls `get_session_changes`; a later epoch mismatch
+    /// means the transcript was rotated (`/clear`) and the client full-reloads.
+    pub epoch: u64,
+    /// Phase 5: the session's `change_seq` at load time — the high-water mark
+    /// the client passes as `since_seq` on its first `get_session_changes` poll.
+    pub current_seq: u64,
 }
 
 /// One descriptor from `SolutionSession::pending_messages` exposed to
@@ -1383,6 +1391,11 @@ impl McpServerTool for GetSessionTool {
             };
             let summary = session_summary(session, cx);
             let pending_bundles = build_pending_bundle_summaries(session, cx);
+            // Pure-read delta-cursor seed (Phase 5): `change_seq` is durable
+            // before readout (Task 5.1b), so handing it to the client never
+            // outruns persistence.
+            let epoch = session.epoch;
+            let current_seq = session.change_seq;
             Ok(GetSessionResult {
                 id: summary.id,
                 solution_id: summary.solution_id,
@@ -1399,6 +1412,8 @@ impl McpServerTool for GetSessionTool {
                 total_count,
                 pending_bundles,
                 active_subagents: summary.active_subagents,
+                epoch,
+                current_seq,
             })
         })?;
 
@@ -4658,6 +4673,60 @@ mod tests {
                 "EntrySummary.index must match absolute position"
             );
         }
+    }
+
+    /// Phase 5 Task 5.3 Part A: a full `get_session` load carries the session's
+    /// current `epoch` + `current_seq` so the cache-first mobile client can seed
+    /// its delta cursor from one fetch (then poll `get_session_changes`).
+    #[gpui::test]
+    async fn get_session_seeds_delta_cursor_epoch_and_seq(cx: &mut gpui::TestAppContext) {
+        let (session_id, _tmp) = seed_session_with_n_entries(cx, 3).await;
+
+        // Bump both watermarks the way the store would after activity, and
+        // rotate the epoch the way a `/clear` would.
+        mutate_session(session_id, cx, |s| {
+            s.epoch = 7;
+            s.change_seq = 42;
+        });
+
+        let result = GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("get_session");
+
+        assert_eq!(
+            result.structured_content.epoch, 7,
+            "full load must carry the session's epoch"
+        );
+        assert_eq!(
+            result.structured_content.current_seq, 42,
+            "full load must carry the session's change_seq as current_seq"
+        );
+
+        // A further mutation that bumps change_seq is reflected on the next load.
+        mutate_session(session_id, cx, |s| {
+            s.change_seq = 43;
+        });
+        let result = GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("get_session");
+        assert_eq!(
+            result.structured_content.current_seq, 43,
+            "current_seq must track change_seq"
+        );
     }
 
     /// Build a COLD, row-native session: `session.entries` populated, NO
