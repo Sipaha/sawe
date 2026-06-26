@@ -1541,7 +1541,6 @@ async fn reset_context_clears_cold_entries(cx: &mut TestAppContext) {
                 s.cold_persisted_v2.push(PersistedEntryV2::Assistant(PersistedAssistantMessage {
                     chunks: vec![PersistedAssistantChunk::Message("cold msg".into())],
                 }));
-                s.cold_persisted_ms.push(1_700_000_000_000);
                 cx.notify();
             });
         });
@@ -5738,6 +5737,105 @@ async fn entry_updated_preserves_created_ms(cx: &mut TestAppContext) {
         assert!(
             s.entries[1].created_ms > 0,
             "entry 1 must retain its positive created_ms after update on entry 0"
+        );
+    });
+}
+
+/// Fix 4: after cold-restore of a NON-EMPTY prefix, attaching a live thread
+/// sets `live_base` to the prefix length. A subsequent `NewEntry` must land
+/// at `entries[live_base]` (AFTER the cold prefix) and leave the cold prefix
+/// entries unchanged.
+#[gpui::test]
+async fn new_entry_after_cold_prefix_lands_at_live_base(cx: &mut TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Inject 2 fake cold SessionEntries and re-attach the same acp_thread so
+    // live_base is recomputed from entries.len() = 2.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session exists");
+            session.update(cx, |s, cx| {
+                s.entries = vec![
+                    SessionEntry {
+                        created_ms: 1_700_000_000_000,
+                        mod_seq: 0,
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: "cold user".to_string(),
+                            chunks: vec![],
+                        },
+                    },
+                    SessionEntry {
+                        created_ms: 1_700_000_001_000,
+                        mod_seq: 0,
+                        subagent_id: None,
+                        kind: SessionEntryKind::AssistantMessage { chunks: vec![] },
+                    },
+                ];
+                // Re-attach the same thread so live_base = entries.len() = 2.
+                s.set_acp_thread(Some(acp_thread.clone()), cx);
+            });
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Confirm live_base == 2 and is_cold() == false.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert_eq!(s.live_base, 2, "live_base must equal cold prefix length");
+        assert!(!s.is_cold(), "session has a live thread");
+    });
+
+    // Fire a NewEntry via push_user_content_block.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("live msg".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        // Total entries = 2 cold + 1 live.
+        assert_eq!(
+            s.entries.len(),
+            3,
+            "entries must be cold(2) + live(1) = 3, got {}",
+            s.entries.len()
+        );
+        // Cold prefix entries must be unchanged.
+        assert_eq!(
+            s.entries[0].created_ms, 1_700_000_000_000,
+            "cold entry[0] created_ms must be unchanged"
+        );
+        assert_eq!(
+            s.entries[1].created_ms, 1_700_000_001_000,
+            "cold entry[1] created_ms must be unchanged"
+        );
+        // New entry must be at index live_base (= 2) with a real positive timestamp.
+        assert!(
+            s.entries[2].created_ms > 0,
+            "live entry at entries[2] must have a positive created_ms, got {}",
+            s.entries[2].created_ms
+        );
+        assert!(
+            matches!(s.entries[2].kind, SessionEntryKind::UserMessage { .. }),
+            "live entry at entries[2] must be UserMessage, got {:?}",
+            s.entries[2].kind
         );
     });
 }

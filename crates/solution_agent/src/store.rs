@@ -702,7 +702,7 @@ fn serializable_snapshot(session: &SolutionSession, cx: &App) -> Vec<u8> {
     // we persist must mirror that — otherwise persist drops the cold prefix
     // every snapshot and the next reload shows only this-session entries.
     //
-    // The cold prefix is already in `cold_persisted_v2` / `cold_persisted_ms`
+    // The cold prefix is already in `cold_persisted_v2`
     // (raw wire form); emit those directly — no round-trip through
     // `from_persisted`/`to_persisted` (which requires `&mut App`).
     // The live thread's entries go through the normal `to_persisted` path.
@@ -1666,10 +1666,6 @@ impl SolutionAgentStore {
                         .as_ref()
                         .map(|p| p.entries_v2.clone())
                         .unwrap_or_default();
-                    let raw_ms = preloaded_persisted
-                        .as_ref()
-                        .map(|p| p.entry_created_ms.clone())
-                        .unwrap_or_default();
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(preloaded_persisted, cx);
                     let entity = cx.new(|cx| {
@@ -1696,7 +1692,6 @@ impl SolutionAgentStore {
                             cx,
                         );
                         s.cold_persisted_v2 = raw_v2;
-                        s.cold_persisted_ms = raw_ms;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
                         s
                     });
@@ -2345,10 +2340,6 @@ impl SolutionAgentStore {
                         .as_ref()
                         .map(|p| p.entries_v2.clone())
                         .unwrap_or_default();
-                    let raw_ms = persisted
-                        .as_ref()
-                        .map(|p| p.entry_created_ms.clone())
-                        .unwrap_or_default();
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(persisted, cx);
                     let cold_entries_for_entries =
@@ -2367,7 +2358,6 @@ impl SolutionAgentStore {
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
                         s.cold_persisted_v2 = raw_v2;
-                        s.cold_persisted_ms = raw_ms;
                         // Seed from the persisted metadata so the
                         // status-row meter shows the last-known total
                         // for cold tabs (no live thread → no
@@ -2562,7 +2552,6 @@ impl SolutionAgentStore {
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
                         s.cold_persisted_v2 = raw_v2;
-                        s.cold_persisted_ms = restored_created_ms;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
                         s.tab_order = session_tab_order;
@@ -2850,10 +2839,6 @@ impl SolutionAgentStore {
                         .as_ref()
                         .map(|p| p.entries_v2.clone())
                         .unwrap_or_default();
-                    let raw_ms = persisted
-                        .as_ref()
-                        .map(|p| p.entry_created_ms.clone())
-                        .unwrap_or_default();
                     let (cold_entries, created_ms) = cold_entries_from_persisted(persisted, cx);
                     session.entries = crate::session_entry::rebuild_entries(
                         &cold_entries,
@@ -2862,7 +2847,6 @@ impl SolutionAgentStore {
                         cx,
                     );
                     session.cold_persisted_v2 = raw_v2;
-                    session.cold_persisted_ms = raw_ms;
                     session.hydrating = false;
                     // Drives the session view's `cx.observe(&session)` →
                     // re-render → cold-list resize catch-up so the freshly
@@ -3177,7 +3161,6 @@ impl SolutionAgentStore {
                     // wiped together so the post-rotate UI starts from
                     // the (empty) live thread only.
                     s.cold_persisted_v2.clear();
-                    s.cold_persisted_ms.clear();
                     s.entries.clear();
                     // `set_acp_thread` emits ThreadReplaced + notify;
                     // last so SessionView re-attaches against a fully
@@ -3332,7 +3315,6 @@ impl SolutionAgentStore {
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
                     s.cold_persisted_v2.clear();
-                    s.cold_persisted_ms.clear();
                     s.entries.clear();
                     // Cache the (possibly freshly-built headless) project so
                     // a subsequent reset/restart on this now-live session
@@ -4933,14 +4915,26 @@ impl SolutionAgentStore {
                         let live_base = s.live_base;
                         let entry = if gap_idx < live_base {
                             // Already materialized as a SessionEntry during cold restore.
-                            s.entries[gap_idx].clone()
+                            let Some(e) = s.entries.get(gap_idx) else {
+                                log::warn!(
+                                    "solution_agent NewEntry gap-fill: cold entry at idx {} missing (entries.len={})",
+                                    gap_idx,
+                                    s.entries.len(),
+                                );
+                                continue;
+                            };
+                            e.clone()
                         } else {
                             let local = gap_idx - live_base;
-                            if let Some(e) = live.get(local) {
-                                crate::session_entry::to_session_entry(e, cx)
-                            } else {
+                            let Some(e) = live.get(local) else {
+                                log::warn!(
+                                    "solution_agent NewEntry gap-fill: live entry at local idx {} missing (live.len={})",
+                                    local,
+                                    live.len(),
+                                );
                                 continue;
-                            }
+                            };
+                            crate::session_entry::to_session_entry(e, cx)
                         };
                         let mut gap_entry = entry;
                         gap_entry.created_ms = crate::model::NO_TIMESTAMP_MS;

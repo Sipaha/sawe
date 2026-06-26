@@ -359,10 +359,7 @@ pub struct SolutionSession {
     /// `reset_context`/`rotate_context` since the blob is then replaced by the live thread's
     /// new transcript.
     pub(crate) cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2>,
-    /// Creation timestamps (milliseconds since epoch) for the cold prefix entries, parallel to
-    /// `cold_persisted_v2`. Cleared on `reset_context`/`rotate_context`.
-    pub(crate) cold_persisted_ms: Vec<i64>,
-    /// Store-maintained list of owned session entries for mobile delta-sync
+/// Store-maintained list of owned session entries for mobile delta-sync
     /// (Phase 2+). Mutated only through `set_entries` setter.
     pub entries: Vec<SessionEntry>,
     /// `true` while a restored tab's `acp_thread_blob` is still being
@@ -526,7 +523,6 @@ impl SolutionSession {
             flush_after_cancel: false,
             live_base: 0,
             cold_persisted_v2: Vec::new(),
-            cold_persisted_ms: Vec::new(),
             entries: Vec::new(),
             hydrating: false,
             last_turn_duration: None,
@@ -657,7 +653,6 @@ mod tests {
             flush_after_cancel: false,
             live_base: 0,
             cold_persisted_v2: Vec::new(),
-            cold_persisted_ms: Vec::new(),
             entries: Vec::new(),
             hydrating: false,
             last_turn_duration: None,
