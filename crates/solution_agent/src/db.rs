@@ -154,6 +154,12 @@ impl SolutionAgentDb {
         // (e.g. context compaction that discards old entries). NULL = pre-phase-4
         // rows; Tasks 2-5 populate it.
         apply_idempotent_add_column(&connection, "epoch INTEGER");
+        // Phase 4 Task 3a: persist model/effort/cached_models as columns so they
+        // survive the removal of the transcript blob (Task 5). NULL = not set or
+        // pre-Task-3a rows; read column-first then blob-fallback in restore_open_tabs.
+        apply_idempotent_add_column(&connection, "desired_model TEXT");
+        apply_idempotent_add_column(&connection, "desired_effort TEXT");
+        apply_idempotent_add_column(&connection, "cached_models TEXT");
 
         connection.exec(indoc! {"
             CREATE TABLE IF NOT EXISTS solution_session_background_agent (
@@ -634,14 +640,14 @@ fn insert_or_update_metadata(
     connection: &Connection,
     meta: &SolutionSessionMetadata,
 ) -> Result<()> {
-    // `preview` and `total_tokens` use COALESCE so a metadata write that
-    // doesn't have those fields populated yet (e.g. fresh-session insert at
-    // create time) doesn't clobber values an event-driven update wrote
-    // earlier in the same session.
+    // `preview`, `total_tokens`, `cwd`, `parent_session_id`, `desired_model`,
+    // `desired_effort`, and `cached_models` use COALESCE so a metadata write
+    // that doesn't carry a value (e.g. a fresh-session insert at create time)
+    // doesn't clobber values an event-driven update wrote earlier in the same
+    // session.
     //
-    // Nested tuple shape because `sqlez::Bind` only implements tuples up
-    // to size 10; we have 12 columns now that `parent_session_id` is
-    // persisted (5 + 7).
+    // Nested tuple shape because `sqlez::Bind` only implements tuples up to
+    // size 10; we have 15 columns now (5 + 7 + 3).
     let mut insert = connection.exec_bound::<(
         (String, String, String, Arc<str>, String),
         (
@@ -653,13 +659,15 @@ fn insert_or_update_metadata(
             Option<String>,
             Option<String>,
         ),
+        (Option<String>, Option<String>, Option<String>),
     )>(indoc! {"
         INSERT INTO solution_sessions (
             id, solution_id, agent_id, acp_session_id, title,
             created_at, last_activity_at, preview, total_tokens,
-            context_count, cwd, parent_session_id
+            context_count, cwd, parent_session_id,
+            desired_model, desired_effort, cached_models
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         ON CONFLICT(id) DO UPDATE SET
             solution_id        = excluded.solution_id,
             agent_id           = excluded.agent_id,
@@ -671,13 +679,23 @@ fn insert_or_update_metadata(
             total_tokens       = COALESCE(excluded.total_tokens, total_tokens),
             context_count      = excluded.context_count,
             cwd                = COALESCE(excluded.cwd, cwd),
-            parent_session_id  = COALESCE(excluded.parent_session_id, parent_session_id)
+            parent_session_id  = COALESCE(excluded.parent_session_id, parent_session_id),
+            desired_model      = COALESCE(excluded.desired_model, desired_model),
+            desired_effort     = COALESCE(excluded.desired_effort, desired_effort),
+            cached_models      = COALESCE(excluded.cached_models, cached_models)
     "})?;
 
     let cwd_str = if meta.cwd.as_os_str().is_empty() {
         None
     } else {
         Some(meta.cwd.to_string_lossy().into_owned())
+    };
+    // Serialize cached_models as None when empty so COALESCE preserves the
+    // last non-empty list on a write that doesn't carry a fresh model list.
+    let cached_models_json = if meta.cached_models.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&meta.cached_models)?)
     };
     insert((
         (
@@ -696,6 +714,7 @@ fn insert_or_update_metadata(
             cwd_str,
             meta.parent_session_id.map(|id| id.to_string()),
         ),
+        (meta.desired_model.clone(), meta.desired_effort.clone(), cached_models_json),
     ))?;
 
     Ok(())
@@ -1132,7 +1151,7 @@ fn select_metadata_for_solution(
     solution_id: &SolutionId,
 ) -> Result<Vec<SolutionSessionMetadata>> {
     // Same nested-tuple shape as the INSERT side — `sqlez::Column` only
-    // implements tuples up to size 10; we have 12 columns now.
+    // implements tuples up to size 10; we have 15 columns now (5 + 7 + 3).
     let mut select = connection.select_bound::<String, (
         (String, String, String, Arc<str>, String),
         (
@@ -1144,10 +1163,12 @@ fn select_metadata_for_solution(
             Option<String>,
             Option<String>,
         ),
+        (Option<String>, Option<String>, Option<String>),
     )>(indoc! {"
         SELECT id, solution_id, agent_id, acp_session_id, title,
                created_at, last_activity_at, preview, total_tokens,
-               context_count, cwd, parent_session_id
+               context_count, cwd, parent_session_id,
+               desired_model, desired_effort, cached_models
         FROM solution_sessions
         WHERE solution_id = ?
         ORDER BY last_activity_at DESC
@@ -1166,6 +1187,7 @@ fn select_metadata_for_solution(
             cwd,
             parent_session_id,
         ),
+        (desired_model, desired_effort, cached_models_json),
     ) in rows
     {
         let id = SolutionSessionId::parse(&id)
@@ -1184,6 +1206,17 @@ fn select_metadata_for_solution(
             ),
             None => None,
         };
+        // Parse cached_models tolerantly: a corrupt JSON cell logs a warning
+        // and falls back to empty rather than failing the whole listing.
+        let cached_models: Vec<claude_native::ModelInfo> = cached_models_json
+            .and_then(|s| match serde_json::from_str(&s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::warn!("invalid cached_models json for {id}: {e}");
+                    None
+                }
+            })
+            .unwrap_or_default();
 
         out.push(SolutionSessionMetadata {
             id,
@@ -1198,6 +1231,9 @@ fn select_metadata_for_solution(
             context_count: context_count.max(1) as u32,
             cwd: cwd.map(std::path::PathBuf::from).unwrap_or_default(),
             parent_session_id,
+            desired_model,
+            desired_effort,
+            cached_models,
         });
     }
     Ok(out)
@@ -1226,6 +1262,9 @@ mod tests {
             context_count: 1,
             cwd: std::path::PathBuf::new(),
             parent_session_id: None,
+            desired_model: None,
+            desired_effort: None,
+            cached_models: vec![],
         }
     }
 
@@ -1726,5 +1765,97 @@ mod tests {
         assert!(rows_a.is_empty());
         let rows_b = db.load_entries(session_b).await.unwrap();
         assert_eq!(rows_b.len(), 1);
+    }
+
+    // ── Task 3a: session model/effort/cached_models columns ──────────────────
+
+    /// Helper: build a `ModelInfo` for use in tests.
+    fn make_model_info(value: &str) -> claude_native::ModelInfo {
+        claude_native::ModelInfo {
+            value: value.into(),
+            display_name: format!("{value} Display"),
+            description: format!("{value} description"),
+        }
+    }
+
+    /// (a) Round-trip: fields written in save_metadata come back from
+    /// list_for_solution intact.
+    /// (b) COALESCE: a second save with all-None/empty doesn't clobber the
+    /// values from the first.
+    /// (c) cached_models JSON serialises and deserialises without data loss.
+    #[gpui::test]
+    async fn session_settings_roundtrip_and_coalesce(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        // (a) round-trip
+        let mut meta = make_meta(1, "sol-settings");
+        meta.desired_model = Some("claude-opus-4-5".into());
+        meta.desired_effort = Some("high".into());
+        meta.cached_models = vec![
+            make_model_info("claude-opus-4-5"),
+            make_model_info("claude-sonnet-4-5"),
+        ];
+        db.save_metadata(meta.clone()).await.unwrap();
+
+        let listed = db
+            .list_for_solution(SolutionId("sol-settings".into()))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        let loaded = &listed[0];
+        assert_eq!(loaded.desired_model, Some("claude-opus-4-5".into()));
+        assert_eq!(loaded.desired_effort, Some("high".into()));
+        assert_eq!(loaded.cached_models, meta.cached_models);
+
+        // (b) COALESCE: second write with None/empty must not clobber
+        let mut meta_nones = make_meta(1, "sol-settings");
+        // Override id to match the existing row so ON CONFLICT fires.
+        meta_nones.id = meta.id;
+        meta_nones.desired_model = None;
+        meta_nones.desired_effort = None;
+        meta_nones.cached_models = vec![];
+        db.save_metadata(meta_nones).await.unwrap();
+
+        let listed2 = db
+            .list_for_solution(SolutionId("sol-settings".into()))
+            .await
+            .unwrap();
+        assert_eq!(listed2.len(), 1);
+        let loaded2 = &listed2[0];
+        // Original values must still be present.
+        assert_eq!(
+            loaded2.desired_model,
+            Some("claude-opus-4-5".into()),
+            "COALESCE must not clobber desired_model"
+        );
+        assert_eq!(
+            loaded2.desired_effort,
+            Some("high".into()),
+            "COALESCE must not clobber desired_effort"
+        );
+        assert_eq!(
+            loaded2.cached_models, meta.cached_models,
+            "COALESCE must not clobber cached_models"
+        );
+
+        // (c) cached_models JSON round-trip: a write with ≥1 model and then a
+        // read must preserve all fields of ModelInfo.
+        let mut meta2 = make_meta(2, "sol-settings");
+        meta2.cached_models = vec![make_model_info("model-x")];
+        db.save_metadata(meta2.clone()).await.unwrap();
+
+        let listed3 = db
+            .list_for_solution(SolutionId("sol-settings".into()))
+            .await
+            .unwrap();
+        let loaded3 = listed3
+            .iter()
+            .find(|m| m.id == meta2.id)
+            .expect("row must be present");
+        assert_eq!(loaded3.cached_models.len(), 1);
+        assert_eq!(loaded3.cached_models[0].value, "model-x");
+        assert_eq!(loaded3.cached_models[0].display_name, "model-x Display");
+        assert_eq!(loaded3.cached_models[0].description, "model-x description");
     }
 }

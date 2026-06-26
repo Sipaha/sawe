@@ -759,6 +759,9 @@ impl SolutionAgentStore {
                 context_count: s.context_count,
                 cwd: s.cwd.clone(),
                 parent_session_id: s.parent_session_id,
+                desired_model: s.desired_model.clone(),
+                desired_effort: s.desired_effort.clone(),
+                cached_models: s.cached_models.clone(),
             };
             (meta, s.project.clone())
         });

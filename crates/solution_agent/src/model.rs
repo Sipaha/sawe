@@ -14,6 +14,7 @@ use crate::background_agent;
 use crate::background_shell;
 use crate::session_entry::SessionEntry;
 
+
 /// Length of a `SolutionSessionId` in ASCII characters. 8 chars over a
 /// 36-char alphabet ≈ 36⁸ ≈ 2.8 × 10¹² combinations — comfortably
 /// collision-free for the realistic upper bound of a few thousand
@@ -656,6 +657,15 @@ pub struct SolutionSessionMetadata {
     /// `None` for top-level sessions and for legacy rows written
     /// before the column existed.
     pub parent_session_id: Option<SolutionSessionId>,
+    /// Persisted copy of [`SolutionSession::desired_model`]. `None` for
+    /// sessions where the user hasn't made a model selection yet.
+    pub desired_model: Option<String>,
+    /// Persisted copy of [`SolutionSession::desired_effort`]. `None` for
+    /// sessions where the user hasn't made an effort selection yet.
+    pub desired_effort: Option<String>,
+    /// Persisted copy of [`SolutionSession::cached_models`]. Empty for
+    /// sessions that haven't yet fetched the model list from the agent.
+    pub cached_models: Vec<claude_native::ModelInfo>,
 }
 
 #[cfg(test)]

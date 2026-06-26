@@ -1430,6 +1430,9 @@ fn stale_archive_dirs_gates_on_count_then_age() {
         context_count: 1,
         cwd: PathBuf::new(),
         parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
     };
 
     // <= the min-session gate: keep everything, even ancient archives.
@@ -1692,6 +1695,9 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
         context_count: 1,
         cwd: PathBuf::new(),
         parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
     };
     let meta_b = crate::model::SolutionSessionMetadata {
         id: id_b,
@@ -1894,6 +1900,9 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
         context_count: 1,
         cwd: PathBuf::new(),
         parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
     };
     db.save_metadata(meta_a).await.expect("meta a");
 

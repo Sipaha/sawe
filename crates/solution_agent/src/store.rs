@@ -1259,6 +1259,9 @@ impl SolutionAgentStore {
             context_count: s.context_count,
             cwd: s.cwd.clone(),
             parent_session_id: s.parent_session_id,
+            desired_model: s.desired_model.clone(),
+            desired_effort: s.desired_effort.clone(),
+            cached_models: s.cached_models.clone(),
         };
         db.save_metadata(meta).detach_and_log_err(cx);
     }
@@ -1941,7 +1944,7 @@ impl SolutionAgentStore {
             conn.select_model(&acp_sid, value.clone());
             conn.set_desired_model(&acp_sid, Some(value));
         }
-        self.persist_session_blob(session_id, cx);
+        self.persist_session_row(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
     }
 
@@ -1975,7 +1978,7 @@ impl SolutionAgentStore {
             conn.set_desired_effort(&acp_sid, Some(value.clone()));
             conn.select_effort(&acp_sid, value);
         }
-        self.persist_session_blob(session_id, cx);
+        self.persist_session_row(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
     }
 
@@ -2003,7 +2006,7 @@ impl SolutionAgentStore {
                 let agent_id = session.read(cx).agent_id.clone();
                 self.agent_models.insert(agent_id, models.clone());
                 session.update(cx, |s, _| s.cached_models = models);
-                self.persist_session_blob(session_id, cx);
+                self.persist_session_row(session_id, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
                 return;
             }
@@ -2041,7 +2044,7 @@ impl SolutionAgentStore {
                 this.agent_models.insert(agent_id, models.clone());
                 if let Some(session) = this.session(session_id) {
                     session.update(cx, |s, _| s.cached_models = models);
-                    this.persist_session_blob(session_id, cx);
+                    this.persist_session_row(session_id, cx);
                     cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
                 }
             })
@@ -2333,18 +2336,23 @@ impl SolutionAgentStore {
                     let persisted = blobs
                         .remove(id)
                         .and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
-                    // Extract model fields before moving `persisted` into
-                    // `cold_entries_from_persisted` (which consumes the Option).
-                    let restored_available_models = persisted
-                        .as_ref()
-                        .map(|p| p.available_models.clone())
-                        .unwrap_or_default();
-                    let restored_desired_model = persisted
-                        .as_ref()
-                        .and_then(|p| p.desired_model.clone());
-                    let restored_desired_effort = persisted
-                        .as_ref()
-                        .and_then(|p| p.desired_effort.clone());
+                    // Read model/effort/cached_models from metadata columns first
+                    // (Task 3a); fall back to the blob for legacy rows written
+                    // before these columns existed (NULL = not yet migrated).
+                    let restored_available_models = if !meta.cached_models.is_empty() {
+                        meta.cached_models.clone()
+                    } else {
+                        persisted
+                            .as_ref()
+                            .map(|p| p.available_models.clone())
+                            .unwrap_or_default()
+                    };
+                    let restored_desired_model = meta.desired_model.clone().or_else(|| {
+                        persisted.as_ref().and_then(|p| p.desired_model.clone())
+                    });
+                    let restored_desired_effort = meta.desired_effort.clone().or_else(|| {
+                        persisted.as_ref().and_then(|p| p.desired_effort.clone())
+                    });
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(persisted, cx);
                     let cold_entries_for_entries =
@@ -5239,7 +5247,7 @@ impl SolutionAgentStore {
                             self.agent_models.insert(agent_id, models.clone());
                             if s.read(cx).cached_models != models {
                                 s.update(cx, |s, _| s.cached_models = models);
-                                self.persist_session_blob(session_id, cx);
+                                self.persist_session_row(session_id, cx);
                             }
                         }
                     }

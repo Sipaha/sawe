@@ -2041,6 +2041,9 @@ impl SolutionSessionView {
             context_count: session.context_count,
             cwd: session.cwd.clone(),
             parent_session_id: session.parent_session_id,
+            desired_model: session.desired_model.clone(),
+            desired_effort: session.desired_effort.clone(),
+            cached_models: session.cached_models.clone(),
         };
         let store = SolutionAgentStore::global(cx);
         let task = store.update(cx, |store, cx| store.resume_session(meta, project, cx));
