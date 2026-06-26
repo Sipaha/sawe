@@ -199,9 +199,23 @@ pub(crate) fn render_compact_prompt_inner(
         compact_dir_str.push(std::path::MAIN_SEPARATOR);
     }
 
+    // The per-solution MCP socket — `solution_agent.compact_session` is a
+    // solution-scoped tool, so it lives ONLY on this socket, never on the
+    // editor-global `~/.spk/sawe/config/mcp.sock`. The template hands the
+    // agent the literal path so it can `nc -U` it directly instead of
+    // guessing (or hitting "Tool not found" on the global socket). The
+    // per-solution socket is bound for every OPEN Solution (see
+    // `editor_mcp` solution-socket lifecycle driven off
+    // `SolutionStoreEvent::Opened/Closed`), so it is present regardless of
+    // which Solution is the foreground one.
+    let solution_socket = editor_mcp::solution_socket_path(solution_id.0.as_str())
+        .to_string_lossy()
+        .into_owned();
+
     Ok(COMPACT_INSTRUCTIONS_TEMPLATE
         .replace("{{session_id}}", &session_id.to_string())
         .replace("{{compact_dir}}", &compact_dir_str)
+        .replace("{{solution_socket}}", &solution_socket)
         .replace("{{solution_id}}", solution_id.0.as_str())
         .replace("{{agent_id}}", agent_id.as_ref())
         .replace("{{started_at_iso}}", &started_at.to_rfc3339())
@@ -286,7 +300,7 @@ impl SolutionSessionView {
 
 /// Compact button activation threshold. Below this the conversation is
 /// too short for a compact to be worth the round-trip.
-pub(crate) const COMPACT_BUTTON_MIN_PCT: f64 = 0.20;
+pub(crate) const COMPACT_BUTTON_MIN_PCT: f64 = 0.10;
 
 /// Threshold at which the compact button paints in warning colour.
 /// Past this, the user should rotate before the model starts dropping
@@ -490,7 +504,7 @@ mod tests {
                     solution_id.clone(),
                     agent_id.clone(),
                     // 50% of the 1.0M default window → comfortably above the
-                    // 20% COMPACT_BUTTON_MIN_PCT gate, with ample headroom.
+                    // 10% COMPACT_BUTTON_MIN_PCT gate, with ample headroom.
                     Some(500_000),
                     Some(project.clone()),
                     store,

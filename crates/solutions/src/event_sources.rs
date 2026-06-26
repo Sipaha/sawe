@@ -70,7 +70,7 @@ pub fn install(cx: &mut App) {
     coordinator.update(cx, |this, cx| {
         if let Some(store) = SolutionStore::try_global(cx) {
             this.subscriptions.push(
-                cx.subscribe(&store, |_this, _store, event, cx| match event {
+                cx.subscribe(&store, |_this, store, event, cx| match event {
                     SolutionStoreEvent::Changed => {
                         editor_mcp::emit_notification(cx, "solution_changed", json!({}));
                     }
@@ -127,15 +127,33 @@ pub fn install(cx: &mut App) {
                     // alongside) already drives the `solution_changed`
                     // notification that refreshes remote clients' lists.
                     SolutionStoreEvent::Deleted { .. } => {}
-                    // `Closed` drives desktop-tab teardown via the
-                    // per-Workspace subscriber in `solutions_ui`; this
-                    // coordinator-level handler doesn't need to react.
-                    SolutionStoreEvent::Closed { .. } => {}
-                    // `Opened` drives the per-session `workspace.session_opened`
-                    // fan-out via the subscriber installed by `workspace_events`
-                    // (which sees both stores). This coordinator doesn't need
-                    // to react.
-                    SolutionStoreEvent::Opened { .. } => {}
+                    // Per-solution MCP socket lifecycle is driven off the
+                    // authoritative open/closed state here — NOT off the
+                    // MultiWorkspace observer's one-shot visible-worktree scan.
+                    // A Solution can be marked open from several paths (window
+                    // open, `solutions.open`, member-add Activate) and joins a
+                    // shared window via switching; binding the socket only when
+                    // the observer happened to see its worktrees left
+                    // background Solutions reporting `open=true` with no live
+                    // listener (so `compact_session` over nc failed). `Opened`
+                    // fires from every open path, so hooking it here guarantees
+                    // the socket exists for as long as the Solution is open,
+                    // regardless of which Solution is foreground. Idempotent:
+                    // `open_solution_socket` no-ops if already bound.
+                    SolutionStoreEvent::Opened { id } => {
+                        let root = store
+                            .read(cx)
+                            .solutions()
+                            .iter()
+                            .find(|sol| &sol.id == id)
+                            .map(|sol| sol.root.clone());
+                        if let Some(root) = root {
+                            editor_mcp::open_solution_socket(cx, id.0.as_str(), root);
+                        }
+                    }
+                    SolutionStoreEvent::Closed { id } => {
+                        editor_mcp::close_solution_socket(cx, id.0.as_str());
+                    }
                 }),
             );
         }
@@ -206,27 +224,20 @@ pub fn install(cx: &mut App) {
                         let project = workspace.read(cx).project().clone();
                         wire_project(this, &project, cx);
                     }
-                    // Mark the newly-opened solutions as open.
+                    // Mark the newly-opened solutions as open. The per-solution
+                    // MCP socket is bound/torn down by the `SolutionStoreEvent::
+                    // Opened`/`Closed` subscriber above — `mark_open`/`mark_closed`
+                    // emit those events, so we don't (and must not) open/close the
+                    // socket directly here: doing both would split the lifecycle
+                    // across two code paths, which is exactly the desync that left
+                    // background Solutions `open=true` with no live socket.
                     if !open_ids.is_empty() {
                         if let Some(store) = SolutionStore::try_global(cx) {
-                            // Capture roots before the mutable update so each
-                            // Solution's per-solution MCP socket can be opened
-                            // (a scoped subagent talks to its own socket only).
-                            let roots: Vec<(crate::SolutionId, std::path::PathBuf)> = store
-                                .read(cx)
-                                .solutions()
-                                .iter()
-                                .filter(|sol| open_ids.contains(&sol.id))
-                                .map(|sol| (sol.id.clone(), sol.root.clone()))
-                                .collect();
                             store.update(cx, |s, cx| {
                                 for id in &open_ids {
                                     s.mark_open(id.clone(), cx);
                                 }
                             });
-                            for (id, root) in roots {
-                                editor_mcp::open_solution_socket(cx, id.as_str(), root);
-                            }
                         }
                         // Register a release observer on the coordinator's entity
                         // so when the MultiWorkspace is dropped (window closed) we
@@ -243,9 +254,6 @@ pub fn install(cx: &mut App) {
                                             s.mark_closed(id, cx);
                                         }
                                     });
-                                }
-                                for id in &close_ids {
-                                    editor_mcp::close_solution_socket(cx, id.as_str());
                                 }
                             });
                         this.subscriptions.push(release_sub);

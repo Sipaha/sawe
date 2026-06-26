@@ -19,6 +19,10 @@ paths, do not write files anywhere else.
   separator — `{{compact_dir}}continue.md` is the literal path of the
   file you will write.)
 - `SOLUTION_ID` = `{{solution_id}}`
+- `SOLUTION_SOCKET` = `{{solution_socket}}`
+  (the Unix socket that serves this Solution's MCP tools, including
+  `solution_agent.compact_session`. This is the ONLY socket that tool
+  lives on — the editor-global `mcp.sock` does not have it.)
 - `AGENT_ID` = `{{agent_id}}`
 - `STARTED_AT` = `{{started_at_iso}}`
 - `TOKENS_USED` = `{{tokens_used}}`
@@ -126,64 +130,27 @@ B → branching, C → exploratory).
 
 ## Step 3 — Trigger the session rotation
 
-After all files are on disk, invoke the editor's
-`solution_agent.compact_session` MCP tool with these arguments:
+After all files are on disk, rotate the session by calling the editor's
+`solution_agent.compact_session` tool over its Unix socket. **Do not look
+for an auto-bound `mcp__…` function and do not dial any other socket** —
+`compact_session` lives ONLY on `SOLUTION_SOCKET` (above). Run this exact
+command from your shell (the paths are already filled in for this
+session — copy it verbatim):
 
-```json
-{
-  "session_id": "{{session_id}}",
-  "prompt_file": "{{compact_dir}}continue.md"
-}
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"solution_agent.compact_session","arguments":{"session_id":"{{session_id}}","prompt_file":"{{compact_dir}}continue.md"}}}' \
+  | timeout 20 nc -U {{solution_socket}}
 ```
 
-### How to invoke (pick the path your runtime supports — try in order)
-
-1. **Native MCP-tool binding.** If the sawe MCP server's tools
-   are auto-bound in your runtime as callable functions (Claude Code
-   bridges them as `mcp__<server>__<tool>` or similar), invoke
-   directly. The exact callable name varies by harness; try
-   `mcp__sawe__solution_agent_compact_session` or
-   `mcp__sawe__solution_agent_compact_session` first.
-
-2. **Direct JSON-RPC over the editor's Unix socket.** Always works as
-   long as the editor process is alive. The socket lives at
-   `$HOME/.spk/sawe-dev/config/mcp.sock` for a `--debug` build
-   or `$HOME/.spk/sawe/config/mcp.sock` for release; the path
-   is symlinked into the runtime tmpdir but the symlink under
-   `$HOME` is stable. Newline-delimited JSON-RPC 2.0. Example using
-   Bash + Python (substitute `{{session_id}}` and the prompt path):
-
-   ```bash
-   python3 - <<'PY'
-   import socket, json, os
-   sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-   sock.connect(os.path.expanduser("~/.spk/sawe/config/mcp.sock"))
-   f = sock.makefile("rwb", buffering=0)
-   req = {
-       "jsonrpc": "2.0", "id": 1,
-       "method": "tools/call",
-       "params": {
-           "name": "solution_agent.compact_session",
-           "arguments": {
-               "session_id": "{{session_id}}",
-               "prompt_file": "{{compact_dir}}continue.md",
-           },
-       },
-   }
-   f.write((json.dumps(req) + "\n").encode())
-   while True:
-       line = f.readline()
-       if not line: break
-       msg = json.loads(line)
-       if msg.get("id") == 1:
-           print(json.dumps(msg, indent=2))
-           break
-   PY
-   ```
+`nc -U` opens the Unix-domain socket; the request is one newline-delimited
+JSON-RPC 2.0 frame. The `timeout 20` guarantees `nc` returns even though
+the server keeps the connection open after replying — that is expected,
+not an error.
 
 ### What success looks like
 
-The tool response carries a `structuredContent` block of the form
+`nc` prints one JSON-RPC response line. On success it carries a
+`structuredContent` block of the form
 `{"new_session_id": "...", "prompt_bytes": <N>}` and a `content`
 text line like `"rotated <sid> into context c<NN> (<N> bytes)"`.
 Once you see that, the rotation has happened: your conversation
@@ -193,7 +160,9 @@ otherwise compose would already be running against the fresh
 context. Do NOT send any further messages — the rotation is the
 end of this context's contribution.
 
-### If the tool errors
+### If the response carries an error
+
+Read the `error.message` (or the `content` text) and act on it:
 
 - `unknown session ...` — the editor has lost track of this session.
   Don't retry; surface the error to the user.
@@ -208,16 +177,18 @@ end of this context's contribution.
   refused the rotation because one of `state.md` / `decisions.md` /
   `next.md` (case A / B) / `continue.md` / `session-state.json` is
   missing or zero-bytes. Re-check Step 2 + retry.
+- `Method not found` / `Tool not found` — you dialed the wrong socket.
+  Confirm you used `SOLUTION_SOCKET` exactly, not the global `mcp.sock`.
 
-### If you cannot invoke the MCP tool at all
+### If you cannot reach the socket at all
 
-(transport unavailable, socket missing, runtime gives no way to
-shell out, etc.) — STOP. Do NOT mark the compact "done". Tell the
-user: "Handoff files are written at `{{compact_dir}}` but I cannot
-invoke `solution_agent.compact_session` from this runtime. To
-complete the rotation, please start a fresh session manually and
-feed the contents of `{{compact_dir}}continue.md` as the first
-user message." A failed compact must be observable, not silent.
+(`nc` is missing, the socket file does not exist, or every call times
+out with no response) — STOP. Do NOT mark the compact "done". Tell the
+user: "Handoff files are written at `{{compact_dir}}` but I cannot reach
+`solution_agent.compact_session` on `{{solution_socket}}`. To complete
+the rotation, please start a fresh session manually and feed the
+contents of `{{compact_dir}}continue.md` as the first user message."
+A failed compact must be observable, not silent.
 
 ## Hard rules
 

@@ -277,6 +277,16 @@ pub struct SolutionDetail {
     pub members: Vec<MemberDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_opened_at: Option<String>,
+    pub open: bool,
+    /// Path of this Solution's per-solution MCP socket. Present only while the
+    /// Solution is open — same value `solutions.list` exposes. A subagent
+    /// scoped to this Solution reaches `solution_agent.compact_session` (and
+    /// every other solution-scoped tool) ONLY through this socket; the
+    /// editor-global `mcp.sock` does not carry them. `solutions.get` is in
+    /// SHARED_TOOLS, so the subagent can read this off its own per-solution
+    /// socket to recover the path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_socket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -321,7 +331,7 @@ impl McpServerTool for GetSolutionTool {
                 s.solutions()
                     .iter()
                     .find(|sol| sol.id.as_str() == input.solution_id)
-                    .map(|sol| (build_detail(sol), sol.root.clone()))
+                    .map(|sol| (build_detail(sol, s.is_open(&sol.id)), sol.root.clone()))
                     .with_context(|| format!("solution_not_found: {}", input.solution_id))
             })
         })?;
@@ -340,7 +350,12 @@ impl McpServerTool for GetSolutionTool {
     }
 }
 
-fn build_detail(sol: &Solution) -> SolutionDetail {
+fn build_detail(sol: &Solution, open: bool) -> SolutionDetail {
+    let mcp_socket = open.then(|| {
+        editor_mcp::solution_socket_path(sol.id.as_str())
+            .to_string_lossy()
+            .into_owned()
+    });
     SolutionDetail {
         id: sol.id.as_str().to_string(),
         name: sol.name.clone(),
@@ -358,6 +373,8 @@ fn build_detail(sol: &Solution) -> SolutionDetail {
             })
             .collect(),
         last_opened_at: sol.last_opened_at.map(|t| t.to_rfc3339()),
+        open,
+        mcp_socket,
     }
 }
 

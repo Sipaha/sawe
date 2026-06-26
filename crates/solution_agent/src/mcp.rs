@@ -5146,7 +5146,7 @@ mod tests {
     }
 
     /// `start_compact` MCP tool refuses on a fresh session whose
-    /// context usage is well below the 20% threshold — mirrors the
+    /// context usage is well below the 10% threshold — mirrors the
     /// desktop status-row gate. The structured `queued=false` + reason
     /// is the contract the phone client renders on its button.
     #[gpui::test]
