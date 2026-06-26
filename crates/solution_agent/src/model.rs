@@ -357,6 +357,16 @@ pub struct SolutionSession {
     /// paints identically to its live form. Cleared once
     /// `resume_session` attaches a real `AcpThread`.
     pub cold_entries: Vec<acp_thread::AgentThreadEntry>,
+    /// `true` while a restored tab's `acp_thread_blob` is still being
+    /// deserialised on a background task. Set by the lazy-hydration path
+    /// ([`SolutionAgentStore::restore_open_tabs_lazy`]) when a placeholder
+    /// session entity is materialised with empty `cold_entries`; cleared
+    /// once the blob lands and `cold_entries` is populated. The session
+    /// view renders a loading spinner (instead of "no messages yet") while
+    /// this is `true` and there is no live thread, so a not-yet-hydrated
+    /// background tab reads as "loading", not "empty". Always `false` for
+    /// fresh/live sessions and for tabs hydrated synchronously.
+    pub hydrating: bool,
     /// Unix-millis creation time per thread entry, index-aligned with the
     /// live thread's absolute entry indices (and with `cold_entries` when
     /// the session is cold). Stamped once at first append — never restamped
@@ -519,6 +529,7 @@ impl SolutionSession {
             pending_messages: VecDeque::new(),
             flush_after_cancel: false,
             cold_entries: Vec::new(),
+            hydrating: false,
             entry_created_ms: Vec::new(),
             last_turn_duration: None,
             cached_total_tokens: None,
@@ -639,6 +650,7 @@ mod tests {
             pending_messages: VecDeque::new(),
             flush_after_cancel: false,
             cold_entries: Vec::new(),
+            hydrating: false,
             entry_created_ms: Vec::new(),
             last_turn_duration: None,
             cached_total_tokens: None,

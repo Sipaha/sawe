@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, Global, SharedString, Subscription,
-    Task, TaskExt as _,
+    Task, TaskExt as _, WeakEntity,
 };
 use solutions::{Solution, SolutionId, SolutionStore, SolutionStoreEvent};
 use util::ResultExt;
@@ -2611,6 +2611,216 @@ impl SolutionAgentStore {
             })?;
             Ok(result_ids)
         })
+    }
+
+    /// Lazy sibling of [`hydrate_all_for_solution`] used by the console
+    /// panel's tab restore. Instead of loading every open session's
+    /// `acp_thread_blob` before any tab can paint, this materialises
+    /// *placeholder* session entities (metadata only, empty `cold_entries`,
+    /// `hydrating = true`) for all open chat tabs in one fast foreground
+    /// pass and resolves the returned task as soon as the `priority`
+    /// session's blob has loaded. Every other session's transcript loads on
+    /// detached background tasks and lands on its entity afterwards (the
+    /// session view shows a spinner until then). The net effect: opening a
+    /// solution with many heavy chat tabs paints the strip + the active
+    /// tab's content immediately rather than blocking on a serial blob load.
+    ///
+    /// Registration mirrors `hydrate_all_for_solution` exactly — sessions
+    /// are inserted into `self.sessions` only (NOT `by_solution`) and a
+    /// `workspace.session_opened` is emitted for tab-pinned rows — so the
+    /// mobile `list_sessions` / navigator stay consistent regardless of
+    /// which restore path ran. Idempotent against `already_open`.
+    ///
+    /// `priority` is the session id of the tab that will be active when the
+    /// panel finishes restoring; pass `None` to load every blob detached
+    /// (the task then resolves right after the placeholders are created).
+    pub fn hydrate_open_tabs_lazy(
+        &self,
+        solution_id: SolutionId,
+        priority: Option<SolutionSessionId>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<SolutionSessionId>>> {
+        self.reap_stale_session_archives(solution_id.clone(), cx);
+        let Some(db) = self.persistence.clone() else {
+            return Task::ready(Ok(Vec::new()));
+        };
+        let already_open: std::collections::HashSet<SolutionSessionId> =
+            self.sessions.keys().copied().collect();
+        cx.spawn(async move |this, cx| {
+            // Metadata-only queries — deliberately NO blob loads here so the
+            // placeholder pass below can return fast.
+            let open_ids: std::collections::HashSet<SolutionSessionId> = db
+                .list_open_session_ids(solution_id.clone())
+                .await?
+                .into_iter()
+                .collect();
+            if open_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let tabbed_ids: Vec<SolutionSessionId> =
+                db.list_open_tabs(solution_id.clone()).await.unwrap_or_default();
+            let tab_order_map: std::collections::HashMap<SolutionSessionId, i64> = tabbed_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (*id, i as i64))
+                .collect();
+            let metas = db.list_for_solution(solution_id.clone()).await?;
+            if metas.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Foreground pass 1: create empty placeholders for every open,
+            // not-yet-loaded session and emit the same tab-pinned
+            // `session_opened` deltas `hydrate_all_for_solution` would. No
+            // blob touched, so this returns near-instantly.
+            let hydrated: Vec<SolutionSessionId> = this.update(cx, |this, cx| {
+                let mut hydrated: Vec<SolutionSessionId> = Vec::new();
+                for meta in &metas {
+                    if !open_ids.contains(&meta.id) || already_open.contains(&meta.id) {
+                        continue;
+                    }
+                    if this.sessions.contains_key(&meta.id) {
+                        continue;
+                    }
+                    let session_tab_order = tab_order_map.get(&meta.id).copied();
+                    let entity = cx.new(|_| {
+                        let mut s = SolutionSession::new_idle(
+                            meta.id,
+                            meta.solution_id.clone(),
+                            meta.agent_id.clone(),
+                            meta.acp_session_id.clone(),
+                        );
+                        s.title = meta.title.clone();
+                        s.created_at = meta.created_at;
+                        s.last_activity_at = meta.last_activity_at;
+                        s.context_count = meta.context_count;
+                        s.cwd = meta.cwd.clone();
+                        // Blob not loaded yet — left empty, filled by the
+                        // background pass below. `hydrating` flips the
+                        // session view's empty state to a spinner.
+                        s.cold_entries = Vec::new();
+                        s.entry_created_ms = Vec::new();
+                        s.hydrating = true;
+                        s.cached_total_tokens = meta.total_tokens;
+                        s.parent_session_id = meta.parent_session_id;
+                        s.tab_order = session_tab_order;
+                        s
+                    });
+                    // Same intentional partial registration as
+                    // `hydrate_all_for_solution`: `self.sessions` only, skip
+                    // `by_solution` + `SessionCreated` (see that method's
+                    // comment for why).
+                    this.sessions.insert(meta.id, entity);
+                    hydrated.push(meta.id);
+                }
+                if let Some(coord) =
+                    editor_mcp::workspace_seq::WorkspaceEventCoordinator::try_global(cx)
+                {
+                    for id in &hydrated {
+                        let Some(entity) = this.sessions.get(id) else {
+                            continue;
+                        };
+                        let (is_tabbed, summary) = entity.read_with(cx, |s, cx| {
+                            (s.tab_order.is_some(), crate::mcp::session_summary(s, cx))
+                        });
+                        if !is_tabbed {
+                            continue;
+                        }
+                        coord.emit_sequenced(
+                            cx,
+                            "workspace.session_opened",
+                            serde_json::json!({
+                                "solution_id": solution_id.as_str(),
+                                "session": summary,
+                            }),
+                        );
+                    }
+                }
+                if !hydrated.is_empty() {
+                    cx.notify();
+                }
+                hydrated
+            })?;
+
+            if hydrated.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Load the priority (soon-to-be-active) tab's blob inline so the
+            // panel paints its content immediately instead of a spinner; the
+            // returned task only resolves once this lands.
+            let priority = priority.filter(|p| hydrated.contains(p));
+            if let Some(priority_id) = priority {
+                Self::load_cold_blob_into_session(db.clone(), this.clone(), cx, priority_id).await;
+            }
+
+            // Every other restored tab hydrates on its own detached task so a
+            // big backlog can't block the foreground; each lands on its entity
+            // and clears its spinner independently.
+            for sid in hydrated
+                .iter()
+                .copied()
+                .filter(|id| Some(*id) != priority)
+            {
+                let db = db.clone();
+                let this = this.clone();
+                cx.spawn(async move |cx| {
+                    Self::load_cold_blob_into_session(db, this, cx, sid).await;
+                })
+                .detach();
+            }
+
+            Ok(hydrated)
+        })
+    }
+
+    /// Background helper for [`hydrate_open_tabs_lazy`]: load one session's
+    /// transcript blob + background-agent rows off-thread and apply them to
+    /// the already-materialised placeholder entity, clearing `hydrating`. A
+    /// missing entity (session closed before the blob landed) or a failed
+    /// load is logged and dropped — the placeholder simply stays empty.
+    async fn load_cold_blob_into_session(
+        db: Arc<crate::db::SolutionAgentDb>,
+        this: WeakEntity<Self>,
+        cx: &mut AsyncApp,
+        session_id: SolutionSessionId,
+    ) {
+        let blob = db.load_blob(session_id).await.unwrap_or(None);
+        let bg_rows = db
+            .load_background_agents(session_id.to_string())
+            .await
+            .unwrap_or_default();
+        this.update(cx, |this, cx| {
+            let persisted =
+                blob.and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
+            if let Some(entity) = this.sessions.get(&session_id).cloned() {
+                entity.update(cx, |session, cx| {
+                    let (cold_entries, created_ms) = cold_entries_from_persisted(persisted, cx);
+                    session.cold_entries = cold_entries;
+                    session.entry_created_ms = created_ms;
+                    session.hydrating = false;
+                    // Drives the session view's `cx.observe(&session)` →
+                    // re-render → cold-list resize catch-up so the freshly
+                    // loaded transcript paints.
+                    cx.notify();
+                });
+            }
+            if !bg_rows.is_empty() {
+                this.reconcile_background_agents_for(session_id, bg_rows, cx);
+            }
+            // Background shells are ephemeral across restarts — drop the stale
+            // rows just like `hydrate_all_for_solution` does.
+            if let Some(db) = this.persistence.clone() {
+                let session_id = session_id.to_string();
+                cx.background_spawn(async move {
+                    db.delete_background_shells_for_session(session_id)
+                        .await
+                        .log_err();
+                })
+                .detach();
+            }
+        })
+        .log_err();
     }
 
     pub fn close_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) -> Result<()> {

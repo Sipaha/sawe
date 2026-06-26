@@ -216,11 +216,24 @@ impl ConsolePanel {
             cx.new(|cx| Self::new(workspace.weak_handle(), store, window, cx))
         })?;
 
-        // Best-effort restore: a failure here must not block the workspace
-        // from opening, so swallow errors with `.log_err()`.
-        Self::restore_from_db(workspace.clone(), panel.clone(), &mut cx)
-            .await
-            .log_err();
+        // Restore persisted tabs in the BACKGROUND. `load` is awaited by
+        // `initialize_panels` before the panel is added to the dock, so any
+        // work done here delays the panel's dock icon AND its content from
+        // appearing at all. `restore_from_db` hydrates each chat tab's
+        // session transcript off disk — seconds of work for a busy
+        // Solution — which used to leave the whole panel (icon included)
+        // invisible until it finished. Detaching it lets `load` return
+        // immediately: the empty panel + icon paint at once and tabs fill
+        // in as their sessions hydrate. Best-effort: a restore failure must
+        // not take the panel down, so errors are logged, not propagated.
+        {
+            let workspace = workspace.clone();
+            let panel = panel.clone();
+            cx.spawn(async move |cx: &mut AsyncWindowContext| {
+                Self::restore_from_db(workspace, panel, cx).await.log_err();
+            })
+            .detach();
+        }
 
         Ok(panel)
     }
@@ -251,12 +264,21 @@ impl ConsolePanel {
             return Ok(());
         }
 
-        // If any persisted row is a chat tab, eagerly hydrate the active
-        // solution's sessions from disk so `ChatProvider::new_tab_from_existing`
-        // can find them. Without this the session lives in DB but not in the
-        // in-memory store, so chat-tab restore silently skips with a "session
-        // no longer exists" warning. The store filters out `closed_at != null`
-        // rows internally, so explicitly-closed sessions still don't come back.
+        // If any persisted row is a chat tab, hydrate the active solution's
+        // sessions from disk so `ChatProvider::new_tab_from_existing` can find
+        // them. Without this the session lives in DB but not in the in-memory
+        // store, so chat-tab restore silently skips with a "session no longer
+        // exists" warning. The store filters out `closed_at != null` rows
+        // internally, so explicitly-closed sessions still don't come back.
+        //
+        // We use the LAZY path (`hydrate_open_tabs_lazy`): it materialises
+        // empty placeholder entities for every open chat tab fast, then loads
+        // each transcript blob in the background — the active tab first
+        // (passed as `priority` so it paints with content, not a spinner),
+        // the rest detached. Only the placeholder pass is awaited here, so
+        // `new_tab_from_existing` finds every session id while the heavy blob
+        // loads are still in flight; tabs whose blob hasn't landed render a
+        // loading spinner until it does.
         let has_chat_rows = rows.iter().any(|(_, kind, _, _, _)| kind == "chat");
         if has_chat_rows {
             let solution_id = workspace
@@ -264,9 +286,16 @@ impl ConsolePanel {
                 .ok()
                 .flatten();
             if let Some(solution_id) = solution_id {
+                // The active chat tab (active==1) is the one the user will see
+                // first; prioritise loading its transcript so it doesn't flash
+                // a spinner.
+                let priority = rows
+                    .iter()
+                    .find(|(_, kind, _, _, active)| kind == "chat" && *active)
+                    .and_then(|(_, _, item_id, _, _)| SolutionSessionId::parse(item_id).ok());
                 let hydrate = cx.update(|_, cx| {
                     SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                        store.hydrate_all_for_solution(solution_id, cx)
+                        store.hydrate_open_tabs_lazy(solution_id, priority, cx)
                     })
                 });
                 if let Ok(task) = hydrate {
