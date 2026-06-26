@@ -9,6 +9,7 @@ use context_server::types::ToolResponseContent;
 use gpui::{App, AsyncApp, Entity};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 
 use crate::background_agent::BackgroundAgent;
 use crate::background_shell::BackgroundShell;
@@ -1296,36 +1297,26 @@ impl McpServerTool for GetSessionTool {
             let entity = store
                 .read_with(cx, |store, _| store.session(session_id))
                 .with_context(|| format!("session_not_found: {}", session_id))?;
-            // Clone the cold v2 entries before taking the long-lived `session`
-            // borrow so that `from_persisted` (which needs `&mut App`) can be
-            // called on the cloned data without conflicting borrows.
-            let cold_v2_cloned: Vec<crate::cold_persistence::PersistedEntryV2> =
-                entity.read(cx).cold_persisted_v2.clone();
-            let cold_acp: Vec<acp_thread::AgentThreadEntry> = cold_v2_cloned
-                .into_iter()
-                .map(|v2| crate::cold_persistence::from_persisted(v2, cx))
-                .collect();
             let session = entity.read(cx);
-            // Live sessions have an attached `acp_thread`; cold (sleeping)
-            // sessions don't — but they still have entries from `cold_persisted_v2`
-            // reconstructed from the persisted blob on disk. Without this
-            // fallback the mobile client sees an empty chat for any
-            // session whose subprocess hasn't been respawned yet (a
-            // common state for any session you scroll past without
-            // tapping into).
-            // History after restart lives in the cold prefix (rebuilt from
-            // the persisted blob on disk); messages produced AFTER the
-            // resume land in the new `AcpThread.entries()`. `claude
-            // --resume <id>` does NOT re-emit the transcript through
-            // stream-json — it just continues from where it left off —
-            // so without concatenating, the chat shows only post-restart
-            // messages and the user thinks history was wiped.
-            let live_entries: Vec<&acp_thread::AgentThreadEntry> = session
-                .acp_thread()
-                .map(|thread| thread.read(cx).entries().iter().collect())
-                .unwrap_or_default();
-            let mut entries_ref: Vec<&acp_thread::AgentThreadEntry> = cold_acp.iter().collect();
-            entries_ref.extend(live_entries);
+            // Phase 4 Task 5a: serve the transcript from the unified
+            // `session.entries` (Vec<SessionEntry>) — the same cold+live
+            // model the desktop renders and Phase 4 persists/loads as
+            // rows. Reading from `cold_persisted_v2` + the live
+            // `acp_thread().entries()` (the pre-repoint path) returned an
+            // EMPTY transcript for any row-native session that was cold or
+            // resumed: Task 4 leaves `cold_persisted_v2` empty, and
+            // `claude --resume` does not re-emit history, so neither
+            // source held the pre-restart entries. `session.entries` is
+            // kept in lock-step with the live thread by the store's
+            // `NewEntry` handler, so live sessions read identically.
+            //
+            // Authorization options for any in-flight WaitingForConfirmation
+            // tool call are not stored on `SessionEntry` (a side-channel,
+            // live-only concern); harvest them off the live thread (empty
+            // for cold sessions) and re-attach per tool-call id below.
+            let live_auth_options = live_auth_options_for_session(session, cx);
+            let entries_ref: Vec<&crate::session_entry::SessionEntry> =
+                session.entries.iter().collect();
             let (entries, total_count) = {
                 // R-6e: index-anchored slice. `after_index` /
                 // `before_index` are exclusive bounds and `count`
@@ -1358,8 +1349,8 @@ impl McpServerTool for GetSessionTool {
                     let passes_filter = match subagent_filter {
                         None => true,
                         Some(_) if active_empty => true,
-                        Some("__main__") => entry.subagent_id().is_none(),
-                        Some(id) => entry.subagent_id().map(|s| s.as_ref()) == Some(id),
+                        Some("__main__") => entry.subagent_id.is_none(),
+                        Some(id) => entry.subagent_id.as_deref() == Some(id),
                     };
                     if passes_filter {
                         filtered_total += 1;
@@ -1368,22 +1359,16 @@ impl McpServerTool for GetSessionTool {
                         && after.map_or(true, |a| index > a)
                         && before.map_or(true, |b| index < b);
                     if in_range {
-                        let created_ms = session
-                            .entries
-                            .get(index)
-                            .map(|e| e.created_ms)
-                            .filter(|&ms| ms > 0);
                         kept.push(summarize_entry(
                             entry,
                             index,
-                            created_ms,
                             input.include_full_content,
                             input.include_images,
                             &mut image_cursor,
-                            cx,
+                            &live_auth_options,
                         ));
                     } else {
-                        image_cursor += count_images_in_entry(entry);
+                        image_cursor += count_images_in_entry(&entry.kind);
                     }
                 }
                 if let Some(n) = input.count {
@@ -1456,29 +1441,105 @@ fn build_pending_bundle_summaries(
         .collect()
 }
 
-fn entry_role(entry: &acp_thread::AgentThreadEntry) -> EntryRoleDto {
-    match entry {
-        acp_thread::AgentThreadEntry::UserMessage(_) => EntryRoleDto::User,
-        acp_thread::AgentThreadEntry::AssistantMessage(_) => EntryRoleDto::Assistant,
-        acp_thread::AgentThreadEntry::ToolCall(_) => EntryRoleDto::ToolCall,
-        acp_thread::AgentThreadEntry::CompletedPlan(_) => EntryRoleDto::Plan,
-        acp_thread::AgentThreadEntry::ContextCompaction(_) => EntryRoleDto::ContextCompaction,
+fn entry_role(kind: &crate::session_entry::SessionEntryKind) -> EntryRoleDto {
+    use crate::session_entry::SessionEntryKind;
+    match kind {
+        SessionEntryKind::UserMessage { .. } => EntryRoleDto::User,
+        SessionEntryKind::AssistantMessage { .. } => EntryRoleDto::Assistant,
+        SessionEntryKind::ToolCall { .. } => EntryRoleDto::ToolCall,
+        SessionEntryKind::Plan(_) => EntryRoleDto::Plan,
+        SessionEntryKind::ContextCompaction { .. } => EntryRoleDto::ContextCompaction,
     }
 }
 
-/// Maps a `ToolCallStatus` to the structured wire enum. Parallels
-/// `conversation_render::tool_call_status_text` (which stays for the
-/// desktop UI's human labels) but emits the typed wire variant.
-fn tool_call_status_dto(status: &acp_thread::ToolCallStatus) -> ToolCallStatusDto {
-    use acp_thread::ToolCallStatus;
+/// Maps the unified `session_entry::ToolStatus` to the structured wire
+/// enum. Parallels `conversation_render::tool_call_status_text` (which
+/// stays for the desktop UI's human labels) but emits the typed wire
+/// variant. Note this consumes `session_entry::ToolStatus`, not
+/// `acp_thread::ToolCallStatus` — the variants line up one-to-one.
+fn tool_status_dto(status: &crate::session_entry::ToolStatus) -> ToolCallStatusDto {
+    use crate::session_entry::ToolStatus;
     match status {
-        ToolCallStatus::Pending => ToolCallStatusDto::Pending,
-        ToolCallStatus::WaitingForConfirmation { .. } => ToolCallStatusDto::WaitingForConfirmation,
-        ToolCallStatus::InProgress => ToolCallStatusDto::Running,
-        ToolCallStatus::Completed => ToolCallStatusDto::Done,
-        ToolCallStatus::Failed => ToolCallStatusDto::Failed,
-        ToolCallStatus::Rejected => ToolCallStatusDto::Rejected,
-        ToolCallStatus::Canceled => ToolCallStatusDto::Canceled,
+        ToolStatus::Pending => ToolCallStatusDto::Pending,
+        ToolStatus::WaitingForConfirmation => ToolCallStatusDto::WaitingForConfirmation,
+        ToolStatus::InProgress => ToolCallStatusDto::Running,
+        ToolStatus::Completed => ToolCallStatusDto::Done,
+        ToolStatus::Failed => ToolCallStatusDto::Failed,
+        ToolStatus::Rejected => ToolCallStatusDto::Rejected,
+        ToolStatus::Canceled => ToolCallStatusDto::Canceled,
+    }
+}
+
+/// Human label for a `session_entry::ToolStatus`, byte-identical to the
+/// `acp_thread::ToolCallStatus` `Display` impl that the old
+/// `ToolCall::to_markdown` printed after `Status: `. Kept in lock-step so
+/// the reconstructed tool-call markdown matches what the live thread used
+/// to emit on the wire.
+fn tool_status_label(status: &crate::session_entry::ToolStatus) -> &'static str {
+    use crate::session_entry::ToolStatus;
+    match status {
+        ToolStatus::Pending => "Pending",
+        ToolStatus::WaitingForConfirmation => "Waiting for confirmation",
+        ToolStatus::InProgress => "In Progress",
+        ToolStatus::Completed => "Completed",
+        ToolStatus::Failed => "Failed",
+        ToolStatus::Rejected => "Rejected",
+        ToolStatus::Canceled => "Canceled",
+    }
+}
+
+/// Reconstruct the wire markdown for a `SessionEntry`, byte-for-byte
+/// matching what the old `acp_thread::AgentThreadEntry::to_markdown`
+/// produced for the same conversation content. The unified entry model
+/// holds markdown source strings rather than live `Markdown` entities, so
+/// each variant is recomposed from those sources using the exact same
+/// templates the live path used (see `acp_thread.rs`). The one
+/// unavoidable loss is the user "(checkpoint)" header suffix: SessionEntry
+/// does not retain the checkpoint flag, so a checkpointed user message now
+/// renders as a plain `## User`. That suffix never affected the structured
+/// wire fields (role/preview/tool_call/images), only the cosmetic header.
+fn session_entry_to_markdown(kind: &crate::session_entry::SessionEntryKind) -> String {
+    use crate::session_entry::{AssistantChunk, SessionEntryKind};
+    match kind {
+        SessionEntryKind::UserMessage { content_md, .. } => {
+            format!("## User\n\n{content_md}\n\n")
+        }
+        SessionEntryKind::AssistantMessage { chunks } => {
+            let body = chunks
+                .iter()
+                .map(|chunk| match chunk {
+                    AssistantChunk::Message(md) => md.clone(),
+                    AssistantChunk::Thought(md) => format!("<thinking>\n{md}\n</thinking>"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            format!("## Assistant\n\n{body}\n\n")
+        }
+        SessionEntryKind::ToolCall {
+            label_md,
+            status,
+            content_md,
+            ..
+        } => {
+            let mut markdown = format!(
+                "**Tool Call: {}**\nStatus: {}\n\n",
+                label_md,
+                tool_status_label(status)
+            );
+            for content in content_md {
+                markdown.push_str(content);
+                markdown.push_str("\n\n");
+            }
+            markdown
+        }
+        SessionEntryKind::Plan(items) => {
+            let mut md = String::from("## Plan\n\n");
+            for item in items {
+                md.push_str(&format!("- [x] {}\n", item.content_md));
+            }
+            md
+        }
+        SessionEntryKind::ContextCompaction { .. } => "--- Context Compacted ---\n\n".to_string(),
     }
 }
 
@@ -1515,16 +1576,20 @@ const FIELD_PREVIEW_MAX_CHARS: usize = 500;
 /// order so each `EntryImage.index` is stable across the session even
 /// when an entry holds multiple images.
 fn summarize_entry(
-    entry: &acp_thread::AgentThreadEntry,
+    entry: &crate::session_entry::SessionEntry,
     index: usize,
-    created_ms: Option<i64>,
     include_full_content: bool,
     include_images: bool,
     image_cursor: &mut usize,
-    cx: &App,
+    live_auth_options: &HashMap<String, Vec<ToolCallAuthOption>>,
 ) -> EntrySummary {
-    let role = entry_role(entry);
-    let raw_markdown = entry.to_markdown(cx);
+    use crate::session_entry::SessionEntryKind;
+    let kind = &entry.kind;
+    let role = entry_role(kind);
+    // `created_ms` is read directly off the unified entry (the store
+    // stamps it on append); the absent-sentinel / 0 maps to `None`.
+    let created_ms = (entry.created_ms > 0).then_some(entry.created_ms);
+    let raw_markdown = session_entry_to_markdown(kind);
     // Snapshot the image cursor BEFORE the entry's images are extracted /
     // counted so we have a stable base for rewriting `` `Image` ``
     // placeholders in assistant markdown into `spk-image://N` links. The
@@ -1537,7 +1602,10 @@ fn summarize_entry(
         // links so mobile (and any other ACP client) renders them through
         // the same path it already uses for user-attached images. The
         // base index is the cursor at this entry's start — see
-        // `clean_assistant_message_text` in conversation_render.
+        // `clean_assistant_message_text` in conversation_render. The
+        // assistant markdown already carries the `` `Image` `` literal
+        // (from `block.to_markdown` at conversion time) so the rewrite
+        // still fires even though the raw image bytes were flattened away.
         crate::conversation_render::clean_assistant_message_text(&raw_markdown, image_index_base)
     } else {
         raw_markdown
@@ -1549,37 +1617,33 @@ fn summarize_entry(
         None
     };
     let images = if include_images {
-        Some(extract_images_for_entry(entry, image_cursor))
+        Some(extract_images_for_entry(kind, image_cursor))
     } else {
         // Advance the cursor even when the caller didn't opt in, so
         // toggling `include_images` between calls preserves the same
         // stable indices.
-        *image_cursor += count_images_in_entry(entry);
+        *image_cursor += count_images_in_entry(kind);
         None
     };
-    let tool_call = if let acp_thread::AgentThreadEntry::ToolCall(call) = entry {
-        Some(tool_call_summary(call, cx))
+    let tool_call = if let SessionEntryKind::ToolCall { .. } = kind {
+        Some(tool_call_summary(kind, live_auth_options))
     } else {
         None
     };
-    let plan = if let acp_thread::AgentThreadEntry::CompletedPlan(entries) = entry {
+    let plan = if let SessionEntryKind::Plan(items) = kind {
         Some(PlanSummary {
-            items: entries
-                .iter()
-                .map(|e| e.content.read(cx).source().to_string())
-                .collect(),
+            items: items.iter().map(|item| item.content_md.clone()).collect(),
         })
     } else {
         None
     };
-    let client_send_ids: Vec<i64> =
-        if let acp_thread::AgentThreadEntry::UserMessage(message) = entry {
-            acp_thread::client_send_ids_from_user_message(message)
-        } else {
-            Vec::new()
-        };
+    let client_send_ids: Vec<i64> = if let SessionEntryKind::UserMessage { chunks, .. } = kind {
+        acp_thread::csids_from_blocks(chunks)
+    } else {
+        Vec::new()
+    };
     let client_send_id = client_send_ids.first().copied();
-    let subagent_id = entry.subagent_id().map(|s| s.to_string());
+    let subagent_id = entry.subagent_id.as_ref().map(|s| s.to_string());
 
     EntrySummary {
         role,
@@ -1599,148 +1663,175 @@ fn summarize_entry(
 /// Counts image content blocks in an entry without allocating image
 /// payloads. Used to keep `image_cursor` stable when the caller
 /// opted out of `include_images`.
-fn count_images_in_entry(entry: &acp_thread::AgentThreadEntry) -> usize {
-    match entry {
-        acp_thread::AgentThreadEntry::UserMessage(message) => message
-            .chunks
+fn count_images_in_entry(kind: &crate::session_entry::SessionEntryKind) -> usize {
+    use crate::session_entry::SessionEntryKind;
+    match kind {
+        // Only user-message images are countable: `UserMessage.chunks`
+        // keeps the raw `acp::ContentBlock::Image` blocks. Assistant and
+        // tool-call content are flattened to markdown in the unified
+        // entry model (the raw Image blocks are NOT retained), so they
+        // contribute zero EXTRACTABLE images. We deliberately count only
+        // what we can extract so `image_cursor` / `EntryImage.index` stay
+        // in lock-step with the inlined payloads — assistant images
+        // survive purely as `spk-image://N` markdown links (see the
+        // module-level note on `extract_images_for_entry`).
+        SessionEntryKind::UserMessage { chunks, .. } => chunks
             .iter()
             .filter(|chunk| matches!(chunk, acp::ContentBlock::Image(_)))
             .count(),
-        acp_thread::AgentThreadEntry::AssistantMessage(message) => message
-            .chunks
-            .iter()
-            .filter(|chunk| match chunk {
-                acp_thread::AssistantMessageChunk::Message { block }
-                | acp_thread::AssistantMessageChunk::Thought { block } => {
-                    matches!(block, acp_thread::ContentBlock::Image { .. })
-                }
-            })
-            .count(),
-        acp_thread::AgentThreadEntry::ToolCall(call) => call
-            .content
-            .iter()
-            .filter(|content| matches!(content, acp_thread::ToolCallContent::ContentBlock(block) if matches!(block, acp_thread::ContentBlock::Image { .. })))
-            .count(),
-        acp_thread::AgentThreadEntry::CompletedPlan(_) => 0,
-        acp_thread::AgentThreadEntry::ContextCompaction(_) => 0,
+        SessionEntryKind::AssistantMessage { .. }
+        | SessionEntryKind::ToolCall { .. }
+        | SessionEntryKind::Plan(_)
+        | SessionEntryKind::ContextCompaction { .. } => 0,
     }
 }
 
 /// Pulls inline image payloads out of an entry as wire-ready
-/// `EntryImage` records. Reads raw base64 from `acp::ContentBlock::Image`
-/// directly on user messages (the original ACP envelope is preserved in
-/// `UserMessage.chunks`); for assistant / tool-call image blocks we
-/// re-encode the bytes the desktop side already decoded into
-/// `gpui::Image` (loses no fidelity — they're identical bytes, just
-/// reshipped through base64).
+/// `EntryImage` records.
+///
+/// IMAGE FIDELITY (graceful degradation, Phase 4 Task 5a): only
+/// USER-message images are recoverable. `UserMessage.chunks` retains the
+/// raw `acp::ContentBlock::Image` blocks, so the original base64 payload
+/// round-trips byte-for-byte — identical to the pre-repoint user path.
+///
+/// ASSISTANT and TOOL-CALL images cannot be inlined: the unified
+/// `SessionEntry` model flattens assistant chunks and tool content to
+/// markdown strings and does NOT retain the raw `gpui::Image` bytes, so
+/// there is nothing to base64-encode here. Those images survive only as
+/// `spk-image://N` links in the markdown (assistant via
+/// `clean_assistant_message_text`); the inline base64 payload is
+/// unavailable. This is acceptable in practice — claude does not emit
+/// image content, and tool-image content blocks are rare. To restore full
+/// fidelity a future task would have to enrich
+/// `SessionEntryKind::{AssistantMessage, ToolCall}` to keep the raw image
+/// blocks (do NOT attempt to recover them from the model here — they are
+/// genuinely gone). `image_cursor` only advances for extractable (user)
+/// images so the `spk-image://N` indices stay stable across calls.
 fn extract_images_for_entry(
-    entry: &acp_thread::AgentThreadEntry,
+    kind: &crate::session_entry::SessionEntryKind,
     image_cursor: &mut usize,
 ) -> Vec<EntryImage> {
-    use base64::Engine as _;
+    use crate::session_entry::SessionEntryKind;
     let mut out = Vec::new();
 
-    match entry {
-        acp_thread::AgentThreadEntry::UserMessage(message) => {
-            for chunk in &message.chunks {
-                if let acp::ContentBlock::Image(image_content) = chunk {
-                    out.push(EntryImage {
-                        index: *image_cursor,
-                        mime_type: image_content.mime_type.clone(),
-                        data_base64: image_content.data.clone(),
-                    });
-                    *image_cursor += 1;
-                }
+    if let SessionEntryKind::UserMessage { chunks, .. } = kind {
+        for chunk in chunks {
+            if let acp::ContentBlock::Image(image_content) = chunk {
+                out.push(EntryImage {
+                    index: *image_cursor,
+                    mime_type: image_content.mime_type.clone(),
+                    data_base64: image_content.data.clone(),
+                });
+                *image_cursor += 1;
             }
         }
-        acp_thread::AgentThreadEntry::AssistantMessage(message) => {
-            for chunk in &message.chunks {
-                let block = match chunk {
-                    acp_thread::AssistantMessageChunk::Message { block } => block,
-                    acp_thread::AssistantMessageChunk::Thought { block } => block,
-                };
-                if let acp_thread::ContentBlock::Image { image, .. } = block {
-                    out.push(EntryImage {
-                        index: *image_cursor,
-                        mime_type: image.format.mime_type().to_string(),
-                        data_base64: base64::engine::general_purpose::STANDARD.encode(&image.bytes),
-                    });
-                    *image_cursor += 1;
-                }
-            }
-        }
-        acp_thread::AgentThreadEntry::ToolCall(call) => {
-            for content in &call.content {
-                if let acp_thread::ToolCallContent::ContentBlock(
-                    acp_thread::ContentBlock::Image { image, .. },
-                ) = content
-                {
-                    out.push(EntryImage {
-                        index: *image_cursor,
-                        mime_type: image.format.mime_type().to_string(),
-                        data_base64: base64::engine::general_purpose::STANDARD.encode(&image.bytes),
-                    });
-                    *image_cursor += 1;
-                }
-            }
-        }
-        acp_thread::AgentThreadEntry::CompletedPlan(_) => {}
-        acp_thread::AgentThreadEntry::ContextCompaction(_) => {}
     }
     out
 }
 
-/// Builds a `ToolCallSummary` for the wire. Status string mirrors
-/// `conversation_render::tool_call_status_text` so remote consumers
-/// and the desktop UI agree on the label.
-fn tool_call_summary(call: &acp_thread::ToolCall, cx: &App) -> ToolCallSummary {
-    let name = call
-        .tool_name
-        .as_ref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| call.label.read(cx).source().to_string());
-    let status = tool_call_status_dto(&call.status);
-    let args_preview = call
-        .raw_input
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default())
-        .map(|s| truncate_preview(&s, FIELD_PREVIEW_MAX_CHARS))
-        .unwrap_or_default();
-    let result_preview = call
-        .raw_output
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default())
-        .map(|s| truncate_preview(&s, FIELD_PREVIEW_MAX_CHARS))
-        .unwrap_or_default();
-    let tool_status_started_at_ms = call.status_started_at.map(|t| t.timestamp_millis());
-    // Surface authorization choices only while the call is blocked on the
-    // user. Reuse the Q1 `permission_buttons` helper so the wire options
-    // and the desktop buttons are derived from the exact same flattening
-    // (Flat / Dropdown / DropdownWithPatterns all collapse identically),
-    // and so the server can later reconstruct the outcome from `option_id`.
-    let options = match &call.status {
-        acp_thread::ToolCallStatus::WaitingForConfirmation { options, .. } => {
-            crate::conversation_render::permission_buttons(options)
-                .into_iter()
-                .map(|button| ToolCallAuthOption {
-                    option_id: button.option_id.0.to_string(),
-                    label: button.label.to_string(),
-                    kind: permission_kind_str(button.kind).to_string(),
-                    is_allow: button.is_allow(),
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-    ToolCallSummary {
-        tool_call_id: call.id.0.to_string(),
-        name,
+/// Builds a `ToolCallSummary` for the wire from a unified
+/// `SessionEntryKind::ToolCall`. Caller must pass the `ToolCall` variant;
+/// other variants yield a default-ish summary (the callers above gate on
+/// the variant first).
+///
+/// Authorization `options` are NOT stored on `SessionEntry` — a
+/// `WaitingForConfirmation` tool call's permission choices live on the
+/// LIVE `acp_thread` only (it's an in-flight, side-channel concern; a
+/// cold/resumed session has no pending authorizations). So the caller
+/// passes `live_auth_options`, a map of `tool_call_id ->
+/// Vec<ToolCallAuthOption>` harvested from the live thread (empty for cold
+/// sessions). This keeps the live auth-prompt wire shape intact while the
+/// transcript itself is served from the unified entry model.
+fn tool_call_summary(
+    kind: &crate::session_entry::SessionEntryKind,
+    live_auth_options: &HashMap<String, Vec<ToolCallAuthOption>>,
+) -> ToolCallSummary {
+    use crate::session_entry::SessionEntryKind;
+    let SessionEntryKind::ToolCall {
+        id,
+        label_md,
         status,
+        raw_input,
+        raw_output,
+        tool_name,
+        status_started_at,
+        ..
+    } = kind
+    else {
+        // Unreachable in practice (callers gate on the ToolCall variant),
+        // but produce a benign empty summary rather than panicking.
+        return ToolCallSummary {
+            tool_call_id: String::new(),
+            name: String::new(),
+            status: ToolCallStatusDto::Pending,
+            args_preview: String::new(),
+            result_preview: String::new(),
+            tool_status_started_at_ms: None,
+            options: Vec::new(),
+        };
+    };
+    let name = tool_name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| label_md.clone());
+    let status_dto = tool_status_dto(status);
+    let args_preview = raw_input
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default())
+        .map(|s| truncate_preview(&s, FIELD_PREVIEW_MAX_CHARS))
+        .unwrap_or_default();
+    let result_preview = raw_output
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default())
+        .map(|s| truncate_preview(&s, FIELD_PREVIEW_MAX_CHARS))
+        .unwrap_or_default();
+    let tool_status_started_at_ms = *status_started_at;
+    // Surface authorization choices only while the call is blocked on the
+    // user, sourced from the live thread (cold sessions have none).
+    let options = live_auth_options.get(id).cloned().unwrap_or_default();
+    ToolCallSummary {
+        tool_call_id: id.clone(),
+        name,
+        status: status_dto,
         args_preview,
         result_preview,
         tool_status_started_at_ms,
         options,
     }
+}
+
+/// Harvest the live `WaitingForConfirmation` authorization options off a
+/// session's live thread, keyed by tool-call id. Empty for cold sessions
+/// (no live thread) or when no tool call is awaiting confirmation. Used to
+/// re-attach the live auth-prompt options onto the SessionEntry-served
+/// `ToolCallSummary` (the options are not stored on `SessionEntry`).
+fn live_auth_options_for_session(
+    session: &crate::model::SolutionSession,
+    cx: &App,
+) -> HashMap<String, Vec<ToolCallAuthOption>> {
+    let mut map = HashMap::new();
+    let Some(thread) = session.acp_thread() else {
+        return map;
+    };
+    for entry in thread.read(cx).entries() {
+        if let acp_thread::AgentThreadEntry::ToolCall(call) = entry {
+            if let acp_thread::ToolCallStatus::WaitingForConfirmation { options, .. } =
+                &call.status
+            {
+                let buttons = crate::conversation_render::permission_buttons(options)
+                    .into_iter()
+                    .map(|button| ToolCallAuthOption {
+                        option_id: button.option_id.0.to_string(),
+                        label: button.label.to_string(),
+                        kind: permission_kind_str(button.kind).to_string(),
+                        is_allow: button.is_allow(),
+                    })
+                    .collect();
+                map.insert(call.id.0.to_string(), buttons);
+            }
+        }
+    }
+    map
 }
 
 /// Snake-case wire string for a `PermissionOptionKind`, matching the
@@ -1841,11 +1932,11 @@ impl McpServerTool for GetSessionEntryTool {
                 .read_with(cx, |store, _| store.session(session_id))
                 .with_context(|| format!("session_not_found: {}", session_id))?;
             let session = entity.read(cx);
-            let thread = session
-                .acp_thread()
-                .ok_or_else(|| anyhow!("session_has_no_thread: {}", session_id))?;
-            let thread_ref = thread.read(cx);
-            let entries = thread_ref.entries();
+            // Phase 4 Task 5a: read the single entry from the unified
+            // `session.entries` (works for cold/resumed row-native
+            // sessions too — the old live-thread-only path errored
+            // `session_has_no_thread` for any sleeping session).
+            let entries = &session.entries;
             let len = entries.len();
             anyhow::ensure!(
                 want_index < len,
@@ -1860,24 +1951,19 @@ impl McpServerTool for GetSessionEntryTool {
             // (markdown `spk-image://N` links etc.) consistent.
             let mut image_cursor = 0usize;
             for entry in entries.iter().take(want_index) {
-                image_cursor += count_images_in_entry(entry);
+                image_cursor += count_images_in_entry(&entry.kind);
             }
             let entry = entries
                 .get(want_index)
                 .ok_or_else(|| anyhow!("entry vanished mid-read"))?;
-            let created_ms = session
-                .entries
-                .get(want_index)
-                .map(|e| e.created_ms)
-                .filter(|&ms| ms > 0);
+            let live_auth_options = live_auth_options_for_session(session, cx);
             let summary = summarize_entry(
                 entry,
                 want_index,
-                created_ms,
                 true,
                 include_images,
                 &mut image_cursor,
-                cx,
+                &live_auth_options,
             );
             Ok(GetSessionEntryResult { entry: summary })
         })?;
@@ -3257,20 +3343,25 @@ impl McpServerTool for ReadSessionHistoryTool {
         //    render entries directly off the AcpThread. This is fresher
         //    than the persisted blob, which only updates on turn
         //    completion.
+        // Phase 4 Task 5a: render from the unified `session.entries`
+        // whenever the session is in memory — live OR cold (a restored
+        // tab whose subprocess hasn't been respawned). The old path only
+        // rendered when a live `acp_thread` was attached, so a cold
+        // row-native session fell through to the archive blob (and, for
+        // row-native sessions, the blob is no longer the source of
+        // truth). Reading `session.entries` makes the in-memory read the
+        // single source for both states.
         let live = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
-            store.read_with(cx, |store, cx| {
+            store.read_with(cx, |store, _| {
                 let session = store.session(session_id)?;
                 let s = session.read(cx);
                 let title = s.title.to_string();
-                let entries = s.acp_thread().map(|thread| {
-                    thread
-                        .read(cx)
-                        .entries()
-                        .iter()
-                        .map(|entry| entry.to_markdown(cx))
-                        .collect::<Vec<String>>()
-                })?;
+                let entries = s
+                    .entries
+                    .iter()
+                    .map(|entry| session_entry_to_markdown(&entry.kind))
+                    .collect::<Vec<String>>();
                 Some((title, entries))
             })
         });
@@ -4261,6 +4352,153 @@ mod tests {
                 "EntrySummary.index must match absolute position"
             );
         }
+    }
+
+    /// Build a COLD, row-native session: `session.entries` populated, NO
+    /// live `acp_thread` attached. Mirrors the post-restart state of a
+    /// row-native session (Phase 4 Task 4 leaves `cold_persisted_v2`
+    /// empty), which is precisely where `get_session` must now read from
+    /// `session.entries` rather than the (empty) cold prefix + (absent)
+    /// live thread. The user message carries a 1×1 PNG image chunk so
+    /// image extraction can be asserted on the user path.
+    async fn seed_cold_row_native_session(
+        cx: &mut gpui::TestAppContext,
+    ) -> (crate::model::SolutionSessionId, String, tempfile::TempDir) {
+        use crate::session_entry::{SessionEntry, SessionEntryKind};
+        let (solution_id, tmp, _project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+        let image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAen5lOEAAAAASUVORK5CYII=".to_string();
+        let image_b64_clone = image_b64.clone();
+        let session_id = cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                let id = crate::model::SolutionSessionId::new();
+                let mut session = crate::model::SolutionSession::new_idle(
+                    id,
+                    solution_id.clone(),
+                    SharedString::from("mock-agent"),
+                    acp::SessionId::new(format!("acp-{}", id.as_str())),
+                );
+                session.title = SharedString::from("cold session");
+                session.entries = vec![
+                    SessionEntry {
+                        created_ms: 1_700_000_000_000,
+                        mod_seq: 1,
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: "hello".into(),
+                            chunks: vec![
+                                fake_user_text_chunk("hello"),
+                                fake_image_chunk("image/png", &image_b64_clone),
+                            ],
+                        },
+                    },
+                    SessionEntry {
+                        created_ms: 1_700_000_000_001,
+                        mod_seq: 2,
+                        subagent_id: None,
+                        kind: SessionEntryKind::AssistantMessage {
+                            chunks: vec![crate::session_entry::AssistantChunk::Message(
+                                "world".into(),
+                            )],
+                        },
+                    },
+                ];
+                // Cold, row-native: NO live thread, empty cold_persisted_v2.
+                assert!(session.acp_thread().is_none());
+                assert!(session.cold_persisted_v2.is_empty());
+                store.register_prebuilt_session(session, cx)
+            })
+        });
+        (session_id, image_b64, tmp)
+    }
+
+    #[gpui::test]
+    async fn get_session_cold_row_native_returns_entries_from_session_entries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // RED before the repoint: a cold row-native session has empty
+        // cold_persisted_v2 and no live thread, so the OLD get_session
+        // returned an empty transcript. After the repoint it must serve
+        // the two entries from session.entries.
+        let (session_id, _img, _tmp) = seed_cold_row_native_session(cx).await;
+
+        let result = GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    include_full_content: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("get_session");
+
+        let entries = &result.structured_content.entries;
+        assert_eq!(
+            entries.len(),
+            2,
+            "cold row-native session must serve entries from session.entries"
+        );
+        assert_eq!(result.structured_content.total_count, 2);
+        assert_eq!(entries[0].role, EntryRoleDto::User);
+        assert_eq!(entries[1].role, EntryRoleDto::Assistant);
+        assert!(
+            entries[0]
+                .markdown
+                .as_ref()
+                .is_some_and(|m| m.contains("hello")),
+            "user markdown must round-trip from content_md"
+        );
+        assert!(
+            entries[1]
+                .markdown
+                .as_ref()
+                .is_some_and(|m| m.contains("world")),
+            "assistant markdown must round-trip from chunks"
+        );
+    }
+
+    #[gpui::test]
+    async fn get_session_cold_row_native_preserves_user_images(cx: &mut gpui::TestAppContext) {
+        // User-image fidelity must survive the SessionEntry repoint:
+        // UserMessage.chunks retains the raw acp::ContentBlock::Image, so
+        // the base64 payload round-trips unchanged.
+        let (session_id, expected_b64, _tmp) = seed_cold_row_native_session(cx).await;
+
+        let result = GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    include_images: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("get_session");
+
+        let mut saw_expected = false;
+        for entry in &result.structured_content.entries {
+            if let Some(images) = &entry.images {
+                for image in images {
+                    if image.data_base64 == expected_b64 {
+                        assert_eq!(image.mime_type, "image/png");
+                        saw_expected = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_expected,
+            "the seeded user PNG payload must round-trip unchanged from UserMessage.chunks"
+        );
     }
 
     #[gpui::test]
