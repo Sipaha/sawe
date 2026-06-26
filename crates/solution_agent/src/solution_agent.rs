@@ -11,6 +11,7 @@ pub mod background_agent;
 pub mod background_shell;
 pub mod claude_adapter;
 pub(crate) mod cold_persistence;
+pub mod session_entry;
 pub(crate) mod compact;
 pub(crate) mod conversation_render;
 pub(crate) mod db;
