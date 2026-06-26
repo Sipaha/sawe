@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use acp_thread::{AgentThreadEntry, ToolCallContent, ToolCallStatus, UserMessageId};
+use acp_thread::{AgentThreadEntry, ToolCallContent};
 use agent_client_protocol::schema as acp;
 use base64::Engine;
 use chrono::TimeZone as _;
@@ -188,7 +188,7 @@ pub struct SolutionSessionView {
     /// from `recompute_rewind_table` so per-render lookup is O(1) per
     /// entry instead of the previous in-loop `entries.iter().skip(idx)`
     /// scan that was O(N²) on every frame for long conversations.
-    rewind_table: Vec<Option<UserMessageId>>,
+    rewind_table: Vec<Option<String>>,
     /// Pre-pass output consumed by the virtualized list's processor
     /// closure. Refreshed at the top of every `Render` call before the
     /// `list(...)` element is constructed so the per-visible-item
@@ -311,7 +311,7 @@ pub struct SolutionSessionView {
     /// `jsonl_to_entries` builds fresh `Markdown` widgets and the
     /// `AgentThreadEntry` enum is `!Clone`, so we can't materialise
     /// the slice every closure invocation.
-    background_entries_for_render: Vec<AgentThreadEntry>,
+    background_entries_for_render: Vec<crate::session_entry::SessionEntry>,
     /// Freshness fingerprint of `background_entries_for_render`: the
     /// `BackgroundAgentId` whose JSONL was last converted, plus the file
     /// mtime + size at conversion time. On each Background render we
@@ -334,7 +334,7 @@ pub struct SolutionSessionView {
     /// cleared otherwise. Owned (not borrowed) for the same `!Clone`
     /// reason as the background vec: the single `AssistantMessage` carries
     /// a freshly-built `Markdown` widget that can't be cloned per frame.
-    background_shell_entries_for_render: Vec<AgentThreadEntry>,
+    background_shell_entries_for_render: Vec<crate::session_entry::SessionEntry>,
     /// Freshness fingerprint of `background_shell_entries_for_render`: the
     /// `BackgroundShellId` last rendered, plus the snapshot mtime and the
     /// `output_tail` byte length at build time. When the selected shell's
@@ -742,16 +742,9 @@ impl SolutionSessionView {
     /// `ensure_tool_tick` — when this flips back to false the tick task
     /// breaks its loop and self-clears.
     fn has_in_progress_tool_call(&self, cx: &App) -> bool {
-        let Some(thread) = self.session.read(cx).acp_thread() else {
-            return false;
-        };
-        thread.read(cx).entries().iter().any(|entry| {
-            matches!(
-                entry,
-                AgentThreadEntry::ToolCall(call)
-                    if matches!(call.status, ToolCallStatus::InProgress)
-            )
-        })
+        crate::conversation_render::entries_have_in_progress_tool_call(
+            &self.session.read(cx).entries,
+        )
     }
 
     /// Spawn a background tick that wakes the view once a second for as
@@ -891,12 +884,16 @@ impl SolutionSessionView {
     /// the strip is hidden anyway, so we render EVERY entry regardless
     /// of `subagent_id`. Otherwise persisted entries stamped with a now-
     /// dead `toolu_xxx` would silently disappear from Main after restart.
-    pub(crate) fn should_render_entry(&self, entry: &AgentThreadEntry, cx: &App) -> bool {
+    pub(crate) fn should_render_entry(
+        &self,
+        entry: &crate::session_entry::SessionEntry,
+        cx: &App,
+    ) -> bool {
         if self.session.read(cx).active_subagents.is_empty() {
             return true;
         }
         self.selected_subagent
-            .matches_parent_entry(entry.subagent_id())
+            .matches_parent_entry(entry.subagent_id.as_ref())
     }
 
     /// Snap-to-next helper extracted out of `on_subagents_changed` so
@@ -1130,7 +1127,16 @@ impl SolutionSessionView {
             content.as_str()
         };
         let lines: Vec<&str> = trimmed.lines().collect();
-        self.background_entries_for_render = crate::background_agent::jsonl_to_entries(&lines, cx);
+        // Project the JSONL-derived live entries onto owned `SessionEntry`s
+        // so the drill-in path feeds the same `SessionEntry` render seam as
+        // the main conversation. Drill-in entries carry no per-entry
+        // timestamp (the JSONL has its own that we don't surface yet), so
+        // `created_ms` stays 0 (filtered as "unknown" by the renderer).
+        let entries = crate::background_agent::jsonl_to_entries(&lines, cx);
+        self.background_entries_for_render = entries
+            .iter()
+            .map(|entry| crate::session_entry::to_session_entry(entry, cx))
+            .collect();
         self.background_entries_fingerprint = stat.as_ref().and_then(|meta| {
             meta.modified()
                 .ok()
@@ -1189,8 +1195,11 @@ impl SolutionSessionView {
         if fresh {
             return true;
         }
-        self.background_shell_entries_for_render =
-            build_shell_drill_in_entries(&shell, chrono::Utc::now(), cx);
+        let shell_entries = build_shell_drill_in_entries(&shell, chrono::Utc::now(), cx);
+        self.background_shell_entries_for_render = shell_entries
+            .iter()
+            .map(|entry| crate::session_entry::to_session_entry(entry, cx))
+            .collect();
         self.background_shell_entries_fingerprint = Some((id, fp_mtime, fp_len));
         true
     }
@@ -1202,15 +1211,22 @@ impl SolutionSessionView {
     /// frame; this version is O(N) once per thread mutation.
     fn recompute_rewind_table(&mut self, cx: &App) {
         let session = self.session.read(cx);
-        let Some(thread) = session.acp_thread() else {
+        // Rewind only applies to a live thread (truncate/rewind acts on the
+        // live `AcpThread`); a cold tab has no thread to rewind. Keep the
+        // table empty in that case so the per-entry menu hides the action.
+        if session.acp_thread().is_none() {
             self.rewind_table.clear();
             return;
-        };
-        let entries = thread.read(cx).entries();
-        let user_ids: Vec<Option<UserMessageId>> = entries
+        }
+        // Project the unified `session.entries` to the `SessionEntry`
+        // UserMessage id (a String); `compute_rewind_table` walks it once.
+        // The String is resolved back to the live `UserMessageId` at the
+        // rewind action site (see `conversation_render::resolve_user_message_id`).
+        let user_ids: Vec<Option<String>> = session
+            .entries
             .iter()
-            .map(|entry| match entry {
-                AgentThreadEntry::UserMessage(message) => message.id.clone(),
+            .map(|entry| match &entry.kind {
+                crate::session_entry::SessionEntryKind::UserMessage { id, .. } => id.clone(),
                 _ => None,
             })
             .collect();
@@ -1423,15 +1439,16 @@ impl SolutionSessionView {
     /// `on_thread_event` do. Without this, Enter / the ↑↓ buttons move the
     /// counter and the active-match highlight but never bring an off-screen
     /// match into view, so iterating "does nothing" visually.
-    fn scroll_to_selected_match(&mut self, cx: &mut Context<Self>) {
+    fn scroll_to_selected_match(&mut self, _cx: &mut Context<Self>) {
         let Some(entry_idx) = self.find.as_ref().and_then(|find| {
             let selected = find.selected?;
             find.matches.get(selected).map(|m| m.entry_idx)
         }) else {
             return;
         };
-        let cold_offset = self.session.read(cx).cold_entries.len();
-        self.list_state.scroll_to_reveal_item(cold_offset + entry_idx);
+        // `entry_idx` is now the global index into `session.entries`
+        // (which the virtualized list also indexes 1:1), so no cold offset.
+        self.list_state.scroll_to_reveal_item(entry_idx);
     }
 
     fn previous_match(
@@ -1472,18 +1489,18 @@ impl SolutionSessionView {
         let query_lower = query.to_lowercase();
         let mut matches = Vec::new();
         let session = self.session.read(cx);
-        if let Some(thread) = session.acp_thread() {
-            let thread = thread.read(cx);
-            for (entry_idx, entry) in thread.entries().iter().enumerate() {
-                for (span_idx, text) in entry_text_spans(entry, cx).into_iter().enumerate() {
-                    find_all(&text, &query_lower, |range| {
-                        matches.push(FindMatch {
-                            entry_idx,
-                            span_idx,
-                            range,
-                        });
+        // Iterate the unified `session.entries` so `entry_idx` is the global
+        // index (matching `markdown_for_render`'s keys and the list dispatch),
+        // not the live-thread-only index the previous code used.
+        for (entry_idx, entry) in session.entries.iter().enumerate() {
+            for (span_idx, text) in entry_text_spans(entry).into_iter().enumerate() {
+                find_all(&text, &query_lower, |range| {
+                    matches.push(FindMatch {
+                        entry_idx,
+                        span_idx,
+                        range,
                     });
-                }
+                });
             }
         }
         find.selected = if matches.is_empty() { None } else { Some(0) };
@@ -2534,7 +2551,7 @@ impl SolutionSessionView {
             return self
                 .background_entries_for_render
                 .iter()
-                .map(|entry| entry_text_spans(entry, cx))
+                .map(entry_text_spans)
                 .collect();
         }
         // Shell drill-in views source from the parallel shell vec
@@ -2543,35 +2560,18 @@ impl SolutionSessionView {
             return self
                 .background_shell_entries_for_render
                 .iter()
-                .map(|entry| entry_text_spans(entry, cx))
+                .map(entry_text_spans)
                 .collect();
         }
-        let session = self.session.read(cx);
-        // MUST mirror the render path's cold-then-live concatenation in
-        // `render_conversation_body`. The returned vector indexes the
-        // global entries list — `markdown_for_render` is keyed by
-        // global index, so missing cold entries here means
-        // `render_entry` falls back to a default `Markdown` widget for
-        // cold rows (the observed regression: tiny font + plain
-        // styling on the restored history because the proper
-        // `MarkdownStyle` is only applied via the cached entity that
-        // we never populated for cold indices).
-        let cold_iter = session
-            .cold_entries
+        // The unified `session.entries` is the single cold+live source the
+        // store keeps in sync; it indexes 1:1 with the render path and the
+        // `markdown_for_render` cache (keyed by global entry index).
+        self.session
+            .read(cx)
+            .entries
             .iter()
-            .map(|entry| entry_text_spans(entry, cx));
-        let live_iter = session
-            .acp_thread()
-            .map(|thread| {
-                thread
-                    .read(cx)
-                    .entries()
-                    .iter()
-                    .map(|entry| entry_text_spans(entry, cx))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        cold_iter.chain(live_iter).collect()
+            .map(entry_text_spans)
+            .collect()
     }
 
     /// Walks every tool-call terminal currently in the conversation and
@@ -2684,13 +2684,7 @@ impl Render for SolutionSessionView {
             } else if is_shell {
                 self.background_shell_entries_for_render.len()
             } else {
-                let session = self.session.read(cx);
-                let cold = session.cold_entries.len();
-                let live = session
-                    .acp_thread()
-                    .map(|t| t.read(cx).entries().len())
-                    .unwrap_or(0);
-                cold + live
+                self.session.read(cx).entries.len()
             };
             self.list_state.reset(new_count);
             self.list_state.set_follow_mode(FollowMode::Tail);
@@ -2862,31 +2856,19 @@ impl Render for SolutionSessionView {
                 // Empty / no-thread states render plain text; no point
                 // spinning up a `list(...)` widget when there's nothing
                 // to scroll through.
-                // `entries_count` covers BOTH live (thread.entries) and
-                // cold (cold_entries) modes. Cold tabs (no live thread)
-                // source from `cold_entries` only. Once the live thread
-                // attaches (first send wakes the agent), `claude
-                // --resume` does NOT re-emit the transcript through
-                // stream-json — so the live thread's `entries()` only
-                // contains messages from THIS session, not the prior
-                // history. To keep the conversation visible after the
-                // cold→live transition we render `cold_entries`
-                // (everything that was persisted at restart) followed
-                // by `thread.entries()` (everything new this session).
-                // The per-entry index passed to the list processor is
-                // global to this concatenation: indices `[0..cold_len)`
-                // are cold, `[cold_len..total)` are live.
-                let cold_count = session.cold_entries.len();
-                let live_count = session
-                    .acp_thread()
-                    .map(|t| t.read(cx).entries().len())
-                    .unwrap_or(0);
+                // `entries_count` covers the whole conversation. The
+                // non-drill-in path reads the store-maintained unified
+                // `session.entries` (cold prefix + live tail, kept in sync
+                // by the store on every thread event — see
+                // `session_entry::rebuild_entries`). The per-entry index
+                // passed to the list processor is the global index into
+                // that single vec.
                 let entries_count = if is_background {
                     self.background_entries_for_render.len()
                 } else if is_shell {
                     self.background_shell_entries_for_render.len()
                 } else {
-                    cold_count + live_count
+                    session.entries.len()
                 };
                 // Drill-in views grow their entry count between renders as
                 // new content lands (JSONL rows on disk for Background, a
@@ -2995,29 +2977,25 @@ impl Render for SolutionSessionView {
                                 );
                                 let is_drill_in_inner = is_bg || is_shell_inner;
                                 let session = this.session.read(cx);
-                                // Cold-then-live concatenation: indices
-                                // `[0..cold_count)` route to
-                                // `cold_entries`; `[cold_count..total)`
-                                // route to the live thread's entries
-                                // offset by `cold_count`. The cold
-                                // branch passes an invalid
-                                // `WeakEntity<AcpThread>` because the
-                                // rewind menu (the only thread-
-                                // dependent branch in `render_entry`)
-                                // is gated on `rewind_target.is_some()`
-                                // and we set that to `None` for cold.
+                                // Single source of truth: the drill-in vecs
+                                // (Background/Shell) or the store-maintained
+                                // unified `session.entries`, both
+                                // `Vec<SessionEntry>`. `idx` is the global
+                                // index into whichever vec is active.
                                 //
-                                // Background branch reads from
-                                // `this.background_entries_for_render`
-                                // (populated for this frame by
-                                // `build_background_entries_for_render`)
-                                // and never supports rewind — the JSONL
-                                // transcript belongs to a Managed Agent
-                                // process whose lifecycle is independent
-                                // of this view.
-                                let cold_count_inner = session.cold_entries.len();
+                                // The live thread handle (when one is
+                                // attached) is forwarded to `render_entry`
+                                // for the two things `SessionEntry` cannot
+                                // carry: the rewind action (resolves the
+                                // String id back to a live `UserMessageId`)
+                                // and the `WaitingForConfirmation` permission
+                                // buttons (looked up by tool-call id on the
+                                // live thread). Drill-in views never have a
+                                // rewindable parent thread — they belong to
+                                // an independent Managed Agent process — so
+                                // they pass an invalid handle and no rewind.
                                 let (entry_ref, thread_weak, supports_rewind): (
-                                    Option<&AgentThreadEntry>,
+                                    Option<&crate::session_entry::SessionEntry>,
                                     gpui::WeakEntity<acp_thread::AcpThread>,
                                     bool,
                                 ) = if is_bg {
@@ -3032,20 +3010,20 @@ impl Render for SolutionSessionView {
                                         gpui::WeakEntity::<acp_thread::AcpThread>::new_invalid(),
                                         false,
                                     )
-                                } else if idx < cold_count_inner {
-                                    (
-                                        session.cold_entries.get(idx),
-                                        gpui::WeakEntity::<acp_thread::AcpThread>::new_invalid(),
-                                        false,
-                                    )
                                 } else if let Some(thread_entity) = session.acp_thread() {
-                                    let thread = thread_entity.read(cx);
-                                    let supports = thread.supports_truncate(cx);
-                                    let entry = thread.entries().get(idx - cold_count_inner);
-                                    (entry, thread_entity.downgrade(), supports)
-                                } else {
+                                    let supports = thread_entity.read(cx).supports_truncate(cx);
                                     (
-                                        None,
+                                        session.entries.get(idx),
+                                        thread_entity.downgrade(),
+                                        supports,
+                                    )
+                                } else {
+                                    // Cold tab (no live thread): entries paint
+                                    // from `session.entries`, but there's no
+                                    // thread to rewind against, so the handle
+                                    // is invalid and rewind is off.
+                                    (
+                                        session.entries.get(idx),
                                         gpui::WeakEntity::<acp_thread::AcpThread>::new_invalid(),
                                         false,
                                     )
@@ -3067,9 +3045,9 @@ impl Render for SolutionSessionView {
                                 }
                                 let rewind_target = if supports_rewind
                                     && matches!(
-                                        entry,
-                                        AgentThreadEntry::AssistantMessage(_)
-                                            | AgentThreadEntry::ToolCall(_)
+                                        entry.kind,
+                                        crate::session_entry::SessionEntryKind::AssistantMessage { .. }
+                                            | crate::session_entry::SessionEntryKind::ToolCall { .. }
                                     ) {
                                     this.rewind_table.get(idx).cloned().flatten()
                                 } else {
@@ -3078,45 +3056,32 @@ impl Render for SolutionSessionView {
                                 let Some(style) = this.markdown_style_for_render.as_ref() else {
                                     return Empty.into_any_element();
                                 };
-                                // Per-entry timestamp + date-separator
-                                // computation. `entry_created_ms` is
-                                // index-aligned with the parent-thread
-                                // entries list; only `ms > 0` is a real
-                                // time. Background views don't have
-                                // per-entry timestamps in the parent
-                                // session's vec (the JSONL has its own
-                                // timestamps that we don't surface to
-                                // the renderer yet), so suppress the
-                                // separator and use the background
-                                // entries length for `is_last`.
+                                // Per-entry date-separator computation. Reads
+                                // the entry's own `created_ms` (and the
+                                // previous entry's) off `session.entries`; only
+                                // `ms > 0` is a real time. Drill-in entries
+                                // carry `created_ms == 0` (no surfaced JSONL
+                                // timestamp), so the separator is suppressed.
                                 let entry_count = if is_bg {
                                     this.background_entries_for_render.len()
                                 } else if is_shell_inner {
                                     this.background_shell_entries_for_render.len()
                                 } else {
-                                    session.cold_entries.len()
-                                        + session
-                                            .acp_thread()
-                                            .map(|t| t.read(cx).entries().len())
-                                            .unwrap_or(0)
+                                    session.entries.len()
                                 };
                                 let is_last = idx + 1 == entry_count;
-                                let created_ms = if is_drill_in_inner {
-                                    None
-                                } else {
+                                let entry_ms = |i: usize| -> Option<i64> {
+                                    if is_drill_in_inner {
+                                        return None;
+                                    }
                                     session
-                                        .entry_created_ms
-                                        .get(idx)
-                                        .copied()
+                                        .entries
+                                        .get(i)
+                                        .map(|e| e.created_ms)
                                         .filter(|&ms| ms > 0)
                                 };
-                                let prev_ms = if is_drill_in_inner {
-                                    None
-                                } else {
-                                    idx.checked_sub(1)
-                                        .and_then(|p| session.entry_created_ms.get(p).copied())
-                                        .filter(|&ms| ms > 0)
-                                };
+                                let created_ms = entry_ms(idx);
+                                let prev_ms = idx.checked_sub(1).and_then(entry_ms);
                                 let date_separator = created_ms.and_then(|ms| {
                                     let this_local = chrono::Utc
                                         .timestamp_millis_opt(ms)
@@ -3151,23 +3116,22 @@ impl Render for SolutionSessionView {
                                 // distinct chip that opens the full text in a
                                 // popover (detected by its stable heading) —
                                 // never inline, which would balloon the scroll.
-                                if let AgentThreadEntry::UserMessage(message) = entry
-                                    && crate::conversation_render::is_compaction_prompt_message(
-                                        message, cx,
+                                if let crate::session_entry::SessionEntryKind::UserMessage {
+                                    content_md,
+                                    ..
+                                } = &entry.kind
+                                    && crate::conversation_render::is_compaction_prompt_text(
+                                        content_md,
                                     )
                                 {
                                     let prompt_markdown =
                                         this.markdown_for_render.get(&(idx, 0)).cloned();
                                     let prompt_style = this.markdown_style_for_render.clone();
-                                    let raw_text = crate::conversation_render::content_block_text(
-                                        &message.content,
-                                        cx,
-                                    );
                                     return crate::conversation_render::render_compaction_prompt_chip(
                                         idx,
                                         prompt_markdown,
                                         prompt_style,
-                                        raw_text,
+                                        content_md.clone(),
                                         cx,
                                     );
                                 }
@@ -3175,7 +3139,6 @@ impl Render for SolutionSessionView {
                                 render_entry(
                                     idx,
                                     entry,
-                                    created_ms,
                                     is_last,
                                     date_separator,
                                     &this.markdown_for_render,

@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use acp_thread::{
-    AcpThread, AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock,
-    PermissionOptions, PlanEntry, SelectedPermissionOutcome, SelectedPermissionParams, ToolCall,
-    ToolCallContent, ToolCallStatus, UserMessage, UserMessageId,
+    AcpThread, AgentThreadEntry, ContentBlock, PermissionOptions, SelectedPermissionOutcome,
+    SelectedPermissionParams, ToolCall, ToolCallContent, ToolCallStatus, UserMessageId,
 };
+use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind, ToolStatus};
 use agent_client_protocol::schema as acp;
 use base64::Engine;
 use chrono::TimeZone as _;
@@ -33,9 +33,11 @@ pub(crate) struct FindMatch {
 
 /// Pure backward-walk that computes, for each entry index, the id of the
 /// next user message *after* it (the rewind target). Caller pre-projects
-/// the entries list to `Option<UserMessageId>` per slot — `Some(id)` for a
-/// user message that carries an id, `None` for everything else (assistant,
-/// tool, plan, or a user message without an id).
+/// the entries list to `Option<String>` per slot — `Some(id)` for a
+/// user message that carries an id (the `SessionEntry::UserMessage.id`),
+/// `None` for everything else (assistant, tool, plan, or a user message
+/// without an id). The `String` id is resolved back to a live
+/// `UserMessageId` at the rewind action site.
 ///
 /// At index `i` the result holds:
 ///   - `None` if `user_ids[i].is_some()` — rewinding TO a user message
@@ -46,11 +48,9 @@ pub(crate) struct FindMatch {
 ///
 /// O(N) once per thread mutation, replacing the previous O(N²) per-render
 /// forward scan that lived inside the conversation render loop.
-pub(crate) fn compute_rewind_table(
-    user_ids: &[Option<UserMessageId>],
-) -> Vec<Option<UserMessageId>> {
+pub(crate) fn compute_rewind_table(user_ids: &[Option<String>]) -> Vec<Option<String>> {
     let mut table = vec![None; user_ids.len()];
-    let mut current: Option<UserMessageId> = None;
+    let mut current: Option<String> = None;
     for idx in (0..user_ids.len()).rev() {
         if let Some(id) = &user_ids[idx] {
             current = Some(id.clone());
@@ -68,16 +68,15 @@ pub(crate) fn compute_rewind_table(
 /// up with the label rendered for that span. If you add or reorder labels
 /// in a render function, mirror the change here or matches will be applied
 /// to the wrong line.
-pub(crate) fn entry_text_spans(entry: &AgentThreadEntry, cx: &App) -> Vec<String> {
-    match entry {
-        AgentThreadEntry::UserMessage(message) => vec![clean_user_message_text(
-            &content_block_text(&message.content, cx),
-        )],
-        AgentThreadEntry::AssistantMessage(message) => {
-            let has_message = message
-                .chunks
+pub(crate) fn entry_text_spans(entry: &SessionEntry) -> Vec<String> {
+    match &entry.kind {
+        SessionEntryKind::UserMessage { content_md, .. } => {
+            vec![clean_user_message_text(content_md)]
+        }
+        SessionEntryKind::AssistantMessage { chunks } => {
+            let has_message = chunks
                 .iter()
-                .any(|c| matches!(c, AssistantMessageChunk::Message { .. }));
+                .any(|c| matches!(c, AssistantChunk::Message(_)));
             if has_message {
                 // Coalesce every visible `Message` chunk into ONE span so a
                 // single assistant turn matches/renders as one continuous
@@ -88,16 +87,15 @@ pub(crate) fn entry_text_spans(entry: &AgentThreadEntry, cx: &App) -> Vec<String
                 // inter-widget gap. Thoughts are dropped once a real answer
                 // exists (mirrors `render_assistant_message`).
                 let mut combined = String::new();
-                for chunk in &message.chunks {
-                    if let AssistantMessageChunk::Message { block } = chunk {
-                        let text = content_block_text(block, cx);
+                for chunk in chunks {
+                    if let AssistantChunk::Message(text) = chunk {
                         if text.is_empty() {
                             continue;
                         }
                         if !combined.is_empty() {
                             combined.push_str("\n\n");
                         }
-                        combined.push_str(&text);
+                        combined.push_str(text);
                     }
                 }
                 if combined.is_empty() {
@@ -110,9 +108,8 @@ pub(crate) fn entry_text_spans(entry: &AgentThreadEntry, cx: &App) -> Vec<String
                 // keep one span per thought, each rendered under its own
                 // "thinking…" label.
                 let mut spans = Vec::new();
-                for chunk in &message.chunks {
-                    if let AssistantMessageChunk::Thought { block } = chunk {
-                        let text = content_block_text(block, cx);
+                for chunk in chunks {
+                    if let AssistantChunk::Thought(text) = chunk {
                         if !text.is_empty() {
                             spans.push(format!("thinking: {text}"));
                         }
@@ -121,31 +118,30 @@ pub(crate) fn entry_text_spans(entry: &AgentThreadEntry, cx: &App) -> Vec<String
                 spans
             }
         }
-        AgentThreadEntry::ToolCall(call) => {
-            let label_text = call.label.read(cx).source().to_string();
-            let status_text = tool_call_status_text(&call.status);
-            let mut spans = vec![format!("Tool: {label_text} ({status_text})")];
-            for content in &call.content {
-                let summary = tool_call_content_summary(call, content, cx);
+        SessionEntryKind::ToolCall {
+            label_md,
+            status,
+            content_md,
+            ..
+        } => {
+            let status_text = tool_status_text(status);
+            let mut spans = vec![format!("Tool: {label_md} ({status_text})")];
+            for summary in content_md {
                 if !summary.is_empty() {
-                    spans.push(summary);
+                    spans.push(summary.clone());
                 }
             }
             spans
         }
-        AgentThreadEntry::CompletedPlan(entries) => {
+        SessionEntryKind::Plan(items) => {
             let mut spans = vec!["Plan".to_string()];
-            for entry in entries {
-                let source = entry.content.read(cx).source().to_string();
-                spans.push(format!("• {source}"));
+            for item in items {
+                spans.push(format!("• {}", item.content_md));
             }
             spans
         }
-        AgentThreadEntry::ContextCompaction(compaction) => match &compaction.summary {
-            Some(summary) => vec![format!(
-                "Context compaction: {}",
-                summary.read(cx).source()
-            )],
+        SessionEntryKind::ContextCompaction { summary_md, .. } => match summary_md {
+            Some(summary) => vec![format!("Context compaction: {summary}")],
             None => vec!["Context compaction".to_string()],
         },
     }
@@ -170,16 +166,33 @@ pub(crate) fn find_all(text: &str, query_lower: &str, mut emit: impl FnMut(Range
     }
 }
 
-pub(crate) fn tool_call_status_text(status: &ToolCallStatus) -> &'static str {
+/// Status label for an owned [`ToolStatus`] — drives the tool-card status
+/// badge and the find-bar span text.
+pub(crate) fn tool_status_text(status: &ToolStatus) -> &'static str {
     match status {
-        ToolCallStatus::Pending => "pending",
-        ToolCallStatus::WaitingForConfirmation { .. } => "waiting for confirmation",
-        ToolCallStatus::InProgress => "running",
-        ToolCallStatus::Completed => "done",
-        ToolCallStatus::Failed => "failed",
-        ToolCallStatus::Rejected => "rejected",
-        ToolCallStatus::Canceled => "canceled",
+        ToolStatus::Pending => "pending",
+        ToolStatus::WaitingForConfirmation => "waiting for confirmation",
+        ToolStatus::InProgress => "running",
+        ToolStatus::Completed => "done",
+        ToolStatus::Failed => "failed",
+        ToolStatus::Rejected => "rejected",
+        ToolStatus::Canceled => "canceled",
     }
+}
+
+/// Pure predicate used by the view's per-second elapsed-badge tick: does
+/// any entry hold a tool call still `InProgress`? Reads owned
+/// [`SessionEntry`]s so it works on both cold and live transcripts.
+pub(crate) fn entries_have_in_progress_tool_call(entries: &[SessionEntry]) -> bool {
+    entries.iter().any(|entry| {
+        matches!(
+            &entry.kind,
+            SessionEntryKind::ToolCall {
+                status: ToolStatus::InProgress,
+                ..
+            }
+        )
+    })
 }
 
 /// A single clickable authorization choice flattened out of the
@@ -317,48 +330,94 @@ pub(crate) fn render_span(
     }
 }
 
+/// Serialize a [`UserMessageId`] to the same `String` shape
+/// `session_entry::to_session_entry` stores in
+/// `SessionEntryKind::UserMessage.id`, so the two can be compared.
+fn user_message_id_to_string(id: &UserMessageId) -> String {
+    serde_json::to_value(id)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Find the live `UserMessageId` whose serialized form matches the
+/// `SessionEntry::UserMessage.id` string `target`. Returns `None` when no
+/// live user message carries that id (e.g. the live thread was replaced
+/// out from under a stale render) so the rewind is a no-op rather than a
+/// truncate against the wrong turn.
+fn resolve_user_message_id(thread: &AcpThread, target: &str) -> Option<UserMessageId> {
+    thread.entries().iter().find_map(|entry| match entry {
+        AgentThreadEntry::UserMessage(message) => {
+            let id = message.id.as_ref()?;
+            (user_message_id_to_string(id) == target).then(|| id.clone())
+        }
+        _ => None,
+    })
+}
+
 pub(crate) fn render_entry(
     entry_idx: usize,
-    entry: &AgentThreadEntry,
-    created_ms: Option<i64>,
+    entry: &SessionEntry,
     is_last: bool,
     date_separator: Option<String>,
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
     assistant_label: &SharedString,
-    rewind_target: Option<UserMessageId>,
+    rewind_target: Option<String>,
     thread: gpui::WeakEntity<AcpThread>,
     cx: &App,
 ) -> AnyElement {
-    let inner: AnyElement = match entry {
-        AgentThreadEntry::UserMessage(message) => render_user_message(
+    // `created_ms == 0` is the "unknown time" sentinel (replayed gap /
+    // pre-feature / drill-in); `render_message_time` filters `ms > 0`, so
+    // forward it through `Option` to keep the same downstream behaviour.
+    let created_ms = Some(entry.created_ms).filter(|&ms| ms > 0);
+    let inner: AnyElement = match &entry.kind {
+        SessionEntryKind::UserMessage {
+            content_md, chunks, ..
+        } => render_user_message(
             entry_idx,
-            message,
+            content_md,
+            chunks,
             created_ms,
             is_last,
             markdown_for,
             style,
             cx,
         ),
-        AgentThreadEntry::AssistantMessage(message) => render_assistant_message(
+        SessionEntryKind::AssistantMessage { chunks } => render_assistant_message(
             entry_idx,
-            message,
+            chunks,
             created_ms,
             is_last,
             markdown_for,
             style,
             assistant_label,
+        ),
+        SessionEntryKind::ToolCall {
+            id,
+            label_md,
+            status,
+            content_md,
+            raw_input,
+            status_started_at,
+            ..
+        } => render_tool_call(
+            entry_idx,
+            id,
+            label_md,
+            status,
+            content_md,
+            raw_input.as_ref(),
+            *status_started_at,
+            markdown_for,
+            style,
+            thread.clone(),
             cx,
         ),
-        AgentThreadEntry::ToolCall(call) => {
-            render_tool_call(entry_idx, call, markdown_for, style, thread.clone(), cx)
-        }
-        AgentThreadEntry::CompletedPlan(entries) => {
-            render_plan(entry_idx, entries, markdown_for, style, cx)
-        }
+        SessionEntryKind::Plan(items) => render_plan(entry_idx, items, markdown_for, style, cx),
         // Context compaction is a lightweight divider marking where the model
         // summarized its own history; render it as a muted single-line label.
-        AgentThreadEntry::ContextCompaction(_) => gpui::div()
+        SessionEntryKind::ContextCompaction { .. } => gpui::div()
             .px_2()
             .py_1()
             .child(ui::Label::new("Context compacted").color(ui::Color::Muted))
@@ -398,7 +457,18 @@ pub(crate) fn render_entry(
                                 let target_id = target_id.clone();
                                 if let Some(thread) = thread.upgrade() {
                                     thread.update(cx, |thread: &mut AcpThread, cx| {
-                                        thread.rewind(target_id, cx).detach_and_log_err(cx);
+                                        // The rewind target is the
+                                        // `SessionEntry::UserMessage.id` (a
+                                        // String). Resolve it back to the live
+                                        // thread's `UserMessageId` by matching
+                                        // the user message that carries it, so
+                                        // `rewind` gets exactly the id the live
+                                        // thread holds.
+                                        if let Some(id) =
+                                            resolve_user_message_id(thread, &target_id)
+                                        {
+                                            thread.rewind(id, cx).detach_and_log_err(cx);
+                                        }
                                     });
                                 }
                             }
@@ -520,7 +590,8 @@ fn strip_one_timestamp(segment: &str) -> &str {
 
 pub(crate) fn render_user_message(
     entry_idx: usize,
-    message: &UserMessage,
+    content_md: &str,
+    chunks: &[acp::ContentBlock],
     created_ms: Option<i64>,
     is_last: bool,
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
@@ -532,13 +603,11 @@ pub(crate) fn render_user_message(
     // user-typed `[image #N]` placeholders into markdown links so the
     // Markdown widget paints them as clickable spans. The actual
     // image preview opens through the `on_url_click` hook below.
-    let raw_text = content_block_text(&message.content, cx);
-    let text = clean_user_message_text(&raw_text);
+    let text = clean_user_message_text(content_md);
     let bubble_bg = cx.theme().colors().text_accent.opacity(0.12);
     let group_name = SharedString::from(format!("user-msg-{entry_idx}"));
 
-    let images: Vec<std::sync::Arc<gpui::Image>> = message
-        .chunks
+    let images: Vec<std::sync::Arc<gpui::Image>> = chunks
         .iter()
         .filter_map(|chunk| match chunk {
             acp::ContentBlock::Image(image_content) => decode_image_local(image_content),
@@ -610,13 +679,6 @@ pub(crate) fn render_user_message(
 pub(crate) fn is_compaction_prompt_text(text: &str) -> bool {
     text.trim_start()
         .starts_with(crate::compact::COMPACT_PROMPT_HEADING)
-}
-
-/// `is_compaction_prompt_text` against a rendered `UserMessage`. The
-/// injected prompt is sent as a plain turn (no queue timestamp / hint
-/// prefix), so the raw content already begins with the heading.
-pub(crate) fn is_compaction_prompt_message(message: &UserMessage, cx: &App) -> bool {
-    is_compaction_prompt_text(&content_block_text(&message.content, cx))
 }
 
 /// Renders the compact-context prompt as a distinct, clickable chip that
@@ -991,13 +1053,12 @@ impl Render for ImagePreviewWindowView {
 
 pub(crate) fn render_assistant_message(
     entry_idx: usize,
-    message: &AssistantMessage,
+    chunks: &[AssistantChunk],
     created_ms: Option<i64>,
     is_last: bool,
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
     _assistant_label: &SharedString,
-    cx: &App,
 ) -> AnyElement {
     let group_name = SharedString::from(format!("assistant-msg-{entry_idx}"));
     // No "<Adapter>" header above assistant messages either — the absence of
@@ -1016,10 +1077,9 @@ pub(crate) fn render_assistant_message(
     // chunk arrives the thoughts become noise (Claude was reasoning)
     // and we drop them. Matches Cursor / upstream Zed AgentPanel which
     // collapse reasoning tokens once the answer starts streaming.
-    let has_message = message
-        .chunks
+    let has_message = chunks
         .iter()
-        .any(|c| matches!(c, AssistantMessageChunk::Message { .. }));
+        .any(|c| matches!(c, AssistantChunk::Message(_)));
     // Must mirror `entry_text_spans` exactly — the markdown cache is keyed by
     // `(entry_idx, span_idx)` and built from that function's spans, so the
     // span shape here has to line up or find-highlighting and the rendered
@@ -1030,16 +1090,15 @@ pub(crate) fn render_assistant_message(
         // `combined` also feeds the footer copy button, so the clipboard
         // matches exactly what's painted (no hidden reasoning leaks in).
         let mut combined = String::new();
-        for chunk in &message.chunks {
-            if let AssistantMessageChunk::Message { block } = chunk {
-                let text = content_block_text(block, cx);
+        for chunk in chunks {
+            if let AssistantChunk::Message(text) = chunk {
                 if text.is_empty() {
                     continue;
                 }
                 if !combined.is_empty() {
                     combined.push_str("\n\n");
                 }
-                combined.push_str(&text);
+                combined.push_str(text);
             }
         }
         if !combined.is_empty() {
@@ -1053,13 +1112,12 @@ pub(crate) fn render_assistant_message(
     } else {
         // Thought-only: one "thinking…" block per reasoning chunk.
         let mut span_idx = 0;
-        for chunk in &message.chunks {
-            if let AssistantMessageChunk::Thought { block } = chunk {
-                let text = content_block_text(block, cx);
+        for chunk in chunks {
+            if let AssistantChunk::Thought(text) = chunk {
                 if text.is_empty() {
                     continue;
                 }
-                let element = render_span((entry_idx, span_idx), &text, markdown_for, style);
+                let element = render_span((entry_idx, span_idx), text, markdown_for, style);
                 container = container.child(
                     div()
                         .child(
@@ -1185,20 +1243,25 @@ fn tool_call_arg_preview(raw_input: &serde_json::Value) -> Option<String> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_tool_call(
     entry_idx: usize,
-    call: &ToolCall,
+    tool_call_id: &str,
+    label_text: &str,
+    status: &ToolStatus,
+    content_md: &[String],
+    raw_input: Option<&serde_json::Value>,
+    status_started_at: Option<i64>,
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
     thread: gpui::WeakEntity<AcpThread>,
     cx: &App,
 ) -> AnyElement {
-    let label_text = call.label.read(cx).source().to_string();
-    let status_text = tool_call_status_text(&call.status);
-    let status_color = match call.status {
-        ToolCallStatus::Failed => Color::Error,
-        ToolCallStatus::Rejected | ToolCallStatus::Canceled => Color::Warning,
-        ToolCallStatus::Completed => Color::Success,
+    let status_text = tool_status_text(status);
+    let status_color = match status {
+        ToolStatus::Failed => Color::Error,
+        ToolStatus::Rejected | ToolStatus::Canceled => Color::Warning,
+        ToolStatus::Completed => Color::Success,
         _ => Color::Muted,
     };
 
@@ -1208,9 +1271,10 @@ pub(crate) fn render_tool_call(
     // the entity (see acp_thread::ToolCall::status_started_at) but
     // rendering "ran for Xs" on done/failed/canceled calls is a
     // deliberate follow-up, not part of the live-counter surface.
-    let elapsed_label = if matches!(call.status, ToolCallStatus::InProgress) {
-        call.status_started_at.map(|started| {
-            let elapsed_secs = (chrono::Utc::now() - started).num_seconds().max(0) as u64;
+    let elapsed_label = if matches!(status, ToolStatus::InProgress) {
+        status_started_at.map(|started_ms| {
+            let elapsed_secs = ((chrono::Utc::now().timestamp_millis() - started_ms) / 1000)
+                .max(0) as u64;
             crate::status_row::format_elapsed(elapsed_secs)
         })
     } else {
@@ -1224,7 +1288,7 @@ pub(crate) fn render_tool_call(
     // actually ran — only the output is shown, which is often
     // ambiguous (a green `cargo check` and a green `cargo build` look
     // identical post-hoc).
-    let arg_preview = call.raw_input.as_ref().and_then(tool_call_arg_preview);
+    let arg_preview = raw_input.and_then(tool_call_arg_preview);
 
     let mut container = v_flex()
         .gap_0p5()
@@ -1241,12 +1305,7 @@ pub(crate) fn render_tool_call(
                         .size(IconSize::XSmall)
                         .color(Color::Muted),
                 )
-                .child(render_span(
-                    (entry_idx, 0),
-                    &label_text,
-                    markdown_for,
-                    style,
-                ))
+                .child(render_span((entry_idx, 0), label_text, markdown_for, style))
                 .child(
                     Label::new(status_text)
                         .size(LabelSize::XSmall)
@@ -1277,12 +1336,11 @@ pub(crate) fn render_tool_call(
         });
 
     let mut span_idx = 1;
-    for content in &call.content {
-        let summary = tool_call_content_summary(call, content, cx);
+    for summary in content_md {
         if !summary.is_empty() {
             container = container.child(div().child(render_span(
                 (entry_idx, span_idx),
-                &summary,
+                summary,
                 markdown_for,
                 style,
             )));
@@ -1296,10 +1354,38 @@ pub(crate) fn render_tool_call(
     // the `respond_tx` oneshot the connection is awaiting and unblocks the
     // turn. The buttons disappear on the next render once the status moves
     // off `WaitingForConfirmation`.
-    if let ToolCallStatus::WaitingForConfirmation { options, .. } = &call.status {
-        let buttons = permission_buttons(options);
+    //
+    // The owned `SessionEntry` only carries the `WaitingForConfirmation`
+    // MARKER — not the live `PermissionOptions` or the respond channel
+    // (those are not serializable and never enter `SessionEntry`). An
+    // in-flight call only exists while the live thread does, so for such an
+    // entry we look the live `ToolCall` up by id in the thread the view
+    // still holds, and render the buttons against ITS options + ITS
+    // `acp::ToolCallId` (so `authorize_tool_call` fulfils the right
+    // oneshot). Phase 4/5 adds a side-map for the mobile wire.
+    let live_authorization = if matches!(status, ToolStatus::WaitingForConfirmation) {
+        thread.upgrade().and_then(|thread| {
+            thread.read(cx).entries().iter().find_map(|entry| {
+                let AgentThreadEntry::ToolCall(call) = entry else {
+                    return None;
+                };
+                if call.id.0.as_ref() != tool_call_id {
+                    return None;
+                }
+                match &call.status {
+                    ToolCallStatus::WaitingForConfirmation { options, .. } => {
+                        Some((call.id.clone(), permission_buttons(options)))
+                    }
+                    _ => None,
+                }
+            })
+        })
+    } else {
+        None
+    };
+    if let Some((live_tool_call_id, buttons)) = live_authorization {
         if !buttons.is_empty() {
-            let tool_call_id = call.id.clone();
+            let tool_call_id = live_tool_call_id;
             let mut row = h_flex().gap_1().mt_0p5().flex_wrap();
             for (button_idx, button) in buttons.into_iter().enumerate() {
                 let style = if button.is_allow() {
@@ -1545,7 +1631,7 @@ pub(crate) fn terminal_output_markdown(
 
 pub(crate) fn render_plan(
     entry_idx: usize,
-    entries: &[PlanEntry],
+    items: &[crate::session_entry::PlanItem],
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
     cx: &App,
@@ -1567,7 +1653,7 @@ pub(crate) fn render_plan(
                 )
                 .child(render_span((entry_idx, 0), "Plan", markdown_for, style)),
         );
-    for (i, _entry) in entries.iter().enumerate() {
+    for (i, _item) in items.iter().enumerate() {
         let span_idx = 1 + i;
         // Bullet prefix is now part of the span text (see
         // entry_text_spans), so the rendered markdown already includes
@@ -1585,12 +1671,11 @@ pub(crate) fn content_block_text(block: &ContentBlock, cx: &App) -> String {
 mod tests {
     use super::*;
 
-    fn id(label: &str) -> UserMessageId {
-        // UserMessageId wraps Arc<str>; serde round-trip is the only public
-        // way to mint one with a deterministic value (its `new()` always
-        // generates a fresh UUID).
-        serde_json::from_value(serde_json::Value::String(label.into()))
-            .expect("UserMessageId deserializes from any string")
+    fn id(label: &str) -> String {
+        // The rewind table now keys on the `SessionEntry::UserMessage.id`
+        // String (the serialized form of a `UserMessageId`), so a test id is
+        // just the label itself.
+        label.to_string()
     }
 
     #[test]
@@ -1737,7 +1822,7 @@ mod tests {
     fn empty_entries_produce_empty_table() {
         assert_eq!(
             compute_rewind_table(&[]),
-            Vec::<Option<UserMessageId>>::new()
+            Vec::<Option<String>>::new()
         );
     }
 
@@ -1984,5 +2069,59 @@ mod tests {
         let (ranges, sel) = matches_for_span(&matches, Some(2), 1, 0);
         assert_eq!(ranges, vec![5..8]);
         assert_eq!(sel, Some(0));
+    }
+
+    fn tool_entry(status: ToolStatus) -> SessionEntry {
+        SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: None,
+            kind: SessionEntryKind::ToolCall {
+                id: "tc".into(),
+                label_md: "Run".into(),
+                kind: acp::ToolKind::Execute,
+                status,
+                content_md: Vec::new(),
+                raw_input: None,
+                raw_output: None,
+                tool_name: None,
+                locations: Vec::new(),
+                status_started_at: None,
+            },
+        }
+    }
+
+    fn user_entry() -> SessionEntry {
+        SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: "hi".into(),
+                chunks: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn in_progress_tool_call_detected_from_session_entries() {
+        // A `SessionEntryKind::ToolCall { status: InProgress }` anywhere in
+        // the list flips the per-second elapsed-badge tick on.
+        let entries = vec![user_entry(), tool_entry(ToolStatus::InProgress)];
+        assert!(entries_have_in_progress_tool_call(&entries));
+    }
+
+    #[test]
+    fn no_in_progress_tool_call_when_all_terminal() {
+        // Terminal / non-running statuses (and an empty list) do not.
+        assert!(!entries_have_in_progress_tool_call(&[]));
+        let entries = vec![
+            user_entry(),
+            tool_entry(ToolStatus::Completed),
+            tool_entry(ToolStatus::WaitingForConfirmation),
+            tool_entry(ToolStatus::Failed),
+        ];
+        assert!(!entries_have_in_progress_tool_call(&entries));
     }
 }
