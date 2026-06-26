@@ -158,8 +158,31 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
                 },
             )
         }
-        // CompletedPlan / ContextCompaction implemented in Task 4.
-        _ => unimplemented!("converted in Tasks 3-4"),
+        AgentThreadEntry::CompletedPlan(entries) => (
+            None,
+            SessionEntryKind::Plan(
+                entries
+                    .iter()
+                    .map(|e| PlanItem {
+                        content_md: e.content.read(cx).source().to_string(),
+                        priority: e.priority.clone(),
+                        status: e.status.clone(),
+                    })
+                    .collect(),
+            ),
+        ),
+        AgentThreadEntry::ContextCompaction(c) => (
+            None,
+            SessionEntryKind::ContextCompaction {
+                id: c.id.0.to_string(),
+                status: match c.status {
+                    acp_thread::ContextCompactionStatus::InProgress => CompactionStatus::InProgress,
+                    acp_thread::ContextCompactionStatus::Completed => CompactionStatus::Completed,
+                    acp_thread::ContextCompactionStatus::Canceled => CompactionStatus::Canceled,
+                },
+                summary_md: c.summary.as_ref().map(|m| m.read(cx).source().to_string()),
+            },
+        ),
     };
     SessionEntry {
         created_ms: 0,
@@ -274,6 +297,35 @@ mod tests {
                     assert!(matches!(kind, acp::ToolKind::Edit));
                 }
                 _ => panic!("expected ToolCall"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn converts_plan_and_compaction(cx: &mut TestAppContext) {
+        use acp_thread::{AgentThreadEntry, ContextCompaction, ContextCompactionId, ContextCompactionStatus, PlanEntry};
+        cx.update(|cx| {
+            let plan = AgentThreadEntry::CompletedPlan(vec![PlanEntry {
+                content: cx.new(|cx| markdown::Markdown::new("step one".into(), None, None, cx)),
+                priority: acp::PlanEntryPriority::Medium,
+                status: acp::PlanEntryStatus::Completed,
+            }]);
+            match to_session_entry(&plan, cx).kind {
+                SessionEntryKind::Plan(items) => assert_eq!(items[0].content_md, "step one"),
+                _ => panic!("expected Plan"),
+            }
+
+            let compaction = AgentThreadEntry::ContextCompaction(ContextCompaction {
+                id: ContextCompactionId("cc_1".into()),
+                status: ContextCompactionStatus::Completed,
+                summary: Some(cx.new(|cx| markdown::Markdown::new("summary".into(), None, None, cx))),
+            });
+            match to_session_entry(&compaction, cx).kind {
+                SessionEntryKind::ContextCompaction { status, summary_md, .. } => {
+                    assert!(matches!(status, CompactionStatus::Completed));
+                    assert_eq!(summary_md.as_deref(), Some("summary"));
+                }
+                _ => panic!("expected ContextCompaction"),
             }
         });
     }
