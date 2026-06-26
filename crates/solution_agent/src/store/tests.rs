@@ -6289,3 +6289,94 @@ async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
         epoch_after_reset
     );
 }
+
+/// Phase 4 Task 3 (follow-up): `/clear` (reset_context) must not only wipe
+/// in-memory entries and bump the in-memory epoch — it must also flush that
+/// state to the DB so a cold-load after a /clear doesn't replay stale rows.
+///
+/// Uses the `reset_context` path (not the persist_all_rows fallback) because
+/// the method is public and the test harness supports a live AcpThread session.
+/// After the call, `db.load_entries` must be empty and `db.load_epoch` must be
+/// strictly greater than the epoch that was written before the reset.
+#[gpui::test]
+async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    // Append two entries so the DB has rows to clear.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Sanity check: two rows must be persisted before the reset.
+    let rows_before = db.load_entries(session_id).await.expect("load entries before");
+    assert_eq!(rows_before.len(), 2, "two appends → two persisted rows before clear");
+
+    // Capture the epoch as written to the DB before the reset.
+    let epoch_in_db_before = db
+        .load_epoch(session_id)
+        .await
+        .expect("load epoch before")
+        .unwrap_or(0);
+
+    // Call reset_context — this clears entries, bumps in-memory epoch, then
+    // calls persist_all_rows which deletes all rows and saves the new epoch.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.reset_context(session_id, cx))
+    })
+    .await
+    .expect("reset_context");
+
+    cx.executor().run_until_parked();
+
+    // DB rows must be gone after the clear.
+    let rows_after = db.load_entries(session_id).await.expect("load entries after");
+    assert_eq!(
+        rows_after.len(),
+        0,
+        "reset_context must delete all persisted entry rows"
+    );
+
+    // DB epoch must have advanced so a cold-load sees the new epoch, not the
+    // stale pre-clear one.
+    let epoch_in_db_after = db
+        .load_epoch(session_id)
+        .await
+        .expect("load epoch after")
+        .unwrap_or(0);
+    assert!(
+        epoch_in_db_after > epoch_in_db_before,
+        "reset_context must persist the bumped epoch to the DB (was {}, got {})",
+        epoch_in_db_before,
+        epoch_in_db_after
+    );
+}
