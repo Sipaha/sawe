@@ -354,12 +354,6 @@ pub struct SolutionSession {
     /// detached. For sessions that have never been restored from cold (fresh sessions or sessions
     /// after `reset_context`/`rotate_context`), this is `0`.
     pub live_base: usize,
-    /// Raw persisted form of the cold prefix (the entries from the blob that were restored before
-    /// the live `AcpThread` was attached). Kept for the snapshot path — `serializable_snapshot`
-    /// re-emits these directly without reconverting through `SessionEntry`. Cleared on
-    /// `reset_context`/`rotate_context` since the blob is then replaced by the live thread's
-    /// new transcript.
-    pub(crate) cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2>,
 /// Store-maintained list of owned session entries for mobile delta-sync
     /// (Phase 2+). Mutated only through `set_entries` setter.
     pub entries: Vec<SessionEntry>,
@@ -533,7 +527,6 @@ impl SolutionSession {
             pending_messages: VecDeque::new(),
             flush_after_cancel: false,
             live_base: 0,
-            cold_persisted_v2: Vec::new(),
             entries: Vec::new(),
             hydrating: false,
             last_turn_duration: None,
@@ -693,7 +686,6 @@ mod tests {
             pending_messages: VecDeque::new(),
             flush_after_cancel: false,
             live_base: 0,
-            cold_persisted_v2: Vec::new(),
             entries: Vec::new(),
             hydrating: false,
             last_turn_duration: None,

@@ -1812,8 +1812,7 @@ impl SolutionSessionView {
         });
         self.compose_editor.update(cx, |e, cx| e.clear(window, cx));
         self.pending_images.clear();
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.persist_session_blob(session_id, cx);
+        SolutionAgentStore::global(cx).update(cx, |_store, cx| {
             cx.emit(crate::store::SolutionAgentStoreEvent::SessionStateChanged(
                 session_id,
             ));

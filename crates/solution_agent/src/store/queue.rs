@@ -708,7 +708,6 @@ impl SolutionAgentStore {
                                     .detach();
                             }
                         }
-                        store.persist_session_blob(session_id, cx);
                     })?;
                 }
             }

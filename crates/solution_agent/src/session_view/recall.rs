@@ -124,12 +124,10 @@ impl SolutionSessionView {
         if !images.is_empty() {
             self.pending_images.extend(images);
         }
-        // Persist the now-empty queue and emit a state-changed event so any
-        // listeners (navigator tab indicator, status row, …) refresh from
-        // the new state — the bundle just moved out of `pending_messages`,
-        // and the on-disk snapshot needs to follow.
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.persist_session_blob(session_id, cx);
+        // Emit a state-changed event so any listeners (navigator tab indicator,
+        // status row, …) refresh from the new state — the bundle just moved
+        // out of `pending_messages`.
+        SolutionAgentStore::global(cx).update(cx, |_store, cx| {
             cx.emit(crate::store::SolutionAgentStoreEvent::SessionStateChanged(
                 session_id,
             ));

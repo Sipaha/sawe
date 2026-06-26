@@ -1301,14 +1301,9 @@ impl McpServerTool for GetSessionTool {
             // Phase 4 Task 5a: serve the transcript from the unified
             // `session.entries` (Vec<SessionEntry>) — the same cold+live
             // model the desktop renders and Phase 4 persists/loads as
-            // rows. Reading from `cold_persisted_v2` + the live
-            // `acp_thread().entries()` (the pre-repoint path) returned an
-            // EMPTY transcript for any row-native session that was cold or
-            // resumed: Task 4 leaves `cold_persisted_v2` empty, and
-            // `claude --resume` does not re-emit history, so neither
-            // source held the pre-restart entries. `session.entries` is
-            // kept in lock-step with the live thread by the store's
-            // `NewEntry` handler, so live sessions read identically.
+            // rows. `session.entries` is kept in lock-step with the live
+            // thread by the store's `NewEntry` handler, so live and cold
+            // sessions read identically.
             //
             // Authorization options for any in-flight WaitingForConfirmation
             // tool call are not stored on `SessionEntry` (a side-channel,
@@ -4356,10 +4351,9 @@ mod tests {
 
     /// Build a COLD, row-native session: `session.entries` populated, NO
     /// live `acp_thread` attached. Mirrors the post-restart state of a
-    /// row-native session (Phase 4 Task 4 leaves `cold_persisted_v2`
-    /// empty), which is precisely where `get_session` must now read from
-    /// `session.entries` rather than the (empty) cold prefix + (absent)
-    /// live thread. The user message carries a 1×1 PNG image chunk so
+    /// row-native session: `session.entries` populated, no live `acp_thread`.
+    /// `get_session` must read from `session.entries` directly.
+    /// The user message carries a 1×1 PNG image chunk so
     /// image extraction can be asserted on the user path.
     async fn seed_cold_row_native_session(
         cx: &mut gpui::TestAppContext,
@@ -4409,9 +4403,8 @@ mod tests {
                         },
                     },
                 ];
-                // Cold, row-native: NO live thread, empty cold_persisted_v2.
+                // Cold, row-native: NO live thread.
                 assert!(session.acp_thread().is_none());
-                assert!(session.cold_persisted_v2.is_empty());
                 store.register_prebuilt_session(session, cx)
             })
         });
@@ -4422,9 +4415,7 @@ mod tests {
     async fn get_session_cold_row_native_returns_entries_from_session_entries(
         cx: &mut gpui::TestAppContext,
     ) {
-        // RED before the repoint: a cold row-native session has empty
-        // cold_persisted_v2 and no live thread, so the OLD get_session
-        // returned an empty transcript. After the repoint it must serve
+        // A cold row-native session has no live thread; get_session must serve
         // the two entries from session.entries.
         let (session_id, _img, _tmp) = seed_cold_row_native_session(cx).await;
 

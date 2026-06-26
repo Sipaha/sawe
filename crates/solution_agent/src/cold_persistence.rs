@@ -114,6 +114,7 @@ pub struct PersistedPlanEntry {
 
 /// Build a `PersistedEntryV2` from a live entry, returning `None` when
 /// the entry isn't safe to freeze (in-flight tool calls).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn to_persisted(entry: &AgentThreadEntry, cx: &App) -> Option<PersistedEntryV2> {
     match entry {
         AgentThreadEntry::UserMessage(msg) => Some(PersistedEntryV2::User(PersistedUserMessage {

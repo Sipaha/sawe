@@ -726,141 +726,6 @@ fn unique_session_title(
     SharedString::from(base.to_string())
 }
 
-fn serializable_snapshot(session: &SolutionSession, cx: &App) -> Vec<u8> {
-    // The visible conversation is the cold+live concatenation (see the
-    // render path in `session_view.rs::render_conversation_body` and the
-    // matching `sync_thread_subscription` list_state sizing). The blob
-    // we persist must mirror that — otherwise persist drops the cold prefix
-    // every snapshot and the next reload shows only this-session entries.
-    //
-    // The cold prefix is already in `cold_persisted_v2`
-    // (raw wire form); emit those directly — no round-trip through
-    // `from_persisted`/`to_persisted` (which requires `&mut App`).
-    // The live thread's entries go through the normal `to_persisted` path.
-    // In-flight tool calls drop out via `to_persisted` returning `None`;
-    // their ms is dropped too so `entries_v2` and `entry_created_ms`
-    // keep their 1:1 invariant.
-    let cold_count = session.cold_persisted_v2.len();
-    let live_entries: Vec<&acp_thread::AgentThreadEntry> = session
-        .acp_thread()
-        .map(|thread| thread.read(cx).entries().iter().collect())
-        .unwrap_or_default();
-
-    let mut entries = Vec::with_capacity(cold_count + live_entries.len());
-    let mut entry_summaries = Vec::with_capacity(cold_count + live_entries.len());
-    let mut entries_v2 = Vec::with_capacity(cold_count + live_entries.len());
-    let mut entry_created_ms = Vec::with_capacity(cold_count + live_entries.len());
-
-    // Cold prefix: re-emit the already-persisted v2 entries directly.
-    for (cold_idx, v2) in session.cold_persisted_v2.iter().enumerate() {
-        let markdown = markdown_from_persisted_v2(v2);
-        let role = persisted_role_for_v2(v2);
-        entries.push(PersistedEntry {
-            role,
-            markdown: markdown.clone(),
-        });
-        entry_summaries.push(markdown);
-        entries_v2.push(v2.clone());
-        entry_created_ms.push(
-            session
-                .entries
-                .get(cold_idx)
-                .map(|e| e.created_ms)
-                .unwrap_or(crate::model::NO_TIMESTAMP_MS),
-        );
-    }
-
-    // Live entries: go through the normal to_persisted path.
-    for (local_idx, entry) in live_entries.iter().enumerate() {
-        if let Some(persisted) = crate::cold_persistence::to_persisted(entry, cx) {
-            let markdown = entry.to_markdown(cx);
-            entries.push(PersistedEntry {
-                role: persisted_role_for(entry),
-                markdown: markdown.clone(),
-            });
-            entry_summaries.push(markdown);
-            entries_v2.push(persisted);
-            let global_idx = cold_count + local_idx;
-            entry_created_ms.push(
-                session
-                    .entries
-                    .get(global_idx)
-                    .map(|e| e.created_ms)
-                    .unwrap_or(crate::model::NO_TIMESTAMP_MS),
-            );
-        }
-    }
-
-    let snapshot = PersistedSession {
-        title: session.title.to_string(),
-        entries,
-        entry_summaries,
-        entries_v2,
-        entry_created_ms,
-        available_models: session.cached_models.clone(),
-        desired_model: session.desired_model.clone(),
-        desired_effort: session.desired_effort.clone(),
-    };
-    serde_json::to_vec(&snapshot).unwrap_or_default()
-}
-
-/// Extract a flat markdown summary from a `PersistedEntryV2` without needing a
-/// GPUI context. Used by `serializable_snapshot` for the cold prefix.
-fn markdown_from_persisted_v2(v2: &crate::cold_persistence::PersistedEntryV2) -> String {
-    use crate::cold_persistence::{PersistedAssistantChunk, PersistedEntryV2};
-    match v2 {
-        PersistedEntryV2::User(msg) => msg.content_md.clone(),
-        PersistedEntryV2::Assistant(msg) => msg
-            .chunks
-            .iter()
-            .map(|chunk| match chunk {
-                PersistedAssistantChunk::Message(s) | PersistedAssistantChunk::Thought(s) => {
-                    s.as_str()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        PersistedEntryV2::Tool(call) => {
-            let content: Vec<&str> = call.content.iter().map(|c| c.markdown.as_str()).collect();
-            if content.is_empty() {
-                call.label_md.clone()
-            } else {
-                content.join("\n")
-            }
-        }
-        PersistedEntryV2::Plan(entries) => entries
-            .iter()
-            .map(|e| e.content_md.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
-fn persisted_role_for_v2(
-    v2: &crate::cold_persistence::PersistedEntryV2,
-) -> PersistedRole {
-    use crate::cold_persistence::PersistedEntryV2;
-    match v2 {
-        PersistedEntryV2::User(_) => PersistedRole::User,
-        PersistedEntryV2::Assistant(_) => PersistedRole::Assistant,
-        PersistedEntryV2::Tool(_) => PersistedRole::Tool,
-        PersistedEntryV2::Plan(_) => PersistedRole::Assistant,
-    }
-}
-
-fn persisted_role_for(entry: &acp_thread::AgentThreadEntry) -> PersistedRole {
-    match entry {
-        acp_thread::AgentThreadEntry::UserMessage(_) => PersistedRole::User,
-        acp_thread::AgentThreadEntry::AssistantMessage(_) => PersistedRole::Assistant,
-        acp_thread::AgentThreadEntry::ToolCall(_) => PersistedRole::Tool,
-        acp_thread::AgentThreadEntry::CompletedPlan(_) => PersistedRole::Plan,
-        // Compaction markers never persist (`to_persisted` returns `None`), so
-        // this arm is unreachable in practice; classify as Assistant for
-        // completeness since the summary is model-emitted.
-        acp_thread::AgentThreadEntry::ContextCompaction(_) => PersistedRole::Assistant,
-    }
-}
-
 /// The fixed effort options offered in the UI (no per-agent list — these are
 /// Claude Code's effort levels; `ultracode` = "xhigh + workflows").
 pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultracode"];
@@ -1726,24 +1591,18 @@ impl SolutionAgentStore {
                     // the persisted generation). Fall back to the legacy blob
                     // only when there are no rows, then lazily migrate it.
                     let migrating = preloaded_rows.is_empty();
-                    let (entries, cold_persisted_v2) = if !preloaded_rows.is_empty() {
-                        (entries_from_rows(preloaded_rows), Vec::new())
+                    let entries = if !preloaded_rows.is_empty() {
+                        entries_from_rows(preloaded_rows)
                     } else {
                         let (cold_entries, restored_created_ms) =
                             cold_entries_from_persisted(preloaded_persisted, cx);
-                        let entries = crate::session_entry::rebuild_entries(
+                        crate::session_entry::rebuild_entries(
                             &cold_entries,
                             &[],
                             &restored_created_ms,
                             0,
                             cx,
-                        );
-                        let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
-                            cold_entries
-                                .iter()
-                                .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
-                                .collect();
-                        (entries, cold_persisted_v2)
+                        )
                     };
                     let entity = cx.new(|cx| {
                         let mut s = SolutionSession::new_idle(
@@ -1769,7 +1628,6 @@ impl SolutionAgentStore {
                         } else {
                             s.epoch = preloaded_epoch as u64;
                         }
-                        s.cold_persisted_v2 = cold_persisted_v2;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
                         s
                     });
@@ -2446,8 +2304,8 @@ impl SolutionAgentStore {
                     let restored_desired_effort = meta.desired_effort.clone().or_else(|| {
                         persisted.as_ref().and_then(|p| p.desired_effort.clone())
                     });
-                    let (entries, cold_persisted_v2) = if let Some(rows) = rows {
-                        (entries_from_rows(rows), Vec::new())
+                    let entries = if let Some(rows) = rows {
+                        entries_from_rows(rows)
                     } else {
                         // Reconstruct the persisted dialog as live-shape
                         // `AgentThreadEntry`s. Prefer the structured v2 payload;
@@ -2455,19 +2313,13 @@ impl SolutionAgentStore {
                         // Assistant-shaped entry per flat markdown summary.
                         let (cold_entries, restored_created_ms) =
                             cold_entries_from_persisted(persisted, cx);
-                        let entries = crate::session_entry::rebuild_entries(
+                        crate::session_entry::rebuild_entries(
                             &cold_entries,
                             &[],
                             &restored_created_ms,
                             0,
                             cx,
-                        );
-                        let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
-                            cold_entries
-                                .iter()
-                                .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
-                                .collect();
-                        (entries, cold_persisted_v2)
+                        )
                     };
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
@@ -2488,7 +2340,6 @@ impl SolutionAgentStore {
                         } else {
                             s.epoch = epoch as u64;
                         }
-                        s.cold_persisted_v2 = cold_persisted_v2;
                         // Seed from the persisted metadata so the
                         // status-row meter shows the last-known total
                         // for cold tabs (no live thread → no
@@ -2681,8 +2532,8 @@ impl SolutionAgentStore {
                     let rows = rows_per_session.remove(&meta.id);
                     let migrating = rows.is_none();
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
-                    let (entries, cold_persisted_v2) = if let Some(rows) = rows {
-                        (entries_from_rows(rows), Vec::new())
+                    let entries = if let Some(rows) = rows {
+                        entries_from_rows(rows)
                     } else {
                         let persisted = blobs.remove(&meta.id).and_then(|bytes| {
                             serde_json::from_slice::<PersistedSession>(&bytes).ok()
@@ -2692,19 +2543,13 @@ impl SolutionAgentStore {
                             .map(|p| p.entry_created_ms.clone())
                             .unwrap_or_default();
                         let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
-                        let entries = crate::session_entry::rebuild_entries(
+                        crate::session_entry::rebuild_entries(
                             &cold_entries,
                             &[],
                             &restored_created_ms,
                             0,
                             cx,
-                        );
-                        let cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2> =
-                            cold_entries
-                                .iter()
-                                .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
-                                .collect();
-                        (entries, cold_persisted_v2)
+                        )
                     };
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
@@ -2725,7 +2570,6 @@ impl SolutionAgentStore {
                         } else {
                             s.epoch = epoch as u64;
                         }
-                        s.cold_persisted_v2 = cold_persisted_v2;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
                         s.tab_order = session_tab_order;
@@ -3028,25 +2872,20 @@ impl SolutionAgentStore {
             let mut rows = Some(rows);
             if let Some(entity) = this.sessions.get(&session_id).cloned() {
                 entity.update(cx, |session, cx| {
-                    let (entries, cold_persisted_v2) = if let Some(rows) =
+                    let entries = if let Some(rows) =
                         rows.take().filter(|r| !r.is_empty())
                     {
-                        (entries_from_rows(rows), Vec::new())
+                        entries_from_rows(rows)
                     } else {
                         let (cold_entries, created_ms) =
                             cold_entries_from_persisted(persisted, cx);
-                        let entries = crate::session_entry::rebuild_entries(
+                        crate::session_entry::rebuild_entries(
                             &cold_entries,
                             &[],
                             &created_ms,
                             0,
                             cx,
-                        );
-                        let cold_persisted_v2 = cold_entries
-                            .iter()
-                            .filter_map(|e| crate::cold_persistence::to_persisted(e, cx))
-                            .collect();
-                        (entries, cold_persisted_v2)
+                        )
                     };
                     session.entries = entries;
                     session.init_change_seq_from_entries();
@@ -3055,7 +2894,6 @@ impl SolutionAgentStore {
                     } else {
                         session.epoch = epoch as u64;
                     }
-                    session.cold_persisted_v2 = cold_persisted_v2;
                     session.hydrating = false;
                     // Drives the session view's `cx.observe(&session)` →
                     // re-render → cold-list resize catch-up so the freshly
@@ -3367,15 +3205,6 @@ impl SolutionAgentStore {
                     // hint should not survive past the rotation).
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
-                    // Compact archives the prior context and continues
-                    // in a fresh ACP session under the same tab. The
-                    // render path concatenates the cold prefix ahead of
-                    // the live thread, so without clearing them the
-                    // rotated tab would keep painting the
-                    // already-archived conversation. Both must be
-                    // wiped together so the post-rotate UI starts from
-                    // the (empty) live thread only.
-                    s.cold_persisted_v2.clear();
                     s.entries.clear();
                     s.bump_epoch();
                     // `set_acp_thread` emits ThreadReplaced + notify;
@@ -3535,7 +3364,6 @@ impl SolutionAgentStore {
                     // — "Done in Xs" must not survive a context wipe.
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
-                    s.cold_persisted_v2.clear();
                     s.entries.clear();
                     s.bump_epoch();
                     // Cache the (possibly freshly-built headless) project so
@@ -3802,30 +3630,6 @@ impl SolutionAgentStore {
                 .map(|i| i as i64);
             entity.update(cx, |s, _| s.tab_order = new_order);
         }
-    }
-
-    /// Schedule a debounce-friendly write of the session's serialised snapshot
-    /// to the persistence backend (if configured). The serialisation runs on
-    /// the foreground thread because it must read the `AcpThread` entity; the
-    /// SQLite write itself is dispatched to the background executor by
-    /// `SolutionAgentDb::save_blob`.
-    pub fn persist_session_blob(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get(&session_id).cloned() else {
-            return;
-        };
-        let Some(db) = self.persistence.clone() else {
-            return;
-        };
-        cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let blob: Vec<u8> = cx.update(|cx| {
-                let s = session.read(cx);
-                serializable_snapshot(s, cx)
-            });
-            if !blob.is_empty() {
-                db.save_blob(session_id, blob).await.log_err();
-            }
-        })
-        .detach();
     }
 
     /// Phase 4 row tuple: `(idx, mod_seq, created_ms, subagent_id, payload)`
