@@ -621,6 +621,13 @@ impl SolutionSession {
     /// full transcript reload. The caller picks the anchor: the persisted
     /// `change_seq` (restart-monotonic cursor) when available, else
     /// `max(mod_seq)` for legacy rows (see [`Self::restore_change_seq`]).
+    ///
+    /// The bump count (3, one per section watermark) is part of the
+    /// restart-determinism contract: a cold restore re-derives `change_seq =
+    /// anchor + 3` purely from the persisted anchor, so a cursor issued from a
+    /// prior boot's seed is always reproduced. Changing the count would make a
+    /// restart derive a different `change_seq` that could fall below an
+    /// already-issued cursor — keep it equal to the number of section watermarks.
     pub fn seed_change_seq(&mut self, anchor: u64) {
         self.change_seq = anchor;
         self.queue_seq = self.bump_change_seq();

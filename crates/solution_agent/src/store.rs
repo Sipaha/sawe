@@ -1166,9 +1166,13 @@ impl SolutionAgentStore {
     /// Used by the section `mark_*` helpers, which advance `change_seq` (via a
     /// watermark bump) WITHOUT touching any entry row, so the entry-persist
     /// helpers don't cover them. INVARIANT (Task 5.1b): the durable `change_seq`
-    /// must be >= every value ever handed to a delta client as `current_seq`, so
+    /// should track every value handed to a delta client as `current_seq`, so
     /// each watermark advance is flushed here before the matching section event
-    /// is emitted (and thus before any subsequent read could expose it).
+    /// is emitted — i.e. before any in-process read could expose it. The write
+    /// itself is detached, so a hard crash in the gap between issuing a cursor
+    /// and the flush landing can still leave durable briefly behind; the
+    /// `max()`-guarded UPDATE plus the deterministic restore seed absorb the
+    /// common cases (write reordering and no-activity restarts).
     fn persist_change_seq(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
         let Some(db) = self.persistence.clone() else {
             return;

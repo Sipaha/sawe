@@ -1074,8 +1074,16 @@ fn select_epoch(connection: &Connection, session_id: &str) -> Result<Option<i64>
 }
 
 fn update_change_seq(connection: &Connection, session_id: &str, change_seq: i64) -> Result<()> {
+    // `max(COALESCE(...), ?1)` keeps the durable value monotonic regardless of
+    // the order detached background writes land in: a lower write can never
+    // overwrite a higher one. This protects the Task 5.1b invariant (durable
+    // change_seq >= every issued cursor) against write reordering. COALESCE is
+    // required because SQLite's scalar `max(X, Y)` returns NULL if either arg is
+    // NULL (the legacy / first-write case).
     let mut stmt = connection.exec_bound::<(i64, String)>(indoc! {"
-        UPDATE solution_sessions SET change_seq = ?1 WHERE id = ?2
+        UPDATE solution_sessions
+        SET change_seq = max(COALESCE(change_seq, 0), ?1)
+        WHERE id = ?2
     "})?;
     stmt((change_seq, session_id.to_string()))?;
     Ok(())
@@ -1807,6 +1815,13 @@ mod tests {
         db.save_change_seq(meta.id, 42).await.unwrap();
         let updated = db.load_change_seq(meta.id).await.unwrap();
         assert_eq!(updated, Some(42));
+
+        // The UPDATE is `max`-guarded: a stale lower write (e.g. a detached
+        // background flush that lands out of order) must NOT roll the durable
+        // value back below an already-issued cursor.
+        db.save_change_seq(meta.id, 10).await.unwrap();
+        let guarded = db.load_change_seq(meta.id).await.unwrap();
+        assert_eq!(guarded, Some(42), "a lower write must not overwrite a higher durable change_seq");
     }
 
     #[gpui::test]
