@@ -605,7 +605,7 @@ impl SolutionSessionView {
         // hydrated. Seed it explicitly here so a restored cold tab
         // shows up on first frame, and tail-anchor so we land on the
         // latest message instead of the head.
-        let cold_count = view.session.read(cx).cold_entries.len();
+        let cold_count = view.session.read(cx).entries.len();
         if view.session.read(cx).acp_thread().is_none() && cold_count > 0 {
             view.list_state.reset(cold_count);
             view.list_state.set_follow_mode(FollowMode::Tail);
@@ -677,25 +677,25 @@ impl SolutionSessionView {
                 self._thread_subscription = None;
                 // Cold tab path: `list_state` drives the same
                 // virtualized list the live mode uses, so size it to
-                // `cold_entries.len()` here. Without this the list
-                // renders 0 rows even though `cold_entries` may have
-                // a full conversation. Tail-anchor + scroll_to_end so
-                // the user lands on the latest message — same as the
+                // `entries.len()` here. Without this the list renders
+                // 0 rows even though the cold prefix may have a full
+                // conversation. Tail-anchor + scroll_to_end so the
+                // user lands on the latest message — same as the
                 // live-resume case below.
-                let cold_count = self.session.read(cx).cold_entries.len();
+                let cold_count = self.session.read(cx).entries.len();
                 self.list_state.reset(cold_count);
                 self.list_state.set_follow_mode(FollowMode::Tail);
                 self.list_state.scroll_to_end();
             }
             Some(thread) => {
-                // Live mode count = cold + live, matching the render-
-                // path concatenation. Without including cold here the
-                // virtualized list would size to live-only and only
-                // render the rows added this session — silently
-                // wiping the visible history on the cold→live
-                // transition (the bug observed when the first send
-                // after editor restart cleared the conversation).
-                let cold_count = self.session.read(cx).cold_entries.len();
+                // Live mode count = cold prefix + live, matching the
+                // render-path concatenation. Without including the cold
+                // base here the virtualized list would size to live-only
+                // and only render the rows added this session — silently
+                // wiping the visible history on the cold→live transition
+                // (the bug observed when the first send after editor
+                // restart cleared the conversation).
+                let cold_count = self.session.read(cx).live_base;
                 let count = cold_count + thread.read(cx).entries().len();
                 let current = self.list_state.item_count();
                 // Cold→live promotion: the list already holds exactly the
@@ -801,10 +801,10 @@ impl SolutionSessionView {
         // All `AcpThreadEvent` indices are local to the live thread, but
         // the virtualized list is sized over the cold+live concatenation
         // (see render path + `sync_thread_subscription`). Offset every
-        // index passed to `list_state` by the cold-entry count so an
+        // index passed to `list_state` by the cold-prefix count so an
         // EntryUpdated for live[5] doesn't accidentally remeasure
         // cold[5].
-        let cold_offset = self.session.read(cx).cold_entries.len();
+        let cold_offset = self.session.read(cx).live_base;
         match event {
             NewEntry => {
                 let live_count = thread.read(cx).entries().len();

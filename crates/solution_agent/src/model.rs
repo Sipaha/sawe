@@ -346,26 +346,30 @@ pub struct SolutionSession {
     /// pressed Stop) drops the queue — which is the right default,
     /// but the "Send now" button needs the inverse behaviour.
     pub flush_after_cancel: bool,
-    /// Reconstructed `AgentThreadEntry` list loaded from
-    /// `solution_sessions.acp_thread_blob` at panel-open time.
-    /// Populated only for sessions restored by
-    /// `SolutionAgentStore::restore_open_tabs` — i.e. tabs whose
-    /// `acp_thread` is `None` because we deferred the agent subprocess
-    /// until the user actually sends a message. The session view feeds
-    /// these directly into the same virtualized list path as live mode
-    /// (each carries fresh `Markdown` widgets recreated by
-    /// `cold_persistence::from_persisted`), so the cold conversation
-    /// paints identically to its live form. Cleared once
-    /// `resume_session` attaches a real `AcpThread`.
-    pub cold_entries: Vec<acp_thread::AgentThreadEntry>,
+    /// Length of the cold-restored prefix in `entries` at the moment the live `AcpThread` was
+    /// attached. Used by the live-event handlers (`NewEntry`/`EntryUpdated`/`EntriesRemoved`)
+    /// to map a live thread's local entry index to a global index in `entries`. Set by
+    /// `set_acp_thread` to `entries.len()` when a thread is attached, and reset to `0` when
+    /// detached. For sessions that have never been restored from cold (fresh sessions or sessions
+    /// after `reset_context`/`rotate_context`), this is `0`.
+    pub live_base: usize,
+    /// Raw persisted form of the cold prefix (the entries from the blob that were restored before
+    /// the live `AcpThread` was attached). Kept for the snapshot path — `serializable_snapshot`
+    /// re-emits these directly without reconverting through `SessionEntry`. Cleared on
+    /// `reset_context`/`rotate_context` since the blob is then replaced by the live thread's
+    /// new transcript.
+    pub(crate) cold_persisted_v2: Vec<crate::cold_persistence::PersistedEntryV2>,
+    /// Creation timestamps (milliseconds since epoch) for the cold prefix entries, parallel to
+    /// `cold_persisted_v2`. Cleared on `reset_context`/`rotate_context`.
+    pub(crate) cold_persisted_ms: Vec<i64>,
     /// Store-maintained list of owned session entries for mobile delta-sync
     /// (Phase 2+). Mutated only through `set_entries` setter.
     pub entries: Vec<SessionEntry>,
     /// `true` while a restored tab's `acp_thread_blob` is still being
     /// deserialised on a background task. Set by the lazy-hydration path
     /// ([`SolutionAgentStore::restore_open_tabs_lazy`]) when a placeholder
-    /// session entity is materialised with empty `cold_entries`; cleared
-    /// once the blob lands and `cold_entries` is populated. The session
+    /// session entity is materialised with empty `entries`; cleared
+    /// once the blob lands and `entries` is populated. The session
     /// view renders a loading spinner (instead of "no messages yet") while
     /// this is `true` and there is no live thread, so a not-yet-hydrated
     /// background tab reads as "loading", not "empty". Always `false` for
@@ -488,7 +492,7 @@ pub struct SolutionSession {
 
 impl SolutionSession {
     /// Fresh, idle session with no live `AcpThread` attached. All
-    /// optional state (`title`, `cwd`, `cold_entries`, …) defaults to
+    /// optional state (`title`, `cwd`, `entries`, …) defaults to
     /// "empty"; callers should poke the relevant `pub` fields after
     /// construction. Use [`set_acp_thread`](Self::set_acp_thread) to
     /// attach the live thread once available.
@@ -520,7 +524,9 @@ impl SolutionSession {
             _acp_subscription: None,
             pending_messages: VecDeque::new(),
             flush_after_cancel: false,
-            cold_entries: Vec::new(),
+            live_base: 0,
+            cold_persisted_v2: Vec::new(),
+            cold_persisted_ms: Vec::new(),
             entries: Vec::new(),
             hydrating: false,
             last_turn_duration: None,
@@ -543,7 +549,7 @@ impl SolutionSession {
 
     /// `true` when this session was restored from the DB but the agent
     /// subprocess hasn't been spawned yet — so rendering must come
-    /// from `cold_entries` rather than `acp_thread.entries()`.
+    /// from `entries` (the cold-restored prefix) rather than `acp_thread.entries()`.
     pub fn is_cold(&self) -> bool {
         self.acp_thread.is_none()
     }
@@ -566,6 +572,7 @@ impl SolutionSession {
     /// `SessionView::_thread_subscription` on the dead thread and
     /// silently halts conversation-list rendering for that session.
     pub fn set_acp_thread(&mut self, thread: Option<Entity<AcpThread>>, cx: &mut Context<Self>) {
+        self.live_base = if thread.is_some() { self.entries.len() } else { 0 };
         self.acp_thread = thread;
         cx.emit(SolutionSessionEvent::ThreadReplaced);
         cx.notify();
@@ -648,7 +655,9 @@ mod tests {
             _acp_subscription: None,
             pending_messages: VecDeque::new(),
             flush_after_cancel: false,
-            cold_entries: Vec::new(),
+            live_base: 0,
+            cold_persisted_v2: Vec::new(),
+            cold_persisted_ms: Vec::new(),
             entries: Vec::new(),
             hydrating: false,
             last_turn_duration: None,

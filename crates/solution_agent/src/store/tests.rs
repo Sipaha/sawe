@@ -1529,25 +1529,21 @@ async fn reset_context_swaps_acp_thread_without_bumping_count(cx: &mut TestAppCo
 
 #[gpui::test]
 async fn reset_context_clears_cold_entries(cx: &mut TestAppContext) {
+    use crate::cold_persistence::{PersistedAssistantChunk, PersistedAssistantMessage, PersistedEntryV2};
     let (session_id, _old_thread, _tmp) = create_session_with_thread(cx).await;
 
-    // Stamp a fake cold entry so we can prove `reset_context` clears it.
+    // Stamp a fake cold prefix so we can prove `reset_context` clears it.
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             let session = store.session(session_id).expect("session exists");
-            session.update(cx, |s, _| {
-                s.cold_entries
-                    .push(acp_thread::AgentThreadEntry::AssistantMessage(
-                        acp_thread::AssistantMessage {
-                            chunks: Vec::new(),
-                            indented: false,
-                            is_subagent_output: false,
-                            subagent_id: None,
-                        },
-                    ));
+            session.update(cx, |s, cx| {
+                s.cold_persisted_v2.push(PersistedEntryV2::Assistant(PersistedAssistantMessage {
+                    chunks: vec![PersistedAssistantChunk::Message("cold msg".into())],
+                }));
+                s.cold_persisted_ms.push(1_700_000_000_000);
+                cx.notify();
             });
-            cx.notify();
         });
     });
 
@@ -1564,10 +1560,11 @@ async fn reset_context_clears_cold_entries(cx: &mut TestAppContext) {
             let session = store.session(session_id).expect("session exists");
             let s = session.read(cx);
             assert!(
-                s.cold_entries.is_empty(),
-                "reset_context should drop cold_entries (was {:?})",
-                s.cold_entries.len()
+                s.cold_persisted_v2.is_empty(),
+                "reset_context should drop cold_persisted_v2 (was {:?})",
+                s.cold_persisted_v2.len()
             );
+            assert!(s.entries.is_empty(), "reset_context should drop entries");
         });
     });
 }
@@ -1743,19 +1740,19 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
             let sb = store.session(id_b).expect("session B restored");
             sa.read_with(cx, |s, _| {
                 assert!(s.is_cold(), "restored session should be cold");
-                assert_eq!(s.cold_entries.len(), 1);
+                assert_eq!(s.entries.len(), 1);
                 // v1 blobs hydrate as Assistant-shaped legacy rows
                 // (the old `role` field is no longer round-tripped —
                 // structured v2 carries the real role per variant).
                 assert!(matches!(
-                    s.cold_entries[0],
-                    acp_thread::AgentThreadEntry::AssistantMessage(_)
+                    s.entries[0].kind,
+                    crate::session_entry::SessionEntryKind::AssistantMessage { .. }
                 ));
             });
             sb.read_with(cx, |s, _| {
                 assert!(s.is_cold());
-                // No blob saved for B → cold_entries empty.
-                assert!(s.cold_entries.is_empty());
+                // No blob saved for B → entries empty.
+                assert!(s.entries.is_empty());
             });
             // sessions_for is what the navigator's reconcile path
             // reads; insertion order into `by_solution` must match
@@ -1860,6 +1857,109 @@ fn persisted_session_roundtrips_with_structured_entries() {
     assert!(matches!(decoded.entries[2].role, PersistedRole::Tool));
     assert_eq!(decoded.entries[0].markdown, "Hello");
     assert_eq!(decoded.entry_summaries.len(), 3);
+}
+
+/// Task 5: cold-restored session exposes transcript via `entries` (not `cold_entries`).
+/// `is_cold()` is true (no live thread) and `entries` is non-empty.
+#[gpui::test]
+async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
+    use crate::cold_persistence::{
+        PersistedAssistantChunk, PersistedAssistantMessage, PersistedEntryV2, PersistedUserMessage,
+    };
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.set_persistence(db.clone());
+        });
+    });
+
+    let id_a = crate::model::SolutionSessionId::new();
+    let agent_id = SharedString::from("claude-acp");
+    let now = Utc::now();
+
+    let meta_a = crate::model::SolutionSessionMetadata {
+        id: id_a,
+        solution_id: solution_id.clone(),
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        title: SharedString::from("session A"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+    };
+    db.save_metadata(meta_a).await.expect("meta a");
+
+    let blob_a = serde_json::to_vec(&PersistedSession {
+        title: "session A".into(),
+        entries: vec![],
+        entry_summaries: vec![],
+        entries_v2: vec![
+            PersistedEntryV2::User(PersistedUserMessage {
+                id: None,
+                content_md: "first prompt".into(),
+                chunks: vec![],
+            }),
+            PersistedEntryV2::Assistant(PersistedAssistantMessage {
+                chunks: vec![PersistedAssistantChunk::Message("reply".into())],
+            }),
+        ],
+        entry_created_ms: vec![1_700_000_000_000, 1_700_000_001_000],
+        available_models: vec![],
+        desired_model: None,
+        desired_effort: None,
+    })
+    .unwrap();
+    db.save_blob(id_a, blob_a).await.expect("blob a");
+    db.update_tab_orders(solution_id.clone(), vec![id_a])
+        .await
+        .expect("tab order");
+
+    let ordered = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.restore_open_tabs(solution_id.clone(), cx)
+            })
+        })
+        .await
+        .expect("restore");
+    assert_eq!(ordered, vec![id_a]);
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sa = store.session(id_a).expect("session A restored");
+            sa.read_with(cx, |s, _| {
+                assert!(s.is_cold(), "restored session should be cold");
+                assert_eq!(s.entries.len(), 2, "entries must hold the 2 restored entries");
+                assert_eq!(s.live_base, 0, "cold session has live_base = 0 (no live thread)");
+                assert!(
+                    matches!(
+                        s.entries[0].kind,
+                        crate::session_entry::SessionEntryKind::UserMessage { .. }
+                    ),
+                    "first entry must be UserMessage"
+                );
+                assert!(
+                    matches!(
+                        s.entries[1].kind,
+                        crate::session_entry::SessionEntryKind::AssistantMessage { .. }
+                    ),
+                    "second entry must be AssistantMessage"
+                );
+                assert_eq!(s.entries[0].created_ms, 1_700_000_000_000);
+                assert_eq!(s.entries[1].created_ms, 1_700_000_001_000);
+            });
+        });
+    });
 }
 
 #[test]
@@ -5546,12 +5646,12 @@ async fn new_entry_rebuilds_session_entries(cx: &mut TestAppContext) {
             .session(session_id)
             .expect("session exists");
         let s = session.read(cx);
-        // Cold is empty for a fresh session; live has 2 entries → entries must be 2.
+        // Cold prefix is empty for a fresh session; live has 2 entries → entries must be 2.
         assert_eq!(
             s.entries.len(),
             2,
             "entries must equal cold({}) + live(2) after two NewEntry events",
-            s.cold_entries.len()
+            s.live_base
         );
         // The last entry must be the assistant message we just appended.
         assert!(

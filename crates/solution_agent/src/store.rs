@@ -699,39 +699,48 @@ fn serializable_snapshot(session: &SolutionSession, cx: &App) -> Vec<u8> {
     // The visible conversation is the cold+live concatenation (see the
     // render path in `session_view.rs::render_conversation_body` and the
     // matching `sync_thread_subscription` list_state sizing). The blob
-    // we persist must mirror that — otherwise persist drops cold_entries
-    // every snapshot and the next reload shows only this-session
-    // entries (the "history disappears after first send" regression
-    // observed once cold→live render concatenation was wired up).
+    // we persist must mirror that — otherwise persist drops the cold prefix
+    // every snapshot and the next reload shows only this-session entries.
     //
-    // Each `(role, persisted_v2_payload, ms)` triple is built once and
-    // both the v1 mirror (`entries` + flat `entry_summaries` for the
-    // MCP read tool) and the v2 structured payload are filled from it,
-    // so the two stay aligned. In-flight tool calls drop out via
-    // `to_persisted` returning `None`; their ms is dropped too so
-    // `entries_v2` and `entry_created_ms` keep their 1:1 invariant.
-    let cold_count = session.cold_entries.len();
+    // The cold prefix is already in `cold_persisted_v2` / `cold_persisted_ms`
+    // (raw wire form); emit those directly — no round-trip through
+    // `from_persisted`/`to_persisted` (which requires `&mut App`).
+    // The live thread's entries go through the normal `to_persisted` path.
+    // In-flight tool calls drop out via `to_persisted` returning `None`;
+    // their ms is dropped too so `entries_v2` and `entry_created_ms`
+    // keep their 1:1 invariant.
+    let cold_count = session.cold_persisted_v2.len();
     let live_entries: Vec<&acp_thread::AgentThreadEntry> = session
         .acp_thread()
         .map(|thread| thread.read(cx).entries().iter().collect())
         .unwrap_or_default();
-    let combined: Vec<(usize, &acp_thread::AgentThreadEntry)> = session
-        .cold_entries
-        .iter()
-        .enumerate()
-        .chain(
-            live_entries
-                .iter()
-                .enumerate()
-                .map(|(i, e)| (cold_count + i, *e)),
-        )
-        .collect();
 
-    let mut entries = Vec::with_capacity(combined.len());
-    let mut entry_summaries = Vec::with_capacity(combined.len());
-    let mut entries_v2 = Vec::with_capacity(combined.len());
-    let mut entry_created_ms = Vec::with_capacity(combined.len());
-    for (global_index, entry) in &combined {
+    let mut entries = Vec::with_capacity(cold_count + live_entries.len());
+    let mut entry_summaries = Vec::with_capacity(cold_count + live_entries.len());
+    let mut entries_v2 = Vec::with_capacity(cold_count + live_entries.len());
+    let mut entry_created_ms = Vec::with_capacity(cold_count + live_entries.len());
+
+    // Cold prefix: re-emit the already-persisted v2 entries directly.
+    for (cold_idx, v2) in session.cold_persisted_v2.iter().enumerate() {
+        let markdown = markdown_from_persisted_v2(v2);
+        let role = persisted_role_for_v2(v2);
+        entries.push(PersistedEntry {
+            role,
+            markdown: markdown.clone(),
+        });
+        entry_summaries.push(markdown);
+        entries_v2.push(v2.clone());
+        entry_created_ms.push(
+            session
+                .entries
+                .get(cold_idx)
+                .map(|e| e.created_ms)
+                .unwrap_or(crate::model::NO_TIMESTAMP_MS),
+        );
+    }
+
+    // Live entries: go through the normal to_persisted path.
+    for (local_idx, entry) in live_entries.iter().enumerate() {
         if let Some(persisted) = crate::cold_persistence::to_persisted(entry, cx) {
             let markdown = entry.to_markdown(cx);
             entries.push(PersistedEntry {
@@ -740,17 +749,17 @@ fn serializable_snapshot(session: &SolutionSession, cx: &App) -> Vec<u8> {
             });
             entry_summaries.push(markdown);
             entries_v2.push(persisted);
-            // Read the creation time from `session.entries` at the same global
-            // index — that's where `created_ms` now lives per entry.
+            let global_idx = cold_count + local_idx;
             entry_created_ms.push(
                 session
                     .entries
-                    .get(*global_index)
+                    .get(global_idx)
                     .map(|e| e.created_ms)
                     .unwrap_or(crate::model::NO_TIMESTAMP_MS),
             );
         }
     }
+
     let snapshot = PersistedSession {
         title: session.title.to_string(),
         entries,
@@ -762,6 +771,50 @@ fn serializable_snapshot(session: &SolutionSession, cx: &App) -> Vec<u8> {
         desired_effort: session.desired_effort.clone(),
     };
     serde_json::to_vec(&snapshot).unwrap_or_default()
+}
+
+/// Extract a flat markdown summary from a `PersistedEntryV2` without needing a
+/// GPUI context. Used by `serializable_snapshot` for the cold prefix.
+fn markdown_from_persisted_v2(v2: &crate::cold_persistence::PersistedEntryV2) -> String {
+    use crate::cold_persistence::{PersistedAssistantChunk, PersistedEntryV2};
+    match v2 {
+        PersistedEntryV2::User(msg) => msg.content_md.clone(),
+        PersistedEntryV2::Assistant(msg) => msg
+            .chunks
+            .iter()
+            .map(|chunk| match chunk {
+                PersistedAssistantChunk::Message(s) | PersistedAssistantChunk::Thought(s) => {
+                    s.as_str()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        PersistedEntryV2::Tool(call) => {
+            let content: Vec<&str> = call.content.iter().map(|c| c.markdown.as_str()).collect();
+            if content.is_empty() {
+                call.label_md.clone()
+            } else {
+                content.join("\n")
+            }
+        }
+        PersistedEntryV2::Plan(entries) => entries
+            .iter()
+            .map(|e| e.content_md.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn persisted_role_for_v2(
+    v2: &crate::cold_persistence::PersistedEntryV2,
+) -> PersistedRole {
+    use crate::cold_persistence::PersistedEntryV2;
+    match v2 {
+        PersistedEntryV2::User(_) => PersistedRole::User,
+        PersistedEntryV2::Assistant(_) => PersistedRole::Assistant,
+        PersistedEntryV2::Tool(_) => PersistedRole::Tool,
+        PersistedEntryV2::Plan(_) => PersistedRole::Assistant,
+    }
 }
 
 fn persisted_role_for(entry: &acp_thread::AgentThreadEntry) -> PersistedRole {
@@ -1600,7 +1653,7 @@ impl SolutionAgentStore {
                         cx.emit(SolutionAgentStoreEvent::SessionQueueChanged(session_id));
                     }
                 } else {
-                    // Hydrate cold_entries from the preloaded blob
+                    // Hydrate cold prefix from the preloaded blob
                     // BEFORE attaching the live thread. claude --resume
                     // does NOT re-emit the transcript through
                     // stream-json, and `build_entries` concatenates
@@ -1609,6 +1662,14 @@ impl SolutionAgentStore {
                     // subprocess will happily continue from where it
                     // left off in the background (the close→reopen
                     // empty-history bug).
+                    let raw_v2 = preloaded_persisted
+                        .as_ref()
+                        .map(|p| p.entries_v2.clone())
+                        .unwrap_or_default();
+                    let raw_ms = preloaded_persisted
+                        .as_ref()
+                        .map(|p| p.entry_created_ms.clone())
+                        .unwrap_or_default();
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(preloaded_persisted, cx);
                     let entity = cx.new(|cx| {
@@ -1634,7 +1695,8 @@ impl SolutionAgentStore {
                             &restored_created_ms,
                             cx,
                         );
-                        s.cold_entries = cold_entries;
+                        s.cold_persisted_v2 = raw_v2;
+                        s.cold_persisted_ms = raw_ms;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
                         s
                     });
@@ -2279,6 +2341,14 @@ impl SolutionAgentStore {
                     let restored_desired_effort = persisted
                         .as_ref()
                         .and_then(|p| p.desired_effort.clone());
+                    let raw_v2 = persisted
+                        .as_ref()
+                        .map(|p| p.entries_v2.clone())
+                        .unwrap_or_default();
+                    let raw_ms = persisted
+                        .as_ref()
+                        .map(|p| p.entry_created_ms.clone())
+                        .unwrap_or_default();
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(persisted, cx);
                     let cold_entries_for_entries =
@@ -2296,7 +2366,8 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
-                        s.cold_entries = cold_entries;
+                        s.cold_persisted_v2 = raw_v2;
+                        s.cold_persisted_ms = raw_ms;
                         // Seed from the persisted metadata so the
                         // status-row meter shows the last-known total
                         // for cold tabs (no live thread → no
@@ -2465,45 +2536,11 @@ impl SolutionAgentStore {
                         .as_ref()
                         .map(|p| p.entry_created_ms.clone())
                         .unwrap_or_default();
-                    let cold_entries: Vec<acp_thread::AgentThreadEntry> = persisted
-                        .map(|persisted| {
-                            if !persisted.entries_v2.is_empty() {
-                                persisted
-                                    .entries_v2
-                                    .into_iter()
-                                    .map(|p| crate::cold_persistence::from_persisted(p, cx))
-                                    .collect()
-                            } else {
-                                let legacy_sources: Vec<String> =
-                                    if !persisted.entry_summaries.is_empty() {
-                                        persisted.entry_summaries
-                                    } else {
-                                        persisted
-                                            .entries
-                                            .into_iter()
-                                            .map(|e| e.markdown)
-                                            .collect()
-                                    };
-                                legacy_sources
-                                    .into_iter()
-                                    .map(|md| {
-                                        crate::cold_persistence::from_persisted(
-                                            crate::cold_persistence::PersistedEntryV2::Assistant(
-                                                crate::cold_persistence::PersistedAssistantMessage {
-                                                    chunks: vec![
-                                                        crate::cold_persistence::PersistedAssistantChunk::Message(
-                                                            md,
-                                                        ),
-                                                    ],
-                                                },
-                                            ),
-                                            cx,
-                                        )
-                                    })
-                                    .collect()
-                            }
-                        })
+                    let raw_v2 = persisted
+                        .as_ref()
+                        .map(|p| p.entries_v2.clone())
                         .unwrap_or_default();
+                    let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
                     let cold_entries_for_entries = crate::session_entry::rebuild_entries(
                         &cold_entries,
@@ -2524,7 +2561,8 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
-                        s.cold_entries = cold_entries;
+                        s.cold_persisted_v2 = raw_v2;
+                        s.cold_persisted_ms = restored_created_ms;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
                         s.tab_order = session_tab_order;
@@ -2713,7 +2751,6 @@ impl SolutionAgentStore {
                         // Blob not loaded yet — left empty, filled by the
                         // background pass below. `hydrating` flips the
                         // session view's empty state to a spinner.
-                        s.cold_entries = Vec::new();
                         s.hydrating = true;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
@@ -2809,6 +2846,14 @@ impl SolutionAgentStore {
                 blob.and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
             if let Some(entity) = this.sessions.get(&session_id).cloned() {
                 entity.update(cx, |session, cx| {
+                    let raw_v2 = persisted
+                        .as_ref()
+                        .map(|p| p.entries_v2.clone())
+                        .unwrap_or_default();
+                    let raw_ms = persisted
+                        .as_ref()
+                        .map(|p| p.entry_created_ms.clone())
+                        .unwrap_or_default();
                     let (cold_entries, created_ms) = cold_entries_from_persisted(persisted, cx);
                     session.entries = crate::session_entry::rebuild_entries(
                         &cold_entries,
@@ -2816,7 +2861,8 @@ impl SolutionAgentStore {
                         &created_ms,
                         cx,
                     );
-                    session.cold_entries = cold_entries;
+                    session.cold_persisted_v2 = raw_v2;
+                    session.cold_persisted_ms = raw_ms;
                     session.hydrating = false;
                     // Drives the session view's `cx.observe(&session)` →
                     // re-render → cold-list resize catch-up so the freshly
@@ -3124,13 +3170,14 @@ impl SolutionAgentStore {
                     s.last_turn_duration = None;
                     // Compact archives the prior context and continues
                     // in a fresh ACP session under the same tab. The
-                    // render path concatenates `cold_entries` ahead of
+                    // render path concatenates the cold prefix ahead of
                     // the live thread, so without clearing them the
                     // rotated tab would keep painting the
                     // already-archived conversation. Both must be
                     // wiped together so the post-rotate UI starts from
                     // the (empty) live thread only.
-                    s.cold_entries.clear();
+                    s.cold_persisted_v2.clear();
+                    s.cold_persisted_ms.clear();
                     s.entries.clear();
                     // `set_acp_thread` emits ThreadReplaced + notify;
                     // last so SessionView re-attaches against a fully
@@ -3284,7 +3331,8 @@ impl SolutionAgentStore {
                     // — "Done in Xs" must not survive a context wipe.
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
-                    s.cold_entries.clear();
+                    s.cold_persisted_v2.clear();
+                    s.cold_persisted_ms.clear();
                     s.entries.clear();
                     // Cache the (possibly freshly-built headless) project so
                     // a subsequent reset/restart on this now-live session
@@ -4856,7 +4904,7 @@ impl SolutionAgentStore {
                 // transition would overwrite a cold entry in `session.entries`.
                 let (cold_count, live_last_local) = {
                     let session = session_entity.read(cx);
-                    let cold = session.cold_entries.len();
+                    let cold = session.live_base;
                     let live_last = session
                         .acp_thread()
                         .map(|thread| thread.read(cx).entries().len().saturating_sub(1))
@@ -4882,10 +4930,12 @@ impl SolutionAgentStore {
                     for gap_idx in current_len..global_entry_index {
                         // These are pre-existing entries whose creation time was never
                         // captured; convert from cold or live and stamp with the sentinel.
-                        let entry = if gap_idx < s.cold_entries.len() {
-                            crate::session_entry::to_session_entry(&s.cold_entries[gap_idx], cx)
+                        let live_base = s.live_base;
+                        let entry = if gap_idx < live_base {
+                            // Already materialized as a SessionEntry during cold restore.
+                            s.entries[gap_idx].clone()
                         } else {
-                            let local = gap_idx - s.cold_entries.len();
+                            let local = gap_idx - live_base;
                             if let Some(e) = live.get(local) {
                                 crate::session_entry::to_session_entry(e, cx)
                             } else {
@@ -4898,7 +4948,7 @@ impl SolutionAgentStore {
                     }
                     // The new entry at global_entry_index, stamped with now_ms.
                     if current_len + additions.len() == global_entry_index {
-                        let local = global_entry_index - s.cold_entries.len();
+                        let local = global_entry_index - s.live_base;
                         if let Some(live_entry) = live.get(local) {
                             let mut new_entry =
                                 crate::session_entry::to_session_entry(live_entry, cx);
@@ -5227,8 +5277,8 @@ impl SolutionAgentStore {
                 // Truncate `session.entries` to match: a rewind removes all
                 // entries from `range.start` onward (in global index space).
                 // Cold entries are never removed by a live-thread rewind, so
-                // the truncation point is `cold_count + range.start`.
-                let cold_count = session_entity.read(cx).cold_entries.len();
+                // the truncation point is `live_base + range.start`.
+                let cold_count = session_entity.read(cx).live_base;
                 let global_truncate = cold_count + range.start;
                 session_entity.update(cx, |s, cx| {
                     s.entries.truncate(global_truncate);
@@ -5351,7 +5401,7 @@ impl SolutionAgentStore {
                 // Incremental EntryUpdated: reconvert only the changed entry and
                 // replace it in `session.entries`, preserving its `created_ms`
                 // (no restamp — the creation time is fixed at first append).
-                let cold_count = session_entity.read(cx).cold_entries.len();
+                let cold_count = session_entity.read(cx).live_base;
                 let global_idx = cold_count + *idx;
                 let updated_entry = {
                     let s = session_entity.read(cx);

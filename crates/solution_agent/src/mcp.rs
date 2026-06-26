@@ -1296,15 +1296,24 @@ impl McpServerTool for GetSessionTool {
             let entity = store
                 .read_with(cx, |store, _| store.session(session_id))
                 .with_context(|| format!("session_not_found: {}", session_id))?;
+            // Clone the cold v2 entries before taking the long-lived `session`
+            // borrow so that `from_persisted` (which needs `&mut App`) can be
+            // called on the cloned data without conflicting borrows.
+            let cold_v2_cloned: Vec<crate::cold_persistence::PersistedEntryV2> =
+                entity.read(cx).cold_persisted_v2.clone();
+            let cold_acp: Vec<acp_thread::AgentThreadEntry> = cold_v2_cloned
+                .into_iter()
+                .map(|v2| crate::cold_persistence::from_persisted(v2, cx))
+                .collect();
             let session = entity.read(cx);
             // Live sessions have an attached `acp_thread`; cold (sleeping)
-            // sessions don't — but they still have `cold_entries`
+            // sessions don't — but they still have entries from `cold_persisted_v2`
             // reconstructed from the persisted blob on disk. Without this
             // fallback the mobile client sees an empty chat for any
             // session whose subprocess hasn't been respawned yet (a
             // common state for any session you scroll past without
             // tapping into).
-            // History after restart lives in `cold_entries` (rebuilt from
+            // History after restart lives in the cold prefix (rebuilt from
             // the persisted blob on disk); messages produced AFTER the
             // resume land in the new `AcpThread.entries()`. `claude
             // --resume <id>` does NOT re-emit the transcript through
@@ -1315,8 +1324,7 @@ impl McpServerTool for GetSessionTool {
                 .acp_thread()
                 .map(|thread| thread.read(cx).entries().iter().collect())
                 .unwrap_or_default();
-            let mut entries_ref: Vec<&acp_thread::AgentThreadEntry> =
-                session.cold_entries.iter().collect();
+            let mut entries_ref: Vec<&acp_thread::AgentThreadEntry> = cold_acp.iter().collect();
             entries_ref.extend(live_entries);
             let (entries, total_count) = {
                 // R-6e: index-anchored slice. `after_index` /
