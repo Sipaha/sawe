@@ -998,6 +998,151 @@ fn dispatch_mouse_move(
     );
 }
 
+// =====================================================================
+// windows.screenshot
+// =====================================================================
+
+/// Capture a screenshot of the editor window with the given `window_id`.
+/// Returns the image as base64 in the MCP `content` array (an `image`
+/// block the Read tool / an LLM can view directly) AND in
+/// `structured_content`. Default format is JPEG quality 80 for token
+/// efficiency; pass `format: "png"` for a pixel-perfect capture.
+///
+/// Renders the window's current scene into an offscreen texture via
+/// `gpui::Window::render_to_image` (the wgpu `render_to_image` path), so it
+/// works under the native `--headless` platform with no X server and is
+/// immune to other windows covering the editor.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct ScreenshotParams {
+    pub window_id: String,
+    /// Image format: "jpeg" (default), "png", or "webp".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Quality 1..=100 for jpeg/webp (ignored for png). Default: 80.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
+    /// Optional max dimension; if either width or height exceeds this, the
+    /// image is downscaled while preserving aspect ratio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_dimension: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for ScreenshotParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            window_id: String,
+            format: Option<String>,
+            quality: Option<u8>,
+            max_dimension: Option<u32>,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(ScreenshotParams {
+            window_id: inner.window_id,
+            format: inner.format,
+            quality: inner.quality,
+            max_dimension: inner.max_dimension,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ScreenshotResult {
+    pub width: u32,
+    pub height: u32,
+    pub media_type: String,
+    /// Base64-encoded image bytes (same payload as the `content` image block).
+    pub base64_data: String,
+}
+
+#[derive(Clone)]
+pub struct ScreenshotTool;
+
+impl McpServerTool for ScreenshotTool {
+    type Input = ScreenshotParams;
+    type Output = ScreenshotResult;
+    const NAME: &'static str = "windows.screenshot";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.window_id.is_empty(),
+            "invalid_params: window_id is required"
+        );
+        let format = input
+            .format
+            .as_deref()
+            .unwrap_or("jpeg")
+            .to_ascii_lowercase();
+        let quality = input.quality.unwrap_or(80).clamp(1, 100);
+
+        let rgba = cx.update(|cx| -> anyhow::Result<image::RgbaImage> {
+            let handle = find_window_by_id(&input.window_id, cx)?;
+            handle
+                .update(cx, |_view, window, _cx| window.render_to_image())
+                .map_err(|err| anyhow::anyhow!("render_to_image failed: {err}"))?
+        })?;
+
+        let (orig_w, orig_h) = rgba.dimensions();
+        let resized = match input.max_dimension {
+            Some(max_dim) if orig_w.max(orig_h) > max_dim => {
+                let scale = max_dim as f32 / orig_w.max(orig_h) as f32;
+                let new_w = ((orig_w as f32 * scale).round() as u32).max(1);
+                let new_h = ((orig_h as f32 * scale).round() as u32).max(1);
+                image::imageops::resize(&rgba, new_w, new_h, image::imageops::FilterType::Lanczos3)
+            }
+            _ => rgba,
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        let media_type: &'static str = match format.as_str() {
+            "png" => {
+                resized
+                    .write_to(&mut cursor, image::ImageFormat::Png)
+                    .map_err(|e| anyhow::anyhow!("encode png: {e}"))?;
+                "image/png"
+            }
+            "webp" => {
+                resized
+                    .write_to(&mut cursor, image::ImageFormat::WebP)
+                    .map_err(|e| anyhow::anyhow!("encode webp: {e}"))?;
+                "image/webp"
+            }
+            "jpeg" | "jpg" => {
+                let rgb = image::DynamicImage::ImageRgba8(resized.clone()).to_rgb8();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality)
+                    .encode_image(&rgb)
+                    .map_err(|e| anyhow::anyhow!("encode jpeg: {e}"))?;
+                "image/jpeg"
+            }
+            other => anyhow::bail!("unsupported_format: {other}"),
+        };
+
+        use base64::Engine as _;
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(&buf);
+        let width = resized.width();
+        let height = resized.height();
+
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Image {
+                data: base64_data.clone(),
+                mime_type: media_type.to_string(),
+            }],
+            structured_content: ScreenshotResult {
+                width,
+                height,
+                media_type: media_type.to_string(),
+                base64_data,
+            },
+        })
+    }
+}
+
 fn find_window_by_id(window_id: &str, cx: &mut App) -> anyhow::Result<gpui::AnyWindowHandle> {
     // Mirror the iteration order used by `windows.list`: prefer Z-ordered
     // stack, fall back to the unstable slot-map iteration so both tools

@@ -184,6 +184,7 @@ const GLOBAL_TOOLS: &[&str] = &[
     "windows.hover_at",
     "windows.hover_id",
     "windows.dump_visual_structure",
+    "windows.screenshot",
     // Remote Control surface. Every tool the Android client can reach through
     // `remote_control::allow_list` MUST live on the global socket: the mobile
     // proxy (`remote_control::proxy::connect`) dials `editor_mcp::socket_path()`

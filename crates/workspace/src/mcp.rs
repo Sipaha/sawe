@@ -47,4 +47,7 @@ pub fn register(cx: &mut App) {
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(windows::HoverIdTool);
     });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(windows::ScreenshotTool);
+    });
 }
