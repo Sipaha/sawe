@@ -1695,8 +1695,10 @@ impl SolutionAgentStore {
                             &cold_entries,
                             &[],
                             &restored_created_ms,
+                            0,
                             cx,
                         );
+                        s.init_change_seq_from_entries();
                         s.cold_persisted_v2 = cold_persisted_v2;
                         s.set_acp_thread(Some(acp_thread.clone()), cx);
                         s
@@ -2345,7 +2347,7 @@ impl SolutionAgentStore {
                     let (cold_entries, restored_created_ms) =
                         cold_entries_from_persisted(persisted, cx);
                     let cold_entries_for_entries =
-                        crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, cx);
+                        crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, 0, cx);
                     // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
                     // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
                     // are also captured. For v2 blobs this is equivalent to cloning
@@ -2369,6 +2371,7 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
+                        s.init_change_seq_from_entries();
                         s.cold_persisted_v2 = cold_persisted_v2;
                         // Seed from the persisted metadata so the
                         // status-row meter shows the last-known total
@@ -2544,6 +2547,7 @@ impl SolutionAgentStore {
                         &cold_entries,
                         &[],
                         &restored_created_ms,
+                        0,
                         cx,
                     );
                     // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
@@ -2569,6 +2573,7 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = cold_entries_for_entries;
+                        s.init_change_seq_from_entries();
                         s.cold_persisted_v2 = cold_persisted_v2;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
@@ -2858,8 +2863,10 @@ impl SolutionAgentStore {
                         &cold_entries,
                         &[],
                         &created_ms,
+                        0,
                         cx,
                     );
+                    session.init_change_seq_from_entries();
                     // Build cold_persisted_v2 from the loaded AgentThreadEntry values so
                     // that legacy blobs (entries_v2 empty, entries/entry_summaries used)
                     // are also captured. For v2 blobs this is equivalent to cloning

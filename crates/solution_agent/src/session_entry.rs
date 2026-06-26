@@ -192,22 +192,29 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
     }
 }
 
-/// Rebuild the unified entry list from a cold prefix and a live thread slice.
+/// Rebuild the entry list from a cold prefix for a cold restore.
 ///
-/// Converts `cold` then `live` in order via [`to_session_entry`], stamping
-/// each result's `created_ms` from the index-aligned `created_ms` slice (0
-/// when absent). The global index counts across cold then live so the
-/// alignment matches `entry_created_ms` in the store.
+/// Converts `cold` in order via [`to_session_entry`], stamping each result's
+/// `created_ms` from the index-aligned `created_ms` slice (0 when absent) and
+/// its `mod_seq` as `base_seq + 1 + index` so that cold-restored entries carry
+/// ascending, non-zero sequence numbers. The caller is responsible for calling
+/// `init_change_seq_from_entries` after `set_entries` so that the first live
+/// append continues monotonically from `n+1`.
+///
+/// `live` is accepted for API compatibility but must always be empty; live
+/// entries are appended by the store's `NewEntry` handler.
 pub fn rebuild_entries(
     cold: &[AgentThreadEntry],
     live: &[AgentThreadEntry],
     created_ms: &[i64],
+    base_seq: u64,
     cx: &App,
 ) -> Vec<SessionEntry> {
     let mut entries = Vec::with_capacity(cold.len() + live.len());
     for (global_idx, entry) in cold.iter().chain(live.iter()).enumerate() {
         let mut session_entry = to_session_entry(entry, cx);
         session_entry.created_ms = created_ms.get(global_idx).copied().unwrap_or(0);
+        session_entry.mod_seq = base_seq + 1 + global_idx as u64;
         entries.push(session_entry);
     }
     entries

@@ -2023,7 +2023,7 @@ async fn legacy_blob_cold_history_survives_snapshot(cx: &mut TestAppContext) {
         let cold_v2_len = cold_persisted_v2.len();
         // Rebuild session entries before moving cold_persisted_v2 and cold_entries.
         let session_entries =
-            crate::session_entry::rebuild_entries(&cold_entries, &[], &[], cx);
+            crate::session_entry::rebuild_entries(&cold_entries, &[], &[], 0, cx);
         let session = cx.new(|_| {
             let mut s = crate::model::SolutionSession::new_idle(
                 session_id,
@@ -5999,6 +5999,119 @@ async fn new_entry_after_cold_prefix_lands_at_live_base(cx: &mut TestAppContext)
             matches!(s.entries[2].kind, SessionEntryKind::UserMessage { .. }),
             "live entry at entries[2] must be UserMessage, got {:?}",
             s.entries[2].kind
+        );
+    });
+}
+
+/// Phase 3, Task 3: cold-restored entries get ascending `mod_seq` (1-based)
+/// and `change_seq` is re-seated so the first live `NewEntry` stamps the next
+/// monotonic value.
+///
+/// Setup: create a session with a live thread, then replace its entries with 2
+/// cold entries built by `rebuild_entries(base_seq=0)` and seed `change_seq`
+/// via `init_change_seq_from_entries`.  Re-attach the live thread so the store
+/// observes `NewEntry`.  Fire one user message and assert the new entry's
+/// `mod_seq` == 3.
+#[gpui::test]
+async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppContext) {
+    use crate::cold_persistence::{
+        PersistedAssistantChunk, PersistedAssistantMessage, PersistedEntryV2, PersistedUserMessage,
+    };
+    use crate::session_entry::SessionEntryKind;
+
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Build 2 cold AgentThreadEntry values via the persisted → cold pipeline,
+    // then call `rebuild_entries` with `base_seq = 0` to get stamped SessionEntries.
+    let (cold_entries, created_ms) = cx.update(|cx| {
+        crate::store::cold_entries_from_persisted(
+            Some(crate::store::PersistedSession {
+                title: "test".into(),
+                entries: vec![],
+                entry_summaries: vec![],
+                entries_v2: vec![
+                    PersistedEntryV2::User(PersistedUserMessage {
+                        id: None,
+                        content_md: "cold user".into(),
+                        chunks: vec![],
+                    }),
+                    PersistedEntryV2::Assistant(PersistedAssistantMessage {
+                        chunks: vec![PersistedAssistantChunk::Message("cold reply".into())],
+                    }),
+                ],
+                entry_created_ms: vec![1_700_000_000_000, 1_700_000_001_000],
+                available_models: vec![],
+                desired_model: None,
+                desired_effort: None,
+            }),
+            cx,
+        )
+    });
+
+    // Inject the cold entries and re-seat change_seq, then re-attach the live
+    // thread so the store's observe_task_notification hook sees subsequent NewEntry.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session exists");
+            session.update(cx, |s, cx| {
+                let stamped = crate::session_entry::rebuild_entries(&cold_entries, &[], &created_ms, 0, cx);
+                s.set_entries(stamped, cx);
+                s.init_change_seq_from_entries();
+                // Re-attach the live thread so live_base = 2 and the store
+                // resumes observing AcpThreadEvent notifications.
+                s.set_acp_thread(Some(acp_thread.clone()), cx);
+            });
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Assert: mod_seq stamped 1..=2, change_seq re-seated to 2.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert_eq!(s.entries.len(), 2, "expected 2 cold entries");
+        assert_eq!(
+            s.entries[0].mod_seq, 1,
+            "cold entry[0].mod_seq must be 1"
+        );
+        assert_eq!(
+            s.entries[1].mod_seq, 2,
+            "cold entry[1].mod_seq must be 2"
+        );
+        assert_eq!(
+            s.change_seq, 2,
+            "change_seq must be re-seated to 2 after cold restore"
+        );
+    });
+
+    // Fire one live NewEntry; it must receive mod_seq == 3.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("live msg".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert_eq!(s.entries.len(), 3, "entries must be cold(2) + live(1) = 3");
+        assert_eq!(
+            s.entries[2].mod_seq, 3,
+            "first live NewEntry must stamp mod_seq == 3"
+        );
+        assert!(
+            matches!(s.entries[2].kind, SessionEntryKind::UserMessage { .. }),
+            "live entry must be UserMessage"
         );
     });
 }
