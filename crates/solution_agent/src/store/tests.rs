@@ -5818,6 +5818,92 @@ async fn entry_updated_preserves_created_ms(cx: &mut TestAppContext) {
     });
 }
 
+/// Phase 3, Task 2: `mod_seq` is stamped on every live mutation.
+/// After two `NewEntry` events, entry0.mod_seq==1 and entry1.mod_seq==2.
+/// After `EntryUpdated(0)`, entry0.mod_seq==3 (advanced) and entry1.mod_seq==2
+/// (unchanged). `entry0.created_ms` must be preserved across the update.
+#[gpui::test]
+async fn mod_seq_stamped_on_live_mutations(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // First NewEntry: user message.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Second NewEntry: assistant message.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // After two NewEntry events: entry0.mod_seq==1, entry1.mod_seq==2.
+    let original_entry0_created_ms = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session exists");
+        let s = session.read(cx);
+        assert_eq!(s.entries.len(), 2, "two NewEntry events → two entries");
+        assert_eq!(
+            s.entries[0].mod_seq, 1,
+            "entry0.mod_seq must be 1 after first NewEntry"
+        );
+        assert_eq!(
+            s.entries[1].mod_seq, 2,
+            "entry1.mod_seq must be 2 after second NewEntry"
+        );
+        s.entries[0].created_ms
+    });
+
+    // EntryUpdated on entry 0 (local index 0).
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::EntryUpdated(0));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session exists");
+        let s = session.read(cx);
+        assert_eq!(
+            s.entries.len(),
+            2,
+            "EntryUpdated must not change entries count"
+        );
+        assert_eq!(
+            s.entries[0].mod_seq, 3,
+            "entry0.mod_seq must advance to 3 after EntryUpdated(0)"
+        );
+        assert_eq!(
+            s.entries[1].mod_seq, 2,
+            "entry1.mod_seq must remain 2 (unchanged by EntryUpdated on entry0)"
+        );
+        assert_eq!(
+            s.entries[0].created_ms,
+            original_entry0_created_ms,
+            "EntryUpdated must not restamp entry0.created_ms"
+        );
+    });
+}
+
 /// Fix 4: after cold-restore of a NON-EMPTY prefix, attaching a live thread
 /// sets `live_base` to the prefix length. A subsequent `NewEntry` must land
 /// at `entries[live_base]` (AFTER the cold prefix) and leave the cold prefix

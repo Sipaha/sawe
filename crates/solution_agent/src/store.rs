@@ -4968,7 +4968,13 @@ impl SolutionAgentStore {
                     additions
                 };
                 session_entity.update(cx, |s, cx| {
+                    let first_new = s.entries.len();
                     s.entries.extend(new_entries);
+                    let new_count = s.entries.len() - first_new;
+                    let seqs: Vec<u64> = (0..new_count).map(|_| s.bump_change_seq()).collect();
+                    for (entry, seq) in s.entries[first_new..].iter_mut().zip(seqs) {
+                        entry.mod_seq = seq;
+                    }
                     cx.notify();
                 });
                 cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
@@ -5291,6 +5297,7 @@ impl SolutionAgentStore {
                 let global_truncate = cold_count + range.start;
                 session_entity.update(cx, |s, cx| {
                     s.entries.truncate(global_truncate);
+                    s.bump_change_seq();
                     cx.notify();
                 });
                 // The user-facing `/clear` does NOT reach this branch:
@@ -5429,8 +5436,10 @@ impl SolutionAgentStore {
                 };
                 if let Some(entry) = updated_entry {
                     session_entity.update(cx, |s, cx| {
+                        let seq = s.bump_change_seq();
                         if let Some(slot) = s.entries.get_mut(global_idx) {
                             *slot = entry;
+                            slot.mod_seq = seq;
                         }
                         cx.notify();
                     });
