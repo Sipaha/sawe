@@ -485,6 +485,16 @@ pub struct SolutionSession {
     /// The mobile `workspace.snapshot` filter uses `tab_order.is_some()` to
     /// decide whether a session is visible to the unified open-workspace screen.
     pub tab_order: Option<i64>,
+    /// Monotonic change sequence for this session. Starts at 0 and incremented
+    /// via `bump_change_seq()` (pre-increment: the first call returns 1). Used
+    /// by mobile delta-sync to stamp each entry so `mod_seq == 0` stays the
+    /// "unstamped" sentinel. Private write via helpers; pub read.
+    pub change_seq: u64,
+    /// Transcript generation counter. Incremented via `bump_epoch()` on
+    /// wholesale replacements (`/clear`, compact, rehydrate). The mobile delta
+    /// uses this to force a full reload when the transcript history changes
+    /// structurally.
+    pub epoch: u64,
 }
 
 impl SolutionSession {
@@ -540,6 +550,8 @@ impl SolutionSession {
             background_shells: HashMap::new(),
             background_shell_order: Vec::new(),
             tab_order: None,
+            change_seq: 0,
+            epoch: 0,
         }
     }
 
@@ -579,6 +591,25 @@ impl SolutionSession {
     pub fn set_entries(&mut self, entries: Vec<SessionEntry>, cx: &mut Context<Self>) {
         self.entries = entries;
         cx.notify();
+    }
+
+    /// Allocate the next monotonic change sequence for this session. Pre-increment:
+    /// the first call returns 1, so `mod_seq == 0` stays the "unstamped" sentinel.
+    pub fn bump_change_seq(&mut self) -> u64 {
+        self.change_seq += 1;
+        self.change_seq
+    }
+
+    /// Re-seat `change_seq` above the highest stamped entry after a cold restore so
+    /// new stamps never collide with restored `mod_seq` values.
+    pub fn init_change_seq_from_entries(&mut self) {
+        self.change_seq = self.entries.iter().map(|e| e.mod_seq).max().unwrap_or(0);
+    }
+
+    /// Bump the transcript generation (cleared/replaced wholesale: /clear, compact,
+    /// rehydrate). The mobile delta uses this to force a full reload.
+    pub fn bump_epoch(&mut self) {
+        self.epoch += 1;
     }
 }
 
@@ -670,6 +701,8 @@ mod tests {
             background_shells: HashMap::new(),
             background_shell_order: Vec::new(),
             tab_order: None,
+            change_seq: 0,
+            epoch: 0,
         }
     }
 
@@ -750,5 +783,19 @@ mod tests {
         cx.run_until_parked();
         assert!(notified.get());
         session.read_with(cx, |s, _| assert_eq!(s.entries.len(), 1));
+    }
+
+    #[gpui::test]
+    fn change_seq_is_monotonic_and_epoch_bumps(cx: &mut TestAppContext) {
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, _| {
+            assert_eq!(s.change_seq, 0);
+            assert_eq!(s.bump_change_seq(), 1);
+            assert_eq!(s.bump_change_seq(), 2);
+            assert_eq!(s.change_seq, 2);
+            let e0 = s.epoch;
+            s.bump_epoch();
+            assert_eq!(s.epoch, e0 + 1);
+        });
     }
 }
