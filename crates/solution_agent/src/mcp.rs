@@ -32,6 +32,9 @@ pub fn register(cx: &mut App) {
         server.add_tool(GetSessionEntryTool);
     });
     editor_mcp::register_tool(cx, |server| {
+        server.add_tool(GetSessionChangesTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
         server.add_tool(CreateSessionTool);
     });
     editor_mcp::register_tool(cx, |server| {
@@ -1402,6 +1405,265 @@ impl McpServerTool for GetSessionTool {
         let title = result.title.clone();
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text { text: title }],
+            structured_content: result,
+        })
+    }
+}
+
+// =====================================================================
+// solution_agent.get_session_changes
+// =====================================================================
+
+/// Default for `GetSessionChangesParams::include_images`. The delta is the
+/// live render source (unlike `get_session`, which defaults `include_images`
+/// false for cheap listing), so image payloads are inlined by default.
+fn default_true() -> bool {
+    true
+}
+
+/// Mobile delta poll input. Returns only what changed since `since_seq`:
+/// entries with `mod_seq > since_seq` (passing the subagent filter), plus each
+/// section (state / queue / subagents) only when its watermark moved past
+/// `since_seq`. On epoch mismatch the result is a `reset` and the client
+/// full-reloads via `get_session`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GetSessionChangesParams {
+    pub session_id: String,
+    /// The client's last-seen `change_seq`. Entries / sections at or below
+    /// this are unchanged and omitted. A fresh client passes 0.
+    pub since_seq: u64,
+    /// The epoch the client's cached state was built against. A mismatch
+    /// means the transcript was rotated / reset under the client (a `/clear`
+    /// or migration `bump_epoch`), so the delta is meaningless → `reset`.
+    pub known_epoch: u64,
+    /// Per-tab filter, identical semantics to `GetSessionParams::subagent_filter`
+    /// (`None`/empty-active → all; `"__main__"` → entries with no `subagent_id`;
+    /// any other id → entries of that subagent). Applied to both
+    /// `changed_entries` and `total_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_filter: Option<String>,
+    /// Whether to inline base64 image payloads on changed entries. Defaults
+    /// true — the delta is the live render source.
+    #[serde(default = "default_true")]
+    pub include_images: bool,
+}
+
+impl<'de> Deserialize<'de> for GetSessionChangesParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+            since_seq: u64,
+            known_epoch: u64,
+            #[serde(default)]
+            subagent_filter: Option<String>,
+            #[serde(default = "default_true")]
+            include_images: bool,
+        }
+        let inner = Inner::deserialize(de)?;
+        Ok(Self {
+            session_id: inner.session_id,
+            since_seq: inner.since_seq,
+            known_epoch: inner.known_epoch,
+            subagent_filter: inner.subagent_filter,
+            include_images: inner.include_images,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GetSessionChangesResult {
+    /// Current session epoch. The client stores this alongside `current_seq`
+    /// as its `(epoch, last_seq)` cursor for the next poll.
+    pub epoch: u64,
+    /// Current `change_seq` — the cursor the client passes as the next
+    /// `since_seq`. This RPC is pure-read; it never bumps the clock.
+    pub current_seq: u64,
+    /// True iff `known_epoch != epoch`: the cached state is stale, every
+    /// other field is empty/absent, and the client must full-reload via
+    /// `get_session`.
+    pub reset: bool,
+    /// FILTERED total entry count (after the subagent filter, ignoring
+    /// `since_seq`). The client sets its list length to this after upserting
+    /// `changed_entries`, which drops any tail beyond the new count — the
+    /// shrink-detection signal under the tail-truncate model. Always sent.
+    pub total_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_entries: Vec<EntrySummary>,
+    /// Forward-compat only. The transcript only appends, in-place-updates, or
+    /// tail-truncates (no mid-list deletion; rewind is dead-for-claude), so
+    /// shrink detection rides entirely on `total_count` and this stays empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_indices: Vec<usize>,
+    /// Present only when `state_seq > since_seq`. Absent means "unchanged,
+    /// keep your cached state".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<SessionStateDto>,
+    /// Present only when `queue_seq > since_seq`. Absent means "queue
+    /// unchanged". An empty Vec means "queue changed and is now empty".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_bundles: Option<Vec<QueuedBundleSummary>>,
+    /// Present only when `subagents_seq > since_seq`. Absent means "subagent
+    /// strip unchanged". An empty Vec means "strip changed and is now empty".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_subagents: Option<Vec<SubagentDto>>,
+}
+
+#[derive(Clone)]
+pub struct GetSessionChangesTool;
+
+impl McpServerTool for GetSessionChangesTool {
+    type Input = GetSessionChangesParams;
+    type Output = GetSessionChangesResult;
+    const NAME: &'static str = "solution_agent.get_session_changes";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+
+        let result = cx.update(|cx| -> Result<GetSessionChangesResult> {
+            let store = SolutionAgentStore::global(cx);
+            let entity = store
+                .read_with(cx, |store, _| store.session(session_id))
+                .with_context(|| format!("session_not_found: {}", session_id))?;
+            let session = entity.read(cx);
+
+            let epoch = session.epoch;
+            // Pure-read cursor: `change_seq` was made durable-before-readout in
+            // Task 5.1b, so handing it to the client never outruns persistence.
+            let current_seq = session.change_seq;
+
+            // Subagent filter gate — identical to `get_session` so a tab's
+            // delta membership matches its full-load membership exactly.
+            let subagent_filter = input.subagent_filter.as_deref();
+            let active_empty = session.active_subagents.is_empty();
+            let passes_filter = |entry: &crate::session_entry::SessionEntry| match subagent_filter {
+                None => true,
+                Some(_) if active_empty => true,
+                Some("__main__") => entry.subagent_id.is_none(),
+                Some(id) => entry.subagent_id.as_deref() == Some(id),
+            };
+
+            // Epoch mismatch: the client's cache is against a rotated/reset
+            // transcript. Return a `reset` with everything empty/absent; the
+            // client ignores `total_count` and full-reloads. We still compute
+            // the filtered count for schema completeness.
+            if input.known_epoch != epoch {
+                let total_count = session.entries.iter().filter(|e| passes_filter(e)).count();
+                return Ok(GetSessionChangesResult {
+                    epoch,
+                    current_seq,
+                    reset: true,
+                    total_count,
+                    changed_entries: Vec::new(),
+                    removed_indices: Vec::new(),
+                    state: None,
+                    pending_bundles: None,
+                    active_subagents: None,
+                });
+            }
+
+            let live_auth_options = live_auth_options_for_session(session, cx);
+
+            // Walk entries oldest-first with ONE `image_cursor`, advancing it
+            // over EVERY entry — including filtered-out and unchanged ones —
+            // exactly as `get_session` does (mcp.rs ~1343-1368). This keeps the
+            // global `EntryImage.index` / `spk-image://N` indices identical to
+            // what `get_session` returns for the same `subagent_filter`, so a
+            // delta-applied transcript renders byte-for-byte like a full load.
+            let mut image_cursor = 0usize;
+            let mut changed_entries: Vec<EntrySummary> = Vec::new();
+            let mut total_count = 0usize;
+            for (index, entry) in session.entries.iter().enumerate() {
+                let passes = passes_filter(entry);
+                if passes {
+                    total_count += 1;
+                }
+                if passes && entry.mod_seq > input.since_seq {
+                    changed_entries.push(summarize_entry(
+                        entry,
+                        index,
+                        true,
+                        input.include_images,
+                        &mut image_cursor,
+                        &live_auth_options,
+                    ));
+                } else {
+                    // Skipped (filtered out OR unchanged): still advance the
+                    // cursor so later changed entries get global image indices
+                    // identical to get_session's. `summarize_entry` itself
+                    // advances the cursor; the skip branch must mirror that.
+                    image_cursor += count_images_in_entry(&entry.kind);
+                }
+            }
+
+            // Wall-clock anchors for the state DTO — same scheme as
+            // `session_summary` (monotonic Instant rebased onto unix-millis).
+            let instant_to_ms = |started_at: std::time::Instant| -> i64 {
+                let wall = chrono::Utc::now()
+                    - chrono::Duration::from_std(started_at.elapsed()).unwrap_or_default();
+                wall.timestamp_millis()
+            };
+            let running_started_at_ms = match &session.state {
+                crate::model::SessionState::Running { started_at, .. } => instant_to_ms(*started_at),
+                _ => 0,
+            };
+            let stopping_started_at_ms = match &session.state {
+                crate::model::SessionState::Stopping { started_at } => instant_to_ms(*started_at),
+                _ => 0,
+            };
+
+            // Uniform `watermark > since_seq` rule per section. No
+            // cold-session special-case: 5.1b seeds the section watermarks
+            // above the restored `change_seq`, so a restarted client re-sends
+            // its (now empty) sections through this same rule.
+            let state = (session.state_seq > input.since_seq).then(|| {
+                SessionStateDto::from_state(
+                    &session.state,
+                    running_started_at_ms,
+                    stopping_started_at_ms,
+                )
+            });
+            let pending_bundles = (session.queue_seq > input.since_seq)
+                .then(|| build_pending_bundle_summaries(session, cx));
+            let active_subagents = (session.subagents_seq > input.since_seq)
+                .then(|| build_active_subagents_vec(session));
+
+            Ok(GetSessionChangesResult {
+                epoch,
+                current_seq,
+                reset: false,
+                total_count,
+                changed_entries,
+                removed_indices: Vec::new(),
+                state,
+                pending_bundles,
+                active_subagents,
+            })
+        })?;
+
+        let text = format!(
+            "{} changed entr{} (epoch {}, seq {})",
+            result.changed_entries.len(),
+            if result.changed_entries.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            result.epoch,
+            result.current_seq,
+        );
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text { text }],
             structured_content: result,
         })
     }
@@ -6456,5 +6718,427 @@ mod tests {
             "assistant entry must round-trip; got: {:?}",
             sc.entries[1]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 5.2: get_session_changes (mobile delta).
+    // -----------------------------------------------------------------
+
+    /// 1×1 PNG, base64 (no `data:` prefix) — same fixture the other image
+    /// tests use, kept tiny so it doesn't bloat the suite.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAen5lOEAAAAASUVORK5CYII=";
+
+    /// Build a COLD, row-native session with a fixed entry layout for the
+    /// delta tests:
+    ///   index 0: Main user message + image     (mod_seq 1)
+    ///   index 1: Main assistant message        (mod_seq 2)
+    ///   index 2: Subagent("sub1") assistant    (mod_seq 3)
+    ///   index 3: Main user message + image     (mod_seq 4)
+    /// `change_seq` is seated at 4 (= max mod_seq). All section watermarks
+    /// start at 0 so a `since_seq=0` poll re-sends every section; individual
+    /// tests bump the watermarks they care about. No live thread.
+    async fn seed_delta_session(
+        cx: &mut gpui::TestAppContext,
+    ) -> (crate::model::SolutionSessionId, tempfile::TempDir) {
+        use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+        let (solution_id, tmp, _project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+        let session_id = cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                let id = crate::model::SolutionSessionId::new();
+                let mut session = crate::model::SolutionSession::new_idle(
+                    id,
+                    solution_id.clone(),
+                    SharedString::from("mock-agent"),
+                    acp::SessionId::new(format!("acp-{}", id.as_str())),
+                );
+                session.title = SharedString::from("delta session");
+                session.entries = vec![
+                    SessionEntry {
+                        created_ms: 1_700_000_000_000,
+                        mod_seq: 1,
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: "u0".into(),
+                            chunks: vec![
+                                fake_user_text_chunk("u0"),
+                                fake_image_chunk("image/png", TINY_PNG_B64),
+                            ],
+                        },
+                    },
+                    SessionEntry {
+                        created_ms: 1_700_000_000_001,
+                        mod_seq: 2,
+                        subagent_id: None,
+                        kind: SessionEntryKind::AssistantMessage {
+                            chunks: vec![AssistantChunk::Message("a1-main".into())],
+                        },
+                    },
+                    SessionEntry {
+                        created_ms: 1_700_000_000_002,
+                        mod_seq: 3,
+                        subagent_id: Some(SharedString::from("sub1")),
+                        kind: SessionEntryKind::AssistantMessage {
+                            chunks: vec![AssistantChunk::Message("s2-sub".into())],
+                        },
+                    },
+                    SessionEntry {
+                        created_ms: 1_700_000_000_003,
+                        mod_seq: 4,
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: "u3".into(),
+                            chunks: vec![
+                                fake_user_text_chunk("u3"),
+                                fake_image_chunk("image/png", TINY_PNG_B64),
+                            ],
+                        },
+                    },
+                ];
+                session.change_seq = 4;
+                store.register_prebuilt_session(session, cx)
+            })
+        });
+        (session_id, tmp)
+    }
+
+    /// Mutate the in-memory session (set watermarks, push a queue bundle,
+    /// seed a subagent tab, change state, …).
+    fn mutate_session(
+        session_id: crate::model::SolutionSessionId,
+        cx: &mut gpui::TestAppContext,
+        f: impl FnOnce(&mut crate::model::SolutionSession),
+    ) {
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store
+                .read(cx)
+                .session(session_id)
+                .expect("session must exist");
+            session.update(cx, |s, _| f(s));
+        });
+    }
+
+    async fn run_changes(
+        params: GetSessionChangesParams,
+        cx: &mut gpui::TestAppContext,
+    ) -> GetSessionChangesResult {
+        GetSessionChangesTool
+            .run(params, &mut cx.to_async())
+            .await
+            .expect("get_session_changes")
+            .structured_content
+    }
+
+    #[gpui::test]
+    async fn get_session_changes_returns_only_entries_past_since_seq(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (session_id, _tmp) = seed_delta_session(cx).await;
+
+        // since_seq = 2 → only entries with mod_seq 3 and 4 (indices 2, 3).
+        let result = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 2,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+
+        assert!(!result.reset);
+        assert_eq!(result.epoch, 0);
+        assert_eq!(result.current_seq, 4);
+        // total_count is the full (filtered=None) count, independent of since_seq.
+        assert_eq!(result.total_count, 4);
+        let indices: Vec<usize> = result.changed_entries.iter().map(|e| e.index).collect();
+        assert_eq!(
+            indices,
+            vec![2, 3],
+            "only mod_seq > since_seq entries, with absolute indices"
+        );
+
+        // since_seq = 4 → nothing changed.
+        let none = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 4,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        assert!(none.changed_entries.is_empty());
+        assert_eq!(none.total_count, 4);
+    }
+
+    #[gpui::test]
+    async fn get_session_changes_section_omit_and_include(cx: &mut gpui::TestAppContext) {
+        let (session_id, _tmp) = seed_delta_session(cx).await;
+
+        // Only the state watermark moves past since_seq.
+        mutate_session(session_id, cx, |s| {
+            s.state = crate::model::SessionState::AwaitingInput;
+            s.state_seq = 6;
+            s.queue_seq = 4;
+            s.subagents_seq = 3;
+            s.change_seq = 6;
+        });
+
+        let result = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 5,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        assert!(
+            matches!(result.state, Some(SessionStateDto::AwaitingInput)),
+            "state_seq > since_seq → state Some, got {:?}",
+            result.state
+        );
+        assert!(
+            result.pending_bundles.is_none(),
+            "queue_seq <= since_seq → pending_bundles None"
+        );
+        assert!(
+            result.active_subagents.is_none(),
+            "subagents_seq <= since_seq → active_subagents None"
+        );
+
+        // Converse: only the queue watermark moves.
+        mutate_session(session_id, cx, |s| {
+            s.pending_messages.push_back(crate::model::PendingBundle {
+                target: crate::model::QueueTarget::Main,
+                blocks: vec![fake_user_text_chunk("queued")],
+            });
+            s.queue_seq = 8;
+            s.state_seq = 6;
+            s.subagents_seq = 3;
+            s.change_seq = 8;
+        });
+        let result = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 7,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        assert!(
+            result.state.is_none(),
+            "state_seq <= since_seq → state None"
+        );
+        let bundles = result
+            .pending_bundles
+            .expect("queue_seq > since_seq → pending_bundles Some");
+        assert_eq!(bundles.len(), 1, "the queued bundle surfaces");
+        assert!(result.active_subagents.is_none());
+    }
+
+    #[gpui::test]
+    async fn get_session_changes_reset_on_epoch_mismatch(cx: &mut gpui::TestAppContext) {
+        let (session_id, _tmp) = seed_delta_session(cx).await;
+        // Push the session epoch above the client's known_epoch.
+        mutate_session(session_id, cx, |s| {
+            s.epoch = 3;
+            // Move every watermark so a non-reset path WOULD have populated them.
+            s.state_seq = 5;
+            s.queue_seq = 5;
+            s.subagents_seq = 5;
+        });
+
+        let result = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 0,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+
+        assert!(result.reset, "epoch mismatch must set reset");
+        assert_eq!(result.epoch, 3);
+        assert!(result.changed_entries.is_empty());
+        assert!(result.removed_indices.is_empty());
+        assert!(result.state.is_none());
+        assert!(result.pending_bundles.is_none());
+        assert!(result.active_subagents.is_none());
+        // total_count is still the filtered count (client ignores it).
+        assert_eq!(result.total_count, 4);
+    }
+
+    #[gpui::test]
+    async fn get_session_changes_subagent_filter_narrows_entries_and_total(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (session_id, _tmp) = seed_delta_session(cx).await;
+        // A subagent strip must be present, else the filter bypass kicks in.
+        seed_subagent_tabs(session_id, &[("sub1", "Sub One")], cx);
+
+        // sub1 filter, since_seq 0 → only the sub1 entry (index 2).
+        let sub = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 0,
+                known_epoch: 0,
+                subagent_filter: Some("sub1".to_string()),
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        let sub_indices: Vec<usize> = sub.changed_entries.iter().map(|e| e.index).collect();
+        assert_eq!(sub_indices, vec![2], "sub1 filter keeps only the sub1 entry");
+        assert_eq!(sub.total_count, 1, "filtered total is the sub1 count");
+
+        // __main__ filter → the three subagent_id == None entries (0, 1, 3).
+        let main = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 0,
+                known_epoch: 0,
+                subagent_filter: Some("__main__".to_string()),
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        let main_indices: Vec<usize> = main.changed_entries.iter().map(|e| e.index).collect();
+        assert_eq!(
+            main_indices,
+            vec![0, 1, 3],
+            "__main__ filter keeps subagent_id == None entries"
+        );
+        assert_eq!(main.total_count, 3);
+    }
+
+    #[gpui::test]
+    async fn get_session_changes_image_indices_match_get_session(cx: &mut gpui::TestAppContext) {
+        // The subtle parity test: a changed entry positioned AFTER earlier
+        // image-bearing entries must report image indices identical to what
+        // get_session returns for the same session + filter. Index 3 carries
+        // an image and sits after the image at index 0, so its EntryImage.index
+        // must be 1 in BOTH responses.
+        let (session_id, _tmp) = seed_delta_session(cx).await;
+
+        let full = GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    include_full_content: true,
+                    include_images: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("get_session")
+            .structured_content;
+
+        // Delta with since_seq = 3 → only index 3 (the second image-bearer).
+        let delta = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 3,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: true,
+            },
+            cx,
+        )
+        .await;
+        assert_eq!(
+            delta.changed_entries.len(),
+            1,
+            "since_seq 3 yields exactly index 3"
+        );
+        let delta_entry = &delta.changed_entries[0];
+        assert_eq!(delta_entry.index, 3);
+
+        let full_entry = full
+            .entries
+            .iter()
+            .find(|e| e.index == 3)
+            .expect("get_session must include index 3");
+
+        let delta_image_indices: Vec<usize> = delta_entry
+            .images
+            .as_ref()
+            .expect("delta entry images populated")
+            .iter()
+            .map(|img| img.index)
+            .collect();
+        let full_image_indices: Vec<usize> = full_entry
+            .images
+            .as_ref()
+            .expect("full entry images populated")
+            .iter()
+            .map(|img| img.index)
+            .collect();
+        assert_eq!(
+            delta_image_indices, full_image_indices,
+            "delta image indices must equal get_session's for the same entry"
+        );
+        assert_eq!(
+            delta_image_indices,
+            vec![1],
+            "the second image-bearing entry's image is global index 1"
+        );
+    }
+
+    #[gpui::test]
+    async fn get_session_changes_tail_truncate_shrinks_total(cx: &mut gpui::TestAppContext) {
+        let (session_id, _tmp) = seed_delta_session(cx).await;
+        // Tail-truncate to the first two entries (mirrors EntriesRemoved).
+        mutate_session(session_id, cx, |s| {
+            s.entries.truncate(2);
+            s.change_seq = 5;
+            // Bump the surviving tail entry's mod_seq so it re-sends.
+            if let Some(last) = s.entries.last_mut() {
+                last.mod_seq = 5;
+            }
+        });
+
+        let result = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 4,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        assert_eq!(result.total_count, 2, "total_count shrank to the new length");
+        assert!(
+            result.removed_indices.is_empty(),
+            "removed_indices stays empty under the tail-truncate model"
+        );
+        let indices: Vec<usize> = result.changed_entries.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![1], "surviving changed entry keeps its index");
     }
 }
