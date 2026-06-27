@@ -1029,6 +1029,19 @@ pub struct GetSessionParams {
     /// can paginate the tab correctly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_filter: Option<String>,
+    /// Token-frugal transcript slice for the supervisor judge. When set,
+    /// the response is reduced to only the entries that matter for judging
+    /// "what is the real goal and did the agent stop short": every
+    /// `role == "user"` entry, the `N` entries immediately preceding each
+    /// one (the context that prompted it), and the single most-recent entry
+    /// (where the agent came to rest). Everything else — the agent's long
+    /// tool-call/assistant churn — is dropped, so a judge no longer has to
+    /// pull a 100k+-token full transcript into its clean context every
+    /// wake-up. Applied AFTER `subagent_filter`/index windows and BEFORE
+    /// `count`. `total_count` still reflects the unsliced filtered total so
+    /// the judge can see how long the session actually is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_anchored_lead: Option<usize>,
 }
 
 impl<'de> Deserialize<'de> for GetSessionParams {
@@ -1043,6 +1056,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
             after_index: Option<usize>,
             count: Option<usize>,
             subagent_filter: Option<String>,
+            user_anchored_lead: Option<usize>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -1053,6 +1067,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
             after_index: inner.after_index,
             count: inner.count,
             subagent_filter: inner.subagent_filter,
+            user_anchored_lead: inner.user_anchored_lead,
         })
     }
 }
@@ -1309,6 +1324,38 @@ pub struct QueuedBundleSummary {
     pub image_count: u32,
 }
 
+/// Reduce a transcript window to the entries a supervisor judge actually
+/// needs: every `User` entry, the `lead` entries immediately before each
+/// one, and the final entry (where the agent came to rest). Preserves order
+/// and the absolute `EntrySummary.index` of every surviving entry. A no-op
+/// when there are no user entries (nothing to anchor on → keep the window
+/// as-is, so the judge still sees *something*).
+fn apply_user_anchored_filter(kept: &mut Vec<EntrySummary>, lead: usize) {
+    if kept.is_empty() {
+        return;
+    }
+    let has_user = kept.iter().any(|e| e.role == EntryRoleDto::User);
+    if !has_user {
+        return;
+    }
+    let mut keep = vec![false; kept.len()];
+    for (pos, entry) in kept.iter().enumerate() {
+        if entry.role == EntryRoleDto::User {
+            let start = pos.saturating_sub(lead);
+            for flag in keep.iter_mut().take(pos + 1).skip(start) {
+                *flag = true;
+            }
+        }
+    }
+    // Always retain the resting turn — the judge needs to see where the
+    // agent stopped, which is rarely a user entry.
+    if let Some(last) = keep.last_mut() {
+        *last = true;
+    }
+    let mut iter = keep.into_iter();
+    kept.retain(|_| iter.next().unwrap_or(false));
+}
+
 #[derive(Clone)]
 pub struct GetSessionTool;
 
@@ -1402,6 +1449,12 @@ impl McpServerTool for GetSessionTool {
                     } else {
                         image_cursor += count_images_in_entry(&entry.kind);
                     }
+                }
+                // Judge-frugal slice (user messages + lead context + the
+                // resting turn), applied before `count` so a tail window
+                // still tails the anchored slice.
+                if let Some(lead) = input.user_anchored_lead {
+                    apply_user_anchored_filter(&mut kept, lead);
                 }
                 if let Some(n) = input.count {
                     if kept.len() > n {
@@ -7803,5 +7856,73 @@ mod tests {
         );
         let indices: Vec<usize> = result.changed_entries.iter().map(|e| e.index).collect();
         assert_eq!(indices, vec![1], "surviving changed entry keeps its index");
+    }
+
+    fn anchored_entry(index: usize, role: EntryRoleDto) -> EntrySummary {
+        EntrySummary {
+            role,
+            index,
+            preview: String::new(),
+            markdown: None,
+            images: None,
+            tool_call: None,
+            plan: None,
+            client_send_id: None,
+            client_send_ids: Vec::new(),
+            created_ms: None,
+            subagent_id: None,
+        }
+    }
+
+    #[test]
+    fn user_anchored_filter_keeps_user_lead_and_resting_turn() {
+        use EntryRoleDto::*;
+        // Timeline: assistant churn, a user turn, more churn, another user
+        // turn, then a long agent tail. lead=2 → each user keeps itself + 2
+        // before; the final entry is always kept (the resting turn).
+        let mut kept = vec![
+            anchored_entry(0, Assistant),
+            anchored_entry(1, ToolCall),
+            anchored_entry(2, Assistant),
+            anchored_entry(3, User), // keeps 1,2,3
+            anchored_entry(4, ToolCall),
+            anchored_entry(5, Assistant),
+            anchored_entry(6, ToolCall),
+            anchored_entry(7, User), // keeps 5,6,7
+            anchored_entry(8, Assistant),
+            anchored_entry(9, ToolCall),
+            anchored_entry(10, Assistant), // resting turn → kept
+        ];
+        apply_user_anchored_filter(&mut kept, 2);
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![1, 2, 3, 5, 6, 7, 10]);
+    }
+
+    #[test]
+    fn user_anchored_filter_dedups_overlapping_windows_and_clamps_start() {
+        use EntryRoleDto::*;
+        // Back-to-back user turns with lead larger than the gap must not
+        // duplicate the shared lead entries, and lead past index 0 clamps.
+        let mut kept = vec![
+            anchored_entry(0, Assistant),
+            anchored_entry(1, User),
+            anchored_entry(2, User),
+            anchored_entry(3, Assistant),
+        ];
+        apply_user_anchored_filter(&mut kept, 5);
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn user_anchored_filter_noop_without_user_entries() {
+        use EntryRoleDto::*;
+        let mut kept = vec![
+            anchored_entry(0, Assistant),
+            anchored_entry(1, ToolCall),
+        ];
+        apply_user_anchored_filter(&mut kept, 3);
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![0, 1], "no anchor → window kept as-is");
     }
 }

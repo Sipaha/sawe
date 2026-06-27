@@ -203,6 +203,16 @@ pub struct JudgeBriefingContext {
     /// when usage is unknown (cold session, no live token reading yet).
     pub context_usage: Option<String>,
     pub audit: bool,
+    /// Absolute path to the editor binary, used to reach the Solution MCP
+    /// socket from Bash via `<bridge_bin> --nc <socket_path>`. The judge's
+    /// claude process is NOT reliably given the editor's `solution_agent.*`
+    /// MCP tools (claude's MCP-server registration is flaky and silently
+    /// drops servers), so the judge talks to the socket through this bridge
+    /// binary — a plain shell pipe it always has — instead of MCP tools.
+    pub bridge_bin: String,
+    /// Absolute path to this Solution's MCP unix socket (the per-solution
+    /// `mcp.sock`). Target of the `--nc` bridge pipe above.
+    pub socket_path: String,
 }
 
 const JUDGE_INSTRUCTIONS: &str = include_str!("../resources/supervisor_judge_instructions.md");
@@ -219,11 +229,12 @@ pub const SUPERVISOR_SYSTEM_PROMPT: &str = "\
 You are an independent Supervisor evaluating another AI coding session — you are \
 NOT a worker on its task. Do NOT write or edit code, run the task, or make git \
 commits. Your sole job is to read the supervised session and its artifacts, then \
-issue exactly ONE verdict by calling the `solution_agent.supervisor_verdict` MCP \
-tool (or `solution_agent.supervisor_audit_verdict` when auditing). You may read \
-files, read the conversation via `solution_agent.get_session`, and update your \
-diary — but stay outside the work and judge it from the outside. Follow the \
-briefing you are given in the first message.";
+issue exactly ONE verdict. You reach the editor (to read the conversation and to \
+submit your verdict) by piping JSON-RPC through the `--nc` socket bridge from \
+Bash — NOT through `mcp__*` tools (do NOT ToolSearch for editor tools; they are \
+not in your toolset). The first message gives you the exact bridge command and \
+the `solution_agent.*` method names to call. You may read files and update your \
+diary, but stay outside the work and judge it from the outside.";
 
 /// Render the judge's single user-turn briefing by substituting the runtime
 /// paths into the instruction template. The meta-auditor variant (`audit:
@@ -253,6 +264,8 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         .replace("{DIARY_PATH}", &ctx.diary_path)
         .replace("{VERDICTS_PATH}", &ctx.verdicts_path)
         .replace("{COMPACT_DIR}", &ctx.compact_dir)
+        .replace("{BRIDGE_BIN}", &ctx.bridge_bin)
+        .replace("{SOCKET_PATH}", &ctx.socket_path)
         .replace("{CONTEXT_USAGE_SECTION}", &context_section)
         .replace("{CUSTOM_PROMPT_SECTION}", &custom_section)
 }
@@ -509,13 +522,19 @@ mod tests {
             custom_prompt: Some("don't stop before tests pass".into()),
             context_usage: Some("187,000 / 200,000 tokens (94%)".into()),
             audit: false,
+            bridge_bin: "/path/to/sawe".into(),
+            socket_path: "/run/sol/mcp.sock".into(),
         };
         let out = build_judge_briefing(&ctx);
         assert!(out.contains("abcd1234"));
         assert!(out.contains("/sol/.agents/abcd1234/supervisor/diary.md"));
         assert!(out.contains("don't stop before tests pass"));
         assert!(out.contains("187,000 / 200,000 tokens (94%)"));
+        // The `--nc` bridge command is fully materialized for the judge.
+        assert!(out.contains("/path/to/sawe --nc /run/sol/mcp.sock"));
         assert!(!out.contains("{DIARY_PATH}"), "all placeholders substituted");
+        assert!(!out.contains("{BRIDGE_BIN}"));
+        assert!(!out.contains("{SOCKET_PATH}"));
         assert!(!out.contains("{CUSTOM_PROMPT_SECTION}"));
         assert!(!out.contains("{CONTEXT_USAGE_SECTION}"));
     }
@@ -530,6 +549,8 @@ mod tests {
             custom_prompt: None,
             context_usage: None,
             audit: false,
+            bridge_bin: "/path/to/sawe".into(),
+            socket_path: "/run/sol/mcp.sock".into(),
         };
         let out = build_judge_briefing(&ctx);
         assert!(!out.contains("{CUSTOM_PROMPT_SECTION}"));

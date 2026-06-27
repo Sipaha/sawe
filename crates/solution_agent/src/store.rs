@@ -1075,6 +1075,18 @@ impl SolutionAgentStore {
             .supervisor_states
             .get(&id)
             .and_then(|s| s.custom_prompt.clone());
+        // The judge talks to the editor over the `--nc` socket bridge from
+        // Bash (claude does NOT reliably register the editor's
+        // `solution_agent.*` MCP tools — see supervisor instructions). Resolve
+        // the same per-solution socket the subagent bridge uses, falling back
+        // to the editor-global socket exactly like `sawe_mcp_bridge_server`.
+        let bridge_bin = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "sawe".to_string());
+        let socket_path = editor_mcp::solution_socket_for_path(cx, &solution_root)
+            .unwrap_or_else(editor_mcp::socket_path)
+            .to_string_lossy()
+            .into_owned();
         let briefing =
             crate::supervisor::build_judge_briefing(&crate::supervisor::JudgeBriefingContext {
                 supervised_session_id: id.to_string(),
@@ -1092,6 +1104,8 @@ impl SolutionAgentStore {
                 custom_prompt,
                 context_usage,
                 audit,
+                bridge_bin,
+                socket_path,
             });
 
         // Spawn the judge/auditor as a CHILD of the supervised session

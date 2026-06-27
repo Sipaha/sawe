@@ -15,11 +15,27 @@ or is stuck repeating itself / missing a problem that needs the human.
   ambiguity that the supervisor keeps papering over with `continue` when it
   should be escalating to the human with `ask`?
 
+## How you submit the verdict — `--nc` socket bridge
+
+You do NOT have the editor's `solution_agent.*` tools as `mcp__*` tools (do NOT
+`ToolSearch` for them). You call the editor's MCP socket from **Bash** by piping
+one JSON-RPC request through the editor binary's `--nc` bridge:
+
+```bash
+req='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"<TOOL>","arguments":<ARGS_JSON>}}'
+( printf '%s\n' "$req"; sleep 2 ) | timeout 12 {BRIDGE_BIN} --nc {SOCKET_PATH}
+```
+
+The response is one JSON-RPC line; the data is in `.result.structuredContent`.
+No `initialize` handshake is needed. (You read `{VERDICTS_PATH}` and
+`{DIARY_PATH}` directly with `cat`/Read — only the verdict goes over the bridge.)
+
 ## Required final step
 
-Call `solution_agent.supervisor_audit_verdict` with `session_id` =
-`{SUPERVISED_SESSION_ID}`, `ok` = true to let supervision continue or false to
-force human escalation, `action` = `continue_supervision` or `escalate`, and a
-short `reasoning`.
+Submit through the bridge — tool `solution_agent.supervisor_audit_verdict`,
+arguments
+`{"session_id":"{SUPERVISED_SESSION_ID}","ok":<true|false>,"action":"<continue_supervision|escalate>","reasoning":"<short>"}`
+(`ok:true` lets supervision continue, `ok:false`/`escalate` forces human
+escalation). CHECK the response comes back `isError:false`; retry on error.
 
 {CUSTOM_PROMPT_SECTION}
