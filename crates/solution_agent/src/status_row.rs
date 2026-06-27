@@ -1073,11 +1073,12 @@ fn supervisor_popover_menu(
             String::new()
         };
         menu = menu.header(SharedString::from(format!(
-            "Verdicts: {} · ↻{} ⚙{} ✓{} ❗{}{} · ~{} tokens",
+            "Verdicts: {} · ↻{} ⚙{} ✓{} 💬{} ❗{}{} · ~{} tokens",
             stats.total,
             stats.by_action[crate::supervisor::VerdictAction::Continue as usize],
             stats.by_action[crate::supervisor::VerdictAction::Compact as usize],
             stats.by_action[crate::supervisor::VerdictAction::Done as usize],
+            stats.by_action[crate::supervisor::VerdictAction::AskAgent as usize],
             stats.by_action[crate::supervisor::VerdictAction::Ask as usize],
             audits_suffix,
             stats.total_tokens,
@@ -1094,6 +1095,7 @@ fn supervisor_popover_menu(
                     Some(crate::supervisor::VerdictAction::Continue) => "↻",
                     Some(crate::supervisor::VerdictAction::Compact) => "⚙",
                     Some(crate::supervisor::VerdictAction::Done) => "✓",
+                    Some(crate::supervisor::VerdictAction::AskAgent) => "💬",
                     Some(crate::supervisor::VerdictAction::Ask) => "❗",
                     None => {
                         if matches!(record.kind, crate::supervisor::VerdictKind::Audit) {

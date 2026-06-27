@@ -7552,6 +7552,39 @@ async fn apply_continue_nudges_and_increments(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn apply_ask_agent_increments_and_records(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.supervisor_states.get_mut(&id).unwrap().status =
+            crate::supervisor::SupervisorStatus::Judging;
+    });
+    store.update(cx, |store, cx| {
+        store.apply_verdict(
+            id,
+            crate::supervisor::VerdictAction::AskAgent,
+            "unclear whether tests were actually run".into(),
+            None,
+            Some("Did you run the full test suite, and did it pass?".into()),
+            None,
+            cx,
+        );
+    });
+    // ask_agent behaves like continue for the guard: counts toward the cap and
+    // returns the session to Watching (it sent the question to the agent).
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.consecutive_continues, 1);
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
+
+    // The verdict was logged with action == AskAgent.
+    let root = crate::store::test_support::session_solution_root(&store, id, cx);
+    let dir = crate::supervisor::supervisor_dir(&root, id);
+    let recs = crate::supervisor::read_verdicts(&dir);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].action, Some(crate::supervisor::VerdictAction::AskAgent));
+}
+
+#[gpui::test]
 async fn fifteen_continues_force_ask(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
     store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));

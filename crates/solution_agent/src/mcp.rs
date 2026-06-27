@@ -4290,12 +4290,16 @@ impl McpServerTool for SupervisorVerdictTool {
             "compact" => crate::supervisor::VerdictAction::Compact,
             "done" => crate::supervisor::VerdictAction::Done,
             "ask" => crate::supervisor::VerdictAction::Ask,
+            "ask_agent" => crate::supervisor::VerdictAction::AskAgent,
             other => anyhow::bail!("invalid_params: unknown action {other:?}"),
         };
-        if matches!(action, crate::supervisor::VerdictAction::Ask) {
+        if matches!(
+            action,
+            crate::supervisor::VerdictAction::Ask | crate::supervisor::VerdictAction::AskAgent
+        ) {
             anyhow::ensure!(
                 input.question.is_some(),
-                "invalid_params: action \"ask\" requires a question"
+                "invalid_params: actions \"ask\"/\"ask_agent\" require a question"
             );
         }
         let session_id = SolutionSessionId::parse(&input.session_id)
@@ -4588,6 +4592,7 @@ pub struct GetSupervisorStateResult {
     pub verdicts_compact: usize,
     pub verdicts_done: usize,
     pub verdicts_ask: usize,
+    pub verdicts_ask_agent: usize,
     pub audits: usize,
     pub total_tokens: u64,
 }
@@ -4645,6 +4650,8 @@ impl McpServerTool for GetSupervisorStateTool {
                         [crate::supervisor::VerdictAction::Done as usize],
                     verdicts_ask: stats.by_action
                         [crate::supervisor::VerdictAction::Ask as usize],
+                    verdicts_ask_agent: stats.by_action
+                        [crate::supervisor::VerdictAction::AskAgent as usize],
                     audits: stats.audits,
                     total_tokens: stats.total_tokens,
                 },
@@ -4659,6 +4666,7 @@ impl McpServerTool for GetSupervisorStateTool {
                     verdicts_compact: 0,
                     verdicts_done: 0,
                     verdicts_ask: 0,
+                    verdicts_ask_agent: 0,
                     audits: 0,
                     total_tokens: 0,
                 },

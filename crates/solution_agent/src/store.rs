@@ -1480,6 +1480,48 @@ impl SolutionAgentStore {
             VerdictAction::Ask => {
                 self.escalate_to_user(id, question.unwrap_or_default(), cx);
             }
+            VerdictAction::AskAgent => {
+                // Pose a clarifying question to the WORKING AGENT (not the
+                // human). Mechanically like `Continue` — it sends a message
+                // into the supervised session and counts toward the same
+                // consecutive-nudge guards so it can't loop forever — but the
+                // message is the judge's question, and the agent's answer lands
+                // in the history for the next wake-up's verdict.
+                let count = {
+                    let state = self
+                        .supervisor_states
+                        .entry(id)
+                        .or_insert_with(|| crate::supervisor::SupervisorState::new(id));
+                    state.consecutive_continues += 1;
+                    state.consecutive_continues
+                };
+                let agent_question = question.unwrap_or_else(|| {
+                    "Is the task fully complete? If not, what concrete work remains?".into()
+                });
+                match crate::supervisor::continue_guard(count) {
+                    crate::supervisor::ContinueGuard::Nudge => {
+                        if let Some(state) = self.supervisor_states.get_mut(&id) {
+                            state.status = SupervisorStatus::Watching;
+                        }
+                        self.persist_supervisor_state(id, cx);
+                        self.send_supervisor_nudge(id, agent_question, cx).detach();
+                    }
+                    crate::supervisor::ContinueGuard::Audit => {
+                        if let Some(state) = self.supervisor_states.get_mut(&id) {
+                            state.status = SupervisorStatus::Watching;
+                        }
+                        self.persist_supervisor_state(id, cx);
+                        self.send_supervisor_nudge(id, agent_question, cx).detach();
+                        self.spawn_auditor(id, cx);
+                    }
+                    crate::supervisor::ContinueGuard::ForceAsk => {
+                        let question = "The supervisor has nudged/queried the agent 15 times \
+                                        in a row — check whether the agent is stuck."
+                            .to_string();
+                        self.escalate_to_user(id, question, cx);
+                    }
+                }
+            }
         }
 
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));

@@ -62,7 +62,14 @@ pub enum VerdictAction {
     Continue = 0,
     Compact = 1,
     Done = 2,
+    /// Escalate a question to the human operator (work pauses for the user).
     Ask = 3,
+    /// Pose a clarifying question to the WORKING AGENT (not the human): the
+    /// question is sent into the supervised session, the agent answers, and the
+    /// supervisor re-evaluates on the next wake-up with the answer in hand. Use
+    /// when it's unclear whether the work is actually finished. Subject to the
+    /// same consecutive-nudge guards as `Continue` so it can't loop forever.
+    AskAgent = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,8 +176,8 @@ impl SupervisorState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerdictStats {
     pub total: usize,
-    /// Indexed by `VerdictAction as usize`.
-    pub by_action: [usize; 4],
+    /// Indexed by `VerdictAction as usize` (Continue, Compact, Done, Ask, AskAgent).
+    pub by_action: [usize; 5],
     pub audits: usize,
     pub total_tokens: u64,
 }

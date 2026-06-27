@@ -34,9 +34,15 @@ judge from the outside, not to trust its self-assessment.
   `state.md` files under `{COMPACT_DIR}` and the conversation. It is appended to
   a durable session log the operator reads later (after the live dialogue is
   gone to compaction), so write it for a human returning much later.
-- `ask` — you cannot responsibly decide without the human (genuine ambiguity,
+- `ask_agent` — you cannot yet tell whether the work is actually finished, and
+  the WORKING AGENT could resolve it. Provide a `question` that is sent to the
+  agent (not the human); the agent answers, and you re-evaluate on the next
+  wake-up with the answer in the transcript. Prefer this over `ask` whenever the
+  uncertainty is "is this really done / did you handle X?" rather than something
+  only the human can decide. (Counts toward the same nudge cap, so don't loop.)
+- `ask` — you cannot responsibly decide without the HUMAN (genuine ambiguity,
   conflicting instructions, or a destructive/irreversible choice). Provide a
-  concrete `question`.
+  concrete `question`. Use this only when the agent itself can't resolve it.
 
 ## Required final step
 
