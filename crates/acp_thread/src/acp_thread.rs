@@ -2323,6 +2323,17 @@ impl AcpThread {
                             buffer.pending.drain(..byte_boundary);
                         });
 
+                        // The reveal task is the ONLY place buffered text reaches
+                        // the markdown, and it did so without signalling. The
+                        // persisted/MCP model (`session.entries`) re-syncs an entry
+                        // only on `EntryUpdated`, so without this every gradually
+                        // revealed tail (incl. the final bytes of a turn) is frozen
+                        // out of the stored entry — the truncated-reply bug. Emit
+                        // for the last entry (a new entry always flushes the buffer
+                        // first, so the streaming target is the tail entry).
+                        let last = this.entries.len().saturating_sub(1);
+                        cx.emit(AcpThreadEvent::EntryUpdated(last));
+
                         true
                     })
                     .unwrap_or(false);
@@ -3013,6 +3024,15 @@ impl AcpThread {
                 match response {
                     Ok(r) => {
                         Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
+                        // The end-of-turn flush dumps the buffer's tail straight
+                        // into the markdown — bypassing the reveal task's
+                        // per-tick `EntryUpdated`. Signal it so the persisted/MCP
+                        // `session.entries` re-syncs the final bytes; otherwise
+                        // the last buffered tail of every turn is dropped from the
+                        // stored entry (truncated reply on mobile / after reload).
+                        if !this.entries.is_empty() {
+                            cx.emit(AcpThreadEvent::EntryUpdated(this.entries.len() - 1));
+                        }
 
                         if r.stop_reason == acp::StopReason::MaxTokens {
                             this.had_error = true;
@@ -3095,6 +3115,10 @@ impl AcpThread {
                     }
                     Err(e) => {
                         Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
+                        // Same end-of-turn tail re-sync as the Ok path above.
+                        if !this.entries.is_empty() {
+                            cx.emit(AcpThreadEvent::EntryUpdated(this.entries.len() - 1));
+                        }
 
                         this.had_error = true;
                         cx.emit(AcpThreadEvent::Error);
