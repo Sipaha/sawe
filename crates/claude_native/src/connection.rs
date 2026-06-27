@@ -84,6 +84,31 @@ fn looks_like_text_tool_call(text: &str) -> bool {
     text.contains("invoke name=") && text.contains("invoke>")
 }
 
+/// Decide what (if any) text to append from a final `Assistant` message's text
+/// block, given the text already streamed for that message. The final block is
+/// the AUTHORITATIVE complete text; the streamed deltas are an in-progress
+/// prefix that can be cut short. Returns the slice of `final_text` to emit as a
+/// new `AgentMessageChunk` (appends, so it must never re-emit streamed bytes):
+///
+/// * not streamed → the whole block (recovery for the non-streaming path);
+/// * streamed a proper prefix shorter than the final → the MISSING SUFFIX
+///   (completes a truncated/dropped stream — the "reply stays cut off" bug);
+/// * streamed the whole thing (or anything that isn't a shorter prefix) →
+///   `None` (genuine duplicate, or a mismatch we don't risk double-appending).
+fn final_text_block_suffix<'a>(
+    streamed: bool,
+    streamed_text: &str,
+    final_text: &'a str,
+) -> Option<&'a str> {
+    if !streamed {
+        Some(final_text)
+    } else if final_text.len() > streamed_text.len() && final_text.starts_with(streamed_text) {
+        Some(&final_text[streamed_text.len()..])
+    } else {
+        None
+    }
+}
+
 /// Default grace period after a soft `interrupt` before the Stop escalates to
 /// a hard kill + `--resume` respawn. Overridable for tests via
 /// [`ClaudeNativeConnection::set_escalation_timeout_for_test`].
@@ -1652,23 +1677,42 @@ async fn run_update_pump(
             for block in &blocks {
                 let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match kind {
-                    "text" if !text_streamed_for_current_message => {
+                    "text" => {
+                        // The final `Assistant` message carries the AUTHORITATIVE
+                        // complete text. Three cases:
+                        //  - nothing streamed → emit the whole block (recovery for
+                        //    the local-command / non-streaming path).
+                        //  - streaming was PARTIAL (the streamed deltas are a
+                        //    proper prefix of the final, shorter than it — a
+                        //    truncated/dropped stream) → emit only the MISSING
+                        //    SUFFIX so the message is completed, not left cut off
+                        //    (the "interrupted reply stays 'Тел'" bug).
+                        //  - streaming already delivered the whole text → emit
+                        //    nothing (a genuine duplicate).
+                        // Appends, so we must never re-emit already-streamed bytes.
                         if let Some(text) = block.get("text").and_then(|v| v.as_str())
                             && !text.is_empty()
                         {
-                            let chunk = acp::ContentChunk::new(acp::ContentBlock::Text(
-                                acp::TextContent::new(text.to_string()),
-                            ));
-                            let mut update = acp::SessionUpdate::AgentMessageChunk(chunk);
-                            if let Some(parent) = parent_id.as_deref() {
-                                stamp_subagent_meta(&mut update, parent);
+                            let suffix = final_text_block_suffix(
+                                text_streamed_for_current_message,
+                                &current_message_text,
+                                text,
+                            );
+                            if let Some(suffix) = suffix.filter(|s| !s.is_empty()) {
+                                let chunk = acp::ContentChunk::new(acp::ContentBlock::Text(
+                                    acp::TextContent::new(suffix.to_string()),
+                                ));
+                                let mut update = acp::SessionUpdate::AgentMessageChunk(chunk);
+                                if let Some(parent) = parent_id.as_deref() {
+                                    stamp_subagent_meta(&mut update, parent);
+                                }
+                                thread
+                                    .update(cx, |thread, cx| {
+                                        thread.handle_session_update(update, cx).log_err();
+                                    })
+                                    .ok();
+                                text_blocks_recovered += 1;
                             }
-                            thread
-                                .update(cx, |thread, cx| {
-                                    thread.handle_session_update(update, cx).log_err();
-                                })
-                                .ok();
-                            text_blocks_recovered += 1;
                         }
                     }
                     "thinking" if !thinking_streamed_for_current_message => {
@@ -2116,6 +2160,24 @@ impl AgentConnection for ClaudeNativeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_text_block_suffix_cases() {
+        // Not streamed → emit the whole final block (recovery path).
+        assert_eq!(final_text_block_suffix(false, "", "full reply"), Some("full reply"));
+        // Streamed the complete text → duplicate, emit nothing.
+        assert_eq!(final_text_block_suffix(true, "full reply", "full reply"), None);
+        // Streamed a SHORT prefix (truncated stream) → emit only the suffix.
+        assert_eq!(
+            final_text_block_suffix(true, "Тел", "Телефон подключён"),
+            Some("ефон подключён")
+        );
+        // Streamed text isn't a prefix of the final (mismatch) → don't
+        // double-append; leave it (None).
+        assert_eq!(final_text_block_suffix(true, "Tel", "Телефон"), None);
+        // Streamed text longer than final (shouldn't happen) → None.
+        assert_eq!(final_text_block_suffix(true, "Телефон", "Тел"), None);
+    }
 
     #[test]
     fn build_default_hooks_registers_post_tool_use_and_stop() {
