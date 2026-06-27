@@ -2112,7 +2112,26 @@ impl SolutionAgentStore {
     /// Persist the row for `session_id` to the DB so the History popover and
     /// "Continue last session" CTA pick it up across editor restarts. No-op
     /// when persistence is disabled (test contexts).
+    /// Ephemeral supervisor judge/auditor sessions must leave NO durable trace
+    /// in the DB. `is_supervisor_ephemeral` is an in-memory-only flag (there is
+    /// no persisted column for it), so a judge row written to `solution_sessions`
+    /// reloads after a restart as an ordinary child session — leaking the
+    /// judge's private supervisor reasoning as a visible session chip on the
+    /// desktop session list and the paired mobile (the live create/close/state
+    /// emits are already suppressed; persistence was the unguarded path). Every
+    /// persist-to-DB helper guards on this, so ephemeral sessions are never
+    /// written — which also stops the DB from accreting one judge transcript per
+    /// supervisor wake-up.
+    fn is_ephemeral_session(&self, session_id: SolutionSessionId, cx: &App) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|s| s.read(cx).is_supervisor_ephemeral)
+    }
+
     fn persist_session_row(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
+        if self.is_ephemeral_session(session_id, cx) {
+            return;
+        }
         let Some(db) = self.persistence.clone() else {
             return;
         };
@@ -2174,6 +2193,9 @@ impl SolutionAgentStore {
     /// `max()`-guarded UPDATE plus the deterministic restore seed absorb the
     /// common cases (write reordering and no-activity restarts).
     fn persist_change_seq(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
+        if self.is_ephemeral_session(session_id, cx) {
+            return;
+        }
         let Some(db) = self.persistence.clone() else {
             return;
         };
@@ -4763,6 +4785,9 @@ impl SolutionAgentStore {
     /// cold load. On empty `entries` it degrades to "delete all rows + save
     /// epoch".
     pub fn persist_all_rows(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
+        if self.is_ephemeral_session(session_id, cx) {
+            return;
+        }
         let Some(session) = self.sessions.get(&session_id).cloned() else {
             return;
         };
@@ -4812,6 +4837,9 @@ impl SolutionAgentStore {
         start_idx: usize,
         cx: &mut Context<Self>,
     ) {
+        if self.is_ephemeral_session(session_id, cx) {
+            return;
+        }
         let Some(session) = self.sessions.get(&session_id).cloned() else {
             return;
         };
@@ -4856,6 +4884,9 @@ impl SolutionAgentStore {
         global_idx: usize,
         cx: &mut Context<Self>,
     ) {
+        if self.is_ephemeral_session(session_id, cx) {
+            return;
+        }
         let Some(session) = self.sessions.get(&session_id).cloned() else {
             return;
         };
@@ -4900,6 +4931,9 @@ impl SolutionAgentStore {
         from_idx: usize,
         cx: &mut Context<Self>,
     ) {
+        if self.is_ephemeral_session(session_id, cx) {
+            return;
+        }
         let Some(session) = self.sessions.get(&session_id).cloned() else {
             return;
         };

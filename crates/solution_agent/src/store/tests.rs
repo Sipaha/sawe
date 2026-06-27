@@ -3668,6 +3668,64 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
     assert_eq!(remaining.len(), 1, "EntriesRemoved must delete the trailing row");
 }
 
+/// Ephemeral supervisor judge/auditor sessions must leave NO durable trace: a
+/// persisted row reloads (without the in-memory `is_supervisor_ephemeral` flag)
+/// as a normal child session, leaking the judge's private reasoning as a
+/// visible session chip after a restart. Every persist-to-DB path guards on the
+/// flag, so an ephemeral session writes neither entry rows nor a
+/// `solution_sessions` row, even when the entry-append + explicit flushes fire.
+#[gpui::test]
+async fn ephemeral_session_is_never_persisted(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+
+    // Stamp the session ephemeral, then wire persistence.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, _| s.is_supervisor_ephemeral = true);
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    // Append an entry (NewEntry → the auto persist_upsert path) AND fire the
+    // explicit row/all-rows flushes — every one must skip the ephemeral session.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "private supervisor reasoning".to_string(),
+                    ),
+                ),
+                cx,
+            );
+        });
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.persist_session_row(session_id, cx);
+            store.persist_all_rows(session_id, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    assert!(
+        db.load_entries(session_id)
+            .await
+            .expect("load entries")
+            .is_empty(),
+        "ephemeral session entries must never be persisted"
+    );
+    assert!(
+        db.load_change_seq(session_id)
+            .await
+            .expect("load change_seq")
+            .is_none(),
+        "ephemeral session must leave no solution_sessions row"
+    );
+}
+
 #[gpui::test]
 async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut TestAppContext) {
     use crate::model::NO_TIMESTAMP_MS;
