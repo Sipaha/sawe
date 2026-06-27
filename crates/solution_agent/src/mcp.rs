@@ -1593,6 +1593,14 @@ pub struct GetSessionChangesResult {
     pub total_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_entries: Vec<EntrySummary>,
+    /// True when more changed entries exist beyond this page (the response was
+    /// capped to [`CHANGED_ENTRIES_PAGE`]). The client keeps polling from the
+    /// advanced `current_seq` until it gets a page with `has_more == false`.
+    /// Lets a client that fell far behind catch up in bounded pages instead of
+    /// one unbounded "big bang" response. Omitted (defaults false) when the
+    /// page covers everything — back-compat with clients that don't read it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_more: bool,
     /// Forward-compat only. The transcript only appends, in-place-updates, or
     /// tail-truncates (no mid-list deletion; rewind is dead-for-claude), so
     /// shrink detection rides entirely on `total_count` and this stays empty.
@@ -1611,6 +1619,12 @@ pub struct GetSessionChangesResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_subagents: Option<Vec<SubagentDto>>,
 }
+
+/// Max `changed_entries` returned per `get_session_changes` call. A client
+/// behind by more than this gets `has_more: true` and keeps polling from the
+/// advanced cursor, so catch-up is bounded per round-trip instead of one
+/// unbounded response.
+const CHANGED_ENTRIES_PAGE: usize = 10;
 
 #[derive(Clone)]
 pub struct GetSessionChangesTool;
@@ -1670,6 +1684,7 @@ impl McpServerTool for GetSessionChangesTool {
                     reset: true,
                     total_count,
                     changed_entries: Vec::new(),
+                    has_more: false,
                     removed_indices: Vec::new(),
                     state: None,
                     pending_bundles: None,
@@ -1686,7 +1701,13 @@ impl McpServerTool for GetSessionChangesTool {
             // what `get_session` returns for the same `subagent_filter`, so a
             // delta-applied transcript renders byte-for-byte like a full load.
             let mut image_cursor = 0usize;
-            let mut changed_entries: Vec<EntrySummary> = Vec::new();
+            // Collect each changed entry WITH its `mod_seq` so the page can be
+            // taken in `mod_seq` order (the cursor axis), independent of index
+            // order — an old entry re-edited has a high `mod_seq` but a low
+            // index. The image index baked into each `EntrySummary` is computed
+            // during this index-order walk, so reordering the Vec afterwards is
+            // safe.
+            let mut changed: Vec<(u64, EntrySummary)> = Vec::new();
             let mut total_count = 0usize;
             for (index, entry) in session.entries.iter().enumerate() {
                 let passes = passes_filter(entry);
@@ -1694,14 +1715,15 @@ impl McpServerTool for GetSessionChangesTool {
                     total_count += 1;
                 }
                 if passes && entry.mod_seq > input.since_seq {
-                    changed_entries.push(summarize_entry(
+                    let summary = summarize_entry(
                         entry,
                         index,
                         true,
                         input.include_images,
                         &mut image_cursor,
                         &live_auth_options,
-                    ));
+                    );
+                    changed.push((entry.mod_seq, summary));
                 } else {
                     // Skipped (filtered out OR unchanged): still advance the
                     // cursor so later changed entries get global image indices
@@ -1710,6 +1732,30 @@ impl McpServerTool for GetSessionChangesTool {
                     image_cursor += count_images_in_entry(&entry.kind);
                 }
             }
+
+            // Paginate by `mod_seq` (ascending) so a client that fell far behind
+            // catches up in bounded pages instead of one unbounded "big bang"
+            // response. The cursor advances only to the last entry of the page;
+            // `has_more` tells the client to keep polling from there. Sections
+            // stay gated on the request's `since_seq` (eligible from page 1) and
+            // are idempotent full-replacements, so re-sending them across a
+            // multi-page catch-up is harmless.
+            changed.sort_by_key(|(seq, _)| *seq);
+            let has_more = changed.len() > CHANGED_ENTRIES_PAGE;
+            let (changed_entries, page_current_seq): (Vec<EntrySummary>, u64) = if has_more {
+                let page_last_seq = changed[CHANGED_ENTRIES_PAGE - 1].0;
+                let entries = changed
+                    .into_iter()
+                    .take(CHANGED_ENTRIES_PAGE)
+                    .map(|(_, e)| e)
+                    .collect();
+                (entries, page_last_seq)
+            } else {
+                // Caught up entry-wise: hand out the full `change_seq` so a
+                // re-poll from here returns nothing and section watermarks drain.
+                let entries = changed.into_iter().map(|(_, e)| e).collect();
+                (entries, current_seq)
+            };
 
             // Wall-clock anchors for the state DTO — same scheme as
             // `session_summary` (monotonic Instant rebased onto unix-millis).
@@ -1745,10 +1791,11 @@ impl McpServerTool for GetSessionChangesTool {
 
             Ok(GetSessionChangesResult {
                 epoch,
-                current_seq,
+                current_seq: page_current_seq,
                 reset: false,
                 total_count,
                 changed_entries,
+                has_more,
                 removed_indices: Vec::new(),
                 state,
                 pending_bundles,
@@ -7598,6 +7645,60 @@ mod tests {
         .await;
         assert!(none.changed_entries.is_empty());
         assert_eq!(none.total_count, 4);
+    }
+
+    #[gpui::test]
+    async fn get_session_changes_paginates_changed_entries(cx: &mut gpui::TestAppContext) {
+        use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+        let (session_id, _tmp) = seed_delta_session(cx).await;
+        // Replace with 15 entries (mod_seq 1..=15) so a since=0 poll exceeds the
+        // 10-per-page cap.
+        mutate_session(session_id, cx, |s| {
+            s.entries = (1..=15u64)
+                .map(|n| SessionEntry {
+                    created_ms: 1_700_000_000_000 + n as i64,
+                    mod_seq: n,
+                    subagent_id: None,
+                    kind: SessionEntryKind::AssistantMessage {
+                        chunks: vec![AssistantChunk::Message(format!("a{n}"))],
+                    },
+                })
+                .collect();
+            s.change_seq = 15;
+        });
+
+        // Page 1: capped at 10, has_more, cursor at the 10th entry's mod_seq.
+        let p1 = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 0,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        assert_eq!(p1.changed_entries.len(), CHANGED_ENTRIES_PAGE, "page capped");
+        assert!(p1.has_more, "more entries remain after page 1");
+        assert_eq!(p1.current_seq, 10, "cursor advances to the 10th mod_seq");
+        assert_eq!(p1.total_count, 15, "total_count is the full filtered count");
+
+        // Page 2: the remaining 5, caught up, cursor at the full change_seq.
+        let p2 = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: p1.current_seq,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        assert_eq!(p2.changed_entries.len(), 5, "remaining entries on page 2");
+        assert!(!p2.has_more, "caught up after page 2");
+        assert_eq!(p2.current_seq, 15, "cursor at full change_seq when caught up");
     }
 
     #[gpui::test]
