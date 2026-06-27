@@ -253,9 +253,12 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
     };
     let context_section = match &ctx.context_usage {
         Some(usage) => format!(
-            "## Context-window fullness (right now)\n\n{usage}\n\nWeigh this when \
-             deciding `compact`: the higher the fullness, the stronger the case for a \
-             `compact` verdict before more work. Treat ≥80% as a strong signal.\n"
+            "## Context-window fullness (right now)\n\n{usage}\n\nWeigh this against \
+             what comes next (see the `compact` verdict): the higher the fullness AND \
+             the heavier the next step, the stronger the case for a `compact` verdict \
+             now. Don't treat any single percentage as a hard gate — a long/expensive \
+             next run at moderate fullness (~65%+) warrants compacting before it, \
+             while a short next step is fine at higher fullness.\n"
         ),
         None => String::new(),
     };
