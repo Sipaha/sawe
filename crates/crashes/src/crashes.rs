@@ -198,6 +198,13 @@ pub struct InitCrashHandler {
 pub struct CrashPanic {
     pub message: String,
     pub span: String,
+    /// Symbolicated Rust backtrace captured in the panic hook (frames still on
+    /// the stack). Written to the crash sidecar JSON so a panic is diagnosable
+    /// from the crashed binary's own symbols, without symbolicating the
+    /// minidump (whose binary may have been rebuilt/overwritten by the time
+    /// anyone looks). Empty string when capture is unavailable.
+    #[serde(default)]
+    pub backtrace: String,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -371,11 +378,19 @@ pub fn panic_hook(crash_client: Arc<Client>, message: &str, location: Option<&Lo
     let thread_name = current_thread.name().unwrap_or("<unnamed>");
 
     let location = location.map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
-    log::error!("thread '{thread_name}' panicked at {location}:\n{message}...");
+    // Capture frames while they're still on the stack (the hook runs before the
+    // abort that generates the minidump). `force_capture` ignores RUST_BACKTRACE,
+    // so this works in the minidump build path which never sets it.
+    let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+    log::error!("thread '{thread_name}' panicked at {location}:\n{message}\n{backtrace}");
 
     send_crash_server_message(
         &crash_client,
-        CrashServerMessage::Panic(CrashPanic { message, span }),
+        CrashServerMessage::Panic(CrashPanic {
+            message,
+            span,
+            backtrace,
+        }),
     );
     log::error!("triggering a crash to generate a minidump...");
 
