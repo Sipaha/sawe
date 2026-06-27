@@ -56,6 +56,15 @@ pub fn translate(method: &str) -> Option<&'static str> {
         "remote.solution_agent.restart_agent" => Some("solution_agent.restart_agent"),
         "remote.solution_agent.reset_context" => Some("solution_agent.reset_context"),
         "remote.solution_agent.start_compact" => Some("solution_agent.start_compact"),
+        "remote.solution_agent.set_supervisor_enabled" => {
+            Some("solution_agent.set_supervisor_enabled")
+        }
+        "remote.solution_agent.set_supervisor_prompt" => {
+            Some("solution_agent.set_supervisor_prompt")
+        }
+        "remote.solution_agent.get_supervisor_state" => {
+            Some("solution_agent.get_supervisor_state")
+        }
         "remote.solution_agent.upload_init" => Some("solution_agent.upload_init"),
         "remote.solution_agent.upload_status" => Some("solution_agent.upload_status"),
         "remote.solution_agent.upload_finish" => Some("solution_agent.upload_finish"),
@@ -201,6 +210,18 @@ mod tests {
             (
                 "remote.solution_agent.start_compact",
                 "solution_agent.start_compact",
+            ),
+            (
+                "remote.solution_agent.set_supervisor_enabled",
+                "solution_agent.set_supervisor_enabled",
+            ),
+            (
+                "remote.solution_agent.set_supervisor_prompt",
+                "solution_agent.set_supervisor_prompt",
+            ),
+            (
+                "remote.solution_agent.get_supervisor_state",
+                "solution_agent.get_supervisor_state",
             ),
             (
                 "remote.solution_agent.upload_init",

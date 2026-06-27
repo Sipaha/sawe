@@ -100,6 +100,15 @@ pub fn register(cx: &mut App) {
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(SupervisorAuditVerdictTool);
     });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(SetSupervisorEnabledTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(SetSupervisorPromptTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(GetSupervisorStateTool);
+    });
 }
 
 // =====================================================================
@@ -4402,6 +4411,265 @@ impl McpServerTool for SupervisorAuditVerdictTool {
                 text: "recorded".into(),
             }],
             structured_content: SupervisorAuditVerdictResult {},
+        })
+    }
+}
+
+// =====================================================================
+// solution_agent.set_supervisor_enabled
+// =====================================================================
+
+/// Enable or disable the Chat Supervisor for the given session.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SetSupervisorEnabledParams {
+    pub session_id: String,
+    pub enabled: bool,
+}
+
+impl<'de> Deserialize<'de> for SetSupervisorEnabledParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+            enabled: bool,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            session_id: inner.session_id,
+            enabled: inner.enabled,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SetSupervisorEnabledResult {}
+
+#[derive(Clone)]
+pub struct SetSupervisorEnabledTool;
+
+impl McpServerTool for SetSupervisorEnabledTool {
+    type Input = SetSupervisorEnabledParams;
+    type Output = SetSupervisorEnabledResult;
+    const NAME: &'static str = "solution_agent.set_supervisor_enabled";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.set_supervision_enabled(session_id, input.enabled, cx);
+            });
+        });
+
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: "ok".to_string(),
+            }],
+            structured_content: SetSupervisorEnabledResult {},
+        })
+    }
+}
+
+// =====================================================================
+// solution_agent.set_supervisor_prompt
+// =====================================================================
+
+/// Set a custom prompt for the Chat Supervisor of the given session.
+/// Pass `null` to clear the custom prompt and revert to the default.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SetSupervisorPromptParams {
+    pub session_id: String,
+    pub prompt: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for SetSupervisorPromptParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+            prompt: Option<String>,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            session_id: inner.session_id,
+            prompt: inner.prompt,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SetSupervisorPromptResult {}
+
+#[derive(Clone)]
+pub struct SetSupervisorPromptTool;
+
+impl McpServerTool for SetSupervisorPromptTool {
+    type Input = SetSupervisorPromptParams;
+    type Output = SetSupervisorPromptResult;
+    const NAME: &'static str = "solution_agent.set_supervisor_prompt";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.set_supervisor_prompt(session_id, input.prompt, cx);
+            });
+        });
+
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: "ok".to_string(),
+            }],
+            structured_content: SetSupervisorPromptResult {},
+        })
+    }
+}
+
+// =====================================================================
+// solution_agent.get_supervisor_state
+// =====================================================================
+
+/// Read the Chat Supervisor state and cumulative verdict statistics for
+/// a session. Returns a default (all-zero) result when the session is
+/// not found or has never had supervision enabled.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct GetSupervisorStateParams {
+    pub session_id: String,
+}
+
+impl<'de> Deserialize<'de> for GetSupervisorStateParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            session_id: inner.session_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GetSupervisorStateResult {
+    pub enabled: bool,
+    /// `SupervisorStatus::to_db_string()` value.
+    pub status: String,
+    pub consecutive_continues: u32,
+    /// Ceiling enforced by the supervisor before it escalates to the user.
+    pub max_continues: u32,
+    pub custom_prompt: Option<String>,
+    pub verdicts_total: usize,
+    pub verdicts_continue: usize,
+    pub verdicts_compact: usize,
+    pub verdicts_done: usize,
+    pub verdicts_ask: usize,
+    pub audits: usize,
+    pub total_tokens: u64,
+}
+
+#[derive(Clone)]
+pub struct GetSupervisorStateTool;
+
+impl McpServerTool for GetSupervisorStateTool {
+    type Input = GetSupervisorStateParams;
+    type Output = GetSupervisorStateResult;
+    const NAME: &'static str = "solution_agent.get_supervisor_state";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+
+        let result = cx.update(|cx| -> GetSupervisorStateResult {
+            let store = SolutionAgentStore::global(cx);
+            let (supervisor_state, solution_root) = store.read_with(cx, |store, cx| {
+                (
+                    store.supervisor_state(session_id),
+                    store.solution_root_for_app(session_id, cx),
+                )
+            });
+
+            let stats = solution_root
+                .map(|root| {
+                    let dir = crate::supervisor::supervisor_dir(&root, session_id);
+                    let records = crate::supervisor::read_verdicts(&dir);
+                    crate::supervisor::verdict_stats(&records)
+                })
+                .unwrap_or_default();
+
+            match supervisor_state {
+                Some(state) => GetSupervisorStateResult {
+                    enabled: state.enabled,
+                    status: state.status.to_db_string(),
+                    consecutive_continues: state.consecutive_continues,
+                    max_continues: crate::supervisor::MAX_CONSECUTIVE_CONTINUES,
+                    custom_prompt: state.custom_prompt,
+                    verdicts_total: stats.total,
+                    verdicts_continue: stats.by_action
+                        [crate::supervisor::VerdictAction::Continue as usize],
+                    verdicts_compact: stats.by_action
+                        [crate::supervisor::VerdictAction::Compact as usize],
+                    verdicts_done: stats.by_action
+                        [crate::supervisor::VerdictAction::Done as usize],
+                    verdicts_ask: stats.by_action
+                        [crate::supervisor::VerdictAction::Ask as usize],
+                    audits: stats.audits,
+                    total_tokens: stats.total_tokens,
+                },
+                None => GetSupervisorStateResult {
+                    enabled: false,
+                    status: crate::supervisor::SupervisorStatus::Disabled.to_db_string(),
+                    consecutive_continues: 0,
+                    max_continues: crate::supervisor::MAX_CONSECUTIVE_CONTINUES,
+                    custom_prompt: None,
+                    verdicts_total: 0,
+                    verdicts_continue: 0,
+                    verdicts_compact: 0,
+                    verdicts_done: 0,
+                    verdicts_ask: 0,
+                    audits: 0,
+                    total_tokens: 0,
+                },
+            }
+        });
+
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: serde_json::to_string(&result).unwrap_or_default(),
+            }],
+            structured_content: result,
         })
     }
 }
