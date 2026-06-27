@@ -124,4 +124,9 @@ pub(crate) const SUPPORTED_EVENT_KINDS: &[&str] = &[
     "agent_session_title_changed",
     "agent_session_message_appended",
     "agent_session_notification_sent",
+    // Content-free, coalesced "transcript advanced — re-poll" signal. Carries
+    // `{ session_id, current_seq }`; the mobile polls `get_session_changes` to
+    // convergence (cursor >= current_seq) on it, so a single delivered dirty
+    // heals a view left short by lost per-entry pokes.
+    "agent_session_dirty",
 ];

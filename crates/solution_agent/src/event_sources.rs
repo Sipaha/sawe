@@ -15,6 +15,7 @@ use gpui::{App, AppContext as _, Entity, Global, Subscription};
 use serde_json::json;
 
 use crate::mcp::truncate_preview;
+use crate::model::SolutionSessionId;
 use crate::notifier::NotifyKind;
 use crate::store::{SolutionAgentStore, SolutionAgentStoreEvent};
 
@@ -44,8 +45,74 @@ pub fn install(cx: &mut App) {
     });
     coordinator.update(cx, |this, cx| {
         this.subscriptions.push(
-            cx.subscribe(&store, |_this, _store, event, cx| match event {
-                SolutionAgentStoreEvent::SessionCreated {
+            cx.subscribe(&store, |_this, _store, event, cx| {
+                emit_event_notification(event, cx);
+                // Coalesced "re-poll" signal: any change that advances a
+                // session's `change_seq` also emits a content-free
+                // `agent_session_dirty { session_id, current_seq }`. The mobile
+                // polls `get_session_changes` to convergence on it, so a single
+                // delivered dirty heals a transcript left short by lost per-entry
+                // pokes (the "interrupted reply stays interrupted" bug). Pure
+                // lifecycle/tab/notify events don't advance a transcript and
+                // don't signal dirty.
+                if let Some(id) = dirty_target_session(event) {
+                    editor_mcp::emit_notification(
+                        cx,
+                        "agent_session_dirty",
+                        build_session_dirty_payload(id, cx),
+                    );
+                }
+            }),
+        );
+    });
+
+    cx.set_global(GlobalEventSourceCoordinator(coordinator));
+}
+
+/// The session whose transcript a store event advanced — i.e. the one a remote
+/// client should re-poll. `None` for lifecycle/tab/notify events that don't
+/// move a session's `change_seq`. Used to drive the `agent_session_dirty`
+/// convergence signal.
+fn dirty_target_session(event: &SolutionAgentStoreEvent) -> Option<crate::model::SolutionSessionId> {
+    use SolutionAgentStoreEvent::*;
+    match event {
+        SessionStateChanged(id)
+        | SessionTitleChanged(id)
+        | SessionMessageAppended(id, _)
+        | SessionQueueChanged(id)
+        | SessionSubagentsChanged(id)
+        | SessionBackgroundAgentsChanged(id)
+        | SessionBackgroundShellsChanged(id) => Some(*id),
+        SessionContextReset { id, .. } => Some(*id),
+        SessionCreated { .. } | SessionClosed(_) | SessionNotified(..) | TabsChanged { .. } => None,
+    }
+}
+
+/// Build the `agent_session_dirty` payload: the session id + its CURRENT
+/// `change_seq` (read at emit time, so it reflects the latest change, not the
+/// one that happened to trigger this emit — a higher seq is always safe, the
+/// client converges to it). Falls back to seq 0 when the session is gone.
+pub(crate) fn build_session_dirty_payload(
+    session_id: SolutionSessionId,
+    cx: &App,
+) -> serde_json::Value {
+    let current_seq = SolutionAgentStore::try_global(cx)
+        .and_then(|store| {
+            store.read_with(cx, |store, cx| {
+                store.session(session_id).map(|s| s.read(cx).change_seq)
+            })
+        })
+        .unwrap_or(0);
+    json!({
+        "session_id": session_id.to_string(),
+        "current_seq": current_seq,
+    })
+}
+
+/// Translate a single [`SolutionAgentStoreEvent`] into its MCP notification.
+fn emit_event_notification(event: &SolutionAgentStoreEvent, cx: &mut App) {
+    match event {
+        SolutionAgentStoreEvent::SessionCreated {
                     id,
                     parent_session_id,
                 } => {
@@ -146,11 +213,7 @@ pub fn install(cx: &mut App) {
                         payload,
                     );
                 }
-            }),
-        );
-    });
-
-    cx.set_global(GlobalEventSourceCoordinator(coordinator));
+    }
 }
 
 /// Build the JSON payload for an `agent_session_message_appended`
@@ -489,6 +552,62 @@ mod tests {
             assert_eq!(obj.get("entry_index").and_then(|v| v.as_u64()), Some(7));
             assert!(obj.get("role").is_none());
             assert!(obj.get("preview").is_none());
+        });
+    }
+
+    #[test]
+    fn dirty_target_is_transcript_events_only() {
+        use crate::store::SolutionAgentStoreEvent::*;
+        let sid = crate::model::SolutionSessionId::new();
+        // Transcript-advancing events signal a re-poll.
+        assert_eq!(dirty_target_session(&SessionMessageAppended(sid, 3)), Some(sid));
+        assert_eq!(dirty_target_session(&SessionStateChanged(sid)), Some(sid));
+        assert_eq!(dirty_target_session(&SessionQueueChanged(sid)), Some(sid));
+        assert_eq!(dirty_target_session(&SessionSubagentsChanged(sid)), Some(sid));
+        // Pure lifecycle events do NOT — nothing for a client to re-fetch.
+        assert_eq!(dirty_target_session(&SessionClosed(sid)), None);
+        assert_eq!(
+            dirty_target_session(&SessionCreated {
+                id: sid,
+                parent_session_id: None,
+            }),
+            None
+        );
+    }
+
+    #[gpui::test]
+    async fn dirty_payload_carries_session_id_and_current_seq(cx: &mut TestAppContext) {
+        let (session_id, _acp_thread, _tmp) =
+            crate::store::tests::create_session_with_thread(cx).await;
+        cx.update(|cx| {
+            let thread = {
+                let store = SolutionAgentStore::global(cx);
+                store
+                    .read(cx)
+                    .session(session_id)
+                    .and_then(|s| s.read(cx).acp_thread().cloned())
+            }
+            .expect("thread");
+            thread.update(cx, |thread, cx| {
+                let chunk = agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("hi".to_string()),
+                );
+                thread.push_user_content_block(None, chunk, cx);
+            });
+        });
+        cx.executor().run_until_parked();
+
+        cx.update(|cx| {
+            let payload = build_session_dirty_payload(session_id, cx);
+            let obj = payload.as_object().expect("object");
+            assert_eq!(
+                obj.get("session_id").and_then(|v| v.as_str()),
+                Some(session_id.to_string().as_str())
+            );
+            assert!(
+                obj.get("current_seq").and_then(|v| v.as_u64()).is_some(),
+                "current_seq must be a u64: {payload}"
+            );
         });
     }
 
