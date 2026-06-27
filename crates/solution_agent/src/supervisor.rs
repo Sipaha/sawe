@@ -201,6 +201,23 @@ pub struct JudgeBriefingContext {
 const JUDGE_INSTRUCTIONS: &str = include_str!("../resources/supervisor_judge_instructions.md");
 const AUDIT_INSTRUCTIONS: &str = include_str!("../resources/supervisor_audit_instructions.md");
 
+/// System prompt for the ephemeral judge/auditor sessions, appended INSTEAD of
+/// the solution's default worker system prompt. The default prompt frames the
+/// session as a worker ("You are working inside a Solution… run build/test/git…"),
+/// which can pull the judge into doing the task instead of judging it. This
+/// override keeps Claude's standard tool-using behaviour but re-frames the
+/// session as a read-only outside evaluator whose only output is a verdict tool
+/// call. The per-turn briefing carries the concrete instructions.
+pub const SUPERVISOR_SYSTEM_PROMPT: &str = "\
+You are an independent Supervisor evaluating another AI coding session — you are \
+NOT a worker on its task. Do NOT write or edit code, run the task, or make git \
+commits. Your sole job is to read the supervised session and its artifacts, then \
+issue exactly ONE verdict by calling the `solution_agent.supervisor_verdict` MCP \
+tool (or `solution_agent.supervisor_audit_verdict` when auditing). You may read \
+files, read the conversation via `solution_agent.get_session`, and update your \
+diary — but stay outside the work and judge it from the outside. Follow the \
+briefing you are given in the first message.";
+
 /// Render the judge's single user-turn briefing by substituting the runtime
 /// paths into the instruction template. The meta-auditor variant (`audit:
 /// true`) swaps in a different template but shares the same placeholder set.
@@ -246,6 +263,44 @@ pub fn diary_path(dir: &Path) -> PathBuf {
 
 pub fn verdicts_path(dir: &Path) -> PathBuf {
     dir.join("verdicts.jsonl")
+}
+
+/// Cumulative, compaction-surviving record of what was accomplished over a
+/// session's lifetime, at `<solution_root>/.agents/<session_id>/session-log.md`.
+/// Each custom compaction appends the agent's own `state.md` summary here, and
+/// the supervisor's `done` verdict appends a final wrap-up — so the operator can
+/// return later and read the whole arc even after context compactions wiped the
+/// live dialogue.
+pub fn session_log_path(solution_root: &Path, session_id: SolutionSessionId) -> PathBuf {
+    solution_root
+        .join(".agents")
+        .join(session_id.to_string())
+        .join("session-log.md")
+}
+
+/// Append a timestamped `## {header}` section followed by `body` to `path`,
+/// creating the file (and its parent dir) on first write. Best-effort: the
+/// caller logs the error. `now_ms` is the Unix-millis timestamp to stamp (the
+/// caller passes `chrono::Utc::now().timestamp_millis()` — kept as a param so
+/// this stays pure and unit-testable).
+pub fn append_session_log(
+    path: &Path,
+    header: &str,
+    body: &str,
+    now_ms: i64,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let stamp = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_default();
+    let section = format!("\n## {header} — {stamp}\n\n{}\n", body.trim_end());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(section.as_bytes())
 }
 
 pub fn append_verdict(dir: &Path, rec: &VerdictRecord) -> std::io::Result<()> {
@@ -346,6 +401,25 @@ mod tests {
         let root = std::path::Path::new("/tmp/sol");
         let dir = supervisor_dir(root, sid());
         assert_eq!(dir, root.join(".agents").join("abcd1234").join("supervisor"));
+    }
+
+    #[test]
+    fn session_log_path_and_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = session_log_path(tmp.path(), sid());
+        assert_eq!(
+            path,
+            tmp.path().join(".agents").join("abcd1234").join("session-log.md")
+        );
+        append_session_log(&path, "Compaction c01", "did the first thing", 0).unwrap();
+        append_session_log(&path, "✓ Session complete (Supervisor)", "all done", 0).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("## Compaction c01"));
+        assert!(contents.contains("did the first thing"));
+        assert!(contents.contains("## ✓ Session complete (Supervisor)"));
+        assert!(contents.contains("all done"));
+        // appends accumulate (compaction entry precedes the completion entry)
+        assert!(contents.find("Compaction c01").unwrap() < contents.find("all done").unwrap());
     }
 
     #[test]

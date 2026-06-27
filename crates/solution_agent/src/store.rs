@@ -1462,6 +1462,18 @@ impl SolutionAgentStore {
                 }
                 self.persist_supervisor_state(id, cx);
                 self.clear_supervisor_question(id, cx);
+                // Append the supervisor's completion summary (the judge's
+                // `reasoning`, which the briefing asks it to make a thorough
+                // session wrap-up) to the cumulative session log.
+                if let Some(root) = self.solution_root_for(id, cx) {
+                    crate::supervisor::append_session_log(
+                        &crate::supervisor::session_log_path(&root, id),
+                        "✓ Session complete (Supervisor)",
+                        &reasoning,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .log_err();
+                }
                 self.notify_supervisor_done(id, &reasoning, cx);
             }
             VerdictAction::Ask => {
@@ -1969,7 +1981,19 @@ impl SolutionAgentStore {
         cx: &App,
     ) -> Option<acp::Meta> {
         let mut meta = acp::Meta::new();
-        if let Some(adapter) = self.adapters.get(agent_id) {
+        // Ephemeral supervisor judge/auditor sessions get a Supervisor system
+        // prompt instead of the solution's worker framing, so they judge from
+        // the outside rather than drifting into doing the task.
+        let is_supervisor = session_id
+            .and_then(|id| self.sessions.get(&id))
+            .map(|s| s.read(cx).is_supervisor_ephemeral)
+            .unwrap_or(false);
+        if is_supervisor {
+            meta.insert(
+                "systemPrompt".to_string(),
+                serde_json::json!({ "append": crate::supervisor::SUPERVISOR_SYSTEM_PROMPT }),
+            );
+        } else if let Some(adapter) = self.adapters.get(agent_id) {
             let prompt = adapter.build_initial_system_prompt(solution);
             if !prompt.is_empty() {
                 meta.insert(

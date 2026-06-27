@@ -3353,6 +3353,29 @@ impl McpServerTool for CompactSessionTool {
             .to_path_buf();
         validate_handoff_files(&compact_dir)?;
 
+        // Append the agent's own `state.md` summary to the cumulative session
+        // log (`.agents/<sid>/session-log.md`) BEFORE rotating, so the operator
+        // can read what was accomplished across the whole session even after
+        // compactions wiped the live dialogue. Best-effort — never blocks the
+        // rotation.
+        if let (Some(parent), Ok(state_md)) = (
+            compact_dir.parent(),
+            std::fs::read_to_string(compact_dir.join("state.md")),
+        ) {
+            let label = compact_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "compact".into());
+            if let Err(err) = crate::supervisor::append_session_log(
+                &parent.join("session-log.md"),
+                &format!("Compaction {label}"),
+                &state_md,
+                chrono::Utc::now().timestamp_millis(),
+            ) {
+                log::warn!("compact_session: append session-log failed: {err}");
+            }
+        }
+
         // 2. Rotate the in-flight ACP thread under the SAME
         //    SolutionSessionId. Subprocess pool entry stays, tab stays,
         //    only the conversation history is swapped out. Returns the

@@ -28,7 +28,12 @@ judge from the outside, not to trust its self-assessment.
   project's own compaction mechanism (it writes durable handoff files under
   `{COMPACT_DIR}`); you only issue the `compact` verdict.
 - `done` — the goal (from user messages + next.md) is genuinely complete and
-  verified. Be strict: do not declare done on the agent's word alone.
+  verified. Be strict: do not declare done on the agent's word alone. When you
+  issue `done`, make your `reasoning` a thorough, self-contained summary of what
+  was accomplished across the WHOLE session — aggregate from the compact
+  `state.md` files under `{COMPACT_DIR}` and the conversation. It is appended to
+  a durable session log the operator reads later (after the live dialogue is
+  gone to compaction), so write it for a human returning much later.
 - `ask` — you cannot responsibly decide without the human (genuine ambiguity,
   conflicting instructions, or a destructive/irreversible choice). Provide a
   concrete `question`.
