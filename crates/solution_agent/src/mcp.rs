@@ -1606,16 +1606,18 @@ pub struct GetSessionChangesResult {
     /// shrink detection rides entirely on `total_count` and this stays empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_indices: Vec<usize>,
-    /// Present only when `state_seq > since_seq`. Absent means "unchanged,
-    /// keep your cached state".
+    /// ALWAYS present on a non-`reset` response (the small sections are sent
+    /// unconditionally so a delta fully re-establishes them — see the
+    /// always-send rationale in `GetSessionChangesTool::run`). `Option` is kept
+    /// for the `reset` path (all sections `None`) and wire back-compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<SessionStateDto>,
-    /// Present only when `queue_seq > since_seq`. Absent means "queue
-    /// unchanged". An empty Vec means "queue changed and is now empty".
+    /// ALWAYS present on a non-`reset` response. An empty Vec means "the queue
+    /// is empty"; the client adopts it as the authoritative queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_bundles: Option<Vec<QueuedBundleSummary>>,
-    /// Present only when `subagents_seq > since_seq`. Absent means "subagent
-    /// strip unchanged". An empty Vec means "strip changed and is now empty".
+    /// ALWAYS present on a non-`reset` response. An empty Vec means "the strip
+    /// is empty"; the client adopts it as the authoritative subagent strip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_subagents: Option<Vec<SubagentDto>>,
 }
@@ -1773,21 +1775,33 @@ impl McpServerTool for GetSessionChangesTool {
                 _ => 0,
             };
 
-            // Uniform `watermark > since_seq` rule per section. No
-            // cold-session special-case: 5.1b seeds the section watermarks
-            // above the restored `change_seq`, so a restarted client re-sends
-            // its (now empty) sections through this same rule.
-            let state = (session.state_seq > input.since_seq).then(|| {
-                SessionStateDto::from_state(
-                    &session.state,
-                    running_started_at_ms,
-                    stopping_started_at_ms,
-                )
-            });
-            let pending_bundles = (session.queue_seq > input.since_seq)
-                .then(|| build_pending_bundle_summaries(session, cx));
-            let active_subagents = (session.subagents_seq > input.since_seq)
-                .then(|| build_active_subagents_vec(session));
+            // Always send the three small sections (state scalar, queue,
+            // subagent strip) regardless of `since_seq`. They are bounded and
+            // cheap, and the old `watermark > since_seq` gate created an
+            // UNRECOVERABLE staleness hole: once a client's cursor advanced past
+            // a section watermark, the delta path could never resend that
+            // section. Two ways that happened in the wild:
+            //   * cache-restore on session open synthesises a placeholder state
+            //     (`Idle`) and seats the cursor at `cached.lastSeq`, already far
+            //     above a long-Running session's old `state_seq` → the next
+            //     delta omitted `state` → the phone froze at "Idle" while the
+            //     desktop ran for an hour;
+            //   * a section mutation that forgot to bump its watermark (e.g. the
+            //     `→Idle` subagent-strip GC) → the cleared strip never reached
+            //     the phone, stranding a finished subagent tab.
+            // Sending them every poll makes each delta a full re-establishment
+            // of the small mutable state — unconditional convergence, immune to
+            // a placeholder cursor or a missed bump. `applySessionDelta` already
+            // treats a present section as an authoritative replacement (an empty
+            // Vec means "now empty"). The watermarks still drive the cheap
+            // `agent_session_dirty` poke; they just no longer gate delivery.
+            let state = Some(SessionStateDto::from_state(
+                &session.state,
+                running_started_at_ms,
+                stopping_started_at_ms,
+            ));
+            let pending_bundles = Some(build_pending_bundle_summaries(session, cx));
+            let active_subagents = Some(build_active_subagents_vec(session));
 
             Ok(GetSessionChangesResult {
                 epoch,
@@ -7702,22 +7716,26 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn get_session_changes_section_omit_and_include(cx: &mut gpui::TestAppContext) {
+    async fn get_session_changes_sections_always_present(cx: &mut gpui::TestAppContext) {
         let (session_id, _tmp) = seed_delta_session(cx).await;
 
-        // Only the state watermark moves past since_seq.
+        // The three small sections are ALWAYS sent, regardless of how far the
+        // section watermarks sit below `since_seq`. Here every watermark is far
+        // below the client's cursor — the gated implementation would have
+        // omitted all three (the staleness hole); the always-send contract
+        // surfaces the current values so the delta re-establishes them.
         mutate_session(session_id, cx, |s| {
             s.state = crate::model::SessionState::AwaitingInput;
-            s.state_seq = 6;
-            s.queue_seq = 4;
-            s.subagents_seq = 3;
-            s.change_seq = 6;
+            s.state_seq = 2;
+            s.queue_seq = 2;
+            s.subagents_seq = 2;
+            s.change_seq = 9;
         });
 
         let result = run_changes(
             GetSessionChangesParams {
                 session_id: session_id.to_string(),
-                since_seq: 5,
+                since_seq: 8,
                 known_epoch: 0,
                 subagent_filter: None,
                 include_images: false,
@@ -7727,33 +7745,37 @@ mod tests {
         .await;
         assert!(
             matches!(result.state, Some(SessionStateDto::AwaitingInput)),
-            "state_seq > since_seq → state Some, got {:?}",
+            "state always present (even with state_seq << since_seq), got {:?}",
             result.state
         );
         assert!(
-            result.pending_bundles.is_none(),
-            "queue_seq <= since_seq → pending_bundles None"
+            result
+                .pending_bundles
+                .as_ref()
+                .is_some_and(|b| b.is_empty()),
+            "pending_bundles always present; empty Vec when the queue is empty"
         );
         assert!(
-            result.active_subagents.is_none(),
-            "subagents_seq <= since_seq → active_subagents None"
+            result
+                .active_subagents
+                .as_ref()
+                .is_some_and(|a| a.is_empty()),
+            "active_subagents always present; empty Vec when the strip is empty"
         );
 
-        // Converse: only the queue watermark moves.
+        // A non-empty queue surfaces in the same always-present section.
         mutate_session(session_id, cx, |s| {
             s.pending_messages.push_back(crate::model::PendingBundle {
                 target: crate::model::QueueTarget::Main,
                 blocks: vec![fake_user_text_chunk("queued")],
             });
-            s.queue_seq = 8;
-            s.state_seq = 6;
-            s.subagents_seq = 3;
-            s.change_seq = 8;
+            s.queue_seq = 2;
+            s.change_seq = 10;
         });
         let result = run_changes(
             GetSessionChangesParams {
                 session_id: session_id.to_string(),
-                since_seq: 7,
+                since_seq: 9,
                 known_epoch: 0,
                 subagent_filter: None,
                 include_images: false,
@@ -7762,14 +7784,13 @@ mod tests {
         )
         .await;
         assert!(
-            result.state.is_none(),
-            "state_seq <= since_seq → state None"
+            matches!(result.state, Some(SessionStateDto::AwaitingInput)),
+            "state still present on a later poll"
         );
         let bundles = result
             .pending_bundles
-            .expect("queue_seq > since_seq → pending_bundles Some");
+            .expect("pending_bundles always Some");
         assert_eq!(bundles.len(), 1, "the queued bundle surfaces");
-        assert!(result.active_subagents.is_none());
     }
 
     #[gpui::test]

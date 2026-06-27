@@ -6933,6 +6933,79 @@ async fn subagent_spawn_bumps_subagents_watermark(cx: &mut TestAppContext) {
     });
 }
 
+/// The `→Idle` subagent-strip GC in `mutate_state` clears a stranded strip and
+/// MUST move `subagents_seq` (and emit `SessionSubagentsChanged`), exactly like
+/// an explicit removal — otherwise the mobile delta (and the desktop strip
+/// view) never learns the strip emptied and a finished subagent tab strands.
+#[gpui::test]
+async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Strand a subagent pill: register an InProgress Task (non-terminal, so the
+    // per-tool-call removal path never fires) and force the session Running.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.upsert_tool_call(
+                make_task_tool_call(
+                    "toolu_gc_1",
+                    "Task",
+                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    Some("Worker"),
+                    None,
+                ),
+                cx,
+            )
+            .expect("upsert task");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let subagents_seq_after_spawn = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+            });
+            let seq = session.read(cx).subagents_seq;
+            assert_eq!(session.read(cx).active_subagents.len(), 1, "pill stranded");
+            seq
+        })
+    });
+
+    // Transition into Idle through `mutate_state` — the GC must fire.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.mutate_state(session_id, |state| *state = SessionState::Idle, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert!(
+            s.active_subagents.is_empty() && s.active_subagent_order.is_empty(),
+            "→Idle GC must clear the stranded strip"
+        );
+        assert!(
+            s.subagents_seq > subagents_seq_after_spawn,
+            "the GC clear must advance subagents_seq ({} !> {})",
+            s.subagents_seq,
+            subagents_seq_after_spawn
+        );
+        assert_eq!(
+            s.subagents_seq, s.change_seq,
+            "subagents_seq must equal the freshly-allocated change_seq after GC"
+        );
+    });
+}
+
 /// Phase 5, Task 5.1: a discriminant-changing transition through `mutate_state`
 /// (Idle → Running) emits `SessionStateChanged` and must move `state_seq` to the
 /// freshly-allocated `change_seq`.
@@ -7826,6 +7899,41 @@ async fn user_reply_rearms_supervision_after_done(cx: &mut gpui::TestAppContext)
         st.status,
         crate::supervisor::SupervisorStatus::Watching,
         "re-armed supervision returns to Watching"
+    );
+}
+
+/// Regression: a `Compact` verdict re-entered the store. `apply_verdict` runs
+/// inside the MCP tool's `store.update(...)` lease, and the Compact arm called
+/// `compact::start_compact_for_session`, which re-`read_with`s the global store
+/// → `double_lease_panic` ("cannot read SolutionAgentStore while it is already
+/// being updated"). Every supervisor "compact" verdict crashed the live editor.
+/// The fix defers the compact past the update lease; this test drives the exact
+/// path (apply_verdict(Compact) inside `store.update`, then pump deferred work)
+/// and must NOT panic.
+#[gpui::test]
+async fn compact_verdict_does_not_reenter_store(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        // Pre-fix this call panicked synchronously inside the update.
+        store.apply_verdict(
+            id,
+            crate::supervisor::VerdictAction::Compact,
+            "context is large; compact".into(),
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+    // The deferred compact runs here (post-lease). It may decline (no context to
+    // compact on the seeded session) — that's fine; the point is no panic.
+    cx.executor().run_until_parked();
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id).unwrap());
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Watching,
+        "a Compact verdict leaves supervision Watching"
     );
 }
 

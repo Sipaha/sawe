@@ -1478,7 +1478,17 @@ impl SolutionAgentStore {
                     state.status = SupervisorStatus::Watching;
                 }
                 self.persist_supervisor_state(id, cx);
-                match crate::compact::start_compact_for_session(id, cx) {
+                // `start_compact_for_session` re-acquires the global
+                // `SolutionAgentStore` and `read_with`s it — but `apply_verdict`
+                // runs INSIDE the MCP tool's `store.update(...)` lease (mcp.rs
+                // `SupervisorVerdictTool::run`), so calling it inline reads the
+                // store entity while it is `&mut`-borrowed → `double_lease_panic`
+                // ("cannot read SolutionAgentStore while it is already being
+                // updated"). Every supervisor "compact" verdict crashed the
+                // editor this way. Defer the call past the current update so the
+                // lease is released first (decision: never read an entity during
+                // its own mutation — snapshot before, or defer).
+                cx.defer(move |cx| match crate::compact::start_compact_for_session(id, cx) {
                     Err(err) => {
                         log::warn!("apply_verdict compact({id}): {err}");
                     }
@@ -1489,7 +1499,7 @@ impl SolutionAgentStore {
                         );
                     }
                     Ok(_) => {}
-                }
+                });
             }
             VerdictAction::Done => {
                 if let Some(state) = self.supervisor_states.get_mut(&id) {
@@ -6873,12 +6883,24 @@ impl SolutionAgentStore {
         // engaged and hides most of the conversation. Clearing here is the
         // catch-all the per-tool-call path misses.
         if !matches!(previous, SessionState::Idle) && matches!(next, SessionState::Idle) {
-            session.update(cx, |s, _| {
+            let cleared = session.update(cx, |s, _| {
                 if !s.active_subagents.is_empty() || !s.active_subagent_order.is_empty() {
                     s.active_subagents.clear();
                     s.active_subagent_order.clear();
+                    true
+                } else {
+                    false
                 }
             });
+            // The clear is a strip mutation: route it through the watermark+emit
+            // helper so `SessionSubagentsChanged` fires (desktop strip re-render)
+            // and `subagents_seq` advances. The mobile delta now always sends
+            // the strip, but the bump keeps the watermark honest and the emit
+            // drives the dirty poke — never mutate a section silently (the same
+            // invariant `mark_state_changed` documents).
+            if cleared {
+                self.mark_subagents_changed(session_id, cx);
+            }
         }
         let now = std::time::Instant::now();
         let is_focused = self
