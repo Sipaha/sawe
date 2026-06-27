@@ -6968,6 +6968,95 @@ async fn mutate_state_bumps_state_watermark(cx: &mut TestAppContext) {
     });
 }
 
+/// Regression (Chat Supervisor port, C1/I1): a state change on an
+/// `is_supervisor_ephemeral` session (the hidden judge/auditor) must NOT emit a
+/// sequenced `workspace.session_state_changed` notification — that event is
+/// forwarded to mobile by `remote_control`'s allow-list, so an unfiltered emit
+/// would leak the invisible judge's Idle→Running→Idle churn on every supervisor
+/// wake-up. Asserted via the coordinator's seq counter: `emit_sequenced` advances
+/// it, the suppressed path does not. A non-ephemeral control session in the same
+/// test confirms the guard is specific to the ephemeral flag (and that internal
+/// bookkeeping — `state_seq` — still advances for the judge).
+#[gpui::test]
+async fn ephemeral_session_state_change_does_not_emit_workspace_event(
+    cx: &mut TestAppContext,
+) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(editor_mcp::workspace_seq::install);
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            // Mark the session as the hidden ephemeral supervisor judge.
+            session.update(cx, |s, _| {
+                s.is_supervisor_ephemeral = true;
+                s.state = SessionState::Idle;
+            });
+
+            let coord = editor_mcp::workspace_seq::WorkspaceEventCoordinator::global(cx);
+            let seq_before = coord.current_seq();
+            let state_seq_before = session.read(cx).state_seq;
+
+            // Idle → Running is a real discriminant change, so the wire emit
+            // would fire for a visible session.
+            store.mutate_state(
+                session_id,
+                |state| {
+                    *state = SessionState::Running {
+                        started_at: std::time::Instant::now(),
+                        notified: false,
+                    };
+                },
+                cx,
+            );
+
+            let coord = editor_mcp::workspace_seq::WorkspaceEventCoordinator::global(cx);
+            assert_eq!(
+                coord.current_seq(),
+                seq_before,
+                "ephemeral judge state change must NOT advance the workspace seq \
+                 (no workspace.session_state_changed emit leaks to mobile)"
+            );
+            // Internal bookkeeping must still run: the judge's own state_seq
+            // advances so `message_generator`'s Idle/Errored await still resolves.
+            assert!(
+                session.read(cx).state_seq > state_seq_before,
+                "internal state_seq must still advance for the ephemeral session"
+            );
+        });
+    });
+
+    // Control: a NON-ephemeral session in the same store DOES emit, proving the
+    // guard keys on `is_supervisor_ephemeral` and not on some unrelated path.
+    let (visible_id, _thread2, _tmp2) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(visible_id).expect("session");
+            session.update(cx, |s, _| s.state = SessionState::Idle);
+            let coord = editor_mcp::workspace_seq::WorkspaceEventCoordinator::global(cx);
+            let seq_before = coord.current_seq();
+            store.mutate_state(
+                visible_id,
+                |state| {
+                    *state = SessionState::Running {
+                        started_at: std::time::Instant::now(),
+                        notified: false,
+                    };
+                },
+                cx,
+            );
+            let coord = editor_mcp::workspace_seq::WorkspaceEventCoordinator::global(cx);
+            assert!(
+                coord.current_seq() > seq_before,
+                "a visible session's state change MUST advance the workspace seq"
+            );
+        });
+    });
+}
+
 /// Phase 3, Task 4: `reset_context` (/clear) must increment `epoch` by exactly 1,
 /// because it replaces the transcript wholesale. A plain `NewEntry` must NOT bump
 /// `epoch` (only `change_seq` / `mod_seq` advance on live appends).

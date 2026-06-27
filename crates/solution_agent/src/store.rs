@@ -980,7 +980,7 @@ impl SolutionAgentStore {
     /// throwaway session in the SAME solution+agent (cwd = solution root so the
     /// judge's file tools can read project files, `.agents` handoffs, and the
     /// diary), then delivers [`build_judge_briefing`] as its single user turn.
-    /// The verdict tool (Task 6) calls [`finish_judge`] to tear the judge down
+    /// The verdict tool calls [`finish_judge`] to tear the judge down
     /// once a verdict is recorded.
     ///
     /// The judge needs an `Entity<project::Project>`; the 1 Hz tick has no
@@ -999,7 +999,7 @@ impl SolutionAgentStore {
     /// [`build_judge_briefing`] as the single user turn. The only differences
     /// are the briefing's `audit` flag and which in-flight map records the
     /// handle (`judge_sessions` vs `auditor_sessions`). Behaviour is otherwise
-    /// identical to the reviewed Task 5 judge spawn — including project
+    /// identical to the judge spawn — including project
     /// resolution, the hidden parent-linked create, and the failure path.
     ///
     /// The session needs an `Entity<project::Project>`; the 1 Hz tick has no
@@ -1154,7 +1154,8 @@ impl SolutionAgentStore {
             // On success the session runs until it calls its verdict tool
             // (`supervisor_verdict` for the judge, `supervisor_audit_verdict`
             // for the auditor), which tears it down. The ends-without-verdict
-            // path (transient failure + backoff/retry) is wired in Task 10.
+            // path (transient failure) is handled by the judge-stuck watchdog
+            // in `tick_supervisor`, which applies backoff/retry on timeout.
         });
         let handle = JudgeHandle {
             judge_id: None,
@@ -6723,6 +6724,17 @@ impl SolutionAgentStore {
         let Some(entity) = self.sessions.get(session_id) else {
             return;
         };
+        // Ephemeral supervisor judge/auditor sessions are invisible: their own
+        // Idle->Running->Idle churn must not reach mobile. `remote_control`'s
+        // allow-list forwards every `workspace.*` event to the phone, so an
+        // unfiltered emit here leaks the hidden judge on every supervisor
+        // wake-up. Mirrors the create/close-side suppression. The supervised
+        // session's own state changes still emit (only the EPHEMERAL session's
+        // do not), and the internal `SessionStateChanged` event is untouched —
+        // `message_generator` relies on it to detect the judge going Idle.
+        if entity.read(cx).is_supervisor_ephemeral {
+            return;
+        }
         let summary = entity.read_with(cx, |s, cx| crate::mcp::session_summary(s, cx));
         coord.emit_sequenced(
             cx,
@@ -6798,7 +6810,13 @@ impl SolutionAgentStore {
             .map(|f| f(session_id, cx))
             .unwrap_or(false);
         let has_pending_messages = !session.read(cx).pending_messages.is_empty();
-        if let Some(decision) = notifier::decide_notification(
+        // Ephemeral supervisor judge/auditor sessions are invisible — no tray
+        // toast for an Errored judge or one whose turn crosses JUDGE_TIMEOUT_SECS.
+        // Same suppression intent as the wire emit above; internal bookkeeping
+        // (state transitions, subagent GC, Stopping safety-net) already ran.
+        let is_supervisor_ephemeral = session.read(cx).is_supervisor_ephemeral;
+        if !is_supervisor_ephemeral
+            && let Some(decision) = notifier::decide_notification(
             session_id,
             &previous,
             &next,

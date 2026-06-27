@@ -4223,7 +4223,7 @@ impl McpServerTool for ForceIdleTool {
 /// - `compact`: queue a compact-context prompt on the session.
 /// - `done`: mark supervision stopped (`Done`) and log completion.
 /// - `ask`: pause supervision in `WaitingUser` and escalate the question
-///   to the operator (full implementation in Task 9).
+///   to the operator.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct SupervisorVerdictParams {
     pub session_id: String,

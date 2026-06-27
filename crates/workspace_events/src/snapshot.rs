@@ -47,8 +47,15 @@ pub(crate) fn build_snapshot(cx: &App) -> WorkspaceSnapshot {
                             let session = entity.read(cx);
                             // Filter 2: only include sessions that are
                             // currently visible in the desktop session-tab
-                            // strip (`tab_order IS NOT NULL`).
-                            if session.solution_id == sol_id && session.tab_order.is_some() {
+                            // strip (`tab_order IS NOT NULL`). The
+                            // `!is_supervisor_ephemeral` check is defense-in-depth:
+                            // hidden judge/auditor sessions never get a tab_order,
+                            // but assert it explicitly so a future tab_order leak
+                            // can't surface a judge in the mobile snapshot.
+                            if session.solution_id == sol_id
+                                && session.tab_order.is_some()
+                                && !session.is_supervisor_ephemeral
+                            {
                                 Some(solution_agent::mcp::session_summary(session, cx))
                             } else {
                                 None

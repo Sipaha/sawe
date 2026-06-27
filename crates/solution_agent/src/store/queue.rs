@@ -402,8 +402,9 @@ impl SolutionAgentStore {
         content: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        // PORT-TODO: reset_supervisor_continue_counter is defined in store.rs
-        // (part of the supervisor store.rs port). Wire up once that lands.
+        // A user message resets the supervisor's auto-continue counter so the
+        // next idle window starts a fresh judge cycle rather than counting
+        // toward the continue cap.
         self.reset_supervisor_continue_counter(session_id, cx);
         let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
             agent_client_protocol::schema::TextContent::new(content),

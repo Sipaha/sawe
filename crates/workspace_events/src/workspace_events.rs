@@ -69,7 +69,14 @@ fn install_solution_open_observer(cx: &mut App) {
                 a.all_sessions()
                     .filter_map(|entity| {
                         let s = entity.read(cx);
-                        if s.solution_id == id && s.tab_order.is_some() {
+                        // `!is_supervisor_ephemeral` is defense-in-depth: hidden
+                        // judge/auditor sessions never get a tab_order, but assert
+                        // it so a future tab_order leak can't emit a session_opened
+                        // tab-order summary for an invisible judge.
+                        if s.solution_id == id
+                            && s.tab_order.is_some()
+                            && !s.is_supervisor_ephemeral
+                        {
                             Some(solution_agent::mcp::session_summary(s, cx))
                         } else {
                             None
