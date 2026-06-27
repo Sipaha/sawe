@@ -1954,7 +1954,7 @@ impl SolutionSessionView {
             let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(content))];
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
                 store
-                    .send_message_blocks_targeted(session_id, blocks, target, cx)
+                    .send_message_blocks_targeted(session_id, blocks, target, true, cx)
                     .detach_and_log_err(cx);
             });
             return;
@@ -1973,7 +1973,7 @@ impl SolutionSessionView {
         }
         SolutionAgentStore::global(cx).update(cx, |store, cx| {
             store
-                .send_message_blocks_targeted(session_id, blocks, target, cx)
+                .send_message_blocks_targeted(session_id, blocks, target, true, cx)
                 .detach_and_log_err(cx);
         });
     }

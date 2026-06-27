@@ -1258,24 +1258,42 @@ impl SolutionAgentStore {
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
     }
 
-    /// Reset the consecutive-continue counter for session `id` and restore
-    /// `Watching` status when supervision is enabled. Called when the human
-    /// sends a message into a supervised session so that the cap / audit
-    /// cadence restarts from zero.
+    /// Called when the HUMAN sends a message into a supervised session. Three
+    /// effects, all keyed off the supervisor's current status:
+    ///
+    /// * resets the consecutive-continue counter (cap / audit cadence restart);
+    /// * resumes a `WaitingUser` pause (the human answered the `ask`) → `Watching`;
+    /// * **re-arms a `Stopped(Done)` session**: the supervisor had declared the
+    ///   task complete and auto-disabled itself, but a new user message means the
+    ///   work continues, so supervision re-enables → `Watching`. Re-arm is scoped
+    ///   to `Done` only — a user-driven toggle-off (`Disabled`) stays off, and a
+    ///   `Quota` / `ProviderError` stop is an infra wall we don't auto-retry here.
     pub(crate) fn reset_supervisor_continue_counter(
         &mut self,
         id: SolutionSessionId,
         cx: &mut Context<Self>,
     ) {
+        use crate::supervisor::{StoppedReason, SupervisorStatus};
         if let Some(state) = self.supervisor_states.get_mut(&id) {
-            if state.consecutive_continues == 0
-                && !matches!(state.status, crate::supervisor::SupervisorStatus::WaitingUser)
-            {
+            let was_done = matches!(state.status, SupervisorStatus::Stopped(StoppedReason::Done));
+            let waiting = matches!(state.status, SupervisorStatus::WaitingUser);
+            if state.consecutive_continues == 0 && !waiting && !was_done {
                 return;
             }
             state.consecutive_continues = 0;
+            if was_done {
+                // Re-arm: Done auto-disabled supervision; the user is continuing
+                // the work, so restore their original enabled intent. Clear any
+                // stale backoff so the watchdog can fire on the next idle.
+                state.enabled = true;
+                state.backoff_attempt = 0;
+                state.next_eligible_ms = None;
+            }
             if state.enabled {
-                state.status = crate::supervisor::SupervisorStatus::Watching;
+                state.status = SupervisorStatus::Watching;
+            }
+            if was_done {
+                self.backoff_timers.remove(&id);
             }
             self.persist_supervisor_state(id, cx);
             self.clear_supervisor_question(id, cx);
@@ -1359,7 +1377,10 @@ impl SolutionAgentStore {
         let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
             agent_client_protocol::schema::TextContent::new(content),
         )];
-        self.send_message_blocks(id, blocks, cx)
+        // `from_user: false` — a supervisor nudge must NOT reset the
+        // continue-cap counter (apply_verdict just incremented it) nor be
+        // mistaken for a human reply that resumes a `WaitingUser` pause.
+        self.send_message_blocks_targeted(id, blocks, crate::model::QueueTarget::Main, false, cx)
     }
 
     /// Record the judge's verdict, tear down the judge session, and execute the

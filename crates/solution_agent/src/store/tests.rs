@@ -1208,6 +1208,7 @@ async fn take_pending_routes_by_target(cx: &mut TestAppContext) {
                         "for teammate".to_string(),
                     ))],
                     crate::model::QueueTarget::Subagent(SharedString::from("agent-1")),
+                    true,
                     cx,
                 )
                 .detach_and_log_err(cx);
@@ -1302,6 +1303,7 @@ async fn main_hook_never_drains_subagent_bundle(cx: &mut TestAppContext) {
                         "orphan".to_string(),
                     ))],
                     crate::model::QueueTarget::Subagent(SharedString::from("ghost")),
+                    true,
                     cx,
                 )
                 .detach_and_log_err(cx);
@@ -7705,6 +7707,126 @@ async fn escalate_sets_marker_and_waiting(cx: &mut gpui::TestAppContext) {
     });
     assert_eq!(status, crate::supervisor::SupervisorStatus::WaitingUser);
     assert_eq!(q.as_deref(), Some("Which API did you mean?"));
+}
+
+/// Regression: a human reply into a supervised session that is paused in
+/// `WaitingUser` (after an `ask`) must RESUME supervision (→ `Watching`) and
+/// clear the question banner — but ONLY for a genuine user send (`from_user:
+/// true`), never for a supervisor nudge (`from_user: false`). The desktop
+/// compose row funnels through `send_message_blocks_targeted`, so the resume
+/// must live there, not only in the MCP `send_message` path (the bug: a chat
+/// reply left supervision stuck `WaitingUser` forever).
+#[gpui::test]
+async fn user_reply_resumes_waiting_user_supervision(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.escalate_to_user(id, "Restart the stand yourself?".into(), cx);
+    });
+
+    let msg = |text: &str| {
+        vec![acp::ContentBlock::Text(acp::TextContent::new(text.to_string()))]
+    };
+
+    // A supervisor nudge (from_user: false) must NOT resume — still WaitingUser.
+    store.update(cx, |store, cx| {
+        store
+            .send_message_blocks_targeted(
+                id,
+                msg("supervisor nudge"),
+                crate::model::QueueTarget::Main,
+                false,
+                cx,
+            )
+            .detach();
+    });
+    let (status, q) = store.read_with(cx, |store, cx| {
+        (
+            store.supervisor_state(id).unwrap().status,
+            store.session(id).unwrap().read(cx).supervisor_question.clone(),
+        )
+    });
+    assert_eq!(
+        status,
+        crate::supervisor::SupervisorStatus::WaitingUser,
+        "a non-user send must not resume a WaitingUser pause"
+    );
+    assert!(q.is_some(), "question stays set after a non-user send");
+
+    // A genuine user reply (from_user: true) resumes supervision + clears banner.
+    store.update(cx, |store, cx| {
+        store
+            .send_message_blocks_targeted(
+                id,
+                msg("готово, перезапустил"),
+                crate::model::QueueTarget::Main,
+                true,
+                cx,
+            )
+            .detach();
+    });
+    let (status, q) = store.read_with(cx, |store, cx| {
+        (
+            store.supervisor_state(id).unwrap().status,
+            store.session(id).unwrap().read(cx).supervisor_question.clone(),
+        )
+    });
+    assert_eq!(
+        status,
+        crate::supervisor::SupervisorStatus::Watching,
+        "a user reply must resume supervision to Watching"
+    );
+    assert!(q.is_none(), "user reply must clear the supervisor question");
+}
+
+/// A `Done` verdict auto-disables supervision (`Stopped(Done)`). When the user
+/// then continues the work with a new message, supervision must RE-ARM
+/// (`enabled` + `Watching`) — the task is evidently not done anymore. A
+/// user-driven toggle-off must NOT re-arm this way (that's covered by the
+/// status scope: only `Stopped(Done)` re-arms, not `Disabled`).
+#[gpui::test]
+async fn user_reply_rearms_supervision_after_done(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.apply_verdict(
+            id,
+            crate::supervisor::VerdictAction::Done,
+            "task complete".into(),
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id).unwrap());
+    assert!(!st.enabled, "Done disables supervision");
+    assert!(matches!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Stopped(crate::supervisor::StoppedReason::Done)
+    ));
+
+    // User continues the work — supervision must re-arm.
+    store.update(cx, |store, cx| {
+        store
+            .send_message_blocks_targeted(
+                id,
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "ещё не всё, продолжаем".to_string(),
+                ))],
+                crate::model::QueueTarget::Main,
+                true,
+                cx,
+            )
+            .detach();
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id).unwrap());
+    assert!(st.enabled, "a user reply after Done must re-enable supervision");
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Watching,
+        "re-armed supervision returns to Watching"
+    );
 }
 
 #[gpui::test]

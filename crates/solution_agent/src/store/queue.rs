@@ -402,10 +402,8 @@ impl SolutionAgentStore {
         content: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        // A user message resets the supervisor's auto-continue counter so the
-        // next idle window starts a fresh judge cycle rather than counting
-        // toward the continue cap.
-        self.reset_supervisor_continue_counter(session_id, cx);
+        // Supervisor counter-reset + `WaitingUser` resume happen in the
+        // `send_message_blocks_targeted` funnel (from_user: true) below.
         let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
             agent_client_protocol::schema::TextContent::new(content),
         )];
@@ -429,7 +427,7 @@ impl SolutionAgentStore {
         blocks: Vec<agent_client_protocol::schema::ContentBlock>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        self.send_message_blocks_targeted(session_id, blocks, QueueTarget::Main, cx)
+        self.send_message_blocks_targeted(session_id, blocks, QueueTarget::Main, true, cx)
     }
 
     /// Like [`send_message_blocks`], but stamps the queued follow-up with an
@@ -448,6 +446,7 @@ impl SolutionAgentStore {
         session_id: SolutionSessionId,
         blocks: Vec<agent_client_protocol::schema::ContentBlock>,
         target: QueueTarget,
+        from_user: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let Some(session_entity) = self.session(session_id) else {
@@ -458,6 +457,19 @@ impl SolutionAgentStore {
             return Task::ready(Err(anyhow!(
                 "send_message_blocks: at least one ContentBlock required"
             )));
+        }
+
+        // A genuine USER message into a supervised session both (a) resets the
+        // continue-cap / audit-cadence counter and (b) RESUMES supervision when
+        // it was paused in `WaitingUser` (the human answered the supervisor's
+        // `ask`). This funnel is the single point every user send passes through
+        // (desktop compose, teammate tabs, MCP, queue flush), so the resume no
+        // longer depends on the caller remembering to reset — the bug where a
+        // chat reply left supervision stuck `WaitingUser` forever. The supervisor
+        // nudge passes `from_user: false` (it must NOT zero the counter it just
+        // incremented).
+        if from_user {
+            self.reset_supervisor_continue_counter(session_id, cx);
         }
 
         // "Chat About This" path. If the open session has a tool call
