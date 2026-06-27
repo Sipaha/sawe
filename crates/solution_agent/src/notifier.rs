@@ -80,6 +80,26 @@ pub fn decide_notification(
     }
 }
 
+/// Thin wrapper around [`dispatch`] for callers that want to fire a
+/// notification without building a full [`NotificationDecision`]. Uses
+/// `elapsed: Duration::ZERO` (no running-time threshold — the notification
+/// fires unconditionally as far as the decision struct is concerned; the
+/// caller decides when to call this).
+pub fn dispatch_raw(
+    session_id: SolutionSessionId,
+    kind: NotifyKind,
+    title: &str,
+    body: &str,
+    cx: &mut App,
+) {
+    let decision = NotificationDecision {
+        kind,
+        elapsed: Duration::ZERO,
+        session_id,
+    };
+    dispatch(&decision, title, body, cx);
+}
+
 /// Fire a desktop notification via the freedesktop portal (Linux/FreeBSD).
 /// Other platforms log a warning placeholder until a per-platform backend
 /// is added. Errors from the portal are intentionally swallowed: a broken

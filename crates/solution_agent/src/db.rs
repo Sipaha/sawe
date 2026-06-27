@@ -248,6 +248,29 @@ impl SolutionAgentDb {
         "})?()
         .map_err(|e| anyhow!("Failed to create idx_session_by_solution: {}", e))?;
 
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS supervisor_state (
+                session_id            TEXT PRIMARY KEY,
+                enabled               INTEGER NOT NULL,
+                custom_prompt         TEXT,
+                consecutive_continues INTEGER NOT NULL,
+                backoff_attempt       INTEGER NOT NULL,
+                last_fired_at         INTEGER,
+                status                TEXT NOT NULL,
+                next_eligible_ms      INTEGER
+            )
+        "})?()
+        .map_err(|e| anyhow!("Failed to create supervisor_state table: {}", e))?;
+
+        // `next_eligible_ms` gates the watchdog from re-firing a judge
+        // during a transient-failure backoff. Added idempotently because the
+        // table may already exist (from before this column) in a user DB.
+        apply_idempotent_add_column_to(
+            &connection,
+            "supervisor_state",
+            "next_eligible_ms INTEGER",
+        );
+
         Ok(Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
@@ -457,6 +480,93 @@ impl SolutionAgentDb {
         })
     }
 
+    pub fn save_supervisor_state(
+        &self,
+        state: crate::supervisor::SupervisorState,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut insert = connection.exec_bound::<(
+                String,
+                i64,
+                Option<String>,
+                i64,
+                i64,
+                Option<i64>,
+                String,
+                Option<i64>,
+            )>(indoc! {"
+                INSERT INTO supervisor_state (
+                    session_id, enabled, custom_prompt, consecutive_continues,
+                    backoff_attempt, last_fired_at, status, next_eligible_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    enabled               = excluded.enabled,
+                    custom_prompt         = excluded.custom_prompt,
+                    consecutive_continues = excluded.consecutive_continues,
+                    backoff_attempt       = excluded.backoff_attempt,
+                    last_fired_at         = excluded.last_fired_at,
+                    status                = excluded.status,
+                    next_eligible_ms      = excluded.next_eligible_ms
+            "})?;
+            insert((
+                state.session_id.to_string(),
+                state.enabled as i64,
+                state.custom_prompt.clone(),
+                state.consecutive_continues as i64,
+                state.backoff_attempt as i64,
+                state.last_fired_at,
+                state.status.to_db_string(),
+                state.next_eligible_ms,
+            ))?;
+            Ok(())
+        })
+    }
+
+    pub fn load_supervisor_states(
+        &self,
+    ) -> Task<Result<Vec<crate::supervisor::SupervisorState>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection.select::<(
+                String,
+                i64,
+                Option<String>,
+                i64,
+                i64,
+                Option<i64>,
+                String,
+                Option<i64>,
+            )>(indoc! {"
+                SELECT session_id, enabled, custom_prompt, consecutive_continues,
+                       backoff_attempt, last_fired_at, status, next_eligible_ms
+                FROM supervisor_state
+            "})?;
+            let rows = select()?;
+            let mut out = Vec::with_capacity(rows.len());
+            for (session_id, enabled, custom_prompt, cont, backoff, last_fired, status, next_eligible) in
+                rows
+            {
+                let session_id = crate::model::SolutionSessionId::parse(&session_id)
+                    .map_err(|e| anyhow!("invalid session id in supervisor_state: {e}"))?;
+                out.push(crate::supervisor::SupervisorState {
+                    session_id,
+                    enabled: enabled != 0,
+                    custom_prompt,
+                    consecutive_continues: cont.max(0) as u32,
+                    backoff_attempt: backoff.max(0) as u32,
+                    last_fired_at: last_fired,
+                    next_eligible_ms: next_eligible,
+                    status: crate::supervisor::SupervisorStatus::parse_db_string(&status),
+                });
+            }
+            Ok(out)
+        })
+    }
+
     /// Soft-close: mark the row's `closed_at` so MCP / UI can distinguish
     /// archived sessions from live ones, but keep `acp_thread_blob` so
     /// downstream tooling can still read the conversation transcript
@@ -593,6 +703,13 @@ impl SolutionAgentDb {
 /// at `warn` so a busted migration leaves a breadcrumb instead of
 /// silently leaving the schema half-applied.
 fn apply_idempotent_add_column(connection: &Connection, column_def: &str) {
+    apply_idempotent_add_column_to(connection, "solution_sessions", column_def);
+}
+
+/// Generalized form of [apply_idempotent_add_column] that targets an arbitrary
+/// `table`. `table` is always an internal constant (never user input), so
+/// inlining it into the DDL carries no injection risk.
+fn apply_idempotent_add_column_to(connection: &Connection, table: &str, column_def: &str) {
     // Pre-check via `PRAGMA table_info`. The sqlez wrapper surfaces
     // duplicate-column errors as opaque "Prepare call failed for
     // query: …" without the underlying SQLite text, so the old
@@ -600,10 +717,10 @@ fn apply_idempotent_add_column(connection: &Connection, column_def: &str) {
     // logged one WARN per already-applied migration. Inspecting the
     // catalog up front avoids both the noise AND the prepare attempt.
     let column_name = column_def.split_whitespace().next().unwrap_or(column_def);
-    if column_exists(connection, "solution_sessions", column_name) {
+    if column_exists(connection, table, column_name) {
         return;
     }
-    let ddl = format!("ALTER TABLE solution_sessions ADD COLUMN {column_def}");
+    let ddl = format!("ALTER TABLE {table} ADD COLUMN {column_def}");
     let mut run = match connection.exec(&ddl) {
         Ok(run) => run,
         Err(err) => {
@@ -1295,6 +1412,36 @@ fn select_metadata_for_solution(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[gpui::test]
+    async fn supervisor_state_roundtrips(cx: &mut gpui::TestAppContext) {
+        use crate::supervisor::{StoppedReason, SupervisorState, SupervisorStatus};
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let id = crate::model::SolutionSessionId::parse("zzzz9999").unwrap();
+        let mut st = SupervisorState::new(id);
+        st.enabled = true;
+        st.custom_prompt = Some("don't stop before tests pass".into());
+        st.consecutive_continues = 3;
+        st.next_eligible_ms = Some(1_700_000_000_000);
+        st.status = SupervisorStatus::Watching;
+        db.save_supervisor_state(st.clone()).await.unwrap();
+
+        // overwrite (upsert)
+        st.consecutive_continues = 4;
+        st.next_eligible_ms = Some(1_700_000_999_000);
+        st.status = SupervisorStatus::Stopped(StoppedReason::Quota);
+        db.save_supervisor_state(st).await.unwrap();
+
+        let all = db.load_supervisor_states().await.unwrap();
+        let got = all.iter().find(|s| s.session_id == id).unwrap();
+        assert!(got.enabled);
+        assert_eq!(got.consecutive_continues, 4);
+        assert_eq!(got.custom_prompt.as_deref(), Some("don't stop before tests pass"));
+        assert_eq!(got.status, SupervisorStatus::Stopped(StoppedReason::Quota));
+        assert_eq!(got.next_eligible_ms, Some(1_700_000_999_000));
+    }
 
     fn make_meta(seq: u32, sol: &str) -> SolutionSessionMetadata {
         SolutionSessionMetadata {

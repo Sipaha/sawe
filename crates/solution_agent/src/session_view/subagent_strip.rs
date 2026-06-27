@@ -143,17 +143,27 @@ fn state_label(state: &SessionState) -> &'static str {
 }
 
 /// Read every session in the current solution into a flat snapshot
-/// vector. The DFS works against snapshots so it stays a pure
-/// function and the unit tests don't need GPUI render plumbing.
+/// vector, excluding live ephemeral judge sessions. The DFS works
+/// against snapshots so it stays a pure function and the unit tests
+/// don't need GPUI render plumbing.
 fn collect_snapshots(
     store: &Entity<SolutionAgentStore>,
     solution_id: &SolutionId,
     cx: &gpui::App,
 ) -> Vec<SessionSnapshot> {
-    store
-        .read(cx)
+    let store_ref = store.read(cx);
+    let hidden_ids = store_ref.live_supervisor_session_ids();
+    store_ref
         .sessions_for(solution_id)
         .into_iter()
+        // Exclude ephemeral supervisor judges/auditors: by the live handle-map
+        // union AND by the `is_supervisor_ephemeral` entity flag (the flag stays
+        // correct even at the close-time window where the map entry is already
+        // gone — see `close_session`).
+        .filter(|entity| {
+            let s = entity.read(cx);
+            !hidden_ids.contains(&s.id) && !s.is_supervisor_ephemeral
+        })
         .map(|entity| {
             let s = entity.read(cx);
             // Live thread overrides the cached value: a running session
@@ -594,5 +604,52 @@ mod tests {
         assert_eq!(abbreviate_tokens(1_000), "1.0k");
         assert_eq!(abbreviate_tokens(138_300), "138.3k");
         assert_eq!(abbreviate_tokens(1_200_000), "1.2M");
+    }
+
+    /// Verify that a live judge session excluded from snapshots (mirroring
+    /// what `collect_snapshots` does after reading
+    /// `store.live_supervisor_session_ids()`)
+    /// causes the strip to hide when the supervised session is alone.
+    /// This is the "Fix 2: judge in subagent strip" regression guard.
+    #[test]
+    fn judge_excluded_from_snapshots_strip_hides_for_lone_supervised_session() {
+        let supervised = snap("aa", None, "Supervised", 1);
+        // The judge is parent-linked to the supervised session but is
+        // excluded by collect_snapshots before compute_strip_rows runs.
+        // We simulate this by simply not including it in the snapshot slice.
+        let rows = compute_strip_rows(
+            supervised.id,
+            &SolutionId("sol-a".into()),
+            &[supervised],
+        );
+        assert!(
+            rows.is_none(),
+            "strip should hide when judge is excluded and only the supervised session remains"
+        );
+    }
+
+    /// When a judge snapshot is NOT excluded (pre-fix behaviour), a child
+    /// bubble appears. After the fix collect_snapshots removes it first, so
+    /// compute_strip_rows only ever sees the filtered list. This test
+    /// documents the pre-fix leak for clarity: a judge snapshot present in
+    /// the list WOULD produce two rows (supervised + judge child).
+    #[test]
+    fn judge_snapshot_present_would_produce_two_rows_demonstrating_pre_fix_leak() {
+        let supervised = snap("aa", None, "Supervised", 1);
+        let judge = snap("bb", Some("aa"), "Judge", 2);
+        let rows = compute_strip_rows(
+            supervised.id,
+            &SolutionId("sol-a".into()),
+            &[supervised, judge],
+        );
+        assert!(
+            rows.is_some(),
+            "without filtering, a judge child produces strip rows"
+        );
+        assert_eq!(
+            rows.unwrap().len(),
+            2,
+            "pre-fix: two rows (supervised root + judge child)"
+        );
     }
 }

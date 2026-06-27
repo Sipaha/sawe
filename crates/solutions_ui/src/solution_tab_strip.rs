@@ -15,8 +15,9 @@
 //!     closed solutions for the `+` button branching.
 //!   * `SolutionStore::pending_adds_for(&id)` for the clone-in-flight
 //!     spinner on each tab.
-//!   * `SolutionAgentStore::sessions_for(&id)` for the live AI session
-//!     count badge on each tab.
+//!   * `SolutionAgentStore::visible_session_count(&id)` for the live AI
+//!     session count badge on each tab (excludes ephemeral supervisor
+//!     judge sessions so they never tick the badge during an idle wake-up).
 //!
 //! Re-render triggers (registered in [`SolutionTabStrip::new`]):
 //!   * `SolutionStoreEvent` — covers solution add/remove/rename and
@@ -144,7 +145,7 @@ impl Render for SolutionTabStrip {
             let is_active = active_solution_id.as_ref() == Some(&sol_id);
             let ai_count = agent_store
                 .as_ref()
-                .map(|s| s.read(cx).sessions_for(&sol_id).len())
+                .map(|s| s.read(cx).visible_session_count(&sol_id))
                 .unwrap_or(0);
             let in_flight = !store_read.pending_adds_for(&sol_id).is_empty();
             tabs.push((

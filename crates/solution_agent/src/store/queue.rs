@@ -390,12 +390,21 @@ impl SolutionAgentStore {
 
     /// Send a plain-text user message. Convenience wrapper around
     /// `send_message_blocks` for the common single-text-block case.
+    ///
+    /// This is the human-send entry point: it resets the supervisor's
+    /// consecutive-continue counter so that any pending `ForceAsk` escalation
+    /// is cleared and the guard restarts from zero after the user engages.
+    /// Supervisor-generated nudges use `send_supervisor_nudge` instead to
+    /// avoid clobbering the counter that was just incremented.
     pub fn send_message(
         &mut self,
         session_id: SolutionSessionId,
         content: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        // PORT-TODO: reset_supervisor_continue_counter is defined in store.rs
+        // (part of the supervisor store.rs port). Wire up once that lands.
+        self.reset_supervisor_continue_counter(session_id, cx);
         let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
             agent_client_protocol::schema::TextContent::new(content),
         )];

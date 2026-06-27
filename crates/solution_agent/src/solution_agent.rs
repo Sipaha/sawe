@@ -25,11 +25,13 @@ pub mod notifier;
 pub(crate) mod pool;
 pub mod rename_session_modal;
 pub mod reopen_session_modal;
+pub mod supervisor_instruction_modal;
 pub mod session_view;
 pub(crate) mod slash_commands;
 pub mod status_item;
 pub(crate) mod status_row;
 pub mod store;
+pub mod supervisor;
 pub mod upload;
 
 pub use claude_native::ModelInfo;
@@ -87,7 +89,7 @@ pub fn init(cx: &mut App) {
         Ok(db) => {
             cx.update(|cx| {
                 let store = store::SolutionAgentStore::global(cx);
-                store.update(cx, |store, _| store.set_persistence(db));
+                store.update(cx, |store, cx| store.set_persistence(db, cx));
             });
         }
         Err(err) => {

@@ -28,6 +28,8 @@ mod connection_pool;
 mod queue;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub(crate) use queue::{QUEUE_HINT_LINE, TS_PREFIX_CLOSE, TS_PREFIX_OPEN};
 
@@ -114,6 +116,45 @@ pub struct SolutionAgentStore {
     /// 1 Hz healthcheck loop that drives `tick_background_agents`.
     /// Held so the timer cancels when the store is dropped.
     _bg_agents_tick: Option<Task<()>>,
+    /// Per-session supervisor control state (enabled flag, counters, status).
+    /// Loaded from `supervisor_state` at init; mutated by the toggle UI, the
+    /// watchdog (`tick_supervisor`), and the verdict tools. Narrative (diary,
+    /// verdict log) lives on disk, not here.
+    supervisor_states: HashMap<SolutionSessionId, crate::supervisor::SupervisorState>,
+    /// In-flight ephemeral judge sessions, keyed by the SUPERVISED
+    /// session id. Holds the judge's own session id (for cleanup) and the
+    /// driving task. Dropping the task cancels the spawn.
+    judge_sessions: HashMap<SolutionSessionId, JudgeHandle>,
+    /// In-flight ephemeral meta-auditor sessions, keyed by the SUPERVISED
+    /// session id. Structurally identical to `judge_sessions` (same
+    /// `JudgeHandle`) but kept in a separate map so a live auditor and a live
+    /// judge for the same supervised session don't clobber each other. Both
+    /// maps feed `live_supervisor_session_ids` for UI hiding.
+    auditor_sessions: HashMap<SolutionSessionId, JudgeHandle>,
+    /// Live transient-failure backoff timers, keyed by the SUPERVISED session id.
+    /// Held only so the timer task isn't dropped (cancelled) immediately. The
+    /// timer's wake-up is a no-op — the watchdog re-fire gate is enforced by
+    /// `SupervisorState::next_eligible_ms`, not by the timer itself — but a live
+    /// timer keeps the 1 Hz tick loop honest about when the session becomes
+    /// eligible again. Kept SEPARATE from `judge_sessions` so a stale backoff
+    /// handle never blocks the next `spawn_judge`.
+    backoff_timers: HashMap<SolutionSessionId, Task<()>>,
+}
+
+/// An in-flight ephemeral judge/auditor session. `judge_id` is `None` until
+/// the async create resolves; `_task` drives create → send-briefing and is
+/// dropped (cancelling the spawn) when the handle is removed by `finish_judge`.
+struct JudgeHandle {
+    judge_id: Option<SolutionSessionId>,
+    /// Wall-clock spawn time (`chrono::Utc::now().timestamp_millis()`), set at
+    /// insert in `spawn_ephemeral_supervisor_session`. Drives the auditor-stuck
+    /// sweep in `tick_supervisor`: an auditor that errors/ends WITHOUT calling
+    /// `supervisor_audit_verdict` spawns while the supervised session is
+    /// `Watching` (not `Judging`), so the judge-stuck timeout never catches it;
+    /// without this timestamp the handle would leak forever and meta-audit would
+    /// be permanently disabled for that session.
+    started_ms: i64,
+    _task: Task<()>,
 }
 
 struct EntryUpdateThrottle {
@@ -766,6 +807,7 @@ impl SolutionAgentStore {
                         this.tick_background_agents(cx);
                         this.scan_parent_jsonls_for_completions(cx);
                         this.tick_background_shells(cx);
+                        this.tick_supervisor(cx);
                     })
                     .is_err()
                 {
@@ -790,6 +832,10 @@ impl SolutionAgentStore {
             metrics_emitter: MetricsEmitter::new(),
             _solution_subscription: solution_subscription,
             _bg_agents_tick: Some(bg_agents_tick),
+            supervisor_states: HashMap::new(),
+            judge_sessions: HashMap::new(),
+            auditor_sessions: HashMap::new(),
+            backoff_timers: HashMap::new(),
         }
     }
 
@@ -812,8 +858,25 @@ impl SolutionAgentStore {
         self.server_registry.get(agent_id).cloned()
     }
 
-    pub fn set_persistence(&mut self, db: Arc<SolutionAgentDb>) {
-        self.persistence = Some(db);
+    pub fn set_persistence(&mut self, db: Arc<SolutionAgentDb>, cx: &mut Context<Self>) {
+        self.persistence = Some(db.clone());
+        // One-time load: merge persisted supervisor states into the in-memory
+        // map. Uses `or_insert` semantics so any states already toggled before
+        // the DB was ready are not clobbered.
+        cx.spawn(async move |this, cx| {
+            let states = db
+                .load_supervisor_states()
+                .await
+                .log_err()
+                .unwrap_or_default();
+            this.update(cx, |this, _| {
+                for st in states {
+                    this.supervisor_states.entry(st.session_id).or_insert(st);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Returns the database handle if set. Used by the navigator to list
@@ -821,6 +884,815 @@ impl SolutionAgentStore {
     /// "Resume" / "Continue last session" affordances.
     pub fn db(&self) -> Option<Arc<SolutionAgentDb>> {
         self.persistence.clone()
+    }
+
+    pub fn supervisor_state(
+        &self,
+        id: SolutionSessionId,
+    ) -> Option<crate::supervisor::SupervisorState> {
+        self.supervisor_states.get(&id).cloned()
+    }
+
+    pub fn set_supervision_enabled(
+        &mut self,
+        id: SolutionSessionId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self
+            .supervisor_states
+            .entry(id)
+            .or_insert_with(|| crate::supervisor::SupervisorState::new(id));
+        if state.enabled == enabled {
+            return;
+        }
+        state.enabled = enabled;
+        if enabled {
+            state.status = crate::supervisor::SupervisorStatus::Watching;
+            state.consecutive_continues = 0;
+            state.backoff_attempt = 0;
+            // A fresh enable must never inherit a stale backoff gate from a
+            // previous transient-failure run, or the watchdog would refuse to
+            // fire until the old delay elapsed.
+            state.next_eligible_ms = None;
+            self.backoff_timers.remove(&id);
+        } else {
+            state.status = crate::supervisor::SupervisorStatus::Disabled;
+            self.backoff_timers.remove(&id);
+            self.clear_supervisor_question(id, cx);
+        }
+        self.persist_supervisor_state(id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
+    pub fn set_supervisor_prompt(
+        &mut self,
+        id: SolutionSessionId,
+        prompt: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = prompt.filter(|p| !p.trim().is_empty());
+        let state = self
+            .supervisor_states
+            .entry(id)
+            .or_insert_with(|| crate::supervisor::SupervisorState::new(id));
+        state.custom_prompt = prompt;
+        self.persist_supervisor_state(id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
+    pub(crate) fn persist_supervisor_state(&self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        let (Some(db), Some(state)) = (self.persistence.clone(), self.supervisor_states.get(&id))
+        else {
+            return;
+        };
+        let state = state.clone();
+        cx.background_spawn(async move {
+            db.save_supervisor_state(state).await.log_err();
+        })
+        .detach();
+    }
+
+    /// Resolve the root directory of the solution that owns `id`, via the
+    /// `SolutionStore` global (the compact.rs pattern). Returns `None` when the
+    /// session is unknown, the `SolutionStore` global is absent (headless /
+    /// test), or the solution isn't registered.
+    fn solution_root_for(&self, id: SolutionSessionId, cx: &App) -> Option<PathBuf> {
+        let session = self.session(id)?;
+        let solution_id = session.read(cx).solution_id.clone();
+        SolutionStore::try_global(cx).and_then(|store| {
+            store.read_with(cx, |s, _| {
+                s.solutions()
+                    .iter()
+                    .find(|sol| sol.id == solution_id)
+                    .map(|sol| sol.root.clone())
+            })
+        })
+    }
+
+    /// Public read-only variant of [`solution_root_for`] for use from rendering
+    /// code (e.g. the status-row supervisor popover) that only has `&App`.
+    pub fn solution_root_for_app(&self, id: SolutionSessionId, cx: &App) -> Option<PathBuf> {
+        self.solution_root_for(id, cx)
+    }
+
+    /// Spawn an ephemeral judge for the supervised session `id`. Creates a
+    /// throwaway session in the SAME solution+agent (cwd = solution root so the
+    /// judge's file tools can read project files, `.agents` handoffs, and the
+    /// diary), then delivers [`build_judge_briefing`] as its single user turn.
+    /// The verdict tool (Task 6) calls [`finish_judge`] to tear the judge down
+    /// once a verdict is recorded.
+    ///
+    /// The judge needs an `Entity<project::Project>`; the 1 Hz tick has no
+    /// Window/Workspace, so we reuse the supervised session's CACHED project
+    /// (the same source `restart_agent` uses). Prebuilt/cold sessions have no
+    /// cached project — the judge is skipped for those (expected: this path is
+    /// verified live, not in unit tests where the seed session is project-less).
+    pub(crate) fn spawn_judge(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        self.spawn_ephemeral_supervisor_session(id, false, cx);
+    }
+
+    /// Shared body for [`spawn_judge`] (`audit = false`) and [`spawn_auditor`]
+    /// (`audit = true`). Both spawn a throwaway session in the SAME
+    /// solution+agent (cwd = solution root so its file tools can read project
+    /// files, `.agents` handoffs, the diary, and the verdict log), then deliver
+    /// [`build_judge_briefing`] as the single user turn. The only differences
+    /// are the briefing's `audit` flag and which in-flight map records the
+    /// handle (`judge_sessions` vs `auditor_sessions`). Behaviour is otherwise
+    /// identical to the reviewed Task 5 judge spawn — including project
+    /// resolution, the hidden parent-linked create, and the failure path.
+    ///
+    /// The session needs an `Entity<project::Project>`; the 1 Hz tick has no
+    /// Window/Workspace, so we reuse the supervised session's CACHED project
+    /// (the same source `restart_agent` uses). Prebuilt/cold sessions have no
+    /// cached project — the spawn is skipped for those (expected: this path is
+    /// verified live, not in unit tests where the seed session is project-less).
+    fn spawn_ephemeral_supervisor_session(
+        &mut self,
+        id: SolutionSessionId,
+        audit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = if audit { "spawn_auditor" } else { "spawn_judge" };
+        // One judge AND one auditor at most per supervised session at a time;
+        // each kind guards only its own map so a judge doesn't block an auditor.
+        let already_running = if audit {
+            self.auditor_sessions.contains_key(&id)
+        } else {
+            self.judge_sessions.contains_key(&id)
+        };
+        if already_running {
+            return;
+        }
+        let Some(session) = self.session(id) else {
+            return;
+        };
+        let (solution_id, agent_id, project, context_usage) = {
+            let s = session.read(cx);
+            let project = s
+                .project
+                .clone()
+                .or_else(|| s.acp_thread().map(|t| t.read(cx).project().clone()));
+            // Context-window fullness of the SUPERVISED session, so the judge
+            // can weigh a `compact` verdict. Auditors review the supervisor's
+            // own work, not the agent's context, so they get `None`.
+            let context_usage = if audit {
+                None
+            } else {
+                let used = s
+                    .acp_thread()
+                    .and_then(|t| t.read(cx).token_usage().map(|u| u.used_tokens))
+                    .or(s.cached_total_tokens);
+                let max = s.cached_max_tokens;
+                match (used, max) {
+                    (Some(used), Some(max)) if max > 0 => {
+                        let pct = ((used as f64 / max as f64) * 100.0).round() as u64;
+                        Some(format!("{used} / {max} tokens ({pct}%)"))
+                    }
+                    (Some(used), _) => {
+                        Some(format!("{used} tokens used (context window size unknown)"))
+                    }
+                    _ => None,
+                }
+            };
+            (s.solution_id.clone(), s.agent_id.clone(), project, context_usage)
+        };
+        let Some(project) = project else {
+            log::debug!("{kind}({id}): session has no cached project (prebuilt/cold); skipped");
+            return;
+        };
+        let Some(solution_root) = self.solution_root_for(id, cx) else {
+            log::warn!(
+                "{kind}({id}): solution {:?} not registered; disabling supervision",
+                solution_id.0
+            );
+            self.set_supervision_enabled(id, false, cx);
+            return;
+        };
+
+        let dir = crate::supervisor::supervisor_dir(&solution_root, id);
+        let custom_prompt = self
+            .supervisor_states
+            .get(&id)
+            .and_then(|s| s.custom_prompt.clone());
+        let briefing =
+            crate::supervisor::build_judge_briefing(&crate::supervisor::JudgeBriefingContext {
+                supervised_session_id: id.to_string(),
+                diary_path: crate::supervisor::diary_path(&dir)
+                    .to_string_lossy()
+                    .into_owned(),
+                verdicts_path: crate::supervisor::verdicts_path(&dir)
+                    .to_string_lossy()
+                    .into_owned(),
+                compact_dir: solution_root
+                    .join(".agents")
+                    .join(id.to_string())
+                    .to_string_lossy()
+                    .into_owned(),
+                custom_prompt,
+                context_usage,
+                audit,
+            });
+
+        // Spawn the judge/auditor as a CHILD of the supervised session
+        // (`parent_session_id = Some(id)`) instead of a top-level session.
+        // `create_session_with_parent` skips `open_session_in_strip` for any
+        // parent-linked session (no `tab_order`, no `TabsChanged { opened }`),
+        // so the ephemeral session never flickers a visible tab in the
+        // ConsolePanel strip on each idle wake-up. It is NOT registered in the
+        // parent's `active_subagents` map (that map is driven only by Task/Agent
+        // ToolCall events on the parent's ACP thread, never by this create), so
+        // it also stays out of the subagent strip and the
+        // `agent_session_active_subagents_changed` wire surface. The verdict /
+        // audit-verdict tool closes it by its stored `judge_id`. The
+        // `ephemeral_supervisor = true` arg stamps `is_supervisor_ephemeral` on
+        // the new session entity so every enumeration surface (Sparkle badge,
+        // subagent strip, `list_sessions`, `get_session_children`, the desktop
+        // "AI: N" counter) filters it out, and so the create/close wire
+        // notifications are suppressed at the store-event source.
+        let create = self.create_session_with_parent(
+            solution_id,
+            agent_id,
+            project,
+            Some(solution_root),
+            Some(id),
+            None,
+            None,
+            true,
+            cx,
+        );
+        let task = cx.spawn(async move |this, cx| {
+            let ephemeral_id = match create.await {
+                Ok(ephemeral_id) => ephemeral_id,
+                Err(err) => {
+                    log::warn!("{kind}({id}): create failed: {err}");
+                    this.update(cx, |this, cx| this.on_judge_failed(id, err.to_string(), cx))
+                        .ok();
+                    return;
+                }
+            };
+            this.update(cx, |this, _| {
+                let map = if audit {
+                    &mut this.auditor_sessions
+                } else {
+                    &mut this.judge_sessions
+                };
+                if let Some(handle) = map.get_mut(&id) {
+                    handle.judge_id = Some(ephemeral_id);
+                }
+            })
+            .ok();
+            // Deliver the briefing as the session's single user turn.
+            let send = this.update(cx, |this, cx| this.send_message(ephemeral_id, briefing, cx));
+            if let Ok(send) = send {
+                if let Err(err) = send.await {
+                    log::warn!("{kind}({id}): briefing send failed: {err}");
+                    this.update(cx, |this, cx| this.on_judge_failed(id, err.to_string(), cx))
+                        .ok();
+                }
+            }
+            // On success the session runs until it calls its verdict tool
+            // (`supervisor_verdict` for the judge, `supervisor_audit_verdict`
+            // for the auditor), which tears it down. The ends-without-verdict
+            // path (transient failure + backoff/retry) is wired in Task 10.
+        });
+        let handle = JudgeHandle {
+            judge_id: None,
+            started_ms: chrono::Utc::now().timestamp_millis(),
+            _task: task,
+        };
+        if audit {
+            self.auditor_sessions.insert(id, handle);
+        } else {
+            self.judge_sessions.insert(id, handle);
+        }
+    }
+
+    /// Tear down the ephemeral judge for supervised session `id` and clear its
+    /// handle. Called by the verdict tool once a verdict is recorded+executed.
+    /// Dropping the `JudgeHandle` also cancels the driving task if it's still
+    /// in flight.
+    pub(crate) fn finish_judge(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        if let Some(handle) = self.judge_sessions.remove(&id) {
+            if let Some(judge_id) = handle.judge_id {
+                self.close_session(judge_id, cx).log_err();
+            }
+        }
+    }
+
+    /// Spawn the ephemeral meta-auditor for supervised session `id`. The
+    /// auditor reviews the SUPERVISOR's own work (`verdicts.jsonl` + `diary.md`)
+    /// rather than the agent dialogue, deciding whether the supervisor is making
+    /// real progress or is looping. Triggered every 5 consecutive `continue`
+    /// verdicts by [`apply_verdict`]. Shares its body with [`spawn_judge`] via
+    /// [`spawn_ephemeral_supervisor_session`] (`audit = true`).
+    pub(crate) fn spawn_auditor(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        self.spawn_ephemeral_supervisor_session(id, true, cx);
+    }
+
+    /// Tear down the ephemeral auditor for supervised session `id` and clear its
+    /// handle. Called by the audit-verdict tool once the auditor records a
+    /// verdict. Dropping the `JudgeHandle` also cancels the driving task if it's
+    /// still in flight.
+    pub(crate) fn finish_auditor(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        if let Some(handle) = self.auditor_sessions.remove(&id) {
+            if let Some(auditor_id) = handle.judge_id {
+                self.close_session(auditor_id, cx).log_err();
+            }
+        }
+    }
+
+    /// Record the meta-auditor's verdict for supervised session `id`, tear down
+    /// the auditor session, and act on the result. Appends an `Audit`-kind
+    /// `VerdictRecord` (carrying `audit_ok`) to `verdicts.jsonl`; when the audit
+    /// fails (`!ok`) or explicitly escalates, pauses supervision in `WaitingUser`
+    /// and routes the reasoning to the human via [`escalate_to_user`]. When the
+    /// audit passes (`ok && !escalate`) supervision is left untouched — the
+    /// 5-continue cadence already nudged the agent forward in `apply_verdict`.
+    pub(crate) fn apply_audit_verdict(
+        &mut self,
+        id: SolutionSessionId,
+        ok: bool,
+        escalate: bool,
+        reasoning: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::supervisor::{VerdictKind, VerdictRecord};
+
+        if let Some(root) = self.solution_root_for(id, cx) {
+            let dir = crate::supervisor::supervisor_dir(&root, id);
+            let rec = VerdictRecord {
+                ts_ms: chrono::Utc::now().timestamp_millis(),
+                kind: VerdictKind::Audit,
+                action: None,
+                audit_ok: Some(ok),
+                reasoning: reasoning.clone(),
+                message: None,
+                question: None,
+                tokens: None,
+            };
+            crate::supervisor::append_verdict(&dir, &rec).log_err();
+        }
+
+        self.finish_auditor(id, cx);
+
+        if escalate || !ok {
+            self.escalate_to_user(id, format!("Supervisor meta-audit: {reasoning}"), cx);
+        }
+
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
+    /// Reset the consecutive-continue counter for session `id` and restore
+    /// `Watching` status when supervision is enabled. Called when the human
+    /// sends a message into a supervised session so that the cap / audit
+    /// cadence restarts from zero.
+    pub(crate) fn reset_supervisor_continue_counter(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            if state.consecutive_continues == 0
+                && !matches!(state.status, crate::supervisor::SupervisorStatus::WaitingUser)
+            {
+                return;
+            }
+            state.consecutive_continues = 0;
+            if state.enabled {
+                state.status = crate::supervisor::SupervisorStatus::Watching;
+            }
+            self.persist_supervisor_state(id, cx);
+            self.clear_supervisor_question(id, cx);
+            cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+        }
+    }
+
+    /// Clear the pending supervisor question banner for session `id`. Emits
+    /// `SessionStateChanged` only when the field was actually set (avoids a
+    /// spurious notify when it was already `None`).
+    pub(crate) fn clear_supervisor_question(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.session(id) {
+            let was_set = session.read(cx).supervisor_question.is_some();
+            if was_set {
+                session.update(cx, |s, _| s.supervisor_question = None);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+            }
+        }
+    }
+
+    /// Escalate a supervisor question to the user: set `WaitingUser`, store
+    /// the question on the session for the banner, fire a high-priority
+    /// desktop notification, and emit `SessionStateChanged`.
+    pub(crate) fn escalate_to_user(
+        &mut self,
+        id: SolutionSessionId,
+        question: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            state.status = crate::supervisor::SupervisorStatus::WaitingUser;
+        }
+        self.persist_supervisor_state(id, cx);
+        if let Some(session) = self.session(id) {
+            session.update(cx, |s, _| s.supervisor_question = Some(question.clone().into()));
+        }
+        let title = "Sawe — Supervisor".to_string();
+        let body = format!("🛡 {question}");
+        crate::notifier::dispatch_raw(
+            id,
+            crate::notifier::NotifyKind::AwaitingInput,
+            &title,
+            &body,
+            cx,
+        );
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
+    /// Notify the user that the supervisor considers the task complete.
+    pub(crate) fn notify_supervisor_done(
+        &mut self,
+        id: SolutionSessionId,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let title = "Sawe — Supervisor".to_string();
+        let body = format!("✓ Work complete: {reason}");
+        crate::notifier::dispatch_raw(
+            id,
+            crate::notifier::NotifyKind::Completed,
+            &title,
+            &body,
+            cx,
+        );
+    }
+
+    /// Send a supervisor-generated nudge message. Unlike the public
+    /// [`send_message`](crate::store::queue) entry point, this does NOT reset
+    /// the consecutive-continue counter — supervisor nudges must never clear
+    /// the guard that was incremented just before the nudge was issued.
+    fn send_supervisor_nudge(
+        &mut self,
+        id: SolutionSessionId,
+        content: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<anyhow::Result<()>> {
+        let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
+            agent_client_protocol::schema::TextContent::new(content),
+        )];
+        self.send_message_blocks(id, blocks, cx)
+    }
+
+    /// Record the judge's verdict, tear down the judge session, and execute the
+    /// verdict action. Orchestrates the three-step response to every judge turn:
+    ///
+    /// 1. Append a `VerdictRecord` to `verdicts.jsonl` (best-effort; never
+    ///    blocks the action even when the write fails).
+    /// 2. Call `finish_judge` to close the ephemeral judge session.
+    /// 3. Dispatch the action: `Continue` nudges the supervised session and
+    ///    increments the guard counter; `Compact` queues a compact prompt;
+    ///    `Done` stops supervision; `Ask` escalates to the user.
+    ///
+    /// `Continue` runs through `continue_guard`: it nudges, or every 5th
+    /// consecutive continue also spawns a meta-auditor, or at the 15-cap
+    /// forces an `Ask` escalation instead of a 16th nudge.
+    pub(crate) fn apply_verdict(
+        &mut self,
+        id: SolutionSessionId,
+        action: crate::supervisor::VerdictAction,
+        reasoning: String,
+        message: Option<String>,
+        question: Option<String>,
+        tokens: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::supervisor::{
+            StoppedReason, SupervisorStatus, VerdictAction, VerdictKind, VerdictRecord,
+        };
+
+        if let Some(root) = self.solution_root_for(id, cx) {
+            let dir = crate::supervisor::supervisor_dir(&root, id);
+            let rec = VerdictRecord {
+                ts_ms: chrono::Utc::now().timestamp_millis(),
+                kind: VerdictKind::Verdict,
+                action: Some(action),
+                audit_ok: None,
+                reasoning: reasoning.clone(),
+                message: message.clone(),
+                question: question.clone(),
+                tokens,
+            };
+            crate::supervisor::append_verdict(&dir, &rec).log_err();
+        }
+
+        self.finish_judge(id, cx);
+
+        // A real verdict means the judge succeeded: clear any transient-failure
+        // backoff so a previously-flaky supervisor that recovered is not gated
+        // on the next watchdog fire. Done here (covers Continue/Compact/Done/Ask
+        // uniformly) rather than per-arm.
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            state.backoff_attempt = 0;
+            state.next_eligible_ms = None;
+        }
+        self.backoff_timers.remove(&id);
+
+        match action {
+            VerdictAction::Continue => {
+                let count = {
+                    let state = self
+                        .supervisor_states
+                        .entry(id)
+                        .or_insert_with(|| crate::supervisor::SupervisorState::new(id));
+                    state.consecutive_continues += 1;
+                    state.consecutive_continues
+                };
+                match crate::supervisor::continue_guard(count) {
+                    crate::supervisor::ContinueGuard::Nudge => {
+                        if let Some(state) = self.supervisor_states.get_mut(&id) {
+                            state.status = SupervisorStatus::Watching;
+                        }
+                        self.persist_supervisor_state(id, cx);
+                        let nudge = message.unwrap_or_else(|| "Continue.".into());
+                        self.send_supervisor_nudge(id, nudge, cx).detach();
+                    }
+                    crate::supervisor::ContinueGuard::Audit => {
+                        if let Some(state) = self.supervisor_states.get_mut(&id) {
+                            state.status = SupervisorStatus::Watching;
+                        }
+                        self.persist_supervisor_state(id, cx);
+                        let nudge = message.unwrap_or_else(|| "Continue.".into());
+                        self.send_supervisor_nudge(id, nudge, cx).detach();
+                        self.spawn_auditor(id, cx);
+                    }
+                    crate::supervisor::ContinueGuard::ForceAsk => {
+                        let question = "The supervisor issued \"Continue\" 15 times in a row — \
+                                        check whether the agent is stuck."
+                            .to_string();
+                        self.escalate_to_user(id, question, cx);
+                    }
+                }
+            }
+            VerdictAction::Compact => {
+                if let Some(state) = self.supervisor_states.get_mut(&id) {
+                    state.status = SupervisorStatus::Watching;
+                }
+                self.persist_supervisor_state(id, cx);
+                match crate::compact::start_compact_for_session(id, cx) {
+                    Err(err) => {
+                        log::warn!("apply_verdict compact({id}): {err}");
+                    }
+                    Ok(outcome) if !outcome.queued => {
+                        log::warn!(
+                            "apply_verdict compact({id}): not queued: {:?}",
+                            outcome.reason
+                        );
+                    }
+                    Ok(_) => {}
+                }
+            }
+            VerdictAction::Done => {
+                if let Some(state) = self.supervisor_states.get_mut(&id) {
+                    state.enabled = false;
+                    state.status = SupervisorStatus::Stopped(StoppedReason::Done);
+                }
+                self.persist_supervisor_state(id, cx);
+                self.clear_supervisor_question(id, cx);
+                self.notify_supervisor_done(id, &reasoning, cx);
+            }
+            VerdictAction::Ask => {
+                self.escalate_to_user(id, question.unwrap_or_default(), cx);
+            }
+        }
+
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
+    /// Handle a judge that failed to produce a verdict — either because the
+    /// create/send errored, or because it ended/timed-out without calling its
+    /// verdict tool. Tears down the judge handle, then classifies `message`:
+    ///
+    /// * [`JudgeFailure::Quota`] (usage/billing/rate-limit exhaustion) → stop
+    ///   supervision immediately (`Stopped(Quota)`), no retries: more requests
+    ///   would only burn into the same wall.
+    /// * [`JudgeFailure::Transient`] → advance `backoff_attempt`; once it strictly
+    ///   exceeds the [`BACKOFF_SCHEDULE_MINS`] length (i.e. on the 9th failure) give
+    ///   up (`Stopped(ProviderError)`), otherwise gate the next watchdog fire
+    ///   `BACKOFF_SCHEDULE_MINS[attempt-1]` minutes out (via `next_eligible_ms`)
+    ///   and return to `Watching`. All 8 schedule entries (1,1,2,3,5,10,30,60 min)
+    ///   are used before giving up.
+    pub(crate) fn on_judge_failed(
+        &mut self,
+        id: SolutionSessionId,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::supervisor::{
+            BACKOFF_SCHEDULE_MINS, JudgeFailure, StoppedReason, SupervisorState, SupervisorStatus,
+        };
+        self.finish_judge(id, cx);
+        match crate::supervisor::classify_judge_error(&message) {
+            JudgeFailure::Quota => {
+                if let Some(state) = self.supervisor_states.get_mut(&id) {
+                    state.enabled = false;
+                    state.status = SupervisorStatus::Stopped(StoppedReason::Quota);
+                    state.next_eligible_ms = None;
+                }
+                self.backoff_timers.remove(&id);
+                self.append_supervisor_diary_note(
+                    id,
+                    "supervisor stopped: provider quota / usage limit",
+                    cx,
+                );
+                self.clear_supervisor_question(id, cx);
+            }
+            JudgeFailure::Transient => {
+                let attempt = {
+                    let state = self
+                        .supervisor_states
+                        .entry(id)
+                        .or_insert_with(|| SupervisorState::new(id));
+                    state.backoff_attempt += 1;
+                    state.backoff_attempt
+                };
+                // Give up once we've exceeded the schedule. With 8 entries
+                // this means: attempts 1..=8 each schedule a retry (delays
+                // index 0..=7), and the 9th transient failure exhausts.
+                if attempt as usize > BACKOFF_SCHEDULE_MINS.len() {
+                    if let Some(state) = self.supervisor_states.get_mut(&id) {
+                        state.enabled = false;
+                        state.status = SupervisorStatus::Stopped(StoppedReason::ProviderError);
+                        state.next_eligible_ms = None;
+                    }
+                    self.backoff_timers.remove(&id);
+                    self.append_supervisor_diary_note(
+                        id,
+                        "supervisor stopped: provider error, backoff schedule exhausted",
+                        cx,
+                    );
+                    self.clear_supervisor_question(id, cx);
+                } else {
+                    let delay_mins = BACKOFF_SCHEDULE_MINS[(attempt - 1) as usize];
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let next_eligible = now_ms + (delay_mins as i64) * 60_000;
+                    if let Some(state) = self.supervisor_states.get_mut(&id) {
+                        state.status = SupervisorStatus::Watching;
+                        state.next_eligible_ms = Some(next_eligible);
+                    }
+                    self.append_supervisor_diary_note(
+                        id,
+                        &format!(
+                            "judge transient failure (attempt {attempt}/{}): retry in {delay_mins} min",
+                            BACKOFF_SCHEDULE_MINS.len()
+                        ),
+                        cx,
+                    );
+                    // Hold a live timer so the eligibility window is honoured by a
+                    // wake-up even if no other tick churns; the gate itself is
+                    // `next_eligible_ms`, checked in `tick_supervisor`.
+                    let delay = std::time::Duration::from_secs(delay_mins * 60);
+                    let task = cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(delay).await;
+                        this.update(cx, |this, _cx| {
+                            this.backoff_timers.remove(&id);
+                        })
+                        .ok();
+                    });
+                    self.backoff_timers.insert(id, task);
+                }
+            }
+        }
+        self.persist_supervisor_state(id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
+    /// Best-effort append of a timestamped line to the session's supervisor
+    /// `diary.md`. Used to leave a human-readable breadcrumb for failure /
+    /// backoff events (the structured record stays in `verdicts.jsonl`). Silent
+    /// no-op when the solution root can't be resolved (headless / test without a
+    /// registered solution); write errors are logged, never propagated.
+    pub(crate) fn append_supervisor_diary_note(
+        &mut self,
+        id: SolutionSessionId,
+        note: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.solution_root_for(id, cx) else {
+            return;
+        };
+        let dir = crate::supervisor::supervisor_dir(&root, id);
+        let line = format!("- {} {note}\n", chrono::Utc::now().to_rfc3339());
+        (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(crate::supervisor::diary_path(&dir))?;
+            std::io::Write::write_all(&mut file, line.as_bytes())
+        })()
+        .log_err();
+    }
+
+    pub(crate) fn tick_supervisor(&mut self, cx: &mut Context<Self>) {
+        use crate::model::SessionState;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Auditor-stuck sweep: a meta-auditor spawns while the supervised
+        // session is `Watching` (not `Judging`), so the judge-stuck timeout in
+        // the per-session loop below never catches it. An auditor that
+        // errors/ends WITHOUT calling `supervisor_audit_verdict` would leave its
+        // `auditor_sessions` handle live forever and permanently disable
+        // meta-audit for that session. Clean up any auditor older than the
+        // timeout so the next audit cycle can spawn fresh. No supervision
+        // backoff is applied — the auditor failing is not the judge failing.
+        let stale_auditors: Vec<SolutionSessionId> = self
+            .auditor_sessions
+            .iter()
+            .filter(|(_, handle)| {
+                now_ms.saturating_sub(handle.started_ms)
+                    >= (crate::supervisor::AUDITOR_TIMEOUT_SECS as i64) * 1000
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale_auditors {
+            self.finish_auditor(id, cx);
+            self.append_supervisor_diary_note(
+                id,
+                "meta-auditor timed out / ended without verdict; handle cleaned up",
+                cx,
+            );
+        }
+
+        let session_ids: Vec<SolutionSessionId> = self
+            .supervisor_states
+            .iter()
+            .filter(|(_, st)| st.enabled)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in session_ids {
+            let Some(state) = self.supervisor_states.get(&id) else {
+                continue;
+            };
+            let enabled = state.enabled;
+            let status = state.status.clone();
+            let next_eligible_ms = state.next_eligible_ms;
+            let last_fired_at = state.last_fired_at;
+
+            // Judge-stuck watchdog: a judge that errored / ended WITHOUT calling
+            // its verdict tool leaves the session pinned in `Judging` forever
+            // (finish_judge never ran), so the watchdog would never re-fire.
+            // Treat an over-long `Judging` window as a transient failure. This
+            // single timeout uniformly catches crash, error, AND silent-end
+            // without per-judge session-state subscriptions.
+            if matches!(status, crate::supervisor::SupervisorStatus::Judging) {
+                let fired_at = last_fired_at.unwrap_or(now_ms);
+                let stuck_ms = now_ms.saturating_sub(fired_at);
+                if stuck_ms >= (crate::supervisor::JUDGE_TIMEOUT_SECS as i64) * 1000 {
+                    self.on_judge_failed(
+                        id,
+                        "judge timed out / ended without verdict".to_string(),
+                        cx,
+                    );
+                }
+                continue;
+            }
+
+            let Some(session) = self.session(id) else {
+                continue;
+            };
+            let (idle_or_errored, last_activity_ms) = {
+                let s = session.read(cx);
+                let idle_or_errored =
+                    matches!(s.state, SessionState::Idle | SessionState::Errored(_));
+                (idle_or_errored, s.last_activity_at.timestamp_millis())
+            };
+            if now_ms >= next_eligible_ms.unwrap_or(0)
+                && crate::supervisor::should_fire(
+                    enabled,
+                    &status,
+                    idle_or_errored,
+                    last_activity_ms,
+                    now_ms,
+                    crate::supervisor::IDLE_THRESHOLD_SECS,
+                )
+            {
+                if let Some(st) = self.supervisor_states.get_mut(&id) {
+                    st.status = crate::supervisor::SupervisorStatus::Judging;
+                    st.last_fired_at = Some(now_ms);
+                    // We've consumed the backoff window; clear the gate so a stale
+                    // value can't block a later eligible fire.
+                    st.next_eligible_ms = None;
+                }
+                self.backoff_timers.remove(&id);
+                self.persist_supervisor_state(id, cx);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+                self.spawn_judge(id, cx);
+            }
+        }
     }
 
     /// Create a new ACP session for `(solution_id, agent_id)`, multiplexed
@@ -868,6 +1740,7 @@ impl SolutionAgentStore {
             None,
             model,
             effort,
+            false,
             cx,
         )
     }
@@ -887,6 +1760,13 @@ impl SolutionAgentStore {
         parent_session_id: Option<SolutionSessionId>,
         model: Option<String>,
         effort: Option<String>,
+        // True only for the supervisor's hidden judge/auditor sessions. The
+        // flag must be stamped on the session entity BEFORE the synchronous
+        // `SessionCreated` emit below so every enumeration / wire-notification
+        // surface can filter on it from the first observation onward — the
+        // caller can't set it after this task resolves because the emit has
+        // already fired by then.
+        ephemeral_supervisor: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<SolutionSessionId>> {
         let pair = (solution_id.clone(), agent_id.clone());
@@ -998,6 +1878,7 @@ impl SolutionAgentStore {
                     s.project = Some(project.clone());
                     s.cwd = session_cwd.clone();
                     s.parent_session_id = parent_session_id;
+                    s.is_supervisor_ephemeral = ephemeral_supervisor;
                     // Persist the model the session was created on so it shows
                     // as selected in the status row and survives a cold reload.
                     s.desired_model = model.clone();
@@ -1023,10 +1904,17 @@ impl SolutionAgentStore {
                 // the live `initialize` response. Deduped per agent, so this is
                 // a no-op once any session of this agent has captured a list.
                 store.ensure_agent_models(solution_id.clone(), agent_id.clone(), cx);
-                cx.emit(SolutionAgentStoreEvent::SessionCreated {
-                    id: session_id,
-                    parent_session_id,
-                });
+                // Hidden supervisor judge/auditor sessions are excluded from
+                // the wire `agent_session_created` churn (a connected mobile
+                // client would otherwise see a create+close pair every idle
+                // wake-up). They're never user-visible, so suppressing the
+                // store event at the source is the single cleanest chokepoint.
+                if !ephemeral_supervisor {
+                    cx.emit(SolutionAgentStoreEvent::SessionCreated {
+                        id: session_id,
+                        parent_session_id,
+                    });
+                }
                 cx.notify();
                 anyhow::Ok(session_id)
             })??;
@@ -1735,6 +2623,38 @@ impl SolutionAgentStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Count of `solution_id`'s live sessions that are user-visible — i.e.
+    /// [`sessions_for`](Self::sessions_for) minus the ephemeral supervisor
+    /// judge sessions. The judge is spawned on every idle wake-up, runs for
+    /// seconds, then is torn down by `finish_judge`; it must not tick the
+    /// Sparkle AI-session badge up by 1 each time. User-created child sessions
+    /// (`parent_session_id` set via the wire `create_session` tool) are NOT
+    /// excluded — only live judges, identified authoritatively from the
+    /// `judge_sessions` handle map.
+    pub fn visible_session_count(&self, solution_id: &SolutionId) -> usize {
+        let hidden_ids = self.live_supervisor_session_ids();
+        self.by_solution
+            .get(solution_id)
+            .map(|ids| ids.iter().filter(|id| !hidden_ids.contains(id)).count())
+            .unwrap_or(0)
+    }
+
+    /// Set of session ids that are currently live ephemeral SUPERVISOR sessions
+    /// — the UNION of in-flight judges (`judge_sessions`) and meta-auditors
+    /// (`auditor_sessions`). Both kinds are spawned by the supervisor, run for a
+    /// few seconds, then torn down via `finish_judge` / `finish_auditor`. They
+    /// must be excluded from user-visible surfaces (AI-session badge, subagent
+    /// strip) so neither flickers as a child bubble while it is alive. This is
+    /// the single source of truth for that hiding — adding a new ephemeral
+    /// supervisor map means unioning it in here.
+    pub(crate) fn live_supervisor_session_ids(&self) -> HashSet<SolutionSessionId> {
+        self.judge_sessions
+            .values()
+            .chain(self.auditor_sessions.values())
+            .filter_map(|handle| handle.judge_id)
+            .collect()
     }
 
     pub fn session(&self, id: SolutionSessionId) -> Option<Entity<SolutionSession>> {
@@ -3030,6 +3950,11 @@ impl SolutionAgentStore {
             );
         }
         let solution_id = session_read.solution_id.clone();
+        // Captured while the entity is still live (the flag is dropped with the
+        // entity below). Hidden supervisor judge/auditor sessions suppress all
+        // close notifications, mirroring the create-side suppression so a
+        // connected mobile client never sees their per-wake-up churn.
+        let is_supervisor_ephemeral = session_read.is_supervisor_ephemeral;
         if let Some(list) = self.by_solution.get_mut(&solution_id) {
             list.retain(|sid| *sid != id);
         }
@@ -3046,22 +3971,26 @@ impl SolutionAgentStore {
         if let Some(db) = &self.persistence {
             db.mark_closed(id, Some(Utc::now())).detach_and_log_err(cx);
         }
-        cx.emit(SolutionAgentStoreEvent::SessionClosed(id));
-        // Emit sequenced workspace notification so remote clients can
-        // drop the session from their in-memory maps immediately.
-        // `solution_id` was captured above while `session_read` was live
-        // (before the entity was removed from `self.sessions`).
-        // Guard with `try_global` so test contexts that don't install the
-        // MCP layer don't panic.
-        if let Some(coord) = editor_mcp::workspace_seq::WorkspaceEventCoordinator::try_global(cx) {
-            coord.emit_sequenced(
-                cx,
-                "workspace.session_deleted",
-                serde_json::json!({
-                    "solution_id": solution_id.as_str(),
-                    "session_id": id.to_string(),
-                }),
-            );
+        if !is_supervisor_ephemeral {
+            cx.emit(SolutionAgentStoreEvent::SessionClosed(id));
+            // Emit sequenced workspace notification so remote clients can
+            // drop the session from their in-memory maps immediately.
+            // `solution_id` was captured above while `session_read` was live
+            // (before the entity was removed from `self.sessions`).
+            // Guard with `try_global` so test contexts that don't install the
+            // MCP layer don't panic.
+            if let Some(coord) =
+                editor_mcp::workspace_seq::WorkspaceEventCoordinator::try_global(cx)
+            {
+                coord.emit_sequenced(
+                    cx,
+                    "workspace.session_deleted",
+                    serde_json::json!({
+                        "solution_id": solution_id.as_str(),
+                        "session_id": id.to_string(),
+                    }),
+                );
+            }
         }
         cx.notify();
         Ok(())

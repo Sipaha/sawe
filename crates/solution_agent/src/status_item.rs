@@ -41,10 +41,15 @@ impl Render for SolutionAgentStatusItem {
             store
                 .all_sessions()
                 .filter(|session| {
-                    matches!(
-                        session.read(cx).state,
-                        SessionState::Running { .. } | SessionState::Stopping { .. }
-                    )
+                    let session = session.read(cx);
+                    // The supervisor's hidden judge/auditor sessions run a turn
+                    // (so they'd be `Running`), but must never tick the desktop
+                    // "AI: N" counter up — they're not user-visible work.
+                    !session.is_supervisor_ephemeral
+                        && matches!(
+                            session.state,
+                            SessionState::Running { .. } | SessionState::Stopping { .. }
+                        )
                 })
                 .count()
         });

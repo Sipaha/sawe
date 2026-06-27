@@ -3269,6 +3269,32 @@ impl Render for SolutionSessionView {
                     .when_some(resuming_section, |this, section| this.child(section))
             })
             .when_some(subagent_strip, |this, strip| this.child(strip))
+            .when_some(
+                self.session.read(cx).supervisor_question.clone(),
+                |this, question| {
+                    this.child(
+                        h_flex()
+                            .id("supervisor-question-banner")
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .bg(cx.theme().colors().editor_subheader_background)
+                            .child(
+                                ui::Icon::new(IconName::Eye)
+                                    .size(ui::IconSize::Small)
+                                    .color(ui::Color::Warning),
+                            )
+                            .child(
+                                Label::new(question)
+                                    .size(ui::LabelSize::Small)
+                                    .color(ui::Color::Warning),
+                            ),
+                    )
+                },
+            )
             .children({
                 // Status row sits directly above the compose box: token
                 // meter / agent / model / "Thinking… 3m12s" / "Done in

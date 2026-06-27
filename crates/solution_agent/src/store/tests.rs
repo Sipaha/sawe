@@ -75,6 +75,61 @@ fn close_session_removes_from_indices(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sol = SolutionId("sol-a".into());
+            let agent = SharedString::from("claude-acp");
+
+            // Two ordinary user sessions + one judge child session.
+            let supervised = SolutionSessionId::new();
+            let other = SolutionSessionId::new();
+            let judge = SolutionSessionId::new();
+            for id in [supervised, other, judge] {
+                insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+            }
+
+            // Before the judge is registered, all three count.
+            assert_eq!(store.sessions_for(&sol).len(), 3);
+            assert_eq!(store.visible_session_count(&sol), 3);
+
+            // Register the judge handle (as `spawn_judge` does once create
+            // resolves): supervised_id -> JudgeHandle { judge_id }.
+            store.judge_sessions.insert(
+                supervised,
+                JudgeHandle {
+                    judge_id: Some(judge),
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+
+            // The live judge is now excluded from the badge count, but the
+            // raw session list is unchanged (judge is still reachable).
+            assert_eq!(store.sessions_for(&sol).len(), 3);
+            assert_eq!(store.visible_session_count(&sol), 2);
+
+            // A judge handle whose create has not resolved yet (judge_id None)
+            // excludes nothing.
+            store.judge_sessions.remove(&supervised);
+            store.judge_sessions.insert(
+                supervised,
+                JudgeHandle {
+                    judge_id: None,
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+            assert_eq!(store.visible_session_count(&sol), 3);
+        });
+    });
+}
+
 /// Set up SolutionStore with one Solution rooted at a tempdir, plus
 /// a `Project::test` whose worktree is that root. Returns
 /// (`SolutionId`, `tempdir`, `Project`). Hold the tempdir for the
@@ -1631,8 +1686,8 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -1837,8 +1892,8 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -2022,8 +2077,8 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -2135,8 +2190,8 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -2255,8 +2310,8 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -2345,8 +2400,8 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -2491,8 +2546,8 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -2632,8 +2687,8 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -3517,8 +3572,8 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -6003,6 +6058,7 @@ async fn create_child_session_is_not_pinned(cx: &mut TestAppContext) {
                     Some(parent),
                     None,
                     None,
+                    false,
                     cx,
                 )
             })
@@ -7047,8 +7103,8 @@ async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppCont
     let executor = cx.executor();
     let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.set_persistence(db.clone());
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
         });
     });
 
@@ -7210,4 +7266,476 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
             );
         });
     });
+}
+
+/// Verify that persisted supervisor states are merged into the store map as
+/// soon as `set_persistence` is called — not lazily deferred to per-solution
+/// hydration. This is the "restart" path: supervisor toggles written to the
+/// DB in a previous run must be visible in the fresh store after init.
+#[gpui::test]
+async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppContext) {
+    // Open a DB and write a supervisor state row directly, simulating work
+    // done in a previous session. The in-memory DB is keyed by thread name,
+    // so a second `open` call below shares the same data.
+    let session_id = crate::model::SolutionSessionId::new();
+    let db = Arc::new(
+        crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"),
+    );
+    let state = crate::supervisor::SupervisorState {
+        session_id,
+        enabled: true,
+        custom_prompt: Some("reload me".into()),
+        consecutive_continues: 0,
+        backoff_attempt: 0,
+        last_fired_at: None,
+        next_eligible_ms: None,
+        status: crate::supervisor::SupervisorStatus::Watching,
+    };
+    db.save_supervisor_state(state.clone())
+        .await
+        .expect("save_supervisor_state");
+
+    // Create a fresh store (no prior in-memory state) and attach persistence.
+    let registry = Arc::new(AdapterRegistry::new());
+    let store: gpui::Entity<SolutionAgentStore> = cx.update(|cx| {
+        cx.new(|cx| SolutionAgentStore::new_in_app(registry, cx))
+    });
+
+    // Pre-condition: the fresh store has no supervisor state for our session.
+    let pre = store.read_with(cx, |s, _| s.supervisor_state(session_id));
+    assert!(pre.is_none(), "fresh store must not have supervisor state yet");
+
+    // Open the same shared in-memory DB and call set_persistence — this
+    // must fire the one-time load.
+    let db2 = Arc::new(
+        crate::db::SolutionAgentDb::open(cx.executor()).expect("open db again"),
+    );
+    store.update(cx, |store, cx| {
+        store.set_persistence(db2, cx);
+    });
+
+    // Pump the executor so the spawned load task runs to completion.
+    cx.run_until_parked();
+
+    // Post-condition: the loaded row is now in the map.
+    let loaded = store
+        .read_with(cx, |s, _| s.supervisor_state(session_id))
+        .expect("supervisor state must be present after persistence init");
+    assert!(loaded.enabled, "enabled must be restored from DB");
+    assert_eq!(
+        loaded.custom_prompt.as_deref(),
+        Some("reload me"),
+        "custom_prompt must be restored from DB"
+    );
+    assert_eq!(loaded.status, crate::supervisor::SupervisorStatus::Watching);
+}
+
+#[gpui::test]
+async fn toggle_supervision_persists_and_reads_back(cx: &mut gpui::TestAppContext) {
+    let (store, session_id, _tmp) =
+        crate::store::test_support::seed_store_with_session(cx).await;
+
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(session_id, true, cx);
+        store.set_supervisor_prompt(session_id, Some("verify FORK.md updated".into()), cx);
+    });
+
+    let st = store.read_with(cx, |store, _| store.supervisor_state(session_id)).unwrap();
+    assert!(st.enabled);
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
+    assert_eq!(st.custom_prompt.as_deref(), Some("verify FORK.md updated"));
+
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(session_id, false, cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(session_id)).unwrap();
+    assert!(!st.enabled);
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::Disabled);
+}
+
+#[gpui::test]
+async fn tick_fires_judge_after_threshold(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    // Force the session Idle with last_activity 2 minutes ago.
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.set_supervision_enabled(id, true, cx);
+    });
+
+    store.update(cx, |store, cx| store.tick_supervisor(cx));
+
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::Judging);
+    assert!(st.last_fired_at.is_some());
+
+    // Second tick must NOT re-fire (already Judging).
+    store.update(cx, |store, cx| {
+        if let Some(s) = store.supervisor_states.get(&id) {
+            assert_eq!(s.status, crate::supervisor::SupervisorStatus::Judging);
+        }
+        store.tick_supervisor(cx);
+    });
+    let st2 = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st2.last_fired_at, st.last_fired_at, "must not re-fire while judging");
+}
+
+#[gpui::test]
+async fn tick_sweeps_stuck_auditor(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
+
+    // Register a STALE auditor handle (spawned past the timeout) and a FRESH
+    // one for an unrelated supervised id. The stale handle models an auditor
+    // that errored / ended without calling `supervisor_audit_verdict` while the
+    // supervised session sat in `Watching` — the judge-stuck path never sees it.
+    let fresh_id = SolutionSessionId::new();
+    let timeout_ms = (crate::supervisor::AUDITOR_TIMEOUT_SECS as i64) * 1000;
+    let now = chrono::Utc::now().timestamp_millis();
+    store.update(cx, |store, _| {
+        store.auditor_sessions.insert(
+            id,
+            JudgeHandle {
+                judge_id: None,
+                started_ms: now - timeout_ms - 1_000,
+                _task: Task::ready(()),
+            },
+        );
+        store.auditor_sessions.insert(
+            fresh_id,
+            JudgeHandle {
+                judge_id: None,
+                started_ms: now,
+                _task: Task::ready(()),
+            },
+        );
+    });
+
+    store.update(cx, |store, cx| store.tick_supervisor(cx));
+
+    store.read_with(cx, |store, _| {
+        assert!(
+            !store.auditor_sessions.contains_key(&id),
+            "stale auditor handle must be swept by the auditor-stuck sweep"
+        );
+        assert!(
+            store.auditor_sessions.contains_key(&fresh_id),
+            "a fresh auditor handle must survive the sweep"
+        );
+    });
+
+    // The sweep is a pure cleanup — it must NOT pause/disable supervision
+    // (an auditor failing is not the judge failing).
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert!(st.enabled, "auditor timeout must not disable supervision");
+}
+
+#[gpui::test]
+async fn apply_continue_nudges_and_increments(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.supervisor_states.get_mut(&id).unwrap().status =
+            crate::supervisor::SupervisorStatus::Judging;
+    });
+    store.update(cx, |store, cx| {
+        store.apply_verdict(
+            id,
+            crate::supervisor::VerdictAction::Continue,
+            "two items left".into(),
+            None,
+            None,
+            Some(500),
+            cx,
+        );
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.consecutive_continues, 1);
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
+
+    // Verdict was recorded to disk.
+    let root = crate::store::test_support::session_solution_root(&store, id, cx);
+    let dir = crate::supervisor::supervisor_dir(&root, id);
+    assert_eq!(crate::supervisor::read_verdicts(&dir).len(), 1);
+}
+
+#[gpui::test]
+async fn fifteen_continues_force_ask(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
+
+    for _ in 0..15 {
+        store.update(cx, |store, cx| {
+            store.supervisor_states.get_mut(&id).unwrap().status =
+                crate::supervisor::SupervisorStatus::Judging;
+            store.apply_verdict(
+                id,
+                crate::supervisor::VerdictAction::Continue,
+                "still going".into(),
+                None,
+                None,
+                None,
+                cx,
+            );
+        });
+    }
+
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::WaitingUser);
+
+    // User replies → counter resets, back to watching.
+    store.update(cx, |store, cx| store.reset_supervisor_continue_counter(id, cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.consecutive_continues, 0);
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
+}
+
+#[gpui::test]
+async fn audit_escalate_pauses_supervision(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.apply_audit_verdict(id, false, true, "supervisor is looping".into(), cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::WaitingUser);
+
+    // An Audit-kind record must be on disk.
+    let root = crate::store::test_support::session_solution_root(&store, id, cx);
+    let dir = crate::supervisor::supervisor_dir(&root, id);
+    let recs = crate::supervisor::read_verdicts(&dir);
+    assert!(
+        recs.iter()
+            .any(|r| matches!(r.kind, crate::supervisor::VerdictKind::Audit)),
+        "expected an Audit-kind verdict record"
+    );
+    assert!(
+        recs.iter()
+            .any(|r| matches!(r.kind, crate::supervisor::VerdictKind::Audit)
+                && r.audit_ok == Some(false)),
+        "Audit record must carry audit_ok = Some(false)"
+    );
+}
+
+#[gpui::test]
+fn visible_session_count_excludes_live_auditors(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sol = SolutionId("sol-a".into());
+            let agent = SharedString::from("claude-acp");
+
+            // Two ordinary user sessions + one auditor child session.
+            let supervised = SolutionSessionId::new();
+            let other = SolutionSessionId::new();
+            let auditor = SolutionSessionId::new();
+            for id in [supervised, other, auditor] {
+                insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+            }
+
+            assert_eq!(store.visible_session_count(&sol), 3);
+
+            // Register a live AUDITOR handle (separate map from judges); it
+            // must be excluded from the badge count exactly like a judge.
+            store.auditor_sessions.insert(
+                supervised,
+                JudgeHandle {
+                    judge_id: Some(auditor),
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+            assert_eq!(store.visible_session_count(&sol), 2);
+            assert!(store.live_supervisor_session_ids().contains(&auditor));
+
+            // Auditor whose create hasn't resolved (judge_id None) excludes nothing.
+            store.auditor_sessions.remove(&supervised);
+            store.auditor_sessions.insert(
+                supervised,
+                JudgeHandle {
+                    judge_id: None,
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+            assert_eq!(store.visible_session_count(&sol), 3);
+        });
+    });
+}
+
+#[gpui::test]
+async fn escalate_sets_marker_and_waiting(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.escalate_to_user(id, "Which API did you mean?".into(), cx);
+    });
+    let (status, q) = store.read_with(cx, |store, cx| {
+        let st = store.supervisor_state(id).unwrap();
+        let q = store.session(id).unwrap().read(cx).supervisor_question.clone();
+        (st.status, q)
+    });
+    assert_eq!(status, crate::supervisor::SupervisorStatus::WaitingUser);
+    assert_eq!(q.as_deref(), Some("Which API did you mean?"));
+}
+
+#[gpui::test]
+async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+
+    // Enable supervision and escalate a question — the banner should be set.
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.escalate_to_user(id, "Q?".into(), cx);
+    });
+    let (status, q) = store.read_with(cx, |store, cx| {
+        let st = store.supervisor_state(id).unwrap();
+        let q = store.session(id).unwrap().read(cx).supervisor_question.clone();
+        (st.status, q)
+    });
+    assert_eq!(status, crate::supervisor::SupervisorStatus::WaitingUser);
+    assert!(q.is_some(), "question must be set after escalate_to_user");
+
+    // A Done verdict fires before the user replies — banner must be cleared.
+    store.update(cx, |store, cx| {
+        store.apply_verdict(
+            id,
+            crate::supervisor::VerdictAction::Done,
+            "all done".into(),
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+    let q_after = store.read_with(cx, |store, cx| {
+        store.session(id).unwrap().read(cx).supervisor_question.clone()
+    });
+    assert!(
+        q_after.is_none(),
+        "supervisor_question must be cleared after Done verdict"
+    );
+
+    // Verify the supervision state is stopped-done.
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert!(
+        matches!(
+            st.status,
+            crate::supervisor::SupervisorStatus::Stopped(
+                crate::supervisor::StoppedReason::Done
+            )
+        ),
+        "supervision must be stopped-done"
+    );
+
+    // Also verify that set_supervision_enabled(false) clears a pending question.
+    let (store2, id2, _tmp2) = crate::store::test_support::seed_store_with_session(cx).await;
+    store2.update(cx, |store, cx| {
+        store.set_supervision_enabled(id2, true, cx);
+        store.escalate_to_user(id2, "still waiting?".into(), cx);
+    });
+    let q_before_disable = store2.read_with(cx, |store, cx| {
+        store.session(id2).unwrap().read(cx).supervisor_question.clone()
+    });
+    assert!(q_before_disable.is_some(), "question must be set before disable");
+
+    store2.update(cx, |store, cx| {
+        store.set_supervision_enabled(id2, false, cx);
+    });
+    let q_after_disable = store2.read_with(cx, |store, cx| {
+        store.session(id2).unwrap().read(cx).supervisor_question.clone()
+    });
+    assert!(
+        q_after_disable.is_none(),
+        "supervisor_question must be cleared when supervision is disabled"
+    );
+}
+
+#[gpui::test]
+async fn quota_error_stops_immediately(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.supervisor_states.get_mut(&id).unwrap().status =
+            crate::supervisor::SupervisorStatus::Judging;
+        store.on_judge_failed(id, "Error: usage limit reached".into(), cx);
+    });
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert!(!st.enabled);
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Stopped(crate::supervisor::StoppedReason::Quota)
+    );
+    // Quota never schedules a retry.
+    assert_eq!(st.next_eligible_ms, None);
+}
+
+#[gpui::test]
+async fn transient_error_advances_backoff_then_gives_up(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
+    // The spec requires all 8 delays to be waited: 1,1,2,3,5,10,30,60 minutes.
+    // Failures 1..=8 must each leave status Watching with a retry gate; the 9th
+    // failure exhausts the schedule and gives up (Stopped(ProviderError)).
+    let mut prev_next_eligible: Option<i64> = None;
+    for expected in 1..=9u32 {
+        store.update(cx, |store, cx| {
+            store.supervisor_states.get_mut(&id).unwrap().status =
+                crate::supervisor::SupervisorStatus::Judging;
+            store.on_judge_failed(id, "overloaded_error".into(), cx);
+        });
+        let st = store
+            .read_with(cx, |store, _| store.supervisor_state(id))
+            .unwrap();
+        if expected <= 8 {
+            assert_eq!(st.backoff_attempt, expected);
+            assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
+            // Each transient retry arms an eligibility gate in the future.
+            let next = st.next_eligible_ms;
+            assert!(
+                next.is_some(),
+                "attempt {expected} must schedule a retry window"
+            );
+            // Each successive delay must be >= the previous one (schedule is non-decreasing).
+            if let (Some(prev), Some(cur)) = (prev_next_eligible, next) {
+                assert!(
+                    cur >= prev,
+                    "attempt {expected}: next_eligible_ms should not decrease"
+                );
+            }
+            // The 8th failure must schedule the 60-minute delay (last schedule entry).
+            if expected == 8 {
+                // 60 min = 3_600_000 ms; prev entry was 30 min = 1_800_000 ms.
+                // Verify the 8th delay is strictly larger than the 7th.
+                if let (Some(prev), Some(cur)) = (prev_next_eligible, next) {
+                    assert!(
+                        cur > prev,
+                        "attempt 8 (60-min delay) must set a later gate than attempt 7 (30-min)"
+                    );
+                }
+            }
+            prev_next_eligible = next;
+        }
+    }
+    // After the 9th transient failure the schedule is exhausted.
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert!(!st.enabled);
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Stopped(
+            crate::supervisor::StoppedReason::ProviderError
+        )
+    );
+    // Giving up must clear the gate (no dangling retry).
+    assert_eq!(st.next_eligible_ms, None);
 }

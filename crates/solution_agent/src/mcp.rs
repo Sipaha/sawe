@@ -94,6 +94,12 @@ pub fn register(cx: &mut App) {
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(ForceIdleTool);
     });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(SupervisorVerdictTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(SupervisorAuditVerdictTool);
+    });
 }
 
 // =====================================================================
@@ -335,6 +341,11 @@ impl McpServerTool for ListSessionsTool {
                     .all_sessions()
                     .filter_map(|entity| {
                         let session = entity.read(cx);
+                        // Hidden supervisor judge/auditor sessions are never
+                        // user-visible; exclude them from the enumeration.
+                        if session.is_supervisor_ephemeral {
+                            return None;
+                        }
                         if let Some(want) = &want_solution {
                             if &session.solution_id != want {
                                 return None;
@@ -541,6 +552,12 @@ impl McpServerTool for GetSessionChildrenTool {
                     .all_sessions()
                     .filter_map(|entity| {
                         let session = entity.read(cx);
+                        // The supervisor's hidden judge/auditor sessions are
+                        // parent-linked to the supervised session, so they'd
+                        // otherwise surface here; exclude them.
+                        if session.is_supervisor_ephemeral {
+                            return None;
+                        }
                         if session.parent_session_id == Some(parent_id) {
                             Some(session_summary(session, cx))
                         } else {
@@ -2410,6 +2427,7 @@ impl McpServerTool for CreateSessionTool {
                     parent_session_id,
                     None,
                     None,
+                    false,
                     cx,
                 )
             })
@@ -4161,6 +4179,210 @@ impl McpServerTool for ForceIdleTool {
     }
 }
 
+// =====================================================================
+// solution_agent.supervisor_verdict
+// =====================================================================
+
+/// Record the judge's verdict for a supervised session and execute the
+/// corresponding action (`continue`, `compact`, `done`, or `ask`).
+///
+/// - `continue`: increment the guard counter, send a nudge message, and
+///   return the session to `Watching`.
+/// - `compact`: queue a compact-context prompt on the session.
+/// - `done`: mark supervision stopped (`Done`) and log completion.
+/// - `ask`: pause supervision in `WaitingUser` and escalate the question
+///   to the operator (full implementation in Task 9).
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SupervisorVerdictParams {
+    pub session_id: String,
+    /// One of: "continue", "compact", "done", "ask".
+    pub action: String,
+    pub reasoning: String,
+    /// Optional nudge message sent to the session when action == "continue".
+    /// Defaults to "Continue." when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Required when action == "ask". The question to surface to the operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for SupervisorVerdictParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+            action: String,
+            reasoning: String,
+            message: Option<String>,
+            question: Option<String>,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            session_id: inner.session_id,
+            action: inner.action,
+            reasoning: inner.reasoning,
+            message: inner.message,
+            question: inner.question,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SupervisorVerdictResult {}
+
+#[derive(Clone)]
+pub struct SupervisorVerdictTool;
+
+impl McpServerTool for SupervisorVerdictTool {
+    type Input = SupervisorVerdictParams;
+    type Output = SupervisorVerdictResult;
+    const NAME: &'static str = "solution_agent.supervisor_verdict";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        anyhow::ensure!(
+            !input.reasoning.is_empty(),
+            "invalid_params: reasoning is required"
+        );
+        let action = match input.action.as_str() {
+            "continue" => crate::supervisor::VerdictAction::Continue,
+            "compact" => crate::supervisor::VerdictAction::Compact,
+            "done" => crate::supervisor::VerdictAction::Done,
+            "ask" => crate::supervisor::VerdictAction::Ask,
+            other => anyhow::bail!("invalid_params: unknown action {other:?}"),
+        };
+        if matches!(action, crate::supervisor::VerdictAction::Ask) {
+            anyhow::ensure!(
+                input.question.is_some(),
+                "invalid_params: action \"ask\" requires a question"
+            );
+        }
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.apply_verdict(
+                    session_id,
+                    action,
+                    input.reasoning,
+                    input.message,
+                    input.question,
+                    None,
+                    cx,
+                );
+            });
+        });
+
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: "recorded".into(),
+            }],
+            structured_content: SupervisorVerdictResult {},
+        })
+    }
+}
+
+// =====================================================================
+// solution_agent.supervisor_audit_verdict
+// =====================================================================
+
+/// Record the meta-auditor's verdict for a supervised session. The auditor
+/// reviews the SUPERVISOR's own verdict log + diary (not the agent dialogue)
+/// and decides whether the supervisor is making real progress or looping.
+///
+/// - `continue_supervision`: the supervisor is healthy; supervision proceeds.
+/// - `escalate`: pause supervision in `WaitingUser` and surface the reasoning
+///   to the operator. `ok = false` also forces escalation regardless of action.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SupervisorAuditVerdictParams {
+    pub session_id: String,
+    /// Whether the supervisor is making real progress (`true`) or is stuck /
+    /// missing a problem the human should see (`false`).
+    pub ok: bool,
+    /// One of: "continue_supervision", "escalate".
+    pub action: String,
+    pub reasoning: String,
+}
+
+impl<'de> Deserialize<'de> for SupervisorAuditVerdictParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+            ok: bool,
+            action: String,
+            reasoning: String,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            session_id: inner.session_id,
+            ok: inner.ok,
+            action: inner.action,
+            reasoning: inner.reasoning,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SupervisorAuditVerdictResult {}
+
+#[derive(Clone)]
+pub struct SupervisorAuditVerdictTool;
+
+impl McpServerTool for SupervisorAuditVerdictTool {
+    type Input = SupervisorAuditVerdictParams;
+    type Output = SupervisorAuditVerdictResult;
+    const NAME: &'static str = "solution_agent.supervisor_audit_verdict";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        anyhow::ensure!(
+            !input.reasoning.is_empty(),
+            "invalid_params: reasoning is required"
+        );
+        let escalate = match input.action.as_str() {
+            "continue_supervision" => false,
+            "escalate" => true,
+            other => anyhow::bail!("invalid_params: unknown action {other:?}"),
+        };
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.apply_audit_verdict(session_id, input.ok, escalate, input.reasoning, cx);
+            });
+        });
+
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: "recorded".into(),
+            }],
+            structured_content: SupervisorAuditVerdictResult {},
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! R-5e enrichment coverage. These tests build a real `AcpThread`
@@ -5183,6 +5405,7 @@ mod tests {
                     Some(parent_id),
                     None,
                     None,
+                    false,
                     cx,
                 )
             })
@@ -5358,6 +5581,67 @@ mod tests {
         assert!(
             result.structured_content.children.is_empty(),
             "leaf session has no children"
+        );
+    }
+
+    #[gpui::test]
+    async fn supervisor_ephemeral_sessions_hidden_from_enumeration(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A supervised parent with one hidden ephemeral judge child. The judge
+        // must NOT surface in either `list_sessions` (the parent does) or
+        // `get_session_children` (an empty list — it's the only child).
+        let (parent_id, _thread, _tmp) = create_session_with_thread(cx).await;
+        let judge_id = create_child_session(cx, parent_id).await;
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store
+                    .session(judge_id)
+                    .expect("judge session exists")
+                    .update(cx, |s, _| s.is_supervisor_ephemeral = true);
+            });
+        });
+
+        let listed = ListSessionsTool
+            .run(
+                ListSessionsParams {
+                    solution_id: None,
+                    parent_session_id: None,
+                    count: None,
+                    before_last_activity_at_ms: None,
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("list_sessions");
+        let ids: Vec<&str> = listed
+            .structured_content
+            .sessions
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&parent_id.to_string().as_str()),
+            "the supervised parent is still enumerated"
+        );
+        assert!(
+            !ids.contains(&judge_id.to_string().as_str()),
+            "the flagged ephemeral judge is excluded from list_sessions"
+        );
+
+        let children = GetSessionChildrenTool
+            .run(
+                GetSessionChildrenParams {
+                    session_id: parent_id.to_string(),
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("get_session_children");
+        assert!(
+            children.structured_content.children.is_empty(),
+            "the flagged ephemeral judge is excluded from get_session_children"
         );
     }
 
@@ -6691,8 +6975,8 @@ mod tests {
             crate::db::SolutionAgentDb::open(executor).expect("open db"),
         );
         cx.update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, _| {
-                store.set_persistence(db.clone());
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_persistence(db.clone(), cx);
             });
         });
 

@@ -1,13 +1,14 @@
 //! Status footer rendered between the conversation list and the compose box: state badge, token meter, model / mode / cwd labels, compact + clear popover.
 
 use chrono::TimeZone as _;
-use gpui::{Animation, AnimationExt, ElementId, pulsating_between};
+use gpui::{Animation, AnimationExt, ElementId, WeakEntity, pulsating_between};
 use gpui::{
     Context, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 use ui::prelude::*;
 use ui::{CommonAnimationExt, ContextMenu, IconName, Label, LabelSize, PopoverMenu};
 use util::ResultExt as _;
+use workspace::Workspace;
 
 use crate::compact::{
     COMPACT_BUTTON_MIN_PCT, COMPACT_BUTTON_WARN_PCT, COMPACT_HEADROOM_MIN_TOKENS,
@@ -951,8 +952,169 @@ pub(crate) fn render_status_row(
                 this.child(Label::new("·").color(Color::Muted).size(LabelSize::Small))
                     .child(Label::new(mode).color(Color::Muted).size(LabelSize::Small))
             })
+            .when(!is_subagent_tab, |this| {
+                let sup = SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .supervisor_state(session_id);
+                let enabled = sup.as_ref().map(|s| s.enabled).unwrap_or(false);
+                let icon_color = if enabled { Color::Accent } else { Color::Muted };
+                let tooltip_text: SharedString = if enabled {
+                    "Supervisor on — click for menu".into()
+                } else {
+                    "Enable chat supervisor".into()
+                };
+                let trigger = ui::IconButton::new("solution-status-supervisor", IconName::Eye)
+                    .icon_size(IconSize::Small)
+                    .icon_color(icon_color)
+                    .tooltip(ui::Tooltip::text(tooltip_text));
+                let workspace = view.workspace_handle().clone();
+                this.child(Label::new("·").color(Color::Muted).size(LabelSize::Small))
+                    .child(
+                        PopoverMenu::new("solution-status-supervisor-menu")
+                            .trigger(trigger)
+                            .menu(move |window, cx| {
+                                Some(supervisor_popover_menu(
+                                    session_id,
+                                    workspace.clone(),
+                                    window,
+                                    cx,
+                                ))
+                            })
+                            .anchor(gpui::Anchor::TopRight),
+                    )
+            })
             .into_any_element(),
     )
+}
+
+fn supervisor_popover_menu(
+    session_id: crate::model::SolutionSessionId,
+    workspace: WeakEntity<Workspace>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> gpui::Entity<ContextMenu> {
+    let store = SolutionAgentStore::global(cx);
+    let state = store.read(cx).supervisor_state(session_id);
+    let enabled = state.as_ref().map(|s| s.enabled).unwrap_or(false);
+    let consecutive_continues = state
+        .as_ref()
+        .map(|s| s.consecutive_continues)
+        .unwrap_or(0);
+    let custom_prompt = state.as_ref().and_then(|s| s.custom_prompt.clone());
+    // Read verdicts once; derive both the summary stats and the log rows
+    // from the same vec to avoid two filesystem reads.
+    let verdicts = store
+        .read(cx)
+        .solution_root_for_app(session_id, cx)
+        .map(|root| {
+            let dir = crate::supervisor::supervisor_dir(&root, session_id);
+            crate::supervisor::read_verdicts(&dir)
+        })
+        .unwrap_or_default();
+    let stats = crate::supervisor::verdict_stats(&verdicts);
+    ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+        let header_text: SharedString = if enabled {
+            "Supervisor enabled".into()
+        } else {
+            "Supervisor disabled".into()
+        };
+        menu = menu.header(header_text);
+        let toggle_label: SharedString = if enabled {
+            "Disable supervisor".into()
+        } else {
+            "Enable supervisor".into()
+        };
+        menu = menu.item(
+            ui::ContextMenuEntry::new(toggle_label)
+                .icon(if enabled { IconName::EyeOff } else { IconName::Eye })
+                .icon_color(Color::Muted)
+                .handler(move |_window, cx| {
+                    SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                        store.set_supervision_enabled(session_id, !enabled, cx);
+                    });
+                }),
+        );
+
+        let prompt_label: SharedString = match &custom_prompt {
+            Some(p) => format!("Instruction: “{}”", p.chars().take(30).collect::<String>()).into(),
+            None => "Set supervisor instruction…".into(),
+        };
+        let current_prompt = custom_prompt.clone();
+        menu = menu.item(
+            ui::ContextMenuEntry::new(prompt_label)
+                .icon(IconName::Pencil)
+                .icon_color(Color::Muted)
+                .handler(move |window, cx| {
+                    let Some(workspace) = workspace.upgrade() else {
+                        return;
+                    };
+                    let current = current_prompt.clone();
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, move |window, cx| {
+                            crate::supervisor_instruction_modal::SupervisorInstructionModal::new(
+                                session_id,
+                                current,
+                                window,
+                                cx,
+                            )
+                        });
+                    });
+                }),
+        );
+
+        menu = menu.separator();
+        menu = menu.header(SharedString::from(format!(
+            "Consecutive continues: {consecutive_continues}/{}",
+            crate::supervisor::MAX_CONSECUTIVE_CONTINUES
+        )));
+        let audits_suffix = if stats.audits > 0 {
+            format!(" · 🔍{}", stats.audits)
+        } else {
+            String::new()
+        };
+        menu = menu.header(SharedString::from(format!(
+            "Verdicts: {} · ↻{} ⚙{} ✓{} ❗{}{} · ~{} tokens",
+            stats.total,
+            stats.by_action[crate::supervisor::VerdictAction::Continue as usize],
+            stats.by_action[crate::supervisor::VerdictAction::Compact as usize],
+            stats.by_action[crate::supervisor::VerdictAction::Done as usize],
+            stats.by_action[crate::supervisor::VerdictAction::Ask as usize],
+            audits_suffix,
+            stats.total_tokens,
+        )));
+
+        // Show up to 8 most-recent verdicts, newest first.
+        menu = menu.separator();
+        if verdicts.is_empty() {
+            menu = menu.header("No verdicts");
+        } else {
+            menu = menu.header("Recent verdicts");
+            for record in verdicts.iter().rev().take(8) {
+                let action_icon = match record.action {
+                    Some(crate::supervisor::VerdictAction::Continue) => "↻",
+                    Some(crate::supervisor::VerdictAction::Compact) => "⚙",
+                    Some(crate::supervisor::VerdictAction::Done) => "✓",
+                    Some(crate::supervisor::VerdictAction::Ask) => "❗",
+                    None => {
+                        if matches!(record.kind, crate::supervisor::VerdictKind::Audit) {
+                            "🔍"
+                        } else {
+                            "?"
+                        }
+                    }
+                };
+                let reasoning = if record.reasoning.chars().count() > 60 {
+                    let truncated: String = record.reasoning.chars().take(57).collect();
+                    format!("{action_icon} {truncated}…")
+                } else {
+                    format!("{action_icon} {}", record.reasoning)
+                };
+                menu = menu.header(SharedString::from(reasoning));
+            }
+        }
+
+        menu
+    })
 }
 
 /// Hardcoded fallback when claude-acp doesn't advertise the model's

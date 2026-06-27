@@ -502,6 +502,16 @@ pub struct SolutionSession {
     /// per `init_change_seq_from_entries`). The mobile delta omits the section
     /// when `watermark <= since_seq`. Tracks `state`.
     pub state_seq: u64,
+    /// Set when the supervisor escalates a question to the human. Rendered as
+    /// a 🛡 banner above the compose row; cleared when the user next sends a
+    /// message. NOT part of the agent conversation history.
+    pub supervisor_question: Option<SharedString>,
+    /// True for the supervisor's hidden judge/auditor sessions; excluded from
+    /// all user-visible session enumerations and from wire create/close
+    /// notifications. The flag lives on the session entity (not a side map)
+    /// so it remains readable at close time, when the in-flight judge/auditor
+    /// maps have already dropped their handles.
+    pub is_supervisor_ephemeral: bool,
 }
 
 impl SolutionSession {
@@ -561,6 +571,8 @@ impl SolutionSession {
             queue_seq: 0,
             subagents_seq: 0,
             state_seq: 0,
+            supervisor_question: None,
+            is_supervisor_ephemeral: false,
         }
     }
 
@@ -765,6 +777,8 @@ mod tests {
             queue_seq: 0,
             subagents_seq: 0,
             state_seq: 0,
+            supervisor_question: None,
+            is_supervisor_ephemeral: false,
         }
     }
 
