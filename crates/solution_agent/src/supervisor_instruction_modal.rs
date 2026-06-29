@@ -12,9 +12,12 @@ use workspace::ModalView;
 use crate::model::SolutionSessionId;
 use crate::store::SolutionAgentStore;
 
-/// Single-line popup for setting the supervisor instruction for a session.
-/// Mirrors `RenameSessionModal` — Editor-based single-line input, modal
-/// dismiss on Confirm/Cancel, prefilled with the current prompt if one exists.
+/// Modal for setting the supervisor instruction for a session. A full
+/// multi-line editor (no length limit, soft-wrapped, scrollable) so the
+/// instruction can be a multi-paragraph brief, not a one-liner. `Enter`
+/// inserts a newline; save via the button or `cmd-enter` / `ctrl-enter`
+/// (`menu::Confirm`), cancel via the button or `escape` (`menu::Cancel`).
+/// Prefilled with the current prompt if one exists.
 pub struct SupervisorInstructionModal {
     session_id: SolutionSessionId,
     instruction_editor: Entity<editor::Editor>,
@@ -29,13 +32,19 @@ impl SupervisorInstructionModal {
         cx: &mut Context<Self>,
     ) -> Self {
         let instruction_editor = cx.new(|cx| {
-            let mut e = editor::Editor::single_line(window, cx);
+            let mut e = editor::Editor::multi_line(window, cx);
+            e.set_show_gutter(false, cx);
+            e.set_show_line_numbers(false, cx);
+            e.set_show_vertical_scrollbar(true, cx);
+            // Wrap at the editor width so a long instruction never needs
+            // horizontal scrolling.
+            e.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
             if let Some(text) = current_instruction {
                 e.set_text(text, window, cx);
                 e.select_all(&editor::actions::SelectAll, window, cx);
             } else {
                 e.set_placeholder_text(
-                    "Supervisor instruction for this chat…",
+                    "Supervisor instruction for this chat — write as much as you need…",
                     window,
                     cx,
                 );
@@ -93,14 +102,26 @@ impl Render for SupervisorInstructionModal {
             .flex()
             .flex_col()
             .gap_3()
-            .w(rems(40.))
+            .w(rems(52.))
             .p_4()
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()
             .border_color(cx.theme().colors().border)
             .rounded_md()
             .child(Label::new("Supervisor Instruction").size(LabelSize::Large))
-            .child(self.instruction_editor.clone())
+            .child(
+                div()
+                    .id("supervisor-instruction-editor-frame")
+                    .h(rems(22.))
+                    .min_h_0()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .p_2()
+                    .overflow_hidden()
+                    .child(self.instruction_editor.clone()),
+            )
             .child(
                 div()
                     .flex()
