@@ -7974,6 +7974,7 @@ async fn apply_continue_nudges_and_increments(cx: &mut gpui::TestAppContext) {
             None,
             None,
             Some(500),
+            None,
             cx,
         );
     });
@@ -7982,6 +7983,43 @@ async fn apply_continue_nudges_and_increments(cx: &mut gpui::TestAppContext) {
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
 
     // Verdict was recorded to disk.
+    let root = crate::store::test_support::session_solution_root(&store, id, cx);
+    let dir = crate::supervisor::supervisor_dir(&root, id);
+    assert_eq!(crate::supervisor::read_verdicts(&dir).len(), 1);
+}
+
+#[gpui::test]
+async fn apply_wait_sleeps_without_nudging(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.supervisor_states.get_mut(&id).unwrap().status =
+            crate::supervisor::SupervisorStatus::Judging;
+    });
+    let before = chrono::Utc::now().timestamp_millis();
+    store.update(cx, |store, cx| {
+        store.apply_verdict(
+            id,
+            crate::supervisor::VerdictAction::Wait,
+            "agent is waiting on the background build".into(),
+            None,
+            None,
+            None,
+            Some(90),
+            cx,
+        );
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    // Wait must NOT count toward the consecutive-continue guard.
+    assert_eq!(st.consecutive_continues, 0);
+    // Stays Watching so the watchdog re-fires once the sleep window passes.
+    assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
+    // next_eligible_ms is gated ~90s out (slack for scheduling).
+    let next = st.next_eligible_ms.expect("wait sets next_eligible_ms");
+    assert!(next >= before + 80_000, "next_eligible ~90s out: {next} vs {before}");
+    assert!(next <= before + 100_000, "next_eligible within clamp: {next}");
+
+    // The wait verdict was recorded to disk.
     let root = crate::store::test_support::session_solution_root(&store, id, cx);
     let dir = crate::supervisor::supervisor_dir(&root, id);
     assert_eq!(crate::supervisor::read_verdicts(&dir).len(), 1);
@@ -8002,6 +8040,7 @@ async fn apply_ask_agent_increments_and_records(cx: &mut gpui::TestAppContext) {
             "unclear whether tests were actually run".into(),
             None,
             Some("Did you run the full test suite, and did it pass?".into()),
+            None,
             None,
             cx,
         );
@@ -8033,6 +8072,7 @@ async fn fifteen_continues_force_ask(cx: &mut gpui::TestAppContext) {
                 id,
                 crate::supervisor::VerdictAction::Continue,
                 "still going".into(),
+                None,
                 None,
                 None,
                 None,
@@ -8229,6 +8269,7 @@ async fn user_reply_rearms_supervision_after_done(cx: &mut gpui::TestAppContext)
             None,
             None,
             None,
+            None,
             cx,
         );
     });
@@ -8284,6 +8325,7 @@ async fn compact_verdict_does_not_reenter_store(cx: &mut gpui::TestAppContext) {
             None,
             None,
             None,
+            None,
             cx,
         );
     });
@@ -8321,6 +8363,7 @@ async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
             id,
             crate::supervisor::VerdictAction::Done,
             "all done".into(),
+            None,
             None,
             None,
             None,

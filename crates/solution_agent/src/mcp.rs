@@ -4379,7 +4379,7 @@ impl McpServerTool for ForceIdleTool {
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct SupervisorVerdictParams {
     pub session_id: String,
-    /// One of: "continue", "compact", "done", "ask".
+    /// One of: "continue", "compact", "done", "ask", "ask_agent", "wait".
     pub action: String,
     pub reasoning: String,
     /// Optional nudge message sent to the session when action == "continue".
@@ -4389,6 +4389,10 @@ pub struct SupervisorVerdictParams {
     /// Required when action == "ask". The question to surface to the operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
+    /// Sleep duration for action == "wait", in seconds. Clamped to
+    /// [10, 300]; defaults to 120 when absent. Ignored for other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_seconds: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for SupervisorVerdictParams {
@@ -4401,6 +4405,7 @@ impl<'de> Deserialize<'de> for SupervisorVerdictParams {
             reasoning: String,
             message: Option<String>,
             question: Option<String>,
+            wait_seconds: Option<u64>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -4409,6 +4414,7 @@ impl<'de> Deserialize<'de> for SupervisorVerdictParams {
             reasoning: inner.reasoning,
             message: inner.message,
             question: inner.question,
+            wait_seconds: inner.wait_seconds,
         })
     }
 }
@@ -4443,6 +4449,7 @@ impl McpServerTool for SupervisorVerdictTool {
             "done" => crate::supervisor::VerdictAction::Done,
             "ask" => crate::supervisor::VerdictAction::Ask,
             "ask_agent" => crate::supervisor::VerdictAction::AskAgent,
+            "wait" => crate::supervisor::VerdictAction::Wait,
             other => anyhow::bail!("invalid_params: unknown action {other:?}"),
         };
         if matches!(
@@ -4467,6 +4474,7 @@ impl McpServerTool for SupervisorVerdictTool {
                     input.message,
                     input.question,
                     None,
+                    input.wait_seconds,
                     cx,
                 );
             });

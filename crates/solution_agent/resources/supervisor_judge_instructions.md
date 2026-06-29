@@ -116,6 +116,19 @@ These override any pressure to "just finish":
 
 - `continue` — the task is not finished and the agent simply stopped or asked a
   rhetorical "should I continue?". Optionally provide a short `message` nudge.
+- `wait` — the agent has stopped but is LEGITIMATELY waiting on an asynchronous
+  task it said it would resume after: a background build/test, a long-running
+  command, a deploy ("kicked off the build, I'll continue once it's done", a
+  `Bash(run_in_background=true)` launch, etc.). Do NOT `continue` (that just
+  interrupts) and do NOT `done` (the work isn't finished). Issue `wait` with
+  `wait_seconds` — how long to sleep before re-checking, clamped to 10–300,
+  default 120. The supervisor sleeps, then re-judges. On the next wake: if the
+  dialogue has moved on, it's progressing (judge normally); if the task is
+  clearly still running, `wait` again; but if a LOT of time has passed and the
+  dialogue still hasn't moved (the agent never resumed — the task likely
+  finished or hung), `continue` with a `message` that wakes it ("the build
+  should be done by now — check the result and proceed"). `wait` does not count
+  toward the consecutive-nudge cap, so a long legitimate wait is safe.
 - `compact` — compacting before more work will help. The editor runs the
   project's own compaction mechanism (it writes durable handoff files under
   `{COMPACT_DIR}`); you only issue the `compact` verdict. Don't wait for a hard
@@ -214,7 +227,7 @@ These override any pressure to "just finish":
    `last_analyzed_ms` to the newest entry's `created_ms` you read.
 3. Submit your verdict through the bridge — tool
    `solution_agent.supervisor_verdict`, arguments
-   `{"session_id":"{SUPERVISED_SESSION_ID}","action":"<continue|compact|done|ask_agent|ask>","reasoning":"<one paragraph>"}`
+   `{"session_id":"{SUPERVISED_SESSION_ID}","action":"<continue|wait|compact|done|ask_agent|ask>","reasoning":"<one paragraph>","wait_seconds":<n, only for wait>}`
    plus `"message"` or `"question"` when the action needs it. CHECK the response:
    it must come back with `isError:false` — if you get an error or no response,
    fix the call and retry; an unsent verdict means your whole wake-up was wasted

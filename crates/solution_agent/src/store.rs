@@ -1566,6 +1566,7 @@ impl SolutionAgentStore {
         message: Option<String>,
         question: Option<String>,
         tokens: Option<u64>,
+        wait_seconds: Option<u64>,
         cx: &mut Context<Self>,
     ) {
         use crate::supervisor::{SupervisorStatus, VerdictAction, VerdictKind, VerdictRecord};
@@ -1734,6 +1735,22 @@ impl SolutionAgentStore {
                         self.escalate_to_user(id, question, cx);
                     }
                 }
+            }
+            VerdictAction::Wait => {
+                // The agent legitimately paused to wait on an async task it said
+                // it would resume after (a background build/test/deploy). Don't
+                // nudge — sleep `wait_seconds` (clamped) and re-judge afterward.
+                // Stay `Watching` so the watchdog re-fires once the gate passes;
+                // `next_eligible_ms` is the same gate the failure-backoff uses.
+                // Wait does NOT increment the consecutive-continue guard, so a
+                // long legitimate wait can't trip the 15-nudge force-ask cap.
+                let secs = crate::supervisor::clamp_wait_secs(wait_seconds);
+                let next = chrono::Utc::now().timestamp_millis() + (secs as i64) * 1000;
+                if let Some(state) = self.supervisor_states.get_mut(&id) {
+                    state.status = SupervisorStatus::Watching;
+                    state.next_eligible_ms = Some(next);
+                }
+                self.persist_supervisor_state(id, cx);
             }
         }
 

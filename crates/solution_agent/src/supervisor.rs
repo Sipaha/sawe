@@ -70,6 +70,31 @@ pub enum VerdictAction {
     /// when it's unclear whether the work is actually finished. Subject to the
     /// same consecutive-nudge guards as `Continue` so it can't loop forever.
     AskAgent = 4,
+    /// The agent has (legitimately) stopped to wait on an asynchronous task it
+    /// said it would resume after — a background build/test, a long command, a
+    /// deploy. Instead of nudging it (which would just interrupt), the
+    /// supervisor SLEEPS for `wait_seconds` (clamped to [`MAX_WAIT_SECS`]) and
+    /// re-evaluates on the next wake-up. If the dialogue has moved on by then the
+    /// session is progressing; if a lot of time has passed with no progress the
+    /// judge should `continue` (wake it to check the result) instead of waiting
+    /// again. Does NOT count toward the consecutive-continue guard.
+    Wait = 5,
+}
+
+/// Hard ceiling on a single `Wait` verdict's sleep, and the default when the
+/// judge omits a duration. A wait re-evaluates after at most this long, so a
+/// genuinely-stuck background task is re-checked (and can be woken) within the
+/// window rather than parking the supervisor indefinitely.
+pub const MAX_WAIT_SECS: u64 = 300;
+pub const MIN_WAIT_SECS: u64 = 10;
+pub const DEFAULT_WAIT_SECS: u64 = 120;
+
+/// Clamp a judge-supplied wait duration into `[MIN_WAIT_SECS, MAX_WAIT_SECS]`,
+/// defaulting to `DEFAULT_WAIT_SECS` when absent. Pure for unit-testing.
+pub fn clamp_wait_secs(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(DEFAULT_WAIT_SECS)
+        .clamp(MIN_WAIT_SECS, MAX_WAIT_SECS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,8 +239,9 @@ impl SupervisorState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerdictStats {
     pub total: usize,
-    /// Indexed by `VerdictAction as usize` (Continue, Compact, Done, Ask, AskAgent).
-    pub by_action: [usize; 5],
+    /// Indexed by `VerdictAction as usize` (Continue, Compact, Done, Ask,
+    /// AskAgent, Wait).
+    pub by_action: [usize; 6],
     pub audits: usize,
     pub total_tokens: u64,
 }
@@ -503,6 +529,15 @@ mod tests {
         assert!(matches!(continue_guard(10), Audit));
         assert!(matches!(continue_guard(15), ForceAsk)); // hard cap wins at 15
         assert!(matches!(continue_guard(16), ForceAsk));
+    }
+
+    #[test]
+    fn clamp_wait_secs_bounds_and_default() {
+        assert_eq!(clamp_wait_secs(None), DEFAULT_WAIT_SECS);
+        assert_eq!(clamp_wait_secs(Some(0)), MIN_WAIT_SECS);
+        assert_eq!(clamp_wait_secs(Some(5)), MIN_WAIT_SECS);
+        assert_eq!(clamp_wait_secs(Some(90)), 90);
+        assert_eq!(clamp_wait_secs(Some(10_000)), MAX_WAIT_SECS);
     }
 
     fn sid() -> SolutionSessionId {

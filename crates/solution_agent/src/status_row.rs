@@ -1141,6 +1141,7 @@ fn supervisor_popover_menu(
                     Some(crate::supervisor::VerdictAction::Done) => "✓",
                     Some(crate::supervisor::VerdictAction::AskAgent) => "💬",
                     Some(crate::supervisor::VerdictAction::Ask) => "❗",
+                    Some(crate::supervisor::VerdictAction::Wait) => "⏳",
                     None => {
                         if matches!(record.kind, crate::supervisor::VerdictKind::Audit) {
                             "🔍"
