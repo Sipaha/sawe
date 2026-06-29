@@ -1558,6 +1558,22 @@ impl SolutionAgentStore {
         content: String,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
+        // Leave a distinct Observer breadcrumb so the supervisor's intervention
+        // is visible in the conversation as the OBSERVER acting, not confused
+        // with the user or the agent. Trimmed to a one-liner gist.
+        let gist: String = content
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(&content)
+            .chars()
+            .take(160)
+            .collect();
+        self.push_system_note(
+            id,
+            acp_thread::SystemNoteLevel::Observer,
+            format!("Наблюдатель направил агента: {gist}"),
+            cx,
+        );
         let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
             agent_client_protocol::schema::TextContent::new(content),
         )];
@@ -1844,6 +1860,14 @@ impl SolutionAgentStore {
                             id,
                             &format!(
                                 "usage limit hit; auto-resume scheduled ~{eta} local (reset + 2-15min jitter)"
+                            ),
+                            cx,
+                        );
+                        self.push_system_note(
+                            id,
+                            acp_thread::SystemNoteLevel::Info,
+                            format!(
+                                "Достигнут лимит claude. Наблюдатель продолжит сессию автоматически примерно в {eta}."
                             ),
                             cx,
                         );
