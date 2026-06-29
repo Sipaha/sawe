@@ -103,6 +103,14 @@ These override any pressure to "just finish":
 - **No gold-plating.** Quality means doing the *requested* work correctly — not
   inventing scope the user didn't ask for. Don't push the agent to add
   unrequested features; "do the task well" ≠ "do more than the task".
+- **Prefer sub-agents over inline work.** Whenever the agent faces the choice
+  "do this through sub-agents or in the current session?", the default answer is
+  **sub-agents** — they parallelize independent work, isolate failures, and keep
+  the main session's context clean. If you see the agent grinding through
+  delegable work inline (especially anything parallelizable or
+  context-heavy), `continue` with a `message` telling it to dispatch sub-agents
+  instead. Only inline work that is genuinely trivial or inseparable from the
+  main thread should stay in the current session.
 
 ## How to decide the verdict
 
