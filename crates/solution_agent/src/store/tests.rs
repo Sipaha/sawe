@@ -7548,6 +7548,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         last_fired_at: None,
         next_eligible_ms: None,
         status: crate::supervisor::SupervisorStatus::Watching,
+        last_user_input_ms: None,
     };
     db.save_supervisor_state(state.clone())
         .await
@@ -7639,6 +7640,91 @@ async fn tick_fires_judge_after_threshold(cx: &mut gpui::TestAppContext) {
     });
     let st2 = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
     assert_eq!(st2.last_fired_at, st.last_fired_at, "must not re-fire while judging");
+}
+
+/// Manual user-stop parks the supervisor in `Held`: even an idle, long-silent
+/// session never fires a judge while held, and the next human message re-arms it
+/// to `Watching`. This is the "I stopped the agent myself; don't let the
+/// observer drag it back to work until I say so" guarantee.
+#[gpui::test]
+async fn manual_stop_holds_supervisor_then_message_rearms(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.set_supervision_enabled(id, true, cx);
+        // The user manually stops the agent.
+        store.hold_supervisor(id, cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Held,
+        "manual stop parks the supervisor on hold"
+    );
+    assert!(st.enabled, "Held keeps supervision enabled (it's a pause, not a disable)");
+
+    // A tick while Held must NOT spawn a judge, despite the idle, silent session.
+    store.update(cx, |store, cx| store.tick_supervisor(cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Held,
+        "a held supervisor never fires on the current dialog state"
+    );
+
+    // The user sends a new message → re-arm to Watching.
+    store.update(cx, |store, cx| store.reset_supervisor_continue_counter(id, cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Watching,
+        "the next human message re-arms the held supervisor"
+    );
+}
+
+/// Live typing defers the watchdog: a fresh keystroke (`note_user_input`) makes
+/// the supervisor treat the session as active, so an otherwise-fireable idle
+/// session does NOT get a judge until the typing grace elapses. Prevents the
+/// observer firing its own nudge while the user is mid-message.
+#[gpui::test]
+async fn typing_defers_supervisor_tick(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.set_supervision_enabled(id, true, cx);
+        // The user is mid-message: a keystroke just landed.
+        store.note_user_input(id);
+    });
+
+    store.update(cx, |store, cx| store.tick_supervisor(cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Watching,
+        "a recent keystroke defers the supervisor tick — no judge mid-typing"
+    );
+
+    // Clear the typing marker (grace window elapsed) → the tick now fires.
+    store.update(cx, |store, _| {
+        if let Some(s) = store.supervisor_states.get_mut(&id) {
+            s.last_user_input_ms = None;
+        }
+    });
+    store.update(cx, |store, cx| store.tick_supervisor(cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Judging,
+        "with no recent typing the idle, silent session fires a judge"
+    );
 }
 
 #[gpui::test]
@@ -7946,11 +8032,10 @@ async fn user_reply_resumes_waiting_user_supervision(cx: &mut gpui::TestAppConte
     assert!(q.is_none(), "user reply must clear the supervisor question");
 }
 
-/// A `Done` verdict auto-disables supervision (`Stopped(Done)`). When the user
-/// then continues the work with a new message, supervision must RE-ARM
-/// (`enabled` + `Watching`) — the task is evidently not done anymore. A
-/// user-driven toggle-off must NOT re-arm this way (that's covered by the
-/// status scope: only `Stopped(Done)` re-arms, not `Disabled`).
+/// A `Done` verdict parks supervision in `Held` (standby) WITHOUT disabling it —
+/// the same pause the user's manual Stop uses. When the user then continues the
+/// work with a new message, supervision re-arms to `Watching` (the task is
+/// evidently not done anymore).
 #[gpui::test]
 async fn user_reply_rearms_supervision_after_done(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
@@ -7967,11 +8052,12 @@ async fn user_reply_rearms_supervision_after_done(cx: &mut gpui::TestAppContext)
         );
     });
     let st = store.read_with(cx, |store, _| store.supervisor_state(id).unwrap());
-    assert!(!st.enabled, "Done disables supervision");
-    assert!(matches!(
+    assert!(st.enabled, "Done parks in Held, it does NOT disable supervision");
+    assert_eq!(
         st.status,
-        crate::supervisor::SupervisorStatus::Stopped(crate::supervisor::StoppedReason::Done)
-    ));
+        crate::supervisor::SupervisorStatus::Held,
+        "Done parks the supervisor on hold"
+    );
 
     // User continues the work — supervision must re-arm.
     store.update(cx, |store, cx| {
@@ -8068,16 +8154,12 @@ async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
         "supervisor_question must be cleared after Done verdict"
     );
 
-    // Verify the supervision state is stopped-done.
+    // Verify the supervision state is parked on hold (Done → Held).
     let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
-    assert!(
-        matches!(
-            st.status,
-            crate::supervisor::SupervisorStatus::Stopped(
-                crate::supervisor::StoppedReason::Done
-            )
-        ),
-        "supervision must be stopped-done"
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Held,
+        "a Done verdict parks supervision on hold"
     );
 
     // Also verify that set_supervision_enabled(false) clears a pending question.

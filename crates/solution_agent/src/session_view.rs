@@ -282,6 +282,10 @@ pub struct SolutionSessionView {
     /// `sessions_for(&solution_id)` pass) and a false-positive notify
     /// just paints the same frame again.
     _store_subscription: Option<Subscription>,
+    /// Subscription to the compose editor's `BufferEdited` events: each
+    /// keystroke bumps the supervisor's idle clock (`note_user_input`) so the
+    /// observer never fires a nudge while the user is mid-message.
+    _compose_subscription: Subscription,
     /// Currently selected subagent tab for the strip:
     /// `SubagentView::Main` = the parent thread view, `Task(toolu_id)` =
     /// an in-flight inline `Task`/`Agent` subagent filtered to entries
@@ -522,6 +526,18 @@ impl SolutionSessionView {
                 _ => {}
             })
         });
+        // Each compose keystroke marks the user as active so the supervisor's
+        // idle watchdog defers (note_user_input) — it must not nudge the agent
+        // while the user is in the middle of typing their own message.
+        let compose_subscription =
+            cx.subscribe(&compose_editor, |this: &mut Self, _, event, cx| {
+                if matches!(event, editor::EditorEvent::BufferEdited) {
+                    let id = this.session_id;
+                    if let Some(store) = SolutionAgentStore::try_global(cx) {
+                        store.update(cx, |store, _| store.note_user_input(id));
+                    }
+                }
+            });
         let mut view = Self {
             session_id,
             session,
@@ -534,6 +550,7 @@ impl SolutionSessionView {
             status_thinking_tick: None,
             status_activity_tick: None,
             compose_editor,
+            _compose_subscription: compose_subscription,
             pending_images: Vec::new(),
             find: None,
             compose_height: px(DEFAULT_COMPOSE_HEIGHT),
@@ -1762,6 +1779,9 @@ impl SolutionSessionView {
             if let Err(err) = store.cancel_turn(session_id, cx) {
                 log::warn!("solution_agent: cancel_turn failed: {err:#}");
             }
+            // The HUMAN hit Stop — park the supervisor in `Held` so it doesn't
+            // drag the agent back to work before the user decides to continue.
+            store.hold_supervisor(session_id, cx);
         });
     }
 

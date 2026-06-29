@@ -1277,10 +1277,18 @@ impl SolutionAgentStore {
         if let Some(state) = self.supervisor_states.get_mut(&id) {
             let was_done = matches!(state.status, SupervisorStatus::Stopped(StoppedReason::Done));
             let waiting = matches!(state.status, SupervisorStatus::WaitingUser);
-            if state.consecutive_continues == 0 && !waiting && !was_done {
+            // A `Held` session (the user manually stopped the agent) re-arms on
+            // the next human message — the user has decided to continue.
+            let held = matches!(state.status, SupervisorStatus::Held);
+            if state.consecutive_continues == 0 && !waiting && !was_done && !held {
                 return;
             }
             state.consecutive_continues = 0;
+            if held {
+                // Leaving Held: clear any stale backoff so the watchdog can fire
+                // on the next idle once the agent finishes the new turn.
+                state.next_eligible_ms = None;
+            }
             if was_done {
                 // Re-arm: Done auto-disabled supervision; the user is continuing
                 // the work, so restore their original enabled intent. Clear any
@@ -1292,12 +1300,61 @@ impl SolutionAgentStore {
             if state.enabled {
                 state.status = SupervisorStatus::Watching;
             }
-            if was_done {
+            if was_done || held {
                 self.backoff_timers.remove(&id);
             }
             self.persist_supervisor_state(id, cx);
             self.clear_supervisor_question(id, cx);
             cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+        }
+    }
+
+    /// Park the supervisor in `Held` because the HUMAN manually stopped the
+    /// agent (Stop button / `cancel_turn`). Supervision stays enabled but must
+    /// not re-engage on the current dialog state — no judge, no nudge — until the
+    /// next human message re-arms it (`reset_supervisor_continue_counter`). This
+    /// is the fix for "I stopped the agent myself; don't let the observer drag it
+    /// back to work before I decide to continue." No-op unless supervision is
+    /// enabled and currently `Watching`/`Judging`. Any in-flight judge is torn
+    /// down so a verdict already in flight can't nudge the agent after the stop.
+    pub(crate) fn hold_supervisor(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        use crate::supervisor::SupervisorStatus;
+        let should_hold = self
+            .supervisor_states
+            .get(&id)
+            .is_some_and(|s| {
+                s.enabled
+                    && matches!(
+                        s.status,
+                        SupervisorStatus::Watching | SupervisorStatus::Judging
+                    )
+            });
+        if !should_hold {
+            return;
+        }
+        // Tear down an in-flight judge: at user-stop time the session is usually
+        // Running (status Watching, no judge), but if a judge had just spawned it
+        // would otherwise still deliver a verdict and possibly nudge the agent.
+        self.finish_judge(id, cx);
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            state.status = SupervisorStatus::Held;
+            state.next_eligible_ms = None;
+        }
+        self.backoff_timers.remove(&id);
+        self.persist_supervisor_state(id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
+    /// Note that the HUMAN is typing into `id`'s compose box. Pushes the
+    /// supervisor's idle clock forward (transient `last_user_input_ms`), so the
+    /// watchdog treats the session as active for another `IDLE_THRESHOLD_SECS`
+    /// and never fires a nudge while the user is mid-message. Cheap + frequent
+    /// (one per keystroke burst): in-memory only, no persist, no event.
+    pub(crate) fn note_user_input(&mut self, id: SolutionSessionId) {
+        if let Some(state) = self.supervisor_states.get_mut(&id)
+            && state.enabled
+        {
+            state.last_user_input_ms = Some(chrono::Utc::now().timestamp_millis());
         }
     }
 
@@ -1406,9 +1463,7 @@ impl SolutionAgentStore {
         tokens: Option<u64>,
         cx: &mut Context<Self>,
     ) {
-        use crate::supervisor::{
-            StoppedReason, SupervisorStatus, VerdictAction, VerdictKind, VerdictRecord,
-        };
+        use crate::supervisor::{SupervisorStatus, VerdictAction, VerdictKind, VerdictRecord};
 
         if let Some(root) = self.solution_root_for(id, cx) {
             let dir = crate::supervisor::supervisor_dir(&root, id);
@@ -1502,10 +1557,18 @@ impl SolutionAgentStore {
                 });
             }
             VerdictAction::Done => {
+                // The supervisor considers the work complete. Don't switch
+                // supervision OFF — park it in `Held` (the same standby the
+                // user's manual Stop uses): it stops acting on the current
+                // dialog state but stays enabled, and the next human message
+                // re-arms it to `Watching` (the user evidently has more work).
+                // Mirrors the manual-stop pause so "done" and "I stopped it"
+                // behave identically.
                 if let Some(state) = self.supervisor_states.get_mut(&id) {
-                    state.enabled = false;
-                    state.status = SupervisorStatus::Stopped(StoppedReason::Done);
+                    state.status = SupervisorStatus::Held;
+                    state.next_eligible_ms = None;
                 }
+                self.backoff_timers.remove(&id);
                 self.persist_supervisor_state(id, cx);
                 self.clear_supervisor_question(id, cx);
                 // Append the supervisor's completion summary (the judge's
@@ -1741,6 +1804,7 @@ impl SolutionAgentStore {
             let status = state.status.clone();
             let next_eligible_ms = state.next_eligible_ms;
             let last_fired_at = state.last_fired_at;
+            let last_user_input_ms = state.last_user_input_ms;
 
             // Judge-stuck watchdog: a judge that errored / ended WITHOUT calling
             // its verdict tool leaves the session pinned in `Judging` forever
@@ -1770,12 +1834,17 @@ impl SolutionAgentStore {
                     matches!(s.state, SessionState::Idle | SessionState::Errored(_));
                 (idle_or_errored, s.last_activity_at.timestamp_millis())
             };
+            // Treat live human typing as activity: the supervisor's idle clock
+            // counts silence from the LATER of the session's last activity and
+            // the user's last keystroke, so a nudge never fires while the user
+            // is mid-message (note_user_input bumps `last_user_input_ms`).
+            let quiet_since_ms = last_activity_ms.max(last_user_input_ms.unwrap_or(0));
             if now_ms >= next_eligible_ms.unwrap_or(0)
                 && crate::supervisor::should_fire(
                     enabled,
                     &status,
                     idle_or_errored,
-                    last_activity_ms,
+                    quiet_since_ms,
                     now_ms,
                     crate::supervisor::IDLE_THRESHOLD_SECS,
                 )

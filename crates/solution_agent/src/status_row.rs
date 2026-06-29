@@ -957,13 +957,23 @@ pub(crate) fn render_status_row(
                     .read(cx)
                     .supervisor_state(session_id);
                 let enabled = sup.as_ref().map(|s| s.enabled).unwrap_or(false);
-                let icon_color = if enabled { Color::Accent } else { Color::Muted };
-                let tooltip_text: SharedString = if enabled {
-                    "Supervisor on — click for menu".into()
+                let held = sup
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.status, crate::supervisor::SupervisorStatus::Held));
+                let (icon, icon_color, tooltip_text): (IconName, Color, SharedString) = if !enabled {
+                    (IconName::Eye, Color::Muted, "Enable chat supervisor".into())
+                } else if held {
+                    // Standing by after a manual stop / a "done" verdict: won't
+                    // re-engage until the user sends the next message.
+                    (
+                        IconName::Clock,
+                        Color::Warning,
+                        "Supervisor on hold — your next message resumes it".into(),
+                    )
                 } else {
-                    "Enable chat supervisor".into()
+                    (IconName::Eye, Color::Accent, "Supervisor on — click for menu".into())
                 };
-                let trigger = ui::IconButton::new("solution-status-supervisor", IconName::Eye)
+                let trigger = ui::IconButton::new("solution-status-supervisor", icon)
                     .icon_size(IconSize::Small)
                     .icon_color(icon_color)
                     .tooltip(ui::Tooltip::text(tooltip_text));
@@ -996,6 +1006,11 @@ fn supervisor_popover_menu(
     let store = SolutionAgentStore::global(cx);
     let state = store.read(cx).supervisor_state(session_id);
     let enabled = state.as_ref().map(|s| s.enabled).unwrap_or(false);
+    let status_label: SharedString = state
+        .as_ref()
+        .map(|s| s.status.human_label())
+        .unwrap_or("Off")
+        .into();
     let consecutive_continues = state
         .as_ref()
         .map(|s| s.consecutive_continues)
@@ -1014,7 +1029,7 @@ fn supervisor_popover_menu(
     let stats = crate::supervisor::verdict_stats(&verdicts);
     ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
         let header_text: SharedString = if enabled {
-            "Supervisor enabled".into()
+            format!("Supervisor · {status_label}").into()
         } else {
             "Supervisor disabled".into()
         };

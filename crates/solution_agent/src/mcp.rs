@@ -2932,7 +2932,7 @@ impl McpServerTool for CancelTurnTool {
         cx.update(|cx| -> Result<()> {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                if flush_pending {
+                let result = if flush_pending {
                     // Best-effort: when there is nothing to flush
                     // `interrupt_and_flush_pending` errors with
                     // "no queued messages". Treat that as success
@@ -2944,7 +2944,13 @@ impl McpServerTool for CancelTurnTool {
                     }
                 } else {
                     store.cancel_turn(session_id, cx)
-                }
+                };
+                // Human-initiated stop (desktop / mobile Stop) — park the
+                // supervisor in `Held` so it doesn't re-engage until the user
+                // sends the next message. (A `flush_pending` cancel re-sends the
+                // queued user text, which re-arms via the send funnel anyway.)
+                store.hold_supervisor(session_id, cx);
+                result
             })?;
             Ok(())
         })?;

@@ -561,6 +561,9 @@ impl SolutionAgentDb {
                     last_fired_at: last_fired,
                     next_eligible_ms: next_eligible,
                     status: crate::supervisor::SupervisorStatus::parse_db_string(&status),
+                    // Transient (not persisted): a cold-loaded session has no
+                    // in-flight draft to protect from a supervisor nudge.
+                    last_user_input_ms: None,
                 });
             }
             Ok(out)

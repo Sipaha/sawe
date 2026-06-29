@@ -109,6 +109,13 @@ pub enum SupervisorStatus {
     Watching,
     Judging,
     WaitingUser,
+    /// The user manually stopped the agent: supervision is enabled but
+    /// deliberately standing by — it must NOT re-engage on the current dialog
+    /// state (no judge, no nudge). Cleared back to `Watching` by the next human
+    /// message (`reset_supervisor_continue_counter`). Distinct from
+    /// `WaitingUser` (the supervisor asked a question) and from `Disabled`
+    /// (supervision off): here the user, not the supervisor, hit the brakes.
+    Held,
     Stopped(StoppedReason),
 }
 
@@ -121,9 +128,25 @@ impl SupervisorStatus {
             Self::Watching => "watching".into(),
             Self::Judging => "judging".into(),
             Self::WaitingUser => "waiting_user".into(),
+            Self::Held => "held".into(),
             Self::Stopped(StoppedReason::Quota) => "stopped:quota".into(),
             Self::Stopped(StoppedReason::ProviderError) => "stopped:provider_error".into(),
             Self::Stopped(StoppedReason::Done) => "stopped:done".into(),
+        }
+    }
+
+    /// Short human-readable label for UI surfaces (status-row popover header,
+    /// Eye-icon tooltip).
+    pub fn human_label(&self) -> &'static str {
+        match self {
+            Self::Disabled => "Off",
+            Self::Watching => "Watching",
+            Self::Judging => "Reviewing…",
+            Self::WaitingUser => "Waiting for you",
+            Self::Held => "On hold",
+            Self::Stopped(StoppedReason::Quota) => "Stopped (quota)",
+            Self::Stopped(StoppedReason::ProviderError) => "Stopped (error)",
+            Self::Stopped(StoppedReason::Done) => "Done",
         }
     }
 
@@ -132,6 +155,7 @@ impl SupervisorStatus {
             "watching" => Self::Watching,
             "judging" => Self::Judging,
             "waiting_user" => Self::WaitingUser,
+            "held" => Self::Held,
             "stopped:quota" => Self::Stopped(StoppedReason::Quota),
             "stopped:provider_error" => Self::Stopped(StoppedReason::ProviderError),
             "stopped:done" => Self::Stopped(StoppedReason::Done),
@@ -156,6 +180,12 @@ pub struct SupervisorState {
     /// gates firing on `now_ms >= next_eligible_ms.unwrap_or(0)`.
     pub next_eligible_ms: Option<i64>,
     pub status: SupervisorStatus,
+    /// Epoch-millis of the last time the human typed into this session's compose
+    /// box. TRANSIENT (not persisted): the watchdog treats the session as "still
+    /// active" until `IDLE_THRESHOLD_SECS` after the last keystroke, so the
+    /// supervisor never fires a nudge while the user is mid-message. Reset to
+    /// `None` on restart (a cold session has no in-flight draft to protect).
+    pub last_user_input_ms: Option<i64>,
 }
 
 impl SupervisorState {
@@ -169,6 +199,7 @@ impl SupervisorState {
             last_fired_at: None,
             next_eligible_ms: None,
             status: SupervisorStatus::Disabled,
+            last_user_input_ms: None,
         }
     }
 }
