@@ -88,6 +88,18 @@ Rules that still apply:
   `legal/upstream-zed/` and don't apply to this fork's binaries (no
   service infrastructure).
 
+## Git: pushing is free
+
+This is the maintainer's personal solo repo (`Sipaha/sawe`, branch `main`).
+**Pushing is pre-authorized — push directly to `origin main` without asking**,
+including the very change you just committed. No PR, no review gate, no
+"should I push?" round-trip. Commit, build/verify, push.
+
+The only standing constraints (unchanged): never `git commit --amend` or
+rewrite existing commits unless explicitly asked; never add a `Co-Authored-By`
+trailer; keep commit messages clear and imperative. Force-push to `main` and
+history rewrites still need an explicit go-ahead.
+
 ## What's disabled (do NOT try to "fix" these without explicit instruction)
 
 | Subsystem | Where disabled |
