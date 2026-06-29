@@ -194,6 +194,16 @@ pub(crate) fn render_compact_prompt_inner(
         )
     })?;
 
+    // Bound disk over a long multi-day session: each rotation writes a fresh
+    // `cNN/` handoff dir (~15KB) and they are never otherwise deleted. Keep the
+    // most recent `COMPACT_DIR_RETENTION` and prune older ones. Safe: resume
+    // only ever uses the LATEST rotation's `continue.md`, and the `done`
+    // aggregation reads recent `state.md` summaries (each is itself cumulative),
+    // so older rotations are historical detail, not load-bearing.
+    if let Some(session_dir) = compact_dir.parent() {
+        prune_old_compact_dirs(session_dir, context_count);
+    }
+
     let mut compact_dir_str = compact_dir.to_string_lossy().to_string();
     if !compact_dir_str.ends_with(std::path::MAIN_SEPARATOR) {
         compact_dir_str.push(std::path::MAIN_SEPARATOR);
@@ -221,6 +231,38 @@ pub(crate) fn render_compact_prompt_inner(
         .replace("{{started_at_iso}}", &started_at.to_rfc3339())
         .replace("{{tokens_used}}", &used.to_string())
         .replace("{{tokens_max}}", &max.to_string()))
+}
+
+/// How many most-recent `cNN/` rotation handoff dirs to keep per session.
+const COMPACT_DIR_RETENTION: u32 = 20;
+
+/// Delete `cNN/` handoff dirs older than the retention window. `current` is the
+/// rotation just created; keeps `cNN` where `NN > current - COMPACT_DIR_RETENTION`
+/// and removes the rest. Best-effort — any IO error is ignored (these are
+/// historical handoff snapshots, never load-bearing for resume). Only touches
+/// children named exactly `c<digits>`, so sibling files/dirs (`supervisor/`,
+/// `session-log.md`, `inbox/`, …) are never affected.
+fn prune_old_compact_dirs(session_dir: &std::path::Path, current: u32) {
+    let cutoff = current.saturating_sub(COMPACT_DIR_RETENTION);
+    if cutoff == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(num) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix('c'))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if num <= cutoff && entry.path().is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 impl SolutionSessionView {
@@ -370,6 +412,36 @@ mod tests {
     /// for the duration of the test so `start_resume`'s synchronous
     /// `workspace.upgrade()` check returns `Some` and does not clear
     /// `pending_send` / `resuming` before we can read them.
+    #[test]
+    fn prune_old_compact_dirs_keeps_recent_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path();
+        for n in 1..=25u32 {
+            std::fs::create_dir_all(session_dir.join(format!("c{n:02}"))).unwrap();
+        }
+        // Sibling non-`cNN` entries must survive untouched.
+        std::fs::create_dir_all(session_dir.join("supervisor")).unwrap();
+        std::fs::write(session_dir.join("session-log.md"), b"x").unwrap();
+
+        prune_old_compact_dirs(session_dir, 25);
+
+        // cutoff = 25 - 20 = 5 → delete c01..c05, keep c06..c25.
+        for n in 1..=5u32 {
+            assert!(
+                !session_dir.join(format!("c{n:02}")).exists(),
+                "c{n:02} should be pruned"
+            );
+        }
+        for n in 6..=25u32 {
+            assert!(
+                session_dir.join(format!("c{n:02}")).exists(),
+                "c{n:02} should be kept"
+            );
+        }
+        assert!(session_dir.join("supervisor").exists());
+        assert!(session_dir.join("session-log.md").exists());
+    }
+
     #[gpui::test]
     async fn cold_compact_queues_prompt_and_kicks_resume(cx: &mut TestAppContext) {
         let (solution_id, _tmp, project) =

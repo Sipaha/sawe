@@ -356,6 +356,41 @@ pub fn session_log_path(solution_root: &Path, session_id: SolutionSessionId) -> 
 /// caller logs the error. `now_ms` is the Unix-millis timestamp to stamp (the
 /// caller passes `chrono::Utc::now().timestamp_millis()` — kept as a param so
 /// this stays pure and unit-testable).
+/// Size caps for the append-only supervisor breadcrumb logs. A multi-day
+/// supervised session would otherwise grow these without bound (one diary note
+/// per failure/timeout, one verdict line per judge fire, one section per
+/// compaction). These are tail-read only (the auditor + operator look at the
+/// recent end), so capping keeps the last N bytes and discards the head.
+pub const VERDICTS_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub const DIARY_LOG_MAX_BYTES: u64 = 1024 * 1024;
+pub const SESSION_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Best-effort cap on an append-only log: if `path` exceeds `max_bytes`, rewrite
+/// it keeping only the last `max_bytes` worth of WHOLE lines. Drops the partial
+/// leading line so a `.jsonl` is never left with a truncated record. Called
+/// right after each append; silent no-op on any IO error (these are
+/// breadcrumbs, never load-bearing) and when the file is already under the cap.
+pub fn cap_log_tail(path: &Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let Ok(contents) = std::fs::read(path) else {
+        return;
+    };
+    let start = contents.len().saturating_sub(max_bytes as usize);
+    let slice = &contents[start..];
+    // Skip the (likely partial) first line so we keep only whole records.
+    let line_start = slice
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let _ = std::fs::write(path, &slice[line_start..]);
+}
+
 pub fn append_session_log(
     path: &Path,
     header: &str,
@@ -373,18 +408,23 @@ pub fn append_session_log(
         .create(true)
         .append(true)
         .open(path)?;
-    file.write_all(section.as_bytes())
+    file.write_all(section.as_bytes())?;
+    cap_log_tail(path, SESSION_LOG_MAX_BYTES);
+    Ok(())
 }
 
 pub fn append_verdict(dir: &Path, rec: &VerdictRecord) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut line = serde_json::to_string(rec).map_err(std::io::Error::other)?;
     line.push('\n');
+    let path = verdicts_path(dir);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(verdicts_path(dir))?;
-    file.write_all(line.as_bytes())
+        .open(&path)?;
+    file.write_all(line.as_bytes())?;
+    cap_log_tail(&path, VERDICTS_LOG_MAX_BYTES);
+    Ok(())
 }
 
 pub fn read_verdicts(dir: &Path) -> Vec<VerdictRecord> {
@@ -520,6 +560,36 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].action, Some(VerdictAction::Continue));
         assert_eq!(back[0].tokens, Some(1234));
+    }
+
+    #[test]
+    fn cap_log_tail_trims_to_whole_lines_under_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("verdicts.jsonl");
+        let mut body = String::new();
+        for i in 0..1000 {
+            body.push_str(&format!("{{\"n\":{i},\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}\n"));
+        }
+        std::fs::write(&path, &body).unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        cap_log_tail(&path, 4096);
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after <= 4096, "capped under max: {after}");
+        assert!(after < before, "file shrank");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // No partial leading line — the first kept line is a whole record.
+        let first = contents.lines().next().unwrap();
+        assert!(
+            first.starts_with('{') && first.ends_with('}'),
+            "no partial leading line: {first:?}"
+        );
+        // The most recent line is always retained.
+        assert!(contents.contains("\"n\":999"));
+
+        // No-op when already under the cap (contents byte-identical).
+        cap_log_tail(&path, 10 * 1024 * 1024);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
     }
 
     #[test]

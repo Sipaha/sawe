@@ -1779,16 +1779,18 @@ impl SolutionAgentStore {
             return;
         };
         let dir = crate::supervisor::supervisor_dir(&root, id);
+        let diary_path = crate::supervisor::diary_path(&dir);
         let line = format!("- {} {note}\n", chrono::Utc::now().to_rfc3339());
         (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&dir)?;
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(crate::supervisor::diary_path(&dir))?;
+                .open(&diary_path)?;
             std::io::Write::write_all(&mut file, line.as_bytes())
         })()
         .log_err();
+        crate::supervisor::cap_log_tail(&diary_path, crate::supervisor::DIARY_LOG_MAX_BYTES);
     }
 
     pub(crate) fn tick_supervisor(&mut self, cx: &mut Context<Self>) {
