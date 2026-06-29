@@ -392,7 +392,6 @@ fn register_tab_actions(
         // which the Project Panel keeps showing once the solution scopes to
         // "all worktrees" (e.g. after removing the last member).
         let project = workspace.project().clone();
-        let worktree_path = member_path.clone();
         crate::delete_confirm_modal::open_delete_confirm(
             workspace,
             title,
@@ -419,7 +418,7 @@ fn register_tab_actions(
                 project.update(cx, |project, cx| {
                     let stale: Vec<_> = project
                         .worktrees(cx)
-                        .filter(|w| w.read(cx).abs_path().starts_with(&worktree_path))
+                        .filter(|w| w.read(cx).abs_path().starts_with(&path_for_rm))
                         .map(|w| w.read(cx).id())
                         .collect();
                     for id in stale {

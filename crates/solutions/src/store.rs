@@ -703,8 +703,16 @@ impl SolutionStore {
         // falls back to "show all worktrees", which keeps the just-removed
         // project's now-empty tree on screen. Repointing emits
         // `ActiveMemberChanged`, which those panels subscribe to, so they
-        // rebuild deterministically onto a surviving project (or clear when the
-        // solution is now empty).
+        // rebuild deterministically onto a surviving project.
+        //
+        // The empty case (no member left) only drops the cache entry without
+        // emitting a member-scoped event — `ActiveMemberChanged` can't encode
+        // "cleared". The desktop `RemoveMember` action covers it by detaching
+        // the removed worktree (the project event rebuilds the panels onto the
+        // EmptySolutionPage). A pure-store removal of the last member with an
+        // open window (e.g. the MCP path) would therefore not actively refresh
+        // member-scoped panels; closing that gap needs a dedicated
+        // cleared-member event handled by every member-scoped panel.
         if self.active_member.get(solution_id) == Some(catalog_id) {
             let next = self
                 .config

@@ -693,13 +693,29 @@ mod tests {
             "first project must become the active member"
         );
         // A second project must not steal the active selection.
-        store
+        let second = store
             .update(cx, |s, cx| s.add_empty_member(&sol_id, "Backend", cx))
             .expect("second add");
         assert_eq!(
             store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
-            Some(first),
+            Some(first.clone()),
             "adding a second project must not change the active member"
+        );
+        // Make a NON-first member active, then add a third. This discriminates
+        // the `contains_key` guard in `seed_active_member_if_unset`: re-seeding
+        // would pick `members.first()` (= the first project), so without the
+        // guard the active member would be reset to `first` here. The assertion
+        // that it stays on `second` only holds because the guard short-circuits.
+        store.update(cx, |s, cx| {
+            s.set_active_member(sol_id.clone(), second.clone(), cx)
+        });
+        store
+            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Infra", cx))
+            .expect("third add");
+        assert_eq!(
+            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
+            Some(second),
+            "adding a project must not reset a non-first active member to the first"
         );
     }
 
