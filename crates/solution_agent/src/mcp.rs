@@ -57,6 +57,7 @@ pub fn register(cx: &mut App) {
     });
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(RestartAgentTool);
+        server.add_tool(ReconnectAgentTool);
     });
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(ResetContextTool);
@@ -3271,6 +3272,76 @@ impl McpServerTool for RestartAgentTool {
             }],
             structured_content: RestartAgentResult {
                 session_id: new_session_id.to_string(),
+            },
+        })
+    }
+}
+
+// =====================================================================
+// solution_agent.reconnect_agent
+// =====================================================================
+
+/// Non-destructively recover a wedged session: respawn its subprocess and
+/// replay the SAME `acp_session_id` from the transcript, keeping the
+/// conversation (entries + claude context). Unlike `restart_agent` this does
+/// not wipe history and keeps the session id/title. Returns the session id.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct ReconnectAgentParams {
+    pub session_id: String,
+}
+
+impl<'de> Deserialize<'de> for ReconnectAgentParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+        }
+        Ok(Self {
+            session_id: Option::<Inner>::deserialize(de)?
+                .unwrap_or_default()
+                .session_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct ReconnectAgentResult {
+    pub session_id: String,
+}
+
+#[derive(Clone)]
+pub struct ReconnectAgentTool;
+
+impl McpServerTool for ReconnectAgentTool {
+    type Input = ReconnectAgentParams;
+    type Output = ReconnectAgentResult;
+    const NAME: &'static str = "solution_agent.reconnect_agent";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+
+        let task = cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| store.reconnect_agent(session_id, cx))
+        });
+        let resumed = task.await?;
+
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: resumed.to_string(),
+            }],
+            structured_content: ReconnectAgentResult {
+                session_id: resumed.to_string(),
             },
         })
     }

@@ -4585,6 +4585,92 @@ impl SolutionAgentStore {
         cx.spawn(async move |_this, _cx: &mut AsyncApp| create_task.await)
     }
 
+    /// Non-destructive recovery for a wedged session (claude subprocess hung
+    /// or dead): force a fresh subprocess and REPLAY the SAME `acp_session_id`
+    /// from its on-disk transcript, keeping the conversation. Unlike
+    /// [`restart_agent`] (mints a fresh, empty session — "v1 does not replay
+    /// history") this preserves both the displayed entries and claude's own
+    /// context (it `--resume`s the jsonl). Unlike [`rotate_context`] (same
+    /// pooled subprocess, fresh empty ACP session) it drops the pool entry so
+    /// the next connection spawns a clean subprocess.
+    ///
+    /// Implementation: transition the live session into exactly the shape of a
+    /// cold-restored tab (live `AcpThread` dropped, `SolutionSessionId` +
+    /// persisted `entries` kept) and hand off to the proven [`resume_session`]
+    /// cold path, which grafts the replayed thread onto the existing entity
+    /// in place (no duplication, no loss). Returns the (unchanged) session id.
+    pub fn reconnect_agent(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SolutionSessionId>> {
+        let Some(session) = self.sessions.get(&session_id).cloned() else {
+            return Task::ready(Err(anyhow!("unknown session {session_id}")));
+        };
+        let project = match session.read(cx).project.clone() {
+            Some(project) => project,
+            None => {
+                return Task::ready(Err(anyhow!(
+                    "session {session_id} has no cached project — reconnect_agent not supported \
+                     for prebuilt/cold sessions (nothing to reconnect)"
+                )));
+            }
+        };
+        // Flush any un-debounced tail so the cold entry set + transcript replay
+        // are complete before we drop the live thread.
+        self.persist_all_rows(session_id, cx);
+        let meta = {
+            let s = session.read(cx);
+            let (preview, total_tokens) = s
+                .acp_thread()
+                .map(|thread| {
+                    let thread = thread.read(cx);
+                    (
+                        extract_preview(thread.entries()),
+                        thread.token_usage().map(|u| u.used_tokens),
+                    )
+                })
+                .unwrap_or((None, None));
+            SolutionSessionMetadata {
+                id: session_id,
+                solution_id: s.solution_id.clone(),
+                agent_id: s.agent_id.clone(),
+                acp_session_id: s.acp_session_id.clone(),
+                title: s.title.clone(),
+                created_at: s.created_at,
+                last_activity_at: s.last_activity_at,
+                preview,
+                total_tokens,
+                context_count: s.context_count,
+                cwd: s.cwd.clone(),
+                parent_session_id: s.parent_session_id,
+                desired_model: s.desired_model.clone(),
+                desired_effort: s.desired_effort.clone(),
+                cached_models: s.cached_models.clone(),
+            }
+        };
+        let pair = (meta.solution_id.clone(), meta.agent_id.clone());
+        // Drop the pooled connection so `resume_session`'s
+        // `get_or_spawn_connection` forces a fresh subprocess — the current one
+        // is wedged. Live co-tenant sessions of the same (solution, agent) keep
+        // their own connection Rc, so this only affects the next spawn (mirrors
+        // `restart_agent`).
+        {
+            let mut pool = self.pool.lock();
+            pool.remove(&pair);
+        }
+        // Cold-ize: drop the wedged thread (releasing its connection Rc so the
+        // hung subprocess can be reaped) and surface a transient "reconnecting…"
+        // status. `set_acp_thread(None)` keeps `entries`, so `resume_session`
+        // sees the cold-session shape and grafts in place.
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Errored(SharedString::from("reconnecting…"));
+            s.set_acp_thread(None, cx);
+        });
+        self.mark_state_changed(session_id, cx);
+        self.resume_session(meta, project, cx)
+    }
+
     /// In-place context rotation: drop the current AcpThread, spawn a
     /// fresh ACP-level session against the SAME pooled connection, and
     /// graft it onto the existing `SolutionSession`. The user-facing
