@@ -75,6 +75,126 @@ fn close_session_removes_from_indices(cx: &mut TestAppContext) {
     });
 }
 
+/// Regression: a long-running supervised session that is closed must drop ALL
+/// of its per-session in-memory state, not just the session entity + indices.
+/// Before this, `close_session` left `supervisor_states`, the background-agent /
+/// shell watcher tasks, the backoff timer, the parent-jsonl scan cursor, and any
+/// in-flight judge/auditor handle behind — each accumulating for the editor's
+/// whole lifetime over thousands of open/close cycles (and an orphaned judge
+/// handle never released its pooled `claude` subprocess).
+#[gpui::test]
+fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sol = SolutionId("sol-a".into());
+            let agent = SharedString::from("claude-acp");
+            let id = SolutionSessionId::new();
+            insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+
+            // Populate every per-session runtime map for `id`.
+            store
+                .supervisor_states
+                .insert(id, crate::supervisor::SupervisorState::new(id));
+            store.background_agent_watchers.insert(id, Task::ready(()));
+            store.background_shell_watchers.insert(id, Task::ready(()));
+            store.backoff_timers.insert(id, Task::ready(()));
+            store.parent_jsonl_scan_offsets.insert(id, 0);
+            // A judge whose create has not resolved (judge_id None) — finish_judge
+            // must still drop the handle (no child session to close).
+            store.judge_sessions.insert(
+                id,
+                JudgeHandle {
+                    judge_id: None,
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+            store.auditor_sessions.insert(
+                id,
+                JudgeHandle {
+                    judge_id: None,
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+
+            store.close_session(id, cx).expect("close_session");
+
+            assert!(store.session(id).is_none());
+            assert!(!store.supervisor_states.contains_key(&id), "supervisor_states leaked");
+            assert!(
+                !store.background_agent_watchers.contains_key(&id),
+                "background_agent_watchers leaked"
+            );
+            assert!(
+                !store.background_shell_watchers.contains_key(&id),
+                "background_shell_watchers leaked"
+            );
+            assert!(!store.backoff_timers.contains_key(&id), "backoff_timers leaked");
+            assert!(
+                !store.parent_jsonl_scan_offsets.contains_key(&id),
+                "parent_jsonl_scan_offsets leaked"
+            );
+            assert!(!store.judge_sessions.contains_key(&id), "judge_sessions leaked");
+            assert!(!store.auditor_sessions.contains_key(&id), "auditor_sessions leaked");
+        });
+    });
+}
+
+/// `cold_close_solution` bypasses `close_session` (it drops live entities
+/// without soft-closing the persisted sessions), so it must prune the same
+/// per-session runtime maps itself or they leak when a solution's window closes.
+#[gpui::test]
+fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sol = SolutionId("sol-a".into());
+            let agent = SharedString::from("claude-acp");
+            let id = SolutionSessionId::new();
+            insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+
+            store
+                .supervisor_states
+                .insert(id, crate::supervisor::SupervisorState::new(id));
+            store.background_agent_watchers.insert(id, Task::ready(()));
+            store.background_shell_watchers.insert(id, Task::ready(()));
+            store.backoff_timers.insert(id, Task::ready(()));
+            store.parent_jsonl_scan_offsets.insert(id, 0);
+            store.judge_sessions.insert(
+                id,
+                JudgeHandle {
+                    judge_id: None,
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+
+            store.cold_close_solution(&sol, cx);
+
+            assert!(store.session(id).is_none());
+            assert!(!store.supervisor_states.contains_key(&id), "supervisor_states leaked");
+            assert!(
+                !store.background_agent_watchers.contains_key(&id),
+                "background_agent_watchers leaked"
+            );
+            assert!(
+                !store.background_shell_watchers.contains_key(&id),
+                "background_shell_watchers leaked"
+            );
+            assert!(!store.backoff_timers.contains_key(&id), "backoff_timers leaked");
+            assert!(!store.judge_sessions.contains_key(&id), "judge_sessions leaked");
+        });
+    });
+}
+
 #[gpui::test]
 fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());

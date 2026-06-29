@@ -1224,6 +1224,26 @@ impl SolutionAgentStore {
         }
     }
 
+    /// Drop all per-session in-memory runtime maps for `id`: supervisor control
+    /// state, the background-agent / background-shell watcher tasks, the
+    /// transient-failure backoff timer, the parent-jsonl scan cursor, and the
+    /// per-entry update throttles. Shared by every session-teardown path
+    /// (`close_session`, `cold_close_solution`, `gc_orphan_solutions`) so none of
+    /// these maps accumulates stale entries over a long-lived editor process —
+    /// each was previously only pruned on its own narrow path (or, for
+    /// `supervisor_states`, never), leaking one entry per closed session.
+    /// Does NOT touch the DB, emit events, release the pool, or reap an in-flight
+    /// judge/auditor — callers handle those (`finish_judge`/`finish_auditor` must
+    /// run separately while the supervised session is still reachable).
+    fn evict_session_runtime_maps(&mut self, id: SolutionSessionId) {
+        self.supervisor_states.remove(&id);
+        self.background_agent_watchers.remove(&id);
+        self.background_shell_watchers.remove(&id);
+        self.backoff_timers.remove(&id);
+        self.parent_jsonl_scan_offsets.remove(&id);
+        self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
+    }
+
     /// Record the meta-auditor's verdict for supervised session `id`, tear down
     /// the auditor session, and act on the result. Appends an `Audit`-kind
     /// `VerdictRecord` (carrying `audit_ok`) to `verdicts.jsonl`; when the audit
@@ -4129,6 +4149,17 @@ impl SolutionAgentStore {
     }
 
     pub fn close_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) -> Result<()> {
+        // Reap any in-flight ephemeral judge/auditor for this supervised session
+        // FIRST, while it is still reachable. Each closes its own hidden child
+        // session (releasing that child's pooled `claude` subprocess + refcount);
+        // skipping this strands the judge/auditor session open forever — its pool
+        // refcount is never released, so its subprocess never hits the idle
+        // shutdown debounce and lingers for the editor's whole lifetime (this is
+        // the dozens-of-orphaned-`claude`-processes leak on a long supervised run).
+        // No-ops when `id` has no live judge/auditor (incl. when `id` is itself an
+        // ephemeral child — those are never keys in these maps).
+        self.finish_judge(id, cx);
+        self.finish_auditor(id, cx);
         // Flush the latest transcript and stop any in-flight turn while the
         // session is still live in `self.sessions`. The flush guarantees a
         // later "Reopen Closed Chat" restores the full conversation; the
@@ -4181,11 +4212,13 @@ impl SolutionAgentStore {
         if let Some(list) = self.by_solution.get_mut(&solution_id) {
             list.retain(|sid| *sid != id);
         }
-        // Drop any per-entry update throttles for the closed session;
-        // each holds a live debounce `Task`, so leaving them would leak
-        // for the process lifetime (the throttle is only otherwise
-        // removed when its own timer fires against a still-open session).
-        self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
+        // Drop ALL per-session runtime maps for the closed session (entry
+        // throttles, supervisor state, background watchers, backoff timer,
+        // parent-jsonl cursor) — each holds a live `Task` and/or grows one
+        // entry per closed session, so leaving them leaks for the process
+        // lifetime (the throttle/watcher maps are otherwise only pruned on
+        // their own narrow paths, and `supervisor_states` was never pruned).
+        self.evict_session_runtime_maps(id);
         // Soft-close: keep the persisted blob so downstream tooling
         // (MCP read_session_history, future "View archived sessions"
         // UI, etc.) can still read the transcript. Hard-delete only
@@ -7170,10 +7203,18 @@ impl SolutionAgentStore {
         for id in &session_ids {
             self.persist_all_rows(*id, cx);
         }
+        // Reap each session's in-flight judge/auditor (closes their hidden child
+        // sessions) and drop ALL per-session runtime maps — this path bypasses
+        // `close_session`, so without it the supervisor state / watcher tasks /
+        // judge handles for every session in a closed-window solution leak.
+        for id in &session_ids {
+            self.finish_judge(*id, cx);
+            self.finish_auditor(*id, cx);
+        }
         self.by_solution.remove(solution_id);
         for id in &session_ids {
             self.sessions.remove(id);
-            self.entry_update_throttles.retain(|(sid, _), _| sid != id);
+            self.evict_session_runtime_maps(*id);
         }
         // Drop the pool's connection handle(s) for this solution. Together
         // with the session eviction above (whose entities release their own
@@ -7244,12 +7285,35 @@ impl SolutionAgentStore {
             .collect();
         for sid in orphan_ids {
             if let Some(session_ids) = self.by_solution.remove(&sid) {
+                // Reap each session's in-flight judge/auditor while it is still
+                // reachable (closes their hidden child sessions + releases those
+                // children's pooled subprocesses).
+                for session_id in &session_ids {
+                    self.finish_judge(*session_id, cx);
+                    self.finish_auditor(*session_id, cx);
+                }
                 for session_id in session_ids {
                     self.sessions.remove(&session_id);
+                    // Drop ALL per-session runtime maps — this path bypasses
+                    // `close_session`, so it must prune supervisor state /
+                    // watcher tasks / backoff timers itself or they leak.
+                    self.evict_session_runtime_maps(session_id);
                     if let Some(db) = &self.persistence {
                         db.delete(session_id).detach_and_log_err(cx);
                     }
                     cx.emit(SolutionAgentStoreEvent::SessionClosed(session_id));
+                }
+            }
+            // Release the pool connection(s) for the orphaned solution so its
+            // `claude` subprocess(es) exit now — gc previously left them running.
+            let keys: Vec<(SolutionId, AgentServerId)> = {
+                let pool = self.pool.lock();
+                pool.keys_for_solution(&sid).collect()
+            };
+            if !keys.is_empty() {
+                let mut pool = self.pool.lock();
+                for key in &keys {
+                    pool.remove(key);
                 }
             }
             if let Some(db) = &self.persistence {
