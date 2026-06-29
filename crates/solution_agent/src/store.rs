@@ -765,12 +765,20 @@ pub(crate) fn project_name_for_cwd(
     }
     let member = solution.members.iter().find(|m| m.local_path == cwd)?;
     let store = SolutionStore::try_global(cx)?;
-    store.read_with(cx, |s, _| {
+    // Prefer the catalog display name; fall back to the member's slug
+    // (catalog id) for empty members that have no catalog entry, matching
+    // how the project tab strip labels the same member. The member matched
+    // a real project folder, so it must get a project name — never fall
+    // through to the solution name here.
+    let catalog_name = store.read_with(cx, |s, _| {
         s.catalog()
             .iter()
             .find(|c| c.id == member.catalog_id)
-            .map(|c| SharedString::from(c.name.clone()))
-    })
+            .map(|c| c.name.clone())
+    });
+    Some(SharedString::from(
+        catalog_name.unwrap_or_else(|| member.catalog_id.0.clone()),
+    ))
 }
 
 /// Pick a tab title that doesn't collide with any existing session in

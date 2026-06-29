@@ -281,6 +281,12 @@ impl SolutionStore {
                             store
                                 .in_flight_adds
                                 .remove(&(solution_id.clone(), catalog_id.clone()));
+                            // First project in the solution → make it the
+                            // active member so panels and new AI sessions
+                            // scope to it instead of the solution root. No-op
+                            // when a member is already active. See the matching
+                            // note in `add_empty_member`.
+                            store.seed_active_member_if_unset(&solution_id, cx);
                             cx.emit(SolutionStoreEvent::MemberAddCompleted {
                                 solution: solution_id.clone(),
                                 catalog: catalog_id.clone(),
@@ -363,6 +369,14 @@ impl SolutionStore {
         let new_member = sol.members.last().expect("just pushed").clone();
         self.db_set_member(solution_id, &new_member, position)
             .log_err();
+        // Seed the solution-wide active member when this is the first
+        // project, so panels and newly-started AI / terminal sessions scope
+        // to it immediately. Without this, `active_member` stays `None` until
+        // the project tab strip happens to render and seed it — and a session
+        // started before that lands in the solution root ("ROOT") instead of
+        // the project. `set_active_member` no-ops if one is already set, so
+        // adding a second project never steals the active selection.
+        self.seed_active_member_if_unset(solution_id, cx);
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
         Ok(cat_id)
@@ -650,6 +664,42 @@ mod tests {
         assert!(
             member_path.join(".git").exists(),
             "empty member must be git-initialised (no remote)"
+        );
+    }
+
+    #[gpui::test]
+    async fn add_empty_member_seeds_active_member(cx: &mut TestAppContext) {
+        use std::fs;
+        let dir = tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("solutions.json");
+        let solutions_root = dir.path().join("solutions");
+        fs::create_dir_all(&solutions_root).expect("mkdir solutions");
+
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+        let sol_id = store
+            .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
+            .expect("create solution");
+        assert_eq!(
+            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
+            None,
+            "no active member before any project"
+        );
+        let first = store
+            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Frontend", cx))
+            .expect("first add");
+        assert_eq!(
+            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
+            Some(first.clone()),
+            "first project must become the active member"
+        );
+        // A second project must not steal the active selection.
+        store
+            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Backend", cx))
+            .expect("second add");
+        assert_eq!(
+            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
+            Some(first),
+            "adding a second project must not change the active member"
         );
     }
 

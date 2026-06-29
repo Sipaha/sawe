@@ -312,6 +312,32 @@ impl SolutionStore {
         Some(first)
     }
 
+    /// Seed the solution-wide active member to the first member when none is
+    /// recorded yet. No-op if an active member is already set or the solution
+    /// has no members. Called from the member-add paths so the active member
+    /// is valid the instant a solution gains its first project — panels and
+    /// new AI / terminal sessions depend on it to scope to the project rather
+    /// than falling back to the solution root.
+    pub(crate) fn seed_active_member_if_unset(
+        &mut self,
+        solution: &SolutionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_member.contains_key(solution) {
+            return;
+        }
+        let first = self
+            .config
+            .solutions
+            .iter()
+            .find(|s| &s.id == solution)
+            .and_then(|s| s.members.first())
+            .map(|m| m.catalog_id.clone());
+        if let Some(first) = first {
+            self.set_active_member(solution.clone(), first, cx);
+        }
+    }
+
     /// Resolve the active catalog member for `solution` to the matching
     /// worktree in `project`, using prefix matching on `member.local_path`.
     /// Returns `None` if no active member is set, the member is not found

@@ -1296,7 +1296,13 @@ impl ConsolePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.add_chat_tab_with_cwd(solution_id, None, window, cx);
+        // Scope the new chat to the active project's folder, exactly like the
+        // "+" → "New AI Chat" menu entry. Passing `None` here would default
+        // the session cwd to the solution root, so the keyboard `NewChat`
+        // action (and any other caller of this convenience wrapper) would land
+        // the agent in "ROOT" instead of the selected project.
+        let cwd = active_member_path(&solution_id, cx);
+        self.add_chat_tab_with_cwd(solution_id, cwd, window, cx);
     }
 
     pub fn add_chat_tab_with_cwd(
