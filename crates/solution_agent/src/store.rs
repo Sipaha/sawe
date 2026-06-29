@@ -1242,6 +1242,10 @@ impl SolutionAgentStore {
         self.backoff_timers.remove(&id);
         self.parent_jsonl_scan_offsets.remove(&id);
         self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
+        // The metrics throttle map is keyed by session id and is otherwise
+        // never pruned — one entry would leak per closed session for the
+        // editor's whole lifetime.
+        self.metrics_emitter.clear_session(&id);
     }
 
     /// Record the meta-auditor's verdict for supervised session `id`, tear down

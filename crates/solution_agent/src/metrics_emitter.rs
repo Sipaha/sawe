@@ -49,6 +49,15 @@ impl MetricsEmitter {
         last.insert(*session_id, now);
         editor_mcp::emit_notification(cx, "workspace.session_metrics_changed", payload);
     }
+
+    /// Drop the throttle bookkeeping for a closed session. Without this the
+    /// `last_emit` map keeps one `(SolutionSessionId, Instant)` entry per
+    /// session FOREVER — a slow but unbounded leak over the editor's lifetime
+    /// as sessions open and close across a multi-day run. Called from
+    /// `SolutionAgentStore::evict_session_runtime_maps`.
+    pub fn clear_session(&self, session_id: &SolutionSessionId) {
+        self.last_emit.lock().remove(session_id);
+    }
 }
 
 #[cfg(test)]
