@@ -647,12 +647,12 @@ fn close_solution_workspaces_in(
     use util::ResultExt as _;
 
     // Snapshot every workspace's project-group key alongside the
-    // workspace itself. We close via `remove_project_group` (instead of
-    // `close_workspace`) so the lingering group entry doesn't survive
-    // the close — `remove_workspace`'s fallback walks neighbouring
-    // groups and cheerfully respawns a workspace from the previously-
-    // closed solution's path list, leaving the user with a "ghost" tab
-    // for a solution they explicitly closed seconds ago.
+    // workspace itself. For a workspace that still has worktrees we close
+    // via `remove_project_group` (instead of `close_workspace`) so the
+    // lingering group entry doesn't survive the close — `remove_workspace`'s
+    // fallback walks neighbouring groups and cheerfully respawns a workspace
+    // from the previously-closed solution's path list, leaving the user with
+    // a "ghost" tab for a solution they explicitly closed seconds ago.
     let to_close: Vec<_> = mw
         .workspaces()
         .filter(|ws| crate::open::workspace_has_solution(ws, sol_id, cx))
@@ -663,7 +663,26 @@ fn close_solution_workspaces_in(
     }
     let close_tasks: Vec<_> = to_close
         .into_iter()
-        .map(|(group_key, _)| mw.remove_project_group(&group_key, window, cx))
+        .map(|(group_key, ws)| {
+            if group_key.path_list().paths().is_empty() {
+                // A worktree-less workspace carries the shared empty/default
+                // `ProjectGroupKey`. `remove_project_group(empty)` matches by
+                // key and `workspaces_for_project_group(empty)` returns EVERY
+                // worktree-less workspace in the window — so it would also
+                // close any *other* empty solution's tab (the "closed one
+                // solution and a neighbour closed too" bug). There is also no
+                // project-group entry for an empty key, so the ghost-respawn
+                // concern that motivates `remove_project_group` doesn't apply.
+                // Close just this workspace.
+                mw.close_workspace(&ws, window, cx)
+            } else {
+                // Non-empty keys are unique per solution (each member lives
+                // under its own solution root / git identity), so removing the
+                // whole group only closes this solution's workspaces while
+                // clearing the lingering group entry.
+                mw.remove_project_group(&group_key, window, cx)
+            }
+        })
         .collect();
     // Spawn one coordinator that awaits every close before checking
     // whether this window still hosts any solution. Awaiting
