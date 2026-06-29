@@ -7548,6 +7548,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         last_fired_at: None,
         next_eligible_ms: None,
         status: crate::supervisor::SupervisorStatus::Watching,
+        trigger_count: 0,
         last_user_input_ms: None,
     };
     db.save_supervisor_state(state.clone())
@@ -7725,6 +7726,37 @@ async fn typing_defers_supervisor_tick(cx: &mut gpui::TestAppContext) {
         crate::supervisor::SupervisorStatus::Judging,
         "with no recent typing the idle, silent session fires a judge"
     );
+}
+
+/// The status-icon firing counter: `trigger_count` increments each time the
+/// supervisor fires a judge and resets to 0 on every enable/disable toggle.
+#[gpui::test]
+async fn trigger_count_increments_on_fire_and_resets_on_toggle(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.set_supervision_enabled(id, true, cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.trigger_count, 0, "a fresh enable starts the counter at 0");
+
+    // One fire → count 1.
+    store.update(cx, |store, cx| store.tick_supervisor(cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.trigger_count, 1, "firing a judge increments the counter");
+
+    // Toggle off then on → counter cleared both times.
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, false, cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.trigger_count, 0, "disabling clears the counter");
+
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.trigger_count, 0, "re-enabling keeps the counter at 0");
 }
 
 #[gpui::test]

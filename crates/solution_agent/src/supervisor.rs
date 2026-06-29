@@ -180,6 +180,12 @@ pub struct SupervisorState {
     /// gates firing on `now_ms >= next_eligible_ms.unwrap_or(0)`.
     pub next_eligible_ms: Option<i64>,
     pub status: SupervisorStatus,
+    /// How many times the supervisor has fired (spawned a judge) since it was
+    /// last (re)enabled. Surfaced next to the status-row Eye icon as an
+    /// at-a-glance "how active has the observer been" counter. Reset to 0 on
+    /// every enable/disable toggle (`set_supervision_enabled`). Persisted with
+    /// the rest of the supervisor row so it survives a restart.
+    pub trigger_count: u32,
     /// Epoch-millis of the last time the human typed into this session's compose
     /// box. TRANSIENT (not persisted): the watchdog treats the session as "still
     /// active" until `IDLE_THRESHOLD_SECS` after the last keystroke, so the
@@ -199,6 +205,7 @@ impl SupervisorState {
             last_fired_at: None,
             next_eligible_ms: None,
             status: SupervisorStatus::Disabled,
+            trigger_count: 0,
             last_user_input_ms: None,
         }
     }

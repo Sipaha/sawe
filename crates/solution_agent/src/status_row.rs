@@ -6,7 +6,9 @@ use gpui::{
     Context, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 use ui::prelude::*;
-use ui::{CommonAnimationExt, ContextMenu, IconName, Label, LabelSize, PopoverMenu};
+use ui::{
+    CommonAnimationExt, ContextMenu, IconName, Label, LabelSize, PopoverMenu, right_click_menu,
+};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -960,38 +962,65 @@ pub(crate) fn render_status_row(
                 let held = sup
                     .as_ref()
                     .is_some_and(|s| matches!(s.status, crate::supervisor::SupervisorStatus::Held));
+                let trigger_count = sup.as_ref().map(|s| s.trigger_count).unwrap_or(0);
                 let (icon, icon_color, tooltip_text): (IconName, Color, SharedString) = if !enabled {
-                    (IconName::Eye, Color::Muted, "Enable chat supervisor".into())
+                    (
+                        IconName::Eye,
+                        Color::Muted,
+                        "Click to enable supervisor · right-click for settings".into(),
+                    )
                 } else if held {
                     // Standing by after a manual stop / a "done" verdict: won't
                     // re-engage until the user sends the next message.
                     (
                         IconName::Clock,
                         Color::Warning,
-                        "Supervisor on hold — your next message resumes it".into(),
+                        "Supervisor on hold — your next message resumes it · click to disable · right-click for settings".into(),
                     )
                 } else {
-                    (IconName::Eye, Color::Accent, "Supervisor on — click for menu".into())
+                    (
+                        IconName::Eye,
+                        Color::Accent,
+                        "Supervisor on · click to disable · right-click for settings".into(),
+                    )
                 };
-                let trigger = ui::IconButton::new("solution-status-supervisor", icon)
+                let workspace = view.workspace_handle().clone();
+                // Left-click toggles supervision; right-click opens the settings
+                // popover. Wrapping the IconButton in `right_click_menu` keeps the
+                // button's own `on_click` (left) working while the secondary
+                // button deploys the menu.
+                let icon_button = ui::IconButton::new("solution-status-supervisor", icon)
                     .icon_size(IconSize::Small)
                     .icon_color(icon_color)
-                    .tooltip(ui::Tooltip::text(tooltip_text));
-                let workspace = view.workspace_handle().clone();
+                    .tooltip(ui::Tooltip::text(tooltip_text))
+                    .on_click(move |_, _window, cx| {
+                        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                            store.set_supervision_enabled(session_id, !enabled, cx);
+                        });
+                    });
+                let trigger_cell = std::cell::RefCell::new(Some(icon_button.into_any_element()));
                 this.child(Label::new("·").color(Color::Muted).size(LabelSize::Small))
                     .child(
-                        PopoverMenu::new("solution-status-supervisor-menu")
-                            .trigger(trigger)
-                            .menu(move |window, cx| {
-                                Some(supervisor_popover_menu(
-                                    session_id,
-                                    workspace.clone(),
-                                    window,
-                                    cx,
-                                ))
+                        right_click_menu("solution-status-supervisor-menu")
+                            .trigger(move |_, _, _| {
+                                trigger_cell
+                                    .borrow_mut()
+                                    .take()
+                                    .unwrap_or_else(|| div().into_any_element())
                             })
-                            .anchor(gpui::Anchor::TopRight),
+                            .menu(move |window, cx| {
+                                supervisor_popover_menu(session_id, workspace.clone(), window, cx)
+                            })
+                            .into_any_element(),
                     )
+                    // When enabled, show the firing counter just right of the icon.
+                    .when(enabled, |this| {
+                        this.child(
+                            Label::new(trigger_count.to_string())
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                        )
+                    })
             })
             .into_any_element(),
     )

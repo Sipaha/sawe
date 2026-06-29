@@ -271,6 +271,14 @@ impl SolutionAgentDb {
             "next_eligible_ms INTEGER",
         );
 
+        // Count of supervisor firings since last (re)enable, surfaced next to
+        // the status-row icon. Defaults 0 for pre-existing rows.
+        apply_idempotent_add_column_to(
+            &connection,
+            "supervisor_state",
+            "trigger_count INTEGER NOT NULL DEFAULT 0",
+        );
+
         Ok(Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
@@ -496,12 +504,13 @@ impl SolutionAgentDb {
                 Option<i64>,
                 String,
                 Option<i64>,
+                i64,
             )>(indoc! {"
                 INSERT INTO supervisor_state (
                     session_id, enabled, custom_prompt, consecutive_continues,
-                    backoff_attempt, last_fired_at, status, next_eligible_ms
+                    backoff_attempt, last_fired_at, status, next_eligible_ms, trigger_count
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT(session_id) DO UPDATE SET
                     enabled               = excluded.enabled,
                     custom_prompt         = excluded.custom_prompt,
@@ -509,7 +518,8 @@ impl SolutionAgentDb {
                     backoff_attempt       = excluded.backoff_attempt,
                     last_fired_at         = excluded.last_fired_at,
                     status                = excluded.status,
-                    next_eligible_ms      = excluded.next_eligible_ms
+                    next_eligible_ms      = excluded.next_eligible_ms,
+                    trigger_count         = excluded.trigger_count
             "})?;
             insert((
                 state.session_id.to_string(),
@@ -520,6 +530,7 @@ impl SolutionAgentDb {
                 state.last_fired_at,
                 state.status.to_db_string(),
                 state.next_eligible_ms,
+                state.trigger_count as i64,
             ))?;
             Ok(())
         })
@@ -540,15 +551,25 @@ impl SolutionAgentDb {
                 Option<i64>,
                 String,
                 Option<i64>,
+                i64,
             )>(indoc! {"
                 SELECT session_id, enabled, custom_prompt, consecutive_continues,
-                       backoff_attempt, last_fired_at, status, next_eligible_ms
+                       backoff_attempt, last_fired_at, status, next_eligible_ms, trigger_count
                 FROM supervisor_state
             "})?;
             let rows = select()?;
             let mut out = Vec::with_capacity(rows.len());
-            for (session_id, enabled, custom_prompt, cont, backoff, last_fired, status, next_eligible) in
-                rows
+            for (
+                session_id,
+                enabled,
+                custom_prompt,
+                cont,
+                backoff,
+                last_fired,
+                status,
+                next_eligible,
+                trigger_count,
+            ) in rows
             {
                 let session_id = crate::model::SolutionSessionId::parse(&session_id)
                     .map_err(|e| anyhow!("invalid session id in supervisor_state: {e}"))?;
@@ -561,6 +582,7 @@ impl SolutionAgentDb {
                     last_fired_at: last_fired,
                     next_eligible_ms: next_eligible,
                     status: crate::supervisor::SupervisorStatus::parse_db_string(&status),
+                    trigger_count: trigger_count.max(0) as u32,
                     // Transient (not persisted): a cold-loaded session has no
                     // in-flight draft to protect from a supervisor nudge.
                     last_user_input_ms: None,

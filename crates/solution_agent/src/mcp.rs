@@ -4703,6 +4703,9 @@ pub struct GetSupervisorStateResult {
     /// `SupervisorStatus::to_db_string()` value.
     pub status: String,
     pub consecutive_continues: u32,
+    /// Times the supervisor has fired since last (re)enabled — the at-a-glance
+    /// activity counter shown next to the status icon. Reset on every toggle.
+    pub trigger_count: u32,
     /// Ceiling enforced by the supervisor before it escalates to the user.
     pub max_continues: u32,
     pub custom_prompt: Option<String>,
@@ -4758,6 +4761,7 @@ impl McpServerTool for GetSupervisorStateTool {
                     enabled: state.enabled,
                     status: state.status.to_db_string(),
                     consecutive_continues: state.consecutive_continues,
+                    trigger_count: state.trigger_count,
                     max_continues: crate::supervisor::MAX_CONSECUTIVE_CONTINUES,
                     custom_prompt: state.custom_prompt,
                     verdicts_total: stats.total,
@@ -4778,6 +4782,7 @@ impl McpServerTool for GetSupervisorStateTool {
                     enabled: false,
                     status: crate::supervisor::SupervisorStatus::Disabled.to_db_string(),
                     consecutive_continues: 0,
+                    trigger_count: 0,
                     max_continues: crate::supervisor::MAX_CONSECUTIVE_CONTINUES,
                     custom_prompt: None,
                     verdicts_total: 0,

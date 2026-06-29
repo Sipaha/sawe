@@ -907,6 +907,10 @@ impl SolutionAgentStore {
             return;
         }
         state.enabled = enabled;
+        // Every enable/disable toggle clears the activity counters (fire count +
+        // consecutive-continue cap) — a fresh on/off starts the tally over.
+        state.trigger_count = 0;
+        state.consecutive_continues = 0;
         if enabled {
             state.status = crate::supervisor::SupervisorStatus::Watching;
             state.consecutive_continues = 0;
@@ -1852,6 +1856,9 @@ impl SolutionAgentStore {
                 if let Some(st) = self.supervisor_states.get_mut(&id) {
                     st.status = crate::supervisor::SupervisorStatus::Judging;
                     st.last_fired_at = Some(now_ms);
+                    // One more supervisor firing — surfaced next to the status
+                    // icon. Reset on enable/disable toggle.
+                    st.trigger_count = st.trigger_count.saturating_add(1);
                     // We've consumed the backoff window; clear the gate so a stale
                     // value can't block a later eligible fire.
                     st.next_eligible_ms = None;
