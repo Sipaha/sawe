@@ -78,6 +78,36 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
              whatever you need\" or blanket up-front permission does not \
              count — confirm each out-of-scope action.\n",
         );
+        buf.push_str(
+            "\nHow to work (standing rules for this session):\n\
+             - Quality over speed. Do the task correctly and robustly, not just \
+             fast enough to pass; settle for a lesser solution only after you have \
+             genuinely exhausted the viable approaches.\n\
+             - Finish the whole task. Partial completion is not done — if any part \
+             of the goal remains, keep going instead of stopping at a fraction. But \
+             don't gold-plate: do what was asked well, don't invent extra scope.\n\
+             - Prefer sub-agents. When a piece of work could be done by sub-agents \
+             OR inline in this session, default to dispatching sub-agents — they \
+             parallelise independent work, isolate failures, and keep this session's \
+             context clean. Keep inline only what is trivial or inseparable from the \
+             main thread.\n\
+             - Verify before you claim done. Run the real checks — tests (show the \
+             output), a clean build, and for any user-visible UI an actual \
+             screenshot — and watch for regressions in adjacent behaviour. \"It \
+             should work\" is not done.\n\
+             - Test your own work. If you lack a tool to verify something, BUILD that \
+             tooling yourself (within this solution) and test with it — don't ask the \
+             human to test manually until you have exhausted self-verification.\n\
+             - Keep docs current. When you finish, update the project's docs to match \
+             reality: record new decisions, findings, and changed behaviour, capture \
+             decisions the user made during the task, and DELETE stale or wrong info \
+             rather than leaving it (skip if the project has no docs).\n\
+             - Don't idle on a blocker. Before asking the human a question, check \
+             whether the project docs already answer it. If you are genuinely blocked \
+             on something only the human can resolve, first record the blocker durably \
+             in the project docs, then switch to other independent work that doesn't \
+             need the human — don't sit waiting.\n",
+        );
         buf
     }
 }
@@ -122,6 +152,18 @@ mod tests {
         assert!(prompt.contains("solutions.add_member"));
         assert!(prompt.contains("solutions.add_empty_member"));
         assert!(prompt.contains("\"solution_id\": \"sol-x\""));
+    }
+
+    #[test]
+    fn prompt_includes_working_principles() {
+        let prompt = ClaudeAcpAdapter.build_initial_system_prompt(&solution(vec!["m"]));
+        assert!(prompt.contains("Quality over speed"));
+        assert!(prompt.contains("Partial completion is not done"));
+        assert!(prompt.contains("Prefer sub-agents"));
+        assert!(prompt.contains("Verify before you claim done"));
+        assert!(prompt.contains("Test your own work"));
+        assert!(prompt.contains("Keep docs current"));
+        assert!(prompt.contains("Don't idle on a blocker"));
     }
 
     #[test]
