@@ -612,6 +612,17 @@ pub fn global_gitignore_path() -> Option<PathBuf> {
 mod rebrand_tests {
     use super::*;
 
+    // The `zed` check looks only at the app-controlled portion of the path:
+    // under `cfg(test)`/`test-support`, `home_dir()` is hard-coded to
+    // `/home/zed`, so the home prefix would otherwise trip the assertion on a
+    // segment the rebrand doesn't own. Strip it first.
+    fn app_relative_lossy(p: &std::path::Path) -> String {
+        p.strip_prefix(home_dir())
+            .unwrap_or(p)
+            .to_string_lossy()
+            .to_ascii_lowercase()
+    }
+
     #[test]
     fn config_dir_contains_sawe() {
         let p = config_dir();
@@ -620,7 +631,7 @@ mod rebrand_tests {
             "config_dir should mention sawe; got {p:?}"
         );
         assert!(
-            !p.to_string_lossy().to_ascii_lowercase().contains("zed"),
+            !app_relative_lossy(p).contains("zed"),
             "config_dir must not mention zed; got {p:?}"
         );
     }
@@ -633,7 +644,7 @@ mod rebrand_tests {
             "data_dir should mention sawe; got {p:?}"
         );
         assert!(
-            !p.to_string_lossy().to_ascii_lowercase().contains("zed"),
+            !app_relative_lossy(p).contains("zed"),
             "data_dir must not mention zed; got {p:?}"
         );
     }

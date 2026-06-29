@@ -193,11 +193,14 @@ mod tests {
             "tilde was not expanded: {}",
             s.root.display()
         );
-        // Root is `~/sawe/solutions` in release and
-        // `~/sawe-dev/solutions` in debug. Either way the last
-        // segment is `solutions` and the parent matches the active
-        // base directory name.
-        assert!(s.root.ends_with("solutions"));
+        // Root is `<base_dir>/ss` (`~/.spk/sawe/ss` release,
+        // `~/.spk/sawe-dev/ss` debug) — see `default_root`. The last
+        // segment is the terse `ss` ("solutions"), not the full word.
+        assert!(
+            s.root.ends_with("ss"),
+            "root should end with the `ss` segment: {}",
+            s.root.display()
+        );
     }
 
     #[test]
