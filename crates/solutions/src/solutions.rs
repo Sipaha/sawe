@@ -6,7 +6,6 @@ mod auto_trust;
 pub mod branch_protection;
 mod cache;
 pub mod db;
-mod dock_snapshot;
 mod event_sources;
 pub mod git;
 pub mod mcp;
@@ -20,7 +19,6 @@ mod tabs_snapshot;
 
 pub use add_member::{AddProgressCallback, PendingAddView};
 pub use cache::{default_cache_root, refresh_cache};
-pub use dock_snapshot::{DockSideSnapshot, DockSnapshots, SolutionDockSnapshot};
 pub use event_sources::install as install_event_sources_for_test;
 pub use model::{CatalogId, CatalogProject, Solution, SolutionId, SolutionMember};
 pub use settings::{BranchProtectionMember, BranchProtectionSettings, SolutionsSettings};

@@ -354,6 +354,32 @@ pub struct PanelSizeState {
     pub flex: Option<f32>,
 }
 
+/// A window's dock layout (open/closed, active panel, active-panel size per
+/// side), captured from one `Workspace` and re-applied to another so the
+/// layout stays unified across Solution switches. The fork keeps one
+/// retained `Workspace` per Solution, each with its own `Dock` entities;
+/// without propagating this on `MultiWorkspace::activate` the layout would
+/// drift independently per Solution.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DockLayout {
+    pub left: DockSideLayout,
+    pub right: DockSideLayout,
+    pub bottom: DockSideLayout,
+}
+
+/// Per-side piece of a [`DockLayout`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DockSideLayout {
+    pub is_open: bool,
+    /// Index of the active panel within the dock. Panel registration order
+    /// is deterministic and identical across every `Workspace` in the
+    /// process, so the index maps back to the same panel type on apply.
+    pub active_panel_index: Option<usize>,
+    /// Size of the active panel at capture time; `None` leaves the target
+    /// side's current size untouched (dock closed / no active panel).
+    pub size: Option<PanelSizeState>,
+}
+
 struct PanelEntry {
     panel: Arc<dyn PanelHandle>,
     size_state: PanelSizeState,

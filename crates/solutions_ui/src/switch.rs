@@ -25,11 +25,8 @@ use context_server::types::ToolResponseContent;
 use gpui::{App, AsyncApp, Entity, Task, WeakEntity, Window};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use solutions::{
-    DockSideSnapshot, SolutionDockSnapshot, SolutionId, SolutionStore, SolutionTabsSnapshot,
-};
+use solutions::{SolutionId, SolutionStore, SolutionTabsSnapshot};
 use util::ResultExt as _;
-use workspace::dock::Dock;
 use workspace::{MultiWorkspace, OpenOptions, OpenVisible, SaveIntent, Workspace};
 
 /// Run an in-place Solution switch on the given `Workspace`. Steps:
@@ -80,17 +77,14 @@ pub fn switch_active_solution_in_place(
                         .and_then(|pp| workspace.project().read(app).absolute_path(&pp, app)),
                 }
             });
-            // Capture the leaving Solution's dock layout in the same
-            // breath as its tabs. Both are per-Solution state that would
-            // otherwise be SHARED, because the in-place switch keeps the
-            // one Workspace (and its three Docks) alive across switches.
-            let dock_snapshot =
-                workspace.update(cx, |workspace, cx| capture_dock_snapshot(workspace, cx));
+            // Dock layout is a single SHARED layout across the window
+            // (propagated by `MultiWorkspace::activate`), so the in-place
+            // switch leaves the docks untouched — only the per-Solution
+            // open-tab list is snapshotted here.
             cx.update(|_, cx| {
                 if let Some(store) = SolutionStore::try_global(cx) {
                     store.update(cx, |store, cx| {
                         store.store_tab_snapshot(prev_id.clone(), snapshot, cx);
-                        store.set_dock_snapshot(prev_id, dock_snapshot, cx);
                     });
                 }
             })
@@ -168,84 +162,12 @@ pub fn switch_active_solution_in_place(
             }
         }
 
-        // Step 6: restore target Solution's dock layout, if a snapshot
-        // exists. ABSENT (first time this Solution is shown in this
-        // session) → do nothing: the Solution inherits whatever docks
-        // are currently mounted and starts remembering its own changes
-        // from here on. This toggling is the INTENDED per-Solution
-        // restore, keyed by solution and only applied when a snapshot
-        // exists — NOT a splash-robustness band-aid.
-        let dock_snapshot = cx
-            .update(|_, cx| {
-                SolutionStore::try_global(cx).and_then(|store| {
-                    store.read_with(cx, |s, _| s.dock_snapshot(&target_id).cloned())
-                })
-            })
-            .ok()
-            .flatten();
-        if let Some(dock_snapshot) = dock_snapshot {
-            workspace.update_in(cx, |workspace, window, cx| {
-                apply_dock_snapshot(workspace, &dock_snapshot, window, cx);
-            })?;
-        }
+        // Dock layout is intentionally NOT restored per-Solution here: it
+        // is a single shared layout across the window (see
+        // `MultiWorkspace::activate`), so the in-place switch leaves the
+        // currently-mounted docks as they are.
         Ok(())
     })
-}
-
-/// Capture the current dock layout (open/closed, active panel index, and
-/// active-panel size per side) of the given workspace into a
-/// `SolutionDockSnapshot`. Mirrors `MultiWorkspace::activate`'s old
-/// snapshot helper but also records the active-panel size so a switch
-/// back restores the exact width/height the user dragged to.
-fn capture_dock_snapshot(workspace: &Workspace, cx: &App) -> SolutionDockSnapshot {
-    let side = |dock: &Entity<Dock>| {
-        let dock = dock.read(cx);
-        DockSideSnapshot {
-            is_open: dock.is_open(),
-            active_panel_index: dock.active_panel_index(),
-            size: dock.active_panel_size(),
-        }
-    };
-    SolutionDockSnapshot {
-        left: side(workspace.left_dock()),
-        right: side(workspace.right_dock()),
-        bottom: side(workspace.bottom_dock()),
-    }
-}
-
-/// Apply a previously-captured `SolutionDockSnapshot` to the workspace's
-/// docks. Safe-apply throughout: `activate_panel`/`set_open` are no-ops
-/// when already in the target state, the active-panel index is only
-/// applied when the dock actually has that panel, and the size is only
-/// pushed onto the side's active panel.
-fn apply_dock_snapshot(
-    workspace: &Workspace,
-    snapshot: &SolutionDockSnapshot,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    for (dock, side) in [
-        (workspace.left_dock(), &snapshot.left),
-        (workspace.right_dock(), &snapshot.right),
-        (workspace.bottom_dock(), &snapshot.bottom),
-    ] {
-        dock.update(cx, |dock, cx| {
-            if let Some(index) = side.active_panel_index
-                && index < dock.panels_len()
-            {
-                dock.activate_panel(index, window, cx);
-            }
-            dock.set_open(side.is_open, window, cx);
-            // Size applies to whichever panel is now active. Skip when
-            // the side is closed or has no active panel — there's
-            // nothing visible to size.
-            if let (Some(size_state), Some(active_panel)) =
-                (side.size, dock.active_panel().cloned())
-            {
-                dock.set_panel_size_state(active_panel.as_ref(), size_state, cx);
-            }
-        });
-    }
 }
 
 fn previous_solution_id(
