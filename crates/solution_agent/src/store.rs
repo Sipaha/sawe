@@ -1100,6 +1100,9 @@ impl SolutionAgentStore {
                 verdicts_path: crate::supervisor::verdicts_path(&dir)
                     .to_string_lossy()
                     .into_owned(),
+                intent_path: crate::supervisor::intent_path(&dir)
+                    .to_string_lossy()
+                    .into_owned(),
                 compact_dir: solution_root
                     .join(".agents")
                     .join(id.to_string())

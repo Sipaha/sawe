@@ -84,6 +84,13 @@ two real steps, write two.
 session.** Write it as if you are a teammate who has read all of the
 above files and is briefing a fresh agent. It must:
 - State the goal in one paragraph.
+- **Point the new agent at the supervisor's user-intent record** if it
+  exists: `<solution_root>/.agents/<SESSION_ID>/supervisor/user_intent.md`.
+  The chat supervisor maintains there a durable, compaction-surviving summary
+  of the user's standing directives and constraints (e.g. "user required V at
+  every stage"); this transcript is about to be wiped, so instruct the new
+  agent to read that file and honor it. If the file is absent (supervision
+  off), skip this.
 - Reference `state.md`, `decisions.md`, `next.md` by their full
   absolute paths (they live in `COMPACT_DIR` — i.e. under
   `<solution_root>/.agents/<SESSION_ID>/c<NN>/`). The new session

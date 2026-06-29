@@ -233,6 +233,9 @@ pub struct JudgeBriefingContext {
     pub supervised_session_id: String,
     pub diary_path: String,
     pub verdicts_path: String,
+    /// Path to the durable user-intent record the judge maintains (see
+    /// [`intent_path`]).
+    pub intent_path: String,
     pub compact_dir: String,
     pub custom_prompt: Option<String>,
     /// Human-readable context-window fullness of the supervised session at
@@ -304,6 +307,7 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         .replace("{SUPERVISED_SESSION_ID}", &ctx.supervised_session_id)
         .replace("{DIARY_PATH}", &ctx.diary_path)
         .replace("{VERDICTS_PATH}", &ctx.verdicts_path)
+        .replace("{INTENT_PATH}", &ctx.intent_path)
         .replace("{COMPACT_DIR}", &ctx.compact_dir)
         .replace("{BRIDGE_BIN}", &ctx.bridge_bin)
         .replace("{SOCKET_PATH}", &ctx.socket_path)
@@ -324,6 +328,14 @@ pub fn diary_path(dir: &Path) -> PathBuf {
 
 pub fn verdicts_path(dir: &Path) -> PathBuf {
     dir.join("verdicts.jsonl")
+}
+
+/// Durable, compaction-surviving record of the user's standing intent — the
+/// judge maintains it (reads the live conversation, distills the user's
+/// directives + their context, supersedes contradicted decisions) so the goal
+/// is never lost when a `compact` verdict wipes the transcript.
+pub fn intent_path(dir: &Path) -> PathBuf {
+    dir.join("user_intent.md")
 }
 
 /// Cumulative, compaction-surviving record of what was accomplished over a
@@ -559,6 +571,7 @@ mod tests {
             supervised_session_id: "abcd1234".into(),
             diary_path: "/sol/.agents/abcd1234/supervisor/diary.md".into(),
             verdicts_path: "/sol/.agents/abcd1234/supervisor/verdicts.jsonl".into(),
+            intent_path: "/sol/.agents/abcd1234/supervisor/user_intent.md".into(),
             compact_dir: "/sol/.agents/abcd1234".into(),
             custom_prompt: Some("don't stop before tests pass".into()),
             context_usage: Some("187,000 / 200,000 tokens (94%)".into()),
@@ -586,6 +599,7 @@ mod tests {
             supervised_session_id: "abcd1234".into(),
             diary_path: "d".into(),
             verdicts_path: "v".into(),
+            intent_path: "i".into(),
             compact_dir: "c".into(),
             custom_prompt: None,
             context_usage: None,

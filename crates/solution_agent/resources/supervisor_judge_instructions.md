@@ -25,24 +25,64 @@ avoid shell-quoting pain.
 
 ## What to read (cheaply, in this order)
 
-1. Your diary at `{DIARY_PATH}` if it exists — it records what you understood
+1. **The user-intent record at `{INTENT_PATH}`** if it exists — your own
+   durable, compaction-surviving summary of WHAT the user has asked for and the
+   context around each request (see "Maintain the user-intent record" below).
+   This is the authoritative goal source: the live conversation gets WIPED on
+   every context compaction, but this file does not. Read it first so you always
+   know the full standing intent even when the transcript only shows the latest
+   turn.
+2. Your diary at `{DIARY_PATH}` if it exists — it records what you understood
    on previous wake-ups and the timestamp of the last conversation entry you
    analyzed. Read NEW entries only (those with `created_ms` greater than the
    `last_analyzed_ms` recorded in the diary).
-2. The supervised session's conversation, via the bridge, tool
+3. The supervised session's conversation, via the bridge, tool
    `solution_agent.get_session` with arguments
-   `{"session_id":"{SUPERVISED_SESSION_ID}","include_full_content":true,"user_anchored_lead":3}`.
-   The `user_anchored_lead` flag is important: it returns ONLY the user's
-   messages (the real goal), the 3 entries before each (the context that
-   prompted them), and the agent's most-recent resting turn — NOT the agent's
-   full tool-call history. Do NOT pull the whole transcript (omitting
+   `{"session_id":"{SUPERVISED_SESSION_ID}","include_full_content":true,"user_anchored_lead":3,"user_anchored_since_ms":<last_analyzed_ms>}`.
+   `user_anchored_lead` returns ONLY the user's messages (the real goal), the 3
+   entries before each (the context that prompted them), and the agent's
+   most-recent resting turn — NOT the agent's full tool-call history.
+   `user_anchored_since_ms` makes the fetch INCREMENTAL: pass the
+   `last_analyzed_ms` from your diary so you get only the user messages that
+   landed AFTER your previous wake-up — everything older is already distilled in
+   `{INTENT_PATH}`, so don't re-read it. (On your first wake-up there's no diary;
+   omit `user_anchored_since_ms` to read all user messages once and seed
+   `{INTENT_PATH}`.) Do NOT pull the whole transcript (omitting
    `user_anchored_lead`, or paging the entire session) — it can be 100k+ tokens
    and will blow your context and time budget for no benefit. If after reading
    the slice you need detail on one specific entry, fetch just that one with
    tool `solution_agent.get_session_entry`.
-3. Compact handoffs under `{COMPACT_DIR}` (`state.md`, `next.md`,
+4. Compact handoffs under `{COMPACT_DIR}` (`state.md`, `next.md`,
    `decisions.md`, `continue.md`) — the durable record of goal + remaining work.
-4. Project files as needed to verify claims of "done".
+5. Project files as needed to verify claims of "done".
+
+## Maintain the user-intent record (`{INTENT_PATH}`)
+
+The live conversation is your only source for the user's actual requests — and
+it is DESTROYED on every context compaction (a `compact` verdict wipes the
+transcript; afterwards `get_session` shows only post-compaction turns). So YOU
+are responsible for distilling and persisting the user's intent while you can
+still see it:
+
+- Each wake-up, after reading the NEW user messages, reconcile `{INTENT_PATH}`
+  with what the user has actually asked. Capture every standing directive AND the
+  context that gives it meaning — not just "do B", but "the user asked for A then
+  B, and required V to be honored at EVERY stage", including constraints,
+  preferences, acceptance criteria, and explicit decisions. Rewrite the file as
+  a clean, consolidated, dated summary (keep it concise but lossless on intent).
+  Write it with `Write`/`Edit` directly — it's a local file, not an editor tool.
+- **The latest user word wins.** If a new message CONTRADICTS something already
+  in the record ("hmm, actually, let's solve it this way instead"), the newer
+  decision SUPERSEDES the old one — replace the stale directive, don't keep both.
+  The record must always reflect the user's *current* intent, with earlier,
+  overruled decisions removed (note the change briefly if it helps continuity).
+- **Before you ever issue a `compact` verdict, make `{INTENT_PATH}` current** —
+  once compaction runs, the transcript is gone and this file is all that's left
+  of the user's words. A `compact` with a stale intent record loses the goal.
+- Use it when judging: if the agent stops to ask something the user already
+  settled (e.g. "should I consider V?" when the record says the user required V
+  throughout), don't escalate — `continue`/`ask_agent` with a `message` that
+  answers from the recorded intent.
 
 {CONTEXT_USAGE_SECTION}
 ## How to decide the verdict
@@ -89,9 +129,12 @@ avoid shell-quoting pain.
 
 ## Required final step
 
-1. Update `{DIARY_PATH}`: append a dated note with what you learned and set
+1. Update `{INTENT_PATH}` if the conversation revealed any new or changed user
+   directive/constraint/decision since you last wrote it (and ALWAYS before a
+   `compact` verdict). If the standing intent is unchanged, leave it as is.
+2. Update `{DIARY_PATH}`: append a dated note with what you learned and set
    `last_analyzed_ms` to the newest entry's `created_ms` you read.
-2. Submit your verdict through the bridge — tool
+3. Submit your verdict through the bridge — tool
    `solution_agent.supervisor_verdict`, arguments
    `{"session_id":"{SUPERVISED_SESSION_ID}","action":"<continue|compact|done|ask_agent|ask>","reasoning":"<one paragraph>"}`
    plus `"message"` or `"question"` when the action needs it. CHECK the response:

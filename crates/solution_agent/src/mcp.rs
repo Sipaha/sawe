@@ -1042,6 +1042,14 @@ pub struct GetSessionParams {
     /// the judge can see how long the session actually is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_anchored_lead: Option<usize>,
+    /// Incremental anchor cutoff for `user_anchored_lead`: when set, ONLY user
+    /// messages with `created_ms > user_anchored_since_ms` are anchored on (plus
+    /// their lead context and the resting turn). Lets the supervisor judge fetch
+    /// only the user messages that landed AFTER its previous wake-up — the older
+    /// ones are already distilled into its durable `user_intent.md`. Ignored
+    /// unless `user_anchored_lead` is also set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_anchored_since_ms: Option<i64>,
 }
 
 impl<'de> Deserialize<'de> for GetSessionParams {
@@ -1057,6 +1065,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
             count: Option<usize>,
             subagent_filter: Option<String>,
             user_anchored_lead: Option<usize>,
+            user_anchored_since_ms: Option<i64>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -1068,6 +1077,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
             count: inner.count,
             subagent_filter: inner.subagent_filter,
             user_anchored_lead: inner.user_anchored_lead,
+            user_anchored_since_ms: inner.user_anchored_since_ms,
         })
     }
 }
@@ -1330,17 +1340,40 @@ pub struct QueuedBundleSummary {
 /// and the absolute `EntrySummary.index` of every surviving entry. A no-op
 /// when there are no user entries (nothing to anchor on → keep the window
 /// as-is, so the judge still sees *something*).
-fn apply_user_anchored_filter(kept: &mut Vec<EntrySummary>, lead: usize) {
+fn apply_user_anchored_filter(
+    kept: &mut Vec<EntrySummary>,
+    lead: usize,
+    since_ms: Option<i64>,
+) {
     if kept.is_empty() {
         return;
     }
-    let has_user = kept.iter().any(|e| e.role == EntryRoleDto::User);
+    // A user entry anchors the slice only when it's newer than `since_ms` (the
+    // judge's previous-wake cutoff). An entry with no timestamp is kept (can't
+    // prove it's old). With no `since_ms` every user entry anchors.
+    let anchors = |e: &EntrySummary| {
+        e.role == EntryRoleDto::User
+            && since_ms.is_none_or(|s| e.created_ms.is_none_or(|c| c > s))
+    };
+    let has_user = kept.iter().any(anchors);
     if !has_user {
+        // Incremental mode with nothing new since the cutoff: keep ONLY the
+        // resting turn, so the judge sees where the agent stopped but not the
+        // old user messages (already distilled into `user_intent.md`). In
+        // non-incremental mode (`since_ms == None`) with no user entries at all,
+        // preserve the original no-op (keep the window so the judge sees
+        // something).
+        if since_ms.is_some()
+            && let Some(last) = kept.pop()
+        {
+            kept.clear();
+            kept.push(last);
+        }
         return;
     }
     let mut keep = vec![false; kept.len()];
     for (pos, entry) in kept.iter().enumerate() {
-        if entry.role == EntryRoleDto::User {
+        if anchors(entry) {
             let start = pos.saturating_sub(lead);
             for flag in keep.iter_mut().take(pos + 1).skip(start) {
                 *flag = true;
@@ -1454,7 +1487,7 @@ impl McpServerTool for GetSessionTool {
                 // resting turn), applied before `count` so a tail window
                 // still tails the anchored slice.
                 if let Some(lead) = input.user_anchored_lead {
-                    apply_user_anchored_filter(&mut kept, lead);
+                    apply_user_anchored_filter(&mut kept, lead, input.user_anchored_since_ms);
                 }
                 if let Some(n) = input.count {
                     if kept.len() > n {
@@ -8025,7 +8058,7 @@ mod tests {
             anchored_entry(9, ToolCall),
             anchored_entry(10, Assistant), // resting turn → kept
         ];
-        apply_user_anchored_filter(&mut kept, 2);
+        apply_user_anchored_filter(&mut kept, 2, None);
         let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
         assert_eq!(indices, vec![1, 2, 3, 5, 6, 7, 10]);
     }
@@ -8041,7 +8074,7 @@ mod tests {
             anchored_entry(2, User),
             anchored_entry(3, Assistant),
         ];
-        apply_user_anchored_filter(&mut kept, 5);
+        apply_user_anchored_filter(&mut kept, 5, None);
         let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
         assert_eq!(indices, vec![0, 1, 2, 3]);
     }
@@ -8053,8 +8086,56 @@ mod tests {
             anchored_entry(0, Assistant),
             anchored_entry(1, ToolCall),
         ];
-        apply_user_anchored_filter(&mut kept, 3);
+        apply_user_anchored_filter(&mut kept, 3, None);
         let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
         assert_eq!(indices, vec![0, 1], "no anchor → window kept as-is");
+    }
+
+    /// `since_ms` makes the slice incremental: only user turns newer than the
+    /// cutoff anchor (older ones are already in the judge's `user_intent.md`).
+    #[test]
+    fn user_anchored_filter_since_ms_keeps_only_new_user_turns() {
+        use EntryRoleDto::*;
+        let at = |index: usize, role: EntryRoleDto, ts: i64| {
+            let mut e = anchored_entry(index, role);
+            e.created_ms = Some(ts);
+            e
+        };
+        // Two user turns: old (ts 100) and new (ts 200). cutoff = 150.
+        let mut kept = vec![
+            at(0, Assistant, 90),
+            at(1, ToolCall, 95),
+            at(2, User, 100), // old → must NOT anchor
+            at(3, ToolCall, 180),
+            at(4, Assistant, 190),
+            at(5, User, 200), // new → anchors, lead=2 keeps 3,4,5
+            at(6, Assistant, 210), // resting turn → kept
+        ];
+        apply_user_anchored_filter(&mut kept, 2, Some(150));
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        assert_eq!(
+            indices,
+            vec![3, 4, 5, 6],
+            "only the post-cutoff user turn anchors; old user turn dropped"
+        );
+    }
+
+    /// When nothing is newer than the cutoff, keep ONLY the resting turn — the
+    /// judge sees where the agent stopped, not the already-distilled old turns.
+    #[test]
+    fn user_anchored_filter_since_ms_all_old_keeps_resting_turn() {
+        use EntryRoleDto::*;
+        let at = |index: usize, role: EntryRoleDto, ts: i64| {
+            let mut e = anchored_entry(index, role);
+            e.created_ms = Some(ts);
+            e
+        };
+        let mut kept = vec![
+            at(0, User, 50),
+            at(1, Assistant, 60), // resting turn
+        ];
+        apply_user_anchored_filter(&mut kept, 3, Some(100));
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![1], "all user turns pre-cutoff → only resting turn kept");
     }
 }
