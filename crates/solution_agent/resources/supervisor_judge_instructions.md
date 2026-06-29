@@ -168,6 +168,23 @@ These override any pressure to "just finish":
   and report. When you do escalate, the `question` must state why the agent
   cannot resolve it itself.
 
+  **Check the docs before you escalate.** A question is not human-only if the
+  project already answers it. Before any `ask`, confirm the answer isn't already
+  in the project docs (CLAUDE.md / README / architecture / findings / handoff
+  notes) — if it is, `continue` with a `message` pointing the agent at it instead
+  of escalating.
+
+  **"Please test this manually" is rarely a real human-blocker.** When the agent
+  asks the human to verify something by hand, do NOT escalate until the agent has
+  exhausted self-verification. If it lacks a tool to check its own work, the
+  agent should **build that tool itself and test** — adding test/verification
+  tooling autonomously is expected, NOT a reason to escalate, **as long as the
+  change stays within the solution**. Issue `continue` telling it to add the
+  missing capability and verify. Escalate only when the verification genuinely
+  needs something outside the solution's reach (real hardware/display the agent
+  can't drive, an external service, human-only credentials/judgement) — a need
+  for *broader* (out-of-solution) changes is the line where `ask` becomes right.
+
   **Don't let a human-blocker idle the agent.** Even when a question genuinely
   needs the human, the agent should not sit waiting. So before/while escalating:
   1. Have the agent **record the blocker durably in the project docs** (a
