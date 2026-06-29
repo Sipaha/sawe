@@ -8,13 +8,14 @@
 //!
 //! Visuals: deterministic colour dot derived from the id, name (truncated),
 //! AI session badge (Sparkle + count) when there are live sessions for this
-//! solution, clone-progress spinner while an `add_member` is in flight,
-//! active-tab highlight (background + border accent).
+//! solution, active-tab highlight (background + border accent). The
+//! clone-progress spinner for an in-flight `add_member` lives on the
+//! project tab being cloned (project tab strip), not here.
 //!
-//! The badge counts and clone-in-flight flag are caller-driven (passed
-//! into `new`) so this `RenderOnce` element doesn't read globals during
-//! render — the `SolutionTabStrip` (Task 7) will subscribe to the store
-//! events that change them and pass fresh values down on each rerender.
+//! The badge count is caller-driven (passed into `new`) so this
+//! `RenderOnce` element doesn't read globals during render — the
+//! `SolutionTabStrip` (Task 7) will subscribe to the store events that
+//! change it and pass fresh values down on each rerender.
 
 use gpui::{
     App, ClickEvent, Context, Hsla, IntoElement, Render, RenderOnce, SharedString, WeakEntity,
@@ -22,7 +23,7 @@ use gpui::{
 };
 use solutions::SolutionId;
 use std::cell::RefCell;
-use ui::{ContextMenu, Indicator, prelude::*, right_click_menu};
+use ui::{ContextMenu, prelude::*, right_click_menu};
 use util::ResultExt as _;
 use workspace::{MultiWorkspace, Workspace};
 
@@ -37,7 +38,6 @@ pub struct SolutionTab {
     name: SharedString,
     is_active: bool,
     ai_session_count: usize,
-    clone_in_flight: bool,
     /// Position in the displayed tab order — the drag payload and drop target
     /// both key off it so `MultiWorkspace::reorder_workspaces` can move the
     /// dragged tab to land at this tab's slot.
@@ -85,7 +85,6 @@ impl SolutionTab {
         name: SharedString,
         is_active: bool,
         ai_session_count: usize,
-        clone_in_flight: bool,
         index: usize,
         multi_workspace: WeakEntity<MultiWorkspace>,
         weak_workspace: WeakEntity<Workspace>,
@@ -95,7 +94,6 @@ impl SolutionTab {
             name,
             is_active,
             ai_session_count,
-            clone_in_flight,
             index,
             multi_workspace,
             weak_workspace,
@@ -161,9 +159,6 @@ impl RenderOnce for SolutionTab {
                                 .color(Color::Accent),
                         ),
                 )
-            })
-            .when(self.clone_in_flight, |this| {
-                this.child(Indicator::icon(Icon::new(IconName::ArrowCircle)).color(Color::Accent))
             })
             .on_click({
                 move |_event: &ClickEvent, window, cx| {

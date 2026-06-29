@@ -7,9 +7,11 @@
 //!
 //! Visuals: deterministic colour dot derived from the `CatalogId`
 //! (shared FNV-1a helper with the solution tabs), the catalog project
-//! name (truncated), and an active-tab highlight. Unlike the solution
-//! tab there is no AI-session badge or clone-in-flight spinner — those
-//! are solution-scoped, not member-scoped.
+//! name (truncated), and an active-tab highlight. The clone-progress
+//! spinner for an in-flight `add_member` renders here too, as a
+//! non-interactive [`PendingProjectTab`] ghost — the project being
+//! cloned is exactly the member-scoped surface it belongs on (it used
+//! to wrongly live on the owning solution tab).
 
 use gpui::{
     App, ClickEvent, Context, ElementId, Hsla, IntoElement, Render, RenderOnce, SharedString,
@@ -17,7 +19,7 @@ use gpui::{
 };
 use solutions::{CatalogId, SolutionId, SolutionStore};
 use std::cell::RefCell;
-use ui::{ContextMenu, prelude::*, right_click_menu};
+use ui::{ContextMenu, Indicator, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 
 use crate::actions::RemoveMember;
@@ -201,6 +203,89 @@ impl RenderOnce for ProjectTab {
                 })
             })
             .into_any_element()
+    }
+}
+
+/// A ghost project tab for an `add_member` clone that hasn't landed as a
+/// real member yet. Non-interactive (no click / drag / context menu): it
+/// only shows the project being cloned with a spinning progress indicator
+/// while in flight, or an error icon if the clone failed. It renders in
+/// the project tab strip — the member-scoped surface — rather than on the
+/// owning solution tab, so the spinner points at the project actually
+/// being cloned.
+#[derive(IntoElement)]
+pub struct PendingProjectTab {
+    catalog_id: CatalogId,
+    name: SharedString,
+    /// Human-readable clone stage (e.g. `cloning`, `45%`) surfaced as a
+    /// tooltip so a slow clone is legible without widening the tab.
+    stage: SharedString,
+    percent: Option<u8>,
+    /// `Some(_)` once the add failed and is waiting on the user to retry
+    /// or dismiss it; flips the spinner to an error glyph.
+    error: Option<SharedString>,
+}
+
+impl PendingProjectTab {
+    pub fn new(
+        catalog_id: CatalogId,
+        name: SharedString,
+        stage: SharedString,
+        percent: Option<u8>,
+        error: Option<SharedString>,
+    ) -> Self {
+        Self {
+            catalog_id,
+            name,
+            stage,
+            percent,
+            error,
+        }
+    }
+}
+
+impl RenderOnce for PendingProjectTab {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let dot = dot_color_for_str(self.catalog_id.0.as_str());
+        let row_id = ElementId::from(SharedString::from(format!(
+            "project-tab-pending-{}",
+            self.catalog_id.0
+        )));
+        let tooltip_text: SharedString = match &self.error {
+            Some(err) => SharedString::from(format!("Clone failed: {err}")),
+            None => match self.percent {
+                Some(p) => SharedString::from(format!("{} — {p}%", self.stage)),
+                None => self.stage.clone(),
+            },
+        };
+        let trailing = if self.error.is_some() {
+            Icon::new(IconName::Warning)
+                .size(IconSize::XSmall)
+                .color(Color::Error)
+                .into_any_element()
+        } else {
+            Indicator::icon(Icon::new(IconName::ArrowCircle))
+                .color(Color::Accent)
+                .into_any_element()
+        };
+
+        div()
+            .id(row_id)
+            .child(
+                h_flex()
+                    .h_full()
+                    .px_3()
+                    .gap_2()
+                    .min_w(px(80.0))
+                    .max_w(px(200.0))
+                    .items_center()
+                    .border_b_2()
+                    .border_color(cx.theme().colors().border_transparent)
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(dot))
+                    .child(Label::new(self.name.clone()).truncate().color(Color::Muted))
+                    .child(trailing),
+            )
+            .tooltip(Tooltip::text(tooltip_text))
     }
 }
 

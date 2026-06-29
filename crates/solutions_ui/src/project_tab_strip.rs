@@ -31,7 +31,7 @@ use util::ResultExt as _;
 use workspace::{MultiWorkspace, Workspace};
 
 use crate::AddProjectPicker;
-use crate::project_tab::{DraggedProjectTab, ProjectTab, move_to_end};
+use crate::project_tab::{DraggedProjectTab, PendingProjectTab, ProjectTab, move_to_end};
 
 /// How many project tabs render inline before the rest spill into the
 /// `more` popover. A simple fixed cap — the strip lives in the title bar
@@ -134,6 +134,27 @@ impl Render for ProjectTabStrip {
 
         let order: Vec<CatalogId> = members.iter().map(|(id, _)| id.clone()).collect();
 
+        // Ghost tabs for in-flight (or just-failed) `add_member` clones that
+        // haven't landed as real members yet. Skip any whose catalog id is
+        // already a member — that's the brief window between the clone task
+        // recording the member and removing the in-flight entry. This is the
+        // surface the clone spinner belongs on (the project being cloned),
+        // not the owning solution tab.
+        let pending_tabs = store
+            .read(cx)
+            .pending_adds_for(&solution_id)
+            .into_iter()
+            .filter(|p| !order.contains(&p.catalog_id))
+            .map(|p| {
+                PendingProjectTab::new(
+                    p.catalog_id,
+                    SharedString::from(p.catalog_name),
+                    SharedString::from(p.stage),
+                    p.percent,
+                    p.error.map(SharedString::from),
+                )
+            });
+
         let (visible, overflow): (&[(CatalogId, SharedString)], &[(CatalogId, SharedString)]) =
             if members.len() > MAX_VISIBLE_TABS {
                 members.split_at(MAX_VISIBLE_TABS)
@@ -232,6 +253,7 @@ impl Render for ProjectTabStrip {
             .h_full()
             .overflow_x_scroll()
             .children(tabs)
+            .children(pending_tabs)
             .when_some(end_drop, |this, zone| this.child(zone))
             .when_some(overflow_popover, |this, popover| {
                 this.child(div().px_1().child(popover))

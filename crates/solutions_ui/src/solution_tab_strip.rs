@@ -13,8 +13,6 @@
 //!     solution is highlighted as the active tab.
 //!   * `SolutionStore::solutions()` for the displayed name and to count
 //!     closed solutions for the `+` button branching.
-//!   * `SolutionStore::pending_adds_for(&id)` for the clone-in-flight
-//!     spinner on each tab.
 //!   * `SolutionAgentStore::visible_session_count(&id)` for the live AI
 //!     session count badge on each tab (excludes ephemeral supervisor
 //!     judge sessions so they never tick the badge during an idle wake-up).
@@ -117,15 +115,17 @@ impl Render for SolutionTabStrip {
 
         // Snapshot the data each tab needs in one pass so we don't borrow
         // across mutating callbacks. Each entry is (id, name, is_active,
-        // ai_count, in_flight). `SolutionTab` is a `RenderOnce` that
-        // takes the values by move, so we don't need to keep `&Solution`
-        // references alive past this map.
+        // ai_count). `SolutionTab` is a `RenderOnce` that takes the values
+        // by move, so we don't need to keep `&Solution` references alive
+        // past this map. The clone-in-flight spinner is intentionally NOT
+        // surfaced here — it renders on the project tab being cloned, in
+        // the project tab strip, not on the owning solution tab.
         let active_workspace = mw.read(cx).workspace().clone();
         let store_read = store.read(cx);
         let active_solution_id = solution_id_for_workspace(&active_workspace, store_read, cx);
 
         let mut seen_ids: Vec<SolutionId> = Vec::new();
-        let mut tabs: Vec<(SolutionId, SharedString, bool, usize, bool)> = Vec::new();
+        let mut tabs: Vec<(SolutionId, SharedString, bool, usize)> = Vec::new();
         for ws in mw.read(cx).workspaces() {
             let Some(sol_id) = solution_id_for_workspace(ws, store_read, cx) else {
                 continue;
@@ -147,13 +147,11 @@ impl Render for SolutionTabStrip {
                 .as_ref()
                 .map(|s| s.read(cx).visible_session_count(&sol_id))
                 .unwrap_or(0);
-            let in_flight = !store_read.pending_adds_for(&sol_id).is_empty();
             tabs.push((
                 sol_id.clone(),
                 SharedString::from(sol.name.clone()),
                 is_active,
                 ai_count,
-                in_flight,
             ));
             seen_ids.push(sol_id);
         }
@@ -227,13 +225,12 @@ impl Render for SolutionTabStrip {
             .h_full()
             .overflow_x_scroll()
             .children(tabs.into_iter().enumerate().map(
-                |(index, (id, name, is_active, ai_count, in_flight))| {
+                |(index, (id, name, is_active, ai_count))| {
                     SolutionTab::new(
                         id,
                         name,
                         is_active,
                         ai_count,
-                        in_flight,
                         index,
                         weak_multi_workspace.clone(),
                         weak_workspace.clone(),
