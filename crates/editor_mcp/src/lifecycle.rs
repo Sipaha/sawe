@@ -219,13 +219,21 @@ const GLOBAL_TOOLS: &[&str] = &[
     "solution_agent.restart_agent",
     "solution_agent.reset_context",
     "solution_agent.start_compact",
+    "solution_agent.set_supervisor_enabled",
+    "solution_agent.set_supervisor_prompt",
+    "solution_agent.get_supervisor_state",
     "solution_agent.upload_init",
     "solution_agent.upload_status",
     "solution_agent.upload_finish",
     "solution_agent.upload_abort",
 ];
 
-fn is_global_tool(name: &str) -> bool {
+/// Whether `name` lives on the global MCP socket. The mobile proxy
+/// (`remote_control`) dials the global socket, so EVERY remote-allow-listed
+/// upstream tool must be global — `remote_control`'s allow-list test asserts
+/// exactly this against `is_global_tool` to stop a forwarded-but-not-global
+/// tool ("Tool not found" on the phone) from shipping again.
+pub fn is_global_tool(name: &str) -> bool {
     GLOBAL_TOOLS.contains(&name)
 }
 
@@ -266,6 +274,9 @@ const SHARED_TOOLS: &[&str] = &[
     "solution_agent.restart_agent",
     "solution_agent.reset_context",
     "solution_agent.start_compact",
+    "solution_agent.set_supervisor_enabled",
+    "solution_agent.set_supervisor_prompt",
+    "solution_agent.get_supervisor_state",
     "solution_agent.upload_init",
     "solution_agent.upload_status",
     "solution_agent.upload_finish",

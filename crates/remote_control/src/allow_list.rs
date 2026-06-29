@@ -255,6 +255,23 @@ mod tests {
         for (wire, bare) in cases {
             assert_eq!(translate(wire), Some(*bare), "for {wire}");
         }
+
+        // Consistency guard: the mobile proxy dials the GLOBAL editor_mcp socket,
+        // so every `solution_agent.*` / `workspace.*` tool we forward MUST live on
+        // that socket (`editor_mcp::GLOBAL_TOOLS`). A tool that's allow-listed but
+        // not global comes back as "Tool not found" on the phone — exactly how
+        // `get_supervisor_state` shipped broken. This catches the next such gap at
+        // compile-test time instead of on a user's screen.
+        for (wire, bare) in cases {
+            if bare.starts_with("solution_agent.") || bare.starts_with("workspace.") {
+                assert!(
+                    editor_mcp::is_global_tool(bare),
+                    "{wire} forwards to {bare}, which is NOT in editor_mcp::GLOBAL_TOOLS — \
+                     the mobile proxy would get 'Tool not found'. Add it to GLOBAL_TOOLS \
+                     (and SHARED_TOOLS) in crates/editor_mcp/src/lifecycle.rs."
+                );
+            }
+        }
     }
 
     #[test]
