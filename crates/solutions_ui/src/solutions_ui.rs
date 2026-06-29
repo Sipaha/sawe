@@ -374,6 +374,13 @@ fn register_tab_actions(
             member_label, sol_name,
         ));
         let path_for_rm = member_path.clone();
+        // Capture the triggering workspace's project so the removed member's
+        // worktree can be detached on confirm — otherwise the now-deleted
+        // folder lingers as a dangling (soon-empty) worktree in the project,
+        // which the Project Panel keeps showing once the solution scopes to
+        // "all worktrees" (e.g. after removing the last member).
+        let project = workspace.project().clone();
+        let worktree_path = member_path.clone();
         crate::delete_confirm_modal::open_delete_confirm(
             workspace,
             title,
@@ -393,6 +400,20 @@ fn register_tab_actions(
                 store
                     .update(cx, |s, cx| s.remove_member(&sol_id, &cat_id, cx))
                     .log_err();
+                // Detach the removed member's worktree(s) from the project so
+                // the Project Panel stops rendering its tree. Done before the
+                // folder is rm-rf'd so the editor isn't watching a directory
+                // that's about to vanish.
+                project.update(cx, |project, cx| {
+                    let stale: Vec<_> = project
+                        .worktrees(cx)
+                        .filter(|w| w.read(cx).abs_path().starts_with(&worktree_path))
+                        .map(|w| w.read(cx).id())
+                        .collect();
+                    for id in stale {
+                        project.remove_worktree(id, cx);
+                    }
+                });
                 let path = path_for_rm.clone();
                 cx.background_spawn(async move {
                     let result: std::io::Result<()> =

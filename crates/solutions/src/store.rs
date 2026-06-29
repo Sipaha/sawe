@@ -670,10 +670,29 @@ impl SolutionStore {
             bail!("member not in solution");
         }
         self.db_delete_member(solution_id, catalog_id)?;
-        // Clear the active_member entry if it pointed at the now-gone member
-        // so callers don't keep a dangling catalog id in their cache.
+        // If the removed member was the solution-wide active one, repoint to a
+        // remaining member instead of just dropping the entry. Panels scoped
+        // to the active member (project_panel, git_panel) filter their visible
+        // worktree by `active_member_path`; with no active member that filter
+        // falls back to "show all worktrees", which keeps the just-removed
+        // project's now-empty tree on screen. Repointing emits
+        // `ActiveMemberChanged`, which those panels subscribe to, so they
+        // rebuild deterministically onto a surviving project (or clear when the
+        // solution is now empty).
         if self.active_member.get(solution_id) == Some(catalog_id) {
-            self.active_member.remove(solution_id);
+            let next = self
+                .config
+                .solutions
+                .iter()
+                .find(|s| &s.id == solution_id)
+                .and_then(|s| s.members.first())
+                .map(|m| m.catalog_id.clone());
+            match next {
+                Some(next) => self.set_active_member(solution_id.clone(), next, cx),
+                None => {
+                    self.active_member.remove(solution_id);
+                }
+            }
         }
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
@@ -1047,6 +1066,51 @@ mod tests {
 
         let result = store.update(cx, |s, cx| s.remove_catalog_project(&cat_id, cx));
         assert!(result.is_err(), "expected refusal");
+    }
+
+    #[gpui::test]
+    async fn remove_active_member_repoints_to_remaining(cx: &mut TestAppContext) {
+        let dir = tempdir().expect("tempdir");
+        let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("c.json"), cx));
+        let sol_id = store
+            .update(cx, |s, cx| s.create_solution("Sol", dir.path().to_path_buf(), cx))
+            .expect("create");
+        let a = CatalogId("alpha".into());
+        let b = CatalogId("beta".into());
+        store.update(cx, |s, _| {
+            s.test_force_add_member(&sol_id, &a);
+            s.test_force_add_member(&sol_id, &b);
+        });
+        // Make `alpha` the active member, then remove it.
+        store.update(cx, |s, cx| s.set_active_member(sol_id.clone(), a.clone(), cx));
+        store
+            .update(cx, |s, cx| s.remove_member(&sol_id, &a, cx))
+            .expect("remove active member");
+        // Active member must follow to the surviving member, not go `None`
+        // (which would make the project panel fall back to "show all").
+        assert_eq!(
+            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
+            Some(b),
+        );
+    }
+
+    #[gpui::test]
+    async fn remove_last_member_clears_active(cx: &mut TestAppContext) {
+        let dir = tempdir().expect("tempdir");
+        let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("c.json"), cx));
+        let sol_id = store
+            .update(cx, |s, cx| s.create_solution("Sol", dir.path().to_path_buf(), cx))
+            .expect("create");
+        let only = CatalogId("only".into());
+        store.update(cx, |s, _| s.test_force_add_member(&sol_id, &only));
+        store.update(cx, |s, cx| s.set_active_member(sol_id.clone(), only.clone(), cx));
+        store
+            .update(cx, |s, cx| s.remove_member(&sol_id, &only, cx))
+            .expect("remove last member");
+        assert_eq!(
+            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
+            None,
+        );
     }
 
     #[gpui::test]
