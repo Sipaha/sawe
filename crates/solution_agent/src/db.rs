@@ -279,6 +279,35 @@ impl SolutionAgentDb {
             "trigger_count INTEGER NOT NULL DEFAULT 0",
         );
 
+        // Per-session chat attachments (images written to the session inbox so
+        // the agent can `Read` them mid-turn). Bound to the session AND its
+        // solution so they can be cascade-deleted on cleanup (context
+        // compaction / clear / session close / solution delete) instead of
+        // accumulating on disk for the editor's lifetime. `path` is the
+        // absolute inbox file path.
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS solution_session_attachment (
+                session_id    TEXT NOT NULL,
+                solution_id   TEXT NOT NULL,
+                path          TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (session_id, path)
+            )
+        "})?()
+        .map_err(|e| anyhow!("Failed to create solution_session_attachment table: {}", e))?;
+
+        connection.exec(indoc! {"
+            CREATE INDEX IF NOT EXISTS idx_attachment_by_session
+                ON solution_session_attachment (session_id)
+        "})?()
+        .map_err(|e| anyhow!("Failed to create idx_attachment_by_session: {}", e))?;
+
+        connection.exec(indoc! {"
+            CREATE INDEX IF NOT EXISTS idx_attachment_by_solution
+                ON solution_session_attachment (solution_id)
+        "})?()
+        .map_err(|e| anyhow!("Failed to create idx_attachment_by_solution: {}", e))?;
+
         Ok(Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
@@ -405,6 +434,44 @@ impl SolutionAgentDb {
         self.executor.spawn(async move {
             let connection = connection.lock();
             delete_background_shells_for_session(&connection, &solution_session_id)
+        })
+    }
+
+    pub fn record_attachment(
+        &self,
+        session_id: String,
+        solution_id: String,
+        path: String,
+        created_at_ms: i64,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            insert_attachment(&connection, &session_id, &solution_id, &path, created_at_ms)
+        })
+    }
+
+    pub fn attachment_paths_for_session(&self, session_id: String) -> Task<Result<Vec<String>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            select_attachment_paths_for_session(&connection, &session_id)
+        })
+    }
+
+    pub fn attachment_paths_for_solution(&self, solution_id: String) -> Task<Result<Vec<String>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            select_attachment_paths_for_solution(&connection, &solution_id)
+        })
+    }
+
+    pub fn delete_attachments_for_session(&self, session_id: String) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            delete_attachments_for_session_fn(&connection, &session_id)
         })
     }
 
@@ -1131,6 +1198,66 @@ fn delete_background_shells_for_session(
     Ok(())
 }
 
+fn insert_attachment(
+    connection: &Connection,
+    session_id: &str,
+    solution_id: &str,
+    path: &str,
+    created_at_ms: i64,
+) -> Result<()> {
+    let mut stmt = connection.exec_bound::<(String, String, String, i64)>(indoc! {"
+        INSERT INTO solution_session_attachment
+            (session_id, solution_id, path, created_at_ms)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id, path) DO UPDATE SET
+            solution_id   = excluded.solution_id,
+            created_at_ms = excluded.created_at_ms
+    "})?;
+    stmt((
+        session_id.to_string(),
+        solution_id.to_string(),
+        path.to_string(),
+        created_at_ms,
+    ))?;
+    Ok(())
+}
+
+fn select_attachment_paths_for_session(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = connection.select_bound::<String, String>(indoc! {"
+        SELECT path FROM solution_session_attachment WHERE session_id = ?
+    "})?;
+    stmt(session_id.to_string())
+}
+
+fn select_attachment_paths_for_solution(
+    connection: &Connection,
+    solution_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = connection.select_bound::<String, String>(indoc! {"
+        SELECT path FROM solution_session_attachment WHERE solution_id = ?
+    "})?;
+    stmt(solution_id.to_string())
+}
+
+fn delete_attachments_for_session_fn(connection: &Connection, session_id: &str) -> Result<()> {
+    let mut stmt = connection.exec_bound::<String>(indoc! {"
+        DELETE FROM solution_session_attachment WHERE session_id = ?
+    "})?;
+    stmt(session_id.to_string())?;
+    Ok(())
+}
+
+fn delete_attachments_for_solution_fn(connection: &Connection, solution_id: &str) -> Result<()> {
+    let mut stmt = connection.exec_bound::<String>(indoc! {"
+        DELETE FROM solution_session_attachment WHERE solution_id = ?
+    "})?;
+    stmt(solution_id.to_string())?;
+    Ok(())
+}
+
 fn insert_or_update_entry(
     connection: &Connection,
     session_id: &str,
@@ -1244,6 +1371,10 @@ fn delete_by_solution(connection: &Connection, solution_id: &SolutionId) -> Resu
         DELETE FROM solution_sessions WHERE solution_id = ?
     "})?;
     delete(solution_id.0.clone())?;
+    // Cascade: drop attachment rows for the solution (callers delete the files
+    // themselves via `attachment_paths_for_solution` before this, while the
+    // paths are still queryable).
+    delete_attachments_for_solution_fn(connection, &solution_id.0)?;
     Ok(())
 }
 
@@ -1813,6 +1944,62 @@ mod tests {
         let ses2 = db.load_background_shells("ses-2".into()).await.unwrap();
         assert_eq!(ses2.len(), 1);
         assert_eq!(ses2[0].shell_id, "shell-c");
+    }
+
+    #[gpui::test]
+    async fn attachments_round_trip_and_cascade(cx: &mut gpui::TestAppContext) {
+        let db = SolutionAgentDb::open(cx.executor()).unwrap();
+        db.record_attachment("ses-1".into(), "sol-a".into(), "/inbox/a.png".into(), 1)
+            .await
+            .unwrap();
+        db.record_attachment("ses-1".into(), "sol-a".into(), "/inbox/b.png".into(), 2)
+            .await
+            .unwrap();
+        db.record_attachment("ses-2".into(), "sol-a".into(), "/inbox/c.png".into(), 3)
+            .await
+            .unwrap();
+        db.record_attachment("ses-3".into(), "sol-b".into(), "/inbox/d.png".into(), 4)
+            .await
+            .unwrap();
+
+        let mut by_ses1 = db.attachment_paths_for_session("ses-1".into()).await.unwrap();
+        by_ses1.sort();
+        assert_eq!(by_ses1, vec!["/inbox/a.png", "/inbox/b.png"]);
+
+        let by_sol_a = db.attachment_paths_for_solution("sol-a".into()).await.unwrap();
+        assert_eq!(by_sol_a.len(), 3);
+
+        // Delete by session removes only that session's rows.
+        db.delete_attachments_for_session("ses-1".into()).await.unwrap();
+        assert!(
+            db.attachment_paths_for_session("ses-1".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.attachment_paths_for_session("ses-2".into())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // delete_for_solution cascades to attachment rows for that solution only.
+        db.delete_for_solution(SolutionId("sol-a".into())).await.unwrap();
+        assert!(
+            db.attachment_paths_for_solution("sol-a".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.attachment_paths_for_solution("sol-b".into())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[gpui::test]

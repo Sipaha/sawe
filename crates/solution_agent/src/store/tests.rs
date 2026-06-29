@@ -174,6 +174,43 @@ fn push_and_evict_transcripts_keeps_window() {
     assert_eq!(h.front().map(String::as_str), Some("c"));
 }
 
+#[gpui::test]
+async fn close_session_purges_inbox_attachments(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (inbox_dir, db) =
+        store.update(cx, |store, cx| (store.session_inbox_dir(id, cx), store.persistence()));
+    let db = db.expect("seeded store has persistence");
+
+    std::fs::create_dir_all(&inbox_dir).unwrap();
+    let file = inbox_dir.join("shot.png");
+    std::fs::write(&file, b"png").unwrap();
+    db.record_attachment(
+        id.to_string(),
+        "sol".into(),
+        file.to_string_lossy().into_owned(),
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(file.exists());
+    assert_eq!(
+        db.attachment_paths_for_session(id.to_string()).await.unwrap().len(),
+        1
+    );
+
+    store.update(cx, |store, cx| store.close_session(id, cx).unwrap());
+    cx.run_until_parked();
+
+    assert!(!inbox_dir.exists(), "inbox dir must be removed on close");
+    assert!(
+        db.attachment_paths_for_session(id.to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "attachment rows must be cleared on close"
+    );
+}
+
 /// `cold_close_solution` bypasses `close_session` (it drops live entities
 /// without soft-closing the persisted sessions), so it must prune the same
 /// per-session runtime maps itself or they leak when a solution's window closes.

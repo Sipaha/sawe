@@ -3316,6 +3316,26 @@ impl SolutionAgentStore {
         }
     }
 
+    /// Delete the session's inbox attachment files (the whole `inbox/` dir) and
+    /// their DB rows. Safe because the image pixels also live as base64 in the
+    /// persisted transcript entries (so the UI / reopen are unaffected) — the
+    /// on-disk inbox file is only needed transiently for the agent's `Read`
+    /// during the turn that delivered it. Called at context compaction / clear /
+    /// session close, the points where any agent reference to the path becomes
+    /// unreachable, so a long-running session stops accumulating attachments.
+    /// Must run while the session is still in `self.sessions` (the inbox dir is
+    /// resolved from the session's solution root).
+    fn purge_session_attachments(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        let dir = self.session_inbox_dir(id, cx);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).log_err();
+        }
+        if let Some(db) = &self.persistence {
+            db.delete_attachments_for_session(id.to_string())
+                .detach_and_log_err(cx);
+        }
+    }
+
     /// Drain the session's queued follow-ups, push them into the live thread as
     /// one user entry, and return the agent-facing text (per-message timestamps
     /// already baked in; a leading hint line when `is_end_of_turn`). Returns
@@ -3383,6 +3403,27 @@ impl SolutionAgentStore {
             for block in &combined {
                 if let acp::ContentBlock::Image(img) = block {
                     image_paths.push(queue::save_inbox_image(&dir, image_paths.len(), img));
+                }
+            }
+            // Bind each saved attachment to the session in the DB so it can be
+            // cascade-cleaned (purge_session_attachments / delete_for_solution)
+            // rather than lingering on disk.
+            if let Some(db) = &self.persistence {
+                let solution_id = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.read(cx).solution_id.0.to_string());
+                if let Some(solution_id) = solution_id {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    for path in image_paths.iter().flatten() {
+                        db.record_attachment(
+                            session_id.to_string(),
+                            solution_id.clone(),
+                            path.to_string_lossy().into_owned(),
+                            now_ms,
+                        )
+                        .detach_and_log_err(cx);
+                    }
                 }
             }
         }
@@ -4257,6 +4298,11 @@ impl SolutionAgentStore {
         // ephemeral child — those are never keys in these maps).
         self.finish_judge(id, cx);
         self.finish_auditor(id, cx);
+        // Delete the session's inbox attachments (files + DB rows) while the
+        // session is still in `self.sessions` (the inbox dir resolves from its
+        // solution root). The pixels survive as base64 in the persisted entries,
+        // so reopen is unaffected.
+        self.purge_session_attachments(id, cx);
         // Flush the latest transcript and stop any in-flight turn while the
         // session is still live in `self.sessions`. The flush guarantees a
         // later "Reopen Closed Chat" restores the full conversation; the
@@ -4621,6 +4667,10 @@ impl SolutionAgentStore {
                 // Bound disk: the pre-rotation transcript is now orphaned —
                 // keep only the most recent few of this session's transcripts.
                 store.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
+                // The pre-rotation context (with any attached-image path
+                // references) is wiped, so the inbox files can never be `Read`
+                // again — purge them. Pixels live on as base64 in entries.
+                store.purge_session_attachments(session_id, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionContextReset {
                     id: session_id,
                     context_count: new_count,
@@ -4802,6 +4852,9 @@ impl SolutionAgentStore {
                 // Bound disk: the pre-clear transcript is now orphaned — keep
                 // only the most recent few of this session's transcripts.
                 store.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
+                // `/clear` wipes the context, so the inbox attachment paths are
+                // unreachable — purge the files + rows. Pixels survive as base64.
+                store.purge_session_attachments(session_id, cx);
                 // `reset_context` does not bump `context_count` (only
                 // `rotate_context` does), so read the current value to
                 // forward as-is on the wire.
@@ -7420,7 +7473,20 @@ impl SolutionAgentStore {
                 }
             }
             if let Some(db) = &self.persistence {
-                db.delete_for_solution(sid).detach_and_log_err(cx);
+                // Delete the solution's attachment files THEN its rows (incl. the
+                // attachment-row cascade in delete_for_solution) in one awaited
+                // sequence, so the path lookup completes before the rows it reads
+                // are dropped.
+                let db = db.clone();
+                cx.background_spawn(async move {
+                    if let Ok(paths) = db.attachment_paths_for_solution(sid.0.to_string()).await {
+                        for path in paths {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                    db.delete_for_solution(sid).await.log_err();
+                })
+                .detach();
             }
         }
         cx.notify();
