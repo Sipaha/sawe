@@ -53,7 +53,7 @@ const STUCK_TURN_SECS: u64 = 5 * 60;
 /// long do we treat it as truly stuck and reconnect. Generous so real
 /// builds/tests aren't killed; covers a command that hangs forever or claude
 /// wedging mid-tool.
-const TOOL_STUCK_SECS: u64 = 30 * 60;
+const TOOL_STUCK_SECS: u64 = 20 * 60;
 
 pub struct SolutionAgentStore {
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
