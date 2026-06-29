@@ -67,13 +67,17 @@ pub enum SolutionStoreEvent {
         /// `None` on success; `Some(msg)` on failure or cancellation.
         error: Option<String>,
     },
-    /// Emitted when `set_active_member` updates the solution-wide catalog
-    /// selection. UI listeners react to this so a programmatic selection
-    /// change in one window is reflected in every other window showing the
-    /// same Solution.
+    /// Emitted when the solution-wide active-member selection changes —
+    /// either repointed to a concrete member (`Some`) or cleared because the
+    /// solution has no members left (`None`). UI listeners react to this so a
+    /// programmatic selection change in one window is reflected in every other
+    /// window showing the same Solution. Member-scoped panels (project_panel,
+    /// git_panel, console_panel, title bar, run-config) rebuild on this event
+    /// regardless of the payload, so the `None` case refreshes them off the
+    /// just-removed project — `Changed` alone does not drive a panel rebuild.
     ActiveMemberChanged {
         solution: SolutionId,
-        catalog: CatalogId,
+        catalog: Option<CatalogId>,
     },
     /// Emitted when a Solution is removed from the store. Carries the
     /// solution's `root` path captured *before* removal, because the
@@ -288,7 +292,10 @@ impl SolutionStore {
             })
             .detach();
         }
-        cx.emit(SolutionStoreEvent::ActiveMemberChanged { solution, catalog });
+        cx.emit(SolutionStoreEvent::ActiveMemberChanged {
+            solution,
+            catalog: Some(catalog),
+        });
         cx.notify();
     }
 
@@ -697,22 +704,15 @@ impl SolutionStore {
         }
         self.db_delete_member(solution_id, catalog_id)?;
         // If the removed member was the solution-wide active one, repoint to a
-        // remaining member instead of just dropping the entry. Panels scoped
-        // to the active member (project_panel, git_panel) filter their visible
-        // worktree by `active_member_path`; with no active member that filter
-        // falls back to "show all worktrees", which keeps the just-removed
-        // project's now-empty tree on screen. Repointing emits
-        // `ActiveMemberChanged`, which those panels subscribe to, so they
-        // rebuild deterministically onto a surviving project.
-        //
-        // The empty case (no member left) only drops the cache entry without
-        // emitting a member-scoped event — `ActiveMemberChanged` can't encode
-        // "cleared". The desktop `RemoveMember` action covers it by detaching
-        // the removed worktree (the project event rebuilds the panels onto the
-        // EmptySolutionPage). A pure-store removal of the last member with an
-        // open window (e.g. the MCP path) would therefore not actively refresh
-        // member-scoped panels; closing that gap needs a dedicated
-        // cleared-member event handled by every member-scoped panel.
+        // remaining member or clear the selection. Panels scoped to the active
+        // member (project_panel, git_panel, …) filter their visible worktree by
+        // `active_member_path`; with no active member that filter falls back to
+        // "show all worktrees", which keeps the just-removed project's now-empty
+        // tree on screen. Both branches emit `ActiveMemberChanged` (the empty
+        // case with `None`), which those panels subscribe to, so they rebuild
+        // deterministically onto a surviving project — or off the removed one
+        // when the solution is now empty — without depending on the caller's
+        // worktree teardown (`Changed` alone does not drive a panel rebuild).
         if self.active_member.get(solution_id) == Some(catalog_id) {
             let next = self
                 .config
@@ -725,6 +725,17 @@ impl SolutionStore {
                 Some(next) => self.set_active_member(solution_id.clone(), next, cx),
                 None => {
                     self.active_member.remove(solution_id);
+                    if let Some(db) = self.db.clone() {
+                        let sid = solution_id.0.clone();
+                        cx.background_spawn(async move {
+                            db.clear_active_member(sid).await.log_err();
+                        })
+                        .detach();
+                    }
+                    cx.emit(SolutionStoreEvent::ActiveMemberChanged {
+                        solution: solution_id.clone(),
+                        catalog: None,
+                    });
                 }
             }
         }
@@ -1138,12 +1149,34 @@ mod tests {
         let only = CatalogId("only".into());
         store.update(cx, |s, _| s.test_force_add_member(&sol_id, &only));
         store.update(cx, |s, cx| s.set_active_member(sol_id.clone(), only.clone(), cx));
+
+        // Collect events so we can assert the cleared-member notification
+        // actually fires — member-scoped panels rebuild on `ActiveMemberChanged`
+        // (not `Changed`), so without the `{ catalog: None }` emit a stale tree
+        // would stay on screen after the last member is removed.
+        let events: std::sync::Arc<std::sync::Mutex<Vec<SolutionStoreEvent>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _sub = cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&store, move |_store, ev: &SolutionStoreEvent, _cx| {
+                events.lock().expect("events lock").push(ev.clone());
+            })
+        });
+
         store
             .update(cx, |s, cx| s.remove_member(&sol_id, &only, cx))
             .expect("remove last member");
+        cx.run_until_parked();
         assert_eq!(
             store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
             None,
+        );
+        let events = events.lock().expect("events lock");
+        assert!(
+            events.iter().any(|e| matches!(e,
+                SolutionStoreEvent::ActiveMemberChanged { solution, catalog }
+                    if *solution == sol_id && catalog.is_none())),
+            "expected ActiveMemberChanged {{ catalog: None }} on last-member removal; got: {events:?}"
         );
     }
 
@@ -1460,7 +1493,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(e,
                 SolutionStoreEvent::ActiveMemberChanged { solution, catalog }
-                    if *solution == sol && *catalog == cat)),
+                    if *solution == sol && catalog.as_ref() == Some(&cat))),
             "expected ActiveMemberChanged event; got: {events:?}"
         );
     }

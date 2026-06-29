@@ -177,6 +177,12 @@ impl SolutionsDb {
             SELECT solution_id, catalog_id FROM active_member
         }
     }
+
+    query! {
+        pub async fn clear_active_member(solution_id: String) -> Result<()> {
+            DELETE FROM active_member WHERE solution_id = ?
+        }
+    }
 }
 
 #[cfg(test)]

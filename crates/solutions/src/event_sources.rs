@@ -119,7 +119,9 @@ pub fn install(cx: &mut App) {
                             "solution_active_member_changed",
                             json!({
                                 "solution_id": solution.0,
-                                "catalog_id": catalog.0,
+                                // `null` when the solution's last member was
+                                // removed and the selection was cleared.
+                                "catalog_id": catalog.as_ref().map(|c| c.0.as_str()),
                             }),
                         );
                     }
