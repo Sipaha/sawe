@@ -4089,6 +4089,16 @@ impl SolutionAgentStore {
         // close notifications, mirroring the create-side suppression so a
         // connected mobile client never sees their per-wake-up churn.
         let is_supervisor_ephemeral = session_read.is_supervisor_ephemeral;
+        let agent_id = session_read.agent_id.clone();
+        // Capture the live connection + ACP session id BEFORE the entity drops,
+        // so we can tear down THIS session's `claude` subprocess and release the
+        // pool refcount afterwards (see the `pool_teardown` block at the end of
+        // this fn). `None` for a cold/restored session that was never spawned on
+        // the pool — those neither hold a subprocess nor a refcount to release.
+        let pool_teardown = session_read.acp_thread().map(|thread| {
+            let thread = thread.read(cx);
+            (thread.connection().clone(), thread.session_id().clone())
+        });
         if let Some(list) = self.by_solution.get_mut(&solution_id) {
             list.retain(|sid| *sid != id);
         }
@@ -4125,6 +4135,25 @@ impl SolutionAgentStore {
                     }),
                 );
             }
+        }
+        // Tear down the pool side of the session. The pooled
+        // `ClaudeNativeConnection` is shared across the `(solution, agent)` pair
+        // and OUTLIVES this session, so dropping the `SolutionSession` + its
+        // `AcpThread` above does NOT remove the session from the connection's
+        // `sessions` map — this session's `claude` subprocess would leak (dozens
+        // accrue over a long supervised run, one per judge/auditor wake, each
+        // holding its own MCP child processes). Explicitly close the ACP session
+        // (claude_native removes the `SessionState` and kills its process) and
+        // release the pool refcount so the connection itself shuts down once its
+        // last session closes (the only other `pool_release_session` call site
+        // was the failed-spawn rollback — close leaked the refcount, see the
+        // note on `solution_agent.delete_session`). Skipped for cold/restored
+        // sessions (never spawned on the pool → no subprocess, no refcount).
+        if let Some((connection, acp_session_id)) = pool_teardown {
+            if connection.supports_close_session() {
+                connection.close_session(&acp_session_id, cx).detach();
+            }
+            self.pool_release_session((solution_id.clone(), agent_id), cx);
         }
         cx.notify();
         Ok(())
@@ -4320,6 +4349,12 @@ impl SolutionAgentStore {
             let new_thread = new_thread_task.await?;
 
             let new_count = this.update(cx, |store, cx| {
+                // The PRE-rotation ACP session id, captured before the graft
+                // overwrites it — needed to tear down its now-orphaned subprocess.
+                // Only meaningful if the session was actually live (a cold session
+                // never spawned an old child and never held a pool refcount slot).
+                let old_acp_session_id = session_entity.read(cx).acp_session_id.clone();
+                let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
                 let new_acp_session_id = new_thread.read(cx).session_id().clone();
                 let new_count = current_count.saturating_add(1);
                 session_entity.update(cx, |s, cx| {
@@ -4356,6 +4391,24 @@ impl SolutionAgentStore {
                 // idx 1..N. Targeted upserts alone would leak the old rows.
                 store.persist_all_rows(session_id, cx);
                 store.mark_state_changed(session_id, cx);
+                // Compact reused the pooled connection for a FRESH ACP session
+                // but left the PRE-rotation session live in the connection's
+                // `sessions` map — its `claude` subprocess would leak one process
+                // (plus its MCP children) per /compact. And `get_or_spawn_connection`
+                // above incremented `live_session_count` again WITHOUT releasing
+                // the slot the old ACP session held, so the pair's refcount would
+                // climb by one each rotation and never reach zero on close. Close
+                // the old ACP session (kills its subprocess) and release the extra
+                // refcount so the count still reflects exactly one live session.
+                if old_thread_was_live {
+                    if connection.supports_close_session() {
+                        connection
+                            .clone()
+                            .close_session(&old_acp_session_id, cx)
+                            .detach();
+                    }
+                    store.pool_release_session(pair.clone(), cx);
+                }
                 cx.emit(SolutionAgentStoreEvent::SessionContextReset {
                     id: session_id,
                     context_count: new_count,
@@ -4459,6 +4512,12 @@ impl SolutionAgentStore {
             let new_thread = new_thread_task.await?;
 
             this.update(cx, |store, cx| {
+                // Capture the PRE-clear ACP session id + liveness before the graft
+                // overwrites them, so we can reap its orphaned subprocess + release
+                // the pool slot it held (skipped for a cold session — it never
+                // spawned an old child nor took a refcount slot).
+                let old_acp_session_id = session_entity.read(cx).acp_session_id.clone();
+                let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
                 let new_acp_session_id = new_thread.read(cx).session_id().clone();
                 let had_pending = session_entity.update(cx, |s, cx| {
                     let had_pending = !s.pending_messages.is_empty();
@@ -4516,6 +4575,18 @@ impl SolutionAgentStore {
                 // pre-clear transcript. Targeted upserts can't delete; this must
                 // run on the empty-entries clear path.
                 store.persist_all_rows(session_id, cx);
+                // Reap the pre-clear ACP session's subprocess + balance the pool
+                // refcount that `get_or_spawn_connection` re-incremented above
+                // (same leak/double-count as `rotate_context`).
+                if old_thread_was_live {
+                    if connection.supports_close_session() {
+                        connection
+                            .clone()
+                            .close_session(&old_acp_session_id, cx)
+                            .detach();
+                    }
+                    store.pool_release_session(pair.clone(), cx);
+                }
                 // `reset_context` does not bump `context_count` (only
                 // `rotate_context` does), so read the current value to
                 // forward as-is on the wire.

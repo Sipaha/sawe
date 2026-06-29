@@ -213,6 +213,42 @@ async fn pool_release_arms_60s_shutdown_then_drops(cx: &mut TestAppContext) {
     });
 }
 
+/// Regression: `close_session` must release the pool refcount so the shared
+/// `claude` connection shuts down once its last session closes. Before the fix
+/// `close_session` never called `pool_release_session` (only the failed-spawn
+/// rollback did), so the refcount only ever climbed — the 60s debounce never
+/// armed and the pooled subprocess (plus every per-session `claude` child it
+/// spawned for judges/auditors) leaked for the editor's lifetime.
+#[gpui::test]
+async fn close_session_releases_pooled_connection(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            assert_eq!(store.pool_size(), 1, "a spawned session holds one pooled connection");
+        });
+    });
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.close_session(session_id, cx).expect("close_session");
+        });
+    });
+
+    // The release arms the 60s debounce; drain it and the connection drops.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(61));
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            assert_eq!(
+                store.pool_size(),
+                0,
+                "closing the last session must release + shut down the pooled connection"
+            );
+        });
+    });
+}
+
 #[gpui::test]
 async fn shutdown_cancels_when_session_re_added(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());

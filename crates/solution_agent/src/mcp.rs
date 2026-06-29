@@ -2801,12 +2801,11 @@ impl McpServerTool for SendMessageBlocksTool {
 // =====================================================================
 
 /// Delete a session, dropping its `AcpThread` and removing it from the
-/// store. Mirrors `SolutionAgentStore::close_session` directly — the
-/// pool's per-pair `live_session_count` is not decremented here because
-/// the store's own `close_session` doesn't either (the only production
-/// `pool_release_session` call site is the failed-spawn rollback in
-/// `create_session`). Pool leakage on close is a pre-existing store
-/// concern, not MCP-specific.
+/// store. Mirrors `SolutionAgentStore::close_session` directly, which now
+/// kills the session's `claude` subprocess (via the connection's
+/// `close_session`) and decrements the pool's per-pair `live_session_count`
+/// so the shared connection shuts down once its last session closes — no
+/// extra teardown is needed here.
 ///
 /// Note: the internal Rust method on `SolutionAgentStore` remains
 /// `close_session`; only the wire name is renamed here (B2 scope).
