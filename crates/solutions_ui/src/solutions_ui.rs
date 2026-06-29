@@ -260,7 +260,19 @@ fn close_workspaces_under_root_in(
     }
     let close_tasks: Vec<_> = to_close
         .into_iter()
-        .map(|(group_key, _)| mw.remove_project_group(&group_key, window, cx))
+        .map(|(group_key, ws)| {
+            // Same guard as `close_solution_workspaces_in`: a workspace with
+            // only a hidden placeholder worktree has an empty visible
+            // `ProjectGroupKey`, and `remove_project_group(empty)` would
+            // over-match every other placeholder-only solution in the window.
+            // Close those individually; reserve `remove_project_group` for
+            // unique non-empty keys.
+            if group_key.path_list().paths().is_empty() {
+                mw.close_workspace(&ws, window, cx)
+            } else {
+                mw.remove_project_group(&group_key, window, cx)
+            }
+        })
         .collect();
     cx.spawn_in(window, async move |this, cx| {
         for task in close_tasks {
