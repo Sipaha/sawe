@@ -41,6 +41,13 @@ pub(crate) use queue::{QUEUE_HINT_LINE, TS_PREFIX_CLOSE, TS_PREFIX_OPEN};
 // candidate for tear-down; dead-linger = grace period before reaping.
 const MANAGED_AGENT_STALE_TIMEOUT_SECS: u64 = 120;
 const MANAGED_AGENT_DEAD_LINGER_SECS: u64 = 300;
+/// How long a session may sit in `Running` with zero streaming / tool
+/// activity before the stuck-session watchdog ([`SolutionAgentStore::
+/// tick_stuck_sessions`]) treats its subprocess as wedged and
+/// non-destructively reconnects it. A healthy turn streams well within this;
+/// the trade-off (a legitimately-silent long foreground command gets
+/// reconnected) is documented on the watchdog.
+const STUCK_TURN_SECS: u64 = 5 * 60;
 
 pub struct SolutionAgentStore {
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
@@ -854,6 +861,7 @@ impl SolutionAgentStore {
                         this.scan_parent_jsonls_for_completions(cx);
                         this.tick_background_shells(cx);
                         this.tick_supervisor(cx);
+                        this.tick_stuck_sessions(cx);
                     })
                     .is_err()
                 {
@@ -1953,6 +1961,67 @@ impl SolutionAgentStore {
         })()
         .log_err();
         crate::supervisor::cap_log_tail(&diary_path, crate::supervisor::DIARY_LOG_MAX_BYTES);
+    }
+
+    /// Recovery sweep for wedged sessions. A session stuck in `Running` with
+    /// no streaming / tool activity for [`STUCK_TURN_SECS`] has a hung or dead
+    /// claude subprocess: a healthy turn streams thinking / text / tool calls
+    /// well within that window, each of which bumps `last_activity_at` (so the
+    /// silence clock self-resets on any progress). A cleanly *exited*
+    /// subprocess is already recovered by the connection's EOF path (it fails
+    /// the pending prompt → `Errored`); this catches the harder hung-but-alive
+    /// case the EOF path can't see.
+    ///
+    /// Recovery is [`reconnect_agent`] — non-destructive: it respawns the
+    /// subprocess and replays the same transcript, keeping the conversation.
+    /// `reconnect_agent` synchronously flips the session out of `Running` (to
+    /// `Errored("reconnecting…")`), so the next tick won't re-fire for it.
+    ///
+    /// TRADE-OFF: a turn that is legitimately silent for 5 minutes — e.g.
+    /// claude blocked on a slow FOREGROUND command (a long build/test) that
+    /// streams nothing while it runs — is indistinguishable from a hang and
+    /// will be reconnected, losing that command's in-flight progress (claude
+    /// re-reads context from the transcript on resume). Tune [`STUCK_TURN_SECS`]
+    /// if that bites. Background (`run_in_background`) commands don't block
+    /// claude, so they keep streaming and never trip this.
+    pub(crate) fn tick_stuck_sessions(&mut self, cx: &mut Context<Self>) {
+        use crate::model::SessionState;
+        let now = Utc::now();
+        let stuck: Vec<SolutionSessionId> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let s = session.read(cx);
+                // Live, project-backed, non-ephemeral sessions mid-turn only.
+                // (Ephemeral judge/auditor sessions are short-lived and cold /
+                // prebuilt sessions have nothing to reconnect.)
+                if s.is_supervisor_ephemeral
+                    || s.project.is_none()
+                    || s.acp_thread().is_none()
+                    || !matches!(s.state, SessionState::Running { .. })
+                {
+                    return None;
+                }
+                let silent_secs = now.signed_duration_since(s.last_activity_at).num_seconds();
+                (silent_secs >= STUCK_TURN_SECS as i64).then_some(*id)
+            })
+            .collect();
+        for id in stuck {
+            log::warn!(
+                target: "solution_agent::store",
+                "session={id} wedged in Running with no activity for >={STUCK_TURN_SECS}s — \
+                 auto-reconnecting (respawn subprocess + replay transcript)"
+            );
+            self.append_supervisor_diary_note(
+                id,
+                &format!(
+                    "session wedged (no activity {}m while Running); auto-reconnect",
+                    STUCK_TURN_SECS / 60
+                ),
+                cx,
+            );
+            self.reconnect_agent(id, cx).detach_and_log_err(cx);
+        }
     }
 
     pub(crate) fn tick_supervisor(&mut self, cx: &mut Context<Self>) {
