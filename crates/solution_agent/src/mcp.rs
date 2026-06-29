@@ -1095,6 +1095,31 @@ pub enum EntryRoleDto {
     ToolCall,
     Plan,
     ContextCompaction,
+    /// Editor-originated annotation (watchdog / usage-limit / supervisor). The
+    /// severity is carried in `EntrySummary::system_level`; the text is in
+    /// `preview` / `markdown` like any other entry.
+    System,
+}
+
+/// Severity of a `role == "system"` entry, so the client can render it
+/// distinctly (info vs error vs observer/supervisor).
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemLevelDto {
+    Info,
+    Error,
+    Observer,
+}
+
+impl From<crate::session_entry::SystemEntryLevel> for SystemLevelDto {
+    fn from(level: crate::session_entry::SystemEntryLevel) -> Self {
+        use crate::session_entry::SystemEntryLevel;
+        match level {
+            SystemEntryLevel::Info => Self::Info,
+            SystemEntryLevel::Error => Self::Error,
+            SystemEntryLevel::Observer => Self::Observer,
+        }
+    }
 }
 
 /// Structured wire status for a tool call. Mirrors the
@@ -1144,6 +1169,9 @@ pub struct EntrySummary {
     /// Present only for `role == "plan"` entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanSummary>,
+    /// Present only for `role == "system"` entries — the annotation severity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_level: Option<SystemLevelDto>,
     /// Originating client's locally-generated send id, plumbed verbatim
     /// from the user message's content-block `_meta.spk_client_send_id`
     /// (see `acp_thread::SPK_CLIENT_SEND_ID_META_KEY`). Present only for
@@ -1906,6 +1934,7 @@ fn entry_role(kind: &crate::session_entry::SessionEntryKind) -> EntryRoleDto {
         SessionEntryKind::ToolCall { .. } => EntryRoleDto::ToolCall,
         SessionEntryKind::Plan(_) => EntryRoleDto::Plan,
         SessionEntryKind::ContextCompaction { .. } => EntryRoleDto::ContextCompaction,
+        SessionEntryKind::System { .. } => EntryRoleDto::System,
     }
 }
 
@@ -1997,6 +2026,7 @@ fn session_entry_to_markdown(kind: &crate::session_entry::SessionEntryKind) -> S
             md
         }
         SessionEntryKind::ContextCompaction { .. } => "--- Context Compacted ---\n\n".to_string(),
+        SessionEntryKind::System { text_md, .. } => format!("{text_md}\n\n"),
     }
 }
 
@@ -2101,6 +2131,11 @@ fn summarize_entry(
     };
     let client_send_id = client_send_ids.first().copied();
     let subagent_id = entry.subagent_id.as_ref().map(|s| s.to_string());
+    let system_level = if let SessionEntryKind::System { level, .. } = kind {
+        Some((*level).into())
+    } else {
+        None
+    };
 
     EntrySummary {
         role,
@@ -2110,6 +2145,7 @@ fn summarize_entry(
         images,
         tool_call,
         plan,
+        system_level,
         client_send_id,
         client_send_ids,
         created_ms,
@@ -2139,7 +2175,8 @@ fn count_images_in_entry(kind: &crate::session_entry::SessionEntryKind) -> usize
         SessionEntryKind::AssistantMessage { .. }
         | SessionEntryKind::ToolCall { .. }
         | SessionEntryKind::Plan(_)
-        | SessionEntryKind::ContextCompaction { .. } => 0,
+        | SessionEntryKind::ContextCompaction { .. }
+        | SessionEntryKind::System { .. } => 0,
     }
 }
 
@@ -8111,6 +8148,7 @@ mod tests {
             images: None,
             tool_call: None,
             plan: None,
+            system_level: None,
             client_send_id: None,
             client_send_ids: Vec::new(),
             created_ms: None,

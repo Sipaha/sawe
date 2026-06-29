@@ -398,6 +398,30 @@ pub enum AgentThreadEntry {
     ToolCall(ToolCall),
     CompletedPlan(Vec<PlanEntry>),
     ContextCompaction(ContextCompaction),
+    /// A fork-local, editor-originated annotation interleaved into the
+    /// conversation (NOT sent to or from the agent): watchdog / usage-limit
+    /// notices and supervisor ("observer") activity, so the user can see when
+    /// the editor itself acted on the session. Rendered distinctly per
+    /// [`SystemNoteLevel`].
+    SystemNote(SystemNote),
+}
+
+/// Severity / source of a [`AgentThreadEntry::SystemNote`], driving its
+/// distinct rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemNoteLevel {
+    /// Neutral informational notice (e.g. "reconnected a wedged session").
+    Info,
+    /// Something went wrong (e.g. "reconnect failed", a surfaced agent error).
+    Error,
+    /// Activity from the supervisor / observer (verdicts, nudges, decisions).
+    Observer,
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemNote {
+    pub level: SystemNoteLevel,
+    pub text: SharedString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,6 +467,7 @@ impl AgentThreadEntry {
             Self::ToolCall(_) => false,
             Self::CompletedPlan(_) => false,
             Self::ContextCompaction(_) => false,
+            Self::SystemNote(_) => false,
         }
     }
 
@@ -454,7 +479,10 @@ impl AgentThreadEntry {
         match self {
             Self::AssistantMessage(message) => message.subagent_id.as_ref(),
             Self::ToolCall(call) => call.subagent_id.as_ref(),
-            Self::UserMessage(_) | Self::CompletedPlan(_) | Self::ContextCompaction(_) => None,
+            Self::UserMessage(_)
+            | Self::CompletedPlan(_)
+            | Self::ContextCompaction(_)
+            | Self::SystemNote(_) => None,
         }
     }
 
@@ -472,6 +500,7 @@ impl AgentThreadEntry {
                 md
             }
             Self::ContextCompaction(_) => "--- Context Compacted ---\n\n".to_string(),
+            Self::SystemNote(note) => format!("> _[system]_ {}\n\n", note.text),
         }
     }
 
@@ -1850,7 +1879,8 @@ impl AcpThread {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::SystemNote(_) => {}
             }
         }
         false
@@ -1887,7 +1917,8 @@ impl AcpThread {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::SystemNote(_) => {}
             }
         }
 
@@ -1907,7 +1938,8 @@ impl AcpThread {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::SystemNote(_) => {}
             }
         }
 
@@ -1920,7 +1952,8 @@ impl AcpThread {
                 AgentThreadEntry::UserMessage(..) => return false,
                 AgentThreadEntry::AssistantMessage(..)
                 | AgentThreadEntry::CompletedPlan(..)
-                | AgentThreadEntry::ContextCompaction(_) => continue,
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::SystemNote(_) => continue,
                 AgentThreadEntry::ToolCall(..) => return true,
             }
         }
@@ -2349,6 +2382,25 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.entries.push(entry);
         cx.emit(AcpThreadEvent::NewEntry);
+    }
+
+    /// Interleave an editor-originated [`SystemNote`] into the conversation as
+    /// a new entry. Display-only — it is never sent to the agent and is not
+    /// part of the agent's own transcript (so it won't survive a `load_session`
+    /// replay; the owning store persists it to its own entry rows instead).
+    pub fn push_system_note(
+        &mut self,
+        level: SystemNoteLevel,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_entry(
+            AgentThreadEntry::SystemNote(SystemNote {
+                level,
+                text: text.into(),
+            }),
+            cx,
+        );
     }
 
     pub fn push_context_compaction(

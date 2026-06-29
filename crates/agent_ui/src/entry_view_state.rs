@@ -237,6 +237,9 @@ impl EntryViewState {
                     self.set_entry(index, Entry::ContextCompaction);
                 }
             }
+            // Fork-local system notes carry no interactive editor state (the
+            // upstream agent panel is disabled in this fork anyway).
+            AgentThreadEntry::SystemNote(_) => {}
         };
     }
 

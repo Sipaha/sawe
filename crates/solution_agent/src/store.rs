@@ -4769,7 +4769,41 @@ impl SolutionAgentStore {
             s.set_acp_thread(None, cx);
         });
         self.mark_state_changed(session_id, cx);
-        self.resume_session(meta, project, cx)
+        let resume = self.resume_session(meta, project, cx);
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let resumed = resume.await?;
+            // Leave a visible breadcrumb in the conversation so the user knows
+            // the editor recovered the session (vs it silently coming back).
+            this.update(cx, |store, cx| {
+                store.push_system_note(
+                    resumed,
+                    acp_thread::SystemNoteLevel::Info,
+                    "Агент не отвечал — переподключил сессию (история и контекст сохранены).",
+                    cx,
+                );
+            })
+            .ok();
+            Ok(resumed)
+        })
+    }
+
+    /// Interleave an editor-originated [`acp_thread::SystemNote`] into the
+    /// session's conversation (watchdog / usage-limit / supervisor breadcrumbs).
+    /// Pushes onto the live `AcpThread` so it flows through the normal
+    /// NewEntry → persist → mobile-delta pipeline. No-op for a cold session
+    /// (no live thread) — callers inject right after a resume, when one exists.
+    pub(crate) fn push_system_note(
+        &mut self,
+        session_id: SolutionSessionId,
+        level: acp_thread::SystemNoteLevel,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.sessions.get(&session_id).cloned()
+            && let Some(thread) = session.read(cx).acp_thread().cloned()
+        {
+            thread.update(cx, |t, cx| t.push_system_note(level, text, cx));
+        }
     }
 
     /// In-place context rotation: drop the current AcpThread, spawn a
@@ -6805,20 +6839,37 @@ impl SolutionAgentStore {
         };
         match event {
             acp_thread::AcpThreadEvent::NewEntry => {
-                self.mutate_state(
-                    session_id,
-                    |state| {
-                        if matches!(state, SessionState::Idle | SessionState::AwaitingInput) {
-                            *state = SessionState::Running {
-                                started_at: std::time::Instant::now(),
-                                notified: false,
-                            };
-                        }
-                    },
-                    cx,
-                );
-                if let Some(s) = self.sessions.get(&session_id).cloned() {
-                    s.update(cx, |s, _| s.last_activity_at = Utc::now());
+                // An editor-injected `SystemNote` is not agent activity — it
+                // must NOT flip an Idle session to Running (that would make the
+                // stuck-session watchdog and the status row think a turn is in
+                // flight) nor reset the silence clock. Still convert + persist +
+                // delta-sync it below so it shows in the conversation.
+                let is_system_note = session_entity
+                    .read(cx)
+                    .acp_thread()
+                    .map(|t| {
+                        matches!(
+                            t.read(cx).entries().last(),
+                            Some(acp_thread::AgentThreadEntry::SystemNote(_))
+                        )
+                    })
+                    .unwrap_or(false);
+                if !is_system_note {
+                    self.mutate_state(
+                        session_id,
+                        |state| {
+                            if matches!(state, SessionState::Idle | SessionState::AwaitingInput) {
+                                *state = SessionState::Running {
+                                    started_at: std::time::Instant::now(),
+                                    notified: false,
+                                };
+                            }
+                        },
+                        cx,
+                    );
+                    if let Some(s) = self.sessions.get(&session_id).cloned() {
+                        s.update(cx, |s, _| s.last_activity_at = Utc::now());
+                    }
                 }
                 // First user message appends a NewEntry — refresh DB so the
                 // History popover preview stops being NULL.

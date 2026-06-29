@@ -7,7 +7,9 @@ use acp_thread::{
     AcpThread, AgentThreadEntry, ContentBlock, PermissionOptions, SelectedPermissionOutcome,
     SelectedPermissionParams, ToolCall, ToolCallContent, ToolCallStatus, UserMessageId,
 };
-use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind, ToolStatus};
+use crate::session_entry::{
+    AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel, ToolStatus,
+};
 use agent_client_protocol::schema as acp;
 use base64::Engine;
 use chrono::TimeZone as _;
@@ -144,6 +146,7 @@ pub(crate) fn entry_text_spans(entry: &SessionEntry) -> Vec<String> {
             Some(summary) => vec![format!("Context compaction: {summary}")],
             None => vec!["Context compaction".to_string()],
         },
+        SessionEntryKind::System { text_md, .. } => vec![text_md.clone()],
     }
 }
 
@@ -422,6 +425,29 @@ pub(crate) fn render_entry(
             .py_1()
             .child(ui::Label::new("Context compacted").color(ui::Color::Muted))
             .into_any_element(),
+        // Editor-originated annotation — render distinctly so the user can tell
+        // it apart from the agent's own messages. Info = neutral, Error = red,
+        // Observer (supervisor) = accent.
+        SessionEntryKind::System { level, text_md } => {
+            let (icon, color, tag) = match level {
+                SystemEntryLevel::Info => (IconName::Info, Color::Muted, "System"),
+                SystemEntryLevel::Error => (IconName::Warning, Color::Error, "System"),
+                SystemEntryLevel::Observer => (IconName::Eye, Color::Accent, "Observer"),
+            };
+            h_flex()
+                .gap_1p5()
+                .mx_2()
+                .my_1()
+                .px_2()
+                .py_1()
+                .items_start()
+                .border_l_2()
+                .border_color(color.color(cx))
+                .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                .child(Label::new(tag).size(LabelSize::XSmall).color(color))
+                .child(Label::new(text_md.clone()).color(Color::Default))
+                .into_any_element()
+        }
     };
 
     // Always wrap each entry in a right-click menu. Copy / Copy-as-

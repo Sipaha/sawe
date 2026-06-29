@@ -32,6 +32,13 @@ pub enum PersistedEntryV2 {
     Assistant(PersistedAssistantMessage),
     Tool(PersistedToolCall),
     Plan(Vec<PersistedPlanEntry>),
+    System(PersistedSystemNote),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PersistedSystemNote {
+    pub level: crate::session_entry::SystemEntryLevel,
+    pub text: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,6 +190,14 @@ pub fn to_persisted(entry: &AgentThreadEntry, cx: &App) -> Option<PersistedEntry
         // summarizing its own history) and aren't part of the durable
         // transcript — skip them, like in-flight tool calls.
         AgentThreadEntry::ContextCompaction(_) => None,
+        // System notes ARE durable — they're the user-visible record that the
+        // editor (watchdog / usage-limit / supervisor) acted on the session, so
+        // they must survive a reconnect / restart even though they aren't in
+        // the agent's own transcript.
+        AgentThreadEntry::SystemNote(note) => Some(PersistedEntryV2::System(PersistedSystemNote {
+            level: note.level.into(),
+            text: note.text.to_string(),
+        })),
     }
 }
 
@@ -282,6 +297,10 @@ pub fn from_persisted(persisted: PersistedEntryV2, cx: &mut App) -> AgentThreadE
                 .collect();
             AgentThreadEntry::CompletedPlan(plan_entries)
         }
+        PersistedEntryV2::System(p) => AgentThreadEntry::SystemNote(acp_thread::SystemNote {
+            level: p.level.into(),
+            text: p.text.into(),
+        }),
     }
 }
 

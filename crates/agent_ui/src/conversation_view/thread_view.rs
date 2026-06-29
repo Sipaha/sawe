@@ -5730,6 +5730,14 @@ impl ThreadView {
             AgentThreadEntry::ContextCompaction(compaction) => {
                 self.render_context_compaction(entry_ix, compaction, window, cx)
             }
+            // Fork-local editor annotation. This upstream agent panel is
+            // disabled in the fork; render the text plainly so it still
+            // compiles and shows something if ever re-enabled.
+            AgentThreadEntry::SystemNote(note) => div()
+                .px_5()
+                .py_1()
+                .child(Label::new(note.text.clone()).color(Color::Muted))
+                .into_any_element(),
         };
 
         let is_subagent_output = self.is_subagent()
@@ -6803,7 +6811,8 @@ impl ThreadView {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::SystemNote(_) => {}
             }
         }
 

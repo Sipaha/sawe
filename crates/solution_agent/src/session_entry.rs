@@ -52,6 +52,40 @@ pub enum SessionEntryKind {
         status: CompactionStatus,
         summary_md: Option<String>,
     },
+    /// Editor-originated annotation (watchdog / usage-limit notices, supervisor
+    /// activity), rendered distinctly per [`SystemEntryLevel`]. Not part of the
+    /// agent's transcript — persisted only in the session's own entry rows.
+    System {
+        level: SystemEntryLevel,
+        text_md: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SystemEntryLevel {
+    Info,
+    Error,
+    Observer,
+}
+
+impl From<acp_thread::SystemNoteLevel> for SystemEntryLevel {
+    fn from(level: acp_thread::SystemNoteLevel) -> Self {
+        match level {
+            acp_thread::SystemNoteLevel::Info => Self::Info,
+            acp_thread::SystemNoteLevel::Error => Self::Error,
+            acp_thread::SystemNoteLevel::Observer => Self::Observer,
+        }
+    }
+}
+
+impl From<SystemEntryLevel> for acp_thread::SystemNoteLevel {
+    fn from(level: SystemEntryLevel) -> Self {
+        match level {
+            SystemEntryLevel::Info => Self::Info,
+            SystemEntryLevel::Error => Self::Error,
+            SystemEntryLevel::Observer => Self::Observer,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -181,6 +215,13 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
                     acp_thread::ContextCompactionStatus::Canceled => CompactionStatus::Canceled,
                 },
                 summary_md: c.summary.as_ref().map(|m| m.read(cx).source().to_string()),
+            },
+        ),
+        AgentThreadEntry::SystemNote(note) => (
+            None,
+            SessionEntryKind::System {
+                level: note.level.into(),
+                text_md: note.text.to_string(),
             },
         ),
     };
