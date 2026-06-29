@@ -76,8 +76,14 @@ impl AddProjectPicker {
     }
 
     pub fn add_from_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let solution_id = self.solution_id.0.clone();
         cx.emit(DismissEvent);
-        window.dispatch_action(Box::new(crate::modals::AddCatalogProject), cx);
+        window.dispatch_action(
+            Box::new(crate::actions::AddCatalogProject {
+                solution_id: Some(solution_id),
+            }),
+            cx,
+        );
     }
 
     pub fn add_catalog(

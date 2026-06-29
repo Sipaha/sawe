@@ -95,6 +95,18 @@ pub struct CreateNewProjectInSolution {
     pub solution_id: String,
 }
 
+/// Open the modal to add a new git project to the catalog. When dispatched
+/// from a Solution's project-strip `+` (or the member picker), `solution_id`
+/// carries that Solution so the new project is also added as a member once it
+/// finishes cloning. `None` (the default, e.g. a bare keymap binding) adds to
+/// the catalog only.
+#[derive(PartialEq, Clone, Debug, Default, Deserialize, Serialize, JsonSchema, Action)]
+#[action(namespace = solutions)]
+#[serde(default)]
+pub struct AddCatalogProject {
+    pub solution_id: Option<String>,
+}
+
 /// Open the destructive-action confirmation modal for removing a member
 /// from a solution. Dispatched from the trash icon on a member-picker
 /// row. The modal lists the registry entry + on-disk folder; on confirm

@@ -10,7 +10,7 @@ use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
-use crate::modals::AddCatalogProject;
+use crate::actions::AddCatalogProject;
 
 pub struct AddMemberPicker {
     picker: Entity<Picker<AddMemberDelegate>>,
@@ -201,15 +201,21 @@ impl PickerDelegate for AddMemberDelegate {
                 self.dismissed(window, cx);
             }
             PickerEntry::AddNew => {
-                // Hand off to the AddCatalogProject modal — once the user
-                // adds it the new project shows up in the catalog and they
-                // can re-open this picker to assign it to the solution.
+                // Hand off to the AddCatalogProject modal, carrying this
+                // solution so the new project is added to it (cloning in the
+                // background) as soon as it's in the catalog.
+                let solution_id = self.solution_id.0.clone();
                 self.dismissed(window, cx);
                 let Some(workspace) = self.workspace.upgrade() else {
                     return;
                 };
                 workspace.update(cx, |_, cx| {
-                    window.dispatch_action(Box::new(AddCatalogProject), cx);
+                    window.dispatch_action(
+                        Box::new(AddCatalogProject {
+                            solution_id: Some(solution_id),
+                        }),
+                        cx,
+                    );
                 });
             }
         }

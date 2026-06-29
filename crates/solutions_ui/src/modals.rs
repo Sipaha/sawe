@@ -1,7 +1,7 @@
 use editor::{Editor, EditorEvent};
 use gpui::{
     AppContext as _, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription,
-    WeakEntity, actions,
+    WeakEntity,
 };
 use settings::Settings as _;
 use solutions::{CatalogId, SolutionId, SolutionStore, SolutionsSettings};
@@ -11,17 +11,10 @@ use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 use crate::actions::{
-    CreateNewProjectInSolution, DeleteCatalogProject, DeleteSolution, EditCatalogProject,
-    NewSolution,
+    AddCatalogProject, CreateNewProjectInSolution, DeleteCatalogProject, DeleteSolution,
+    EditCatalogProject, NewSolution,
 };
-
-actions!(
-    solutions,
-    [
-        /// Open the modal to add a new project to the catalog.
-        AddCatalogProject,
-    ]
-);
+use crate::open::{OpenIntent, open_solution};
 
 pub fn register(workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Context<Workspace>) {
     workspace.register_action(|workspace, _: &NewSolution, window, cx| {
@@ -30,10 +23,11 @@ pub fn register(workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Conte
             NewSolutionModal::new(weak, window, cx)
         });
     });
-    workspace.register_action(|workspace, _: &AddCatalogProject, window, cx| {
+    workspace.register_action(|workspace, action: &AddCatalogProject, window, cx| {
         let weak = cx.weak_entity();
-        workspace.toggle_modal(window, cx, |window, cx| {
-            AddCatalogProjectModal::new(weak, window, cx)
+        let solution_id = action.solution_id.clone().map(SolutionId);
+        workspace.toggle_modal(window, cx, move |window, cx| {
+            AddCatalogProjectModal::new(weak, solution_id, window, cx)
         });
     });
     workspace.register_action(|workspace, action: &EditCatalogProject, window, cx| {
@@ -118,7 +112,7 @@ impl NewSolutionModal {
         }
     }
 
-    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.name_editor.read(cx).text(cx);
         let name = name.trim();
         if name.is_empty() {
@@ -126,10 +120,16 @@ impl NewSolutionModal {
         }
         let root = SolutionsSettings::get_global(cx).root.clone();
         let store = SolutionStore::global(cx);
-        store
+        let created = store
             .update(cx, |s, cx| s.create_solution(name, root, cx))
             .log_err();
         cx.emit(DismissEvent);
+        // Open the freshly-created solution right away — creating one and being
+        // left on the previous solution is surprising.
+        if let Some(id) = created {
+            let source = window.window_handle().downcast();
+            open_solution(id, source, OpenIntent::SameWindow, cx);
+        }
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
@@ -191,13 +191,22 @@ pub struct AddCatalogProjectModal {
     name_editor: Entity<Editor>,
     url_editor: Entity<Editor>,
     branch_editor: Entity<Editor>,
+    /// The Solution whose `+` opened this modal, if any — the new project is
+    /// added to it as a member (cloning in the background, shown as a pending
+    /// row with a spinner) once it's in the catalog. `None` = catalog-only.
+    solution_id: Option<SolutionId>,
     _workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     _url_subscription: Subscription,
 }
 
 impl AddCatalogProjectModal {
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        solution_id: Option<SolutionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let name_editor = cx.new(|cx| Editor::single_line(window, cx));
         name_editor.update(cx, |editor, cx| {
             editor.set_placeholder_text("Project name (e.g. ECOS Records)", window, cx);
@@ -250,6 +259,7 @@ impl AddCatalogProjectModal {
             name_editor,
             url_editor,
             branch_editor,
+            solution_id,
             _workspace: workspace,
             focus_handle,
             _url_subscription: url_subscription,
@@ -268,12 +278,23 @@ impl AddCatalogProjectModal {
         } else {
             Some(branch)
         };
+        let solution_id = self.solution_id.clone();
         let store = SolutionStore::global(cx);
-        store
+        let catalog_id = store
             .update(cx, |s, cx| {
                 s.add_catalog_project(&name, &url, default_branch, cx)
             })
             .log_err();
+        // If opened from a Solution's `+`, immediately add the new project as a
+        // member of that Solution. The clone runs in the background; the project
+        // strip shows it as a pending row with a spinner until it completes.
+        if let (Some(solution_id), Some(catalog_id)) = (solution_id, catalog_id) {
+            let cache_root = solutions::default_cache_root();
+            let task = store.update(cx, |s, cx| {
+                s.add_member(solution_id, catalog_id, cache_root, cx)
+            });
+            cx.spawn(async move |_, _| task.await).detach_and_log_err(cx);
+        }
         cx.emit(DismissEvent);
     }
 
@@ -298,7 +319,9 @@ impl EventEmitter<DismissEvent> for AddCatalogProjectModal {}
 
 impl Focusable for AddCatalogProjectModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.name_editor.focus_handle(cx)
+        // URL first: it's what the user pastes, and the Name field auto-derives
+        // from it.
+        self.url_editor.focus_handle(cx)
     }
 }
 
@@ -331,17 +354,17 @@ impl Render for AddCatalogProjectModal {
             .rounded_md()
             .child(Label::new("Add Project to Catalog").size(LabelSize::Large))
             .child(
-                Label::new("Name")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(self.name_editor.clone())
-            .child(
                 Label::new("Remote URL")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
             .child(self.url_editor.clone())
+            .child(
+                Label::new("Name")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(self.name_editor.clone())
             .child(
                 Label::new("Default branch")
                     .size(LabelSize::Small)
