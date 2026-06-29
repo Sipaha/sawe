@@ -499,20 +499,202 @@ pub fn should_fire(
     silent_ms >= (threshold_secs as i64) * 1000
 }
 
-pub fn classify_judge_error(message: &str) -> JudgeFailure {
+/// True when `message` is one of claude's subscription / API usage walls —
+/// the ~5-hour "session limit", the "weekly limit", or the API
+/// quota/rate/billing forms. They all mean "stop issuing requests until the
+/// limit resets". The wording differs between the two subscription limits
+/// (and from the API errors), so this matches every observed phrasing rather
+/// than a single token. Case-insensitive.
+///
+/// Real examples this must catch:
+///   "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"  (5h)
+///   "You've reached your weekly limit · resets ..."                     (weekly)
+///   "rate_limit_error" / "usage limit reached" / "insufficient quota"   (API)
+pub fn is_usage_limit_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    // Quota/usage/billing exhaustion → stop immediately, do not retry.
-    if m.contains("usage limit")
+    m.contains("usage limit")
+        || m.contains("session limit")
+        || m.contains("weekly limit")
         || m.contains("rate_limit")
         || m.contains("rate limit")
         || m.contains("quota")
         || m.contains("insufficient")
         || m.contains("billing")
         || m.contains("credit")
-    {
+        // Subscription phrasings that don't contain any of the words above:
+        || m.contains("hit your limit")
+        || m.contains("reached your limit")
+        || m.contains("limit · resets")
+        || m.contains("limit reached")
+}
+
+pub fn classify_judge_error(message: &str) -> JudgeFailure {
+    // Quota/usage/billing exhaustion → stop immediately, do not retry.
+    if is_usage_limit_error(message) {
         return JudgeFailure::Quota;
     }
     JudgeFailure::Transient
+}
+
+/// Parse the reset moment from a claude usage-limit message and return it as
+/// epoch-millis (UTC). The message carries a wall-clock time plus, usually, a
+/// timezone in parentheses, e.g.:
+///   "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
+///   "...weekly limit · resets Wed 9am (America/New_York)"
+///   "...resets 20:20"                              (24h, no tz)
+///
+/// Resolution order for the timezone: the IANA name in parentheses first
+/// (claude prints it), falling back to the machine's local timezone (which is
+/// what claude reports against anyway). A weekday token (`mon`..`sun`) selects
+/// the next matching date — used by the weekly limit; without one the time is
+/// taken as today (or tomorrow if already past) — the session limit.
+///
+/// Returns `None` when there is no parseable `resets <time>` clause, so the
+/// caller can fall back to a terminal stop. An *under*-estimate (e.g. a weekly
+/// reset printed without a weekday, resolved to tomorrow) is self-correcting:
+/// the resumed turn re-hits the still-active limit and re-schedules.
+pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
+    use chrono::{Datelike, Duration, NaiveTime, TimeZone, Utc, Weekday};
+
+    let lower = message.to_ascii_lowercase();
+    let after = lower.split("resets").nth(1)?;
+
+    // Timezone in parentheses, if present: "(Asia/Novosibirsk)". Parsed from
+    // the ORIGINAL message (IANA names are case-sensitive).
+    let tz: Option<chrono_tz::Tz> = message
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .and_then(|(name, _)| name.trim().parse::<chrono_tz::Tz>().ok());
+
+    // Optional weekday token (weekly limit).
+    let weekday: Option<Weekday> = after.split_whitespace().find_map(parse_weekday);
+
+    // First time-looking token: "8:20pm" / "8pm" / "20:20" / "9".
+    let (hour, minute) = after
+        .split_whitespace()
+        .find_map(|tok| parse_clock(tok.trim_matches(|c: char| c == '.' || c == ',')))?;
+
+    let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+
+    // Build the target instant in the resolved timezone, then convert to UTC
+    // millis. Done generically over the timezone so the local-fallback and the
+    // named-tz path share one code path.
+    fn resolve<Tz: TimeZone>(
+        tz: Tz,
+        now_ms: i64,
+        time: NaiveTime,
+        weekday: Option<Weekday>,
+    ) -> Option<i64> {
+        let now = Utc.timestamp_millis_opt(now_ms).single()?.with_timezone(&tz);
+        let mut date = now.date_naive();
+        match weekday {
+            Some(target) => {
+                // Advance to the next date whose weekday matches (today counts
+                // only if the time hasn't passed yet).
+                for _ in 0..8 {
+                    if date.weekday() == target {
+                        if let Some(dt) = tz
+                            .from_local_datetime(&date.and_time(time))
+                            .single()
+                            .filter(|dt| dt.timestamp_millis() > now_ms)
+                        {
+                            return Some(dt.timestamp_millis());
+                        }
+                    }
+                    date += Duration::days(1);
+                }
+                None
+            }
+            None => {
+                let today = tz.from_local_datetime(&date.and_time(time)).single();
+                match today {
+                    Some(dt) if dt.timestamp_millis() > now_ms => Some(dt.timestamp_millis()),
+                    _ => tz
+                        .from_local_datetime(&(date + Duration::days(1)).and_time(time))
+                        .single()
+                        .map(|dt| dt.timestamp_millis()),
+                }
+            }
+        }
+    }
+
+    match tz {
+        Some(tz) => resolve(tz, now_ms, time, weekday),
+        None => resolve(chrono::Local, now_ms, time, weekday),
+    }
+}
+
+/// Parse a 3+ letter weekday prefix (`mon`, `tuesday`, …) — lowercase input.
+fn parse_weekday(token: &str) -> Option<chrono::Weekday> {
+    use chrono::Weekday::*;
+    let t = token.trim_matches(|c: char| !c.is_ascii_alphabetic());
+    if t.len() < 3 {
+        return None;
+    }
+    Some(match &t[..3] {
+        "mon" => Mon,
+        "tue" => Tue,
+        "wed" => Wed,
+        "thu" => Thu,
+        "fri" => Fri,
+        "sat" => Sat,
+        "sun" => Sun,
+        _ => return None,
+    })
+}
+
+/// Parse a clock token into `(hour_0_23, minute)`. Accepts 12h (`8pm`,
+/// `8:20pm`, `12am`) and 24h (`20:20`, `8:20`, `9`). Returns `None` for tokens
+/// that don't look like a time (so weekday / timezone tokens are skipped).
+fn parse_clock(token: &str) -> Option<(u32, u32)> {
+    let t = token.trim();
+    let (digits, meridiem) = if let Some(rest) = t.strip_suffix("pm") {
+        (rest, Some(true))
+    } else if let Some(rest) = t.strip_suffix("am") {
+        (rest, Some(false))
+    } else {
+        (t, None)
+    };
+    let digits = digits.trim();
+    if digits.is_empty() || !digits.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    let (h_str, m_str) = match digits.split_once(':') {
+        Some((h, m)) => (h, m),
+        None => (digits, "0"),
+    };
+    let mut hour: u32 = h_str.parse().ok()?;
+    let minute: u32 = m_str.parse().ok()?;
+    if minute > 59 {
+        return None;
+    }
+    match meridiem {
+        Some(true) => {
+            // pm: 12pm stays 12, 1–11pm add 12.
+            if hour == 12 {
+                hour = 12;
+            } else if hour <= 11 {
+                hour += 12;
+            } else {
+                return None; // "13pm" is nonsense
+            }
+        }
+        Some(false) => {
+            // am: 12am is midnight (0), others unchanged.
+            if hour == 12 {
+                hour = 0;
+            } else if hour > 11 {
+                return None;
+            }
+        }
+        None => {
+            // 24h. Bare hour like "9" is valid; 0..=23 only.
+        }
+    }
+    if hour > 23 {
+        return None;
+    }
+    Some((hour, minute))
 }
 
 #[cfg(test)]
@@ -723,5 +905,109 @@ mod tests {
         assert!(matches!(classify_judge_error("Error: rate_limit_error"), JudgeFailure::Quota));
         assert!(matches!(classify_judge_error("overloaded_error"), JudgeFailure::Transient));
         assert!(matches!(classify_judge_error("connection reset"), JudgeFailure::Transient));
+    }
+
+    #[test]
+    fn usage_limit_detects_both_subscription_limits() {
+        // The real ~5-hour (session) and weekly subscription walls — neither
+        // contains "usage limit" / "rate limit" / "quota", so the old check
+        // missed them and the supervisor retried the wall forever.
+        assert!(is_usage_limit_error(
+            "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
+        ));
+        assert!(is_usage_limit_error(
+            "You've reached your weekly limit · resets Wed 9am"
+        ));
+        // API / billing forms still match.
+        assert!(is_usage_limit_error("rate_limit_error"));
+        assert!(is_usage_limit_error("insufficient quota"));
+        // Non-limit errors do not.
+        assert!(!is_usage_limit_error("overloaded_error"));
+        assert!(!is_usage_limit_error("connection reset by peer"));
+        // The session-limit message must classify as Quota (was Transient).
+        assert!(matches!(
+            classify_judge_error("You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"),
+            JudgeFailure::Quota
+        ));
+    }
+
+    #[test]
+    fn parse_reset_session_limit_named_tz() {
+        use chrono::{TimeZone, Utc};
+        // 2026-06-29 12:15:00 UTC == 19:15 in Asia/Novosibirsk (UTC+7).
+        let now = Utc.with_ymd_and_hms(2026, 6, 29, 12, 15, 0).unwrap();
+        let got = parse_usage_limit_reset_ms(
+            "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)",
+            now.timestamp_millis(),
+        )
+        .expect("parse");
+        // 8:20pm Novosibirsk == 13:20:00 UTC, same day (still ahead of 19:15).
+        let want = Utc.with_ymd_and_hms(2026, 6, 29, 13, 20, 0).unwrap();
+        assert_eq!(got, want.timestamp_millis());
+    }
+
+    #[test]
+    fn parse_reset_24h_and_rolls_to_tomorrow() {
+        use chrono_tz::Tz;
+        // Use a fixed named tz in the message so the test is independent of the
+        // machine's local zone. now = 10:00 UTC == 17:00 in Novosibirsk.
+        let tz: Tz = "Asia/Novosibirsk".parse().unwrap();
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 29, 10, 0, 0)
+            .unwrap();
+        use chrono::TimeZone as _;
+        // "resets 9:00" (24h) — 9:00 already passed today (17:00 now) → tomorrow.
+        let got = parse_usage_limit_reset_ms(
+            "weekly limit · resets 9:00 (Asia/Novosibirsk)",
+            now.timestamp_millis(),
+        )
+        .expect("parse");
+        let want = tz
+            .with_ymd_and_hms(2026, 6, 30, 9, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn parse_reset_weekday_picks_next_matching_day() {
+        use chrono::TimeZone as _;
+        use chrono_tz::Tz;
+        let tz: Tz = "Asia/Novosibirsk".parse().unwrap();
+        // 2026-06-29 is a Monday. Next Wednesday is 2026-07-01.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 29, 3, 0, 0).unwrap();
+        let got = parse_usage_limit_reset_ms(
+            "You've reached your weekly limit · resets Wed 9am (Asia/Novosibirsk)",
+            now.timestamp_millis(),
+        )
+        .expect("parse");
+        let want = tz
+            .with_ymd_and_hms(2026, 7, 1, 9, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn parse_reset_none_when_no_clause() {
+        let now = 1_782_000_000_000;
+        assert_eq!(parse_usage_limit_reset_ms("rate_limit_error", now), None);
+        assert_eq!(
+            parse_usage_limit_reset_ms("You've hit your session limit", now),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_clock_forms() {
+        assert_eq!(parse_clock("8:20pm"), Some((20, 20)));
+        assert_eq!(parse_clock("8pm"), Some((20, 0)));
+        assert_eq!(parse_clock("12am"), Some((0, 0)));
+        assert_eq!(parse_clock("12pm"), Some((12, 0)));
+        assert_eq!(parse_clock("20:20"), Some((20, 20)));
+        assert_eq!(parse_clock("9"), Some((9, 0)));
+        assert_eq!(parse_clock("wed"), None);
+        assert_eq!(parse_clock("13pm"), None);
+        assert_eq!(parse_clock("8:99"), None);
     }
 }

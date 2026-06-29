@@ -1790,18 +1790,81 @@ impl SolutionAgentStore {
         self.finish_judge(id, cx);
         match crate::supervisor::classify_judge_error(&message) {
             JudgeFailure::Quota => {
-                if let Some(state) = self.supervisor_states.get_mut(&id) {
-                    state.enabled = false;
-                    state.status = SupervisorStatus::Stopped(StoppedReason::Quota);
-                    state.next_eligible_ms = None;
+                // A usage/session/weekly limit is a wall, not a transient error.
+                // If the observer is still enabled AND the message carries a
+                // parseable reset time, schedule an auto-resume: stay `Watching`
+                // with the watchdog gate set to `reset + jitter(2..=15min)`, so
+                // `tick_supervisor` re-fires a judge once the limit clears, which
+                // re-observes the idle/errored worker and nudges it to continue.
+                // The jitter avoids hammering the wall at the exact reset minute.
+                // Otherwise (observer off, or no reset time) fall back to a
+                // terminal `Stopped(Quota)`.
+                use rand::Rng as _;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let enabled = self
+                    .supervisor_states
+                    .get(&id)
+                    .map(|s| s.enabled)
+                    .unwrap_or(false);
+                let resume_at_ms = if enabled {
+                    crate::supervisor::parse_usage_limit_reset_ms(&message, now_ms).map(|reset| {
+                        let jitter_ms = rand::thread_rng().gen_range(120_000i64..=900_000i64);
+                        reset + jitter_ms
+                    })
+                } else {
+                    None
+                };
+                match resume_at_ms {
+                    Some(resume_ms) => {
+                        if let Some(state) = self.supervisor_states.get_mut(&id) {
+                            state.status = SupervisorStatus::Watching;
+                            state.next_eligible_ms = Some(resume_ms);
+                            // Not a judge fault — don't count it toward the
+                            // transient-failure backoff exhaustion.
+                            state.backoff_attempt = 0;
+                        }
+                        let eta = chrono::DateTime::from_timestamp_millis(resume_ms)
+                            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                            .unwrap_or_else(|| "?".into());
+                        self.append_supervisor_diary_note(
+                            id,
+                            &format!(
+                                "usage limit hit; auto-resume scheduled ~{eta} local (reset + 2-15min jitter)"
+                            ),
+                            cx,
+                        );
+                        // Hold a live timer until the resume moment so a wake
+                        // happens even if nothing else ticks the watchdog. The
+                        // gate itself is `next_eligible_ms`, re-checked in
+                        // `tick_supervisor`.
+                        let delay = std::time::Duration::from_millis(
+                            (resume_ms - now_ms).max(0) as u64,
+                        );
+                        let task = cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(delay).await;
+                            this.update(cx, |this, _cx| {
+                                this.backoff_timers.remove(&id);
+                            })
+                            .ok();
+                        });
+                        self.backoff_timers.insert(id, task);
+                    }
+                    None => {
+                        if let Some(state) = self.supervisor_states.get_mut(&id) {
+                            state.enabled = false;
+                            state.status = SupervisorStatus::Stopped(StoppedReason::Quota);
+                            state.next_eligible_ms = None;
+                        }
+                        self.backoff_timers.remove(&id);
+                        self.append_supervisor_diary_note(
+                            id,
+                            "supervisor stopped: provider quota / usage limit \
+                             (no reset time parsed or observer disabled)",
+                            cx,
+                        );
+                        self.clear_supervisor_question(id, cx);
+                    }
                 }
-                self.backoff_timers.remove(&id);
-                self.append_supervisor_diary_note(
-                    id,
-                    "supervisor stopped: provider quota / usage limit",
-                    cx,
-                );
-                self.clear_supervisor_question(id, cx);
             }
             JudgeFailure::Transient => {
                 let attempt = {

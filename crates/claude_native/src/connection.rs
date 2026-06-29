@@ -1424,20 +1424,42 @@ async fn run_update_pump(
                 // Synthesize Stopped on the AcpThread so the store flips
                 // back to Idle and the next user message starts a fresh
                 // prompt().
-                let stop_reason = match &turn_end {
-                    TurnEnd::Stop(reason) => *reason,
-                    TurnEnd::Error(_) => acp::StopReason::EndTurn,
-                };
-                log::warn!(
-                    target: "claude_native::prompt_tx",
-                    "Result handler found prompt_tx already None — synthesizing Stopped({stop_reason:?}) on the \
-                     AcpThread (orphan result, likely background-bash continuation; turn_end={turn_end:?})"
-                );
-                thread
-                    .update(cx, |_thread, cx| {
-                        cx.emit(AcpThreadEvent::Stopped(stop_reason));
-                    })
-                    .ok();
+                // For a clean orphan stop, synthesize `Stopped` so the store
+                // flips Running→Idle. For an orphan *error* (e.g. an account
+                // usage-limit `result` that lands after `prompt_tx` was already
+                // consumed), emit `Error` instead: synthesizing a benign
+                // `Stopped(EndTurn)` here would silently swallow the failure and
+                // leave the session looking like it ended normally (the observed
+                // "froze with no error" symptom). `Error` flips the session to
+                // `Errored` so the user — and the supervisor's usage-limit
+                // auto-resume — actually see it.
+                match &turn_end {
+                    TurnEnd::Stop(reason) => {
+                        log::warn!(
+                            target: "claude_native::prompt_tx",
+                            "Result handler found prompt_tx already None — synthesizing Stopped({reason:?}) \
+                             on the AcpThread (orphan result, likely background-bash continuation)"
+                        );
+                        let reason = *reason;
+                        thread
+                            .update(cx, |_thread, cx| {
+                                cx.emit(AcpThreadEvent::Stopped(reason));
+                            })
+                            .ok();
+                    }
+                    TurnEnd::Error(detail) => {
+                        log::warn!(
+                            target: "claude_native::prompt_tx",
+                            "Result handler found prompt_tx already None for an ERROR result — surfacing it \
+                             on the AcpThread instead of swallowing it (orphan error; detail={detail})"
+                        );
+                        thread
+                            .update(cx, |_thread, cx| {
+                                cx.emit(AcpThreadEvent::Error);
+                            })
+                            .ok();
+                    }
+                }
             }
             continue;
         }
