@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -139,6 +140,19 @@ pub struct SolutionAgentStore {
     /// eligible again. Kept SEPARATE from `judge_sessions` so a stale backoff
     /// handle never blocks the next `spawn_judge`.
     backoff_timers: HashMap<SolutionSessionId, Task<()>>,
+    /// Per-session ordered history of abandoned ACP session ids (one is orphaned
+    /// on each `/compact` rotation and `/clear`). claude writes a
+    /// `~/.claude/projects/<cwd>/<acp_session_id>.jsonl` transcript (+ a
+    /// `<acp_session_id>/` subagents dir) per ACP session and NEVER deletes
+    /// them — GBs accrue over a multi-day session. We keep only the most recent
+    /// `KEEP_RAW_TRANSCRIPTS` (the live one + the last `KEEP_RAW_TRANSCRIPTS-1`
+    /// abandoned) and delete older ones. Keyed by our stable
+    /// `SolutionSessionId` so we only ever delete THIS session's transcripts,
+    /// never another session that happens to share the same project cwd.
+    /// In-memory + best-effort: an editor restart forgets the history (the
+    /// transcripts from before the restart are then left in place), but new
+    /// growth stays bounded for the whole life of a running session.
+    raw_transcript_history: HashMap<SolutionSessionId, VecDeque<String>>,
 }
 
 /// An in-flight ephemeral judge/auditor session. `judge_id` is `None` until
@@ -384,6 +398,30 @@ fn background_agent_dir_for(cwd: &std::path::Path, acp_session_id: &str) -> Opti
 /// same conditions (empty cwd / unresolvable home).
 fn parent_session_jsonl_for(cwd: &std::path::Path, acp_session_id: &str) -> Option<PathBuf> {
     Some(claude_project_dir_for(cwd)?.join(format!("{acp_session_id}.jsonl")))
+}
+
+/// How many of a session's raw claude JSONL transcripts to keep on disk: the
+/// live one plus the last `KEEP_RAW_TRANSCRIPTS - 1` abandoned rotations.
+const KEEP_RAW_TRANSCRIPTS: usize = 3;
+
+/// Push `abandoned` onto a session's transcript ring and return the ids that
+/// now fall outside the keep-window (oldest first). Pure (no IO) so the
+/// retention math is unit-tested directly. With `keep = 3` the live transcript
+/// is kept implicitly and the last 2 abandoned ones are retained.
+fn push_and_evict_transcripts(
+    history: &mut VecDeque<String>,
+    abandoned: String,
+    keep: usize,
+) -> Vec<String> {
+    history.push_back(abandoned);
+    let mut evicted = Vec::new();
+    while history.len() > keep.saturating_sub(1) {
+        match history.pop_front() {
+            Some(old) => evicted.push(old),
+            None => break,
+        }
+    }
+    evicted
 }
 
 /// Defensive per-tick read cap for the parent-JSONL scan. A single JSONL
@@ -836,6 +874,7 @@ impl SolutionAgentStore {
             judge_sessions: HashMap::new(),
             auditor_sessions: HashMap::new(),
             backoff_timers: HashMap::new(),
+            raw_transcript_history: HashMap::new(),
         }
     }
 
@@ -1246,6 +1285,41 @@ impl SolutionAgentStore {
         // never pruned — one entry would leak per closed session for the
         // editor's whole lifetime.
         self.metrics_emitter.clear_session(&id);
+        self.raw_transcript_history.remove(&id);
+    }
+
+    /// Record `abandoned_acp_id` (the ACP session orphaned by a `/compact`
+    /// rotation or `/clear`) for session `id` and delete claude's on-disk JSONL
+    /// transcripts that fall outside the keep-window — the live transcript plus
+    /// the last `KEEP_RAW_TRANSCRIPTS - 1` abandoned ones. Each ACP session
+    /// leaves a `~/.claude/projects/<cwd>/<acp_session_id>.jsonl` (+ a
+    /// `<acp_session_id>/` subagents dir) that claude never cleans up, so a
+    /// multi-day session would otherwise accrue gigabytes of dead transcripts.
+    /// Best-effort: any IO error is ignored. Keyed by our `SolutionSessionId`,
+    /// so only THIS session's transcripts are ever deleted even when several
+    /// sessions share the same project cwd.
+    fn prune_raw_transcripts(
+        &mut self,
+        id: SolutionSessionId,
+        abandoned_acp_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cwd) = self.sessions.get(&id).map(|s| s.read(cx).cwd.clone()) else {
+            return;
+        };
+        if cwd.as_os_str().is_empty() {
+            return;
+        }
+        let history = self.raw_transcript_history.entry(id).or_default();
+        let evicted = push_and_evict_transcripts(history, abandoned_acp_id, KEEP_RAW_TRANSCRIPTS);
+        for old in evicted {
+            if let Some(jsonl) = parent_session_jsonl_for(&cwd, &old) {
+                let _ = std::fs::remove_file(jsonl);
+            }
+            if let Some(proj) = claude_project_dir_for(&cwd) {
+                let _ = std::fs::remove_dir_all(proj.join(&old));
+            }
+        }
     }
 
     /// Record the meta-auditor's verdict for supervised session `id`, tear down
@@ -4527,6 +4601,9 @@ impl SolutionAgentStore {
                     }
                     store.pool_release_session(pair.clone(), cx);
                 }
+                // Bound disk: the pre-rotation transcript is now orphaned —
+                // keep only the most recent few of this session's transcripts.
+                store.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
                 cx.emit(SolutionAgentStoreEvent::SessionContextReset {
                     id: session_id,
                     context_count: new_count,
@@ -4705,6 +4782,9 @@ impl SolutionAgentStore {
                     }
                     store.pool_release_session(pair.clone(), cx);
                 }
+                // Bound disk: the pre-clear transcript is now orphaned — keep
+                // only the most recent few of this session's transcripts.
+                store.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
                 // `reset_context` does not bump `context_count` (only
                 // `rotate_context` does), so read the current value to
                 // forward as-is on the wire.

@@ -154,6 +154,26 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
     });
 }
 
+#[test]
+fn push_and_evict_transcripts_keeps_window() {
+    use std::collections::VecDeque;
+    let mut h: VecDeque<String> = VecDeque::new();
+    // keep = 3 → the live transcript is implicit, so 2 abandoned are retained.
+    assert!(super::push_and_evict_transcripts(&mut h, "a".into(), 3).is_empty());
+    assert!(super::push_and_evict_transcripts(&mut h, "b".into(), 3).is_empty());
+    // The third abandoned id evicts the oldest ("a").
+    assert_eq!(
+        super::push_and_evict_transcripts(&mut h, "c".into(), 3),
+        vec!["a".to_string()]
+    );
+    assert_eq!(
+        super::push_and_evict_transcripts(&mut h, "d".into(), 3),
+        vec!["b".to_string()]
+    );
+    assert_eq!(h.len(), 2);
+    assert_eq!(h.front().map(String::as_str), Some("c"));
+}
+
 /// `cold_close_solution` bypasses `close_session` (it drops live entities
 /// without soft-closing the persisted sessions), so it must prune the same
 /// per-session runtime maps itself or they leak when a solution's window closes.
