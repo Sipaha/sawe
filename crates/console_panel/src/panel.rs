@@ -69,6 +69,33 @@ fn active_member_path(solution_id: &SolutionId, cx: &App) -> Option<PathBuf> {
     Some(solution.root.clone())
 }
 
+/// Whether a tab whose working directory is `tab_cwd` belongs to the
+/// project rooted at `active_member_path`. Mirrors `project_panel`'s
+/// worktree filter (`abs_path().starts_with(active_member_path)`): a `None`
+/// member path means "no active-member filter" so every tab is shown;
+/// otherwise the tab is in scope iff its cwd lives inside the member root.
+fn tab_cwd_in_scope(tab_cwd: Option<&std::path::Path>, active_member_path: Option<&std::path::Path>) -> bool {
+    match active_member_path {
+        None => true,
+        Some(member) => tab_cwd.is_some_and(|cwd| cwd.starts_with(member)),
+    }
+}
+
+/// Resolve which tab the panel should render as active given each tab's
+/// in-scope flag and the stored `active_index`. The stored active tab wins
+/// when it is in scope; otherwise the first in-scope tab is used; `None`
+/// when no tab is in scope. Keeps the highlighted strip tab and the
+/// rendered content in agreement even when the stored active tab belongs to
+/// a different member than the one currently selected.
+fn effective_active_index(in_scope: &[bool], active_index: Option<usize>) -> Option<usize> {
+    if let Some(ix) = active_index
+        && in_scope.get(ix).copied().unwrap_or(false)
+    {
+        return Some(ix);
+    }
+    in_scope.iter().position(|&visible| visible)
+}
+
 pub enum ConsoleTab {
     Terminal {
         view: Entity<TerminalView>,
@@ -77,6 +104,15 @@ pub enum ConsoleTab {
         view: Entity<SolutionSessionView>,
         session_id: SolutionSessionId,
     },
+}
+
+/// Stable per-tab identity used to remember the active tab for each member
+/// project across active-member switches. Indices shift as tabs open/close,
+/// so the per-member memory is keyed by content, not position.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ConsoleTabKey {
+    Terminal(gpui::EntityId),
+    Chat(SolutionSessionId),
 }
 
 /// Drag payload for reordering console tabs. The bespoke tab strip
@@ -132,6 +168,13 @@ pub struct ConsolePanel {
     /// orderings wins (the tab landing vs. the create future resolving)
     /// performs the activation and clears this.
     chat_tab_to_activate: Option<SolutionSessionId>,
+    /// Last-active tab per member project, so switching back to a member
+    /// restores the exact dialog the user last had open there. In-memory
+    /// only — on restart the panel falls back to each member's first tab.
+    active_by_member: HashMap<PathBuf, ConsoleTabKey>,
+    /// The member path the panel last rendered for; used to attribute the
+    /// outgoing active tab to the correct member when the active member flips.
+    last_member_path: Option<PathBuf>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -176,6 +219,18 @@ impl ConsolePanel {
                 }
             },
         );
+        // Re-scope the visible tabs whenever the solution-wide active member
+        // flips, so the strip + content swap to that project's own dialogs —
+        // mirroring how Project Panel / Git Panel follow the active member.
+        let member_change_sub = SolutionStore::try_global(cx).map(|store| {
+            cx.subscribe(&store, |this, _store, event, cx| {
+                if matches!(event, solutions::SolutionStoreEvent::ActiveMemberChanged { .. }) {
+                    this.on_active_member_changed(cx);
+                }
+            })
+        });
+        let mut subscriptions = vec![chat_event_sub];
+        subscriptions.extend(member_change_sub);
         Self {
             workspace,
             tabs: Vec::new(),
@@ -189,7 +244,9 @@ impl ConsolePanel {
             deferred_tasks: HashMap::default(),
             assistant_enabled: false,
             chat_tab_to_activate: None,
-            _subscriptions: vec![chat_event_sub],
+            active_by_member: HashMap::default(),
+            last_member_path: None,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -575,6 +632,20 @@ impl Focusable for ConsolePanel {
 
 impl Render for ConsolePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep the per-member active-tab memory current from this safe
+        // (un-leased) context: record which tab is active for the member we
+        // are about to render, so `on_active_member_changed` can stash it
+        // under the right member when the active member next flips.
+        let member_path = self.active_member_path(cx);
+        let scope_flags = self.tab_scope_flags(cx);
+        if let Some(path) = member_path.clone()
+            && let Some(ix) = effective_active_index(&scope_flags, self.active_index)
+            && let Some(tab) = self.tabs.get(ix)
+        {
+            self.active_by_member.insert(path, Self::tab_key(tab));
+        }
+        self.last_member_path = member_path;
+
         let menu_overlay = self.tab_context_menu.as_ref().map(|(menu, position, _)| {
             deferred(
                 anchored()
@@ -596,7 +667,8 @@ impl Render for ConsolePanel {
 
 impl ConsolePanel {
     fn render_tab_strip(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.active_index;
+        let scope_flags = self.tab_scope_flags(cx);
+        let active = effective_active_index(&scope_flags, self.active_index);
         let mut strip = div()
             .id("console-tab-strip")
             .flex()
@@ -608,6 +680,13 @@ impl ConsolePanel {
             .border_color(cx.theme().colors().border_variant)
             .overflow_x_scroll();
         for (ix, tab) in self.tabs.iter().enumerate() {
+            // Only render tabs belonging to the active member project; the
+            // rest stay live in `self.tabs` (absolute indices keep
+            // activate/close/reorder valid) but are hidden until their
+            // member is selected.
+            if !scope_flags.get(ix).copied().unwrap_or(true) {
+                continue;
+            }
             let (icon, title): (IconName, SharedString) = match tab {
                 ConsoleTab::Terminal { view } => {
                     (IconName::Terminal, view.read(cx).tab_content_text(0, cx))
@@ -795,6 +874,87 @@ impl ConsolePanel {
         let workspace = self.workspace.upgrade()?;
         let workspace = workspace.read(cx);
         active_solution_id_for_workspace(workspace, cx)
+    }
+
+    /// Root path of the panel's active member project — the project selected
+    /// in the project tab strip. `None` when no solution hosts the panel's
+    /// worktrees or no active member is recorded, in which case the panel
+    /// shows every tab (no per-member filter). Mirrors
+    /// `project_panel::ProjectPanel::active_member_path`.
+    fn active_member_path(&self, cx: &App) -> Option<PathBuf> {
+        let solution_id = self.active_solution_id(cx)?;
+        active_member_path(&solution_id, cx)
+    }
+
+    /// Working directory a tab is anchored to, used to decide which member
+    /// project owns it. Chat tabs use the session's immutable `cwd` (set to
+    /// the active member path at creation, the same value `claude-acp` keys
+    /// its transcript bucket on); terminal tabs use their live working
+    /// directory.
+    fn tab_cwd(&self, tab: &ConsoleTab, cx: &App) -> Option<PathBuf> {
+        match tab {
+            ConsoleTab::Terminal { view } => {
+                view.read(cx).terminal().read(cx).working_directory()
+            }
+            ConsoleTab::Chat { session_id, .. } => SolutionAgentStore::try_global(cx)
+                .and_then(|store| store.read(cx).session(*session_id))
+                .map(|session| session.read(cx).cwd.clone()),
+        }
+    }
+
+    /// Per-tab in-scope flags for the currently active member, in tab order.
+    fn tab_scope_flags(&self, cx: &App) -> Vec<bool> {
+        let member_path = self.active_member_path(cx);
+        self.tabs
+            .iter()
+            .map(|tab| {
+                tab_cwd_in_scope(self.tab_cwd(tab, cx).as_deref(), member_path.as_deref())
+            })
+            .collect()
+    }
+
+    /// Stable identity for a tab, used to remember the active tab per member
+    /// across active-member switches.
+    fn tab_key(tab: &ConsoleTab) -> ConsoleTabKey {
+        match tab {
+            ConsoleTab::Terminal { view } => ConsoleTabKey::Terminal(view.entity_id()),
+            ConsoleTab::Chat { session_id, .. } => ConsoleTabKey::Chat(*session_id),
+        }
+    }
+
+    /// Re-resolve `active_index` for the now-active member: remember the tab
+    /// that was active for the previous member, then restore the new
+    /// member's last-active tab (if it is still present and in scope),
+    /// falling back to its first in-scope tab. Called when the solution-wide
+    /// active member flips so the strip and content swap to that project's
+    /// own dialogs.
+    fn on_active_member_changed(&mut self, cx: &mut Context<Self>) {
+        // Stash the outgoing member's active tab so switching back restores
+        // the exact dialog the user last had open.
+        if let Some(prev) = self.last_member_path.take()
+            && let Some(ix) = self.active_index
+            && let Some(tab) = self.tabs.get(ix)
+        {
+            self.active_by_member
+                .insert(prev, Self::tab_key(tab));
+        }
+
+        let member_path = self.active_member_path(cx);
+        let flags = self.tab_scope_flags(cx);
+
+        let remembered = member_path
+            .as_ref()
+            .and_then(|path| self.active_by_member.get(path).copied());
+        let remembered_ix = remembered.and_then(|key| {
+            self.tabs.iter().position(|tab| Self::tab_key(tab) == key)
+        });
+
+        self.active_index = match remembered_ix {
+            Some(ix) if flags.get(ix).copied().unwrap_or(false) => Some(ix),
+            _ => effective_active_index(&flags, self.active_index),
+        };
+        self.last_member_path = member_path;
+        cx.notify();
     }
 
     pub fn add_terminal_tab(
@@ -1380,8 +1540,9 @@ impl ConsolePanel {
         .detach();
     }
 
-    fn render_active_tab(&self, _window: &mut Window, _cx: &mut Context<Self>) -> AnyElement {
-        let Some(ix) = self.active_index else {
+    fn render_active_tab(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let scope_flags = self.tab_scope_flags(cx);
+        let Some(ix) = effective_active_index(&scope_flags, self.active_index) else {
             return div().flex_1().min_h_0().into_any_element();
         };
         match &self.tabs[ix] {
@@ -1401,6 +1562,11 @@ impl ConsolePanel {
     }
 
     fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        // Per-member active-tab memory is recorded in `render` / handled in
+        // `on_active_member_changed`, both of which read the workspace from a
+        // safe (un-leased) context. Reading it here would double-lease when
+        // `activate_tab` runs inside a `Workspace::update` (e.g. a workspace
+        // action handler or a test driving the panel through the window).
         if index < self.tabs.len() {
             self.active_index = Some(index);
             cx.notify();
@@ -1641,7 +1807,55 @@ mod tests {
     use project::{FakeFs, Project};
     use settings::SettingsStore;
     use solution_agent::store::SolutionAgentStore;
+    use std::path::Path;
     use workspace::Workspace;
+
+    #[test]
+    fn tab_cwd_in_scope_filters_by_active_member() {
+        let member_a = Path::new("/sol/member-a");
+        let member_b = Path::new("/sol/member-b");
+
+        // No active member → every tab is in scope (mirrors project_panel,
+        // which shows all worktrees when no member is selected).
+        assert!(tab_cwd_in_scope(Some(Path::new("/sol/member-a/sub")), None));
+        assert!(tab_cwd_in_scope(None, None));
+
+        // With an active member, a tab is in scope iff its cwd lives under
+        // that member's root.
+        assert!(tab_cwd_in_scope(Some(member_a), Some(member_a)));
+        assert!(tab_cwd_in_scope(
+            Some(Path::new("/sol/member-a/nested/dir")),
+            Some(member_a)
+        ));
+        assert!(!tab_cwd_in_scope(Some(member_b), Some(member_a)));
+
+        // A tab whose cwd is the solution root (no member) is hidden while a
+        // member is active, and a tab with no recorded cwd never matches a
+        // concrete member.
+        assert!(!tab_cwd_in_scope(Some(Path::new("/sol")), Some(member_a)));
+        assert!(!tab_cwd_in_scope(None, Some(member_a)));
+    }
+
+    #[test]
+    fn effective_active_index_prefers_in_scope_active() {
+        // Stored active tab is in scope → it stays active.
+        assert_eq!(
+            effective_active_index(&[false, true, true], Some(1)),
+            Some(1)
+        );
+        // Stored active tab is out of scope → fall back to first in-scope tab.
+        assert_eq!(
+            effective_active_index(&[false, true, true], Some(0)),
+            Some(1)
+        );
+        // No stored active → first in-scope tab.
+        assert_eq!(effective_active_index(&[false, false, true], None), Some(2));
+        // Nothing in scope → no active tab.
+        assert_eq!(effective_active_index(&[false, false, false], Some(1)), None);
+        assert_eq!(effective_active_index(&[], None), None);
+        // Stale index past the end → fall back to first in-scope.
+        assert_eq!(effective_active_index(&[true, false], Some(9)), Some(0));
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
