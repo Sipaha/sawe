@@ -41,13 +41,19 @@ pub(crate) use queue::{QUEUE_HINT_LINE, TS_PREFIX_CLOSE, TS_PREFIX_OPEN};
 // candidate for tear-down; dead-linger = grace period before reaping.
 const MANAGED_AGENT_STALE_TIMEOUT_SECS: u64 = 120;
 const MANAGED_AGENT_DEAD_LINGER_SECS: u64 = 300;
-/// How long a session may sit in `Running` with zero streaming / tool
-/// activity before the stuck-session watchdog ([`SolutionAgentStore::
-/// tick_stuck_sessions`]) treats its subprocess as wedged and
-/// non-destructively reconnects it. A healthy turn streams well within this;
-/// the trade-off (a legitimately-silent long foreground command gets
-/// reconnected) is documented on the watchdog.
+/// How long a session may sit in `Running` with zero streaming activity AND no
+/// in-progress tool call before the stuck-session watchdog
+/// ([`SolutionAgentStore::tick_stuck_sessions`]) treats its subprocess as
+/// wedged and non-destructively reconnects it. A healthy turn streams well
+/// within this; a turn legitimately blocked on a foreground command is held off
+/// by the in-progress-tool check (see [`TOOL_STUCK_SECS`]).
 const STUCK_TURN_SECS: u64 = 5 * 60;
+/// Backstop for the watchdog when a tool call is in-progress (claude is blocked
+/// on a foreground command): only after the SAME tool has been running this
+/// long do we treat it as truly stuck and reconnect. Generous so real
+/// builds/tests aren't killed; covers a command that hangs forever or claude
+/// wedging mid-tool.
+const TOOL_STUCK_SECS: u64 = 30 * 60;
 
 pub struct SolutionAgentStore {
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
@@ -1972,20 +1978,24 @@ impl SolutionAgentStore {
     /// the pending prompt → `Errored`); this catches the harder hung-but-alive
     /// case the EOF path can't see.
     ///
+    /// A genuinely-busy turn IS distinguishable from a hang: when claude blocks
+    /// on a slow FOREGROUND command it leaves that tool call in
+    /// [`ToolCallStatus::InProgress`] for the command's whole duration (the
+    /// command streams nothing, so `last_activity_at` is frozen — but the tool
+    /// is demonstrably still running). So we only treat a silent turn as wedged
+    /// when there is NO in-progress tool call. When there IS one we leave it
+    /// alone until that single tool has itself been in-progress for an
+    /// unreasonable [`TOOL_STUCK_SECS`] (backstop for a command that truly hangs
+    /// forever, or claude wedging mid-tool). Background (`run_in_background`)
+    /// commands don't block claude, so they keep streaming and never get here.
+    ///
     /// Recovery is [`reconnect_agent`] — non-destructive: it respawns the
     /// subprocess and replays the same transcript, keeping the conversation.
     /// `reconnect_agent` synchronously flips the session out of `Running` (to
     /// `Errored("reconnecting…")`), so the next tick won't re-fire for it.
-    ///
-    /// TRADE-OFF: a turn that is legitimately silent for 5 minutes — e.g.
-    /// claude blocked on a slow FOREGROUND command (a long build/test) that
-    /// streams nothing while it runs — is indistinguishable from a hang and
-    /// will be reconnected, losing that command's in-flight progress (claude
-    /// re-reads context from the transcript on resume). Tune [`STUCK_TURN_SECS`]
-    /// if that bites. Background (`run_in_background`) commands don't block
-    /// claude, so they keep streaming and never trip this.
     pub(crate) fn tick_stuck_sessions(&mut self, cx: &mut Context<Self>) {
         use crate::model::SessionState;
+        use acp_thread::{AgentThreadEntry, ToolCallStatus};
         let now = Utc::now();
         let stuck: Vec<SolutionSessionId> = self
             .sessions
@@ -1997,27 +2007,49 @@ impl SolutionAgentStore {
                 // prebuilt sessions have nothing to reconnect.)
                 if s.is_supervisor_ephemeral
                     || s.project.is_none()
-                    || s.acp_thread().is_none()
                     || !matches!(s.state, SessionState::Running { .. })
                 {
                     return None;
                 }
+                let thread = s.acp_thread()?;
                 let silent_secs = now.signed_duration_since(s.last_activity_at).num_seconds();
-                (silent_secs >= STUCK_TURN_SECS as i64).then_some(*id)
+                // Not silent long enough yet → claude is clearly alive.
+                if silent_secs < STUCK_TURN_SECS as i64 {
+                    return None;
+                }
+                // How long has the most-recent in-progress tool call been
+                // running? `None` = no tool is executing right now.
+                let active_tool_secs = thread.read(cx).entries().iter().rev().find_map(|e| {
+                    match e {
+                        AgentThreadEntry::ToolCall(tc)
+                            if matches!(tc.status, ToolCallStatus::InProgress) =>
+                        {
+                            let since = tc.status_started_at.unwrap_or(s.last_activity_at);
+                            Some(now.signed_duration_since(since).num_seconds())
+                        }
+                        _ => None,
+                    }
+                });
+                let wedged = match active_tool_secs {
+                    // A tool IS running (foreground command) — leave it be unless
+                    // it has itself been stuck for an unreasonable time.
+                    Some(tool_secs) => tool_secs >= TOOL_STUCK_SECS as i64,
+                    // No tool executing + long silence → claude hung between steps.
+                    None => true,
+                };
+                wedged.then_some(*id)
             })
             .collect();
         for id in stuck {
             log::warn!(
                 target: "solution_agent::store",
-                "session={id} wedged in Running with no activity for >={STUCK_TURN_SECS}s — \
-                 auto-reconnecting (respawn subprocess + replay transcript)"
+                "session={id} wedged in Running (no progress {STUCK_TURN_SECS}s, no live tool — \
+                 or a tool in-progress >{TOOL_STUCK_SECS}s) — auto-reconnecting \
+                 (respawn subprocess + replay transcript)"
             );
             self.append_supervisor_diary_note(
                 id,
-                &format!(
-                    "session wedged (no activity {}m while Running); auto-reconnect",
-                    STUCK_TURN_SECS / 60
-                ),
+                "session wedged while Running (hung subprocess); auto-reconnect",
                 cx,
             );
             self.reconnect_agent(id, cx).detach_and_log_err(cx);
