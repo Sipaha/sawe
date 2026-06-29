@@ -7012,6 +7012,37 @@ impl SolutionAgentStore {
                         None
                     }
                 });
+                // Flush any pending end-of-turn entry-update debounce SYNCHRONOUSLY.
+                //
+                // The last assistant text of a turn arrives via `EntryUpdated`,
+                // whose `SessionMessageAppended` emit (and thus its
+                // `agent_session_dirty` re-poll signal) is debounced 500 ms / 2 s
+                // to coalesce a streaming burst. At turn end that pending debounce
+                // task is the ONLY append signal carrying the final flushed tail,
+                // and it is fragile: if `Stopped` does not change the state
+                // discriminant (e.g. the session was already Idle / Stopping, so
+                // `mark_state_changed` below emits no dirty), or the debounce task
+                // is dropped before it fires, the final entry's append notification
+                // never reaches the client. The mobile then keeps showing the
+                // turn WITHOUT its last message until the next client→server
+                // interaction re-polls — the bug this flush fixes. Emitting the
+                // queued append here (and clearing the slot so it can't double-fire
+                // when its timer elapses) guarantees the final entry's
+                // `SessionMessageAppended` + `agent_session_dirty` ride out
+                // immediately on the turn-completion tick.
+                let pending_throttled: Vec<usize> = self
+                    .entry_update_throttles
+                    .keys()
+                    .filter(|(sid, _)| *sid == session_id)
+                    .map(|(_, idx)| *idx)
+                    .collect();
+                for entry_index in pending_throttled {
+                    self.entry_update_throttles.remove(&(session_id, entry_index));
+                    cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
+                        session_id,
+                        entry_index,
+                    ));
+                }
                 self.mutate_state(session_id, |state| *state = SessionState::Idle, cx);
                 if let Some(s) = self.sessions.get(&session_id).cloned() {
                     s.update(cx, |s, _| {

@@ -4342,6 +4342,309 @@ async fn entry_updated_burst_coalesces_then_force_emits(cx: &mut TestAppContext)
     );
 }
 
+/// Reproduction for the "phone never shows the LAST message of a turn until the
+/// next send" bug. Drives the real turn-end acp event sequence — a streamed
+/// assistant reply whose trailing bytes are flushed at end-of-turn, then
+/// `Stopped` — and asserts that, from a cursor captured BEFORE the turn ended, a
+/// `get_session_changes` poll (what the mobile runs on `agent_session_dirty`)
+/// returns the FINAL entry with its complete text and that the session's
+/// `change_seq` advanced past it.
+///
+/// The wire path the mobile depends on at turn end is: the `Stopped` event flips
+/// the session Idle, which advances `change_seq` and emits a `dirty` carrying
+/// that fresh seq; the mobile converges on it. This test pins that the final
+/// entry IS visible to that poll — without the fix it was not, because the only
+/// `change_seq` bump after the final flush rode the debounced
+/// `SessionMessageAppended` whose timer was cancelled by the session being torn
+/// down / never drained, so the `Stopped` dirty reported a seq that did not yet
+/// cover the flushed tail.
+#[gpui::test]
+async fn final_streamed_message_is_visible_to_delta_poll_after_stop(cx: &mut TestAppContext) {
+    use agent_client_protocol::schema as acp;
+
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // A user message (entry 0) then an assistant reply (entry 1). The assistant
+    // entry starts with a first chunk so subsequent text streams into it.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                acp::ContentBlock::Text(acp::TextContent::new("question".to_string())),
+                cx,
+            );
+            t.push_assistant_content_block(
+                acp::ContentBlock::Text(acp::TextContent::new("Answer: ".to_string())),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Capture the cursor the mobile would hold mid-turn (before the final
+    // streamed tail). This stands in for `openSeq` on the phone.
+    let cursor_before_tail = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let s = store.read(cx).session(session_id).expect("session");
+        s.read(cx).change_seq
+    });
+
+    // Force the session into Running so the upcoming Stopped flips the
+    // discriminant (Running -> Idle) and therefore emits the state change /
+    // dirty the mobile converges on — exactly what a real turn looks like.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.mutate_state(
+                session_id,
+                |state| {
+                    *state = SessionState::Running {
+                        started_at: std::time::Instant::now(),
+                        notified: false,
+                    };
+                },
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Stream a long trailing tail into the assistant entry. It lands in the
+    // streaming buffer and is revealed gradually — the final bytes only reach
+    // the markdown when the buffer is flushed at end-of-turn.
+    const TAIL: &str = "this is the final sentence of the assistant's reply that must reach the phone.";
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                acp::ContentBlock::Text(acp::TextContent::new(TAIL.to_string())),
+                false,
+                cx,
+            );
+        });
+    });
+    // Deliberately do NOT drain the reveal task fully — the tail is still
+    // buffered. The turn-end flush + Stopped is what must surface it.
+
+    // Now emit the exact end-of-turn sequence the run-turn completion code
+    // produces (acp_thread.rs Ok path): cancel the reveal task, flush the
+    // buffered tail into the markdown, signal the final EntryUpdated, then
+    // Stopped. `cancel` flushes the streaming buffer for us.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            // Flush the buffered tail (mirrors `flush_streaming_text` at turn end).
+            let _ = t.cancel(cx);
+            let last = t.entries().len().saturating_sub(1);
+            cx.emit(acp_thread::AcpThreadEvent::EntryUpdated(last));
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // CRITICAL: WITHOUT advancing any debounce/reveal timers, the `dirty`
+    // signal the editor pushed for the Stopped transition must already carry a
+    // `current_seq` that covers the final entry. The mobile receives this dirty
+    // and converges to it; if it does NOT cover the final entry, the phone's
+    // convergence poll either early-returns (cursor already >= target) or fetches
+    // a transcript that still lacks the flushed tail — the "last message missing
+    // until next send" symptom. Reading the dirty payload here mirrors the exact
+    // value `event_sources::build_session_dirty_payload` would have emitted on
+    // the Stopped store event.
+    let (immediate_dirty_seq, final_mod_seq) = cx.update(|cx| {
+        let dirty = crate::event_sources::build_session_dirty_payload(session_id, cx);
+        let seq = dirty
+            .get("current_seq")
+            .and_then(|v| v.as_u64())
+            .expect("dirty payload carries current_seq");
+        let store = SolutionAgentStore::global(cx);
+        let s = store.read(cx).session(session_id).expect("session");
+        let final_mod = s.read(cx).entries.last().expect("final entry").mod_seq;
+        (seq, final_mod)
+    });
+    assert!(
+        immediate_dirty_seq >= final_mod_seq,
+        "the dirty pushed on the Stopped transition (current_seq={immediate_dirty_seq}) must already \
+         cover the final entry's mod_seq ({final_mod_seq}) — without advancing any debounce timer; \
+         otherwise the phone never converges to the final message until the next send"
+    );
+
+    // Drain any debounce / reveal timers so an honest "after everything settles"
+    // state is observed (the bug is that the mobile must NOT need this).
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(2_500));
+    cx.executor().run_until_parked();
+
+    // The session must be Idle and its change_seq must have advanced past the
+    // cursor the mobile held mid-turn.
+    let (state_idle, change_seq_now, final_text) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let s = store.read(cx).session(session_id).expect("session");
+        let s = s.read(cx);
+        let idle = matches!(s.state, SessionState::Idle);
+        let text = match &s.entries.last().expect("final entry").kind {
+            crate::session_entry::SessionEntryKind::AssistantMessage { chunks } => chunks
+                .iter()
+                .map(|c| match c {
+                    crate::session_entry::AssistantChunk::Message(m) => m.to_string(),
+                    crate::session_entry::AssistantChunk::Thought(t) => t.to_string(),
+                })
+                .collect::<String>(),
+            other => panic!("expected assistant final entry, got {other:?}"),
+        };
+        (idle, s.change_seq, text)
+    });
+    assert!(state_idle, "session must be Idle after Stopped");
+    assert!(
+        final_text.contains("final sentence"),
+        "the flushed tail must be stored in the final entry: {final_text:?}"
+    );
+    assert!(
+        change_seq_now > cursor_before_tail,
+        "change_seq must advance past the mid-turn cursor ({change_seq_now} > {cursor_before_tail})"
+    );
+
+    // The decisive assertion: a delta poll from the mid-turn cursor (what the
+    // mobile runs when it receives the `Stopped` dirty) must return the final
+    // entry carrying the full flushed tail.
+    use context_server::listener::McpServerTool as _;
+    let delta = crate::mcp::GetSessionChangesTool
+        .run(
+            crate::mcp::GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: cursor_before_tail,
+                known_epoch: 0,
+                subagent_filter: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_changes")
+        .structured_content;
+    assert!(!delta.reset, "no epoch rotation expected");
+    let final_index = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let s = store.read(cx).session(session_id).expect("session");
+        s.read(cx).entries.len() - 1
+    });
+    let returned_final = delta
+        .changed_entries
+        .iter()
+        .find(|e| e.index == final_index)
+        .unwrap_or_else(|| {
+            panic!(
+                "delta poll from mid-turn cursor must include the final entry (index {final_index}); \
+                 got indices {:?}",
+                delta.changed_entries.iter().map(|e| e.index).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        returned_final.preview.contains("final sentence"),
+        "the delta-returned final entry must carry the flushed tail: {:?}",
+        returned_final.preview
+    );
+}
+
+/// Regression for the "final message strands until next send" bug, isolating the
+/// fragile path: the final entry's append signal rides ONLY the `EntryUpdated`
+/// debounce, and `Stopped` does NOT change the state discriminant (so the
+/// `mark_state_changed` dirty does not bail us out). The turn-completion handler
+/// must flush the pending debounce SYNCHRONOUSLY on `Stopped`, emitting the
+/// final entry's `SessionMessageAppended` (→ `agent_session_dirty`) immediately —
+/// WITHOUT waiting out the 500 ms / 2 s debounce window.
+///
+/// Without the fix the only append emit is the still-armed debounce task, so
+/// this asserts zero appends right after `Stopped` and the test fails.
+#[gpui::test]
+async fn stopped_flushes_pending_entry_update_debounce_immediately(cx: &mut TestAppContext) {
+    use agent_client_protocol::schema as acp;
+
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // One assistant entry to stream into.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                acp::ContentBlock::Text(acp::TextContent::new("partial".to_string())),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Subscribe to SessionMessageAppended for the assistant entry (index 0).
+    let appended = Rc::new(std::cell::RefCell::new(0usize));
+    let _subscription = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let appended = appended.clone();
+        cx.subscribe(&store, move |_store, event, _cx| {
+            if let SolutionAgentStoreEvent::SessionMessageAppended(id, idx) = event
+                && *id == session_id
+                && *idx == 0
+            {
+                *appended.borrow_mut() += 1;
+            }
+        })
+    });
+
+    // Fire an EntryUpdated (streaming chunk). This arms the 500 ms debounce —
+    // no append emit yet. Session stays Idle (never set Running), so the
+    // upcoming Stopped will NOT change the state discriminant: the debounce
+    // flush is the ONLY thing that can surface the final entry promptly.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::EntryUpdated(0));
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        *appended.borrow(),
+        0,
+        "debounced EntryUpdated must not emit before the quiet window"
+    );
+
+    // Turn ends. The Stopped handler must flush the pending debounce slot
+    // synchronously → exactly one append emit on this tick, with NO clock
+    // advance.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        *appended.borrow(),
+        1,
+        "Stopped must flush the pending entry-update debounce immediately so the \
+         final entry's append (and its agent_session_dirty) reaches the client \
+         without waiting out the debounce window"
+    );
+
+    // The flushed slot must be gone so the debounce timer can't double-fire.
+    let still_throttled = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store
+            .read(cx)
+            .entry_update_throttles
+            .contains_key(&(session_id, 0))
+    });
+    assert!(
+        !still_throttled,
+        "the flushed throttle slot must be cleared on Stopped"
+    );
+
+    // And the timer firing later must NOT produce a second append.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(2_500));
+    cx.executor().run_until_parked();
+    assert_eq!(
+        *appended.borrow(),
+        1,
+        "the cleared debounce timer must not double-emit after Stopped flushed it"
+    );
+}
+
 /// Path to the `claude_native` mock binary (a bash script) used by the
 /// integration tests in `crates/claude_native/tests/`. Reuses the same fixture
 /// here so a Phase-2 store-routing test can stand up a real
