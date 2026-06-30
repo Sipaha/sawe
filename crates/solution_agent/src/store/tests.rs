@@ -1070,6 +1070,69 @@ async fn error_event_transitions_to_errored_state(cx: &mut TestAppContext) {
     });
 }
 
+/// Bug #5: once `Error` latched the session to `Errored`, genuine agent
+/// activity (a new entry, or a streaming in-place update) must clear it back
+/// to `Running` so the status row stops showing red "Error: …" while text
+/// streams. An editor-injected SystemNote must NOT clear it (it isn't agent
+/// activity).
+#[gpui::test]
+async fn streaming_activity_clears_latched_errored_state(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let check = move |cx: &mut TestAppContext, want_running: bool, ctx: &str| {
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                let state = store.session(session_id).expect("session exists").read(cx).state.clone();
+                if want_running {
+                    assert!(matches!(state, SessionState::Running { .. }), "{ctx}: expected Running, got {state:?}");
+                } else {
+                    assert!(matches!(state, SessionState::Errored(_)), "{ctx}: expected Errored, got {state:?}");
+                }
+            });
+        });
+    };
+
+    // 1. An agent error latches the session red.
+    cx.update(|cx| acp_thread.update(cx, |_t, cx| cx.emit(acp_thread::AcpThreadEvent::Error)));
+    cx.executor().run_until_parked();
+    check(cx, false, "after Error");
+
+    // 2. An Observer breadcrumb (SystemNote) is editor-originated, not agent
+    //    activity — it must NOT clear the error.
+    cx.update(|cx| acp_thread.update(cx, |t, cx| {
+        t.push_system_note(acp_thread::SystemNoteLevel::Observer, "Наблюдатель направил агента", cx);
+    }));
+    cx.executor().run_until_parked();
+    check(cx, false, "after SystemNote");
+
+    // 3. A genuine new assistant entry (NewEntry) means the agent recovered —
+    //    clears Errored -> Running.
+    cx.update(|cx| acp_thread.update(cx, |t, cx| {
+        t.push_assistant_content_block(
+            agent_client_protocol::schema::ContentBlock::Text(
+                agent_client_protocol::schema::TextContent::new("recovering".to_string())),
+            false, cx);
+    }));
+    cx.executor().run_until_parked();
+    check(cx, true, "after recovered NewEntry");
+
+    // 4. Re-latch Errored, then an in-place streaming EntryUpdated on the same
+    //    assistant entry must also clear it (the visible "red while streaming"
+    //    symptom is EntryUpdated-driven).
+    cx.update(|cx| acp_thread.update(cx, |_t, cx| cx.emit(acp_thread::AcpThreadEvent::Error)));
+    cx.executor().run_until_parked();
+    check(cx, false, "after second Error");
+    cx.update(|cx| acp_thread.update(cx, |t, cx| {
+        t.push_assistant_content_block(
+            agent_client_protocol::schema::ContentBlock::Text(
+                agent_client_protocol::schema::TextContent::new(" more".to_string())),
+            false, cx);
+    }));
+    cx.executor().run_until_parked();
+    check(cx, true, "after streaming EntryUpdated");
+}
+
 #[gpui::test]
 async fn tool_authorization_request_transitions_to_awaiting_input(cx: &mut TestAppContext) {
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;

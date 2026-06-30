@@ -152,6 +152,49 @@ impl SessionState {
         matches!(self, Self::Idle | Self::AwaitingInput | Self::Errored(_))
     }
 
+    /// Flip an inactive/stale state to `Running` because genuine (non-system)
+    /// agent activity just arrived — a new entry or a streaming update. Returns
+    /// `true` when it transitioned. Crucially this clears a latched
+    /// `Errored`: an `AcpThreadEvent::Error` can fire on a transient/recoverable
+    /// condition while the SAME subprocess keeps streaming (claude_native keeps
+    /// its pump alive), and the error paths deliberately never emit `Stopped`,
+    /// so without this the status row stays red "Error: …" forever while text
+    /// streams (bug #5). A genuinely terminal error still surfaces: no further
+    /// entries arrive, so this is never called, and the eventual `Stopped`
+    /// settles the session to `Idle`. No-op (returns `false`) when already
+    /// `Running`/`Stopping`, so an in-flight turn's `notified` flag and a
+    /// pending cancel are never disturbed.
+    pub fn resume_on_activity(&mut self) -> bool {
+        if matches!(self, Self::Idle | Self::AwaitingInput | Self::Errored(_)) {
+            *self = Self::Running {
+                started_at: Instant::now(),
+                notified: false,
+            };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Narrower sibling of [`resume_on_activity`](Self::resume_on_activity) for
+    /// an in-place streaming update (`EntryUpdated`): clear a latched `Errored`
+    /// (bug #5) but leave `Idle`/`AwaitingInput` ALONE. A finished turn can
+    /// still receive late streaming-reveal `EntryUpdated`s after its `Stopped`
+    /// flushed the buffer; resurrecting it to `Running` would wrongly show
+    /// "Thinking…" on a turn that already ended. Only a genuinely new entry
+    /// (`NewEntry`, via `resume_on_activity`) starts a fresh turn.
+    pub fn clear_error_on_activity(&mut self) -> bool {
+        if matches!(self, Self::Errored(_)) {
+            *self = Self::Running {
+                started_at: Instant::now(),
+                notified: false,
+            };
+            true
+        } else {
+            false
+        }
+    }
+
     /// Short, user-facing status label. Use this in the UI instead of
     /// `format!("{:?}", state)` — Debug renders the `Running` variant as
     /// `Running { started_at: Instant { tv_sec: 148873, tv_nsec: ... } }`,
@@ -736,6 +779,58 @@ mod tests {
     use gpui::{AppContext, TestAppContext};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn resume_on_activity_clears_inactive_states_including_errored() {
+        // Genuine non-system agent activity (a new entry / streaming update)
+        // means the session is live again, so a latched `Errored` must clear —
+        // otherwise the status row stays red "Error: agent error" while the
+        // agent keeps streaming (bug #5). `Idle`/`AwaitingInput` clear too.
+        for mut state in [
+            SessionState::Errored("agent error".into()),
+            SessionState::Idle,
+            SessionState::AwaitingInput,
+        ] {
+            let before = state.short_label();
+            assert!(
+                state.resume_on_activity(),
+                "{before} must resume on activity"
+            );
+            assert!(
+                matches!(state, SessionState::Running { notified: false, .. }),
+                "{before} -> Running, got {state:?}"
+            );
+        }
+
+        // Already-active / cancelling states are left untouched (no spurious
+        // reset of `notified`, no Stopping -> Running flip).
+        let started = Instant::now();
+        let mut running = SessionState::Running { started_at: started, notified: true };
+        assert!(!running.resume_on_activity());
+        assert!(matches!(running, SessionState::Running { notified: true, .. }));
+
+        let mut stopping = SessionState::Stopping { started_at: started };
+        assert!(!stopping.resume_on_activity());
+        assert!(matches!(stopping, SessionState::Stopping { .. }));
+    }
+
+    #[test]
+    fn clear_error_on_activity_only_unlatches_errored() {
+        // `clear_error_on_activity` is the narrower sibling for in-place
+        // streaming updates (`EntryUpdated`): it clears a latched `Errored` but
+        // must NOT resurrect a finished turn — an `Idle`/`AwaitingInput` session
+        // can still receive a late streaming-reveal update after the turn's
+        // `Stopped`, and flipping it to Running would wrongly show "Thinking…".
+        let mut errored = SessionState::Errored("agent error".into());
+        assert!(errored.clear_error_on_activity());
+        assert!(matches!(errored, SessionState::Running { notified: false, .. }));
+
+        for mut state in [SessionState::Idle, SessionState::AwaitingInput] {
+            let before = state.short_label();
+            assert!(!state.clear_error_on_activity(), "{before} must be left untouched");
+            assert!(matches!(state, SessionState::Idle | SessionState::AwaitingInput));
+        }
+    }
 
     fn build_session() -> SolutionSession {
         SolutionSession {

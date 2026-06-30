@@ -6882,12 +6882,9 @@ impl SolutionAgentStore {
                     self.mutate_state(
                         session_id,
                         |state| {
-                            if matches!(state, SessionState::Idle | SessionState::AwaitingInput) {
-                                *state = SessionState::Running {
-                                    started_at: std::time::Instant::now(),
-                                    notified: false,
-                                };
-                            }
+                            // Also clears a latched `Errored` — see
+                            // `SessionState::resume_on_activity` (bug #5).
+                            state.resume_on_activity();
                         },
                         cx,
                     );
@@ -7372,6 +7369,26 @@ impl SolutionAgentStore {
                 }
             }
             acp_thread::AcpThreadEvent::EntryUpdated(idx) => {
+                // A streaming update on a non-system entry (assistant-text
+                // chunk, tool-status transition) is proof the agent is live, so
+                // clear a latched `Errored` — the visible "Error while
+                // streaming" symptom is EntryUpdated-driven (bug #5). Mirror the
+                // NewEntry arm's SystemNote guard so an injected note can't flip
+                // state.
+                let updated_is_system_note = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|s| s.read(cx).acp_thread().cloned())
+                    .map(|t| {
+                        matches!(
+                            t.read(cx).entries().get(*idx),
+                            Some(acp_thread::AgentThreadEntry::SystemNote(_))
+                        )
+                    })
+                    .unwrap_or(false);
+                if !updated_is_system_note {
+                    self.mutate_state(session_id, |state| { state.clear_error_on_activity(); }, cx);
+                }
                 // Subagent-tab lifecycle: a tracked Task/Agent ToolCall that
                 // just flipped to a terminal status is a finish signal. We
                 // run this BEFORE the EntryUpdated throttle plumbing so the
