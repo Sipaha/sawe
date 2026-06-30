@@ -192,6 +192,21 @@ struct JudgeHandle {
     _task: Task<()>,
 }
 
+/// Metadata captured by [`SolutionAgentStore::teardown_session_runtime`] while
+/// the live session entity is still reachable, handed back so the caller can
+/// finish the DB/disk/pool side after the in-memory state is gone.
+struct SessionTeardown {
+    solution_id: SolutionId,
+    agent_id: AgentServerId,
+    /// `(live connection, ACP session id)` for a session that was spawned on the
+    /// pool — used to close the ACP session + release the pool refcount. `None`
+    /// for a cold/restored session that never held a subprocess.
+    pool_teardown: Option<(Rc<dyn acp_thread::AgentConnection>, acp::SessionId)>,
+    /// Hidden supervisor judge/auditor session — suppress all close
+    /// notifications (mirrors the create-side suppression).
+    was_ephemeral: bool,
+}
+
 struct EntryUpdateThrottle {
     first_dirty_at: std::time::Instant,
     /// Stored only to keep the debounce timer alive: dropping this
@@ -4571,43 +4586,43 @@ impl SolutionAgentStore {
         .log_err();
     }
 
-    pub fn close_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) -> Result<()> {
-        // Reap any in-flight ephemeral judge/auditor for this supervised session
-        // FIRST, while it is still reachable. Each closes its own hidden child
-        // session (releasing that child's pooled `claude` subprocess + refcount);
-        // skipping this strands the judge/auditor session open forever — its pool
-        // refcount is never released, so its subprocess never hits the idle
-        // shutdown debounce and lingers for the editor's whole lifetime (this is
-        // the dozens-of-orphaned-`claude`-processes leak on a long supervised run).
-        // No-ops when `id` has no live judge/auditor (incl. when `id` is itself an
-        // ephemeral child — those are never keys in these maps).
+    /// Tear down the IN-MEMORY runtime state shared by every per-session
+    /// teardown path ([`close_session`](Self::close_session) and
+    /// [`purge_session_hard`](Self::purge_session_hard)): reap any in-flight
+    /// judge/auditor, cancel an in-flight turn, drop the live entity (releasing
+    /// its `Project`/worktree fd), remove the id from `by_solution` (dropping the
+    /// solution key when it empties), and evict every per-session runtime map.
+    /// Returns the metadata the callers need to finish the DB/disk/pool side
+    /// (captured BEFORE the entity dropped), or `None` when `id` wasn't
+    /// hydrated. This is the single canonical in-memory teardown primitive — no
+    /// call site re-implements finish_judge/cancel/evict inline.
+    fn teardown_session_runtime(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> Option<SessionTeardown> {
+        // Reap any in-flight ephemeral judge/auditor FIRST, while the supervised
+        // session is still reachable. Each closes its own hidden child session
+        // (releasing that child's pooled `claude` subprocess + refcount);
+        // skipping this strands the judge/auditor open forever — its pool
+        // refcount never releases, so its subprocess never hits the idle
+        // shutdown debounce and lingers for the editor's whole lifetime (the
+        // dozens-of-orphaned-`claude`-processes leak on a long supervised run).
+        // No-ops when `id` has no live judge/auditor (incl. when `id` is itself
+        // an ephemeral child — those are never keys in these maps).
         self.finish_judge(id, cx);
         self.finish_auditor(id, cx);
-        // Delete the session's inbox attachments (files + DB rows) while the
-        // session is still in `self.sessions` (the inbox dir resolves from its
-        // solution root). The pixels survive as base64 in the persisted entries,
-        // so reopen is unaffected.
-        self.purge_session_attachments(id, cx);
-        // Flush the latest transcript and stop any in-flight turn while the
-        // session is still live in `self.sessions`. The flush guarantees a
-        // later "Reopen Closed Chat" restores the full conversation; the
-        // cancel keeps the pooled subprocess from churning on a session the
-        // user just dismissed. Both must run before the `remove` below.
-        self.persist_all_rows(id, cx);
         if let Some(entity) = self.sessions.get(&id)
             && matches!(entity.read(cx).state, SessionState::Running { .. })
         {
             self.cancel_turn(id, cx).log_err();
         }
-        let removed = self
-            .sessions
-            .remove(&id)
-            .ok_or_else(|| anyhow!("unknown session {id}"))?;
-        // If the session is being torn down with queued messages still
-        // unflushed, surface them in the log — closing a tab silently
-        // drops everything in `pending_messages` (no Stopped event ever
-        // fires for the torn-down thread).
+        let removed = self.sessions.remove(&id)?;
         let session_read = removed.read(cx);
+        // If the session is being torn down with queued messages still
+        // unflushed, surface them in the log — teardown silently drops
+        // everything in `pending_messages` (no Stopped event ever fires for the
+        // torn-down thread).
         if !session_read.pending_messages.is_empty() {
             let previews: Vec<String> = session_read
                 .pending_messages
@@ -4616,7 +4631,7 @@ impl SolutionAgentStore {
                 .collect();
             log::warn!(
                 target: "solution_agent::queue",
-                "session={id} dropped {} queued bundle(s) on close_session — content: [{}]",
+                "session={id} dropped {} queued bundle(s) on teardown — content: [{}]",
                 session_read.pending_messages.len(),
                 previews.join(" | "),
             );
@@ -4626,41 +4641,56 @@ impl SolutionAgentStore {
         // entity below). Hidden supervisor judge/auditor sessions suppress all
         // close notifications, mirroring the create-side suppression so a
         // connected mobile client never sees their per-wake-up churn.
-        let is_supervisor_ephemeral = session_read.is_supervisor_ephemeral;
+        let was_ephemeral = session_read.is_supervisor_ephemeral;
         let agent_id = session_read.agent_id.clone();
         // Capture the live connection + ACP session id BEFORE the entity drops,
-        // so we can tear down THIS session's `claude` subprocess and release the
-        // pool refcount afterwards (see the `pool_teardown` block at the end of
-        // this fn). `None` for a cold/restored session that was never spawned on
-        // the pool — those neither hold a subprocess nor a refcount to release.
+        // so callers can tear down THIS session's `claude` subprocess and
+        // release the pool refcount. `None` for a cold/restored session that was
+        // never spawned on the pool — those neither hold a subprocess nor a
+        // refcount to release.
         let pool_teardown = session_read.acp_thread().map(|thread| {
             let thread = thread.read(cx);
             (thread.connection().clone(), thread.session_id().clone())
         });
+        drop(session_read);
         if let Some(list) = self.by_solution.get_mut(&solution_id) {
             list.retain(|sid| *sid != id);
+            if list.is_empty() {
+                self.by_solution.remove(&solution_id);
+            }
         }
-        // Drop ALL per-session runtime maps for the closed session (entry
+        // Drop ALL per-session runtime maps for the torn-down session (entry
         // throttles, supervisor state, background watchers, backoff timer,
-        // parent-jsonl cursor) — each holds a live `Task` and/or grows one
-        // entry per closed session, so leaving them leaks for the process
-        // lifetime (the throttle/watcher maps are otherwise only pruned on
-        // their own narrow paths, and `supervisor_states` was never pruned).
+        // parent-jsonl cursor) — each holds a live `Task` and/or grows one entry
+        // per closed session, so leaving them leaks for the process lifetime.
         self.evict_session_runtime_maps(id);
-        // Soft-close: keep the persisted blob so downstream tooling
-        // (MCP read_session_history, future "View archived sessions"
-        // UI, etc.) can still read the transcript. Hard-delete only
-        // happens when the whole solution is removed via
-        // `delete_for_solution`.
-        if let Some(db) = &self.persistence {
-            db.mark_closed(id, Some(Utc::now())).detach_and_log_err(cx);
-        }
-        if !is_supervisor_ephemeral {
+        Some(SessionTeardown {
+            solution_id,
+            agent_id,
+            pool_teardown,
+            was_ephemeral,
+        })
+    }
+
+    /// Emit the per-session close notifications (`SessionClosed` +
+    /// `workspace.session_deleted`) and tear down the pool side of the session.
+    /// Shared close-out tail of [`close_session`](Self::close_session) and
+    /// [`purge_session_hard`](Self::purge_session_hard). The pooled
+    /// `ClaudeNativeConnection` is shared across the `(solution, agent)` pair and
+    /// OUTLIVES the session, so dropping the `SolutionSession` + its `AcpThread`
+    /// does NOT remove the session from the connection's `sessions` map — this
+    /// session's `claude` subprocess would leak. Explicitly close the ACP session
+    /// (claude_native removes the `SessionState` and kills its process) and
+    /// release the pool refcount so the connection itself shuts down once its
+    /// last session closes.
+    fn finalize_session_teardown(
+        &mut self,
+        id: SolutionSessionId,
+        teardown: SessionTeardown,
+        cx: &mut Context<Self>,
+    ) {
+        if !teardown.was_ephemeral {
             cx.emit(SolutionAgentStoreEvent::SessionClosed(id));
-            // Emit sequenced workspace notification so remote clients can
-            // drop the session from their in-memory maps immediately.
-            // `solution_id` was captured above while `session_read` was live
-            // (before the entity was removed from `self.sessions`).
             // Guard with `try_global` so test contexts that don't install the
             // MCP layer don't panic.
             if let Some(coord) =
@@ -4670,133 +4700,177 @@ impl SolutionAgentStore {
                     cx,
                     "workspace.session_deleted",
                     serde_json::json!({
-                        "solution_id": solution_id.as_str(),
+                        "solution_id": teardown.solution_id.as_str(),
                         "session_id": id.to_string(),
                     }),
                 );
             }
         }
-        // Tear down the pool side of the session. The pooled
-        // `ClaudeNativeConnection` is shared across the `(solution, agent)` pair
-        // and OUTLIVES this session, so dropping the `SolutionSession` + its
-        // `AcpThread` above does NOT remove the session from the connection's
-        // `sessions` map — this session's `claude` subprocess would leak (dozens
-        // accrue over a long supervised run, one per judge/auditor wake, each
-        // holding its own MCP child processes). Explicitly close the ACP session
-        // (claude_native removes the `SessionState` and kills its process) and
-        // release the pool refcount so the connection itself shuts down once its
-        // last session closes (the only other `pool_release_session` call site
-        // was the failed-spawn rollback — close leaked the refcount, see the
-        // note on `solution_agent.delete_session`). Skipped for cold/restored
-        // sessions (never spawned on the pool → no subprocess, no refcount).
-        if let Some((connection, acp_session_id)) = pool_teardown {
+        if let Some((connection, acp_session_id)) = teardown.pool_teardown {
             if connection.supports_close_session() {
                 connection.close_session(&acp_session_id, cx).detach();
             }
-            self.pool_release_session((solution_id.clone(), agent_id), cx);
+            self.pool_release_session((teardown.solution_id, teardown.agent_id), cx);
         }
+    }
+
+    pub fn close_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) -> Result<()> {
+        // Delete the session's inbox attachments (files + DB rows) while the
+        // session is still in `self.sessions` (the inbox dir resolves from its
+        // solution root). The pixels survive as base64 in the persisted entries,
+        // so reopen is unaffected. Must run BEFORE teardown (it needs the entity).
+        self.purge_session_attachments(id, cx);
+        // Flush the latest transcript while the session is still live, so a later
+        // "Reopen Closed Chat" restores the full conversation. The in-flight-turn
+        // cancel + entity drop happen inside `teardown_session_runtime`.
+        self.persist_all_rows(id, cx);
+        let teardown = self
+            .teardown_session_runtime(id, cx)
+            .ok_or_else(|| anyhow!("unknown session {id}"))?;
+        // Soft-close: keep the persisted blob so downstream tooling
+        // (MCP read_session_history, future "View archived sessions"
+        // UI, etc.) can still read the transcript. The supervisor_state row is
+        // also kept — `load_supervisor_states` restores it on reopen. Hard-delete
+        // only happens via `purge_session_hard` / `purge_solution_fully`.
+        if let Some(db) = &self.persistence {
+            db.mark_closed(id, Some(Utc::now())).detach_and_log_err(cx);
+        }
+        self.finalize_session_teardown(id, teardown, cx);
         cx.notify();
         Ok(())
     }
 
-    /// HARD teardown of a session whose backing directory has been removed
-    /// (its member was dropped from the solution). Unlike
-    /// [`close_session`](Self::close_session) (soft / reopenable: keeps the row,
-    /// purges only the inbox), this deletes EVERYTHING — the in-memory entity
-    /// (releasing its `Project`/worktree fd), every per-session runtime map, the
-    /// whole `<solution_root>/.agents/<sid>/` on-disk tree (observer files,
-    /// compacts, session-log, inbox), all six DB tables, and the pool refcount.
-    /// There is nothing to reopen, so no `closed_at` soft-close and no tab_order
-    /// is kept.
-    pub fn purge_session_hard(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+    /// Delete an `.agents/<sid>/` archive tree off the foreground thread.
+    /// NotFound is fine (a cold/never-archived session has no dir); any other IO
+    /// error is surfaced rather than silently dropped. Shared by the hard-purge
+    /// paths.
+    fn spawn_remove_archive_dir(&self, archive: PathBuf, cx: &mut Context<Self>) {
+        cx.background_spawn(async move {
+            if let Err(err) = std::fs::remove_dir_all(&archive) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("remove_dir_all {archive:?}: {err}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// HARD teardown of a single session whose backing directory has been
+    /// removed (its member was dropped from the solution, or its whole solution
+    /// was deleted). Unlike [`close_session`](Self::close_session) (soft /
+    /// reopenable: keeps the row, purges only the inbox), this deletes
+    /// EVERYTHING — the in-memory entity (releasing its `Project`/worktree fd),
+    /// every per-session runtime map, the whole `<solution_root>/.agents/<sid>/`
+    /// on-disk tree (observer files, compacts, session-log, inbox), all six DB
+    /// tables, and the pool refcount. There is nothing to reopen, so no
+    /// `closed_at` soft-close and no tab_order is kept.
+    ///
+    /// `root_override` supplies the solution root explicitly for callers that
+    /// already removed the solution from the store (e.g. the `Deleted` event /
+    /// [`purge_solution_fully`](Self::purge_solution_fully)), where
+    /// `solution_root_for` would no longer resolve. `None` falls back to the
+    /// store lookup, which is what the member-removal GC path uses.
+    pub fn purge_session_hard(
+        &mut self,
+        id: SolutionSessionId,
+        root_override: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         // Capture the on-disk archive dir (`.agents/<sid>/`) BEFORE removing the
         // entity — its path resolves from the session's solution root, which is
-        // only reachable while the session is still in `self.sessions`.
-        let archive = self
-            .solution_root_for(id, cx)
+        // only reachable via `solution_root_for` while the session is still in
+        // `self.sessions` (hence the `root_override` escape hatch).
+        let archive = root_override
+            .or_else(|| self.solution_root_for(id, cx))
             .map(|root| root.join(".agents").join(id.to_string()));
-        // Reap any in-flight ephemeral judge/auditor while the supervised session
-        // is still reachable (closes their hidden children + releases those
-        // children's pooled subprocesses), mirroring `close_session`.
-        self.finish_judge(id, cx);
-        self.finish_auditor(id, cx);
-        if let Some(entity) = self.sessions.get(&id)
-            && matches!(entity.read(cx).state, SessionState::Running { .. })
-        {
-            self.cancel_turn(id, cx).log_err();
-        }
-        let Some(removed) = self.sessions.remove(&id) else {
+        let Some(teardown) = self.teardown_session_runtime(id, cx) else {
             // Nothing hydrated for this id — purge the persisted rows + disk
             // tree anyway so a never-loaded orphan is still cleaned up.
             if let Some(db) = &self.persistence {
                 db.purge_session(id).detach_and_log_err(cx);
             }
             if let Some(archive) = archive {
-                cx.background_spawn(async move {
-                    if let Err(err) = std::fs::remove_dir_all(&archive) {
-                        if err.kind() != std::io::ErrorKind::NotFound {
-                            log::warn!("purge_session_hard: remove_dir_all {archive:?}: {err}");
-                        }
-                    }
-                })
-                .detach();
+                self.spawn_remove_archive_dir(archive, cx);
             }
             return;
         };
-        let session_read = removed.read(cx);
-        let solution_id = session_read.solution_id.clone();
-        let is_supervisor_ephemeral = session_read.is_supervisor_ephemeral;
-        let agent_id = session_read.agent_id.clone();
-        let pool_teardown = session_read.acp_thread().map(|thread| {
-            let thread = thread.read(cx);
-            (thread.connection().clone(), thread.session_id().clone())
-        });
-        if let Some(list) = self.by_solution.get_mut(&solution_id) {
-            list.retain(|sid| *sid != id);
-            if list.is_empty() {
-                self.by_solution.remove(&solution_id);
-            }
-        }
-        self.evict_session_runtime_maps(id);
         // Delete the on-disk `.agents/<sid>/` tree off the foreground thread.
-        // NotFound is fine (a cold/never-archived session has no dir); any other
-        // IO error is surfaced rather than silently dropped.
         if let Some(archive) = archive {
-            cx.background_spawn(async move {
-                if let Err(err) = std::fs::remove_dir_all(&archive) {
-                    if err.kind() != std::io::ErrorKind::NotFound {
-                        log::warn!("purge_session_hard: remove_dir_all {archive:?}: {err}");
-                    }
-                }
-            })
-            .detach();
+            self.spawn_remove_archive_dir(archive, cx);
         }
         // HARD-delete the persisted rows across all six tables.
         if let Some(db) = &self.persistence {
             db.purge_session(id).detach_and_log_err(cx);
         }
-        if !is_supervisor_ephemeral {
-            cx.emit(SolutionAgentStoreEvent::SessionClosed(id));
-            if let Some(coord) =
-                editor_mcp::workspace_seq::WorkspaceEventCoordinator::try_global(cx)
-            {
-                coord.emit_sequenced(
-                    cx,
-                    "workspace.session_deleted",
-                    serde_json::json!({
-                        "solution_id": solution_id.as_str(),
-                        "session_id": id.to_string(),
-                    }),
-                );
-            }
+        self.finalize_session_teardown(id, teardown, cx);
+        cx.notify();
+    }
+
+    /// THE single solution-level hard purge. Funneled into by the `Deleted`
+    /// store event (with the captured `root`) and by
+    /// [`gc_orphan_solutions`](Self::gc_orphan_solutions) (with `root: None`
+    /// when a solution vanished from a `Changed` signal, where no root is
+    /// available). Purges every hydrated session via
+    /// [`purge_session_hard`](Self::purge_session_hard), sweeps any non-hydrated
+    /// persisted rows via `delete_for_solution` (all six tables), nukes the
+    /// whole `<root>/.agents` tree when a root is known, and releases the
+    /// solution's pool connection(s). Idempotent: re-running on an
+    /// already-purged solution is a sequence of no-ops (the `by_solution` entry
+    /// is gone, `purge_session`/`delete_for_solution` on missing rows do
+    /// nothing, and a missing `.agents` dir is ignored).
+    pub fn purge_solution_fully(
+        &mut self,
+        solution_id: SolutionId,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        // Snapshot the hydrated ids first — `purge_session_hard` mutates
+        // `by_solution`, so we must not iterate it while purging.
+        let session_ids = self
+            .by_solution
+            .get(&solution_id)
+            .cloned()
+            .unwrap_or_default();
+        for id in session_ids {
+            self.purge_session_hard(id, root.clone(), cx);
         }
-        // Release the pool side exactly as `close_session` does (skip for
-        // cold/restored sessions that were never spawned on the pool).
-        if let Some((connection, acp_session_id)) = pool_teardown {
-            if connection.supports_close_session() {
-                connection.close_session(&acp_session_id, cx).detach();
+        // Sweep any non-hydrated rows (sessions persisted but never loaded this
+        // process) across all six tables. The attachment files are deleted first
+        // while their paths are still queryable.
+        if let Some(db) = &self.persistence {
+            let db = db.clone();
+            let solution_id = solution_id.clone();
+            cx.background_spawn(async move {
+                if let Ok(paths) = db
+                    .attachment_paths_for_solution(solution_id.0.to_string())
+                    .await
+                {
+                    for path in paths {
+                        std::fs::remove_file(path).log_err();
+                    }
+                }
+                db.delete_for_solution(solution_id).await.log_err();
+            })
+            .detach();
+        }
+        // Nuke any remaining `<root>/.agents` archive dirs wholesale (the
+        // per-session purges already removed each hydrated `.agents/<sid>`, but
+        // a never-hydrated session's dir would otherwise linger). Only possible
+        // when the root is known — a `Changed`-detected vanish carries none.
+        if let Some(root) = root {
+            self.spawn_remove_archive_dir(root.join(".agents"), cx);
+        }
+        // Release the pool connection(s) for the solution so its `claude`
+        // subprocess(es) exit now, mirroring `cold_close_solution`.
+        let keys: Vec<(SolutionId, AgentServerId)> = {
+            let pool = self.pool.lock();
+            pool.keys_for_solution(&solution_id).collect()
+        };
+        if !keys.is_empty() {
+            let mut pool = self.pool.lock();
+            for key in &keys {
+                pool.remove(key);
             }
-            self.pool_release_session((solution_id.clone(), agent_id), cx);
         }
         cx.notify();
     }
@@ -4857,7 +4931,10 @@ impl SolutionAgentStore {
             }
         }
         for id in orphans {
-            self.purge_session_hard(id, cx);
+            // The member dir is gone but the solution (and its root) is still in
+            // the store, so `purge_session_hard` resolves the archive path via
+            // `solution_root_for` — no `root_override` needed.
+            self.purge_session_hard(id, None, cx);
         }
     }
 
@@ -8056,6 +8133,18 @@ impl SolutionAgentStore {
                 self.gc_orphan_solutions(cx);
                 self.gc_orphan_members(cx);
             }
+            SolutionStoreEvent::Deleted { id, root } => {
+                // Authoritative solution-delete cleanup: `delete_solution` emits
+                // `Changed` (which may already have purged the hydrated sessions
+                // via `gc_orphan_solutions`) and THEN `Deleted` carrying the root
+                // captured before removal. We funnel into the consolidated
+                // solution-level hard purge with that root so the wholesale
+                // `<root>/.agents` removal + all-six-table DB sweep run even for
+                // never-hydrated sessions. Idempotent against the earlier
+                // `Changed`-driven purge (by_solution is already empty → just the
+                // DB sweep + `.agents` removal).
+                self.purge_solution_fully(id.clone(), Some(root.clone()), cx);
+            }
             SolutionStoreEvent::Closed { id } => self.cold_close_solution(id, cx),
             SolutionStoreEvent::Opened { id } => {
                 // On window open, force-load this solution's persisted sessions
@@ -8180,55 +8269,14 @@ impl SolutionAgentStore {
             .filter(|sid| !alive.contains(*sid))
             .cloned()
             .collect();
+        // Funnel every vanished solution through the single solution-level hard
+        // primitive. A `Changed`-detected vanish carries no root (the store
+        // mapping is already gone), so `.agents` wholesale removal is skipped —
+        // the per-session purges still drop each hydrated `.agents/<sid>`, and
+        // the authoritative `Deleted` event (with the captured root) handles the
+        // wholesale `.agents` sweep when a real delete is the cause.
         for sid in orphan_ids {
-            if let Some(session_ids) = self.by_solution.remove(&sid) {
-                // Reap each session's in-flight judge/auditor while it is still
-                // reachable (closes their hidden child sessions + releases those
-                // children's pooled subprocesses).
-                for session_id in &session_ids {
-                    self.finish_judge(*session_id, cx);
-                    self.finish_auditor(*session_id, cx);
-                }
-                for session_id in session_ids {
-                    self.sessions.remove(&session_id);
-                    // Drop ALL per-session runtime maps — this path bypasses
-                    // `close_session`, so it must prune supervisor state /
-                    // watcher tasks / backoff timers itself or they leak.
-                    self.evict_session_runtime_maps(session_id);
-                    if let Some(db) = &self.persistence {
-                        db.delete(session_id).detach_and_log_err(cx);
-                    }
-                    cx.emit(SolutionAgentStoreEvent::SessionClosed(session_id));
-                }
-            }
-            // Release the pool connection(s) for the orphaned solution so its
-            // `claude` subprocess(es) exit now — gc previously left them running.
-            let keys: Vec<(SolutionId, AgentServerId)> = {
-                let pool = self.pool.lock();
-                pool.keys_for_solution(&sid).collect()
-            };
-            if !keys.is_empty() {
-                let mut pool = self.pool.lock();
-                for key in &keys {
-                    pool.remove(key);
-                }
-            }
-            if let Some(db) = &self.persistence {
-                // Delete the solution's attachment files THEN its rows (incl. the
-                // attachment-row cascade in delete_for_solution) in one awaited
-                // sequence, so the path lookup completes before the rows it reads
-                // are dropped.
-                let db = db.clone();
-                cx.background_spawn(async move {
-                    if let Ok(paths) = db.attachment_paths_for_solution(sid.0.to_string()).await {
-                        for path in paths {
-                            let _ = std::fs::remove_file(path);
-                        }
-                    }
-                    db.delete_for_solution(sid).await.log_err();
-                })
-                .detach();
-            }
+            self.purge_solution_fully(sid, None, cx);
         }
         cx.notify();
     }

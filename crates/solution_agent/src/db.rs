@@ -1306,14 +1306,6 @@ fn delete_attachments_for_session_fn(connection: &Connection, session_id: &str) 
     Ok(())
 }
 
-fn delete_attachments_for_solution_fn(connection: &Connection, solution_id: &str) -> Result<()> {
-    let mut stmt = connection.exec_bound::<String>(indoc! {"
-        DELETE FROM solution_session_attachment WHERE solution_id = ?
-    "})?;
-    stmt(solution_id.to_string())?;
-    Ok(())
-}
-
 fn insert_or_update_entry(
     connection: &Connection,
     session_id: &str,
@@ -1423,15 +1415,38 @@ fn select_change_seq(connection: &Connection, session_id: &str) -> Result<Option
 }
 
 fn delete_by_solution(connection: &Connection, solution_id: &SolutionId) -> Result<()> {
-    let mut delete = connection.exec_bound::<String>(indoc! {"
-        DELETE FROM solution_sessions WHERE solution_id = ?
-    "})?;
-    delete(solution_id.0.clone())?;
-    // Cascade: drop attachment rows for the solution (callers delete the files
-    // themselves via `attachment_paths_for_solution` before this, while the
-    // paths are still queryable).
-    delete_attachments_for_solution_fn(connection, &solution_id.0)?;
-    Ok(())
+    let solution_id = solution_id.0.clone();
+    // One savepoint so the solution can't be left half-purged. Only
+    // `solution_sessions` and `solution_session_attachment` carry a
+    // `solution_id` column; the per-session child tables (entries + the two
+    // background tables key on `session_id`/`solution_session_id`, and
+    // `supervisor_state` keys on `session_id`) have no `solution_id`, so they
+    // are swept via a subselect over the solution's sessions. The subselect
+    // statements MUST run BEFORE the `solution_sessions` delete, otherwise the
+    // subselect would already be empty.
+    let tx = connection.with_savepoint("delete_by_solution", || {
+        for sql in [
+            "DELETE FROM solution_session_entries
+             WHERE session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
+            "DELETE FROM solution_session_background_agent
+             WHERE solution_session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
+            "DELETE FROM solution_session_background_shell
+             WHERE solution_session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
+            "DELETE FROM supervisor_state
+             WHERE session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
+            // Attachment rows carry the solution_id directly (callers delete the
+            // files themselves via `attachment_paths_for_solution` before this,
+            // while the paths are still queryable).
+            "DELETE FROM solution_session_attachment WHERE solution_id = ?",
+            // The parent rows last, so the subselects above still resolve.
+            "DELETE FROM solution_sessions WHERE solution_id = ?",
+        ] {
+            let mut stmt = connection.exec_bound::<String>(sql)?;
+            stmt(solution_id.clone())?;
+        }
+        Ok(())
+    });
+    tx.map_err(|e| anyhow!("delete_by_solution failed: {e}"))
 }
 
 fn apply_tab_orders(
@@ -2202,6 +2217,127 @@ mod tests {
         );
         assert_eq!(
             db.list_for_solution(SolutionId("sol-b".into()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Solution-level hard purge must sweep ALL six per-session tables for the
+    /// target solution (not just `solution_sessions` + attachments), while
+    /// leaving another solution's rows untouched. The background tables key on
+    /// `solution_session_id` and `supervisor_state` keys on `session_id` with
+    /// no `solution_id` column, so the sweep relies on a subselect over
+    /// `solution_sessions` for the doomed solution.
+    #[gpui::test]
+    async fn delete_for_solution_removes_rows_from_all_six_tables(cx: &mut gpui::TestAppContext) {
+        use crate::supervisor::SupervisorState;
+
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        // One session in the doomed solution, one in a survivor solution.
+        let doomed_meta = make_meta(1, "sol-doomed");
+        let doomed = doomed_meta.id;
+        db.save_metadata(doomed_meta).await.unwrap();
+        let keep_meta = make_meta(2, "sol-keep");
+        let keep = keep_meta.id;
+        db.save_metadata(keep_meta).await.unwrap();
+
+        for (id, sol, tag) in [(doomed, "sol-doomed", "x"), (keep, "sol-keep", "y")] {
+            db.upsert_entry(id, 0, 0, 0, None, tag.as_bytes().to_vec())
+                .await
+                .unwrap();
+            db.record_attachment(id.to_string(), sol.into(), format!("/inbox/{tag}.png"), 1)
+                .await
+                .unwrap();
+            db.save_background_agent(BackgroundAgentRow {
+                solution_session_id: id.to_string(),
+                agent_id: format!("agent-{tag}"),
+                jsonl_path: format!("/tmp/{tag}.jsonl"),
+                registered_at_ms: 1,
+                last_seen_label: None,
+                last_mtime_ms: None,
+                stop_reason: None,
+            })
+            .await
+            .unwrap();
+            db.save_background_shell(BackgroundShellRow {
+                solution_session_id: id.to_string(),
+                shell_id: format!("shell-{tag}"),
+                command: "echo hi".into(),
+                output_path: format!("/tmp/shell-{tag}.output"),
+                registered_at_ms: 1,
+                last_tail: None,
+                last_mtime_ms: None,
+                state_text: "running".into(),
+            })
+            .await
+            .unwrap();
+            db.save_supervisor_state(SupervisorState::new(id))
+                .await
+                .unwrap();
+        }
+
+        db.delete_for_solution(SolutionId("sol-doomed".into()))
+            .await
+            .unwrap();
+
+        // Every table is empty for the doomed solution's session.
+        assert!(db.load_entries(doomed).await.unwrap().is_empty());
+        assert!(db
+            .attachment_paths_for_session(doomed.to_string())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .load_background_agents(doomed.to_string())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .load_background_shells(doomed.to_string())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .load_supervisor_states()
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.session_id != doomed));
+        assert!(db
+            .list_for_solution(SolutionId("sol-doomed".into()))
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The survivor solution's session keeps every row.
+        assert_eq!(db.load_entries(keep).await.unwrap().len(), 1);
+        assert_eq!(
+            db.attachment_paths_for_session(keep.to_string())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.load_background_agents(keep.to_string()).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.load_background_shells(keep.to_string()).await.unwrap().len(),
+            1
+        );
+        assert!(db
+            .load_supervisor_states()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_id == keep));
+        assert_eq!(
+            db.list_for_solution(SolutionId("sol-keep".into()))
                 .await
                 .unwrap()
                 .len(),

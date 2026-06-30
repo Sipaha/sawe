@@ -259,7 +259,7 @@ async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::Tes
         .await
         .unwrap();
 
-    store.update(cx, |store, cx| store.purge_session_hard(id, cx));
+    store.update(cx, |store, cx| store.purge_session_hard(id, None, cx));
     cx.run_until_parked();
 
     store.update(cx, |store, _| {
@@ -282,6 +282,156 @@ async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::Tes
     assert!(
         db.load_entries(id).await.unwrap().is_empty(),
         "entry rows must be hard-deleted"
+    );
+}
+
+/// `purge_solution_fully` is the SINGLE solution-level hard primitive: it must
+/// drop every hydrated session of the solution (entity + `.agents/<sid>/` tree),
+/// hard-delete every persisted row across all six tables (incl. non-hydrated
+/// rows via `delete_for_solution`), and nuke the whole `<root>/.agents` tree.
+/// This is what the `Deleted { id, root }` store event funnels into.
+#[gpui::test]
+async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (root, agents_dir, archive_dir, db, sol) = store.update(cx, |store, cx| {
+        let sol = store.session(id).unwrap().read(cx).solution_id.clone();
+        let root = store.solution_root_for_app(id, cx).expect("solution root");
+        let agents = root.join(".agents");
+        (
+            root,
+            agents.clone(),
+            agents.join(id.to_string()),
+            store.persistence().expect("persistence"),
+            sol,
+        )
+    });
+
+    // Lay down the hydrated session's on-disk tree plus a stray archive dir for
+    // a never-hydrated session id (proves the wholesale `.agents` removal).
+    std::fs::create_dir_all(archive_dir.join("inbox")).unwrap();
+    std::fs::write(archive_dir.join("diary.md"), b"notes").unwrap();
+    let stray = agents_dir.join("ses-never-loaded");
+    std::fs::create_dir_all(&stray).unwrap();
+    assert!(archive_dir.exists() && stray.exists());
+
+    // Persist the hydrated session's metadata + an entry, plus a supervisor row.
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id,
+        solution_id: sol.clone(),
+        agent_id: SharedString::from("claude-acp"),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-cold"),
+        title: SharedString::from("Cold"),
+        created_at: Utc::now(),
+        last_activity_at: Utc::now(),
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    })
+    .await
+    .unwrap();
+    db.upsert_entry(id, 0, 0, 0, None, b"e".to_vec()).await.unwrap();
+    db.save_supervisor_state(crate::supervisor::SupervisorState::new(id))
+        .await
+        .unwrap();
+
+    store.update(cx, |store, cx| {
+        store.purge_solution_fully(sol.clone(), Some(root.clone()), cx)
+    });
+    cx.run_until_parked();
+
+    store.update(cx, |store, _| {
+        assert!(store.session(id).is_none(), "entity must be gone");
+        assert!(
+            store.by_solution.get(&sol).map_or(true, |v| v.is_empty()),
+            "by_solution entry for the deleted solution must be gone"
+        );
+    });
+    assert!(!agents_dir.exists(), ".agents tree must be wholesale-removed");
+    assert!(
+        db.list_for_solution(sol.clone()).await.unwrap().is_empty(),
+        "session rows must be hard-deleted"
+    );
+    assert!(db.load_entries(id).await.unwrap().is_empty(), "entries gone");
+    assert!(
+        db.load_supervisor_states()
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.session_id != id),
+        "supervisor_state must be hard-deleted"
+    );
+}
+
+/// `close_session` is SOFT: it keeps the persisted row (mark_closed), keeps the
+/// `<root>/.agents/<sid>/` on-disk tree, and keeps the supervisor_state row so a
+/// later reopen restores both the transcript and supervision settings.
+#[gpui::test]
+async fn close_session_is_soft_keeps_archive_dir_and_supervisor_row(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (archive_dir, db, sol) = store.update(cx, |store, cx| {
+        let sol = store.session(id).unwrap().read(cx).solution_id.clone();
+        let root = store.solution_root_for_app(id, cx).expect("solution root");
+        (
+            root.join(".agents").join(id.to_string()),
+            store.persistence().expect("persistence"),
+            sol,
+        )
+    });
+
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::write(archive_dir.join("diary.md"), b"notes").unwrap();
+    // `mark_closed` stamps `closed_at` on the existing `solution_sessions` row,
+    // so the row must exist before the soft close for the stamp to land.
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id,
+        solution_id: sol.clone(),
+        agent_id: SharedString::from("claude-acp"),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-cold"),
+        title: SharedString::from("Cold"),
+        created_at: Utc::now(),
+        last_activity_at: Utc::now(),
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    })
+    .await
+    .unwrap();
+    db.save_supervisor_state(crate::supervisor::SupervisorState::new(id))
+        .await
+        .unwrap();
+
+    store.update(cx, |store, cx| store.close_session(id, cx).unwrap());
+    cx.run_until_parked();
+
+    assert!(
+        archive_dir.exists(),
+        ".agents/<sid> tree must SURVIVE a soft close"
+    );
+    assert!(
+        db.closed_at(id).await.unwrap().is_some(),
+        "soft close must keep the row and stamp closed_at"
+    );
+    assert!(
+        db.load_supervisor_states()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_id == id),
+        "supervisor_state must survive a soft close (reopen needs it)"
     );
 }
 
