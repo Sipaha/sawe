@@ -1,13 +1,22 @@
 # Bug sweep — solution_agent post-Phase-6 (2026-06-30)
 
-Live tracker for 5 issues the maintainer reported while stress-testing the
+Live tracker for issues the maintainer reported while stress-testing the
 freshly-shipped `solution_agent` system-message + supervisor work (commits
 `6737e00db6` system notes, `638106bd2c` usage-limit/Observer wiring,
 `5f1659c766` flush-on-Stopped). Root causes below are confirmed by code
-reading (and #3 by an empirical repro). Fix order: #5 → #1 → #3 → #2 → #4.
+reading (and #3 by an empirical repro).
+
+SCOREBOARD (2026-06-30):
+- #1 judge↔reply race — ✅ SHIPPED `18e65fbce7`
+- #2 Observer plaque render — 🚧 fix done (uncommitted), AFTER-screenshot in progress
+- #3 session-not-found after restart — ✅ SHIPPED `c987efa5d2`
+- #4 mobile/desktop session-list scope — by design; PENDING maintainer decision (doc + optional label)
+- #5 status latched on Error while streaming — ✅ SHIPPED `b5107a7d41`
+- #6 reconnect → Done, doesn't continue — root-caused; PENDING maintainer decision (auto-continue policy)
+- collateral: `865baee27a` acp_servers test-match SystemNote arm.
 
 Resume: this is the durable task pool. Each row says STATUS + the exact
-fix site. Pick the first unshipped and continue.
+fix site. Pick the first unshipped/undecided and continue.
 
 ---
 
@@ -70,7 +79,16 @@ handle; call `supersede_judge_on_user_reply` → assert handle gone + status
 ---
 
 ## #2 — Observer "plaque" renders strangely
-**STATUS: needs a live screenshot to diagnose precisely. NOT shipped.**
+**STATUS: fix done, UNCOMMITTED; AFTER-screenshot verification in progress.**
+Confirmed via BEFORE png (`docs/findings/2026-06-30-observer-note-BEFORE.png`):
+the breadcrumb rendered on a single non-wrapping `h_flex` row — icon + inline
+"Observer" tag + long body running off the right edge. Fix (conversation_render.rs):
+icon pinned left, then `v_flex().flex_1().min_w_0()` column holding the tag on its
+own line above a WRAPPING `Label` body (LabelSize::Small). Added MCP affordance
+`solution_agent.push_system_note` (mcp.rs + editor_mcp/lifecycle.rs GLOBAL_TOOLS;
+catalog count 85→86 in .rules) so an agent can inject a note to exercise the render
+path; 2 tests. Repro: `/tmp/full.py` over `/tmp/mcp.py` Client against a
+`--debug --headless` instance. Commit once AFTER-screenshot confirms clean wrap.
 
 One supervisor action produces TWO conversation elements: (a) the short
 Observer breadcrumb SystemNote (`conversation_render.rs:431` — Eye icon +
@@ -97,7 +115,15 @@ bubble itself as Observer-sourced).
 ---
 
 ## #3 — "session not found" after restarting the editor on an empty (never-messaged) chat
-**STATUS: root-caused + EMPIRICALLY PROVEN, fix chosen, NOT shipped.**
+**STATUS: SHIPPED `c987efa5d2`.** Fix B (durable). Refinement: `apply_tab_orders`
+is UPDATE-only and matches zero rows before the metadata row exists, so COALESCE
+in the INSERT isn't enough alone — the metadata write itself now CARRIES the real
+`tab_order` (new field on `SolutionSessionMetadata`, plumbed through db INSERT/SELECT
++ all constructions), and `create_session_with_parent` re-persists the row AFTER
+`open_session_in_strip` stamps the in-memory tab_order. `ON CONFLICT … SET tab_order
+= COALESCE(excluded.tab_order, solution_sessions.tab_order)` keeps a None write from
+clobbering. Tests: `tab_order_survives_update_before_insert`,
+`save_metadata_does_not_wipe_existing_tab_order`, `create_session_persists_tab_order_for_restart`.
 
 Lost-update race between two detached background DB writes issued back-to-back
 with no happens-before in `create_session_with_parent`:
@@ -198,6 +224,36 @@ Idle after `resume_session` succeeds.
 `Error` then `Stopped` → `Idle`. Plus a live screenshot of the status row
 showing "Thinking…" (not red) while streaming (status-row change ⇒ screenshot
 required).
+
+---
+
+## #6 — after watchdog reconnect the session sits at "Done" instead of continuing
+**STATUS: root-caused; PENDING maintainer decision on policy. No fix yet.**
+
+`reconnect_agent` (store.rs:4786, fired by the stuck-session watchdog at
+store.rs:2134) is deliberately NON-DESTRUCTIVE: drops the wedged pooled
+connection, sets `Errored("reconnecting…")`, cold-izes the thread (keeps
+`entries`), `resume_session` respawns the subprocess and regrafts the ACP
+session with history+context, pushes an Info note ("Агент не отвечал —
+переподключил…"), and the session lands `Idle` ("Done"). It does NOT re-issue
+the interrupted turn (replaying a mid-turn prompt could re-run tool calls that
+already had side effects) and does NOT touch `supervisor_states`.
+
+So continuation is expected to come from the supervisor: if supervision is
+`Watching`, the watchdog fires a judge `IDLE_THRESHOLD_SECS = 60` s after the
+reconnect (the Info note bumps `last_activity`, restarting the idle timer) →
+continue-nudge. A supervised session DOES self-resume, just up to ~60 s later
+(the maintainer likely screenshotted before that). An UNsupervised session
+stays at Done by design until the user sends anything.
+
+Gap / proposed fix (await decision):
+- (a) After a successful reconnect, if supervision is enabled, immediately
+  re-arm `Watching` and force a continue-nudge (skip the 60 s idle wait) so a
+  supervised session resumes promptly.
+- (b) For an unsupervised session, make the Info breadcrumb actionable
+  ("история сохранена — напиши сообщение, чтобы продолжить") so it's clear it
+  won't move on its own.
+- (c) (rejected) re-issue the last turn — unsafe re: tool-call side effects.
 
 ---
 
