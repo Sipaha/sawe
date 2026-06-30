@@ -771,6 +771,15 @@ pub struct SolutionSessionMetadata {
     /// Persisted copy of [`SolutionSession::cached_models`]. Empty for
     /// sessions that haven't yet fetched the model list from the agent.
     pub cached_models: Vec<claude_native::ModelInfo>,
+    /// Persisted copy of [`SolutionSession::tab_order`]. Carried through so the
+    /// metadata INSERT can COALESCE it against any value a concurrent
+    /// `update_tab_orders` already wrote, instead of clobbering it to NULL. A
+    /// fresh create passes `None` (the strip position is written separately by
+    /// `persist_tab_order` -> `update_tab_orders`); COALESCE(NULL, existing)
+    /// preserves that write even when the INSERT lands AFTER the UPDATE (the
+    /// lost-update race at create time that left idle never-touched sessions
+    /// with `tab_order = NULL`, so `restore_open_tabs` never re-hydrated them).
+    pub tab_order: Option<i64>,
 }
 
 #[cfg(test)]

@@ -7570,6 +7570,7 @@ mod tests {
             desired_model: None,
             desired_effort: None,
             cached_models: vec![],
+            tab_order: None,
         };
         db.save_metadata(meta).await.expect("save metadata");
 

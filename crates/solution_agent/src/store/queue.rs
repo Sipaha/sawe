@@ -792,6 +792,7 @@ impl SolutionAgentStore {
                 desired_model: s.desired_model.clone(),
                 desired_effort: s.desired_effort.clone(),
                 cached_models: s.cached_models.clone(),
+                tab_order: s.tab_order,
             };
             (meta, s.project.clone())
         });

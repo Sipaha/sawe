@@ -2485,6 +2485,21 @@ impl SolutionAgentStore {
             if parent_session_id.is_none() {
                 this.update(cx, |store, cx| {
                     store.open_session_in_strip(session_id, cx);
+                    // Re-persist the metadata row now that `open_session_in_strip`
+                    // has stamped the in-memory `tab_order`. The earlier
+                    // `persist_session_row` (before the strip pin) wrote the row
+                    // with `tab_order = None`, and `persist_tab_order` only issues
+                    // a bare UPDATE — which no-ops if it loses the race to the
+                    // metadata INSERT (the row doesn't exist yet). This second
+                    // write carries the real `tab_order`, and the INSERT's
+                    // `ON CONFLICT … tab_order = COALESCE(excluded, existing)`
+                    // makes the outcome order-independent: whichever of the two
+                    // DB writes lands last, the row ends with the concrete
+                    // tab_order rather than NULL. Without this an idle,
+                    // never-touched new chat could persist with `tab_order = NULL`
+                    // and vanish from `restore_open_tabs` on restart ("unknown
+                    // session" on the next send).
+                    store.persist_session_row(session_id, cx);
                 })?;
             }
 
@@ -2628,6 +2643,13 @@ impl SolutionAgentStore {
             desired_model: s.desired_model.clone(),
             desired_effort: s.desired_effort.clone(),
             cached_models: s.cached_models.clone(),
+            // Carried through so the INSERT's ON CONFLICT path COALESCEs it
+            // against any value a concurrent `persist_tab_order` already wrote;
+            // it never CLEARS an existing tab_order (None -> COALESCE keeps the
+            // stored value). The authoritative strip-position write stays
+            // `update_tab_orders`; this is the live in-memory value (usually
+            // None at create time, before the strip pin lands).
+            tab_order: s.tab_order,
         };
         db.save_metadata(meta).detach_and_log_err(cx);
     }
@@ -4831,6 +4853,7 @@ impl SolutionAgentStore {
                 desired_model: s.desired_model.clone(),
                 desired_effort: s.desired_effort.clone(),
                 cached_models: s.cached_models.clone(),
+                tab_order: s.tab_order,
             }
         };
         let pair = (meta.solution_id.clone(), meta.agent_id.clone());

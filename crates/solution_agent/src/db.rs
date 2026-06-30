@@ -880,13 +880,23 @@ fn insert_or_update_metadata(
     meta: &SolutionSessionMetadata,
 ) -> Result<()> {
     // `preview`, `total_tokens`, `cwd`, `parent_session_id`, `desired_model`,
-    // `desired_effort`, and `cached_models` use COALESCE so a metadata write
-    // that doesn't carry a value (e.g. a fresh-session insert at create time)
-    // doesn't clobber values an event-driven update wrote earlier in the same
-    // session.
+    // `desired_effort`, `cached_models`, and `tab_order` use COALESCE so a
+    // metadata write that doesn't carry a value (e.g. a fresh-session insert at
+    // create time) doesn't clobber values an event-driven update wrote earlier
+    // in the same session.
+    //
+    // `tab_order` in particular guards a lost-update race at create time:
+    // `create_session_with_parent` issues this metadata INSERT and a separate
+    // `update_tab_orders` UPDATE with no happens-before, both contending on one
+    // `Arc<Mutex<Connection>>`. If the UPDATE wins and runs FIRST it no-ops (no
+    // row yet); without COALESCE this INSERT would then create the row with
+    // `tab_order = NULL`, so `select_open_tabs` (and the restore-on-restart
+    // path) never re-hydrates the session -> "unknown session" on send. The
+    // existing-row column is qualified as `solution_sessions.tab_order` so
+    // SQLite resolves the conflict-target row rather than the bare name.
     //
     // Nested tuple shape because `sqlez::Bind` only implements tuples up to
-    // size 10; we have 15 columns now (5 + 7 + 3).
+    // size 10; we have 16 columns now (5 + 7 + 4).
     let mut insert = connection.exec_bound::<(
         (String, String, String, Arc<str>, String),
         (
@@ -898,15 +908,15 @@ fn insert_or_update_metadata(
             Option<String>,
             Option<String>,
         ),
-        (Option<String>, Option<String>, Option<String>),
+        (Option<String>, Option<String>, Option<String>, Option<i64>),
     )>(indoc! {"
         INSERT INTO solution_sessions (
             id, solution_id, agent_id, acp_session_id, title,
             created_at, last_activity_at, preview, total_tokens,
             context_count, cwd, parent_session_id,
-            desired_model, desired_effort, cached_models
+            desired_model, desired_effort, cached_models, tab_order
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(id) DO UPDATE SET
             solution_id        = excluded.solution_id,
             agent_id           = excluded.agent_id,
@@ -921,7 +931,8 @@ fn insert_or_update_metadata(
             parent_session_id  = COALESCE(excluded.parent_session_id, parent_session_id),
             desired_model      = COALESCE(excluded.desired_model, desired_model),
             desired_effort     = COALESCE(excluded.desired_effort, desired_effort),
-            cached_models      = COALESCE(excluded.cached_models, cached_models)
+            cached_models      = COALESCE(excluded.cached_models, cached_models),
+            tab_order          = COALESCE(excluded.tab_order, solution_sessions.tab_order)
     "})?;
 
     let cwd_str = if meta.cwd.as_os_str().is_empty() {
@@ -953,7 +964,12 @@ fn insert_or_update_metadata(
             cwd_str,
             meta.parent_session_id.map(|id| id.to_string()),
         ),
-        (meta.desired_model.clone(), meta.desired_effort.clone(), cached_models_json),
+        (
+            meta.desired_model.clone(),
+            meta.desired_effort.clone(),
+            cached_models_json,
+            meta.tab_order,
+        ),
     ))?;
 
     Ok(())
@@ -1478,7 +1494,7 @@ fn select_metadata_for_solution(
     solution_id: &SolutionId,
 ) -> Result<Vec<SolutionSessionMetadata>> {
     // Same nested-tuple shape as the INSERT side — `sqlez::Column` only
-    // implements tuples up to size 10; we have 15 columns now (5 + 7 + 3).
+    // implements tuples up to size 10; we have 16 columns now (5 + 7 + 4).
     let mut select = connection.select_bound::<String, (
         (String, String, String, Arc<str>, String),
         (
@@ -1490,12 +1506,12 @@ fn select_metadata_for_solution(
             Option<String>,
             Option<String>,
         ),
-        (Option<String>, Option<String>, Option<String>),
+        (Option<String>, Option<String>, Option<String>, Option<i64>),
     )>(indoc! {"
         SELECT id, solution_id, agent_id, acp_session_id, title,
                created_at, last_activity_at, preview, total_tokens,
                context_count, cwd, parent_session_id,
-               desired_model, desired_effort, cached_models
+               desired_model, desired_effort, cached_models, tab_order
         FROM solution_sessions
         WHERE solution_id = ?
         ORDER BY last_activity_at DESC
@@ -1514,7 +1530,7 @@ fn select_metadata_for_solution(
             cwd,
             parent_session_id,
         ),
-        (desired_model, desired_effort, cached_models_json),
+        (desired_model, desired_effort, cached_models_json, tab_order),
     ) in rows
     {
         let id = SolutionSessionId::parse(&id)
@@ -1561,6 +1577,7 @@ fn select_metadata_for_solution(
             desired_model,
             desired_effort,
             cached_models,
+            tab_order,
         });
     }
     Ok(out)
@@ -1622,6 +1639,7 @@ mod tests {
             desired_model: None,
             desired_effort: None,
             cached_models: vec![],
+            tab_order: None,
         }
     }
 
@@ -1754,6 +1772,91 @@ mod tests {
         assert_eq!(
             db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
             vec![m2.id]
+        );
+    }
+
+    #[gpui::test]
+    async fn tab_order_survives_update_before_insert(cx: &mut gpui::TestAppContext) {
+        // Lost-update race at create time: `create_session_with_parent` writes
+        // the metadata row (`save_metadata`) and the strip position
+        // (`update_tab_orders`) as two independent detached DB writes with no
+        // happens-before. `update_tab_orders` is an UPDATE-only path, so if it
+        // wins the race it no-ops (the metadata row doesn't exist yet) — the
+        // strip position can only survive if the metadata write itself carries
+        // the tab_order. The store fixes this by re-persisting the row AFTER
+        // pinning, so the `save_metadata` here carries `Some(0)`.
+        //
+        // This test exercises the DB contract that makes that durable: a
+        // metadata INSERT carrying a concrete tab_order lands it, and the
+        // outcome does not depend on whether the bare UPDATE ran first or never
+        // matched a row.
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let mut m = make_meta(1, "sol-a");
+
+        // UPDATE first against a non-existent row: a genuine no-op, mirroring
+        // the metadata-INSERT-loses-the-race ordering.
+        db.update_tab_orders(SolutionId("sol-a".into()), vec![m.id])
+            .await
+            .unwrap();
+        // INSERT second, carrying the real tab_order the store stamped in
+        // memory before re-persisting. The row must end up pinned regardless of
+        // the lost UPDATE above.
+        m.tab_order = Some(0);
+        db.save_metadata(m.clone()).await.unwrap();
+
+        assert_eq!(
+            db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
+            vec![m.id],
+            "a metadata INSERT carrying tab_order must persist it even when a \
+             prior UPDATE found no row"
+        );
+    }
+
+    #[gpui::test]
+    async fn tab_order_set_after_insert_still_works(cx: &mut gpui::TestAppContext) {
+        // The benign order (INSERT then UPDATE) must keep working unchanged.
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let m = make_meta(1, "sol-a");
+        db.save_metadata(m.clone()).await.unwrap();
+        db.update_tab_orders(SolutionId("sol-a".into()), vec![m.id])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
+            vec![m.id]
+        );
+    }
+
+    #[gpui::test]
+    async fn save_metadata_does_not_wipe_existing_tab_order(cx: &mut gpui::TestAppContext) {
+        // A follow-up `save_metadata` (e.g. a token/preview update) carries
+        // tab_order None, but must NOT clear a tab_order a prior
+        // `update_tab_orders` legitimately set — the ON CONFLICT clause
+        // COALESCE(excluded.tab_order=NULL, solution_sessions.tab_order) keeps it.
+        // This is the load-bearing half of the order-independent fix: even if a
+        // late metadata write lands after the strip position is durable, it
+        // never reverts the row to NULL.
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        let m = make_meta(1, "sol-a");
+        db.save_metadata(m.clone()).await.unwrap();
+        db.update_tab_orders(SolutionId("sol-a".into()), vec![m.id])
+            .await
+            .unwrap();
+        // Re-save metadata (tab_order None) as the live store would on a later
+        // activity-driven update.
+        db.save_metadata(m.clone()).await.unwrap();
+
+        assert_eq!(
+            db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
+            vec![m.id],
+            "a follow-up save_metadata(None) must not clear an existing tab_order"
         );
     }
 

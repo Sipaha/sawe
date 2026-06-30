@@ -1890,6 +1890,7 @@ fn stale_archive_dirs_gates_on_count_then_age() {
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
 
     // <= the min-session gate: keep everything, even ancient archives.
@@ -2114,6 +2115,7 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
     let meta_b = crate::model::SolutionSessionMetadata {
         id: id_b,
@@ -2187,6 +2189,88 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
             assert_eq!(listed, vec![id_b, id_a]);
         });
     });
+}
+
+/// End-to-end regression for the "session not found" / `unknown session`
+/// bug after restarting on a brand-new chat that never received a message.
+///
+/// `create_session_with_parent` persists the metadata row (`save_metadata`)
+/// and the strip position (`update_tab_orders`) as two independent detached
+/// DB writes with no happens-before. `update_tab_orders` is UPDATE-only, so
+/// if it wins the race against the metadata INSERT it no-ops (no row yet),
+/// and the INSERT used to land the row with `tab_order = NULL` — invisible to
+/// `select_open_tabs` / `restore_open_tabs`, so the session was never
+/// re-hydrated on restart. The fix re-persists the row AFTER pinning so the
+/// metadata write carries the real tab_order, and the INSERT's COALESCE
+/// ON CONFLICT keeps it order-independent. Here we drive the real create flow
+/// with persistence wired, let every detached write drain, and assert the row
+/// is durably pinned even though the session never received a message.
+#[gpui::test]
+async fn create_session_persists_tab_order_for_restart(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let db = {
+        let executor = cx.executor();
+        Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"))
+    };
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::new(connect_count.clone())),
+            );
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session");
+
+    // Drain the detached metadata / tab_order writes issued by the create flow.
+    cx.run_until_parked();
+
+    // The session never received a message — but its strip position must still
+    // be durable, so a restart's `restore_open_tabs` (which queries
+    // `list_open_tabs`) re-hydrates it instead of raising "unknown session".
+    let open_tabs = db
+        .list_open_tabs(solution_id.clone())
+        .await
+        .expect("list_open_tabs");
+    assert_eq!(
+        open_tabs,
+        vec![session_id],
+        "a freshly-created, never-messaged session must persist its tab_order \
+         so it survives an editor restart"
+    );
+
+    // The metadata row itself must carry the concrete tab_order (not NULL):
+    // this proves the create flow re-persists the row AFTER pinning, so the
+    // value is durable regardless of which detached write won the race.
+    let metas = db
+        .list_for_solution(solution_id.clone())
+        .await
+        .expect("list_for_solution");
+    let row = metas
+        .iter()
+        .find(|m| m.id == session_id)
+        .expect("metadata row for created session");
+    assert_eq!(
+        row.tab_order,
+        Some(0),
+        "the persisted metadata row must carry the strip position, not NULL"
+    );
 }
 
 /// Regression for the close→reopen empty-history bug: the extracted
@@ -2319,6 +2403,7 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -2503,6 +2588,7 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -2616,6 +2702,7 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -2736,6 +2823,7 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -2826,6 +2914,7 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -2973,6 +3062,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -3113,6 +3203,7 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         cached_models: vec![],
+        tab_order: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -8144,6 +8235,7 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
         desired_model: Some("claude-opus-4-5".to_string()),
         desired_effort: Some("high".to_string()),
         cached_models: vec![],
+        tab_order: None,
     };
 
     // Build the entity exactly as the fixed fresh-entity branch does.
