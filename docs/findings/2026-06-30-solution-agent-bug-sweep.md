@@ -13,7 +13,7 @@ SCOREBOARD (2026-06-30):
 - #4 mobile/desktop session-list scope — ✅ SHIPPED `e625529dad` (maintainer: must be 1:1; mobile now filters to the pinned strip set)
 - #5 status latched on Error while streaming — ✅ SHIPPED `b5107a7d41`
 - #6 reconnect → Done, doesn't continue — ✅ SHIPPED `e2bafe0506` (maintainer: send the agent a "process restarted, continue" prompt)
-- #7 usage-limit resume timer vs new user messages — INVESTIGATING
+- #7 usage-limit resume timer vs new user messages — ✅ SHIPPED `5628f43c76` (clear gate on a successful turn; survives a re-hit Error)
 - collateral: `865baee27a` acp_servers test-match SystemNote arm.
 
 Resume: this is the durable task pool. Each row says STATUS + the exact
@@ -276,7 +276,22 @@ Gap / proposed fix (await decision):
 ---
 
 ## #7 — usage-limit resume timer vs. incoming user messages
-**STATUS: INVESTIGATING.** Maintainer's spec for correct behavior:
+**STATUS: SHIPPED `5628f43c76`.** Investigation outcome — the resume gate IS the
+supervisor mechanism (`on_judge_failed` Quota → `next_eligible_ms` + a
+`backoff_timers` wake task; only when the observer is enabled). Findings vs the
+maintainer's spec: Q1(a) a user message while gated IS sent to the agent (not
+blocked) — already correct; Q1(b) a re-hit keeps the gate (re-hit surfaces as
+`Error`, not `Stopped`) — already correct; **Q2 was the gap** — nothing cleared
+the gate when the agent responded successfully, so the session stayed gated
+until the stale reset time and the timer fired a redundant judge. Fix:
+`clear_resume_gate_on_agent_response` (clears `next_eligible_ms` +
+`backoff_attempt` + removes the timer, mirroring `apply_verdict`'s success
+clear), called from the `Stopped` handler — a `Stopped` is proof the wall is
+gone; a re-hit `Error` leaves the gate armed. Tests:
+`successful_turn_clears_pending_usage_limit_resume_gate`,
+`rehit_error_keeps_pending_usage_limit_resume_gate`.
+
+Maintainer's spec for correct behavior:
 when a usage-limit auto-resume timer is pending and a user sends a new message,
 (1) attempt the send to the agent; if it hits the limit AGAIN, the timer STAYS
 (keep waiting); (2) if the agent actually responds (limit lifted), CANCEL the
