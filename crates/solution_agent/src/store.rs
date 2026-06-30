@@ -1901,7 +1901,7 @@ impl SolutionAgentStore {
                     .unwrap_or(false);
                 let resume_at_ms = if enabled {
                     crate::supervisor::parse_usage_limit_reset_ms(&message, now_ms).map(|reset| {
-                        let jitter_ms = rand::thread_rng().gen_range(120_000i64..=900_000i64);
+                        let jitter_ms = rand::rng().random_range(120_000i64..=900_000i64);
                         reset + jitter_ms
                     })
                 } else {
