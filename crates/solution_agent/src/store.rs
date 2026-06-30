@@ -4699,6 +4699,168 @@ impl SolutionAgentStore {
         Ok(())
     }
 
+    /// HARD teardown of a session whose backing directory has been removed
+    /// (its member was dropped from the solution). Unlike
+    /// [`close_session`](Self::close_session) (soft / reopenable: keeps the row,
+    /// purges only the inbox), this deletes EVERYTHING — the in-memory entity
+    /// (releasing its `Project`/worktree fd), every per-session runtime map, the
+    /// whole `<solution_root>/.agents/<sid>/` on-disk tree (observer files,
+    /// compacts, session-log, inbox), all six DB tables, and the pool refcount.
+    /// There is nothing to reopen, so no `closed_at` soft-close and no tab_order
+    /// is kept.
+    pub fn purge_session_hard(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        // Capture the on-disk archive dir (`.agents/<sid>/`) BEFORE removing the
+        // entity — its path resolves from the session's solution root, which is
+        // only reachable while the session is still in `self.sessions`.
+        let archive = self
+            .solution_root_for(id, cx)
+            .map(|root| root.join(".agents").join(id.to_string()));
+        // Reap any in-flight ephemeral judge/auditor while the supervised session
+        // is still reachable (closes their hidden children + releases those
+        // children's pooled subprocesses), mirroring `close_session`.
+        self.finish_judge(id, cx);
+        self.finish_auditor(id, cx);
+        if let Some(entity) = self.sessions.get(&id)
+            && matches!(entity.read(cx).state, SessionState::Running { .. })
+        {
+            self.cancel_turn(id, cx).log_err();
+        }
+        let Some(removed) = self.sessions.remove(&id) else {
+            // Nothing hydrated for this id — purge the persisted rows + disk
+            // tree anyway so a never-loaded orphan is still cleaned up.
+            if let Some(db) = &self.persistence {
+                db.purge_session(id).detach_and_log_err(cx);
+            }
+            if let Some(archive) = archive {
+                cx.background_spawn(async move {
+                    if let Err(err) = std::fs::remove_dir_all(&archive) {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            log::warn!("purge_session_hard: remove_dir_all {archive:?}: {err}");
+                        }
+                    }
+                })
+                .detach();
+            }
+            return;
+        };
+        let session_read = removed.read(cx);
+        let solution_id = session_read.solution_id.clone();
+        let is_supervisor_ephemeral = session_read.is_supervisor_ephemeral;
+        let agent_id = session_read.agent_id.clone();
+        let pool_teardown = session_read.acp_thread().map(|thread| {
+            let thread = thread.read(cx);
+            (thread.connection().clone(), thread.session_id().clone())
+        });
+        if let Some(list) = self.by_solution.get_mut(&solution_id) {
+            list.retain(|sid| *sid != id);
+            if list.is_empty() {
+                self.by_solution.remove(&solution_id);
+            }
+        }
+        self.evict_session_runtime_maps(id);
+        // Delete the on-disk `.agents/<sid>/` tree off the foreground thread.
+        // NotFound is fine (a cold/never-archived session has no dir); any other
+        // IO error is surfaced rather than silently dropped.
+        if let Some(archive) = archive {
+            cx.background_spawn(async move {
+                if let Err(err) = std::fs::remove_dir_all(&archive) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!("purge_session_hard: remove_dir_all {archive:?}: {err}");
+                    }
+                }
+            })
+            .detach();
+        }
+        // HARD-delete the persisted rows across all six tables.
+        if let Some(db) = &self.persistence {
+            db.purge_session(id).detach_and_log_err(cx);
+        }
+        if !is_supervisor_ephemeral {
+            cx.emit(SolutionAgentStoreEvent::SessionClosed(id));
+            if let Some(coord) =
+                editor_mcp::workspace_seq::WorkspaceEventCoordinator::try_global(cx)
+            {
+                coord.emit_sequenced(
+                    cx,
+                    "workspace.session_deleted",
+                    serde_json::json!({
+                        "solution_id": solution_id.as_str(),
+                        "session_id": id.to_string(),
+                    }),
+                );
+            }
+        }
+        // Release the pool side exactly as `close_session` does (skip for
+        // cold/restored sessions that were never spawned on the pool).
+        if let Some((connection, acp_session_id)) = pool_teardown {
+            if connection.supports_close_session() {
+                connection.close_session(&acp_session_id, cx).detach();
+            }
+            self.pool_release_session((solution_id.clone(), agent_id), cx);
+        }
+        cx.notify();
+    }
+
+    /// Purge every hydrated, non-ephemeral session whose `cwd` no longer falls
+    /// under any alive member's `local_path` (nor the solution root) — i.e. the
+    /// member directory the session was scoped to has been removed from the
+    /// Solution. Ephemeral supervisor children are skipped (their parent's purge
+    /// reaps them via `finish_judge`/`finish_auditor`). Driven from
+    /// `on_solution_event` on a `Changed` (member add/remove) signal.
+    fn gc_orphan_members(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = SolutionStore::try_global(cx) else {
+            return;
+        };
+        // (solution root, member paths) per alive solution, keyed by id.
+        let roots: HashMap<SolutionId, (PathBuf, Vec<PathBuf>)> = store.read_with(cx, |s, _| {
+            s.solutions()
+                .iter()
+                .map(|sol| {
+                    let members = sol.members.iter().map(|m| m.local_path.clone()).collect();
+                    (sol.id.clone(), (sol.root.clone(), members))
+                })
+                .collect()
+        });
+        // Collect orphan ids first; purging mutates `by_solution`, so we must not
+        // iterate it while purging.
+        let mut orphans: Vec<SolutionSessionId> = Vec::new();
+        for (solution_id, session_ids) in &self.by_solution {
+            let Some((root, members)) = roots.get(solution_id) else {
+                // Whole solution vanished — handled by gc_orphan_solutions.
+                continue;
+            };
+            for id in session_ids {
+                let Some(session) = self.sessions.get(id) else {
+                    continue;
+                };
+                let session = session.read(cx);
+                if session.is_supervisor_ephemeral {
+                    continue;
+                }
+                let cwd = &session.cwd;
+                if cwd.as_os_str().is_empty() {
+                    continue;
+                }
+                // A session is in-scope iff its cwd is the solution root itself
+                // (a root-scoped / supervisor-style session) OR sits under a
+                // still-present member directory. A removed member's directory
+                // physically remains under `root`, so we must match `root`
+                // EXACTLY here — a `strip_prefix(root)` test would wrongly keep
+                // every removed-member session (they all live at `root/<member>`).
+                let at_root = cwd == root;
+                let under_member = members
+                    .iter()
+                    .any(|m| cwd == m || cwd.strip_prefix(m).is_ok());
+                if !at_root && !under_member {
+                    orphans.push(*id);
+                }
+            }
+        }
+        for id in orphans {
+            self.purge_session_hard(id, cx);
+        }
+    }
+
     /// Update the user-visible title of a session and persist the change
     /// (best-effort). Emits `SessionTitleChanged` so the navigator
     /// re-renders the row immediately.
@@ -7887,8 +8049,34 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         match event {
-            SolutionStoreEvent::Changed => self.gc_orphan_solutions(cx),
+            SolutionStoreEvent::Changed => {
+                // A member add/remove (among other store mutations) lands here.
+                // First reap whole vanished solutions, then individual sessions
+                // whose member directory was just removed.
+                self.gc_orphan_solutions(cx);
+                self.gc_orphan_members(cx);
+            }
             SolutionStoreEvent::Closed { id } => self.cold_close_solution(id, cx),
+            SolutionStoreEvent::Opened { id } => {
+                // On window open, force-load this solution's persisted sessions
+                // (existing orphans are `closed_at IS NULL` but un-hydrated), then
+                // GC any whose member dir no longer exists. Without the hydrate,
+                // an orphan already in the DB before this feature would never be
+                // loaded — and so never purged — until it was touched some other
+                // way.
+                let id = id.clone();
+                cx.spawn(async move |this, cx| {
+                    let hydrate = this
+                        .update(cx, |this, cx| this.hydrate_all_for_solution(id.clone(), cx))
+                        .log_err();
+                    if let Some(task) = hydrate {
+                        task.await.log_err();
+                    }
+                    this.update(cx, |this, cx| this.gc_orphan_members(cx))
+                        .log_err();
+                })
+                .detach();
+            }
             _ => {}
         }
     }

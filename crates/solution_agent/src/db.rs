@@ -357,6 +357,21 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Hard-delete every persisted trace of a session across all six tables
+    /// (`solution_sessions`, `solution_session_entries`,
+    /// `solution_session_attachment`, `solution_session_background_agent`,
+    /// `solution_session_background_shell`, `supervisor_state`) in a single
+    /// transaction. Unlike [`mark_closed`], the row is gone for good — used by
+    /// the member-removal GC path, where the session's directory no longer
+    /// exists so there is nothing to reopen.
+    pub fn purge_session(&self, id: SolutionSessionId) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            purge_session_fn(&connection, id)
+        })
+    }
+
     pub fn save_background_agent(&self, row: BackgroundAgentRow) -> Task<Result<()>> {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
@@ -1032,6 +1047,29 @@ fn delete_by_id(connection: &Connection, id: SolutionSessionId) -> Result<()> {
     "})?;
     delete(id.to_string())?;
     Ok(())
+}
+
+fn purge_session_fn(connection: &Connection, id: SolutionSessionId) -> Result<()> {
+    let id = id.to_string();
+    // One savepoint so a partial failure can't leave the session half-deleted
+    // (e.g. the row gone but its attachment/supervisor rows still dangling).
+    // The two background tables key on `solution_session_id`; the rest key on
+    // `session_id` — both verified against the CREATE TABLE statements above.
+    let tx = connection.with_savepoint("purge_session", || {
+        for sql in [
+            "DELETE FROM solution_sessions WHERE id = ?",
+            "DELETE FROM solution_session_entries WHERE session_id = ?",
+            "DELETE FROM solution_session_attachment WHERE session_id = ?",
+            "DELETE FROM solution_session_background_agent WHERE solution_session_id = ?",
+            "DELETE FROM solution_session_background_shell WHERE solution_session_id = ?",
+            "DELETE FROM supervisor_state WHERE session_id = ?",
+        ] {
+            let mut stmt = connection.exec_bound::<String>(sql)?;
+            stmt(id.clone())?;
+        }
+        Ok(())
+    });
+    tx.map_err(|e| anyhow!("purge_session failed: {e}"))
 }
 
 fn insert_or_update_background_agent(
@@ -2311,6 +2349,126 @@ mod tests {
         assert!(rows_a.is_empty());
         let rows_b = db.load_entries(session_b).await.unwrap();
         assert_eq!(rows_b.len(), 1);
+    }
+
+    #[gpui::test]
+    async fn purge_session_removes_rows_from_all_six_tables(cx: &mut gpui::TestAppContext) {
+        use crate::supervisor::SupervisorState;
+
+        let executor = cx.executor();
+        let db = SolutionAgentDb::open(executor).unwrap();
+
+        // The session to purge, plus a sibling whose rows must survive.
+        let meta = make_meta(1, "sol-purge");
+        let target = meta.id;
+        db.save_metadata(meta).await.unwrap();
+
+        let sibling_meta = make_meta(2, "sol-purge");
+        let sibling = sibling_meta.id;
+        db.save_metadata(sibling_meta).await.unwrap();
+
+        // Populate all six tables for both sessions, to prove purge is scoped.
+        for (id, tag) in [(target, "x"), (sibling, "y")] {
+            db.upsert_entry(id, 0, 0, 0, None, tag.as_bytes().to_vec())
+                .await
+                .unwrap();
+            db.record_attachment(
+                id.to_string(),
+                "sol-purge".into(),
+                format!("/inbox/{tag}.png"),
+                1,
+            )
+            .await
+            .unwrap();
+            db.save_background_agent(BackgroundAgentRow {
+                solution_session_id: id.to_string(),
+                agent_id: format!("agent-{tag}"),
+                jsonl_path: format!("/tmp/{tag}.jsonl"),
+                registered_at_ms: 1,
+                last_seen_label: None,
+                last_mtime_ms: None,
+                stop_reason: None,
+            })
+            .await
+            .unwrap();
+            db.save_background_shell(BackgroundShellRow {
+                solution_session_id: id.to_string(),
+                shell_id: format!("shell-{tag}"),
+                command: "echo hi".into(),
+                output_path: format!("/tmp/shell-{tag}.output"),
+                registered_at_ms: 1,
+                last_tail: None,
+                last_mtime_ms: None,
+                state_text: "running".into(),
+            })
+            .await
+            .unwrap();
+            db.save_supervisor_state(SupervisorState::new(id))
+                .await
+                .unwrap();
+        }
+
+        db.purge_session(target).await.unwrap();
+
+        // Every table is empty for `target`.
+        assert!(db.load_entries(target).await.unwrap().is_empty());
+        assert!(db
+            .attachment_paths_for_session(target.to_string())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .load_background_agents(target.to_string())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .load_background_shells(target.to_string())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .load_supervisor_states()
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.session_id != target));
+        let listed = db
+            .list_for_solution(SolutionId("sol-purge".into()))
+            .await
+            .unwrap();
+        assert!(listed.iter().all(|m| m.id != target));
+
+        // The sibling's rows all survive.
+        assert_eq!(db.load_entries(sibling).await.unwrap().len(), 1);
+        assert_eq!(
+            db.attachment_paths_for_session(sibling.to_string())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.load_background_agents(sibling.to_string())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.load_background_shells(sibling.to_string())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .load_supervisor_states()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_id == sibling));
+        assert!(listed.iter().any(|m| m.id == sibling));
     }
 
     // ── Task 3a: session model/effort/cached_models columns ──────────────────

@@ -981,6 +981,28 @@ impl SolutionStore {
             local_path: sol.root.join(&cid.0),
         });
     }
+
+    /// Push a member with an explicit `local_path` onto a solution, bypassing
+    /// catalog resolution and DB writes. Lets downstream crates (e.g.
+    /// `solution_agent`) set up member directories for orphan-GC tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_add_member_with_path(
+        &mut self,
+        sid: &SolutionId,
+        cid: &CatalogId,
+        local_path: PathBuf,
+    ) {
+        let sol = self
+            .config
+            .solutions
+            .iter_mut()
+            .find(|s| s.id == *sid)
+            .expect("test_add_member_with_path: solution not found");
+        sol.members.push(SolutionMember {
+            catalog_id: cid.clone(),
+            local_path,
+        });
+    }
 }
 
 pub(crate) struct GlobalSolutionStore(Entity<SolutionStore>);

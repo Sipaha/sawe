@@ -211,6 +211,137 @@ async fn close_session_purges_inbox_attachments(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// `purge_session_hard` is the HARD teardown used when a session's member dir
+/// is removed: it must drop the live entity + indices, delete the whole
+/// `<solution_root>/.agents/<sid>/` tree (observer files, compacts, inbox),
+/// and hard-delete the persisted rows (not soft-close them).
+#[gpui::test]
+async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (archive_dir, db, sol) = store.update(cx, |store, cx| {
+        let sol = store.session(id).unwrap().read(cx).solution_id.clone();
+        let root = store.solution_root_for_app(id, cx).expect("solution root");
+        (
+            root.join(".agents").join(id.to_string()),
+            store.persistence().expect("persistence"),
+            sol,
+        )
+    });
+
+    // Lay down the on-disk session tree (diary + a nested inbox file).
+    std::fs::create_dir_all(archive_dir.join("inbox")).unwrap();
+    std::fs::write(archive_dir.join("diary.md"), b"notes").unwrap();
+    std::fs::write(archive_dir.join("inbox").join("a.png"), b"png").unwrap();
+    assert!(archive_dir.exists());
+
+    // Persist a metadata row + an entry so we can prove the HARD delete.
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id,
+        solution_id: sol.clone(),
+        agent_id: SharedString::from("claude-acp"),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-cold"),
+        title: SharedString::from("Cold"),
+        created_at: Utc::now(),
+        last_activity_at: Utc::now(),
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    })
+    .await
+    .unwrap();
+    db.upsert_entry(id, 0, 0, 0, None, b"e".to_vec())
+        .await
+        .unwrap();
+
+    store.update(cx, |store, cx| store.purge_session_hard(id, cx));
+    cx.run_until_parked();
+
+    store.update(cx, |store, _| {
+        assert!(store.session(id).is_none(), "entity must be gone");
+        assert!(
+            !store.sessions_for(&sol).iter().any(|_| true)
+                || store.by_solution.get(&sol).map_or(true, |v| !v.contains(&id)),
+            "id must be removed from by_solution"
+        );
+    });
+    assert!(!archive_dir.exists(), ".agents/<sid> tree must be deleted");
+    assert!(
+        db.list_for_solution(sol.clone())
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.id != id),
+        "session row must be HARD-deleted, not soft-closed"
+    );
+    assert!(
+        db.load_entries(id).await.unwrap().is_empty(),
+        "entry rows must be hard-deleted"
+    );
+}
+
+/// `gc_orphan_members` purges only sessions whose `cwd` is no longer under any
+/// alive member path (nor the solution root). Sessions under a member dir, or
+/// at the solution root, survive.
+#[gpui::test]
+async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::TestAppContext) {
+    use solutions::{CatalogId, SolutionStore};
+
+    let registry = Arc::new(AdapterRegistry::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("solutions.json");
+    let solutions_root = dir.path().join("solutions");
+    std::fs::create_dir_all(&solutions_root).unwrap();
+
+    let (sol, root, member_path) = cx.update(|cx| {
+        let settings_store = settings::SettingsStore::test(cx);
+        cx.set_global(settings_store);
+        let solution_store = SolutionStore::for_test(cfg_path, cx);
+        solutions::install_global_for_test(solution_store.clone(), cx);
+        let sol = solution_store
+            .update(cx, |s, cx| s.create_solution("Sol", solutions_root.clone(), cx))
+            .expect("create_solution");
+        let root = solution_store.read(cx).solutions()[0].root.clone();
+        let member_path = root.join("kept-member");
+        solution_store.update(cx, |s, _| {
+            s.test_add_member_with_path(&sol, &CatalogId("kept".into()), member_path.clone());
+        });
+        (sol, root, member_path)
+    });
+
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+
+    let agent = SharedString::from("claude-acp");
+    let under_member = SolutionSessionId::new();
+    let at_root = SolutionSessionId::new();
+    let orphan = SolutionSessionId::new();
+
+    store.update(cx, |store, cx| {
+        for (sid, cwd) in [
+            (under_member, member_path.join("sub")),
+            (at_root, root.clone()),
+            (orphan, root.join("removed-member")),
+        ] {
+            let session = insert_cold_session(sid, sol.clone(), agent.clone(), None, None, store, cx);
+            session.update(cx, |s, _| s.cwd = cwd);
+        }
+        store.gc_orphan_members(cx);
+    });
+    cx.run_until_parked();
+
+    store.update(cx, |store, _| {
+        assert!(store.session(under_member).is_some(), "member-dir session kept");
+        assert!(store.session(at_root).is_some(), "root session kept");
+        assert!(store.session(orphan).is_none(), "removed-member session purged");
+    });
+}
+
 /// `cold_close_solution` bypasses `close_session` (it drops live entities
 /// without soft-closing the persisted sessions), so it must prune the same
 /// per-session runtime maps itself or they leak when a solution's window closes.
