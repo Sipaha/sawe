@@ -9141,6 +9141,13 @@ async fn reconnect_continues_a_wedged_running_session(cx: &mut TestAppContext) {
     // directly: the mock backend can't load/resume a session, so we exercise
     // `maybe_send_reconnect_continuation` — the real send + gate — against a
     // live thread, the state the genuine resume path lands in.)
+    //
+    // COVERAGE BOUNDARY: this verifies the gate (`was_running` -> send) and the
+    // actual prompt send, NOT the `reconnect_agent` call site or its
+    // `was_running` capture — those need a resume-capable backend the mock
+    // lacks. If `reconnect_agent` were changed to always pass `was_running:
+    // false`, this test would still pass; that wiring is currently unguarded by
+    // a test (a MockConnection load/resume impl would close the gap).
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
 
     cx.update(|cx| {
