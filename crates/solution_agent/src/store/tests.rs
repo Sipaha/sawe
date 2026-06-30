@@ -9102,3 +9102,90 @@ async fn transient_error_advances_backoff_then_gives_up(cx: &mut gpui::TestAppCo
     // Giving up must clear the gate (no dangling retry).
     assert_eq!(st.next_eligible_ms, None);
 }
+
+/// Helper: does the session's live thread contain a UserMessage carrying the
+/// reconnect continuation prompt?
+fn thread_has_continuation(
+    store: &SolutionAgentStore,
+    session_id: SolutionSessionId,
+    cx: &gpui::App,
+) -> bool {
+    let Some(thread) = store
+        .session(session_id)
+        .and_then(|s| s.read(cx).acp_thread().cloned())
+    else {
+        return false;
+    };
+    thread.read(cx).entries().iter().any(|e| {
+        if let acp_thread::AgentThreadEntry::UserMessage(msg) = e {
+            let text: String = msg
+                .chunks
+                .iter()
+                .filter_map(|b| match b {
+                    acp::ContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            text.contains("продолжай работу с того места")
+        } else {
+            false
+        }
+    })
+}
+
+#[gpui::test]
+async fn reconnect_continues_a_wedged_running_session(cx: &mut TestAppContext) {
+    // #6: the watchdog only reconnects sessions wedged mid-turn, so once the
+    // session is back the agent must be re-engaged with a continuation prompt
+    // rather than parking at Idle. (Driven through the post-resume hook
+    // directly: the mock backend can't load/resume a session, so we exercise
+    // `maybe_send_reconnect_continuation` — the real send + gate — against a
+    // live thread, the state the genuine resume path lands in.)
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.maybe_send_reconnect_continuation(session_id, /* was_running */ true, cx)
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let continued = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            thread_has_continuation(store, session_id, cx)
+        })
+    });
+    assert!(
+        continued,
+        "a continuation prompt must be sent after reconnecting a wedged (Running) session",
+    );
+}
+
+#[gpui::test]
+async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
+    // The gate: a reconnect of an already-idle session (e.g. a manual MCP
+    // reconnect) must NOT inject a spurious "carry on" prompt — there was no
+    // in-flight work to continue.
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.maybe_send_reconnect_continuation(session_id, /* was_running */ false, cx)
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let continued = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            thread_has_continuation(store, session_id, cx)
+        })
+    });
+    assert!(
+        !continued,
+        "no continuation prompt for a reconnect of an already-idle session",
+    );
+}

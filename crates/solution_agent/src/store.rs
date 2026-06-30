@@ -55,6 +55,14 @@ const STUCK_TURN_SECS: u64 = 5 * 60;
 /// wedging mid-tool.
 const TOOL_STUCK_SECS: u64 = 20 * 60;
 
+/// Continuation prompt sent to the agent after [`SolutionAgentStore::reconnect_agent`]
+/// brings a wedged (mid-turn) session back, so it resumes instead of parking at
+/// Idle. Deliberately a fresh "carry on" instruction, NOT a replay of the
+/// interrupted turn (replaying could re-run tool calls whose side effects already
+/// landed).
+const RECONNECT_CONTINUATION_PROMPT: &str = "Твой процесс завис, поэтому редактор перезапустил его. \
+     История и контекст сохранены — продолжай работу с того места, на котором остановился.";
+
 pub struct SolutionAgentStore {
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
@@ -4805,6 +4813,10 @@ impl SolutionAgentStore {
     /// persisted `entries` kept) and hand off to the proven [`resume_session`]
     /// cold path, which grafts the replayed thread onto the existing entity
     /// in place (no duplication, no loss). Returns the (unchanged) session id.
+    ///
+    /// If the session was actively Running when reconnected, a continuation
+    /// prompt ([`RECONNECT_CONTINUATION_PROMPT`]) is sent once it's back so the
+    /// agent resumes instead of parking at Idle.
     pub fn reconnect_agent(
         &mut self,
         session_id: SolutionSessionId,
@@ -4813,6 +4825,14 @@ impl SolutionAgentStore {
         let Some(session) = self.sessions.get(&session_id).cloned() else {
             return Task::ready(Err(anyhow!("unknown session {session_id}")));
         };
+        // The stuck-session watchdog only reconnects sessions wedged mid-turn
+        // (Running), so capture whether real work was in flight BEFORE we flip
+        // the state to `Errored("reconnecting…")` below. If so, once the
+        // session is back we re-engage the agent with a continuation prompt
+        // (see the spawn) instead of leaving it parked at Idle. A manual
+        // reconnect of an already-idle session was_running == false → no
+        // spurious nudge.
+        let was_running = matches!(session.read(cx).state, SessionState::Running { .. });
         let project = match session.read(cx).project.clone() {
             Some(project) => project,
             None => {
@@ -4887,10 +4907,44 @@ impl SolutionAgentStore {
                     "Агент не отвечал — переподключил сессию (история и контекст сохранены).",
                     cx,
                 );
+                store.maybe_send_reconnect_continuation(resumed, was_running, cx);
             })
             .ok();
             Ok(resumed)
         })
+    }
+
+    /// After [`reconnect_agent`](Self::reconnect_agent) brings a session back,
+    /// re-engage the agent with a fresh continuation prompt so it resumes
+    /// instead of parking at Idle — but ONLY when the session was actually
+    /// Running (mid-turn) at reconnect time (`was_running`). A reconnect of an
+    /// already-idle session (e.g. a manual MCP reconnect) gets no spurious
+    /// nudge. The prompt is a "carry on" instruction, deliberately NOT a replay
+    /// of the interrupted turn (replaying could re-run tool calls whose side
+    /// effects already landed). `from_user: false`: editor-originated, so it
+    /// must not reset the supervisor's continue counter / resume a
+    /// `WaitingUser` hold.
+    pub(crate) fn maybe_send_reconnect_continuation(
+        &mut self,
+        session_id: SolutionSessionId,
+        was_running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !was_running {
+            return;
+        }
+        self.send_message_blocks_targeted(
+            session_id,
+            vec![agent_client_protocol::schema::ContentBlock::Text(
+                agent_client_protocol::schema::TextContent::new(
+                    RECONNECT_CONTINUATION_PROMPT.to_string(),
+                ),
+            )],
+            crate::model::QueueTarget::Main,
+            false,
+            cx,
+        )
+        .detach_and_log_err(cx);
     }
 
     /// Interleave an editor-originated [`acp_thread::SystemNote`] into the
