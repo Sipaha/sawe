@@ -8,11 +8,12 @@ reading (and #3 by an empirical repro).
 
 SCOREBOARD (2026-06-30):
 - #1 judge↔reply race — ✅ SHIPPED `18e65fbce7`
-- #2 Observer plaque render — 🚧 fix done (uncommitted), AFTER-screenshot in progress
+- #2 Observer plaque render — ✅ SHIPPED `eb458205b8`
 - #3 session-not-found after restart — ✅ SHIPPED `c987efa5d2`
-- #4 mobile/desktop session-list scope — by design; PENDING maintainer decision (doc + optional label)
+- #4 mobile/desktop session-list scope — ✅ SHIPPED `e625529dad` (maintainer: must be 1:1; mobile now filters to the pinned strip set)
 - #5 status latched on Error while streaming — ✅ SHIPPED `b5107a7d41`
-- #6 reconnect → Done, doesn't continue — root-caused; PENDING maintainer decision (auto-continue policy)
+- #6 reconnect → Done, doesn't continue — ✅ SHIPPED `e2bafe0506` (maintainer: send the agent a "process restarted, continue" prompt)
+- #7 usage-limit resume timer vs new user messages — INVESTIGATING
 - collateral: `865baee27a` acp_servers test-match SystemNote arm.
 
 Resume: this is the durable task pool. Each row says STATUS + the exact
@@ -167,7 +168,15 @@ create→adversarial-order→restore→send integration mirroring
 ---
 
 ## #4 — spk-mail session shows on MOBILE but not DESKTOP
-**STATUS: WORKING AS DESIGNED. Needs a product decision + a FORK.md note. No code bug.**
+**STATUS: SHIPPED `e625529dad`.** Maintainer's call: this IS a bug — must be 1:1.
+Fix: `ListSessionsTool` top-level enumeration now filters to
+`session.tab_order.is_some()` (the desktop strip's pinned set, matching
+`workspace.snapshot`). Sub-agent (`parent_session_id`) drill-downs are exempt
+(children are never pinned). `create_session` pins via `open_session_in_strip`
+(+ #3 made it durable), so nothing legitimate is hidden — a session created
+anywhere is pinned and shows on both surfaces. Test:
+`list_sessions_excludes_untabbed_sessions`. Original by-design analysis kept
+below for context.
 
 Desktop strip = `list_open_tabs` = `tab_order IS NOT NULL AND closed_at IS NULL`
 (only sessions pinned to the ConsolePanel strip). Mobile `list_sessions`
@@ -228,7 +237,16 @@ required).
 ---
 
 ## #6 — after watchdog reconnect the session sits at "Done" instead of continuing
-**STATUS: root-caused; PENDING maintainer decision on policy. No fix yet.**
+**STATUS: SHIPPED `e2bafe0506`.** Maintainer's call: write to the agent that its
+process hung, was restarted, and it can continue. Fix: `reconnect_agent`
+captures `was_running` before flipping to `Errored("reconnecting…")`; after
+`resume_session` succeeds it calls `maybe_send_reconnect_continuation(resumed,
+was_running, cx)` which (only if was_running) sends a fresh continuation prompt
+(`RECONNECT_CONTINUATION_PROMPT`, `from_user:false`) — NOT a replay of the
+interrupted turn. A reconnect of an already-idle session (manual MCP reconnect)
+sends nothing. Tests: `reconnect_continues_a_wedged_running_session`,
+`reconnect_idle_session_sends_no_continuation` (drive the extracted method
+directly — the mock backend can't load/resume). Original analysis below.
 
 `reconnect_agent` (store.rs:4786, fired by the stuck-session watchdog at
 store.rs:2134) is deliberately NON-DESTRUCTIVE: drops the wedged pooled
@@ -254,6 +272,18 @@ Gap / proposed fix (await decision):
   ("история сохранена — напиши сообщение, чтобы продолжить") so it's clear it
   won't move on its own.
 - (c) (rejected) re-issue the last turn — unsafe re: tool-call side effects.
+
+---
+
+## #7 — usage-limit resume timer vs. incoming user messages
+**STATUS: INVESTIGATING.** Maintainer's spec for correct behavior:
+when a usage-limit auto-resume timer is pending and a user sends a new message,
+(1) attempt the send to the agent; if it hits the limit AGAIN, the timer STAYS
+(keep waiting); (2) if the agent actually responds (limit lifted), CANCEL the
+resume timer. Need to verify the current code does both and flag any gap
+(e.g. timer not cancelled on a successful response → redundant auto-resume;
+or a user message dropped while the timer is pending). Source: commit
+`27f9af13f4` usage-limit detect/auto-resume.
 
 ---
 
