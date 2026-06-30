@@ -331,13 +331,13 @@ impl McpServerTool for ListSessionsTool {
             ),
             None => None,
         };
-        // Hydrate any DB-only sessions for the requested solution. The
-        // desktop's tab strip only hydrates rows with `tab_order IS
-        // NOT NULL`, so closed-tab sessions were invisible to MCP-only
-        // consumers like the phone — even though their full transcripts
-        // sit on disk. `hydrate_all_for_solution` is a no-op for already-
-        // hydrated sessions, so the second list_sessions call costs just
-        // one cheap DB metadata query.
+        // Hydrate DB-only sessions for the requested solution so a headless
+        // phone client (no desktop window having hydrated the strip) still
+        // sees them. The enumeration below then filters to the desktop strip's
+        // pinned set (`tab_order IS NOT NULL`) so mobile and desktop list the
+        // same sessions 1-to-1 (#4). `hydrate_all_for_solution` is a no-op for
+        // already-hydrated sessions, so a repeat list_sessions costs just one
+        // cheap DB metadata query.
         if let Some(s) = input.solution_id.as_ref() {
             let sol_id = SolutionId(s.clone());
             let task = cx.update(|cx| {
@@ -368,6 +368,18 @@ impl McpServerTool for ListSessionsTool {
                             if session.parent_session_id != Some(want) {
                                 return None;
                             }
+                        }
+                        // #4: the mobile session list must match the desktop tab
+                        // strip 1-to-1. The strip shows exactly the pinned set
+                        // (`tab_order IS NOT NULL`, via `list_open_tabs`); an
+                        // un-pinned / closed-tab session must NOT surface here
+                        // either, or the phone shows ghosts the desktop doesn't.
+                        // Only applied at top level — a `parent_session_id`
+                        // drill-down lists sub-agent children, which are never
+                        // pinned (no `tab_order`) by design, so the pin filter
+                        // would wrongly empty that view.
+                        if want_parent.is_none() && session.tab_order.is_none() {
+                            return None;
                         }
                         Some(session_summary(session, cx))
                     })
@@ -6654,6 +6666,72 @@ mod tests {
         assert!(
             !ids.contains(&parent_id.to_string()),
             "parent itself is excluded"
+        );
+    }
+
+    #[gpui::test]
+    async fn list_sessions_excludes_untabbed_sessions(cx: &mut gpui::TestAppContext) {
+        // #4: the mobile list must equal the desktop tab strip 1-to-1. A
+        // freshly created session is pinned (`tab_order` set by
+        // `open_session_in_strip`) and shows; an un-pinned session
+        // (`tab_order` NULL — closed-tab, or a row that lost its tab_order)
+        // must NOT appear at top level.
+        let (tabbed_id, _thread, _tmp) = create_session_with_thread(cx).await;
+        let solution_id = cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store
+                .read(cx)
+                .session(tabbed_id)
+                .expect("tabbed")
+                .read(cx)
+                .solution_id
+                .clone()
+        });
+
+        let untabbed_id = cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                assert!(
+                    store.session(tabbed_id).unwrap().read(cx).tab_order.is_some(),
+                    "a freshly created session must be pinned to the strip",
+                );
+                let id = SolutionSessionId::new();
+                crate::store::tests::insert_cold_session(
+                    id,
+                    solution_id.clone(),
+                    "mock-agent".into(),
+                    None,
+                    None,
+                    store,
+                    cx,
+                );
+                id
+            })
+        });
+
+        let result = ListSessionsTool
+            .run(
+                ListSessionsParams {
+                    solution_id: Some(solution_id.0.clone()),
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("list_sessions");
+        let ids: std::collections::HashSet<String> = result
+            .structured_content
+            .sessions
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert!(
+            ids.contains(&tabbed_id.to_string()),
+            "the pinned session is listed",
+        );
+        assert!(
+            !ids.contains(&untabbed_id.to_string()),
+            "the un-pinned session is excluded (1-to-1 with the desktop strip)",
         );
     }
 
