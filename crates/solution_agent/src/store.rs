@@ -4947,6 +4947,35 @@ impl SolutionAgentStore {
         .detach_and_log_err(cx);
     }
 
+    /// A successful worker turn (`Stopped`) proves the agent is responding, so a
+    /// pending usage-limit / transient-backoff resume gate (`next_eligible_ms`
+    /// plus its `backoff_timers` wake task) is stale and must be cleared (#7).
+    /// Otherwise the worker stays gated until the now-irrelevant reset time AND
+    /// the wake timer later fires a redundant judge. A genuine re-hit of the
+    /// usage wall surfaces as `AcpThreadEvent::Error` (not `Stopped`) — see the
+    /// claude_native orphan-result handling — so the gate correctly SURVIVES
+    /// that case and we keep waiting. Idempotent; no-op when no gate is set.
+    /// Mirrors the success-clear in [`apply_verdict`](Self::apply_verdict).
+    pub(crate) fn clear_resume_gate_on_agent_response(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let gated = self
+            .supervisor_states
+            .get(&id)
+            .is_some_and(|s| s.next_eligible_ms.is_some());
+        if !gated {
+            return;
+        }
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            state.next_eligible_ms = None;
+            state.backoff_attempt = 0;
+        }
+        self.backoff_timers.remove(&id);
+        self.persist_supervisor_state(id, cx);
+    }
+
     /// Interleave an editor-originated [`acp_thread::SystemNote`] into the
     /// session's conversation (watchdog / usage-limit / supervisor breadcrumbs).
     /// Pushes onto the live `AcpThread` so it flows through the normal
@@ -7133,6 +7162,13 @@ impl SolutionAgentStore {
                 }
             }
             acp_thread::AcpThreadEvent::Stopped(_) => {
+                // A turn that runs to `Stopped` is proof the agent responded —
+                // cancel any pending usage-limit / backoff resume gate so the
+                // session isn't kept waiting (and a stale wake timer doesn't
+                // fire a redundant judge) after the wall has cleared (#7). A
+                // re-hit of the wall arrives as `Error`, not `Stopped`, so the
+                // gate survives that case.
+                self.clear_resume_gate_on_agent_response(session_id, cx);
                 // Snapshot the Running turn's elapsed time BEFORE the
                 // state flip — `mutate_state` overwrites `started_at`
                 // with `SessionState::Idle` so we can't recover it

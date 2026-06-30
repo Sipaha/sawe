@@ -9189,3 +9189,88 @@ async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
         "no continuation prompt for a reconnect of an already-idle session",
     );
 }
+
+/// Arm a usage-limit / backoff resume gate on `session_id` exactly like
+/// `on_judge_failed`'s Quota branch: `next_eligible_ms` in the future plus a
+/// live `backoff_timers` wake task.
+fn arm_resume_gate(store: &mut SolutionAgentStore, session_id: SolutionSessionId) {
+    let future_ms = chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000;
+    let st = store
+        .supervisor_states
+        .entry(session_id)
+        .or_insert_with(|| crate::supervisor::SupervisorState::new(session_id));
+    st.enabled = true;
+    st.status = crate::supervisor::SupervisorStatus::Watching;
+    st.next_eligible_ms = Some(future_ms);
+    store.backoff_timers.insert(session_id, Task::ready(()));
+}
+
+#[gpui::test]
+async fn successful_turn_clears_pending_usage_limit_resume_gate(cx: &mut TestAppContext) {
+    // #7: a usage-limit auto-resume gate (`next_eligible_ms` + its
+    // `backoff_timers` wake task) must be cancelled once the worker actually
+    // responds — a successful turn (`Stopped`) proves the wall is gone.
+    // Otherwise the session stays gated until the stale reset time and the
+    // timer fires a redundant judge.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| arm_resume_gate(store, session_id));
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.next_eligible_ms, None,
+                "resume gate must be cleared on a successful turn",
+            );
+            assert!(
+                !store.backoff_timers.contains_key(&session_id),
+                "resume wake timer must be removed on a successful turn",
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn rehit_error_keeps_pending_usage_limit_resume_gate(cx: &mut TestAppContext) {
+    // #7 (the other half): a NEW user message that re-hits the wall surfaces as
+    // `AcpThreadEvent::Error` (not `Stopped`), so the pending resume gate must
+    // SURVIVE — we keep waiting for the reset.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| arm_resume_gate(store, session_id));
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Error);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert!(
+                st.next_eligible_ms.is_some(),
+                "resume gate must survive a re-hit (Error), so we keep waiting",
+            );
+            assert!(
+                store.backoff_timers.contains_key(&session_id),
+                "resume wake timer must survive a re-hit (Error)",
+            );
+        });
+    });
+}
