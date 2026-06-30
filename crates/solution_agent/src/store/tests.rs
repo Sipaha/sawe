@@ -492,6 +492,52 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
     });
 }
 
+#[gpui::test]
+async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppContext) {
+    use chrono::TimeZone;
+    // seed_store_with_session installs a SolutionStore (so the reaper resolves
+    // the root) + a persistence DB.
+    let (store, seeded, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let sol = store.read_with(cx, |s, cx| {
+        s.session(seeded).expect("seeded").read(cx).solution_id.clone()
+    });
+    let db = store.read_with(cx, |s, _| s.persistence()).expect("persistence");
+
+    // Two persisted sessions in the same solution: one soft-closed 40 days ago
+    // (past the 30d TTL → reap), one 5 days ago (inside it → keep).
+    let old = SolutionSessionId::new();
+    let recent = SolutionSessionId::new();
+    store.update(cx, |store, cx| {
+        for id in [old, recent] {
+            insert_cold_session(id, sol.clone(), SharedString::from("claude-acp"), None, None, store, cx);
+            store.persist_session_row(id, cx);
+        }
+    });
+    cx.run_until_parked();
+
+    let day = 86_400_000i64;
+    let now = Utc::now().timestamp_millis();
+    db.mark_closed(old, Some(Utc.timestamp_millis_opt(now - 40 * day).unwrap()))
+        .await
+        .unwrap();
+    db.mark_closed(recent, Some(Utc.timestamp_millis_opt(now - 5 * day).unwrap()))
+        .await
+        .unwrap();
+
+    store.update(cx, |store, cx| store.reap_stale_closed_sessions(sol.clone(), cx));
+    cx.run_until_parked();
+
+    let ids: Vec<SolutionSessionId> = db
+        .list_for_solution(sol)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert!(!ids.contains(&old), "session closed 40d ago is hard-purged");
+    assert!(ids.contains(&recent), "session closed 5d ago is kept");
+}
+
 /// `cold_close_solution` bypasses `close_session` (it drops live entities
 /// without soft-closing the persisted sessions), so it must prune the same
 /// per-session runtime maps itself or they leak when a solution's window closes.

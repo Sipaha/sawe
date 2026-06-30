@@ -788,6 +788,22 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Ids of sessions the user soft-closed (`closed_at IS NOT NULL`) more than
+    /// `cutoff_ms` ago — the TTL reaper hard-purges these. `reopen_session`
+    /// clears `closed_at`, so a restored-then-reclosed session restarts the
+    /// clock from its NEW close (its old, long-past `closed_at` is gone).
+    pub fn list_sessions_closed_before(
+        &self,
+        solution_id: SolutionId,
+        cutoff_ms: i64,
+    ) -> Task<Result<Vec<SolutionSessionId>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            select_sessions_closed_before(&connection, &solution_id, cutoff_ms)
+        })
+    }
+
     /// Ids of the solution's *closed* sessions — `closed_at IS NOT NULL`,
     /// i.e. the ones the user explicitly closed via the desktop's close-tab
     /// affordance. Drives the "Reopen Closed Chat" picker, which reads each
@@ -1538,6 +1554,26 @@ fn select_closed_session_ids(
         let parsed = SolutionSessionId::parse(&id)
             .map_err(|e| anyhow!("invalid SolutionSessionId in closed-session row: {e}"))?;
         out.push(parsed);
+    }
+    Ok(out)
+}
+
+fn select_sessions_closed_before(
+    connection: &Connection,
+    solution_id: &SolutionId,
+    cutoff_ms: i64,
+) -> Result<Vec<SolutionSessionId>> {
+    let mut select = connection.select_bound::<(String, i64), String>(indoc! {"
+        SELECT id FROM solution_sessions
+        WHERE solution_id = ? AND closed_at IS NOT NULL AND closed_at < ?
+    "})?;
+    let rows = select((solution_id.0.clone(), cutoff_ms))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for id in rows {
+        out.push(
+            SolutionSessionId::parse(&id)
+                .map_err(|e| anyhow!("invalid SolutionSessionId in closed-session row: {e}"))?,
+        );
     }
     Ok(out)
 }
@@ -2697,5 +2733,46 @@ mod tests {
         assert_eq!(loaded3.cached_models[0].value, "model-x");
         assert_eq!(loaded3.cached_models[0].display_name, "model-x Display");
         assert_eq!(loaded3.cached_models[0].description, "model-x description");
+    }
+
+    #[gpui::test]
+    async fn list_sessions_closed_before_returns_only_old_closed(cx: &mut gpui::TestAppContext) {
+        let db = SolutionAgentDb::open(cx.executor()).unwrap();
+        let day = 86_400_000i64;
+        let now = 1_800_000_000_000i64;
+
+        let old = make_meta(1, "sol-reap");
+        let recent = make_meta(2, "sol-reap");
+        let open = make_meta(3, "sol-reap");
+        let (old_id, recent_id, open_id) = (old.id, recent.id, open.id);
+        for m in [old, recent, open] {
+            db.save_metadata(m).await.unwrap();
+        }
+
+        // `old` was soft-closed 40 days ago (past the 30d cutoff), `recent` 5
+        // days ago (inside it), `open` is still open (no `closed_at`).
+        db.mark_closed(old_id, Some(Utc.timestamp_millis_opt(now - 40 * day).unwrap()))
+            .await
+            .unwrap();
+        db.mark_closed(recent_id, Some(Utc.timestamp_millis_opt(now - 5 * day).unwrap()))
+            .await
+            .unwrap();
+
+        let cutoff = now - 30 * day;
+        let ids = db
+            .list_sessions_closed_before(SolutionId("sol-reap".into()), cutoff)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![old_id], "only the long-ago-closed session is returned");
+
+        // A reopen clears `closed_at`, so a restored session is no longer
+        // eligible even though it was once closed long ago.
+        db.reopen_session(old_id).await.unwrap();
+        let ids = db
+            .list_sessions_closed_before(SolutionId("sol-reap".into()), cutoff)
+            .await
+            .unwrap();
+        assert!(ids.is_empty(), "a reopened session is excluded (closed_at cleared)");
+        let _ = (recent_id, open_id);
     }
 }

@@ -373,6 +373,11 @@ const ARCHIVE_REAP_MIN_SESSIONS: usize = 10;
 /// A session's `.agents/<sid>/` archive is eligible for GC once its last
 /// activity is older than this.
 const ARCHIVE_REAP_MAX_AGE_DAYS: i64 = 30;
+/// A session the user SOFT-closed (tab close) is fully hard-purged (row +
+/// `.agents/<sid>/` tree) once its `closed_at` is older than this — the
+/// "lifetime after which a closed chat is finally cleaned." Reopen clears
+/// `closed_at`, so a restored session restarts the clock from its next close.
+const CLOSED_SESSION_REAP_DAYS: i64 = 30;
 
 /// Pure half of [`SolutionAgentStore::reap_stale_session_archives`]: given a
 /// solution `root` and the metadata for ALL its sessions (closed included),
@@ -4070,14 +4075,61 @@ impl SolutionAgentStore {
         .detach();
     }
 
+    /// TTL reaper: hard-purge sessions the user soft-closed (tab close) more
+    /// than [`CLOSED_SESSION_REAP_DAYS`] ago. A soft close intentionally keeps
+    /// the row + `.agents/<sid>/` tree for "Reopen Closed Chat"; this reclaims
+    /// that disk/DB once the chat has been closed long enough. `reopen_session`
+    /// clears `closed_at`, so restoring a chat restarts the clock from its next
+    /// close. Routes through [`purge_session_hard`](Self::purge_session_hard) —
+    /// the single canonical per-session hard primitive — so a reaped session is
+    /// cleaned exactly like a member/solution delete. Runs at the same
+    /// infrequent seam as [`reap_stale_session_archives`](Self::reap_stale_session_archives)
+    /// (solution open). `&self`: the mutation happens inside the spawned
+    /// `this.update`, so this only schedules.
+    fn reap_stale_closed_sessions(&self, solution_id: SolutionId, cx: &mut Context<Self>) {
+        let Some(db) = self.persistence.clone() else {
+            return;
+        };
+        let Some(root) = SolutionStore::try_global(cx).and_then(|store| {
+            store
+                .read(cx)
+                .solutions()
+                .iter()
+                .find(|sol| sol.id == solution_id)
+                .map(|sol| sol.root.clone())
+        }) else {
+            return;
+        };
+        let cutoff_ms =
+            (Utc::now() - chrono::Duration::days(CLOSED_SESSION_REAP_DAYS)).timestamp_millis();
+        cx.spawn(async move |this, cx| {
+            let ids = match db.list_sessions_closed_before(solution_id, cutoff_ms).await {
+                Ok(ids) => ids,
+                Err(_) => return,
+            };
+            if ids.is_empty() {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                for id in ids {
+                    this.purge_session_hard(id, Some(root.clone()), cx);
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     pub fn hydrate_all_for_solution(
         &self,
         solution_id: SolutionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<SolutionSessionId>>> {
         // Opening a solution is a natural, infrequent point to garbage-collect
-        // stale on-disk session archives under `.agents/`.
+        // stale on-disk session archives under `.agents/`, and to hard-purge
+        // sessions that have sat soft-closed past their TTL.
         self.reap_stale_session_archives(solution_id.clone(), cx);
+        self.reap_stale_closed_sessions(solution_id.clone(), cx);
         let Some(db) = self.persistence.clone() else {
             return Task::ready(Ok(Vec::new()));
         };
