@@ -223,6 +223,10 @@ const GLOBAL_TOOLS: &[&str] = &[
     "solution_agent.set_supervisor_enabled",
     "solution_agent.set_supervisor_prompt",
     "solution_agent.get_supervisor_state",
+    // Debugging primitive: inject an in-conversation SystemNote breadcrumb
+    // into a session addressed by explicit id. Global (operator/agent reaches
+    // any session by id), not solution-scoped, so it stays out of SHARED_TOOLS.
+    "solution_agent.push_system_note",
     "solution_agent.upload_init",
     "solution_agent.upload_status",
     "solution_agent.upload_finish",

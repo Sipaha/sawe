@@ -110,6 +110,9 @@ pub fn register(cx: &mut App) {
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(GetSupervisorStateTool);
     });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(PushSystemNoteTool);
+    });
 }
 
 // =====================================================================
@@ -3245,6 +3248,91 @@ impl McpServerTool for RenameSessionTool {
 }
 
 // =====================================================================
+// solution_agent.push_system_note
+// =====================================================================
+
+/// Inject an in-conversation SystemNote breadcrumb into a live session.
+/// `level` is one of `info` | `error` | `observer`. This exists primarily
+/// so an agent driving the editor over MCP can exercise the SystemNote
+/// rendering path (which otherwise only fires from supervisor / reconnect
+/// internals). No-op on a cold session (no live `AcpThread`): create a
+/// session and send it a message first so a thread exists.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct PushSystemNoteParams {
+    pub session_id: String,
+    /// `info` | `error` | `observer`. Defaults to `info` when empty.
+    pub level: String,
+    pub text: String,
+}
+
+impl<'de> Deserialize<'de> for PushSystemNoteParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+            level: String,
+            text: String,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            session_id: inner.session_id,
+            level: inner.level,
+            text: inner.text,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct PushSystemNoteResult {}
+
+#[derive(Clone)]
+pub struct PushSystemNoteTool;
+
+impl McpServerTool for PushSystemNoteTool {
+    type Input = PushSystemNoteParams;
+    type Output = PushSystemNoteResult;
+    const NAME: &'static str = "solution_agent.push_system_note";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        anyhow::ensure!(!input.text.is_empty(), "invalid_params: text is required");
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+        let level = match input.level.trim().to_ascii_lowercase().as_str() {
+            "" | "info" => acp_thread::SystemNoteLevel::Info,
+            "error" => acp_thread::SystemNoteLevel::Error,
+            "observer" => acp_thread::SystemNoteLevel::Observer,
+            other => {
+                anyhow::bail!("invalid_params: level must be info|error|observer, got {other:?}")
+            }
+        };
+        let text = SharedString::from(input.text);
+
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.push_system_note(session_id, level, text, cx)
+            });
+        });
+
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: "pushed".to_string(),
+            }],
+            structured_content: PushSystemNoteResult {},
+        })
+    }
+}
+
+// =====================================================================
 // solution_agent.restart_agent
 // =====================================================================
 
@@ -5306,6 +5394,61 @@ mod tests {
             "Pending tool call should not surface a started_at timestamp, got: {:?}",
             tool.tool_status_started_at_ms,
         );
+    }
+
+    #[test]
+    fn push_system_note_params_parse_levels() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<PushSystemNoteParams>(v);
+        let p = parse(serde_json::json!({
+            "session_id": "s1", "level": "observer", "text": "hi"
+        }))
+        .expect("parse observer");
+        assert_eq!(p.level, "observer");
+        assert_eq!(p.text, "hi");
+        // Unknown fields are rejected (deny_unknown_fields), matching the
+        // sibling param structs.
+        assert!(
+            parse(serde_json::json!({ "session_id": "s1", "bogus": 1 })).is_err(),
+            "unknown field should be rejected"
+        );
+    }
+
+    #[gpui::test]
+    async fn push_system_note_appends_observer_entry(cx: &mut gpui::TestAppContext) {
+        let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+        let before = cx.update(|cx| acp_thread.read(cx).entries().len());
+
+        cx.update(|cx| {
+            let cx = cx.to_async();
+            async move {
+                PushSystemNoteTool
+                    .run(
+                        PushSystemNoteParams {
+                            session_id: session_id.to_string(),
+                            level: "observer".to_string(),
+                            text: "Наблюдатель направил агента".to_string(),
+                        },
+                        &mut cx.clone(),
+                    )
+                    .await
+            }
+        })
+        .await
+        .expect("push_system_note");
+        cx.executor().run_until_parked();
+
+        cx.update(|cx| {
+            let entries = acp_thread.read(cx).entries();
+            assert_eq!(entries.len(), before + 1, "one SystemNote appended");
+            match entries.last().expect("last entry") {
+                acp_thread::AgentThreadEntry::SystemNote(note) => {
+                    assert_eq!(note.level, acp_thread::SystemNoteLevel::Observer);
+                    assert_eq!(note.text.as_ref(), "Наблюдатель направил агента");
+                }
+                other => panic!("expected SystemNote, got {other:?}"),
+            }
+        });
     }
 
     #[gpui::test]

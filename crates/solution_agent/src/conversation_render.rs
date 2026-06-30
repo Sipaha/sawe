@@ -434,6 +434,16 @@ pub(crate) fn render_entry(
                 SystemEntryLevel::Error => (IconName::Warning, Color::Error, "System"),
                 SystemEntryLevel::Observer => (IconName::Eye, Color::Accent, "Observer"),
             };
+            // `h_flex` + plain `Label` for the body kept the breadcrumb on a
+            // single non-wrapping row: an `h_flex` sizes children to content and
+            // the text child had no width bound, so a long Observer note
+            // overflowed / clipped against the right edge instead of wrapping.
+            // Fix: pin the icon at the left, then a `flex_1` (width-constrained,
+            // `min_w_0` so it can shrink below its content) column holding the
+            // tag and the body. The body `Label` wraps because its container is
+            // bounded and it is neither `single_line` nor `truncate`. This
+            // mirrors the user/assistant renderers, which lay their wrapping
+            // bodies out in a column rather than a bare `h_flex` row.
             h_flex()
                 .gap_1p5()
                 .mx_2()
@@ -444,8 +454,18 @@ pub(crate) fn render_entry(
                 .border_l_2()
                 .border_color(color.color(cx))
                 .child(Icon::new(icon).size(IconSize::XSmall).color(color))
-                .child(Label::new(tag).size(LabelSize::XSmall).color(color))
-                .child(Label::new(text_md.clone()).color(Color::Default))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(Label::new(tag).size(LabelSize::XSmall).color(color))
+                        .child(
+                            Label::new(text_md.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Default),
+                        ),
+                )
                 .into_any_element()
         }
     };
