@@ -653,6 +653,8 @@ impl SolutionAgentDb {
                     // Transient (not persisted): a cold-loaded session has no
                     // in-flight draft to protect from a supervisor nudge.
                     last_user_input_ms: None,
+                    // Transient: no in-flight judge exists for a cold-loaded row.
+                    judge_superseded: false,
                 });
             }
             Ok(out)

@@ -12,7 +12,24 @@ fix site. Pick the first unshipped and continue.
 ---
 
 ## #1 — Observer sends a nudge AFTER the user already replied (judge↔reply race)
-**STATUS: root-caused, fix designed, NOT shipped.**
+**STATUS: SHIPPED.** Marker-based suppression + judge teardown on reply.
+
+Shipped design (refined from the plan below): a transient
+`SupervisorState.judge_superseded` bool is the single suppression signal.
+`supersede_judge_on_user_reply` (called from the `from_user` send funnel in
+queue.rs, next to `reset_supervisor_continue_counter`) tears the in-flight
+judge down, sets `judge_superseded = true`, and returns status `Judging →
+Watching`. `apply_verdict` consumes the marker (`mem::take`) at entry and, if
+set, records the verdict for audit then returns WITHOUT acting (no nudge /
+Observer note / counter bump / escalation). `tick_supervisor` clears the marker
+when spawning a fresh judge so it never pre-suppresses the next cycle. Chosen
+over a judge-handle / `status == Judging` guard because both wrongly suppressed
+faithful existing `apply_verdict` tests (Done/Compact/Ask issued from
+`Watching`/`WaitingUser`); the marker suppresses ONLY a genuinely superseded
+verdict. Tests: `user_reply_supersedes_in_flight_judge` +
+`verdict_applies_while_judge_in_flight` (control). All 480 lib tests green.
+
+Original plan (kept for context):
 
 When a supervised session goes idle, `tick_supervisor` (store.rs:2185) sets
 status `Judging` and `spawn_judge` launches an ephemeral judge session. While
@@ -149,7 +166,9 @@ uses `list_open_tabs` semantics.
 ---
 
 ## #5 — status row stuck on "Error: agent error" while the agent is actively streaming
-**STATUS: root-caused, fix designed, NOT shipped.**
+**STATUS: SHIPPED** (commit b5107a7d41). `SessionState::resume_on_activity`
+(NewEntry) + `clear_error_on_activity` (EntryUpdated, Errored-only so a late
+streaming-reveal can't resurrect a finished turn). 480 lib tests green.
 
 `SessionState::Errored(msg)` (model.rs:128) is LATCHED. Set by
 `AcpThreadEvent::Error | LoadError` → `Errored("agent error")` (store.rs:7290),

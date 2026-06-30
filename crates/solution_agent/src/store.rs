@@ -1472,6 +1472,42 @@ impl SolutionAgentStore {
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
     }
 
+    /// A HUMAN reply into a supervised session that is mid-`Judging` supersedes
+    /// the in-flight judge: the user has taken over direction, so the judge's
+    /// pending verdict is stale and must not nudge the agent afterwards. Tear
+    /// the judge down (its verdict, if it still races in via the MCP tool, is
+    /// then dropped by [`apply_verdict`]'s staleness guard) and return
+    /// supervision to `Watching`. No-op unless a judge is actually in flight.
+    ///
+    /// Distinct from [`hold_supervisor`] (manual STOP → `Held`, supervision
+    /// stands by): a reply means "keep working on what I just said", so normal
+    /// watching resumes rather than parking. Called from the single user-send
+    /// funnel ([`send_message_blocks_targeted`] with `from_user`), alongside
+    /// `reset_supervisor_continue_counter` — separate because that reset
+    /// early-returns when `consecutive_continues == 0`, which would skip the
+    /// FIRST judge of a session.
+    pub(crate) fn supersede_judge_on_user_reply(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::supervisor::SupervisorStatus;
+        if !self.judge_sessions.contains_key(&id) {
+            return;
+        }
+        self.finish_judge(id, cx);
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            // Mark so a verdict that already left the judge (racing the
+            // teardown) is dropped by `apply_verdict`'s guard.
+            state.judge_superseded = true;
+            if matches!(state.status, SupervisorStatus::Judging) {
+                state.status = SupervisorStatus::Watching;
+            }
+        }
+        self.persist_supervisor_state(id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
     /// Note that the HUMAN is typing into `id`'s compose box. Pushes the
     /// supervisor's idle clock forward (transient `last_user_input_ms`), so the
     /// watchdog treats the session as active for another `IDLE_THRESHOLD_SECS`
@@ -1609,6 +1645,21 @@ impl SolutionAgentStore {
     ) {
         use crate::supervisor::{SupervisorStatus, VerdictAction, VerdictKind, VerdictRecord};
 
+        // Staleness guard (bug #1): if a human reply superseded the in-flight
+        // judge (`supersede_judge_on_user_reply` set `judge_superseded`), this
+        // verdict raced in after the user already steered the agent — direction
+        // has moved on. Consume the marker (take + clear) and, below, record the
+        // verdict for audit but do NOT act on it: no nudge, no Observer
+        // breadcrumb, no continue-counter bump, no escalation. The marker is the
+        // ONLY suppression signal, so a verdict in any other state (the
+        // direct-`apply_verdict` paths for Done/Compact/Ask from `Watching`/
+        // `WaitingUser`) is unaffected.
+        let verdict_superseded = self
+            .supervisor_states
+            .get_mut(&id)
+            .map(|s| std::mem::take(&mut s.judge_superseded))
+            .unwrap_or(false);
+
         if let Some(root) = self.solution_root_for(id, cx) {
             let dir = crate::supervisor::supervisor_dir(&root, id);
             let rec = VerdictRecord {
@@ -1625,6 +1676,10 @@ impl SolutionAgentStore {
         }
 
         self.finish_judge(id, cx);
+
+        if verdict_superseded {
+            return;
+        }
 
         // A real verdict means the judge succeeded: clear any transient-failure
         // backoff so a previously-flaky supervisor that recovered is not gated
@@ -2171,6 +2226,10 @@ impl SolutionAgentStore {
             {
                 if let Some(st) = self.supervisor_states.get_mut(&id) {
                     st.status = crate::supervisor::SupervisorStatus::Judging;
+                    // Fresh judge cycle: clear any stale supersede marker from a
+                    // prior reply whose judge never emitted, so this verdict
+                    // isn't pre-suppressed (bug #1).
+                    st.judge_superseded = false;
                     st.last_fired_at = Some(now_ms);
                     // One more supervisor firing — surfaced next to the status
                     // icon. Reset on enable/disable toggle.

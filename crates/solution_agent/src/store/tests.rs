@@ -316,6 +316,121 @@ fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
     });
 }
 
+/// Bug #1: a HUMAN reply into a session whose supervisor is mid-`Judging`
+/// supersedes the in-flight judge — its verdict is now stale (the user took
+/// over direction), so it must NOT push an Observer nudge afterwards. The
+/// reply tears the judge down and returns supervision to `Watching`; a verdict
+/// that still races in is dropped by `apply_verdict`'s staleness guard.
+#[gpui::test]
+fn user_reply_supersedes_in_flight_judge(cx: &mut TestAppContext) {
+    use crate::supervisor::{SupervisorState, SupervisorStatus, VerdictAction};
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sol = SolutionId("sol-a".into());
+            let agent = SharedString::from("claude-acp");
+            let id = SolutionSessionId::new();
+            insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+
+            // Supervisor is mid-Judging with a live judge handle (judge_id None
+            // so finish_judge has no child session to close).
+            let mut st = SupervisorState::new(id);
+            st.enabled = true;
+            st.status = SupervisorStatus::Judging;
+            store.supervisor_states.insert(id, st);
+            store.judge_sessions.insert(
+                id,
+                JudgeHandle {
+                    judge_id: None,
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+
+            // The human replies -> supersede the judge.
+            store.supersede_judge_on_user_reply(id, cx);
+            assert!(
+                !store.judge_sessions.contains_key(&id),
+                "in-flight judge must be torn down on a user reply"
+            );
+            assert!(
+                matches!(store.supervisor_states[&id].status, SupervisorStatus::Watching),
+                "supervisor returns to Watching after the reply, got {:?}",
+                store.supervisor_states[&id].status
+            );
+
+            // A verdict that races in AFTER the teardown is stale: it must NOT
+            // act (no nudge, no continue-counter increment).
+            store.apply_verdict(
+                id,
+                VerdictAction::Continue,
+                "looks unfinished".into(),
+                Some("Keep going.".into()),
+                None,
+                None,
+                None,
+                cx,
+            );
+            assert_eq!(
+                store.supervisor_states[&id].consecutive_continues, 0,
+                "a superseded verdict must be suppressed (no nudge / no counter bump)"
+            );
+        });
+    });
+}
+
+/// Control for bug #1: when the judge is STILL in flight (no user reply), a
+/// `Continue` verdict applies normally — it increments the continue counter and
+/// nudges. Proves the staleness guard discriminates on the judge handle rather
+/// than suppressing every verdict.
+#[gpui::test]
+fn verdict_applies_while_judge_in_flight(cx: &mut TestAppContext) {
+    use crate::supervisor::{SupervisorState, SupervisorStatus, VerdictAction};
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sol = SolutionId("sol-a".into());
+            let agent = SharedString::from("claude-acp");
+            let id = SolutionSessionId::new();
+            insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+
+            let mut st = SupervisorState::new(id);
+            st.enabled = true;
+            st.status = SupervisorStatus::Judging;
+            store.supervisor_states.insert(id, st);
+            store.judge_sessions.insert(
+                id,
+                JudgeHandle {
+                    judge_id: None,
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+
+            store.apply_verdict(
+                id,
+                VerdictAction::Continue,
+                "looks unfinished".into(),
+                Some("Keep going.".into()),
+                None,
+                None,
+                None,
+                cx,
+            );
+            assert_eq!(
+                store.supervisor_states[&id].consecutive_continues, 1,
+                "a live verdict must apply (counter bumped)"
+            );
+        });
+    });
+}
+
 /// Set up SolutionStore with one Solution rooted at a tempdir, plus
 /// a `Project::test` whose worktree is that root. Returns
 /// (`SolutionId`, `tempdir`, `Project`). Hold the tempdir for the
@@ -8102,6 +8217,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         status: crate::supervisor::SupervisorStatus::Watching,
         trigger_count: 0,
         last_user_input_ms: None,
+        judge_superseded: false,
     };
     db.save_supervisor_state(state.clone())
         .await

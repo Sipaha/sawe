@@ -217,6 +217,13 @@ pub struct SupervisorState {
     /// supervisor never fires a nudge while the user is mid-message. Reset to
     /// `None` on restart (a cold session has no in-flight draft to protect).
     pub last_user_input_ms: Option<i64>,
+    /// TRANSIENT (not persisted): set when a human reply supersedes the
+    /// in-flight judge while it is `Judging` (`supersede_judge_on_user_reply`).
+    /// `apply_verdict` consumes it (takes + clears) to DROP a verdict that
+    /// raced in after the user already steered the agent — no nudge / Observer
+    /// breadcrumb (bug #1). Cleared whenever a fresh judge is spawned (status →
+    /// `Judging`) so it can never pre-suppress the next cycle's verdict.
+    pub judge_superseded: bool,
 }
 
 impl SupervisorState {
@@ -232,6 +239,7 @@ impl SupervisorState {
             status: SupervisorStatus::Disabled,
             trigger_count: 0,
             last_user_input_ms: None,
+            judge_superseded: false,
         }
     }
 }

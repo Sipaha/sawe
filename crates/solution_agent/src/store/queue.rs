@@ -470,6 +470,11 @@ impl SolutionAgentStore {
         // incremented).
         if from_user {
             self.reset_supervisor_continue_counter(session_id, cx);
+            // A reply mid-`Judging` supersedes the in-flight judge so its stale
+            // verdict can't nudge the agent after the user already steered it
+            // (bug #1). Separate from the reset above, which early-returns on
+            // the first judge (`consecutive_continues == 0`).
+            self.supersede_judge_on_user_reply(session_id, cx);
         }
 
         // "Chat About This" path. If the open session has a tool call
