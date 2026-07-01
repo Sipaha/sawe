@@ -39,16 +39,26 @@ pub(crate) fn apply_active_member_change(
     {
         let mut st = state.borrow_mut();
         if let Some(prev) = st.current.clone() {
-            let active_path = workspace
-                .active_item(cx)
-                .and_then(|item| item.project_path(cx))
-                .and_then(|pp| workspace.project().read(cx).absolute_path(&pp, cx));
-            let layout = MemberLayout {
-                open_paths: workspace.open_item_abs_paths(cx),
-                active_path,
-                docks: Some(workspace.capture_dock_state(window, cx)),
-            };
-            st.layouts.insert(prev, layout);
+            // Only snapshot when the solution itself hasn't changed. An
+            // in-place solution switch (switch::switch_active_solution_in_place)
+            // swaps worktrees and replays the new solution's tabs on this
+            // same Workspace WITHOUT firing ActiveMemberChanged, so `prev`
+            // can point at a member of a solution that is no longer active.
+            // In that case the live workspace content belongs to the new
+            // solution, not to `prev` — snapshotting it would silently
+            // overwrite `prev`'s saved layout with another solution's files.
+            if prev.0 == solution {
+                let active_path = workspace
+                    .active_item(cx)
+                    .and_then(|item| item.project_path(cx))
+                    .and_then(|pp| workspace.project().read(cx).absolute_path(&pp, cx));
+                let layout = MemberLayout {
+                    open_paths: workspace.open_item_abs_paths(cx),
+                    active_path,
+                    docks: Some(workspace.capture_dock_state(window, cx)),
+                };
+                st.layouts.insert(prev, layout);
+            }
         }
     }
 
@@ -152,6 +162,8 @@ mod tests {
     use std::rc::Rc;
     use theme::LoadThemes;
     use util::path;
+    use workspace::dock::DockPosition;
+    use workspace::dock::test::TestPanel;
     use workspace::{OpenOptions, Workspace};
 
     fn init_test(cx: &mut TestAppContext) {
@@ -280,9 +292,6 @@ mod tests {
         assert_eq!(paths.len(), 1, "None catalog does not clear the editor: {paths:?}");
     }
 
-    use workspace::dock::test::TestPanel;
-    use workspace::dock::DockPosition;
-
     fn left_dock_open(workspace: &gpui::Entity<Workspace>, cx: &mut gpui::VisualTestContext) -> bool {
         workspace.update(cx, |ws, cx| ws.left_dock().read(cx).is_open())
     }
@@ -324,5 +333,71 @@ mod tests {
         // Back to B: left dock closed.
         switch(&state, &workspace, cx, "sol", Some("B"));
         assert!(!left_dock_open(&workspace, cx), "B restores left dock closed");
+    }
+
+    #[gpui::test]
+    async fn solution_switch_does_not_corrupt_outgoing_member_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/sol"),
+            json!({ "a.txt": "", "bfile.txt": "" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/sol").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let state = Rc::new(RefCell::new(MemberLayoutState::default()));
+
+        // 1. Switch to solution A, member X; open a.txt.
+        switch(&state, &workspace, cx, "A", Some("X"));
+        open(&workspace, cx, path!("/sol/a.txt")).await;
+
+        // 2. Switch to A, member X2 (first visit): snapshots (A,X)={a.txt};
+        //    current=(A,X2); no apply, workspace still shows a.txt.
+        switch(&state, &workspace, cx, "A", Some("X2"));
+        let paths = open_paths(&workspace, cx);
+        assert_eq!(paths.len(), 1, "X2 first visit inherits current tabs: {paths:?}");
+        assert!(paths[0].ends_with("a.txt"));
+
+        // 3. Simulate an in-place solution swap (switch.rs) replaying B's
+        //    tabs on the SAME workspace with no ActiveMemberChanged event:
+        //    close everything and open a different file.
+        let item_ids: Vec<_> =
+            workspace.update(cx, |ws, cx| ws.items(cx).map(|i| i.item_id()).collect::<Vec<_>>());
+        for id in item_ids {
+            let t = workspace.update_in(cx, |ws, window, cx| {
+                let pane = ws.active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(id, workspace::SaveIntent::Skip, window, cx)
+                })
+            });
+            let _ = t.await;
+        }
+        open(&workspace, cx, path!("/sol/bfile.txt")).await;
+
+        // 4. Switch to solution B, member Y. `state.current` still says
+        //    (A, X2), which is stale relative to the workspace's real
+        //    content (B's tabs) — the snapshot step must not fire.
+        switch(&state, &workspace, cx, "B", Some("Y"));
+
+        // 5. (A, X2) must not have been corrupted with B's file.
+        let key_x2 = (SolutionId("A".into()), CatalogId("X2".into()));
+        let st = state.borrow();
+        if let Some(layout) = st.layouts.get(&key_x2) {
+            assert!(
+                !layout
+                    .open_paths
+                    .iter()
+                    .any(|p| p.to_string_lossy().ends_with("bfile.txt")),
+                "X2's snapshot must not be corrupted with B's file: {:?}",
+                layout.open_paths
+            );
+        }
+        // (A, X) must still hold its original snapshot of a.txt.
+        let key_x = (SolutionId("A".into()), CatalogId("X".into()));
+        let layout_x = st.layouts.get(&key_x).expect("(A, X) snapshot must still exist");
+        assert_eq!(layout_x.open_paths.len(), 1, "{:?}", layout_x.open_paths);
+        assert!(layout_x.open_paths[0].to_string_lossy().ends_with("a.txt"));
     }
 }
