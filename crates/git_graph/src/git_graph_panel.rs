@@ -13,7 +13,8 @@ use gpui::{
     IntoElement, ParentElement, Pixels, Render, Styled, Subscription, WeakEntity, Window, actions,
     div, px,
 };
-use project::git_store::{GitStore, GitStoreEvent, RepositoryId};
+use project::Project;
+use project::git_store::{GitStore, GitStoreEvent, Repository, RepositoryId};
 use ui::prelude::*;
 use workspace::{
     Workspace,
@@ -67,18 +68,33 @@ impl GitGraphPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let subscriptions =
+        let mut subscriptions =
             vec![
                 cx.subscribe_in(&git_store, window, |this, _git_store, event, window, cx| {
-                    if let GitStoreEvent::ActiveRepositoryChanged(repo_id) = event {
-                        this.set_active_repo(*repo_id, window, cx);
+                    if let GitStoreEvent::ActiveRepositoryChanged(_) = event {
+                        this.refresh_active_repo(window, cx);
                     }
                 }),
             ];
-        let active = git_store
-            .read(cx)
-            .active_repository()
-            .map(|r| r.read(cx).id);
+        // In a multi-member Solution all members share ONE `Project`, so
+        // `ActiveRepositoryChanged` alone tracks the last-focused editor's
+        // repo — NOT the project the user selected in the tab strip. Re-target
+        // the graph when the active member flips too (mirrors git_panel /
+        // title-bar / branch-picker, which all scope to the active member).
+        if let Some(store) = solutions::SolutionStore::try_global(cx) {
+            subscriptions.push(cx.subscribe_in(
+                &store,
+                window,
+                |this, _store, event, window, cx| {
+                    if matches!(
+                        event,
+                        solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
+                    ) {
+                        this.refresh_active_repo(window, cx);
+                    }
+                },
+            ));
+        }
         let mut this = Self {
             workspace,
             git_store,
@@ -87,8 +103,24 @@ impl GitGraphPanel {
             focus_handle,
             _subscriptions: subscriptions,
         };
-        this.set_active_repo(active, window, cx);
+        this.refresh_active_repo(window, cx);
         this
+    }
+
+    /// Recompute which repository the graph should track and re-point the
+    /// inner [`GitGraph`] if it changed. Prefers the active Solution member's
+    /// repo; falls back to the project's `active_repository` outside a
+    /// Solution.
+    fn refresh_active_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo_id = self.resolve_active_repo_id(cx);
+        self.set_active_repo(repo_id, window, cx);
+    }
+
+    fn resolve_active_repo_id(&self, cx: &App) -> Option<RepositoryId> {
+        let project = self.workspace.upgrade()?.read(cx).project().clone();
+        let repo = active_member_repository(&project, cx)
+            .or_else(|| project.read(cx).active_repository(cx))?;
+        Some(repo.read(cx).id)
     }
 
     fn set_active_repo(
@@ -108,6 +140,38 @@ impl GitGraphPanel {
         });
         cx.notify();
     }
+}
+
+/// The repository of the active Solution member, if any. Mirrors
+/// `git_ui::branch_picker::active_member_repository` /
+/// `title_bar::ProjectToolbar::active_member_repository` /
+/// `git_panel::refresh_active_repository_for_selector`: in a multi-member
+/// Solution all members share ONE `Project`, so `Project::active_repository`
+/// follows whichever repo the last-focused editor belongs to rather than the
+/// project the user selected in the tab strip. Returns `None` outside a
+/// Solution so callers fall back to `active_repository`.
+fn active_member_repository(project: &Entity<Project>, cx: &App) -> Option<Entity<Repository>> {
+    let store = solutions::SolutionStore::try_global(cx)?;
+    let store = store.read(cx);
+    let solution = project
+        .read(cx)
+        .worktrees(cx)
+        .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))?;
+    let catalog = store.active_member(&solution.id)?;
+    let member = solution
+        .members
+        .iter()
+        .find(|member| &member.catalog_id == catalog)?;
+    project
+        .read(cx)
+        .repositories(cx)
+        .values()
+        .find(|repo| {
+            repo.read(cx)
+                .work_directory_abs_path
+                .starts_with(&member.local_path)
+        })
+        .cloned()
 }
 
 impl Focusable for GitGraphPanel {
