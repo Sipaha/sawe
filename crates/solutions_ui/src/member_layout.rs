@@ -46,7 +46,7 @@ pub(crate) fn apply_active_member_change(
             let layout = MemberLayout {
                 open_paths: workspace.open_item_abs_paths(cx),
                 active_path,
-                docks: None, // populated in Task 2
+                docks: Some(workspace.capture_dock_state(window, cx)),
             };
             st.layouts.insert(prev, layout);
         }
@@ -69,6 +69,10 @@ pub(crate) fn apply_active_member_change(
         layout
     };
     let Some(layout) = to_apply else { return };
+
+    if let Some(docks) = layout.docks.clone() {
+        workspace.set_dock_structure(docks, window, cx);
+    }
 
     // Center pane: close all editor items, reopen the snapshot paths,
     // activate the previously-active one. Async (open/close are Tasks);
@@ -109,7 +113,7 @@ pub(crate) fn apply_active_member_change(
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{AppContext as _, TestAppContext};
     use project::Project;
     use serde_json::json;
     use solutions::{CatalogId, SolutionId};
@@ -244,5 +248,51 @@ mod tests {
         // The just-open file is left as-is (no forced blank).
         let paths = open_paths(&workspace, cx);
         assert_eq!(paths.len(), 1, "None catalog does not clear the editor: {paths:?}");
+    }
+
+    use workspace::dock::test::TestPanel;
+    use workspace::dock::DockPosition;
+
+    fn left_dock_open(workspace: &gpui::Entity<Workspace>, cx: &mut gpui::VisualTestContext) -> bool {
+        workspace.update(cx, |ws, cx| ws.left_dock().read(cx).is_open())
+    }
+
+    #[gpui::test]
+    async fn member_switch_swaps_dock_open_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/sol"), json!({ "a.txt": "" })).await;
+        let project = Project::test(fs.clone(), [path!("/sol").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        // Register a left-dock panel so the dock can be opened/closed.
+        workspace.update_in(cx, |ws, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            ws.add_panel(panel, window, cx);
+        });
+        let state = Rc::new(RefCell::new(MemberLayoutState::default()));
+
+        switch(&state, &workspace, cx, "sol", Some("A"));
+        // A: open the left dock.
+        workspace.update_in(cx, |ws, window, cx| {
+            ws.left_dock().update(cx, |d, cx| d.set_open(true, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(left_dock_open(&workspace, cx), "A has left dock open");
+
+        // B (first visit): inherits open; then close it for B.
+        switch(&state, &workspace, cx, "sol", Some("B"));
+        workspace.update_in(cx, |ws, window, cx| {
+            ws.left_dock().update(cx, |d, cx| d.set_open(false, window, cx));
+        });
+        cx.run_until_parked();
+
+        // Back to A: left dock re-opens.
+        switch(&state, &workspace, cx, "sol", Some("A"));
+        assert!(left_dock_open(&workspace, cx), "A restores left dock open");
+
+        // Back to B: left dock closed.
+        switch(&state, &workspace, cx, "sol", Some("B"));
+        assert!(!left_dock_open(&workspace, cx), "B restores left dock closed");
     }
 }
