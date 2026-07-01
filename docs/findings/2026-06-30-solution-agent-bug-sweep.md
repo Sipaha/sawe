@@ -80,7 +80,15 @@ handle; call `supersede_judge_on_user_reply` → assert handle gone + status
 ---
 
 ## #2 — Observer "plaque" renders strangely
-**STATUS: fix done, UNCOMMITTED; AFTER-screenshot verification in progress.**
+**SUPERSEDED 2026-07-01 (commit `74a8f8b025`, FORK.md decision #29):** the
+breadcrumb layout described below (icon + tag column + a PLAIN `Label` body)
+was replaced entirely. System entries now render as a readable message bubble —
+plaque badge (level icon + tag) over a `render_span` markdown body (same path as
+user/assistant messages), tinted background + left border per level. The
+`Label`-not-markdown body was the real unreadability cause; the wrapping-row fix
+below was only a partial mitigation. Kept here for history.
+
+**STATUS (historical): fix done, UNCOMMITTED; AFTER-screenshot verification in progress.**
 Confirmed via BEFORE png (`docs/findings/2026-06-30-observer-note-BEFORE.png`):
 the breadcrumb rendered on a single non-wrapping `h_flex` row — icon + inline
 "Observer" tag + long body running off the right edge. Fix (conversation_render.rs):

@@ -411,6 +411,22 @@ How it works: a per-`Workspace` handler registered via `observe_new(Workspace)` 
 
 How to apply: dock size stays shared for free — use ONLY `capture_dock_state`/`set_dock_structure` (open/active/zoom), NEVER the panel-size KVP (`set_panel_size_state`/`capture_dock_layout`). First visit to a member (no stored snapshot) leaves the current layout intact (no blank editor). v1 snapshots a flat open-file list (no center-pane splits). Durable persistence across restart is a deliberate non-goal; layer it on the same seam later without changing the swap logic.
 
+### 29. Editor/supervisor system notes render as readable message bubbles (supersedes the bug-sweep Observer breadcrumb)
+
+`SessionEntryKind::System { level, text_md }` (watchdog / usage-limit / supervisor "Observer" notes — editor-injected, **never part of the agent's context**) renders in `crates/solution_agent/src/conversation_render.rs` as a proper message bubble: a "plaque" badge (level icon + tag) over a markdown body, with the level color tinting a subtle background + a left border. `Info`/`Error`/`Observer` stay visually distinct via that color. The notes stay in the dialog like any other entry.
+
+Why: the body previously went through a plain `Label::new(text_md)`, so a supervisor summary's markdown (bold, links, lists) was dumped raw and cramped — unreadable (the maintainer's screenshot showed a supervisor live-run summary as an illegible one-line grey breadcrumb). This replaces the partial wrapping-row mitigation from the 2026-06-30 bug-sweep (#2 in `docs/findings/2026-06-30-solution-agent-bug-sweep.md`, now marked SUPERSEDED).
+
+How it works / how to apply: the body is rendered with `render_span((entry_idx, 0), text_md, markdown_for, style)` — the SAME markdown path user/assistant messages use. A `Markdown` entity already exists for a System entry because `entry_text_spans` emits its `text_md` as span 0 (so no new markdown plumbing is needed). Any new editor-injected note kind should reuse this arm rather than a bespoke `Label`. Distinguish note classes by `SystemEntryLevel` (icon + color), not by inventing a second renderer.
+
+### 30. The git-graph panel scopes to the active Solution member — and its initial resolve must be deferred out of panel construction
+
+`crates/git_graph/src/git_graph_panel.rs` (`GitGraphPanel`) tracks the **active Solution member's** repository, not the raw `Project::active_repository`. In a multi-member Solution all members share one `Project`, so `active_repository` follows whichever repo the last-focused editor's file belongs to — not the member selected in the tab strip. The panel resolves the repo the same way the title bar / git panel / branch picker do (`active_member_repository`, falling back to `active_repository` outside a Solution) and subscribes to `SolutionStoreEvent::ActiveMemberChanged` so a member-tab switch re-points the graph. (Bug it fixed: with `ecos-data` selected, the graph showed `ecos-unilever`'s develop2/hotfix history because a unilever file was open.)
+
+**Crash follow-up (commit `ba24832848` fixes `75cef0a026`):** `resolve_active_repo_id` reads the `Workspace` entity (`self.workspace.upgrade()?.read(cx)`) to find the active member's repo. But `GitGraphPanel::new` runs INSIDE the `workspace.update_in` that constructs the panel, so the `Workspace` is already mutably leased — reading it there hits GPUI's `double_lease_panic` and **crashes on solution open / panel load** (it compiles; the panic is runtime-only). The pre-fix code read the `git_store` (a different entity), so it never tripped this. Fix: defer the initial `refresh_active_repo` via `cx.defer_in(window, …)` so it runs on the next effect cycle, after the construction lease releases. Subscription-callback refreshes already run outside any `Workspace` update, so they need no defer.
+
+How to apply: never read the parent `Workspace` entity during a panel's `new()` when `new` is invoked from `workspace.update_in` — defer it. See memory `gpui-panel-new-workspace-double-lease`.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.
