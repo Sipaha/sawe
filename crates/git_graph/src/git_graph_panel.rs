@@ -95,7 +95,7 @@ impl GitGraphPanel {
                 },
             ));
         }
-        let mut this = Self {
+        let this = Self {
             workspace,
             git_store,
             graph: None,
@@ -103,7 +103,14 @@ impl GitGraphPanel {
             focus_handle,
             _subscriptions: subscriptions,
         };
-        this.refresh_active_repo(window, cx);
+        // The initial resolve must run AFTER this constructor returns. `new`
+        // executes inside the `workspace.update_in` that creates the panel, so
+        // the Workspace entity is still mutably leased — and `resolve_active_repo_id`
+        // reads it (`self.workspace.upgrade()?.read(cx)`), which would
+        // double-lease-panic. Defer to the next effect cycle, once the
+        // construction lease is released. (Subscription-driven refreshes already
+        // run outside any Workspace update, so they don't need this.)
+        cx.defer_in(window, |this, window, cx| this.refresh_active_repo(window, cx));
         this
     }
 
