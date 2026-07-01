@@ -5779,6 +5779,82 @@ async fn subagent_terminal_status_removes_tab(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn tool_completion_entry_updated_refreshes_silence_clock(cx: &mut TestAppContext) {
+    // A long silent FOREGROUND command bumps `last_activity_at` once (the
+    // tool-call `NewEntry` at start), then blocks claude for minutes while
+    // streaming nothing — during which the stuck-session watchdog is held off
+    // only by the in-progress-tool shield (TOOL_STUCK_SECS). When the command
+    // finishes, its terminal-status transition arrives as an `EntryUpdated`.
+    // That event MUST refresh `last_activity_at`; otherwise the instant the tool
+    // leaves `InProgress` the watchdog sees `silent_secs >= STUCK_TURN_SECS` with
+    // no live tool and falsely reconnects a healthy agent (observed 2026-07-01:
+    // an `until grep …` poll loop hit claude's own 5-min Bash timeout and the
+    // editor immediately "переподключил сессию").
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Tool starts (NewEntry) — bumps last_activity_at to "now".
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.upsert_tool_call(
+                make_task_tool_call(
+                    "toolu_slow_cmd",
+                    "Bash",
+                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    Some("until grep -qE '^(ok|FAIL)' out"),
+                    None,
+                ),
+                cx,
+            )
+            .expect("upsert in progress");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Simulate the long silent run: freeze the clock 6 minutes in the past,
+    // past STUCK_TURN_SECS (5 min).
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        session.update(cx, |s, _| {
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(360);
+        });
+    });
+
+    // Command finishes → terminal-status EntryUpdated on the same tool id.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.upsert_tool_call(
+                make_task_tool_call(
+                    "toolu_slow_cmd",
+                    "Bash",
+                    agent_client_protocol::schema::ToolCallStatus::Completed,
+                    Some("until grep -qE '^(ok|FAIL)' out"),
+                    None,
+                ),
+                cx,
+            )
+            .expect("upsert completed");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // The completion must have reset the silence clock, so a subsequent watchdog
+    // tick sees a live agent, not a wedged one.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let silent_secs = chrono::Utc::now()
+            .signed_duration_since(session.read(cx).last_activity_at)
+            .num_seconds();
+        assert!(
+            silent_secs < 60,
+            "a tool-completion EntryUpdated must refresh last_activity_at \
+             (was {silent_secs}s stale — watchdog would falsely reconnect)"
+        );
+    });
+}
+
+#[gpui::test]
 async fn subagent_label_falls_back_to_subagent_type(cx: &mut TestAppContext) {
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 

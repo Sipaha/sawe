@@ -7851,6 +7851,21 @@ impl SolutionAgentStore {
                     .unwrap_or(false);
                 if !updated_is_system_note {
                     self.mutate_state(session_id, |state| { state.clear_error_on_activity(); }, cx);
+                    // A streaming chunk or a tool-status transition is agent
+                    // activity too, so it must reset the silence clock the
+                    // stuck-session watchdog reads — exactly like `NewEntry`
+                    // does above. Without this, a long silent FOREGROUND command
+                    // (one `NewEntry` at tool start, then minutes blocked while
+                    // streaming nothing, then a terminal-status `EntryUpdated`
+                    // when it finishes) leaves `last_activity_at` frozen at
+                    // tool-start: the instant the tool leaves `InProgress` the
+                    // watchdog's `TOOL_STUCK_SECS` shield drops while `silent_secs`
+                    // is already >= `STUCK_TURN_SECS`, so a perfectly-alive agent
+                    // is falsely declared wedged and reconnected the moment its
+                    // command completes.
+                    if let Some(s) = self.sessions.get(&session_id).cloned() {
+                        s.update(cx, |s, _| s.last_activity_at = Utc::now());
+                    }
                 }
                 // Subagent-tab lifecycle: a tracked Task/Agent ToolCall that
                 // just flipped to a terminal status is a finish signal. We
