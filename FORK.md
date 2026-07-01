@@ -401,6 +401,16 @@ How to apply: anything that should be project-scoped reads `SolutionStore::activ
 - **RepositorySelector (`git_ui/repository_selector.rs`) scoped to the active project** — its repo list is filtered to repos under the active member's `local_path` (fallback: all repos for non-solution projects).
 - Note: the S-SOL-DSH status dashboard is still only reachable via the command palette (`OpenStatusDashboard`) — no keybinding/menu/button. Surfacing it is a possible future task.
 
+### 28. Per-Solution-member workspace layout is session-only, keyed off the `ActiveMemberChanged` event
+
+The member-level analog of #16's solution-level tab replay. `crates/solutions_ui/src/member_layout.rs` remembers each active member's open editor tabs + dock open/active state and swaps them on member switch; dock **sizes** stay shared across members.
+
+Why: all members of a Solution share ONE `Workspace`/`Project` (#27), so the center pane and dock open/active state are global to the window — switching the active member left them untouched. Persisting per-member layout to disk would create a second owner of center-pane state fighting Zed's own workspace serializer (which writes the whole center pane per `workspace_id`), so it is deliberately **in-memory / session-only** (lost on restart; on restart Zed restores the last-active member's layout). Mirrors `console_panel`'s existing in-memory `active_by_member`.
+
+How it works: a per-`Workspace` handler registered via `observe_new(Workspace)` in `solutions_ui::init`; state (`current` member key, per-member `layouts`, in-flight apply `Task`) lives in an `Rc<RefCell<MemberLayoutState>>` captured by a `SolutionStore` subscription owned by the Workspace. On `SolutionStoreEvent::ActiveMemberChanged { solution, catalog }`, `apply_active_member_change` snapshots the outgoing member (`Workspace::open_item_abs_paths` + active path + `capture_dock_state`) and applies the incoming member's snapshot (close all → reopen paths → activate; `set_dock_structure`). No worktree↔member resolution — the event carries the key.
+
+How to apply: dock size stays shared for free — use ONLY `capture_dock_state`/`set_dock_structure` (open/active/zoom), NEVER the panel-size KVP (`set_panel_size_state`/`capture_dock_layout`). First visit to a member (no stored snapshot) leaves the current layout intact (no blank editor). v1 snapshots a flat open-file list (no center-pane splits). Durable persistence across restart is a deliberate non-goal; layer it on the same seam later without changing the swap logic.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.
