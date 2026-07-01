@@ -48,6 +48,7 @@ pub fn init(cx: &mut App) {
     cx.observe_new(modals::register).detach();
     cx.observe_new(register_tab_actions).detach();
     cx.observe_new(register_member_sync_observer).detach();
+    cx.observe_new(member_layout::register_member_layout_controller).detach();
     cx.observe_new(register_solution_delete_observer).detach();
     cx.observe_new(register_solution_close_observer).detach();
     welcome::init(cx);

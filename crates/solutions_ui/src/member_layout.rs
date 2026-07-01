@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{Context, Task, Window};
-use solutions::{CatalogId, SolutionId};
+use solutions::{CatalogId, SolutionId, SolutionStoreEvent};
 use workspace::{DockStructure, OpenOptions, OpenVisible, SaveIntent, Workspace};
 
 type MemberKey = (SolutionId, CatalogId);
@@ -107,6 +107,36 @@ pub(crate) fn apply_active_member_change(
         }
     });
     state.borrow_mut().apply_task = Some(task);
+}
+
+/// One per `Workspace`: subscribe to `ActiveMemberChanged` and drive the
+/// per-member layout swap. State lives in an `Rc<RefCell<..>>` captured by
+/// the subscription closure, which is owned by the Workspace (so the state
+/// and its in-flight apply task die with the window). No-op outside a
+/// Solution (the event simply never fires for a plain project).
+pub(crate) fn register_member_layout_controller(
+    _workspace: &mut Workspace,
+    window: Option<&mut Window>,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(window) = window else { return };
+    let Some(store) = solutions::SolutionStore::try_global(cx) else {
+        return;
+    };
+    let state = Rc::new(RefCell::new(MemberLayoutState::default()));
+    cx.subscribe_in(&store, window, move |workspace, _store, event, window, cx| {
+        if let SolutionStoreEvent::ActiveMemberChanged { solution, catalog } = event {
+            apply_active_member_change(
+                &state,
+                workspace,
+                solution.clone(),
+                catalog.clone(),
+                window,
+                cx,
+            );
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]
