@@ -434,37 +434,41 @@ pub(crate) fn render_entry(
                 SystemEntryLevel::Error => (IconName::Warning, Color::Error, "System"),
                 SystemEntryLevel::Observer => (IconName::Eye, Color::Accent, "Observer"),
             };
-            // `h_flex` + plain `Label` for the body kept the breadcrumb on a
-            // single non-wrapping row: an `h_flex` sizes children to content and
-            // the text child had no width bound, so a long Observer note
-            // overflowed / clipped against the right edge instead of wrapping.
-            // Fix: pin the icon at the left, then a `flex_1` (width-constrained,
-            // `min_w_0` so it can shrink below its content) column holding the
-            // tag and the body. The body `Label` wraps because its container is
-            // bounded and it is neither `single_line` nor `truncate`. This
-            // mirrors the user/assistant renderers, which lay their wrapping
-            // bodies out in a column rather than a bare `h_flex` row.
-            h_flex()
-                .gap_1p5()
+            // Editor-injected note (watchdog / supervisor / system) — NOT part
+            // of the agent's context; the agent never sees these. Render it as a
+            // readable message bubble with a system "plaque" badge (icon + tag)
+            // rather than a cramped one-line breadcrumb: a supervisor summary is
+            // full markdown (bold, links, lists) and was previously dumped as a
+            // raw, non-wrapping `Label` — hence unreadable. The body now goes
+            // through `render_span` (same markdown path as user/assistant
+            // messages); the level color tints a subtle background + left border
+            // so Info / Error / Observer stay distinguishable in the dialog.
+            let bubble_bg = color.color(cx).opacity(0.08);
+            v_flex()
+                .group(SharedString::from(format!("sys-msg-{entry_idx}")))
                 .mx_2()
-                .my_1()
-                .px_2()
-                .py_1()
-                .items_start()
+                .my_1p5()
+                .px_2p5()
+                .py_1p5()
+                .gap_1()
+                .rounded_md()
+                .bg(bubble_bg)
                 .border_l_2()
                 .border_color(color.color(cx))
-                .child(Icon::new(icon).size(IconSize::XSmall).color(color))
                 .child(
-                    v_flex()
-                        .flex_1()
+                    // The "plaque": icon + tag, mirroring the system-note badge.
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                        .child(Label::new(tag).size(LabelSize::XSmall).color(color)),
+                )
+                .child(
+                    // Width-bounded, `min_w_0` so the markdown body wraps.
+                    div()
+                        .w_full()
                         .min_w_0()
-                        .gap_0p5()
-                        .child(Label::new(tag).size(LabelSize::XSmall).color(color))
-                        .child(
-                            Label::new(text_md.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Default),
-                        ),
+                        .child(render_span((entry_idx, 0), text_md, markdown_for, style)),
                 )
                 .into_any_element()
         }
