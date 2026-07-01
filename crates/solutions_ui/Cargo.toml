@@ -37,6 +37,12 @@ util.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

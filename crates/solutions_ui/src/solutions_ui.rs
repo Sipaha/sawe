@@ -6,6 +6,7 @@ pub mod add_project_picker;
 mod add_member_picker;
 pub mod delete_confirm_modal;
 mod empty_solution_page;
+mod member_layout;
 mod modals;
 mod open;
 mod picker;
