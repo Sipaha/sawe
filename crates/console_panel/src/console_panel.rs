@@ -26,8 +26,15 @@ pub fn init(cx: &mut gpui::App) {
             let Some(solution_id) = panel::active_solution_id_for_workspace(workspace, cx) else {
                 return;
             };
+            // Read the project from the `&mut Workspace` we already hold — NOT
+            // from the `Workspace` entity inside `add_chat_tab`. This handler
+            // runs while the `Workspace` is mutably leased, so re-reading the
+            // entity would `double_lease_panic` (fixed regression).
+            let project = workspace.project().clone();
             if let Some(panel) = workspace.panel::<ConsolePanel>(cx) {
-                panel.update(cx, |panel, cx| panel.add_chat_tab(solution_id, window, cx));
+                panel.update(cx, |panel, cx| {
+                    panel.add_chat_tab(solution_id, project, window, cx)
+                });
             }
         });
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {

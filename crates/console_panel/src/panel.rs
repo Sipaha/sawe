@@ -7,6 +7,7 @@ use gpui::{
     Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, Pixels,
     Point, Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
 };
+use project::Project;
 use settings::Settings as _;
 use solution_agent::SolutionSessionId;
 use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
@@ -787,6 +788,14 @@ impl ConsolePanel {
         let active_path = active_solution_id
             .as_ref()
             .and_then(|id| active_member_path(id, cx));
+        // Read the project handle here, in render context, where nothing is
+        // leased — `add_chat_tab_with_cwd` no longer reads it from the
+        // Workspace entity (see its doc comment: the action path holds the
+        // Workspace mutably).
+        let project = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).project().clone());
         let weak_self = cx.weak_entity();
 
         let plus_container = div()
@@ -808,6 +817,7 @@ impl ConsolePanel {
                 .menu(move |window, cx| {
                     let active_solution_id = active_solution_id.clone();
                     let active_path = active_path.clone();
+                    let project = project.clone();
                     let weak_self = weak_self.clone();
                     Some(ContextMenu::build(window, cx, move |menu, _, _| {
                         // New Terminal in the active project's folder (falls
@@ -825,7 +835,9 @@ impl ConsolePanel {
                             })
                         };
                         // New AI Chat in the active project's folder.
-                        let menu = if let Some(solution_id) = active_solution_id.clone() {
+                        let menu = if let (Some(solution_id), Some(project)) =
+                            (active_solution_id.clone(), project.clone())
+                        {
                             let weak_self = weak_self.clone();
                             let cwd = active_path.clone();
                             menu.entry("New AI Chat", None, move |window, cx| {
@@ -833,6 +845,7 @@ impl ConsolePanel {
                                     panel.update(cx, |panel, cx| {
                                         panel.add_chat_tab_with_cwd(
                                             solution_id.clone(),
+                                            project.clone(),
                                             cwd.clone(),
                                             window,
                                             cx,
@@ -1293,6 +1306,7 @@ impl ConsolePanel {
     pub fn add_chat_tab(
         &mut self,
         solution_id: SolutionId,
+        project: Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1302,20 +1316,24 @@ impl ConsolePanel {
         // action (and any other caller of this convenience wrapper) would land
         // the agent in "ROOT" instead of the selected project.
         let cwd = active_member_path(&solution_id, cx);
-        self.add_chat_tab_with_cwd(solution_id, cwd, window, cx);
+        self.add_chat_tab_with_cwd(solution_id, project, cwd, window, cx);
     }
 
+    /// Create a chat session (create-implies-open) under `solution_id` rooted
+    /// at `cwd`. `project` is passed in rather than read from `self.workspace`
+    /// because callers may already hold the `Workspace` mutably (the `NewChat`
+    /// workspace-action handler does): re-leasing the `Workspace` entity here
+    /// via `workspace.read(cx)` would `double_lease_panic`. Callers that own a
+    /// `&mut Workspace` pass `workspace.project().clone()`; the render-time
+    /// menu path reads it while nothing is leased.
     pub fn add_chat_tab_with_cwd(
         &mut self,
         solution_id: SolutionId,
+        project: Entity<Project>,
         cwd: Option<PathBuf>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let project = workspace.read(cx).project().clone();
         // Create-implies-open: `create_session_with_cwd` pins the new
         // session into the strip itself (sets tab_order + emits the
         // `TabsChanged` fan-out), so the actual tab is built and pushed by

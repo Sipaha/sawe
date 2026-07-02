@@ -1,7 +1,13 @@
-# Latent double-lease crash: `console_panel::NewChat` action with an active solution
+# Double-lease crash: `console_panel::NewChat` action with an active solution (FIXED)
 
 **Discovered:** 2026-07-02, while verifying the new `console_panel::ShowSession`
 action over MCP (dispatched `NewChat` as a routing sanity check → editor aborted).
+**Fixed:** same day — `add_chat_tab` / `add_chat_tab_with_cwd` now take the
+`project` as a parameter instead of re-reading it from the `Workspace` entity;
+callers that hold `&mut Workspace` (the `NewChat` handler) pass
+`workspace.project().clone()`, and the render-time "+" menu reads it while
+nothing is leased. Verified live: dispatching `NewChat` with an active Solution
+keeps the editor alive and creates a session (no panic).
 
 ## Symptom
 
@@ -40,9 +46,22 @@ class as decision-#… /  `gpui-panel-new-workspace-double-lease` (reading
 So today the crash is reachable only by dispatching `NewChat` as an action
 (MCP / a future keybinding) while a Solution is open.
 
-## Fix (when someone picks this up — out of scope for the ShowSession change)
+## Fix (applied)
 
-Defer the `Workspace` read out of the action-handler's update, or read the
-project inside the panel's own context. Mirror the `cx.defer_in` remedy used
-for the git-graph panel double-lease. A regression test would dispatch
-`NewChat` with an active solution and assert no panic.
+Deferring does **not** help here: a deferred closure that receives
+`&mut Workspace` still leases it, so a nested `workspace_entity.read(cx)` would
+panic again. The real fix is to stop re-reading the `Workspace` **entity**
+inside `add_chat_tab_with_cwd` and instead receive the `project` from whoever
+already holds `&mut Workspace`:
+
+- `add_chat_tab(solution_id, project, …)` / `add_chat_tab_with_cwd(solution_id,
+  project, cwd, …)` take `project: Entity<Project>`.
+- The `NewChat` action handler reads `workspace.project().clone()` from the
+  `&mut Workspace` it already holds (no entity re-lease) and passes it down.
+- The "+" menu path reads the project once in `render_plus_popover`
+  (render context, nothing leased) and captures it into the menu closure.
+
+Verified live over MCP (`windows.dispatch_action console_panel::NewChat` with an
+active Solution → editor alive, session created, zero panics). No unit test:
+the chat-tab spawn path needs the full editor stack, which these panel tests
+deliberately punt to the runtime MCP probe (see `bootstrap_panel` doc comment).
