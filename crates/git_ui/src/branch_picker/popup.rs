@@ -823,16 +823,33 @@ impl BranchesPopup {
                         cx.emit(DismissEvent);
                     })),
             )
-            // Checkout Tag or Revision… — opens the BranchList picker (same action as New
-            // Branch); the user can pick a branch, tag, or type a revision there. There is
-            // no dedicated tag-focused open path yet.
+            // Checkout Tag or Revision… — opens a free-text `CheckoutRevisionModal`
+            // (type a tag / branch / commit SHA → `checkout_revision`). Distinct
+            // from "New Branch" (which opens the branch-create picker): that
+            // picker only creates branches and can't check out a tag/revision by
+            // name, which is what this entry promises.
             .child(
                 make_row("popup-action-checkout-revision")
                     .child(icon_slot(IconName::GitBranch))
                     .child(Label::new("Checkout Tag or Revision…").size(LabelSize::Small))
-                    .on_click(cx.listener(|_, _, window, cx| {
-                        window.dispatch_action(Box::new(zed_actions::git::Branch), cx);
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let Some(workspace) = this.workspace.upgrade() else {
+                            return;
+                        };
+                        let Some(repo) = this.repository.clone() else {
+                            return;
+                        };
+                        // Dismiss the popover first, then open the modal on the
+                        // next tick so the popover's teardown doesn't steal focus
+                        // from the modal's input.
                         cx.emit(DismissEvent);
+                        window.defer(cx, move |window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.toggle_modal(window, cx, |window, cx| {
+                                    CheckoutRevisionModal::new(repo.clone(), window, cx)
+                                });
+                            });
+                        });
                     })),
             )
             // Separator before branch section nodes
@@ -1415,6 +1432,83 @@ impl Render for RenameBranchPopupModal {
                     ),
             )
             .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
+
+/// Input modal for "Checkout Tag or Revision…": type a tag, branch, or commit
+/// SHA and check it out. The branches popup lists tags/branches for browsing,
+/// but arbitrary revisions (and quick tag lookup by name) need a free-text
+/// entry — this is it. Reuses `Repository::checkout_revision`, the same op the
+/// popup's tag rows use.
+pub struct CheckoutRevisionModal {
+    repo: Entity<Repository>,
+    editor: Entity<Editor>,
+}
+
+impl CheckoutRevisionModal {
+    pub fn new(repo: Entity<Repository>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Tag, branch, or commit…", window, cx);
+            editor
+        });
+        Self { repo, editor }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let revision = self.editor.read(cx).text(cx).trim().to_string();
+        if revision.is_empty() {
+            cx.emit(DismissEvent);
+            return;
+        }
+        let repo = self.repo.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let recv = repo.update(cx, |repo, _| repo.checkout_revision(revision));
+            recv.await??;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to checkout revision", window, cx, |_, _, _| None);
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for CheckoutRevisionModal {}
+impl ModalView for CheckoutRevisionModal {}
+impl Focusable for CheckoutRevisionModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for CheckoutRevisionModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("CheckoutRevisionModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                    .child(Headline::new("Checkout Tag or Revision").size(HeadlineSize::XSmall)),
+            )
+            .child(div().px_3().pb_1().w_full().child(self.editor.clone()))
+            .child(
+                div().px_3().pb_3().child(
+                    Label::new("Enter a tag, branch, or commit SHA to check out.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
     }
 }
 
