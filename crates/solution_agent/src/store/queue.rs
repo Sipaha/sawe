@@ -475,6 +475,15 @@ impl SolutionAgentStore {
             // (bug #1). Separate from the reset above, which early-returns on
             // the first judge (`consecutive_continues == 0`).
             self.supersede_judge_on_user_reply(session_id, cx);
+            // Forget any Observer nudge that was parked waiting for the user to
+            // stop typing (`send_supervisor_nudge`'s hold-on-typing): the user
+            // just sent their own message, so the held nudge is stale. Cleared
+            // here UNCONDITIONALLY because `supersede_judge_on_user_reply`
+            // early-returns when no judge is in flight — which is exactly the
+            // state once a nudge has already been held (its judge finished).
+            if let Some(state) = self.supervisor_states.get_mut(&session_id) {
+                state.pending_nudge = None;
+            }
         }
 
         // "Chat About This" path. If the open session has a tool call

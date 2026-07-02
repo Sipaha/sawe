@@ -8713,6 +8713,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         trigger_count: 0,
         last_user_input_ms: None,
         judge_superseded: false,
+        pending_nudge: None,
     };
     db.save_supervisor_state(state.clone())
         .await
@@ -8888,6 +8889,280 @@ async fn typing_defers_supervisor_tick(cx: &mut gpui::TestAppContext) {
         st.status,
         crate::supervisor::SupervisorStatus::Judging,
         "with no recent typing the idle, silent session fires a judge"
+    );
+}
+
+/// Hold-on-typing: a judge that fired while the user was idle but FINISHED
+/// after the user started composing must NOT drop its nudge into the middle of
+/// the user's message. The verdict is accepted (the continue-counter bumps) but
+/// its nudge is parked in `pending_nudge`; once the user goes quiet for the idle
+/// window, `tick_supervisor` flushes it (without firing a fresh judge).
+#[gpui::test]
+async fn observer_nudge_held_while_typing_then_flushed(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::{SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.set_supervision_enabled(id, true, cx);
+        // Simulate a judge that already fired and is mid-review.
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(st) = store.supervisor_states.get_mut(&id) {
+            st.status = SupervisorStatus::Judging;
+            st.last_fired_at = Some(now);
+        }
+        store.judge_sessions.insert(
+            id,
+            JudgeHandle {
+                judge_id: None,
+                started_ms: now,
+                _task: Task::ready(()),
+            },
+        );
+        // The user starts typing WHILE the judge is running.
+        store.note_user_input(id);
+        // The judge delivers a Continue verdict — but the user is mid-message.
+        store.apply_verdict(
+            id,
+            VerdictAction::Continue,
+            "keep going".into(),
+            Some("Continue please.".into()),
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.consecutive_continues, 1,
+        "the verdict is accepted (counter bumps) even though its nudge is held"
+    );
+    assert_eq!(
+        st.pending_nudge.as_deref(),
+        Some("Continue please."),
+        "the nudge is parked, not delivered, while the user is typing"
+    );
+
+    // The user changes their mind and goes quiet past the idle window.
+    store.update(cx, |store, cx| {
+        let quiet = chrono::Utc::now().timestamp_millis()
+            - (crate::supervisor::IDLE_THRESHOLD_SECS as i64 + 5) * 1000;
+        if let Some(st) = store.supervisor_states.get_mut(&id) {
+            st.last_user_input_ms = Some(quiet);
+        }
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.tick_supervisor(cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.pending_nudge, None,
+        "once the user is quiet for the idle window, the held nudge flushes"
+    );
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Watching,
+        "flushing a held nudge must not fire a fresh judge"
+    );
+}
+
+/// Audit / interrupt: turning supervision OFF while a judge is mid-review tears
+/// the judge down immediately, discards any held nudge, and a verdict that still
+/// races out of the torn-down judge is dropped by the send-time gate (no nudge,
+/// no counter bump). Previously disabling did NOT stop a running observer.
+#[gpui::test]
+async fn disabling_supervision_interrupts_running_judge(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::{SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(st) = store.supervisor_states.get_mut(&id) {
+            st.status = SupervisorStatus::Judging;
+            st.last_fired_at = Some(now);
+            st.pending_nudge = Some("held".into());
+        }
+        store.judge_sessions.insert(
+            id,
+            JudgeHandle {
+                judge_id: None,
+                started_ms: now,
+                _task: Task::ready(()),
+            },
+        );
+        store.set_supervision_enabled(id, false, cx);
+    });
+    store.read_with(cx, |store, _| {
+        assert!(
+            !store.judge_sessions.contains_key(&id),
+            "disabling supervision must tear down the in-flight judge"
+        );
+        let st = store.supervisor_state(id).unwrap();
+        assert!(matches!(st.status, SupervisorStatus::Disabled));
+        assert_eq!(st.pending_nudge, None, "disabling discards a held nudge");
+    });
+    // A verdict racing out of the torn-down judge must be dropped.
+    store.update(cx, |store, cx| {
+        store.apply_verdict(
+            id,
+            VerdictAction::Continue,
+            "keep going".into(),
+            Some("Continue.".into()),
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.consecutive_continues, 0,
+        "a verdict from a disabled supervisor is dropped (no nudge, no counter bump)"
+    );
+}
+
+/// Audit: a verdict that arrives after the user hit Stop (supervision parked in
+/// `Held`) is dropped by the send-time gate. `hold_supervisor` already tore the
+/// judge down; this proves the racing-verdict backstop (previously a verdict
+/// racing in after a manual Stop still nudged the agent).
+#[gpui::test]
+async fn held_supervisor_drops_racing_verdict(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::{SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(st) = store.supervisor_states.get_mut(&id) {
+            st.status = SupervisorStatus::Judging;
+            st.last_fired_at = Some(now);
+        }
+        store.judge_sessions.insert(
+            id,
+            JudgeHandle {
+                judge_id: None,
+                started_ms: now,
+                _task: Task::ready(()),
+            },
+        );
+        store.hold_supervisor(id, cx);
+    });
+    store.read_with(cx, |store, _| {
+        assert!(!store.judge_sessions.contains_key(&id));
+        assert!(matches!(
+            store.supervisor_state(id).unwrap().status,
+            SupervisorStatus::Held
+        ));
+    });
+    store.update(cx, |store, cx| {
+        store.apply_verdict(
+            id,
+            VerdictAction::Continue,
+            "keep going".into(),
+            Some("Continue.".into()),
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.consecutive_continues, 0,
+        "a verdict arriving after a manual Stop (Held) is dropped"
+    );
+}
+
+/// The user sending their own message forgets a nudge that was parked waiting
+/// for them to stop typing. The clear happens in the single user-send funnel
+/// unconditionally, because the judge is already gone once a nudge is held.
+#[gpui::test]
+async fn user_send_discards_held_nudge(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        if let Some(st) = store.supervisor_states.get_mut(&id) {
+            st.pending_nudge = Some("stale observer nudge".into());
+        }
+    });
+    // The user sends their own reply through the single funnel (from_user).
+    store.update(cx, |store, cx| {
+        let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+            "my own reply".to_string(),
+        ))];
+        store
+            .send_message_blocks_targeted(
+                id,
+                blocks,
+                crate::model::QueueTarget::Main,
+                true,
+                cx,
+            )
+            .detach();
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.pending_nudge, None,
+        "the user's own message forgets the held observer nudge"
+    );
+}
+
+/// Interrupt: changing the supervisor's instruction while a judge is mid-review
+/// tears that judge down (its verdict is stale — it reviewed under the old
+/// instruction) and returns to `Watching` so the next tick re-fires under the
+/// new instruction. A verdict racing out of the old judge is then dropped.
+#[gpui::test]
+async fn changing_instruction_interrupts_running_judge(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::{SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(st) = store.supervisor_states.get_mut(&id) {
+            st.status = SupervisorStatus::Judging;
+            st.last_fired_at = Some(now);
+        }
+        store.judge_sessions.insert(
+            id,
+            JudgeHandle {
+                judge_id: None,
+                started_ms: now,
+                _task: Task::ready(()),
+            },
+        );
+        store.set_supervisor_prompt(id, Some("review only the tests".into()), cx);
+    });
+    store.read_with(cx, |store, _| {
+        assert!(
+            !store.judge_sessions.contains_key(&id),
+            "changing the instruction tears down the stale in-flight judge"
+        );
+        assert!(matches!(
+            store.supervisor_state(id).unwrap().status,
+            SupervisorStatus::Watching
+        ));
+    });
+    store.update(cx, |store, cx| {
+        store.apply_verdict(
+            id,
+            VerdictAction::Continue,
+            "keep going".into(),
+            Some("Continue.".into()),
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.consecutive_continues, 0,
+        "a verdict from a judge interrupted by an instruction change is dropped"
     );
 }
 

@@ -962,6 +962,12 @@ pub(crate) fn render_status_row(
                 let held = sup
                     .as_ref()
                     .is_some_and(|s| matches!(s.status, crate::supervisor::SupervisorStatus::Held));
+                // The observer is actively reviewing the conversation (an
+                // ephemeral judge turn is running) — surface it with a pulsing
+                // icon so the user can see the supervisor is working right now.
+                let judging = sup.as_ref().is_some_and(|s| {
+                    matches!(s.status, crate::supervisor::SupervisorStatus::Judging)
+                });
                 let trigger_count = sup.as_ref().map(|s| s.trigger_count).unwrap_or(0);
                 let (icon, icon_color, tooltip_text): (IconName, Color, SharedString) = if !enabled {
                     (
@@ -976,6 +982,12 @@ pub(crate) fn render_status_row(
                         IconName::Clock,
                         Color::Warning,
                         "Supervisor on hold — your next message resumes it · click to disable · right-click for settings".into(),
+                    )
+                } else if judging {
+                    (
+                        IconName::Eye,
+                        Color::Accent,
+                        "Supervisor reviewing… · click to disable · right-click for settings".into(),
                     )
                 } else {
                     (
@@ -998,7 +1010,25 @@ pub(crate) fn render_status_row(
                             store.set_supervision_enabled(session_id, !enabled, cx);
                         });
                     });
-                let trigger_cell = std::cell::RefCell::new(Some(icon_button.into_any_element()));
+                // While the observer is reviewing, wrap the icon in a repeating
+                // opacity pulse so it reads as "working now" at a glance. The
+                // animation self-drives repaints; a `SessionStateChanged` swaps
+                // back to the static icon when `Judging` ends.
+                let icon_element = if judging {
+                    div()
+                        .child(icon_button)
+                        .with_animation(
+                            "solution-status-supervisor-judging",
+                            Animation::new(std::time::Duration::from_secs(1))
+                                .repeat()
+                                .with_easing(pulsating_between(0.35, 1.0)),
+                            |el, delta| el.opacity(delta),
+                        )
+                        .into_any_element()
+                } else {
+                    icon_button.into_any_element()
+                };
+                let trigger_cell = std::cell::RefCell::new(Some(icon_element));
                 this.child(Label::new("·").color(Color::Muted).size(LabelSize::Small))
                     .child(
                         right_click_menu("solution-status-supervisor-menu")

@@ -1008,11 +1008,32 @@ impl SolutionAgentStore {
             // previous transient-failure run, or the watchdog would refuse to
             // fire until the old delay elapsed.
             state.next_eligible_ms = None;
+            // Nor inherit transient markers from a previous run: a leftover
+            // supersede flag or a nudge held for a since-departed draft would
+            // otherwise leak into the first fresh cycle.
+            state.judge_superseded = false;
+            state.pending_nudge = None;
             self.backoff_timers.remove(&id);
         } else {
             state.status = crate::supervisor::SupervisorStatus::Disabled;
+            // Turning supervision OFF must take effect immediately, including on
+            // work already in flight: discard any nudge held for the user to
+            // stop typing, and mark so a verdict already racing out of a judge
+            // we're about to tear down is dropped by `apply_verdict`'s send-time
+            // gate (belt-and-suspenders with the `!enabled` check there).
+            state.pending_nudge = None;
+            state.judge_superseded = true;
+            // `state` borrow ends here — the `self.*` teardown calls below need
+            // `&mut self`.
             self.backoff_timers.remove(&id);
             self.clear_supervisor_question(id, cx);
+            // Interrupt an in-flight observer: a judge/auditor mid-run would
+            // otherwise keep running and deliver a nudge after the user already
+            // switched supervision off. `hold_supervisor` tears the judge down
+            // for the manual-Stop path; disable must do the same (plus the
+            // auditor). Without this, disabling did NOT stop a running observer.
+            self.finish_judge(id, cx);
+            self.finish_auditor(id, cx);
         }
         self.persist_supervisor_state(id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
@@ -1025,11 +1046,30 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         let prompt = prompt.filter(|p| !p.trim().is_empty());
-        let state = self
-            .supervisor_states
-            .entry(id)
-            .or_insert_with(|| crate::supervisor::SupervisorState::new(id));
-        state.custom_prompt = prompt;
+        let changed = {
+            let state = self
+                .supervisor_states
+                .entry(id)
+                .or_insert_with(|| crate::supervisor::SupervisorState::new(id));
+            let changed = state.custom_prompt != prompt;
+            state.custom_prompt = prompt;
+            changed
+        };
+        // Changing the supervisor's instruction makes an IN-FLIGHT judge's
+        // verdict useless — it reviewed the conversation under the OLD
+        // instruction. Rather than let it run to completion and drop the stale
+        // verdict at send time, interrupt it now and return to `Watching` so the
+        // next tick re-fires a fresh judge under the new instruction. `superseded`
+        // covers a verdict already racing out of the torn-down judge.
+        if changed && self.judge_sessions.contains_key(&id) {
+            self.finish_judge(id, cx);
+            if let Some(state) = self.supervisor_states.get_mut(&id) {
+                state.judge_superseded = true;
+                if matches!(state.status, crate::supervisor::SupervisorStatus::Judging) {
+                    state.status = crate::supervisor::SupervisorStatus::Watching;
+                }
+            }
+        }
         self.persist_supervisor_state(id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
     }
@@ -1528,6 +1568,10 @@ impl SolutionAgentStore {
             // Mark so a verdict that already left the judge (racing the
             // teardown) is dropped by `apply_verdict`'s guard.
             state.judge_superseded = true;
+            // The user answered for themselves, so any Observer nudge parked for
+            // the "user stopped typing" flush is now stale — forget it, don't
+            // deliver it after the user's own message.
+            state.pending_nudge = None;
             if matches!(state.status, SupervisorStatus::Judging) {
                 state.status = SupervisorStatus::Watching;
             }
@@ -1622,6 +1666,44 @@ impl SolutionAgentStore {
         content: String,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
+        // "Hold on typing": if the human is composing a message RIGHT NOW (a
+        // keystroke within `IDLE_THRESHOLD_SECS`), do not drop the nudge into
+        // the conversation mid-sentence. The verdict has already been accepted
+        // by `apply_verdict` (the continue-counter bumped); park its nudge in
+        // `pending_nudge` and let `tick_supervisor` deliver it once the user has
+        // gone quiet for the standard idle window — or a genuine user SEND
+        // discards it (`supersede_judge_on_user_reply`). The start-time guard
+        // (`should_fire`) only blocks a NEW judge from firing while the user
+        // types; it cannot cover a judge that fired while the user was idle and
+        // finished after the user began typing — this is that missing seam.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let composing = self
+            .supervisor_states
+            .get(&id)
+            .and_then(|s| s.last_user_input_ms)
+            .is_some_and(|t| {
+                now_ms.saturating_sub(t) < (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000
+            });
+        if composing {
+            if let Some(state) = self.supervisor_states.get_mut(&id) {
+                state.pending_nudge = Some(content);
+            }
+            cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+            return gpui::Task::ready(Ok(()));
+        }
+        self.deliver_nudge_now(id, content, cx)
+    }
+
+    /// Deliver an Observer nudge into the supervised session's conversation
+    /// unconditionally (the hold-on-typing decision lives in the callers:
+    /// [`send_supervisor_nudge`] parks it when the user is mid-message,
+    /// `tick_supervisor` flushes a parked nudge once the user is quiet).
+    fn deliver_nudge_now(
+        &mut self,
+        id: SolutionSessionId,
+        content: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<anyhow::Result<()>> {
         // The nudge is the SINGLE visible element: stamp it with the
         // `spk_observer_nudge` `_meta` marker so `conversation_render` shows it
         // as an OBSERVER comment (eye plaque) instead of a plain user bubble. We
@@ -1666,20 +1748,38 @@ impl SolutionAgentStore {
     ) {
         use crate::supervisor::{SupervisorStatus, VerdictAction, VerdictKind, VerdictRecord};
 
-        // Staleness guard (bug #1): if a human reply superseded the in-flight
-        // judge (`supersede_judge_on_user_reply` set `judge_superseded`), this
-        // verdict raced in after the user already steered the agent — direction
-        // has moved on. Consume the marker (take + clear) and, below, record the
-        // verdict for audit but do NOT act on it: no nudge, no Observer
-        // breadcrumb, no continue-counter bump, no escalation. The marker is the
-        // ONLY suppression signal, so a verdict in any other state (the
-        // direct-`apply_verdict` paths for Done/Compact/Ask from `Watching`/
-        // `WaitingUser`) is unaffected.
-        let verdict_superseded = self
+        // Send-time state re-check (audit). Every eligibility condition that let
+        // this judge fire was evaluated at START; between fire and now an
+        // autonomous judge turn ran (seconds→minutes) during which the live
+        // state can have changed out from under it — the user disabled
+        // supervision, hit Stop (→ `Held`), the session hit a usage wall
+        // (`Stopped`), or the session was torn down. Re-read the state and DROP
+        // the verdict when the supervisor is no longer actively supervising this
+        // session: supervision OFF (`!enabled`, i.e. `Disabled`), parked after a
+        // manual Stop (`Held`), or dead (`Stopped`). Otherwise a verdict from a
+        // run the user already cancelled would nudge the agent anyway. Combined
+        // with `judge_superseded` (consumed here, set by
+        // `supersede_judge_on_user_reply` / the prompt-change interrupt) this is
+        // the "check at the end" half of the double-check — its "check at the
+        // start" half is `should_fire`. `Watching` is allowed through so the
+        // direct-`apply_verdict` paths (e.g. a `Done` verdict from `Watching`,
+        // and the unit tests) still act. The verdict is still logged below for
+        // audit — it just isn't acted on when dropped.
+        let (verdict_superseded, supervising) = self
             .supervisor_states
             .get_mut(&id)
-            .map(|s| std::mem::take(&mut s.judge_superseded))
-            .unwrap_or(false);
+            .map(|s| {
+                (
+                    std::mem::take(&mut s.judge_superseded),
+                    s.enabled
+                        && !matches!(
+                            s.status,
+                            SupervisorStatus::Held | SupervisorStatus::Stopped(_)
+                        ),
+                )
+            })
+            .unwrap_or((false, false));
+        let drop_verdict = verdict_superseded || !supervising;
 
         if let Some(root) = self.solution_root_for(id, cx) {
             let dir = crate::supervisor::supervisor_dir(&root, id);
@@ -1698,7 +1798,7 @@ impl SolutionAgentStore {
 
         self.finish_judge(id, cx);
 
-        if verdict_superseded {
+        if drop_verdict {
             return;
         }
 
@@ -2235,6 +2335,34 @@ impl SolutionAgentStore {
             // the user's last keystroke, so a nudge never fires while the user
             // is mid-message (note_user_input bumps `last_user_input_ms`).
             let quiet_since_ms = last_activity_ms.max(last_user_input_ms.unwrap_or(0));
+
+            // Flush a nudge that was held because the user was typing when the
+            // judge finished (`send_supervisor_nudge`'s hold-on-typing). Deliver
+            // it once the user has been quiet for the standard idle window and
+            // the session is idle — the "user changed their mind and stopped
+            // writing" case. A genuine user SEND would already have discarded it
+            // via the `from_user` funnel. Never fire a FRESH judge while a nudge
+            // is still parked (that would double up), so `continue` regardless.
+            let has_pending = self
+                .supervisor_states
+                .get(&id)
+                .is_some_and(|s| s.pending_nudge.is_some());
+            if has_pending {
+                let quiet_enough = now_ms.saturating_sub(quiet_since_ms)
+                    >= (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000;
+                if idle_or_errored && quiet_enough {
+                    let pending = self
+                        .supervisor_states
+                        .get_mut(&id)
+                        .and_then(|s| s.pending_nudge.take());
+                    if let Some(content) = pending {
+                        self.deliver_nudge_now(id, content, cx).detach();
+                        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+                    }
+                }
+                continue;
+            }
+
             if now_ms >= next_eligible_ms.unwrap_or(0)
                 && crate::supervisor::should_fire(
                     enabled,

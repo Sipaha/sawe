@@ -670,6 +670,8 @@ impl SolutionAgentDb {
                     last_user_input_ms: None,
                     // Transient: no in-flight judge exists for a cold-loaded row.
                     judge_superseded: false,
+                    // Transient: a held nudge does not survive a restart.
+                    pending_nudge: None,
                 });
             }
             Ok(out)

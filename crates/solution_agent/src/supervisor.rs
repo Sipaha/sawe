@@ -224,6 +224,20 @@ pub struct SupervisorState {
     /// breadcrumb (bug #1). Cleared whenever a fresh judge is spawned (status →
     /// `Judging`) so it can never pre-suppress the next cycle's verdict.
     pub judge_superseded: bool,
+    /// TRANSIENT (not persisted): an Observer nudge whose delivery was DEFERRED
+    /// because the human was actively composing a message when the judge
+    /// finished (a keystroke within `IDLE_THRESHOLD_SECS` — see
+    /// `send_supervisor_nudge`). The start-time typing guard (`should_fire`)
+    /// only prevents a NEW judge from firing mid-typing; it can't cover a judge
+    /// that already fired while the user was idle and finished after the user
+    /// started typing. Rather than barge into the middle of the user's
+    /// sentence, the verdict is accepted (the continue-counter still bumps) but
+    /// its nudge is parked here. `tick_supervisor` flushes it once the user has
+    /// gone quiet for the standard idle window; a genuine user SEND
+    /// (`supersede_judge_on_user_reply` on the `from_user` funnel) discards it —
+    /// the user answered for themselves, so the stale observer nudge is
+    /// forgotten. Reset to `None` on restart (a cold session has nothing held).
+    pub pending_nudge: Option<String>,
 }
 
 impl SupervisorState {
@@ -240,6 +254,7 @@ impl SupervisorState {
             trigger_count: 0,
             last_user_input_ms: None,
             judge_superseded: false,
+            pending_nudge: None,
         }
     }
 }
