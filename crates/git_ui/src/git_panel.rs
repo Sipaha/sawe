@@ -253,6 +253,13 @@ fn git_panel_context_menu(
 
 const GIT_PANEL_KEY: &str = "GitPanel";
 
+/// Whether the S-PCH-HK "Before commit" section (Format / Organize imports /
+/// Run task / pre-commit hook / --no-verify) is shown under the commit editor.
+/// Hidden per user request (2026-07-02). Set to `true` to bring it back — the
+/// render method, its setters, the check-runner and config persistence all
+/// stay compiled and wired; only the render is gated off.
+const SHOW_PRE_COMMIT_SECTION: bool = false;
+
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
@@ -7258,7 +7265,18 @@ impl Render for GitPanel {
                                 })
                             })
                             .children(self.render_footer(window, cx))
-                            .children(self.render_pre_commit_section(cx))
+                            // S-PCH-HK "Before commit" section (Format /
+                            // Organize imports / Run task / hook / --no-verify)
+                            // hidden per user request (2026-07-02). The call is
+                            // kept behind a `false` gate — not deleted — so the
+                            // render method + its setters stay live (no
+                            // dead-code cascade) and the check-runner + config
+                            // persistence remain wired. Flip to re-enable.
+                            .children(
+                                SHOW_PRE_COMMIT_SECTION
+                                    .then(|| self.render_pre_commit_section(cx))
+                                    .flatten(),
+                            )
                             .when(self.amend_pending, |this| {
                                 this.child(self.render_pending_amend(cx))
                             })
