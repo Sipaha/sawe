@@ -386,6 +386,14 @@ impl BranchesPopup {
                 _ => 0,
             };
 
+            // Hide empty sections. `favorites`/`backups` are noise when empty
+            // even with no query (nothing to star / no backup refs yet). During
+            // a search, ANY section with zero matches is hidden so the results
+            // are just the sections that actually contain something.
+            if count == 0 && (matches!(key, "favorites" | "backups") || !q.is_empty()) {
+                continue;
+            }
+
             // Collapsed by default; an active search query force-expands so
             // matches stay visible without manual toggling.
             let collapsed = q.is_empty() && self.collapsed_sections.contains(key);
@@ -580,13 +588,6 @@ impl BranchesPopup {
             .favorites
             .iter()
             .any(|b| b == branch_name)
-    }
-
-    fn current_head(&self) -> Option<&str> {
-        self.branches
-            .iter()
-            .find(|b| b.is_head)
-            .map(|b| b.name.as_ref())
     }
 
     fn dispatch_default(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -937,7 +938,9 @@ impl BranchesPopup {
                     .spacing(ListItemSpacing::Sparse)
                     .toggle_state(selected)
                     .start_slot(Icon::new(IconName::Hash).size(IconSize::Small))
-                    .child(Label::new(tag_name.clone()))
+                    // Indent one level so tags nest under the "Tags" section
+                    // header (matches branch/group rows at depth 0).
+                    .child(h_flex().pl(rems(1.0)).child(Label::new(tag_name.clone())))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.checkout_revision(tag_name.clone(), window, cx);
                         cx.emit(DismissEvent);
@@ -981,7 +984,8 @@ impl BranchesPopup {
                     .spacing(ListItemSpacing::Sparse)
                     .toggle_state(selected)
                     .start_slot(Icon::new(IconName::CountdownTimer).size(IconSize::Small))
-                    .child(Label::new(label).color(Color::Muted))
+                    // Indent one level so backups nest under their section header.
+                    .child(h_flex().pl(rems(1.0)).child(Label::new(label).color(Color::Muted)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.restore_backup(branch_clone.clone(), sha_clone.clone(), window, cx);
                     }))
@@ -1191,14 +1195,18 @@ impl ModalView for BranchesPopup {}
 impl EventEmitter<DismissEvent> for BranchesPopup {}
 
 impl Focusable for BranchesPopup {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        // Focus the search field, not the popup container, so opening the
+        // popover lands the caret in "Search branches…" ready to type. The
+        // container element still declares the `BranchesPopup` key_context +
+        // `on_action` handlers, and the query is a single-line editor, so
+        // up/down/enter/escape bubble up to select_prev/next/confirm/cancel.
+        self.query.focus_handle(cx)
     }
 }
 
 impl Render for BranchesPopup {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let head = self.current_head().map(|s| s.to_string());
         let popup = v_flex()
             .key_context("BranchesPopup")
             .track_focus(&self.focus_handle)
@@ -1209,27 +1217,13 @@ impl Render for BranchesPopup {
             .on_action(cx.listener(Self::handle_toggle_favorite))
             .elevation_2(cx)
             .w(rems(32.))
-            // Definite height (not just `max_h`): as an anchored popover the
-            // container is content-sized, so the `flex_1` scroll list below
-            // would collapse to zero height without a height basis here.
-            .h(rems(36.))
-            .child(
-                h_flex()
-                    .px_3()
-                    .pt_2()
-                    .pb_1()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
-                    .child(Headline::new("Branches").size(HeadlineSize::XSmall))
-                    .when_some(head, |this, h| {
-                        this.child(
-                            Label::new(format!("on {}", h))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    }),
-            )
-            .child(div().px_3().pb_1().child(self.query.clone()))
+            // No fixed height — the popup hugs its content (IDEA-style) so a
+            // short result set doesn't reserve a tall empty slab. The scroll
+            // list below caps itself with `max_h`, which is what bounds the
+            // overall popup when there are many rows.
+            // No header — the search field is the first thing in the popup, so
+            // opening it lands the user straight on "type to filter".
+            .child(div().px_3().pt_2().pb_1().child(self.query.clone()))
             .child(div().h_px().bg(cx.theme().colors().border_variant))
             .child(self.render_action_header(cx))
             .child(
@@ -1241,8 +1235,9 @@ impl Render for BranchesPopup {
                 // and no scroll-to-selected, so virtualization isn't needed.
                 v_flex()
                     .id("branches-popup-list")
-                    .flex_1()
-                    .min_h_0()
+                    // Hug content up to a cap, then scroll — keeps the popup
+                    // compact for few rows and bounded for a 192-tag repo.
+                    .max_h(rems(26.))
                     .overflow_y_scroll()
                     .children({
                         let rows = self.rows.clone();
@@ -1472,9 +1467,12 @@ mod tests {
 
         popup.update(cx, |popup, _cx| {
             let headers = section_headers(&popup.rows);
-            assert_eq!(
-                headers,
-                vec!["recent", "favorites", "local", "remote", "tags", "backups"],
+            // Empty project + empty query: `favorites`/`backups` are hidden when
+            // they have nothing (noise otherwise); the rest keep SECTION_ORDER.
+            assert_eq!(headers, vec!["recent", "local", "remote", "tags"]);
+            assert!(
+                !headers.contains(&"favorites") && !headers.contains(&"backups"),
+                "empty favorites/backups must be hidden"
             );
         });
     }
@@ -1496,10 +1494,10 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        // All sections present initially.
+        // Empty project: 4 sections (favorites/backups hidden when empty).
         popup.update(cx, |popup, _cx| {
             let headers = section_headers(&popup.rows);
-            assert_eq!(headers.len(), 6);
+            assert_eq!(headers.len(), 4);
         });
 
         // Sections start collapsed by default, so toggling "recent" expands it.
@@ -1533,8 +1531,8 @@ mod tests {
                 !collapsed,
                 "recent section should expand on first toggle (collapsed by default)"
             );
-            // All 6 section headers still present regardless of collapsed state.
-            assert_eq!(section_headers(&popup.rows).len(), 6);
+            // Section headers still present regardless of collapsed state.
+            assert_eq!(section_headers(&popup.rows).len(), 4);
         });
 
         // Toggle "recent" again — it should collapse back.
