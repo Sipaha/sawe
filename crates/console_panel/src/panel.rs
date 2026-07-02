@@ -731,9 +731,13 @@ impl ConsolePanel {
                         .items_center()
                         .h_full()
                         .child(
+                            // NB: no `LineHeightStyle::UiLabel` here. UiLabel
+                            // pins line-height to 1.0×font-size (no leading),
+                            // and `.truncate()` adds `overflow: hidden`, so
+                            // descenders (g, y, …) got clipped at the tab's
+                            // bottom edge. The default line-height leaves room.
                             Label::new(title.clone())
                                 .size(LabelSize::Default)
-                                .line_height_style(LineHeightStyle::UiLabel)
                                 .truncate(),
                         ),
                 )
