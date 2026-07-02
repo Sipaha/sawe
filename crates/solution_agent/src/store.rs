@@ -1622,24 +1622,17 @@ impl SolutionAgentStore {
         content: String,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
-        // Leave a distinct Observer breadcrumb so the supervisor's intervention
-        // is visible in the conversation as the OBSERVER acting, not confused
-        // with the user or the agent. Trimmed to a one-liner gist.
-        let gist: String = content
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or(&content)
-            .chars()
-            .take(160)
-            .collect();
-        self.push_system_note(
-            id,
-            acp_thread::SystemNoteLevel::Observer,
-            format!("Наблюдатель направил агента: {gist}"),
-            cx,
-        );
+        // The nudge is the SINGLE visible element: stamp it with the
+        // `spk_observer_nudge` `_meta` marker so `conversation_render` shows it
+        // as an OBSERVER comment (eye plaque) instead of a plain user bubble. We
+        // no longer emit a separate "Наблюдатель направил агента: …" breadcrumb
+        // note — the marked message itself carries the full instruction and the
+        // observer attribution, so the old two-element layout (gist note + plain
+        // bubble) is gone. The marker rides on `_meta`, invisible to the agent's
+        // text.
         let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-            agent_client_protocol::schema::TextContent::new(content),
+            agent_client_protocol::schema::TextContent::new(content)
+                .meta(Some(acp_thread::meta_with_observer_nudge())),
         )];
         // `from_user: false` — a supervisor nudge must NOT reset the
         // continue-cap counter (apply_verdict just incremented it) nor be

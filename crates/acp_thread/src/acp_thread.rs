@@ -298,6 +298,39 @@ pub fn csids_from_blocks(blocks: &[acp::ContentBlock]) -> Vec<i64> {
     out
 }
 
+/// Key stamped on a supervisor "Observer" nudge's content blocks so the
+/// desktop renderer can mark it as an OBSERVER comment (eye plaque) rather
+/// than a plain user message. Editor-originated; the agent treats it opaquely
+/// (it rides on `_meta`, never in the visible text). See
+/// `solution_agent::store::send_supervisor_nudge` (stamps it) and
+/// `solution_agent::conversation_render` (reads it).
+pub const SPK_OBSERVER_NUDGE_META_KEY: &str = "spk_observer_nudge";
+
+/// Build a `_meta` object carrying the observer-nudge marker.
+pub fn meta_with_observer_nudge() -> acp::Meta {
+    acp::Meta::from_iter([(SPK_OBSERVER_NUDGE_META_KEY.into(), true.into())])
+}
+
+/// True when any content block carries the `spk_observer_nudge` `_meta`
+/// marker — i.e. this user message is actually a supervisor Observer nudge
+/// and should render as an Observer comment, not the human's own message.
+pub fn is_observer_nudge_blocks(blocks: &[acp::ContentBlock]) -> bool {
+    blocks.iter().any(|block| {
+        let meta = match block {
+            acp::ContentBlock::Text(t) => &t.meta,
+            acp::ContentBlock::Image(i) => &i.meta,
+            acp::ContentBlock::Audio(a) => &a.meta,
+            acp::ContentBlock::ResourceLink(r) => &r.meta,
+            acp::ContentBlock::Resource(r) => &r.meta,
+            _ => return false,
+        };
+        meta.as_ref()
+            .and_then(|m| m.get(SPK_OBSERVER_NUDGE_META_KEY))
+            // Presence is the signal; tolerate any truthy encoding.
+            .is_some_and(|v| v.as_bool().unwrap_or(true))
+    })
+}
+
 #[derive(Debug)]
 pub struct UserMessage {
     pub id: Option<UserMessageId>,
@@ -3956,6 +3989,21 @@ mod tests {
         let unknown =
             acp::Meta::from_iter([(COMMAND_CATEGORY_META_KEY.into(), "future-category".into())]);
         assert_eq!(command_category_from_meta(&Some(unknown)), None);
+    }
+
+    #[test]
+    fn observer_nudge_meta_round_trips() {
+        // A block stamped by `meta_with_observer_nudge` is detected as an
+        // Observer nudge; a plain user block (and an empty set) is not.
+        let stamped = vec![acp::ContentBlock::Text(
+            acp::TextContent::new("Continue.").meta(Some(meta_with_observer_nudge())),
+        )];
+        assert!(is_observer_nudge_blocks(&stamped));
+
+        let plain = vec![acp::ContentBlock::Text(acp::TextContent::new("hi"))];
+        assert!(!is_observer_nudge_blocks(&plain));
+
+        assert!(!is_observer_nudge_blocks(&[]));
     }
 
     fn init_test(cx: &mut TestAppContext) {

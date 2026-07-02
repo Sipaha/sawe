@@ -655,6 +655,11 @@ pub(crate) fn render_user_message(
     // image preview opens through the `on_url_click` hook below.
     let text = clean_user_message_text(content_md);
     let bubble_bg = cx.theme().colors().text_accent.opacity(0.12);
+    // A supervisor Observer nudge is delivered to the agent AS a user message
+    // (so the agent acts on it), but it is NOT the human's own message — the
+    // `spk_observer_nudge` `_meta` marker tags it so we render it as an Observer
+    // comment (eye plaque) instead of a plain user bubble.
+    let is_observer = acp_thread::is_observer_nudge_blocks(chunks);
     let group_name = SharedString::from(format!("user-msg-{entry_idx}"));
 
     let images: Vec<std::sync::Arc<gpui::Image>> = chunks
@@ -690,6 +695,44 @@ pub(crate) fn render_user_message(
             .size(LabelSize::Small)
             .into_any_element()
     };
+
+    if is_observer {
+        // Observer comment: full-width plaque bubble (eye badge + tag over the
+        // markdown body), tinted + left-bordered with the accent color — mirrors
+        // the System/Observer note render (FORK.md #29) so a supervisor
+        // intervention reads as the OBSERVER speaking, not the human.
+        let color = Color::Accent;
+        return v_flex()
+            .group(group_name.clone())
+            .relative()
+            .mx_2()
+            .mb_3()
+            .px_2p5()
+            .py_1p5()
+            .gap_1()
+            .rounded_md()
+            .bg(color.color(cx).opacity(0.08))
+            .border_l_2()
+            .border_color(color.color(cx))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(color))
+                    .child(Label::new("Наблюдатель").size(LabelSize::XSmall).color(color)),
+            )
+            .child(div().w_full().min_w_0().child(body))
+            .child(render_floating_copy_button(
+                SharedString::from(format!("copy-observer-{entry_idx}")),
+                text,
+                group_name.clone(),
+            ))
+            .when_some(
+                render_message_time(created_ms, is_last, group_name),
+                |this, time| this.child(time),
+            )
+            .into_any_element();
+    }
 
     v_flex()
         .group(group_name.clone())
