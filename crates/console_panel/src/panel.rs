@@ -1373,6 +1373,48 @@ impl ConsolePanel {
         self.persist(cx);
     }
 
+    /// Ensure a chat tab exists for `session_id` and make it the active tab.
+    /// Backs the [`crate::ShowSession`] action (MCP-driven UI verification).
+    ///
+    /// Unlike [`add_chat_tab_with_cwd`](Self::add_chat_tab_with_cwd), which
+    /// leans on the create-time `TabsChanged` fan-out to build the tab, this
+    /// spawns the view directly. That matters because a session pinned
+    /// out-of-band (e.g. the `workspace.open_session` RPC) may never produce
+    /// a desktop tab through the event path, so relying on it would leave the
+    /// session unreachable from the strip. Spawning here is idempotent: the
+    /// `has_chat_tab_for` guard (both before the await and inside it) dedupes
+    /// against a tab a parallel handler may have added meanwhile.
+    pub fn show_session(
+        &mut self,
+        session_id: SolutionSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_chat_tab_for(session_id) {
+            self.activate_chat_tab_if_present(session_id, cx);
+            return;
+        }
+        let task = self.chat_provider.update(cx, |provider, cx| {
+            provider.new_tab_from_existing(session_id, window, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let view = task.await.log_err()?;
+            this.update(cx, |this, cx| {
+                if this.has_chat_tab_for(session_id) {
+                    this.activate_chat_tab_if_present(session_id, cx);
+                    return;
+                }
+                this.tabs.push(ConsoleTab::Chat { view, session_id });
+                this.active_index = Some(this.tabs.len() - 1);
+                cx.notify();
+                this.persist(cx);
+            })
+            .log_err();
+            Some(())
+        })
+        .detach();
+    }
+
     fn show_tab_context_menu(
         &mut self,
         tab_index: usize,

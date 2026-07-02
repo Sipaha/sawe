@@ -6,7 +6,7 @@ mod console_panel_settings;
 mod panel;
 mod terminal_provider;
 
-pub use actions::{NewChat, NewTerminal, ToggleFocus};
+pub use actions::{NewChat, NewTerminal, ShowSession, ToggleFocus};
 pub use chat_provider::{ChatProvider, ChatProviderEvent};
 pub use console_panel_settings::ConsolePanelSettings;
 pub use panel::{ConsolePanel, ConsoleTab};
@@ -32,6 +32,15 @@ pub fn init(cx: &mut gpui::App) {
         });
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ConsolePanel>(window, cx);
+        });
+        workspace.register_action(|workspace, action: &ShowSession, window, cx| {
+            let Ok(session_id) = solution_agent::SolutionSessionId::parse(&action.session_id)
+            else {
+                return;
+            };
+            if let Some(panel) = workspace.panel::<ConsolePanel>(cx) {
+                panel.update(cx, |panel, cx| panel.show_session(session_id, window, cx));
+            }
         });
         workspace.register_action(ConsolePanel::handle_new_terminal);
     })
