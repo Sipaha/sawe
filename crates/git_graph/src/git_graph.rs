@@ -5523,6 +5523,109 @@ mod tests {
         );
     }
 
+    /// FileHistory dispatched while a project-panel selection in a NON-git
+    /// worktree is focused must not open a graph (no fall-back source). Lives
+    /// here (not in `project_panel`) because it exercises git_graph's
+    /// FileHistory handler; keeping it in project_panel's tests forced a
+    /// project_panel <-> git_graph dev-dependency cycle that linked two copies
+    /// of project_panel into the test binary and double-registered every
+    /// project_panel action.
+    #[gpui::test]
+    async fn test_file_history_action_does_not_open_graph_for_non_git_selection(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/git-project"),
+            json!({ ".git": {}, "tracked.txt": "tracked" }),
+        )
+        .await;
+        fs.insert_tree(Path::new("/plain-project"), json!({ "plain.txt": "plain" }))
+            .await;
+        fs.set_graph_commits(
+            Path::new("/git-project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: Oid::from_bytes(&[1; 20]).unwrap(),
+                parents: smallvec![],
+                ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+            })],
+        );
+
+        let project = Project::test(
+            fs.clone(),
+            [Path::new("/git-project"), Path::new("/plain-project")],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+
+        let plain_worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktree_for_root_name("plain-project", cx)
+                .expect("plain worktree should exist")
+                .read(cx)
+                .id()
+        });
+        let plain_project_path = project::ProjectPath {
+            worktree_id: plain_worktree_id,
+            path: util::rel_path::rel_path("plain.txt").into(),
+        };
+
+        let workspace_window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = workspace_window
+            .read_with(cx, |multi, _| multi.workspace().clone())
+            .expect("workspace should exist");
+
+        let (weak_workspace, async_window_cx) = workspace_window
+            .update(cx, |multi, window, cx| {
+                (multi.workspace().downgrade(), window.to_async(cx))
+            })
+            .expect("window should be available");
+        cx.background_executor.allow_parking();
+        let project_panel = cx
+            .foreground_executor()
+            .clone()
+            .block_test(ProjectPanel::load(weak_workspace, async_window_cx))
+            .expect("project panel should load");
+        cx.background_executor.forbid_parking();
+
+        workspace_window
+            .update(cx, |multi, window, cx| {
+                multi.workspace().update(cx, |workspace, cx| {
+                    workspace.add_panel(project_panel.clone(), window, cx);
+                });
+            })
+            .expect("workspace window should be available");
+        cx.run_until_parked();
+
+        workspace_window
+            .update(cx, |multi, window, cx| {
+                project_panel.update(cx, |panel, cx| {
+                    panel.select_path_for_test(plain_project_path.clone(), cx)
+                });
+                multi.workspace().update(cx, |workspace, cx| {
+                    workspace.focus_panel::<ProjectPanel>(window, cx);
+                });
+            })
+            .expect("workspace window should be available");
+        cx.run_until_parked();
+
+        workspace_window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(git::FileHistory), cx);
+            })
+            .expect("workspace window should be available");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<GitGraph>(cx).count(), 0);
+        });
+    }
+
     #[gpui::test]
     async fn test_file_history_action_uses_focused_source_and_reuses_matching_graph(
         cx: &mut TestAppContext,

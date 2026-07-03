@@ -165,7 +165,9 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     state: State,
-    _store_subscription: gpui::Subscription,
+    // `None` outside a Solution context (e.g. unit tests, where the
+    // `SolutionStore` global is never installed). The app always has it.
+    _store_subscription: Option<gpui::Subscription>,
 }
 
 struct UpdateVisibleEntriesTask {
@@ -817,19 +819,21 @@ impl ProjectPanel {
 
             // Rebuild the worktree view whenever the solution-wide active
             // member flips so the panel renders the newly-selected project.
-            let store_subscription = cx.subscribe_in(
-                &solutions::SolutionStore::global(cx),
-                window,
-                |this, _store, event, window, cx| {
-                    if matches!(
-                        event,
-                        solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
-                    ) {
-                        this.update_visible_entries(None, false, false, window, cx);
-                        cx.notify();
-                    }
-                },
-            );
+            // Absent outside a Solution context (unit tests never install the
+            // `SolutionStore` global) — degrade gracefully instead of panicking,
+            // mirroring the `try_global` reads in `active_solution`.
+            let store_subscription =
+                solutions::SolutionStore::try_global(cx).map(|store| {
+                    cx.subscribe_in(&store, window, |this, _store, event, window, cx| {
+                        if matches!(
+                            event,
+                            solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
+                        ) {
+                            this.update_visible_entries(None, false, false, window, cx);
+                            cx.notify();
+                        }
+                    })
+                });
 
             let mut this = Self {
                 project: project.clone(),

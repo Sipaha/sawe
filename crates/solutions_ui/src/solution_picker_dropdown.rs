@@ -506,7 +506,8 @@ mod tests {
             .collect();
         assert_eq!(matched, vec!["ECOS Records"]);
 
-        let query = "ed".to_lowercase();
+        // Uppercase query matches a lowercase name case-insensitively.
+        let query = "AW".to_lowercase();
         let matched: Vec<&str> = rows
             .iter()
             .filter(|r| r.name.to_lowercase().contains(&query))

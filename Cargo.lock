@@ -14607,7 +14607,6 @@ dependencies = [
  "fs",
  "futures 0.3.32",
  "git",
- "git_graph",
  "git_ui",
  "gpui",
  "itertools 0.14.0",
