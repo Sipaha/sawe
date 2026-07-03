@@ -8714,6 +8714,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         last_user_input_ms: None,
         judge_superseded: false,
         pending_nudge: None,
+        wait_until_ms: None,
     };
     db.save_supervisor_state(state.clone())
         .await
@@ -9166,6 +9167,114 @@ async fn changing_instruction_interrupts_running_judge(cx: &mut gpui::TestAppCon
     );
 }
 
+/// A session sitting idle OVER a running background command must not wake the
+/// supervisor — the agent is legitimately waiting on that work, and hung
+/// background commands are watched elsewhere. Once the shell exits, the idle
+/// session fires normally.
+#[gpui::test]
+async fn background_command_suppresses_supervisor_tick(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::SupervisorStatus;
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+            let shell_id = crate::background_shell::BackgroundShellId::new("shell-1");
+            s.background_shells.insert(
+                shell_id.clone(),
+                crate::background_shell::BackgroundShell {
+                    id: shell_id,
+                    command: "sleep 100".into(),
+                    output_path: std::path::PathBuf::from("/tmp/x.output"),
+                    registered_at: chrono::Utc::now(),
+                    latest: None,
+                    last_offset: 0,
+                    state: crate::background_shell::ShellRuntimeState::Running,
+                },
+            );
+        });
+        store.set_supervision_enabled(id, true, cx);
+        store.tick_supervisor(cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Watching,
+        "a running background command keeps the supervisor quiet"
+    );
+
+    // The shell finishes → the idle session now fires.
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            for shell in s.background_shells.values_mut() {
+                shell.state = crate::background_shell::ShellRuntimeState::Exited(Some(0));
+            }
+        });
+        store.tick_supervisor(cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Judging,
+        "once the background command exits, the idle session fires a judge"
+    );
+}
+
+/// A `wait` verdict is one-shot: the mechanism honors the full timeout without
+/// re-judging (no fresh judge even though the session is silent past the idle
+/// threshold), then wakes the agent itself when the deadline elapses.
+#[gpui::test]
+async fn wait_is_one_shot_no_rejudge_until_deadline(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::{SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+        });
+        store.set_supervision_enabled(id, true, cx);
+        store.supervisor_states.get_mut(&id).unwrap().status = SupervisorStatus::Judging;
+        store.apply_verdict(
+            id,
+            VerdictAction::Wait,
+            "waiting on the background build".into(),
+            None,
+            None,
+            None,
+            Some(300),
+            cx,
+        );
+    });
+    // Parked with a future deadline: a tick must NOT fire a fresh judge despite
+    // the session being silent for 10 minutes.
+    store.update(cx, |store, cx| store.tick_supervisor(cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Watching,
+        "a parked wait must not re-fire a judge"
+    );
+    assert!(st.wait_until_ms.is_some(), "the wait deadline is still pending");
+
+    // Force the deadline into the past → the mechanism wakes the agent itself
+    // and clears the wait; it does NOT spawn a judge (status stays Watching).
+    store.update(cx, |store, cx| {
+        store.supervisor_states.get_mut(&id).unwrap().wait_until_ms =
+            Some(chrono::Utc::now().timestamp_millis() - 1_000);
+        store.tick_supervisor(cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(st.wait_until_ms, None, "the elapsed wait is cleared");
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Watching,
+        "waking the agent at the deadline does not spawn a judge"
+    );
+}
+
 /// The status-icon firing counter: `trigger_count` increments each time the
 /// supervisor fires a judge and resets to 0 on every enable/disable toggle.
 #[gpui::test]
@@ -9301,12 +9410,13 @@ async fn apply_wait_sleeps_without_nudging(cx: &mut gpui::TestAppContext) {
     let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
     // Wait must NOT count toward the consecutive-continue guard.
     assert_eq!(st.consecutive_continues, 0);
-    // Stays Watching so the watchdog re-fires once the sleep window passes.
+    // Stays Watching (the one-shot wait handler is gated on it).
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
-    // next_eligible_ms is gated ~90s out (slack for scheduling).
-    let next = st.next_eligible_ms.expect("wait sets next_eligible_ms");
-    assert!(next >= before + 80_000, "next_eligible ~90s out: {next} vs {before}");
-    assert!(next <= before + 100_000, "next_eligible within clamp: {next}");
+    // The one-shot wait commits a single wake deadline ~90s out (slack for
+    // scheduling); the mechanism honors it in full without re-judging.
+    let wake = st.wait_until_ms.expect("wait sets wait_until_ms");
+    assert!(wake >= before + 80_000, "wait wake ~90s out: {wake} vs {before}");
+    assert!(wake <= before + 100_000, "wait wake within clamp: {wake}");
 
     // The wait verdict was recorded to disk.
     let root = crate::store::test_support::session_solution_root(&store, id, cx);

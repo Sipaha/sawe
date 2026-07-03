@@ -672,6 +672,8 @@ impl SolutionAgentDb {
                     judge_superseded: false,
                     // Transient: a held nudge does not survive a restart.
                     pending_nudge: None,
+                    // Transient: a parked wait does not survive a restart.
+                    wait_until_ms: None,
                 });
             }
             Ok(out)

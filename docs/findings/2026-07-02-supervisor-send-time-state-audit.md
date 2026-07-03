@@ -80,3 +80,41 @@ idle ~60 s.
 `observer_nudge_held_while_typing_then_flushed`, `disabling_supervision_interrupts_running_judge`,
 `held_supervisor_drops_racing_verdict`, `user_send_discards_held_nudge`,
 `changing_instruction_interrupts_running_judge`. FORK.md decision #31.
+
+---
+
+## Follow-up: the judge polls a parked session (89 `wait`s) — stop firing when nothing is new
+
+**Root cause (from a real session's `verdicts.jsonl`, 220 verdicts):** `wait` 89,
+`continue` 82, `compact` 29, `ask` 10, `done` 9 — the tail is streaks of `wait`
+("Nth consecutive quiet cycle, agent ~30 min idle, NO new operator message"). The
+judge was waking every ≤5 min on an UNCHANGED session (agent parked waiting on the
+operator) and re-deciding the same thing. Two mechanism gaps + one prompt gap:
+
+1. **`wait` had no cap and `MAX_WAIT_SECS` was clamped to 300 s** — so even a
+   judge that wanted a 30-min wait got re-judged every 5 min. Unlike `continue`
+   (15 → ForceAsk), a `wait` loop was unbounded.
+2. **The supervisor fired even while a tracked background command was running** —
+   the agent's idleness over a `Bash(run_in_background=true)` / managed agent is
+   expected, yet the judge woke anyway and returned `wait`.
+3. **The judge used `wait` to poll for the OPERATOR** — but `wait` is meant only
+   for the agent's own async task.
+
+**Fix (FORK.md #32):**
+
+- **No fire while background work is live.** `tick_supervisor` skips a session with
+  any `background_shell` `Running` or messageable `background_agent` (same shape as
+  the typing-defer). Hung background work is already watched (background-shell
+  watcher + `Running`-stuck watchdog), so the judge doesn't need to babysit it.
+- **`wait` is one-shot.** `MAX_WAIT_SECS` 300 → **1800**; the Wait arm parks a single
+  deadline in the transient `SupervisorState.wait_until_ms` and `tick_supervisor`
+  honors it in full (no re-judging in between). At the deadline the mechanism wakes
+  the agent itself (deterministic "check the result and continue" nudge if idle).
+  Cleared on fresh fire / user message / enable-disable; gated on `Watching`.
+- **Prompt:** `wait` reserved for the agent's own timed async task; operator-blocked
+  → `done` (park in `Held`, re-armed by the next operator message) or `ask`. Stated
+  invariant: *if nothing changed since the last verdict, the verdict must not change.*
+
+Tests added: `background_command_suppresses_supervisor_tick`,
+`wait_is_one_shot_no_rejudge_until_deadline` (+ `apply_wait_sleeps_without_nudging`
+updated for `wait_until_ms`). Full suite 507/507.

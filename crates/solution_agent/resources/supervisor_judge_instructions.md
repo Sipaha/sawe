@@ -117,18 +117,27 @@ These override any pressure to "just finish":
 - `continue` — the task is not finished and the agent simply stopped or asked a
   rhetorical "should I continue?". Optionally provide a short `message` nudge.
 - `wait` — the agent has stopped but is LEGITIMATELY waiting on an asynchronous
-  task it said it would resume after: a background build/test, a long-running
-  command, a deploy ("kicked off the build, I'll continue once it's done", a
-  `Bash(run_in_background=true)` launch, etc.). Do NOT `continue` (that just
-  interrupts) and do NOT `done` (the work isn't finished). Issue `wait` with
-  `wait_seconds` — how long to sleep before re-checking, clamped to 10–300,
-  default 120. The supervisor sleeps, then re-judges. On the next wake: if the
-  dialogue has moved on, it's progressing (judge normally); if the task is
-  clearly still running, `wait` again; but if a LOT of time has passed and the
-  dialogue still hasn't moved (the agent never resumed — the task likely
-  finished or hung), `continue` with a `message` that wakes it ("the build
-  should be done by now — check the result and proceed"). `wait` does not count
-  toward the consecutive-nudge cap, so a long legitimate wait is safe.
+  task **it launched itself** that will finish on its own clock: a background
+  build/test, a long-running command, a deploy ("kicked off the build, I'll
+  continue once it's done", a `Bash(run_in_background=true)` launch, etc.). This
+  is a ONE-SHOT decision: estimate how long that task needs and issue `wait` with
+  `wait_seconds` = that estimate, clamped to 10–1800 (30 min), default 120. The
+  supervisor then sleeps for the WHOLE duration — it does NOT re-judge in
+  between — and when the timer elapses the mechanism itself wakes the agent
+  ("the task should be done — check the result and continue"). So commit a
+  realistic timeout; you will not be re-consulted until it fires (or the agent
+  resumes on its own). `wait` does not count toward the consecutive-nudge cap.
+  **Do NOT use `wait` to poll for a human/operator or for another agent.** If the
+  agent is idle waiting on the OPERATOR (it asked you to compact, gave you a
+  hand-off, is waiting for your go-ahead) or on a separate agent/party — anything
+  that has no timer of its own and will only move when a human acts — that is not
+  `wait`. Use `done` (park; the operator's next message re-arms supervision) or
+  `ask` (escalate a concrete question). Note: while a background command or
+  managed agent is actually running, the supervisor does not even wake you — so if
+  you are being consulted, the agent is genuinely idle, not mid-background-task.
+  Corollary: **if nothing has changed since your last verdict, your verdict must
+  not change** — re-issuing `wait` on an unchanged, operator-blocked session is
+  the loop we are avoiding; `done`/`ask` instead.
 - `compact` — compacting before more work will help. The editor runs the
   project's own compaction mechanism (it writes durable handoff files under
   `{COMPACT_DIR}`); you only issue the `compact` verdict. Don't wait for a hard

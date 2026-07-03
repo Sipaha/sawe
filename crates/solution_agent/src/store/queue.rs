@@ -483,6 +483,10 @@ impl SolutionAgentStore {
             // state once a nudge has already been held (its judge finished).
             if let Some(state) = self.supervisor_states.get_mut(&session_id) {
                 state.pending_nudge = None;
+                // A user message is genuinely-new state: cancel any parked
+                // one-shot `wait` so the mechanism doesn't wake the agent for a
+                // situation the user has already moved past.
+                state.wait_until_ms = None;
             }
         }
 

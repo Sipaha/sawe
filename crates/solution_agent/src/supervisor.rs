@@ -82,10 +82,14 @@ pub enum VerdictAction {
 }
 
 /// Hard ceiling on a single `Wait` verdict's sleep, and the default when the
-/// judge omits a duration. A wait re-evaluates after at most this long, so a
-/// genuinely-stuck background task is re-checked (and can be woken) within the
-/// window rather than parking the supervisor indefinitely.
-pub const MAX_WAIT_SECS: u64 = 300;
+/// judge omits a duration. A `wait` is one-shot: the judge commits a realistic
+/// timeout up to this bound and the mechanism honors it in full (it does NOT
+/// re-judge in between), so the ceiling is generous — 30 min — to let the
+/// judge's own estimate stand rather than forcing a re-judge every few minutes
+/// (a 5-minute cap produced dozens of identical `wait` verdicts on a session
+/// parked over a long task). When the timeout elapses the mechanism wakes the
+/// agent itself. A genuinely-stuck task is thus re-checked within 30 min.
+pub const MAX_WAIT_SECS: u64 = 1800;
 pub const MIN_WAIT_SECS: u64 = 10;
 pub const DEFAULT_WAIT_SECS: u64 = 120;
 
@@ -238,6 +242,18 @@ pub struct SupervisorState {
     /// the user answered for themselves, so the stale observer nudge is
     /// forgotten. Reset to `None` on restart (a cold session has nothing held).
     pub pending_nudge: Option<String>,
+    /// TRANSIENT (not persisted): a one-shot `wait` verdict's wake deadline
+    /// (epoch-ms). The judge decides ONCE — "the agent is waiting on X, park
+    /// until here" — and the mechanism honors that single timeout in FULL: while
+    /// this is `Some` and status is `Watching`, `tick_supervisor` does NOT spawn
+    /// a fresh judge (re-judging an unchanged wait is exactly the wasteful poll
+    /// that produced 89 identical `wait` verdicts on one session). When
+    /// `now >= wait_until_ms` the mechanism itself wakes the agent (a
+    /// deterministic "the task should be done — check the result and continue"
+    /// nudge, only if it's idle) and clears this; it does not re-spawn a judge
+    /// just to re-decide. Cleared on a fresh judge fire, a user message, and
+    /// enable/disable. `None` ⟺ no wait is parked.
+    pub wait_until_ms: Option<i64>,
 }
 
 impl SupervisorState {
@@ -255,6 +271,7 @@ impl SupervisorState {
             last_user_input_ms: None,
             judge_superseded: false,
             pending_nudge: None,
+            wait_until_ms: None,
         }
     }
 }

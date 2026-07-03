@@ -1009,10 +1009,11 @@ impl SolutionAgentStore {
             // fire until the old delay elapsed.
             state.next_eligible_ms = None;
             // Nor inherit transient markers from a previous run: a leftover
-            // supersede flag or a nudge held for a since-departed draft would
-            // otherwise leak into the first fresh cycle.
+            // supersede flag, a nudge held for a since-departed draft, or a
+            // parked wait would otherwise leak into the first fresh cycle.
             state.judge_superseded = false;
             state.pending_nudge = None;
+            state.wait_until_ms = None;
             self.backoff_timers.remove(&id);
         } else {
             state.status = crate::supervisor::SupervisorStatus::Disabled;
@@ -1022,6 +1023,7 @@ impl SolutionAgentStore {
             // we're about to tear down is dropped by `apply_verdict`'s send-time
             // gate (belt-and-suspenders with the `!enabled` check there).
             state.pending_nudge = None;
+            state.wait_until_ms = None;
             state.judge_superseded = true;
             // `state` borrow ends here — the `self.*` teardown calls below need
             // `&mut self`.
@@ -1952,17 +1954,20 @@ impl SolutionAgentStore {
             }
             VerdictAction::Wait => {
                 // The agent legitimately paused to wait on an async task it said
-                // it would resume after (a background build/test/deploy). Don't
-                // nudge — sleep `wait_seconds` (clamped) and re-judge afterward.
-                // Stay `Watching` so the watchdog re-fires once the gate passes;
-                // `next_eligible_ms` is the same gate the failure-backoff uses.
-                // Wait does NOT increment the consecutive-continue guard, so a
-                // long legitimate wait can't trip the 15-nudge force-ask cap.
+                // it would resume after. This is a ONE-SHOT decision: the judge
+                // commits a single timeout (`wait_seconds`, clamped up to 30 min)
+                // and the mechanism honors it in FULL via `wait_until_ms` — it
+                // does NOT re-spawn a judge in between (re-judging an unchanged
+                // wait is the wasteful poll we're eliminating). `tick_supervisor`
+                // stays quiet until the deadline, then wakes the agent itself.
+                // Stay `Watching` (the wait handler is gated on it). Wait does
+                // NOT increment the consecutive-continue guard, so a long
+                // legitimate wait can't trip the 15-nudge force-ask cap.
                 let secs = crate::supervisor::clamp_wait_secs(wait_seconds);
-                let next = chrono::Utc::now().timestamp_millis() + (secs as i64) * 1000;
+                let wake_at = chrono::Utc::now().timestamp_millis() + (secs as i64) * 1000;
                 if let Some(state) = self.supervisor_states.get_mut(&id) {
                     state.status = SupervisorStatus::Watching;
-                    state.next_eligible_ms = Some(next);
+                    state.wait_until_ms = Some(wake_at);
                 }
                 self.persist_supervisor_state(id, cx);
             }
@@ -2324,12 +2329,36 @@ impl SolutionAgentStore {
             let Some(session) = self.session(id) else {
                 continue;
             };
-            let (idle_or_errored, last_activity_ms) = {
+            let (idle_or_errored, last_activity_ms, has_live_background_work) = {
                 let s = session.read(cx);
                 let idle_or_errored =
                     matches!(s.state, SessionState::Idle | SessionState::Errored(_));
-                (idle_or_errored, s.last_activity_at.timestamp_millis())
+                // A session sitting idle OVER a background command/agent it
+                // launched is legitimately idle — the agent is waiting on that
+                // work, so there is nothing for the supervisor to judge. Live =
+                // any background shell still `Running`, or any managed agent that
+                // has not hit a terminal stop.
+                let has_live_background_work = s.background_shells.values().any(|sh| {
+                    matches!(sh.state, crate::background_shell::ShellRuntimeState::Running)
+                }) || s.background_agents.values().any(|a| a.is_messageable());
+                (
+                    idle_or_errored,
+                    s.last_activity_at.timestamp_millis(),
+                    has_live_background_work,
+                )
             };
+
+            // Don't fire the supervisor while a background command/agent is
+            // running: the agent's idleness is expected (it's waiting on that
+            // work), and hung background work is already watched elsewhere (the
+            // background-shell watcher + the `Running`-stuck watchdog). Stay
+            // quiet like we do while the user types; the supervisor re-engages
+            // once the work finishes and the agent goes genuinely idle. This is
+            // what keeps the judge from firing a stream of `wait` verdicts over
+            // a session parked on a long build/test.
+            if has_live_background_work {
+                continue;
+            }
             // Treat live human typing as activity: the supervisor's idle clock
             // counts silence from the LATER of the session's last activity and
             // the user's last keystroke, so a nudge never fires while the user
@@ -2360,6 +2389,42 @@ impl SolutionAgentStore {
                         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
                     }
                 }
+                continue;
+            }
+
+            // One-shot `wait`: a judge that decided "the agent is waiting on X,
+            // park until here" committed a single timeout the mechanism honors
+            // in full — no re-judging in between (re-deciding an unchanged wait
+            // is the poll we're eliminating). While the deadline is in the
+            // future, stay quiet. When it elapses, the mechanism itself wakes
+            // the agent (a deterministic "check the result" nudge, only if it's
+            // idle — if it already resumed we just drop the wait and let the
+            // normal cycle judge the new state). Gated on `Watching` so a stale
+            // deadline on a Held/WaitingUser session can't act.
+            if matches!(status, crate::supervisor::SupervisorStatus::Watching)
+                && let Some(wake_at) = self
+                    .supervisor_states
+                    .get(&id)
+                    .and_then(|s| s.wait_until_ms)
+            {
+                if now_ms < wake_at {
+                    continue;
+                }
+                if let Some(st) = self.supervisor_states.get_mut(&id) {
+                    st.wait_until_ms = None;
+                }
+                if idle_or_errored {
+                    self.deliver_nudge_now(
+                        id,
+                        "The task you were waiting on should be done by now — \
+                         check the result and continue."
+                            .to_string(),
+                        cx,
+                    )
+                    .detach();
+                }
+                self.persist_supervisor_state(id, cx);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
                 continue;
             }
 
