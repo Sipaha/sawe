@@ -616,7 +616,20 @@ impl ProjectPanel {
                 window,
                 |this, project, event, window, cx| match event {
                     project::Event::ActiveEntryChanged(Some(entry_id)) => {
-                        if ProjectPanelSettings::get_global(cx).auto_reveal_entries {
+                        // While a per-Solution-member layout swap is closing and
+                        // reopening a batch of tabs, each one re-points the active
+                        // entry; auto-revealing per tab scrolls the tree over and
+                        // over (the "tree jumps on every tab" jank). The swap
+                        // driver suppresses reveal for the batch and clears it
+                        // before re-activating the final file, so the tree reveals
+                        // exactly once, at the end.
+                        let swap_suppressed = this
+                            .workspace
+                            .read_with(cx, |ws, _| ws.active_entry_reveal_suppressed())
+                            .unwrap_or(false);
+                        if !swap_suppressed
+                            && ProjectPanelSettings::get_global(cx).auto_reveal_entries
+                        {
                             this.reveal_entry(project.clone(), *entry_id, true, window, cx)
                                 .ok();
                         }

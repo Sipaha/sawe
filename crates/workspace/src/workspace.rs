@@ -1452,6 +1452,15 @@ pub struct Workspace {
     active_workspace_id: Option<Rc<Cell<EntityId>>>,
     active_worktree_creation: ActiveWorktreeCreation,
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
+    /// Transient (per-window, never serialized): while `true`, the project
+    /// panel skips its auto-reveal-to-active-entry on `ActiveEntryChanged`.
+    /// Set around a per-Solution-member layout swap
+    /// (`solutions_ui::member_layout`), which closes+reopens a batch of tabs —
+    /// each close/open re-points the active entry and would otherwise scroll the
+    /// tree once PER tab (the "tree jumps on every tab" jank). Cleared before the
+    /// swap re-activates the final file, so the tree reveals exactly once, at the
+    /// end.
+    suppress_active_entry_reveal: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1901,6 +1910,7 @@ impl Workspace {
             open_in_dev_container: false,
             _dev_container_task: None,
             deferred_save_items: Vec::new(),
+            suppress_active_entry_reveal: false,
         }
     }
 
@@ -4820,6 +4830,21 @@ impl Workspace {
     ) {
         let new_pane = self.split_pane(self.active_pane.clone(), split_direction, window, cx);
         self.add_item(new_pane, item, None, true, true, window, cx);
+    }
+
+    /// Whether the project panel should skip auto-revealing to the active entry
+    /// right now — set during a per-Solution-member layout swap so the tree
+    /// doesn't scroll once per closed/opened tab. See the field docs.
+    pub fn active_entry_reveal_suppressed(&self) -> bool {
+        self.suppress_active_entry_reveal
+    }
+
+    /// Toggle the transient project-panel reveal suppression (see
+    /// [`Workspace::active_entry_reveal_suppressed`]). Callers MUST clear it
+    /// again — the layout-swap driver clears it before re-activating the final
+    /// file so the tree reveals exactly once.
+    pub fn set_active_entry_reveal_suppressed(&mut self, suppressed: bool) {
+        self.suppress_active_entry_reveal = suppressed;
     }
 
     pub fn open_abs_path(

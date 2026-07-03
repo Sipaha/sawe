@@ -35,6 +35,12 @@ pub(crate) fn apply_active_member_change(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    // Reset any stale reveal suppression from a prior swap whose task was
+    // cancelled by a rapid re-switch (the task clears it on completion, but a
+    // cancelled one never got there). Every entry starts clean; the task below
+    // re-arms it around its own close/open batch.
+    workspace.set_active_entry_reveal_suppressed(false);
+
     // 1. Snapshot the outgoing member from the live workspace.
     {
         let mut st = state.borrow_mut();
@@ -84,21 +90,34 @@ pub(crate) fn apply_active_member_change(
         workspace.set_dock_structure(docks, window, cx);
     }
 
-    // Center pane: close all editor items, reopen the snapshot paths,
-    // activate the previously-active one. Async (open/close are Tasks);
-    // stored in `apply_task` so a rapid re-switch cancels this one.
+    // Suppress the project panel's per-tab reveal for the whole swap: closing
+    // and reopening a batch of tabs re-points the active entry many times, and
+    // revealing on each one scrolls the tree over and over (the jank the user
+    // sees — "the tree jumps on every tab"). We drop the flag just before
+    // re-activating the final file so the tree reveals exactly once, at the end.
+    workspace.set_active_entry_reveal_suppressed(true);
+
+    // Center pane: close all editor items, reopen the snapshot paths, activate
+    // the previously-active one. Async (open/close are Tasks); stored in
+    // `apply_task` so a rapid re-switch cancels this one.
     let task = cx.spawn_in(window, async move |workspace, cx| {
-        let item_ids: Vec<_> = workspace
-            .update(cx, |ws, cx| ws.items(cx).map(|i| i.item_id()).collect::<Vec<_>>())
-            .unwrap_or_default();
-        for id in item_ids {
-            if let Ok(close) = workspace.update_in(cx, |ws, window, cx| {
-                let pane = ws.active_pane().clone();
-                pane.update(cx, |pane, cx| pane.close_item_by_id(id, SaveIntent::Skip, window, cx))
-            }) {
-                let _ = close.await;
-            }
+        // Close the outgoing tabs as ONE batch: `close_items` removes every
+        // matching item in a single task. Awaiting each close in turn (the old
+        // `close_item_by_id` loop) spread the removals across frames, so tabs
+        // visibly vanished one by one; a single batched close collapses that to
+        // one repaint.
+        let close = workspace.update_in(cx, |ws, window, cx| {
+            let pane = ws.active_pane().clone();
+            pane.update(cx, |pane, cx| {
+                pane.close_items(window, cx, SaveIntent::Skip, &|_| true)
+            })
+        });
+        if let Ok(close) = close {
+            let _ = close.await;
         }
+
+        // Reopen the snapshot's tabs IN ORDER (order matters, so sequential).
+        // Reveal is suppressed, so these do not scroll the tree.
         for path in &layout.open_paths {
             if let Ok(open) = workspace.update_in(cx, |ws, window, cx| {
                 let mut options = OpenOptions::default();
@@ -108,12 +127,19 @@ pub(crate) fn apply_active_member_change(
                 let _ = open.await;
             }
         }
-        if let Some(active) = layout.active_path {
-            if let Ok(open) = workspace.update_in(cx, |ws, window, cx| {
-                ws.open_abs_path(active, OpenOptions::default(), window, cx)
-            }) {
-                let _ = open.await;
-            }
+
+        // Drop the suppression, then re-activate the previously-active file so
+        // the tree scrolls to it exactly once. With no active file, just clear
+        // the flag (nothing to reveal).
+        let final_open = workspace.update_in(cx, |ws, window, cx| {
+            ws.set_active_entry_reveal_suppressed(false);
+            layout
+                .active_path
+                .clone()
+                .map(|active| ws.open_abs_path(active, OpenOptions::default(), window, cx))
+        });
+        if let Ok(Some(open)) = final_open {
+            let _ = open.await;
         }
     });
     state.borrow_mut().apply_task = Some(task);
@@ -252,6 +278,33 @@ mod tests {
         let paths = open_paths(&workspace, cx);
         assert_eq!(paths.len(), 1, "B restores exactly its own tab: {paths:?}");
         assert!(paths[0].ends_with("b.txt"), "B restores b.txt: {paths:?}");
+    }
+
+    /// The swap suppresses the project-panel reveal while it closes/reopens
+    /// tabs; it MUST clear that suppression when done, or user-driven reveals
+    /// stay broken. Guards against a stuck flag (e.g. a cancelled apply task).
+    #[gpui::test]
+    async fn swap_clears_reveal_suppression_when_done(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/sol"), json!({ "a.txt": "", "b.txt": "" })).await;
+        let project = Project::test(fs.clone(), [path!("/sol").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let state = Rc::new(RefCell::new(MemberLayoutState::default()));
+
+        switch(&state, &workspace, cx, "sol", Some("A"));
+        open(&workspace, cx, path!("/sol/a.txt")).await;
+        switch(&state, &workspace, cx, "sol", Some("B"));
+        open(&workspace, cx, path!("/sol/b.txt")).await;
+        // Back to A: a real close+reopen swap runs.
+        switch(&state, &workspace, cx, "sol", Some("A"));
+
+        let suppressed = workspace.update(cx, |ws, _| ws.active_entry_reveal_suppressed());
+        assert!(
+            !suppressed,
+            "reveal suppression must be cleared once the swap settles"
+        );
     }
 
     #[gpui::test]
