@@ -146,9 +146,9 @@ A running `sawe` instance exposes an MCP server over a Unix socket so an agent c
 
 **Socket:** `~/.spk/sawe-dev/config/mcp.sock` for a `--debug` build, `~/.spk/sawe/config/mcp.sock` for release (NOT `~/.config/sawe/` — see `crates/paths`). Single-instance — one editor process at a time holds the socket; a second `sawe` invocation hands off CLI args via the existing socket and exits. Lock file is `…/config/mcp.lock`. (`script/run-mcp` prints the resolved socket path on launch.)
 
-**Tool catalog** (86 tools, JSON-RPC 2.0 over the socket — namespaces: `editor.*`, `windows.*`, `solutions.*`, `solution.git.*`, `catalog.*`, `solution_agent.*`, `workspace.*`, `project.*`, `diagnostics.*`):
+**Tool catalog** (87 tools, JSON-RPC 2.0 over the socket — namespaces: `editor.*`, `windows.*`, `solutions.*`, `solution.git.*`, `catalog.*`, `solution_agent.*`, `workspace.*`, `project.*`, `diagnostics.*`):
 - **Probe / control:** `editor.capabilities`, `editor.handle_cli_args`, `editor.{subscribe,unsubscribe,list_subscriptions}`, `editor.{get_operation,cancel_operation}`
-- **Solutions / catalog (the multi-project workspace abstraction):** `solutions.{list,get,create,rename,delete,open,close,find_for_path,add_member,add_empty_member,remove_member,reorder_members}`, `catalog.{list,add_project,remove_project,edit_project,refresh_cache,clear_cache}`
+- **Solutions / catalog (the multi-project workspace abstraction):** `solutions.{list,get,create,rename,delete,open,close,find_for_path,add_member,add_empty_member,remove_member,reorder_members,set_active_member}`, `catalog.{list,add_project,remove_project,edit_project,refresh_cache,clear_cache}`
 - **Solution-wide git (S-SOL-LOG / S-SOL-DSH):** `solution.git.{aggregated_log,status_dashboard,batch_fetch,batch_pull,checkout_pattern}` (the `commit_all` tool + solution-wide commit were removed — commit is per active project)
 - **Solution-scoped AI sessions:** `solution_agent.{list_sessions,get_session,create_session,send_message,cancel_turn,close_session,rename_session,restart_agent,authorize_tool_call,reset_context}`
 - **Windows:** `windows.{list,focus,close,dispatch_action,send_keystroke,send_text,click_at,click_id,hover_at,hover_id,dump_visual_structure}`

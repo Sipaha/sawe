@@ -67,6 +67,9 @@ pub fn register(cx: &mut App) {
         server.add_tool(ReorderMembersTool);
     });
     editor_mcp::register_tool(cx, |server| {
+        server.add_tool(SetActiveMemberTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
         server.add_tool(ListBuffersTool);
     });
     editor_mcp::register_tool(cx, |server| {
@@ -1832,6 +1835,93 @@ impl McpServerTool for ReorderMembersTool {
                 text: "reordered".to_string(),
             }],
             structured_content: ReorderMembersResult { ok: true },
+        })
+    }
+}
+
+// =====================================================================
+// solutions.set_active_member
+// =====================================================================
+
+/// Set the solution-wide active member (the selected project tab). Emits
+/// `ActiveMemberChanged`, which drives the per-member layout swap and the
+/// project-panel tree rebuild — the same path a project-tab click triggers.
+/// No-op if `catalog_id` is already the active member.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SetActiveMemberParams {
+    pub solution_id: String,
+    pub catalog_id: String,
+}
+
+impl<'de> Deserialize<'de> for SetActiveMemberParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            solution_id: String,
+            catalog_id: String,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            solution_id: inner.solution_id,
+            catalog_id: inner.catalog_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SetActiveMemberResult {
+    pub solution_id: String,
+    pub active_member: String,
+}
+
+#[derive(Clone)]
+pub struct SetActiveMemberTool;
+
+impl McpServerTool for SetActiveMemberTool {
+    type Input = SetActiveMemberParams;
+    type Output = SetActiveMemberResult;
+    const NAME: &'static str = "solutions.set_active_member";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.solution_id.is_empty(),
+            "invalid_params: solution_id is required"
+        );
+        anyhow::ensure!(
+            !input.catalog_id.is_empty(),
+            "invalid_params: catalog_id is required"
+        );
+        let (solution_id, catalog_id) = (input.solution_id.clone(), input.catalog_id.clone());
+        cx.update(|cx| -> Result<()> {
+            let store = SolutionStore::global(cx);
+            let sol = crate::SolutionId(input.solution_id);
+            let cat = crate::CatalogId(input.catalog_id);
+            // Guard against recording a bogus active member: the catalog must be
+            // an actual member of the solution (a non-member would leave the
+            // window pointing at a project with no worktree).
+            let is_member = store.read(cx).solutions().iter().find(|s| s.id == sol).is_some_and(
+                |s| s.members.iter().any(|m| m.catalog_id == cat),
+            );
+            anyhow::ensure!(
+                is_member,
+                "not_found: catalog_id is not a member of the solution"
+            );
+            store.update(cx, |s, cx| s.set_active_member(sol, cat, cx));
+            Ok(())
+        })?;
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: format!("active_member: {solution_id} -> {catalog_id}"),
+            }],
+            structured_content: SetActiveMemberResult {
+                solution_id,
+                active_member: catalog_id,
+            },
         })
     }
 }
