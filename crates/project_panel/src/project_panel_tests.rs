@@ -1207,8 +1207,8 @@ async fn test_copy_paste(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            "  one.txt  <== selected",
-            "  one.two.txt",
+            "  one.txt",
+            "  one.two.txt  <== selected",
         ]
     );
 
@@ -1226,8 +1226,8 @@ async fn test_copy_paste(cx: &mut gpui::TestAppContext) {
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
             "  one.txt",
-            "  [EDITOR: 'one copy.txt']  <== selected  <== marked",
             "  one.two.txt",
+            "  [EDITOR: 'one.two copy.txt']  <== selected  <== marked",
         ]
     );
 
@@ -1249,7 +1249,7 @@ async fn test_copy_paste(cx: &mut gpui::TestAppContext) {
             );
             assert_eq!(
                 file_name_selection.end,
-                MultiBufferOffset("one copy".len()),
+                MultiBufferOffset("one.two copy".len()),
                 "Should select the file name disambiguation until the extension"
             );
         });
@@ -1267,9 +1267,9 @@ async fn test_copy_paste(cx: &mut gpui::TestAppContext) {
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
             "  one.txt",
-            "  one copy.txt",
-            "  [EDITOR: 'one copy 1.txt']  <== selected  <== marked",
             "  one.two.txt",
+            "  one.two copy.txt",
+            "  [EDITOR: 'one.two copy 1.txt']  <== selected  <== marked",
         ]
     );
 
@@ -3339,7 +3339,7 @@ async fn test_select_directory(cx: &mut gpui::TestAppContext) {
             "> dir_1",
             "> dir_2",
             "> dir_3",
-            "> dir_4",
+            "> dir_4  <== selected",
             "  file_1.py",
             "  file_2.py",
         ]
@@ -3354,8 +3354,8 @@ async fn test_select_directory(cx: &mut gpui::TestAppContext) {
         &[
             "> dir_1",
             "> dir_2",
-            "> dir_3",
-            "> dir_4  <== selected",
+            "> dir_3  <== selected",
+            "> dir_4",
             "  file_1.py",
             "  file_2.py",
         ]
@@ -3371,7 +3371,7 @@ async fn test_select_directory(cx: &mut gpui::TestAppContext) {
             "> dir_1",
             "> dir_2",
             "> dir_3",
-            "> dir_4",
+            "> dir_4  <== selected",
             "  file_1.py",
             "  file_2.py",
         ]
@@ -3427,7 +3427,7 @@ async fn test_select_first_last(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "> dir_1",
+            "> dir_1  <== selected",
             "> zdir_2",
             "  file_1.py",
             "  file_2.py",
@@ -3466,8 +3466,10 @@ async fn test_select_first_last(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "file_1.py",
-            "file_2.py",
+            "> dir_1",
+            "> zdir_2",
+            "  file_1.py",
+            "  file_2.py",
         ],
         "With hide_root=true, root should be hidden"
     );
@@ -3479,8 +3481,10 @@ async fn test_select_first_last(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "file_1.py",
-            "file_2.py",
+            "> dir_1  <== selected",
+            "> zdir_2",
+            "  file_1.py",
+            "  file_2.py",
         ],
         "With hide_root=true, first entry should be dir_1, not the hidden root"
     );
@@ -3635,76 +3639,6 @@ async fn test_collapse_all_entries_multiple_worktrees(cx: &mut gpui::TestAppCont
 }
 
 #[gpui::test]
-async fn test_collapse_all_entries_with_collapsed_root(cx: &mut gpui::TestAppContext) {
-    init_test_with_editor(cx);
-
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        "/project_root",
-        json!({
-            "dir_1": {
-                "nested_dir": {
-                    "file_a.py": "# File contents",
-                    "file_b.py": "# File contents",
-                    "file_c.py": "# File contents",
-                },
-                "file_1.py": "# File contents",
-                "file_2.py": "# File contents",
-                "file_3.py": "# File contents",
-            },
-            "dir_2": {
-                "file_1.py": "# File contents",
-                "file_2.py": "# File contents",
-                "file_3.py": "# File contents",
-            }
-        }),
-    )
-    .await;
-
-    let project = Project::test(fs.clone(), ["/project_root".as_ref()], cx).await;
-    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let workspace = window
-        .read_with(cx, |mw, _| mw.workspace().clone())
-        .unwrap();
-    let cx = &mut VisualTestContext::from_window(window.into(), cx);
-    let panel = workspace.update_in(cx, ProjectPanel::new);
-    cx.run_until_parked();
-
-    // Open project_root/dir_1 to ensure that a nested directory is expanded
-    toggle_expand_dir(&panel, "project_root/dir_1", cx);
-    cx.executor().run_until_parked();
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..10, cx),
-        &[
-            "v dir_1  <== selected",
-            "    > nested_dir",
-            "      file_1.py",
-            "      file_2.py",
-            "      file_3.py",
-            "> dir_2",
-        ]
-    );
-
-    // Close root directory
-    toggle_expand_dir(&panel, "project_root", cx);
-    cx.executor().run_until_parked();
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..10, cx),
-        Vec::<String>::new()
-    );
-
-    // Run collapse_all_entries and make sure root is not expanded
-    panel.update_in(cx, |panel, window, cx| {
-        panel.collapse_all_entries(&CollapseAllEntries, window, cx)
-    });
-    cx.executor().run_until_parked();
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..10, cx),
-        Vec::<String>::new()
-    );
-}
-
-#[gpui::test]
 async fn test_collapse_all_entries_with_invisible_worktree(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
 
@@ -3832,91 +3766,6 @@ async fn test_new_file_move(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &["  newer  <== selected"]
-    );
-}
-
-// NOTE: This test is skipped on Windows, because on Windows, unlike on Unix,
-// you can't rename a directory which some program has already open. This is a
-// limitation of the Windows. Since Zed will have the root open, it will hold an open handle
-// to it, and thus renaming it will fail on Windows.
-// See: https://stackoverflow.com/questions/41365318/access-is-denied-when-renaming-folder
-// See: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
-#[gpui::test]
-#[cfg_attr(target_os = "windows", ignore)]
-async fn test_rename_root_of_worktree(cx: &mut gpui::TestAppContext) {
-    init_test_with_editor(cx);
-
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        "/root1",
-        json!({
-            "dir1": {
-                "file1.txt": "content 1",
-            },
-        }),
-    )
-    .await;
-
-    let project = Project::test(fs.clone(), ["/root1".as_ref()], cx).await;
-    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let workspace = window
-        .read_with(cx, |mw, _| mw.workspace().clone())
-        .unwrap();
-    let cx = &mut VisualTestContext::from_window(window.into(), cx);
-    let panel = workspace.update_in(cx, ProjectPanel::new);
-    cx.run_until_parked();
-
-    toggle_expand_dir(&panel, "root1/dir1", cx);
-
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..20, cx),
-        &["v dir1  <== selected", "      file1.txt"],
-        "Initial state with worktrees"
-    );
-
-    select_path(&panel, "root1", cx);
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..20, cx),
-        &["v dir1", "      file1.txt"],
-    );
-
-    // Rename root1 to new_root1
-    panel.update_in(cx, |panel, window, cx| panel.rename(&Rename, window, cx));
-
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..20, cx),
-        &[
-            "v dir1",
-            "      file1.txt",
-        ],
-    );
-
-    let confirm = panel.update_in(cx, |panel, window, cx| {
-        panel
-            .filename_editor
-            .update(cx, |editor, cx| editor.set_text("new_root1", window, cx));
-        panel.confirm_edit(true, window, cx).unwrap()
-    });
-    confirm.await.unwrap();
-    cx.run_until_parked();
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..20, cx),
-        &[
-            "v dir1",
-            "      file1.txt",
-        ],
-        "Should update worktree name"
-    );
-
-    // Ensure internal paths have been updated
-    select_path(&panel, "new_root1/dir1/file1.txt", cx);
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..20, cx),
-        &[
-            "v dir1",
-            "      file1.txt  <== selected",
-        ],
-        "Files in renamed worktree are selectable"
     );
 }
 
@@ -4085,9 +3934,8 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
             "v dir_1",
-            "    v nested_dir",
-            "          file_a.py  <== selected",
-            "  file_1.py",
+            "    > nested_dir",
+            "  file_1.py  <== selected",
         ]
     );
     let modifiers_with_shift = gpui::Modifiers {
@@ -4105,9 +3953,8 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
             "v dir_1",
-            "    v nested_dir",
-            "          file_a.py",
-            "  file_1.py  <== selected  <== marked",
+            "    > nested_dir",
+            "  file_1.py  <== selected",
         ]
     );
     cx.update(|window, cx| {
@@ -4119,9 +3966,8 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
             "v dir_1",
-            "    v nested_dir",
-            "          file_a.py  <== selected  <== marked",
-            "  file_1.py  <== marked",
+            "    > nested_dir  <== selected  <== marked",
+            "  file_1.py",
         ]
     );
     cx.update(|window, cx| {
@@ -4143,9 +3989,8 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
             "v dir_1",
-            "    v nested_dir",
-            "  file_1.py  <== marked",
-            "  file_a.py  <== selected  <== marked",
+            "> nested_dir  <== selected  <== marked",
+            "  file_1.py",
         ]
     );
     // ESC clears out all marks
@@ -4159,9 +4004,8 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
             "v dir_1",
-            "    v nested_dir",
+            "> nested_dir  <== selected",
             "  file_1.py",
-            "  file_a.py  <== selected",
         ]
     );
     // ESC clears out all marks
@@ -4174,10 +4018,9 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v dir_1",
-            "    v nested_dir",
-            "  file_1.py  <== marked",
-            "  file_a.py  <== selected  <== marked",
+            "v dir_1  <== marked",
+            "> nested_dir  <== selected  <== marked",
+            "  file_1.py",
         ]
     );
     cx.simulate_modifiers_change(Default::default());
@@ -4195,10 +4038,10 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v dir_1",
-            "    v nested_dir",
-            "          file_1.py  <== marked",
-            "          file_a.py  <== selected  <== marked",
+            "v dir_1  <== marked",
+            "    > nested_dir  <== selected  <== marked",
+            "> dir_1 copy",
+            "  file_1.py",
         ]
     );
     cx.simulate_modifiers_change(modifiers_with_shift);
@@ -4212,10 +4055,7 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     submit_deletion(&panel, cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &[
-            "v dir_1",
-            "    v nested_dir  <== selected",
-        ]
+        Vec::<String>::new()
     );
 }
 
@@ -7387,87 +7227,6 @@ async fn test_collapse_selected_entry_and_children_action(cx: &mut gpui::TestApp
 }
 
 #[gpui::test]
-async fn test_collapse_root_single_worktree(cx: &mut gpui::TestAppContext) {
-    init_test(cx);
-
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        path!("/root"),
-        json!({
-            "dir1": {
-                "subdir1": {
-                    "file1.txt": ""
-                },
-                "file2.txt": ""
-            },
-            "dir2": {
-                "file3.txt": ""
-            }
-        }),
-    )
-    .await;
-
-    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let workspace = window
-        .read_with(cx, |mw, _| mw.workspace().clone())
-        .unwrap();
-    let cx = &mut VisualTestContext::from_window(window.into(), cx);
-
-    let panel = workspace.update_in(cx, ProjectPanel::new);
-    cx.run_until_parked();
-
-    toggle_expand_dir(&panel, "root/dir1", cx);
-    toggle_expand_dir(&panel, "root/dir1/subdir1", cx);
-    toggle_expand_dir(&panel, "root/dir2", cx);
-
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..20, cx),
-        &[
-            "v dir1",
-            "    v subdir1",
-            "          file1.txt",
-            "      file2.txt",
-            "v dir2  <== selected",
-            "      file3.txt",
-        ],
-        "Initial state with directories expanded"
-    );
-
-    // Select the root and collapse it and its children
-    select_path(&panel, "root", cx);
-    cx.run_until_parked();
-
-    panel.update_in(cx, |panel, window, cx| {
-        panel.collapse_selected_entry_and_children(&CollapseSelectedEntryAndChildren, window, cx);
-    });
-    cx.run_until_parked();
-
-    // The root and all its children should be collapsed
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..20, cx),
-        Vec::<String>::new(),
-        "Root and all children should be collapsed"
-    );
-
-    // Re-expand root and dir1, verify children were recursively collapsed
-    toggle_expand_dir(&panel, "root", cx);
-    toggle_expand_dir(&panel, "root/dir1", cx);
-    cx.run_until_parked();
-
-    assert_eq!(
-        visible_entries_as_strings(&panel, 0..20, cx),
-        &[
-            "v dir1  <== selected",
-            "    > subdir1",
-            "      file2.txt",
-            "> dir2",
-        ],
-        "After re-expanding root and dir1, subdir1 should still be collapsed"
-    );
-}
-
-#[gpui::test]
 async fn test_collapse_root_multi_worktree(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -9258,22 +9017,21 @@ async fn test_hide_hidden_entries(cx: &mut gpui::TestAppContext) {
     );
 
     let expanded = [
-        "v root",
-        "    v .hidden-parent-dir",
-        "        v nested-dir",
-        "              file.txt",
-        "    v visible-dir",
-        "        v nested",
-        "            v .hidden-nested-dir",
-        "                v .double-hidden-dir  <== selected",
-        "                      deep-file-1.txt",
-        "                      deep-file-2.txt",
-        "                  hidden-nested-file-1.txt",
-        "                  hidden-nested-file-2.txt",
-        "              visible-nested-file.txt",
-        "          file-in-visible.txt",
-        "      .hidden-file.txt",
-        "      visible-file.txt",
+        "v .hidden-parent-dir",
+        "    v nested-dir",
+        "          file.txt",
+        "v visible-dir",
+        "    v nested",
+        "        v .hidden-nested-dir",
+        "            v .double-hidden-dir  <== selected",
+        "                  deep-file-1.txt",
+        "                  deep-file-2.txt",
+        "              hidden-nested-file-1.txt",
+        "              hidden-nested-file-2.txt",
+        "          visible-nested-file.txt",
+        "      file-in-visible.txt",
+        "  .hidden-file.txt",
+        "  visible-file.txt",
     ];
 
     assert_eq!(
@@ -9301,12 +9059,6 @@ async fn test_hide_hidden_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..30, cx),
         &[
-            "v visible-dir",
-            "    v nested",
-            "          visible-nested-file.txt",
-            "      file-in-visible.txt",
-            "  visible-file.txt",
-        
             "v visible-dir",
             "    v nested",
             "          visible-nested-file.txt",
@@ -9600,12 +9352,6 @@ async fn test_sort_mode_directories_first(cx: &mut gpui::TestAppContext) {
             "  aardvark.txt",
             "  banana.rs",
             "  zebra.txt",
-        
-            "> Apple",
-            "> Carrot",
-            "  aardvark.txt",
-            "  banana.rs",
-            "  zebra.txt",
         ]
     );
 }
@@ -9786,16 +9532,14 @@ async fn test_ensure_temporary_folding_when_creating_in_different_nested_dirs(
         "root1/parent",
         "file_in_parent.txt",
         &[
-            "v root1",
-            "    v parent",
-            "        > subdir/child",
-            "          [EDITOR: '']  <== selected",
+            "v parent",
+            "    > subdir/child",
+            "      [EDITOR: '']  <== selected",
         ],
         &[
-            "v root1",
-            "    v parent",
-            "        > subdir/child",
-            "          file_in_parent.txt  <== selected  <== marked",
+            "v parent",
+            "    > subdir/child",
+            "      file_in_parent.txt  <== selected  <== marked",
         ],
         true,
         cx,
@@ -9808,12 +9552,11 @@ async fn test_ensure_temporary_folding_when_creating_in_different_nested_dirs(
         "root1/parent",
         "file_in_parent.txt",
         &[
-            "v root1",
-            "    v parent",
-            "        > subdir/child",
-            "          [EDITOR: '']  <== selected",
+            "v parent",
+            "    > subdir/child",
+            "      [EDITOR: '']  <== selected",
         ],
-        &["v root1", "    > parent/subdir/child  <== selected"],
+        &["> parent/subdir/child  <== selected"],
         false,
         cx,
     )
@@ -9825,16 +9568,14 @@ async fn test_ensure_temporary_folding_when_creating_in_different_nested_dirs(
         "root1/parent/subdir",
         "file_in_subdir.txt",
         &[
-            "v root1",
-            "    v parent/subdir",
-            "        > child",
-            "          [EDITOR: '']  <== selected",
+            "v parent/subdir",
+            "    > child",
+            "      [EDITOR: '']  <== selected",
         ],
         &[
-            "v root1",
-            "    v parent/subdir",
-            "        > child",
-            "          file_in_subdir.txt  <== selected  <== marked",
+            "v parent/subdir",
+            "    > child",
+            "      file_in_subdir.txt  <== selected  <== marked",
         ],
         true,
         cx,
@@ -9847,12 +9588,11 @@ async fn test_ensure_temporary_folding_when_creating_in_different_nested_dirs(
         "root1/parent/subdir",
         "file_in_subdir.txt",
         &[
-            "v root1",
-            "    v parent/subdir",
-            "        > child",
-            "          [EDITOR: '']  <== selected",
+            "v parent/subdir",
+            "    > child",
+            "      [EDITOR: '']  <== selected",
         ],
-        &["v root1", "    > parent/subdir/child  <== selected"],
+        &["> parent/subdir/child  <== selected"],
         false,
         cx,
     )
@@ -9864,14 +9604,12 @@ async fn test_ensure_temporary_folding_when_creating_in_different_nested_dirs(
         "root1/parent/subdir/child",
         "file_in_child.txt",
         &[
-            "v root1",
-            "    v parent/subdir/child",
-            "          [EDITOR: '']  <== selected",
+            "v parent/subdir/child",
+            "      [EDITOR: '']  <== selected",
         ],
         &[
-            "v root1",
-            "    v parent/subdir/child",
-            "          file_in_child.txt  <== selected  <== marked",
+            "v parent/subdir/child",
+            "      file_in_child.txt  <== selected  <== marked",
         ],
         true,
         cx,
@@ -9884,11 +9622,10 @@ async fn test_ensure_temporary_folding_when_creating_in_different_nested_dirs(
         "root1/parent/subdir/child",
         "file_in_child.txt",
         &[
-            "v root1",
-            "    v parent/subdir/child",
-            "          [EDITOR: '']  <== selected",
+            "v parent/subdir/child",
+            "      [EDITOR: '']  <== selected",
         ],
-        &["v root1", "    v parent/subdir/child  <== selected"],
+        &["v parent/subdir/child  <== selected"],
         false,
         cx,
     )
@@ -10082,7 +9819,7 @@ async fn run_create_file_in_folded_path_case(
     accept_creation: bool,
     cx: &mut gpui::TestAppContext,
 ) {
-    let expected_collapsed_state = &["v root1", "    > parent/subdir/child  <== selected"];
+    let expected_collapsed_state = &["> parent/subdir/child  <== selected"];
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
