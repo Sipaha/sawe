@@ -142,11 +142,10 @@ async fn test_opening_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.rs  <== selected  <== marked",
-            "          second.rs",
-            "          third.rs"
+            "v test",
+            "      first.rs  <== selected  <== marked",
+            "      second.rs",
+            "      third.rs",
         ]
     );
     ensure_single_file_is_opened(&workspace, "test/first.rs", cx);
@@ -157,11 +156,10 @@ async fn test_opening_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.rs",
-            "          second.rs  <== selected  <== marked",
-            "          third.rs"
+            "v test",
+            "      first.rs",
+            "      second.rs  <== selected  <== marked",
+            "      third.rs",
         ]
     );
     ensure_single_file_is_opened(&workspace, "test/second.rs", cx);
@@ -1082,7 +1080,7 @@ async fn test_adding_directory_via_file(cx: &mut gpui::TestAppContext) {
     select_path(&panel, "root1", cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root1  <== selected", "    > .git", "      .dockerignore",]
+        &["> .git", "  .dockerignore"]
     );
 
     // Add a file with the root folder selected. The filename editor is placed
@@ -1095,10 +1093,9 @@ async fn test_adding_directory_via_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root1",
-            "    > .git",
-            "      [EDITOR: '']  <== selected",
-            "      .dockerignore",
+            "> .git",
+            "  [EDITOR: '']  <== selected",
+            "  .dockerignore",
         ]
     );
 
@@ -1113,10 +1110,9 @@ async fn test_adding_directory_via_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root1",
-            "    > .git",
-            "      [PROCESSING: 'new_dir']  <== selected",
-            "      .dockerignore",
+            "> .git",
+            "  [PROCESSING: 'new_dir']  <== selected",
+            "  .dockerignore",
         ]
     );
 
@@ -1125,10 +1121,9 @@ async fn test_adding_directory_via_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root1",
-            "    > .git",
-            "    v new_dir  <== selected",
-            "      .dockerignore",
+            "> .git",
+            "v new_dir  <== selected",
+            "  .dockerignore",
         ]
     );
 
@@ -1147,11 +1142,10 @@ async fn test_adding_directory_via_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root1",
-            "    > .git",
-            "    v new dir 2  <== selected",
-            "    v new_dir",
-            "      .dockerignore",
+            "> .git",
+            "v new dir 2  <== selected",
+            "v new_dir",
+            "  .dockerignore",
         ]
     );
 
@@ -1172,12 +1166,11 @@ async fn test_adding_directory_via_file(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             visible_entries_as_strings(&panel, 0..10, cx),
             &[
-                "v root1",
-                "    > .git",
-                "    v new dir 2",
-                "    v new_dir",
-                "    v new_dir_3  <== selected",
-                "      .dockerignore",
+                "> .git",
+                "v new dir 2",
+                "v new_dir",
+                "v new_dir_3  <== selected",
+                "  .dockerignore",
             ]
         );
     }
@@ -1214,10 +1207,8 @@ async fn test_copy_paste(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            //
-            "v root1",
-            "      one.txt  <== selected",
-            "      one.two.txt",
+            "  one.txt  <== selected",
+            "  one.two.txt",
         ]
     );
 
@@ -1234,11 +1225,9 @@ async fn test_copy_paste(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            //
-            "v root1",
-            "      one.txt",
-            "      [EDITOR: 'one copy.txt']  <== selected  <== marked",
-            "      one.two.txt",
+            "  one.txt",
+            "  [EDITOR: 'one copy.txt']  <== selected  <== marked",
+            "  one.two.txt",
         ]
     );
 
@@ -1277,12 +1266,10 @@ async fn test_copy_paste(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            //
-            "v root1",
-            "      one.txt",
-            "      one copy.txt",
-            "      [EDITOR: 'one copy 1.txt']  <== selected  <== marked",
-            "      one.two.txt",
+            "  one.txt",
+            "  one copy.txt",
+            "  [EDITOR: 'one copy 1.txt']  <== selected  <== marked",
+            "  one.two.txt",
         ]
     );
 
@@ -1322,11 +1309,10 @@ async fn test_cut_paste(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            "v root",
-            "    > a",
-            "    > b",
-            "      one.txt  <== marked",
-            "      two.txt  <== selected  <== marked",
+            "> a",
+            "> b",
+            "  one.txt  <== marked",
+            "  two.txt  <== selected  <== marked",
         ]
     );
 
@@ -1345,11 +1331,10 @@ async fn test_cut_paste(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            "v root",
-            "    v a",
-            "          one.txt  <== marked",
-            "          two.txt  <== selected  <== marked",
-            "    > b",
+            "v a",
+            "      one.txt  <== marked",
+            "      two.txt  <== selected  <== marked",
+            "> b",
         ],
         "Cut entries should be moved on first paste."
     );
@@ -1369,13 +1354,12 @@ async fn test_cut_paste(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            "v root",
-            "    v a",
-            "          one.txt",
-            "          two.txt",
-            "    v b",
-            "          one.txt",
-            "          two.txt  <== selected",
+            "v a",
+            "      one.txt",
+            "      two.txt",
+            "v b",
+            "      one.txt",
+            "      two.txt  <== selected",
         ],
         "Cut entries should only be copied for the second paste!"
     );
@@ -1682,17 +1666,15 @@ async fn test_copy_paste_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            //
-            "v root",
-            "    > a",
-            "    v b",
-            "        v a",
-            "            v inner_dir  <== selected",
-            "                  four.txt",
-            "                  three.txt",
-            "              one.txt",
-            "              two.txt",
-            "    > d.1.20",
+            "> a",
+            "v b",
+            "    v a",
+            "        v inner_dir  <== selected",
+            "              four.txt",
+            "              three.txt",
+            "          one.txt",
+            "          two.txt",
+            "> d.1.20",
         ]
     );
 
@@ -1704,18 +1686,16 @@ async fn test_copy_paste_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            //
-            "v root",
-            "    > a",
-            "    > [EDITOR: 'a copy']  <== selected",
-            "    v b",
-            "        v a",
-            "            v inner_dir",
-            "                  four.txt",
-            "                  three.txt",
-            "              one.txt",
-            "              two.txt",
-            "    > d.1.20",
+            "> a",
+            "> [EDITOR: 'a copy']  <== selected",
+            "v b",
+            "    v a",
+            "        v inner_dir",
+            "              four.txt",
+            "              three.txt",
+            "          one.txt",
+            "          two.txt",
+            "> d.1.20",
         ]
     );
 
@@ -1728,18 +1708,16 @@ async fn test_copy_paste_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            //
-            "v root",
-            "    > a",
-            "    > [PROCESSING: 'c']  <== selected",
-            "    v b",
-            "        v a",
-            "            v inner_dir",
-            "                  four.txt",
-            "                  three.txt",
-            "              one.txt",
-            "              two.txt",
-            "    > d.1.20",
+            "> a",
+            "> [PROCESSING: 'c']  <== selected",
+            "v b",
+            "    v a",
+            "        v inner_dir",
+            "              four.txt",
+            "              three.txt",
+            "          one.txt",
+            "          two.txt",
+            "> d.1.20",
         ]
     );
 
@@ -1752,22 +1730,20 @@ async fn test_copy_paste_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            //
-            "v root",
-            "    > a",
-            "    v b",
-            "        v a",
-            "            v inner_dir",
-            "                  four.txt",
-            "                  three.txt",
-            "              one.txt",
-            "              two.txt",
-            "    v c",
-            "        > a  <== selected",
-            "        > inner_dir",
+            "> a",
+            "v b",
+            "    v a",
+            "        v inner_dir",
+            "              four.txt",
+            "              three.txt",
             "          one.txt",
             "          two.txt",
-            "    > d.1.20",
+            "v c",
+            "    > a  <== selected",
+            "    > inner_dir",
+            "      one.txt",
+            "      two.txt",
+            "> d.1.20",
         ]
     );
 
@@ -1780,24 +1756,22 @@ async fn test_copy_paste_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            //
-            "v root",
-            "    > a",
-            "    v b",
-            "        v a",
-            "            v inner_dir",
-            "                  four.txt",
-            "                  three.txt",
-            "              one.txt",
-            "              two.txt",
-            "    v c",
-            "        > a",
-            "        > inner_dir",
+            "> a",
+            "v b",
+            "    v a",
+            "        v inner_dir",
+            "              four.txt",
+            "              three.txt",
             "          one.txt",
             "          two.txt",
-            "    v d.1.20",
-            "          default.conf",
-            "    > [EDITOR: 'd.1.20 copy']  <== selected",
+            "v c",
+            "    > a",
+            "    > inner_dir",
+            "      one.txt",
+            "      two.txt",
+            "v d.1.20",
+            "      default.conf",
+            "> [EDITOR: 'd.1.20 copy']  <== selected",
         ],
         "Dotted directory names should not be split at the dot when disambiguating"
     );
@@ -1844,13 +1818,12 @@ async fn test_copy_paste_directory_with_sibling_file(cx: &mut gpui::TestAppConte
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v test",
-            "    v dir1  <== marked",
-            "          a.txt",
-            "          b.txt",
-            "    > dir2",
-            "      c.txt  <== selected  <== marked",
-            "      d.txt",
+            "v dir1  <== marked",
+            "      a.txt",
+            "      b.txt",
+            "> dir2",
+            "  c.txt  <== selected  <== marked",
+            "  d.txt",
         ],
         "Initial state before copying dir1 and c.txt"
     );
@@ -1869,17 +1842,16 @@ async fn test_copy_paste_directory_with_sibling_file(cx: &mut gpui::TestAppConte
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v test",
-            "    v dir1  <== marked",
+            "v dir1  <== marked",
+            "      a.txt",
+            "      b.txt",
+            "v dir2",
+            "    v dir1  <== selected",
             "          a.txt",
             "          b.txt",
-            "    v dir2",
-            "        v dir1  <== selected",
-            "              a.txt",
-            "              b.txt",
-            "          c.txt",
-            "      c.txt  <== marked",
-            "      d.txt",
+            "      c.txt",
+            "  c.txt  <== marked",
+            "  d.txt",
         ],
         "Should copy dir1 as well as c.txt into dir2"
     );
@@ -1894,19 +1866,18 @@ async fn test_copy_paste_directory_with_sibling_file(cx: &mut gpui::TestAppConte
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v test",
-            "    v dir1  <== marked",
+            "v dir1  <== marked",
+            "      a.txt",
+            "      b.txt",
+            "v dir2",
+            "    v dir1",
             "          a.txt",
             "          b.txt",
-            "    v dir2",
-            "        v dir1",
-            "              a.txt",
-            "              b.txt",
-            "        > dir1 copy  <== selected",
-            "          c.txt",
-            "          c copy.txt",
-            "      c.txt  <== marked",
-            "      d.txt",
+            "    > dir1 copy  <== selected",
+            "      c.txt",
+            "      c copy.txt",
+            "  c.txt  <== marked",
+            "  d.txt",
         ],
         "Should copy dir1 as well as c.txt into dir2 and disambiguate them without opening the rename editor"
     );
@@ -1954,13 +1925,12 @@ async fn test_copy_paste_nested_and_root_entries(cx: &mut gpui::TestAppContext) 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v test",
-            "    v dir1  <== marked",
-            "          a.txt  <== marked",
-            "          b.txt",
-            "    > dir2",
-            "      c.txt  <== selected  <== marked",
-            "      d.txt",
+            "v dir1  <== marked",
+            "      a.txt  <== marked",
+            "      b.txt",
+            "> dir2",
+            "  c.txt  <== selected  <== marked",
+            "  d.txt",
         ],
         "Initial state before copying a.txt, dir1 and c.txt"
     );
@@ -1979,17 +1949,16 @@ async fn test_copy_paste_nested_and_root_entries(cx: &mut gpui::TestAppContext) 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v test",
-            "    v dir1  <== marked",
-            "          a.txt  <== marked",
+            "v dir1  <== marked",
+            "      a.txt  <== marked",
+            "      b.txt",
+            "v dir2",
+            "    v dir1  <== selected",
+            "          a.txt",
             "          b.txt",
-            "    v dir2",
-            "        v dir1  <== selected",
-            "              a.txt",
-            "              b.txt",
-            "          c.txt",
-            "      c.txt  <== marked",
-            "      d.txt",
+            "      c.txt",
+            "  c.txt  <== marked",
+            "  d.txt",
         ],
         "Should copy dir1 and c.txt into dir2. a.txt is already present in copied dir1."
     );
@@ -2047,9 +2016,8 @@ async fn test_paste_external_paths(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            "v root",
-            "    v subdir",
-            "          new_file.rs  <== selected",
+            "v subdir",
+            "      new_file.rs  <== selected",
         ],
     );
 }
@@ -2139,11 +2107,10 @@ async fn test_remove_opened_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.rs  <== selected  <== marked",
-            "          second.rs",
-            "          third.rs"
+            "v test",
+            "      first.rs  <== selected  <== marked",
+            "      second.rs",
+            "      third.rs",
         ]
     );
     ensure_single_file_is_opened(&workspace, "test/first.rs", cx);
@@ -2152,10 +2119,9 @@ async fn test_remove_opened_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          second.rs  <== selected",
-            "          third.rs"
+            "v test",
+            "      second.rs  <== selected",
+            "      third.rs",
         ],
         "Project panel should have no deleted file, no other file is selected in it"
     );
@@ -2166,10 +2132,9 @@ async fn test_remove_opened_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          second.rs  <== selected  <== marked",
-            "          third.rs"
+            "v test",
+            "      second.rs  <== selected  <== marked",
+            "      third.rs",
         ]
     );
     ensure_single_file_is_opened(&workspace, "test/second.rs", cx);
@@ -2194,7 +2159,7 @@ async fn test_remove_opened_file(cx: &mut gpui::TestAppContext) {
     submit_deletion_skipping_prompt(&panel, cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v src", "    v test", "          third.rs  <== selected"],
+        &["v test", "      third.rs  <== selected"],
         "Project panel should have no deleted file, with one last file remaining"
     );
     ensure_no_open_items_and_panes(&workspace, cx);
@@ -2496,9 +2461,7 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src  <== selected",
-            "    > test"
+            "> test",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -2512,10 +2475,8 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src",
-            "    > [EDITOR: '']  <== selected",
-            "    > test"
+            "> [EDITOR: '']  <== selected",
+            "> test",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -2539,9 +2500,7 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src  <== selected",
-            "    > test"
+            "> test",
         ],
         "File list should be unchanged after failed folder create confirmation"
     );
@@ -2552,9 +2511,7 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src",
-            "    > test  <== selected"
+            "> test  <== selected",
         ]
     );
     panel.update_in(cx, |panel, window, cx| panel.new_file(&NewFile, window, cx));
@@ -2565,12 +2522,11 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          [EDITOR: '']  <== selected",
-            "          first.rs",
-            "          second.rs",
-            "          third.rs"
+            "v test",
+            "      [EDITOR: '']  <== selected",
+            "      first.rs",
+            "      second.rs",
+            "      third.rs",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -2594,11 +2550,10 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test  <== selected",
-            "          first.rs",
-            "          second.rs",
-            "          third.rs"
+            "v test  <== selected",
+            "      first.rs",
+            "      second.rs",
+            "      third.rs",
         ],
         "File list should be unchanged after failed file create confirmation"
     );
@@ -2609,11 +2564,10 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.rs  <== selected",
-            "          second.rs",
-            "          third.rs"
+            "v test",
+            "      first.rs  <== selected",
+            "      second.rs",
+            "      third.rs",
         ],
     );
     panel.update_in(cx, |panel, window, cx| panel.rename(&Rename, window, cx));
@@ -2624,11 +2578,10 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          [EDITOR: 'first.rs']  <== selected",
-            "          second.rs",
-            "          third.rs"
+            "v test",
+            "      [EDITOR: 'first.rs']  <== selected",
+            "      second.rs",
+            "      third.rs",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -2652,11 +2605,10 @@ async fn test_create_duplicate_items(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.rs  <== selected",
-            "          second.rs",
-            "          third.rs"
+            "v test",
+            "      first.rs  <== selected",
+            "      second.rs",
+            "      third.rs",
         ],
         "File list should be unchanged after failed rename confirmation"
     );
@@ -2702,9 +2654,7 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src  <== selected",
-            "    > test"
+            "> test",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -2718,10 +2668,8 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src",
-            "    > [EDITOR: '']  <== selected",
-            "    > test"
+            "> [EDITOR: '']  <== selected",
+            "> test",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -2745,9 +2693,7 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src  <== selected",
-            "    > test"
+            "> test",
         ],
         "File list should be unchanged after failed folder create confirmation"
     );
@@ -2758,9 +2704,7 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src",
-            "    > test  <== selected"
+            "> test  <== selected",
         ]
     );
     panel.update_in(cx, |panel, window, cx| panel.new_file(&NewFile, window, cx));
@@ -2771,12 +2715,11 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          [EDITOR: '']  <== selected",
-            "          first.txt",
-            "          second.txt",
-            "          third.txt"
+            "v test",
+            "      [EDITOR: '']  <== selected",
+            "      first.txt",
+            "      second.txt",
+            "      third.txt",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -2800,11 +2743,10 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test  <== selected",
-            "          first.txt",
-            "          second.txt",
-            "          third.txt"
+            "v test  <== selected",
+            "      first.txt",
+            "      second.txt",
+            "      third.txt",
         ],
         "File list should be unchanged after failed file create confirmation"
     );
@@ -2815,11 +2757,10 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.txt  <== selected",
-            "          second.txt",
-            "          third.txt"
+            "v test",
+            "      first.txt  <== selected",
+            "      second.txt",
+            "      third.txt",
         ],
     );
     panel.update_in(cx, |panel, window, cx| panel.rename(&Rename, window, cx));
@@ -2830,11 +2771,10 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          [EDITOR: 'first.txt']  <== selected",
-            "          second.txt",
-            "          third.txt"
+            "v test",
+            "      [EDITOR: 'first.txt']  <== selected",
+            "      second.txt",
+            "      third.txt",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -2858,11 +2798,10 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.txt  <== selected",
-            "          second.txt",
-            "          third.txt"
+            "v test",
+            "      first.txt  <== selected",
+            "      second.txt",
+            "      third.txt",
         ],
         "File list should be unchanged after failed rename confirmation"
     );
@@ -2877,12 +2816,11 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.txt",
-            "          [EDITOR: 'first copy.txt']  <== selected  <== marked",
-            "          second.txt",
-            "          third.txt"
+            "v test",
+            "      first.txt",
+            "      [EDITOR: 'first copy.txt']  <== selected  <== marked",
+            "      second.txt",
+            "      third.txt",
         ],
     );
 
@@ -2898,12 +2836,11 @@ async fn test_create_duplicate_items_and_check_history(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          first.txt",
-            "          fourth.txt  <== selected",
-            "          second.txt",
-            "          third.txt"
+            "v test",
+            "      first.txt",
+            "      fourth.txt  <== selected",
+            "      second.txt",
+            "      third.txt",
         ],
         "File list should be different after rename confirmation"
     );
@@ -2968,9 +2905,7 @@ async fn test_rename_item_and_check_history(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src  <== selected",
-            "    > test"
+            "> test",
         ]
     );
 
@@ -2980,9 +2915,7 @@ async fn test_rename_item_and_check_history(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src",
-            "    > test  <== selected"
+            "> test  <== selected",
         ]
     );
     panel.update_in(cx, |panel, window, cx| panel.new_file(&NewFile, window, cx));
@@ -3001,11 +2934,10 @@ async fn test_rename_item_and_check_history(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          [EDITOR: 'first.txt']  <== selected  <== marked",
-            "          second.txt",
-            "          third.txt"
+            "v test",
+            "      [EDITOR: 'first.txt']  <== selected  <== marked",
+            "      second.txt",
+            "      third.txt",
         ],
     );
 
@@ -3021,11 +2953,10 @@ async fn test_rename_item_and_check_history(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v src",
-            "    v test",
-            "          fourth.txt  <== selected",
-            "          second.txt",
-            "          third.txt"
+            "v test",
+            "      fourth.txt  <== selected",
+            "      second.txt",
+            "      third.txt",
         ],
         "File list should be different after rename confirmation"
     );
@@ -3390,13 +3321,12 @@ async fn test_select_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    > dir_1  <== selected",
-            "    > dir_2",
-            "    > dir_3",
-            "    > dir_4",
-            "      file_1.py",
-            "      file_2.py",
+            "> dir_1  <== selected",
+            "> dir_2",
+            "> dir_3",
+            "> dir_4",
+            "  file_1.py",
+            "  file_2.py",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -3406,13 +3336,12 @@ async fn test_select_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root  <== selected",
-            "    > dir_1",
-            "    > dir_2",
-            "    > dir_3",
-            "    > dir_4",
-            "      file_1.py",
-            "      file_2.py",
+            "> dir_1",
+            "> dir_2",
+            "> dir_3",
+            "> dir_4",
+            "  file_1.py",
+            "  file_2.py",
         ]
     );
 
@@ -3423,13 +3352,12 @@ async fn test_select_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    > dir_1",
-            "    > dir_2",
-            "    > dir_3",
-            "    > dir_4  <== selected",
-            "      file_1.py",
-            "      file_2.py",
+            "> dir_1",
+            "> dir_2",
+            "> dir_3",
+            "> dir_4  <== selected",
+            "  file_1.py",
+            "  file_2.py",
         ]
     );
 
@@ -3440,13 +3368,12 @@ async fn test_select_directory(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root  <== selected",
-            "    > dir_1",
-            "    > dir_2",
-            "    > dir_3",
-            "    > dir_4",
-            "      file_1.py",
-            "      file_2.py",
+            "> dir_1",
+            "> dir_2",
+            "> dir_3",
+            "> dir_4",
+            "  file_1.py",
+            "  file_2.py",
         ]
     );
 }
@@ -3487,11 +3414,10 @@ async fn test_select_first_last(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    > dir_1",
-            "    > zdir_2",
-            "      file_1.py",
-            "      file_2.py",
+            "> dir_1",
+            "> zdir_2",
+            "  file_1.py",
+            "  file_2.py",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -3501,11 +3427,10 @@ async fn test_select_first_last(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root  <== selected",
-            "    > dir_1",
-            "    > zdir_2",
-            "      file_1.py",
-            "      file_2.py",
+            "> dir_1",
+            "> zdir_2",
+            "  file_1.py",
+            "  file_2.py",
         ]
     );
 
@@ -3516,11 +3441,10 @@ async fn test_select_first_last(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    > dir_1",
-            "    > zdir_2",
-            "      file_1.py",
-            "      file_2.py  <== selected",
+            "> dir_1",
+            "> zdir_2",
+            "  file_1.py",
+            "  file_2.py  <== selected",
         ]
     );
 
@@ -3542,10 +3466,8 @@ async fn test_select_first_last(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "> dir_1",
-            "> zdir_2",
-            "  file_1.py",
-            "  file_2.py",
+            "file_1.py",
+            "file_2.py",
         ],
         "With hide_root=true, root should be hidden"
     );
@@ -3557,10 +3479,8 @@ async fn test_select_first_last(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "> dir_1  <== selected",
-            "> zdir_2",
-            "  file_1.py",
-            "  file_2.py",
+            "file_1.py",
+            "file_2.py",
         ],
         "With hide_root=true, first entry should be dir_1, not the hidden root"
     );
@@ -3604,10 +3524,9 @@ async fn test_dir_toggle_collapse(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        > nested_dir  <== selected",
-            "      file_1.py",
+            "v dir_1",
+            "    > nested_dir  <== selected",
+            "  file_1.py",
         ]
     );
 }
@@ -3654,7 +3573,7 @@ async fn test_collapse_all_entries(cx: &mut gpui::TestAppContext) {
     cx.executor().run_until_parked();
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v project_root", "    > dir_1", "    > dir_2",]
+        &["> dir_1", "> dir_2"]
     );
 
     // Open dir_1 and make sure nested_dir was collapsed when running collapse_all_entries
@@ -3663,13 +3582,12 @@ async fn test_collapse_all_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1  <== selected",
-            "        > nested_dir",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    > dir_2",
+            "v dir_1  <== selected",
+            "    > nested_dir",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "> dir_2",
         ]
     );
 }
@@ -3758,13 +3676,12 @@ async fn test_collapse_all_entries_with_collapsed_root(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1  <== selected",
-            "        > nested_dir",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    > dir_2",
+            "v dir_1  <== selected",
+            "    > nested_dir",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "> dir_2",
         ]
     );
 
@@ -3773,7 +3690,7 @@ async fn test_collapse_all_entries_with_collapsed_root(cx: &mut gpui::TestAppCon
     cx.executor().run_until_parked();
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["> project_root  <== selected"]
+        Vec::<String>::new()
     );
 
     // Run collapse_all_entries and make sure root is not expanded
@@ -3783,7 +3700,7 @@ async fn test_collapse_all_entries_with_collapsed_root(cx: &mut gpui::TestAppCon
     cx.executor().run_until_parked();
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["> project_root  <== selected"]
+        Vec::<String>::new()
     );
 }
 
@@ -3834,7 +3751,7 @@ async fn test_collapse_all_entries_with_invisible_worktree(cx: &mut gpui::TestAp
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v project_root", "    > dir_1", "    > dir_2",],
+        &["> dir_1", "> dir_2"],
         "invisible worktree should not appear in project panel"
     );
 
@@ -3847,7 +3764,7 @@ async fn test_collapse_all_entries_with_invisible_worktree(cx: &mut gpui::TestAp
     cx.executor().run_until_parked();
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v project_root", "    > dir_1  <== selected", "    > dir_2",],
+        &["> dir_1  <== selected", "> dir_2"],
         "with single visible worktree, root should stay expanded even if invisible worktrees exist"
     );
 }
@@ -3887,7 +3804,7 @@ async fn test_new_file_move(cx: &mut gpui::TestAppContext) {
     select_path(&panel, "root/new", cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root", "      new  <== selected  <== marked"]
+        &["  new  <== selected  <== marked"]
     );
     panel.update_in(cx, |panel, window, cx| panel.rename(&Rename, window, cx));
     panel.update_in(cx, |panel, window, cx| {
@@ -3900,7 +3817,7 @@ async fn test_new_file_move(cx: &mut gpui::TestAppContext) {
     cx.executor().run_until_parked();
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root", "      newer  <== selected"]
+        &["  newer  <== selected"]
     );
 
     workspace
@@ -3914,7 +3831,7 @@ async fn test_new_file_move(cx: &mut gpui::TestAppContext) {
     // assert that saving the file doesn't restore "new"
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root", "      newer  <== selected"]
+        &["  newer  <== selected"]
     );
 }
 
@@ -3953,14 +3870,14 @@ async fn test_rename_root_of_worktree(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
-        &["v root1", "    v dir1  <== selected", "          file1.txt",],
+        &["v dir1  <== selected", "      file1.txt"],
         "Initial state with worktrees"
     );
 
     select_path(&panel, "root1", cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
-        &["v root1  <== selected", "    v dir1", "          file1.txt",],
+        &["v dir1", "      file1.txt"],
     );
 
     // Rename root1 to new_root1
@@ -3969,9 +3886,8 @@ async fn test_rename_root_of_worktree(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v [EDITOR: 'root1']  <== selected",
-            "    v dir1",
-            "          file1.txt",
+            "v dir1",
+            "      file1.txt",
         ],
     );
 
@@ -3986,9 +3902,8 @@ async fn test_rename_root_of_worktree(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v new_root1  <== selected",
-            "    v dir1",
-            "          file1.txt",
+            "v dir1",
+            "      file1.txt",
         ],
         "Should update worktree name"
     );
@@ -3998,9 +3913,8 @@ async fn test_rename_root_of_worktree(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v new_root1",
-            "    v dir1",
-            "          file1.txt  <== selected",
+            "v dir1",
+            "      file1.txt  <== selected",
         ],
         "Files in renamed worktree are selectable"
     );
@@ -4170,11 +4084,10 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        v nested_dir",
-            "              file_a.py  <== selected",
-            "      file_1.py",
+            "v dir_1",
+            "    v nested_dir",
+            "          file_a.py  <== selected",
+            "  file_1.py",
         ]
     );
     let modifiers_with_shift = gpui::Modifiers {
@@ -4191,11 +4104,10 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        v nested_dir",
-            "              file_a.py",
-            "      file_1.py  <== selected  <== marked",
+            "v dir_1",
+            "    v nested_dir",
+            "          file_a.py",
+            "  file_1.py  <== selected  <== marked",
         ]
     );
     cx.update(|window, cx| {
@@ -4206,11 +4118,10 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        v nested_dir",
-            "              file_a.py  <== selected  <== marked",
-            "      file_1.py  <== marked",
+            "v dir_1",
+            "    v nested_dir",
+            "          file_a.py  <== selected  <== marked",
+            "  file_1.py  <== marked",
         ]
     );
     cx.update(|window, cx| {
@@ -4231,11 +4142,10 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        v nested_dir",
-            "      file_1.py  <== marked",
-            "      file_a.py  <== selected  <== marked",
+            "v dir_1",
+            "    v nested_dir",
+            "  file_1.py  <== marked",
+            "  file_a.py  <== selected  <== marked",
         ]
     );
     // ESC clears out all marks
@@ -4248,11 +4158,10 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        v nested_dir",
-            "      file_1.py",
-            "      file_a.py  <== selected",
+            "v dir_1",
+            "    v nested_dir",
+            "  file_1.py",
+            "  file_a.py  <== selected",
         ]
     );
     // ESC clears out all marks
@@ -4265,11 +4174,10 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        v nested_dir",
-            "      file_1.py  <== marked",
-            "      file_a.py  <== selected  <== marked",
+            "v dir_1",
+            "    v nested_dir",
+            "  file_1.py  <== marked",
+            "  file_a.py  <== selected  <== marked",
         ]
     );
     cx.simulate_modifiers_change(Default::default());
@@ -4287,11 +4195,10 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        v nested_dir",
-            "              file_1.py  <== marked",
-            "              file_a.py  <== selected  <== marked",
+            "v dir_1",
+            "    v nested_dir",
+            "          file_1.py  <== marked",
+            "          file_a.py  <== selected  <== marked",
         ]
     );
     cx.simulate_modifiers_change(modifiers_with_shift);
@@ -4306,9 +4213,8 @@ async fn test_multiple_marked_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "        v nested_dir  <== selected",
+            "v dir_1",
+            "    v nested_dir  <== selected",
         ]
     );
 }
@@ -4377,9 +4283,8 @@ async fn test_dragged_selection_resolve_entry(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root",
-            "    > a/b/c",
-            "    > target_destination/d  <== selected"
+            "> a/b/c",
+            "> target_destination/d  <== selected",
         ],
         "Moving last empty directory 'd' should leave 'a/b/c' and move only 'd'"
     );
@@ -4426,7 +4331,7 @@ async fn test_dragged_selection_resolve_entry(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root", "    v a", "    > target_destination/b/c/d"],
+        &["v a", "> target_destination/b/c/d"],
         "Moving middle directory 'b' should leave only 'a' and move 'b/c/d'"
     );
 
@@ -4472,7 +4377,7 @@ async fn test_dragged_selection_resolve_entry(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root", "    > target_destination/a/b/c/d"],
+        &["> target_destination/a/b/c/d"],
         "Moving first directory 'a' should move whole 'a/b/c/d' chain"
     );
 }
@@ -4523,7 +4428,7 @@ async fn test_drag_marked_entries_in_folded_directories(cx: &mut gpui::TestAppCo
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root", "    > a/b/c", "    > e/f/g", "    > target"]
+        &["> a/b/c", "> e/f/g", "> target"]
     );
 
     select_folded_path_with_mark(&panel, "root/a/b/c", "root/a/b", cx);
@@ -4551,12 +4456,11 @@ async fn test_drag_marked_entries_in_folded_directories(cx: &mut gpui::TestAppCo
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root",
-            "    > a",
-            "    > e",
-            "    v target",
-            "        > b/c",
-            "        > f/g  <== selected  <== marked"
+            "> a",
+            "> e",
+            "v target",
+            "    > b/c",
+            "    > f/g  <== selected  <== marked",
         ],
         "Should move 'b/c' and 'f/g' to target, leaving 'a' and 'e'"
     );
@@ -4887,11 +4791,10 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    > dir_1",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "> dir_1",
+            "> dir_2",
+            "  .gitignore",
         ]
     );
 
@@ -4912,18 +4815,17 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        v gitignored_dir  <== selected",
-            "              file_a.py",
-            "              file_b.py",
-            "              file_c.py",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    v gitignored_dir  <== selected",
+            "          file_a.py",
+            "          file_b.py",
+            "          file_c.py",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "> dir_2",
+            "  .gitignore",
         ],
         "Should show gitignored dir file list in the project panel"
     );
@@ -4936,11 +4838,10 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    > dir_1  <== selected",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "> dir_1  <== selected",
+            "> dir_2",
+            "  .gitignore",
         ],
         "Should hide all dir contents again and prepare for the auto reveal test"
     );
@@ -4955,11 +4856,10 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             visible_entries_as_strings(&panel, 0..20, cx),
             &[
-                "v project_root",
-                "    > .git",
-                "    > dir_1  <== selected",
-                "    > dir_2",
-                "      .gitignore",
+                "> .git",
+                "> dir_1  <== selected",
+                "> dir_2",
+                "  .gitignore",
             ],
             "When no auto reveal is enabled, the selected entry should not be revealed in the project panel"
         );
@@ -4985,15 +4885,14 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        > gitignored_dir",
-            "          file_1.py  <== selected  <== marked",
-            "          file_2.py",
-            "          file_3.py",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    > gitignored_dir",
+            "      file_1.py  <== selected  <== marked",
+            "      file_2.py",
+            "      file_3.py",
+            "> dir_2",
+            "  .gitignore",
         ],
         "When auto reveal is enabled, not ignored dir_1 entry should be revealed"
     );
@@ -5007,18 +4906,17 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        > gitignored_dir",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    v dir_2",
-            "          file_1.py  <== selected  <== marked",
-            "          file_2.py",
-            "          file_3.py",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    > gitignored_dir",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "v dir_2",
+            "      file_1.py  <== selected  <== marked",
+            "      file_2.py",
+            "      file_3.py",
+            "  .gitignore",
         ],
         "When auto reveal is enabled, not ignored dir_2 entry should be revealed"
     );
@@ -5034,18 +4932,17 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        > gitignored_dir",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    v dir_2",
-            "          file_1.py  <== selected  <== marked",
-            "          file_2.py",
-            "          file_3.py",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    > gitignored_dir",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "v dir_2",
+            "      file_1.py  <== selected  <== marked",
+            "      file_2.py",
+            "      file_3.py",
+            "  .gitignore",
         ],
         "When auto reveal is enabled, a gitignored selected entry should not be revealed in the project panel"
     );
@@ -5059,21 +4956,20 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        v gitignored_dir",
-            "              file_a.py  <== selected  <== marked",
-            "              file_b.py",
-            "              file_c.py",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    v dir_2",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    v gitignored_dir",
+            "          file_a.py  <== selected  <== marked",
+            "          file_b.py",
+            "          file_c.py",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "v dir_2",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "  .gitignore",
         ],
         "When a gitignored entry is explicitly revealed, it should be shown in the project tree"
     );
@@ -5087,21 +4983,20 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        v gitignored_dir",
-            "              file_a.py",
-            "              file_b.py",
-            "              file_c.py",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    v dir_2",
-            "          file_1.py  <== selected  <== marked",
-            "          file_2.py",
-            "          file_3.py",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    v gitignored_dir",
+            "          file_a.py",
+            "          file_b.py",
+            "          file_c.py",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "v dir_2",
+            "      file_1.py  <== selected  <== marked",
+            "      file_2.py",
+            "      file_3.py",
+            "  .gitignore",
         ],
         "After switching to dir_2_file, it should be selected and marked"
     );
@@ -5117,21 +5012,20 @@ async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        v gitignored_dir",
-            "              file_a.py  <== selected  <== marked",
-            "              file_b.py",
-            "              file_c.py",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    v dir_2",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    v gitignored_dir",
+            "          file_a.py  <== selected  <== marked",
+            "          file_b.py",
+            "          file_c.py",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "v dir_2",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "  .gitignore",
         ],
         "When a gitignored entry is already visible, auto reveal should mark it as selected"
     );
@@ -5196,12 +5090,11 @@ async fn test_gitignored_and_always_included(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    > always_included_but_ignored_dir",
-            "    > dir_1",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "> always_included_but_ignored_dir",
+            "> dir_1",
+            "> dir_2",
+            "  .gitignore",
         ]
     );
 
@@ -5243,19 +5136,18 @@ async fn test_gitignored_and_always_included(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v always_included_but_ignored_dir",
-            "          file_a.py  <== selected  <== marked",
-            "          file_b.py",
-            "          file_c.py",
-            "    v dir_1",
-            "        > gitignored_dir",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "v always_included_but_ignored_dir",
+            "      file_a.py  <== selected  <== marked",
+            "      file_b.py",
+            "      file_c.py",
+            "v dir_1",
+            "    > gitignored_dir",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "> dir_2",
+            "  .gitignore",
         ],
         "When auto reveal is enabled, a gitignored but always included selected entry should be revealed in the project panel"
     );
@@ -5313,11 +5205,10 @@ async fn test_explicit_reveal(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    > dir_1",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "> dir_1",
+            "> dir_2",
+            "  .gitignore",
         ]
     );
 
@@ -5338,18 +5229,17 @@ async fn test_explicit_reveal(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        v gitignored_dir  <== selected",
-            "              file_a.py",
-            "              file_b.py",
-            "              file_c.py",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    v gitignored_dir  <== selected",
+            "          file_a.py",
+            "          file_b.py",
+            "          file_c.py",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "> dir_2",
+            "  .gitignore",
         ],
         "Should show gitignored dir file list in the project panel"
     );
@@ -5362,11 +5252,10 @@ async fn test_explicit_reveal(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    > dir_1  <== selected",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "> dir_1  <== selected",
+            "> dir_2",
+            "  .gitignore",
         ],
         "Should hide all dir contents again and prepare for the explicit reveal test"
     );
@@ -5381,11 +5270,10 @@ async fn test_explicit_reveal(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             visible_entries_as_strings(&panel, 0..20, cx),
             &[
-                "v project_root",
-                "    > .git",
-                "    > dir_1  <== selected",
-                "    > dir_2",
-                "      .gitignore",
+                "> .git",
+                "> dir_1  <== selected",
+                "> dir_2",
+                "  .gitignore",
             ],
             "When no auto reveal is enabled, the selected entry should not be revealed in the project panel"
         );
@@ -5400,15 +5288,14 @@ async fn test_explicit_reveal(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        > gitignored_dir",
-            "          file_1.py  <== selected  <== marked",
-            "          file_2.py",
-            "          file_3.py",
-            "    > dir_2",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    > gitignored_dir",
+            "      file_1.py  <== selected  <== marked",
+            "      file_2.py",
+            "      file_3.py",
+            "> dir_2",
+            "  .gitignore",
         ],
         "With no auto reveal, explicit reveal should show the dir_1 entry in the project panel"
     );
@@ -5422,18 +5309,17 @@ async fn test_explicit_reveal(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        > gitignored_dir",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    v dir_2",
-            "          file_1.py  <== selected  <== marked",
-            "          file_2.py",
-            "          file_3.py",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    > gitignored_dir",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "v dir_2",
+            "      file_1.py  <== selected  <== marked",
+            "      file_2.py",
+            "      file_3.py",
+            "  .gitignore",
         ],
         "With no auto reveal, explicit reveal should show the dir_2 entry in the project panel"
     );
@@ -5447,21 +5333,20 @@ async fn test_explicit_reveal(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    > .git",
-            "    v dir_1",
-            "        v gitignored_dir",
-            "              file_a.py  <== selected  <== marked",
-            "              file_b.py",
-            "              file_c.py",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "    v dir_2",
-            "          file_1.py",
-            "          file_2.py",
-            "          file_3.py",
-            "      .gitignore",
+            "> .git",
+            "v dir_1",
+            "    v gitignored_dir",
+            "          file_a.py  <== selected  <== marked",
+            "          file_b.py",
+            "          file_c.py",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "v dir_2",
+            "      file_1.py",
+            "      file_2.py",
+            "      file_3.py",
+            "  .gitignore",
         ],
         "With no auto reveal, explicit reveal should show the gitignored entry in the project panel"
     );
@@ -5642,10 +5527,9 @@ async fn test_autoreveal_follows_multibuffer_selection(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "          file_1.py  <== selected  <== marked",
-            "    > dir_2",
+            "v dir_1",
+            "      file_1.py  <== selected  <== marked",
+            "> dir_2",
         ],
         "When a multibuffer becomes active, its first excerpt's file should be revealed"
     );
@@ -5673,11 +5557,10 @@ async fn test_autoreveal_follows_multibuffer_selection(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "          file_1.py",
-            "    v dir_2",
-            "          file_2.py  <== selected  <== marked",
+            "v dir_1",
+            "      file_1.py",
+            "v dir_2",
+            "      file_2.py  <== selected  <== marked",
         ],
         "Moving the cursor into a different excerpt buffer should reveal that buffer's entry"
     );
@@ -5692,11 +5575,10 @@ async fn test_autoreveal_follows_multibuffer_selection(cx: &mut gpui::TestAppCon
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v project_root",
-            "    v dir_1",
-            "          file_1.py",
-            "    v dir_2",
-            "          file_2.py  <== selected  <== marked",
+            "v dir_1",
+            "      file_1.py",
+            "v dir_2",
+            "      file_2.py  <== selected  <== marked",
         ],
         "Wrapper-level title updates must not clobber the inner editor's reveal"
     );
@@ -5902,7 +5784,7 @@ async fn test_creating_excluded_entries(cx: &mut gpui::TestAppContext) {
     select_path(&panel, "root1", cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root1  <== selected", "      .dockerignore",]
+        &["  .dockerignore"]
     );
     workspace.update_in(cx, |workspace, _, cx| {
         assert!(
@@ -5931,7 +5813,7 @@ async fn test_creating_excluded_entries(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..13, cx),
-        &["v root1", "      .dockerignore"],
+        &["  .dockerignore"],
         "Excluded dir should not be shown after opening a file in it"
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -5985,7 +5867,7 @@ async fn test_creating_excluded_entries(cx: &mut gpui::TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         visible_entries_as_strings(&panel, 0..13, cx),
-        &["v root1", "      .dockerignore"],
+        &["  .dockerignore"],
         "Should not change the project panel after trying to create an excluded directorya directory with the same name as the excluded file"
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -6029,7 +5911,7 @@ async fn test_creating_excluded_entries(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..13, cx),
-        &["v root1", "      .dockerignore"],
+        &["  .dockerignore"],
         "Should not change the project panel after trying to create an excluded directory"
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -6090,9 +5972,7 @@ async fn test_selection_restored_when_creation_cancelled(cx: &mut gpui::TestAppC
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src  <== selected",
-            "    > test"
+            "> test",
         ]
     );
     panel.update_in(cx, |panel, window, cx| {
@@ -6105,10 +5985,8 @@ async fn test_selection_restored_when_creation_cancelled(cx: &mut gpui::TestAppC
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src",
-            "    > [EDITOR: '']  <== selected",
-            "    > test"
+            "> [EDITOR: '']  <== selected",
+            "> test",
         ]
     );
 
@@ -6119,9 +5997,7 @@ async fn test_selection_restored_when_creation_cancelled(cx: &mut gpui::TestAppC
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src  <== selected",
-            "    > test"
+            "> test",
         ]
     );
 
@@ -6135,10 +6011,8 @@ async fn test_selection_restored_when_creation_cancelled(cx: &mut gpui::TestAppC
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src",
-            "    > [EDITOR: '']  <== selected",
-            "    > test"
+            "> [EDITOR: '']  <== selected",
+            "> test",
         ]
     );
     workspace.update_in(cx, |_, window, _| window.blur());
@@ -6146,9 +6020,7 @@ async fn test_selection_restored_when_creation_cancelled(cx: &mut gpui::TestAppC
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            //
-            "v src  <== selected",
-            "    > test"
+            "> test",
         ]
     );
 }
@@ -6194,17 +6066,16 @@ async fn test_basic_file_deletion_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        > subdir1",
-            "          file1.txt  <== selected",
-            "          file2.txt",
-            "    v dir2",
-            "        > subdir2",
-            "          file3.txt",
-            "          file4.txt",
-            "      file5.txt",
-            "      file6.txt",
+            "v dir1",
+            "    > subdir1",
+            "      file1.txt  <== selected",
+            "      file2.txt",
+            "v dir2",
+            "    > subdir2",
+            "      file3.txt",
+            "      file4.txt",
+            "  file5.txt",
+            "  file6.txt",
         ],
         "Initial state before deleting middle file"
     );
@@ -6213,16 +6084,15 @@ async fn test_basic_file_deletion_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        > subdir1",
-            "          file2.txt  <== selected",
-            "    v dir2",
-            "        > subdir2",
-            "          file3.txt",
-            "          file4.txt",
-            "      file5.txt",
-            "      file6.txt",
+            "v dir1",
+            "    > subdir1",
+            "      file2.txt  <== selected",
+            "v dir2",
+            "    > subdir2",
+            "      file3.txt",
+            "      file4.txt",
+            "  file5.txt",
+            "  file6.txt",
         ],
         "Should select next file after deleting middle file"
     );
@@ -6232,15 +6102,14 @@ async fn test_basic_file_deletion_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        > subdir1  <== selected",
-            "    v dir2",
-            "        > subdir2",
-            "          file3.txt",
-            "          file4.txt",
-            "      file5.txt",
-            "      file6.txt",
+            "v dir1",
+            "    > subdir1  <== selected",
+            "v dir2",
+            "    > subdir2",
+            "      file3.txt",
+            "      file4.txt",
+            "  file5.txt",
+            "  file6.txt",
         ],
         "Should select next directory when last file is deleted"
     );
@@ -6250,15 +6119,14 @@ async fn test_basic_file_deletion_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        > subdir1",
-            "    v dir2",
-            "        > subdir2",
-            "          file3.txt",
-            "          file4.txt",
-            "      file5.txt",
-            "      file6.txt  <== selected",
+            "v dir1",
+            "    > subdir1",
+            "v dir2",
+            "    > subdir2",
+            "      file3.txt",
+            "      file4.txt",
+            "  file5.txt",
+            "  file6.txt  <== selected",
         ],
         "Initial state before deleting root level file"
     );
@@ -6267,14 +6135,13 @@ async fn test_basic_file_deletion_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        > subdir1",
-            "    v dir2",
-            "        > subdir2",
-            "          file3.txt",
-            "          file4.txt",
-            "      file5.txt  <== selected",
+            "v dir1",
+            "    > subdir1",
+            "v dir2",
+            "    > subdir2",
+            "      file3.txt",
+            "      file4.txt",
+            "  file5.txt  <== selected",
         ],
         "Should select prev entry at root level"
     );
@@ -6328,12 +6195,11 @@ async fn test_deletion_gitignored(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root",
-            "      .gitignore",
-            "      aa  <== selected",
-            "      cc",
-            "      gg",
-            "      hh"
+            "  .gitignore",
+            "  aa  <== selected",
+            "  cc",
+            "  gg",
+            "  hh",
         ],
         "Initial state should hide files on .gitignore"
     );
@@ -6343,11 +6209,10 @@ async fn test_deletion_gitignored(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root",
-            "      .gitignore",
-            "      cc  <== selected",
-            "      gg",
-            "      hh"
+            "  .gitignore",
+            "  cc  <== selected",
+            "  gg",
+            "  hh",
         ],
         "Should select next entry not on .gitignore"
     );
@@ -6357,10 +6222,9 @@ async fn test_deletion_gitignored(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root",
-            "      .gitignore",
-            "      gg  <== selected",
-            "      hh"
+            "  .gitignore",
+            "  gg  <== selected",
+            "  hh",
         ],
         "Should select next entry not on .gitignore"
     );
@@ -6370,17 +6234,16 @@ async fn test_deletion_gitignored(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root",
-            "      .gitignore",
-            "      gg",
-            "      hh  <== selected"
+            "  .gitignore",
+            "  gg",
+            "  hh  <== selected",
         ],
         "Should select next entry not on .gitignore"
     );
     submit_deletion(&panel, cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
-        &["v root", "      .gitignore", "      gg  <== selected"],
+        &["  .gitignore", "  gg  <== selected"],
         "Should select next entry not on .gitignore"
     );
 }
@@ -6431,11 +6294,10 @@ async fn test_nested_deletion_gitignore(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root",
-            "    v dir1",
-            "          file2  <== selected",
-            "      .gitignore",
-            "      aa"
+            "v dir1",
+            "      file2  <== selected",
+            "  .gitignore",
+            "  aa",
         ],
         "Initial state should hide files on .gitignore"
     );
@@ -6445,10 +6307,9 @@ async fn test_nested_deletion_gitignore(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "      .gitignore",
-            "      aa"
+            "v dir1  <== selected",
+            "  .gitignore",
+            "  aa",
         ],
         "Initial state should hide files on .gitignore"
     );
@@ -6506,18 +6367,17 @@ async fn test_complex_selection_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1  <== selected  <== marked",
-            "        v subdir1  <== marked",
-            "              a.txt",
-            "              b.txt",
-            "          file1.txt",
-            "    v dir2",
-            "        v subdir2",
-            "              c.txt",
-            "              d.txt",
-            "          file2.txt",
-            "      file3.txt",
+            "v dir1  <== selected  <== marked",
+            "    v subdir1  <== marked",
+            "          a.txt",
+            "          b.txt",
+            "      file1.txt",
+            "v dir2",
+            "    v subdir2",
+            "          c.txt",
+            "          d.txt",
+            "      file2.txt",
+            "  file3.txt",
         ],
         "Initial state before deleting nested directory with parent"
     );
@@ -6526,13 +6386,12 @@ async fn test_complex_selection_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir2  <== selected",
-            "        v subdir2",
-            "              c.txt",
-            "              d.txt",
-            "          file2.txt",
-            "      file3.txt",
+            "v dir2  <== selected",
+            "    v subdir2",
+            "          c.txt",
+            "          d.txt",
+            "      file2.txt",
+            "  file3.txt",
         ],
         "Should select next directory after deleting directory with parent"
     );
@@ -6545,13 +6404,12 @@ async fn test_complex_selection_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir2",
-            "        v subdir2",
-            "              c.txt  <== marked",
-            "              d.txt",
-            "          file2.txt  <== marked",
-            "      file3.txt  <== selected  <== marked",
+            "v dir2",
+            "    v subdir2",
+            "          c.txt  <== marked",
+            "          d.txt",
+            "      file2.txt  <== marked",
+            "  file3.txt  <== selected  <== marked",
         ],
         "Initial state before deleting"
     );
@@ -6560,10 +6418,9 @@ async fn test_complex_selection_scenarios(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir2  <== selected",
-            "        v subdir2",
-            "              d.txt",
+            "v dir2  <== selected",
+            "    v subdir2",
+            "          d.txt",
         ],
         "Should select sibling directory"
     );
@@ -6623,19 +6480,18 @@ async fn test_delete_all_files_and_directories(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== marked",
-            "        v subdir1",
-            "              a.txt",
-            "              b.txt",
-            "          file1.txt",
-            "    v dir2  <== marked",
-            "        v subdir2",
-            "              c.txt",
-            "              d.txt",
-            "          file2.txt",
-            "      file3.txt  <== marked",
-            "      file4.txt  <== selected  <== marked",
+            "v dir1  <== marked",
+            "    v subdir1",
+            "          a.txt",
+            "          b.txt",
+            "      file1.txt",
+            "v dir2  <== marked",
+            "    v subdir2",
+            "          c.txt",
+            "          d.txt",
+            "      file2.txt",
+            "  file3.txt  <== marked",
+            "  file4.txt  <== selected  <== marked",
         ],
         "State before deleting all contents"
     );
@@ -6643,7 +6499,7 @@ async fn test_delete_all_files_and_directories(cx: &mut gpui::TestAppContext) {
     submit_deletion(&panel, cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
-        &["v root  <== selected"],
+        Vec::<String>::new(),
         "Only empty root directory should remain after deleting all contents"
     );
 }
@@ -6698,22 +6554,21 @@ async fn test_nested_selection_deletion(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== marked",
-            "        v subdir1  <== marked",
-            "              file_a.txt  <== selected  <== marked",
-            "              file_b.txt",
-            "        > subdir2",
-            "          file1.txt",
-            "    v dir2",
-            "          file2.txt",
+            "v dir1  <== marked",
+            "    v subdir1  <== marked",
+            "          file_a.txt  <== selected  <== marked",
+            "          file_b.txt",
+            "    > subdir2",
+            "      file1.txt",
+            "v dir2",
+            "      file2.txt",
         ],
         "State with parent dir, subdir, and file selected"
     );
     submit_deletion(&panel, cx);
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
-        &["v root", "    v dir2  <== selected", "          file2.txt",],
+        &["v dir2  <== selected", "      file2.txt"],
         "Only dir2 should remain after deletion"
     );
 }
@@ -6909,14 +6764,13 @@ async fn test_selection_vs_marked_entries_priority(cx: &mut gpui::TestAppContext
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "          file1.txt  <== selected",
-            "          file2.txt  <== marked",
-            "          file3.txt",
-            "    v dir2",
-            "          file4.txt",
-            "          file5.txt",
+            "v dir1",
+            "      file1.txt  <== selected",
+            "      file2.txt  <== marked",
+            "      file3.txt",
+            "v dir2",
+            "      file4.txt",
+            "      file5.txt",
         ],
         "Initial state with one marked entry and different selection"
     );
@@ -6926,13 +6780,12 @@ async fn test_selection_vs_marked_entries_priority(cx: &mut gpui::TestAppContext
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "          file2.txt  <== selected  <== marked",
-            "          file3.txt",
-            "    v dir2",
-            "          file4.txt",
-            "          file5.txt",
+            "v dir1",
+            "      file2.txt  <== selected  <== marked",
+            "      file3.txt",
+            "v dir2",
+            "      file4.txt",
+            "      file5.txt",
         ],
         "Should delete selected file, not marked file"
     );
@@ -6944,13 +6797,12 @@ async fn test_selection_vs_marked_entries_priority(cx: &mut gpui::TestAppContext
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "          file2.txt  <== marked",
-            "          file3.txt  <== marked",
-            "    v dir2",
-            "          file4.txt  <== marked",
-            "          file5.txt  <== selected",
+            "v dir1",
+            "      file2.txt  <== marked",
+            "      file3.txt  <== marked",
+            "v dir2",
+            "      file4.txt  <== marked",
+            "      file5.txt  <== selected",
         ],
         "Initial state with multiple marked entries and different selection"
     );
@@ -6960,10 +6812,9 @@ async fn test_selection_vs_marked_entries_priority(cx: &mut gpui::TestAppContext
     assert_eq!(
         visible_entries_as_strings(&panel, 0..15, cx),
         &[
-            "v root",
-            "    v dir1",
-            "    v dir2",
-            "          file5.txt  <== selected",
+            "v dir1",
+            "v dir2",
+            "      file5.txt  <== selected",
         ],
         "Should delete all marked files, leaving only the selected file"
     );
@@ -7125,7 +6976,7 @@ async fn test_expand_all_for_entry(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
-        &["v root", "    > dir1", "      .gitignore",],
+        &["> dir1", "  .gitignore"],
         "Initial state should show collapsed root structure"
     );
 
@@ -7133,12 +6984,11 @@ async fn test_expand_all_for_entry(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        > empty1/empty2/empty3",
-            "        > ignored_dir",
-            "        > subdir1",
-            "      .gitignore",
+            "v dir1  <== selected",
+            "    > empty1/empty2/empty3",
+            "    > ignored_dir",
+            "    > subdir1",
+            "  .gitignore",
         ],
         "Should show first level with auto-folded dirs and ignored dir visible"
     );
@@ -7155,18 +7005,17 @@ async fn test_expand_all_for_entry(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        v empty1",
-            "            v empty2",
-            "                v empty3",
-            "                      file.txt",
-            "        > ignored_dir",
-            "        v subdir1",
-            "            > ignored_nested",
-            "              file1.txt",
-            "              file2.txt",
-            "      .gitignore",
+            "v dir1  <== selected",
+            "    v empty1",
+            "        v empty2",
+            "            v empty3",
+            "                  file.txt",
+            "    > ignored_dir",
+            "    v subdir1",
+            "        > ignored_nested",
+            "          file1.txt",
+            "          file2.txt",
+            "  .gitignore",
         ],
         "After expand_all with auto-fold: should not expand ignored_dir, should expand folded dirs, and should not expand ignored_nested"
     );
@@ -7191,12 +7040,11 @@ async fn test_expand_all_for_entry(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        > empty1",
-            "        > ignored_dir",
-            "        > subdir1",
-            "      .gitignore",
+            "v dir1  <== selected",
+            "    > empty1",
+            "    > ignored_dir",
+            "    > subdir1",
+            "  .gitignore",
         ],
         "With auto-fold disabled: should show all directories separately"
     );
@@ -7213,18 +7061,17 @@ async fn test_expand_all_for_entry(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        v empty1",
-            "            v empty2",
-            "                v empty3",
-            "                      file.txt",
-            "        > ignored_dir",
-            "        v subdir1",
-            "            > ignored_nested",
-            "              file1.txt",
-            "              file2.txt",
-            "      .gitignore",
+            "v dir1  <== selected",
+            "    v empty1",
+            "        v empty2",
+            "            v empty3",
+            "                  file.txt",
+            "    > ignored_dir",
+            "    v subdir1",
+            "        > ignored_nested",
+            "          file1.txt",
+            "          file2.txt",
+            "  .gitignore",
         ],
         "After expand_all without auto-fold: should expand all dirs normally, \
          expand ignored_dir itself but not its subdirs, and not expand ignored_nested"
@@ -7243,20 +7090,19 @@ async fn test_expand_all_for_entry(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        v empty1",
-            "            v empty2",
-            "                v empty3",
-            "                      file.txt",
-            "        v ignored_dir",
-            "            v subdir",
-            "                  deep_file.txt",
-            "        v subdir1",
-            "            > ignored_nested",
-            "              file1.txt",
-            "              file2.txt",
-            "      .gitignore",
+            "v dir1  <== selected",
+            "    v empty1",
+            "        v empty2",
+            "            v empty3",
+            "                  file.txt",
+            "    v ignored_dir",
+            "        v subdir",
+            "              deep_file.txt",
+            "    v subdir1",
+            "        > ignored_nested",
+            "          file1.txt",
+            "          file2.txt",
+            "  .gitignore",
         ],
         "After expand_all on ignored_dir: should expand all contents of the ignored directory"
     );
@@ -7310,15 +7156,14 @@ async fn test_collapse_all_for_entry(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             visible_entries_as_strings(&panel, 0..20, cx),
             &[
-                "v root",
-                "    v dir1",
-                "        v subdir1",
-                "            v nested1",
-                "                  file1.txt",
-                "                  file2.txt",
-                "        v subdir2  <== selected",
-                "              file4.txt",
-                "    > dir2",
+                "v dir1",
+                "    v subdir1",
+                "        v nested1",
+                "              file1.txt",
+                "              file2.txt",
+                "    v subdir2  <== selected",
+                "          file4.txt",
+                "> dir2",
             ],
             "Initial state with everything expanded"
         );
@@ -7334,7 +7179,7 @@ async fn test_collapse_all_for_entry(cx: &mut gpui::TestAppContext) {
 
         assert_eq!(
             visible_entries_as_strings(&panel, 0..20, cx),
-            &["v root", "    > dir1", "    > dir2",],
+            &["> dir1", "> dir2"],
             "All subdirs under dir1 should be collapsed"
         );
     }
@@ -7362,13 +7207,12 @@ async fn test_collapse_all_for_entry(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             visible_entries_as_strings(&panel, 0..20, cx),
             &[
-                "v root",
-                "    v dir1",
-                "        v subdir1/nested1  <== selected",
-                "              file1.txt",
-                "              file2.txt",
-                "        > subdir2",
-                "    > dir2/single_file",
+                "v dir1",
+                "    v subdir1/nested1  <== selected",
+                "          file1.txt",
+                "          file2.txt",
+                "    > subdir2",
+                "> dir2/single_file",
             ],
             "Initial state with some dirs expanded"
         );
@@ -7385,11 +7229,10 @@ async fn test_collapse_all_for_entry(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             visible_entries_as_strings(&panel, 0..20, cx),
             &[
-                "v root",
-                "    v dir1  <== selected",
-                "        > subdir1/nested1",
-                "        > subdir2",
-                "    > dir2/single_file",
+                "v dir1  <== selected",
+                "    > subdir1/nested1",
+                "    > subdir2",
+                "> dir2/single_file",
             ],
             "Subdirs should be collapsed and folded with auto-fold enabled"
         );
@@ -7418,14 +7261,13 @@ async fn test_collapse_all_for_entry(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             visible_entries_as_strings(&panel, 0..20, cx),
             &[
-                "v root",
-                "    v dir1",
-                "        v subdir1",
-                "            v nested1  <== selected",
-                "                  file1.txt",
-                "                  file2.txt",
-                "        > subdir2",
-                "    > dir2",
+                "v dir1",
+                "    v subdir1",
+                "        v nested1  <== selected",
+                "              file1.txt",
+                "              file2.txt",
+                "    > subdir2",
+                "> dir2",
             ],
             "Initial state with some dirs expanded and auto-fold disabled"
         );
@@ -7442,11 +7284,10 @@ async fn test_collapse_all_for_entry(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             visible_entries_as_strings(&panel, 0..20, cx),
             &[
-                "v root",
-                "    v dir1  <== selected",
-                "        > subdir1",
-                "        > subdir2",
-                "    > dir2",
+                "v dir1  <== selected",
+                "    > subdir1",
+                "    > subdir2",
+                "> dir2",
             ],
             "Subdirs should be collapsed but not folded with auto-fold disabled"
         );
@@ -7498,16 +7339,15 @@ async fn test_collapse_selected_entry_and_children_action(cx: &mut gpui::TestApp
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        v subdir1",
-            "            v nested1",
-            "                  file1.txt",
-            "                  file2.txt",
-            "        v subdir2",
-            "              file3.txt",
-            "    v dir2  <== selected",
-            "          file4.txt",
+            "v dir1",
+            "    v subdir1",
+            "        v nested1",
+            "              file1.txt",
+            "              file2.txt",
+            "    v subdir2",
+            "          file3.txt",
+            "v dir2  <== selected",
+            "      file4.txt",
         ],
         "Initial state with directories expanded"
     );
@@ -7523,10 +7363,9 @@ async fn test_collapse_selected_entry_and_children_action(cx: &mut gpui::TestApp
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    > dir1  <== selected",
-            "    v dir2",
-            "          file4.txt",
+            "> dir1  <== selected",
+            "v dir2",
+            "      file4.txt",
         ],
         "dir1 and all its children should be collapsed, dir2 should remain expanded"
     );
@@ -7537,12 +7376,11 @@ async fn test_collapse_selected_entry_and_children_action(cx: &mut gpui::TestApp
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        > subdir1",
-            "        > subdir2",
-            "    v dir2",
-            "          file4.txt",
+            "v dir1  <== selected",
+            "    > subdir1",
+            "    > subdir2",
+            "v dir2",
+            "      file4.txt",
         ],
         "After re-expanding dir1, its children should still be collapsed"
     );
@@ -7586,13 +7424,12 @@ async fn test_collapse_root_single_worktree(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        v subdir1",
-            "              file1.txt",
-            "          file2.txt",
-            "    v dir2  <== selected",
-            "          file3.txt",
+            "v dir1",
+            "    v subdir1",
+            "          file1.txt",
+            "      file2.txt",
+            "v dir2  <== selected",
+            "      file3.txt",
         ],
         "Initial state with directories expanded"
     );
@@ -7609,7 +7446,7 @@ async fn test_collapse_root_single_worktree(cx: &mut gpui::TestAppContext) {
     // The root and all its children should be collapsed
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
-        &["> root  <== selected"],
+        Vec::<String>::new(),
         "Root and all children should be collapsed"
     );
 
@@ -7621,11 +7458,10 @@ async fn test_collapse_root_single_worktree(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        > subdir1",
-            "          file2.txt",
-            "    > dir2",
+            "v dir1  <== selected",
+            "    > subdir1",
+            "      file2.txt",
+            "> dir2",
         ],
         "After re-expanding root and dir1, subdir1 should still be collapsed"
     );
@@ -7882,13 +7718,12 @@ async fn test_collapse_all_for_root_single_worktree(cx: &mut gpui::TestAppContex
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        v subdir1",
-            "              file1.txt",
-            "          file2.txt",
-            "    v dir2  <== selected",
-            "          file3.txt",
+            "v dir1",
+            "    v subdir1",
+            "          file1.txt",
+            "      file2.txt",
+            "v dir2  <== selected",
+            "      file3.txt",
         ],
         "Initial state with directories expanded"
     );
@@ -7903,7 +7738,7 @@ async fn test_collapse_all_for_root_single_worktree(cx: &mut gpui::TestAppContex
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
-        &["v root  <== selected", "    > dir1", "    > dir2"],
+        &["> dir1", "> dir2"],
         "Root should remain expanded but all children should be collapsed"
     );
 
@@ -7913,11 +7748,10 @@ async fn test_collapse_all_for_root_single_worktree(cx: &mut gpui::TestAppContex
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        > subdir1",
-            "          file2.txt",
-            "    > dir2",
+            "v dir1  <== selected",
+            "    > subdir1",
+            "      file2.txt",
+            "> dir2",
         ],
         "After re-expanding dir1, subdir1 should still be collapsed"
     );
@@ -8044,12 +7878,11 @@ async fn test_collapse_all_for_root_noop_on_non_root(cx: &mut gpui::TestAppConte
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1",
-            "        v subdir1",
-            "              file1.txt",
-            "    v dir2  <== selected",
-            "          file2.txt",
+            "v dir1",
+            "    v subdir1",
+            "          file1.txt",
+            "v dir2  <== selected",
+            "      file2.txt",
         ],
         "Initial state with directories expanded"
     );
@@ -8065,12 +7898,11 @@ async fn test_collapse_all_for_root_noop_on_non_root(cx: &mut gpui::TestAppConte
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    v dir1  <== selected",
-            "        v subdir1",
-            "              file1.txt",
-            "    v dir2",
-            "          file2.txt",
+            "v dir1  <== selected",
+            "    v subdir1",
+            "          file1.txt",
+            "v dir2",
+            "      file2.txt",
         ],
         "collapse_all_for_root should be a no-op when called on a non-root directory"
     );
@@ -8109,8 +7941,7 @@ async fn test_create_entries_without_selection(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    > dir1",
+            "> dir1",
         ],
         "Initial state with nothing selected"
     );
@@ -8136,9 +7967,8 @@ async fn test_create_entries_without_selection(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
         &[
-            "v root",
-            "    > dir1",
-            "      hello_from_no_selections  <== selected  <== marked",
+            "> dir1",
+            "  hello_from_no_selections  <== selected  <== marked",
         ],
         "A new file is created under the root directory"
     );
@@ -9471,12 +9301,17 @@ async fn test_hide_hidden_entries(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..30, cx),
         &[
-            "v root",
-            "    v visible-dir",
-            "        v nested",
-            "              visible-nested-file.txt",
-            "          file-in-visible.txt",
-            "      visible-file.txt",
+            "v visible-dir",
+            "    v nested",
+            "          visible-nested-file.txt",
+            "      file-in-visible.txt",
+            "  visible-file.txt",
+        
+            "v visible-dir",
+            "    v nested",
+            "          visible-nested-file.txt",
+            "      file-in-visible.txt",
+            "  visible-file.txt",
         ],
         "With hide_hidden=false, contents of hidden nested directory should be visible"
     );
@@ -9760,12 +9595,17 @@ async fn test_sort_mode_directories_first(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            "v root",
-            "    > Apple",
-            "    > Carrot",
-            "      aardvark.txt",
-            "      banana.rs",
-            "      zebra.txt",
+            "> Apple",
+            "> Carrot",
+            "  aardvark.txt",
+            "  banana.rs",
+            "  zebra.txt",
+        
+            "> Apple",
+            "> Carrot",
+            "  aardvark.txt",
+            "  banana.rs",
+            "  zebra.txt",
         ]
     );
 }
@@ -9812,12 +9652,11 @@ async fn test_sort_mode_mixed(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            "v root",
-            "      Aardvark.txt",
-            "    > apple",
-            "      Banana.rs",
-            "    > carrot",
-            "      Zebra.txt",
+            "  Aardvark.txt",
+            "> apple",
+            "  Banana.rs",
+            "> carrot",
+            "  Zebra.txt",
         ]
     );
 }
@@ -9863,12 +9702,11 @@ async fn test_sort_mode_files_first(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
         &[
-            "v root",
-            "      Aardvark.txt",
-            "      Banana.rs",
-            "      Zebra.txt",
-            "    > apple",
-            "    > carrot",
+            "  Aardvark.txt",
+            "  Banana.rs",
+            "  Zebra.txt",
+            "> apple",
+            "> carrot",
         ]
     );
 }
@@ -9900,7 +9738,7 @@ async fn test_sort_mode_toggle(cx: &mut gpui::TestAppContext) {
     // Initially DirectoriesFirst
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
-        &["v root", "    > dir1", "      file1.txt", "      file2.txt",]
+        &["> dir1", "  file1.txt", "  file2.txt"]
     );
 
     // Toggle to Mixed
@@ -9916,7 +9754,7 @@ async fn test_sort_mode_toggle(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
-        &["v root", "    > dir1", "      file1.txt", "      file2.txt",]
+        &["> dir1", "  file1.txt", "  file2.txt"]
     );
 
     // Toggle back to DirectoriesFirst
@@ -9932,7 +9770,7 @@ async fn test_sort_mode_toggle(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..50, cx),
-        &["v root", "    > dir1", "      file1.txt", "      file2.txt",]
+        &["> dir1", "  file1.txt", "  file2.txt"]
     );
 }
 
@@ -10190,10 +10028,9 @@ async fn test_preserve_temporary_unfolded_active_index_on_blur_from_context_menu
     assert_eq!(
         visible_entries_as_strings(&panel, 0..10, cx),
         &[
-            "v root1",
-            "    v parent",
-            "        > subdir/child",
-            "          [EDITOR: '']  <== selected",
+            "v parent",
+            "    > subdir/child",
+            "      [EDITOR: '']  <== selected",
         ],
         "new file after blur should use the preserved active ancestor"
     );
