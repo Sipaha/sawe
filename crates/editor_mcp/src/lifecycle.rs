@@ -153,6 +153,7 @@ const GLOBAL_TOOLS: &[&str] = &[
     "solutions.close",
     "solutions.rename",
     "solutions.reorder_members",
+    "solutions.set_active_member",
     "solutions.find_for_path",
     // Member management + inspection: shared (see SHARED_TOOLS) — kept on the
     // global socket (the operator addresses any Solution by id, and a member
@@ -482,6 +483,22 @@ pub fn start_server_for_test(_cx: &mut App) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn solution_management_tools_are_global() {
+        // These live on the editor-global socket (the operator addresses any
+        // Solution by id). A brand-new tool defaults to solution-scoped, so a
+        // solution-management tool must be added to GLOBAL_TOOLS explicitly or
+        // it silently vanishes from the global socket — guard the ones that must
+        // be reachable there.
+        for name in [
+            "solutions.set_active_member",
+            "solutions.reorder_members",
+            "solutions.open",
+        ] {
+            assert!(is_global_tool(name), "{name} must be a global-socket tool");
+        }
+    }
 
     #[test]
     fn acquire_lock_writes_pid() {
