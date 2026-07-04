@@ -1836,6 +1836,22 @@ impl SolutionAgentStore {
         self.finish_judge(id, cx);
 
         if drop_verdict {
+            // `finish_judge` reaped the ephemeral judge but does NOT touch
+            // `status`. If we got here still `Judging` (the `!session_idle`
+            // drop — the agent resumed on its own mid-judge; the superseded /
+            // `!supervising` drops already left `Watching`/`Held`/`Stopped`),
+            // return to `Watching` so the status isn't pinned in `Judging` with
+            // no live judge. Otherwise the judge-stuck watchdog would later
+            // mistake it for a crashed judge and charge a bogus transient
+            // backoff — compounding, over repeated benign self-resumes, to a
+            // false `Stopped(ProviderError)` that silently kills supervision.
+            if let Some(state) = self.supervisor_states.get_mut(&id)
+                && matches!(state.status, SupervisorStatus::Judging)
+            {
+                state.status = SupervisorStatus::Watching;
+                self.persist_supervisor_state(id, cx);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+            }
             return;
         }
 
@@ -2439,7 +2455,12 @@ impl SolutionAgentStore {
             // single timeout uniformly catches crash, error, AND silent-end
             // without per-judge session-state subscriptions.
             if matches!(status, crate::supervisor::SupervisorStatus::Judging) {
-                let fired_at = last_fired_at.unwrap_or(now_ms);
+                // A `Judging` status with no `last_fired_at` is a corrupt/phantom
+                // wedge (currently unreachable — every fire sets it and the DB
+                // load coerces `Judging`+`None` → `Watching`). Treat `None` as
+                // "already stuck" (`0`, i.e. infinitely old) so it un-wedges
+                // immediately rather than being pinned forever by `now_ms`.
+                let fired_at = last_fired_at.unwrap_or(0);
                 let stuck_ms = now_ms.saturating_sub(fired_at);
                 if stuck_ms >= (crate::supervisor::JUDGE_TIMEOUT_SECS as i64) * 1000 {
                     self.on_judge_failed(
@@ -2503,8 +2524,16 @@ impl SolutionAgentStore {
             // a turn, which bumps `last_activity_at` past the baseline) does the
             // normal idle-nudge cycle re-engage. `None` (a fresh in-session
             // enable) is always eligible — its idle arose under our watch.
-            let eligible_for_watch =
-                watch_started_ms.is_none_or(|baseline| last_activity_ms > baseline);
+            let eligible_for_watch = watch_started_ms
+                .is_none_or(|baseline| last_activity_ms > baseline)
+                // A session with a SCHEDULED fire (`next_eligible_ms` — a
+                // usage-limit auto-resume or a transient-failure backoff) is not
+                // plain inherited idle: the schedule is explicit intent. Honor
+                // it across a restart, or `watch_started_ms` would gate it out
+                // forever and silently break the "observer will auto-continue at
+                // HH:MM" promise (the plain-idle "manual kick" rule still applies
+                // to sessions with no schedule).
+                || next_eligible_ms.is_some();
 
             // Flush a nudge that was held because the user was typing when the
             // judge finished (`send_supervisor_nudge`'s hold-on-typing). Deliver
@@ -2518,6 +2547,20 @@ impl SolutionAgentStore {
                 .get(&id)
                 .is_some_and(|s| s.pending_nudge.is_some());
             if has_pending {
+                // The held nudge only applies while we're still actively
+                // `Watching`. If the session moved to a paused state since the
+                // nudge was parked (user hit Stop → `Held`, supervisor
+                // escalated → `WaitingUser`, quota → `Stopped`, disabled), it is
+                // stale — DROP it rather than dragging the agent back to work
+                // after the user paused it. (Mirrors the wait-wake `Watching`
+                // gate below; the pause paths — `hold_supervisor` etc. — don't
+                // all clear `pending_nudge` themselves.)
+                if !matches!(status, crate::supervisor::SupervisorStatus::Watching) {
+                    if let Some(st) = self.supervisor_states.get_mut(&id) {
+                        st.pending_nudge = None;
+                    }
+                    continue;
+                }
                 let quiet_enough = now_ms.saturating_sub(quiet_since_ms)
                     >= (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000;
                 if idle_or_errored && quiet_enough {

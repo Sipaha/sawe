@@ -10200,6 +10200,52 @@ async fn continue_verdict_dropped_when_agent_already_running(cx: &mut gpui::Test
         store.session(id).unwrap().read(cx).pending_messages.len()
     });
     assert_eq!(queued, 0, "no spurious supervisor nudge queued behind the live turn");
+    // And the drop must return the supervisor to `Watching` — NOT leave it
+    // pinned in `Judging` with no live judge, which the stuck-watchdog would
+    // later mistake for a crashed judge and charge a bogus backoff (audit #1).
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Watching,
+        "a dropped verdict must un-pin the status from Judging back to Watching"
+    );
+}
+
+/// Audit #3: a nudge parked for the "user stopped typing" flush must be DROPPED
+/// (not delivered) if the session moved to a paused state (`Held` etc.) after
+/// it was parked — otherwise a held nudge drags the agent back to work the user
+/// explicitly stopped. Mirrors the wait-wake path's `Watching` gate.
+#[gpui::test]
+async fn pending_nudge_dropped_when_paused_before_flush(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(300);
+        });
+        // A nudge was held (user was typing when the judge finished), then the
+        // user hit Stop → Held. `hold_supervisor` doesn't clear the parked nudge.
+        let st = store.supervisor_states.get_mut(&id).unwrap();
+        st.pending_nudge = Some("continue where you left off".into());
+        st.status = crate::supervisor::SupervisorStatus::Held;
+        store.tick_supervisor(cx);
+    });
+
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert!(
+        st.pending_nudge.is_none(),
+        "a parked nudge must be dropped once the session is paused (Held), not delivered"
+    );
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Held,
+        "the pause state is preserved — the observer stays Held"
+    );
+    let queued = store.read_with(cx, |store, cx| {
+        store.session(id).unwrap().read(cx).pending_messages.len()
+    });
+    assert_eq!(queued, 0, "the stale nudge must not be delivered/queued after a Stop");
 }
 
 #[gpui::test]
