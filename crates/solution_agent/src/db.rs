@@ -655,6 +655,21 @@ impl SolutionAgentDb {
             {
                 let session_id = crate::model::SolutionSessionId::parse(&session_id)
                     .map_err(|e| anyhow!("invalid session id in supervisor_state: {e}"))?;
+                // A judge is in-flight state that lives only in the transient
+                // `judge_sessions` map — it never survives a restart. A row
+                // persisted mid-`Judging` therefore restores as a PHANTOM: no
+                // judge is actually running, so `supersede_judge_on_user_reply`
+                // (gated on `judge_sessions`) can't clear it on a user reply and
+                // the stuck-watchdog only fires if the persisted `last_fired_at`
+                // is already stale — the status row would show "reviewing"
+                // indefinitely. Coerce it back to `Watching` (and drop the stale
+                // `last_fired_at`) on load so a cold session resumes cleanly.
+                let mut status = crate::supervisor::SupervisorStatus::parse_db_string(&status);
+                let mut last_fired = last_fired;
+                if matches!(status, crate::supervisor::SupervisorStatus::Judging) {
+                    status = crate::supervisor::SupervisorStatus::Watching;
+                    last_fired = None;
+                }
                 out.push(crate::supervisor::SupervisorState {
                     session_id,
                     enabled: enabled != 0,
@@ -663,7 +678,7 @@ impl SolutionAgentDb {
                     backoff_attempt: backoff.max(0) as u32,
                     last_fired_at: last_fired,
                     next_eligible_ms: next_eligible,
-                    status: crate::supervisor::SupervisorStatus::parse_db_string(&status),
+                    status,
                     trigger_count: trigger_count.max(0) as u32,
                     // Transient (not persisted): a cold-loaded session has no
                     // in-flight draft to protect from a supervisor nudge.
@@ -674,6 +689,9 @@ impl SolutionAgentDb {
                     pending_nudge: None,
                     // Transient: a parked wait does not survive a restart.
                     wait_until_ms: None,
+                    // Transient: the per-process watch baseline is established
+                    // on the first tick, not restored from disk.
+                    watch_started_ms: None,
                 });
             }
             Ok(out)
@@ -1709,6 +1727,32 @@ mod tests {
         assert_eq!(got.custom_prompt.as_deref(), Some("don't stop before tests pass"));
         assert_eq!(got.status, SupervisorStatus::Stopped(StoppedReason::Quota));
         assert_eq!(got.next_eligible_ms, Some(1_700_000_999_000));
+    }
+
+    // A row persisted mid-`Judging` is a phantom after a restart: the judge
+    // lives only in the transient `judge_sessions` map and never survives.
+    // Loading it as `Judging` would wedge the status row at "reviewing" (no
+    // judge to finish it, and `supersede_judge_on_user_reply` no-ops because
+    // the map is empty). `load_supervisor_states` must coerce it back to
+    // `Watching` and drop the stale `last_fired_at`.
+    #[gpui::test]
+    async fn judging_status_coerced_to_watching_on_load(cx: &mut gpui::TestAppContext) {
+        use crate::supervisor::{SupervisorState, SupervisorStatus};
+        let db = SolutionAgentDb::open(cx.executor()).unwrap();
+
+        let id = crate::model::SolutionSessionId::parse("aaaa1111").unwrap();
+        let mut st = SupervisorState::new(id);
+        st.enabled = true;
+        st.status = SupervisorStatus::Judging;
+        st.last_fired_at = Some(1_700_000_000_000);
+        db.save_supervisor_state(st).await.unwrap();
+
+        let all = db.load_supervisor_states().await.unwrap();
+        let got = all.iter().find(|s| s.session_id == id).unwrap();
+        assert_eq!(got.status, SupervisorStatus::Watching);
+        assert_eq!(got.last_fired_at, None);
+        // A non-Judging status is preserved verbatim (only the phantom is coerced).
+        assert!(got.enabled);
     }
 
     fn make_meta(seq: u32, sol: &str) -> SolutionSessionMetadata {

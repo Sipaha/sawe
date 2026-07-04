@@ -959,7 +959,15 @@ impl SolutionAgentStore {
                 .log_err()
                 .unwrap_or_default();
             this.update(cx, |this, _| {
-                for st in states {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                for mut st in states {
+                    // Restart path: anchor the idle clock to now so a session
+                    // that was idle before this process started (its persisted
+                    // `last_activity_at` is stale) waits a full idle window
+                    // before the first judge, rather than firing one the instant
+                    // the editor reopens. Fresh in-session enables never take
+                    // this path, so their immediate-idle semantics are unchanged.
+                    st.watch_started_ms = Some(now_ms);
                     this.supervisor_states.entry(st.session_id).or_insert(st);
                 }
             })
@@ -2306,6 +2314,11 @@ impl SolutionAgentStore {
             let next_eligible_ms = state.next_eligible_ms;
             let last_fired_at = state.last_fired_at;
             let last_user_input_ms = state.last_user_input_ms;
+            // Anchors the idle clock to "since this process started watching",
+            // set only on the restart/load path (`set_persistence`). A session
+            // whose supervision was enabled fresh THIS process leaves it `None`
+            // (no baseline → normal immediate idle semantics).
+            let watch_started_ms = state.watch_started_ms;
 
             // Judge-stuck watchdog: a judge that errored / ended WITHOUT calling
             // its verdict tool leaves the session pinned in `Judging` forever
@@ -2362,8 +2375,17 @@ impl SolutionAgentStore {
             // Treat live human typing as activity: the supervisor's idle clock
             // counts silence from the LATER of the session's last activity and
             // the user's last keystroke, so a nudge never fires while the user
-            // is mid-message (note_user_input bumps `last_user_input_ms`).
-            let quiet_since_ms = last_activity_ms.max(last_user_input_ms.unwrap_or(0));
+            // is mid-message (note_user_input bumps `last_user_input_ms`). On the
+            // restart path the clock is ALSO floored at the watch baseline
+            // (`watch_started_ms`): a session that loaded already-idle (its last
+            // activity is from before the restart) counts its silence from when
+            // this process began watching, not from that stale timestamp — so
+            // reopening the editor delays the first judge by a full idle window
+            // instead of firing one instantly on inherited idle. `None` (a
+            // fresh in-session enable) floors at 0, i.e. no change.
+            let quiet_since_ms = last_activity_ms
+                .max(last_user_input_ms.unwrap_or(0))
+                .max(watch_started_ms.unwrap_or(0));
 
             // Flush a nudge that was held because the user was typing when the
             // judge finished (`send_supervisor_nudge`'s hold-on-typing). Deliver

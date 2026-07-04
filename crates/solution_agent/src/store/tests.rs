@@ -8715,6 +8715,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         judge_superseded: false,
         pending_nudge: None,
         wait_until_ms: None,
+        watch_started_ms: None,
     };
     db.save_supervisor_state(state.clone())
         .await
@@ -8753,6 +8754,58 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         "custom_prompt must be restored from DB"
     );
     assert_eq!(loaded.status, crate::supervisor::SupervisorStatus::Watching);
+    // The restart/load path stamps a fresh watch baseline so an inherited idle
+    // session doesn't fire a judge the instant the editor reopens.
+    assert!(
+        loaded.watch_started_ms.is_some(),
+        "load must anchor the idle clock to process start"
+    );
+}
+
+/// Regression for "just reopened the editor and the observer fired instantly":
+/// a restored (restart-path) supervisor row carries a `watch_started_ms`
+/// baseline, and `tick_supervisor` floors the idle clock at it. So a session
+/// that loaded already-idle (its `last_activity_at` is stale, from before the
+/// restart) does NOT get a judge on the first tick — the clock has to accrue a
+/// full idle window from the baseline first. The SAME state with no baseline (a
+/// fresh in-session enable) fires immediately, proving the baseline is the gate.
+#[gpui::test]
+async fn restart_baseline_delays_inherited_idle(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            // Idle long enough to clear the threshold on the raw activity clock.
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.set_supervision_enabled(id, true, cx);
+        // Simulate the restart/load path: the process only just started watching.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        store.supervisor_states.get_mut(&id).unwrap().watch_started_ms = Some(now_ms);
+    });
+
+    store.update(cx, |store, cx| store.tick_supervisor(cx));
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Watching,
+        "an inherited idle session must NOT fire a judge on the first tick after restart"
+    );
+    assert!(st.last_fired_at.is_none(), "no judge should have fired");
+
+    // Drop the baseline (as a fresh in-session enable would have it) → the same
+    // idle, silent session now fires immediately.
+    store.update(cx, |store, cx| {
+        store.supervisor_states.get_mut(&id).unwrap().watch_started_ms = None;
+        store.tick_supervisor(cx);
+    });
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.status,
+        crate::supervisor::SupervisorStatus::Judging,
+        "without a baseline the idle session fires as before"
+    );
 }
 
 #[gpui::test]

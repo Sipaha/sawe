@@ -254,6 +254,19 @@ pub struct SupervisorState {
     /// just to re-decide. Cleared on a fresh judge fire, a user message, and
     /// enable/disable. `None` ⟺ no wait is parked.
     pub wait_until_ms: Option<i64>,
+    /// TRANSIENT (not persisted): epoch-ms of when THIS process first started
+    /// watching the session — set lazily on the first `tick_supervisor` pass
+    /// that sees the row (a cold load leaves it `None`). It anchors the idle
+    /// clock to "since we started watching", not to the persisted
+    /// `last_activity_at` (which can be hours old from before a restart). The
+    /// supervisor only judges state that changed UNDER its watch: a session
+    /// that loads already-idle (`last_activity_at <= watch_started_ms`) is
+    /// watched but never retroactively nudged, so reopening the editor no
+    /// longer fires an instant judge on a pre-restart idle session. Once the
+    /// agent produces genuinely-new activity (a turn completes this process,
+    /// bumping `last_activity_at` past this baseline) the normal idle-nudge
+    /// cycle re-engages. `None` on restart by design.
+    pub watch_started_ms: Option<i64>,
 }
 
 impl SupervisorState {
@@ -272,6 +285,7 @@ impl SupervisorState {
             judge_superseded: false,
             pending_nudge: None,
             wait_until_ms: None,
+            watch_started_ms: None,
         }
     }
 }
