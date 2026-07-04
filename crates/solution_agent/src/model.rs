@@ -14,7 +14,6 @@ use crate::background_agent;
 use crate::background_shell;
 use crate::session_entry::SessionEntry;
 
-
 /// Length of a `SolutionSessionId` in ASCII characters. 8 chars over a
 /// 36-char alphabet ≈ 36⁸ ≈ 2.8 × 10¹² combinations — comfortably
 /// collision-free for the realistic upper bound of a few thousand
@@ -397,7 +396,7 @@ pub struct SolutionSession {
     /// detached. For sessions that have never been restored from cold (fresh sessions or sessions
     /// after `reset_context`/`rotate_context`), this is `0`.
     pub live_base: usize,
-/// Store-maintained list of owned session entries for mobile delta-sync
+    /// Store-maintained list of owned session entries for mobile delta-sync
     /// (Phase 2+). Mutated only through `set_entries` setter.
     pub entries: Vec<SessionEntry>,
     /// `true` while a restored tab's `acp_thread_blob` is still being
@@ -644,7 +643,11 @@ impl SolutionSession {
     /// `SessionView::_thread_subscription` on the dead thread and
     /// silently halts conversation-list rendering for that session.
     pub fn set_acp_thread(&mut self, thread: Option<Entity<AcpThread>>, cx: &mut Context<Self>) {
-        self.live_base = if thread.is_some() { self.entries.len() } else { 0 };
+        self.live_base = if thread.is_some() {
+            self.entries.len()
+        } else {
+            0
+        };
         self.acp_thread = thread;
         cx.emit(SolutionSessionEvent::ThreadReplaced);
         cx.notify();
@@ -806,7 +809,13 @@ mod tests {
                 "{before} must resume on activity"
             );
             assert!(
-                matches!(state, SessionState::Running { notified: false, .. }),
+                matches!(
+                    state,
+                    SessionState::Running {
+                        notified: false,
+                        ..
+                    }
+                ),
                 "{before} -> Running, got {state:?}"
             );
         }
@@ -814,11 +823,19 @@ mod tests {
         // Already-active / cancelling states are left untouched (no spurious
         // reset of `notified`, no Stopping -> Running flip).
         let started = Instant::now();
-        let mut running = SessionState::Running { started_at: started, notified: true };
+        let mut running = SessionState::Running {
+            started_at: started,
+            notified: true,
+        };
         assert!(!running.resume_on_activity());
-        assert!(matches!(running, SessionState::Running { notified: true, .. }));
+        assert!(matches!(
+            running,
+            SessionState::Running { notified: true, .. }
+        ));
 
-        let mut stopping = SessionState::Stopping { started_at: started };
+        let mut stopping = SessionState::Stopping {
+            started_at: started,
+        };
         assert!(!stopping.resume_on_activity());
         assert!(matches!(stopping, SessionState::Stopping { .. }));
     }
@@ -832,12 +849,24 @@ mod tests {
         // `Stopped`, and flipping it to Running would wrongly show "Thinking…".
         let mut errored = SessionState::Errored("agent error".into());
         assert!(errored.clear_error_on_activity());
-        assert!(matches!(errored, SessionState::Running { notified: false, .. }));
+        assert!(matches!(
+            errored,
+            SessionState::Running {
+                notified: false,
+                ..
+            }
+        ));
 
         for mut state in [SessionState::Idle, SessionState::AwaitingInput] {
             let before = state.short_label();
-            assert!(!state.clear_error_on_activity(), "{before} must be left untouched");
-            assert!(matches!(state, SessionState::Idle | SessionState::AwaitingInput));
+            assert!(
+                !state.clear_error_on_activity(),
+                "{before} must be left untouched"
+            );
+            assert!(matches!(
+                state,
+                SessionState::Idle | SessionState::AwaitingInput
+            ));
         }
     }
 

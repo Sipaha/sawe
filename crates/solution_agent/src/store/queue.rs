@@ -114,7 +114,10 @@ pub(crate) const QUEUE_HINT_LINE: &str =
 /// stripped from every UI render site by `conversation_render::strip_injected_meta`.
 pub(crate) fn queue_timestamp_prefix(at: chrono::DateTime<Utc>) -> String {
     let local = at.with_timezone(&chrono::Local);
-    format!("{TS_PREFIX_OPEN}{}{TS_PREFIX_CLOSE}", local.format("%H:%M:%S"))
+    format!(
+        "{TS_PREFIX_OPEN}{}{TS_PREFIX_CLOSE}",
+        local.format("%H:%M:%S")
+    )
 }
 
 /// Flatten a content-block bundle into a single human-readable string the
@@ -563,9 +566,10 @@ impl SolutionAgentStore {
                         .pending_messages
                         .back_mut()
                         .expect("back() was Some immediately above");
-                    last.blocks.push(agent_client_protocol::schema::ContentBlock::Text(
-                        agent_client_protocol::schema::TextContent::new("\n\n".to_string()),
-                    ));
+                    last.blocks
+                        .push(agent_client_protocol::schema::ContentBlock::Text(
+                            agent_client_protocol::schema::TextContent::new("\n\n".to_string()),
+                        ));
                     last.blocks.extend(stamped);
                 } else {
                     s.pending_messages.push_back(PendingBundle {
@@ -741,11 +745,10 @@ impl SolutionAgentStore {
                                 .unwrap_or_default();
                             if !main_blocks.is_empty() {
                                 store.mark_queue_changed(session_id, cx);
-                                let mut with_hint =
-                                    Vec::with_capacity(main_blocks.len() + 1);
-                                with_hint.push(acp::ContentBlock::Text(
-                                    acp::TextContent::new(format!("{QUEUE_HINT_LINE}\n\n")),
-                                ));
+                                let mut with_hint = Vec::with_capacity(main_blocks.len() + 1);
+                                with_hint.push(acp::ContentBlock::Text(acp::TextContent::new(
+                                    format!("{QUEUE_HINT_LINE}\n\n"),
+                                )));
                                 with_hint.extend(main_blocks);
                                 store
                                     .send_message_blocks(session_id, with_hint, cx)
@@ -870,10 +873,15 @@ mod tests {
     #[test]
     fn timestamp_prefix_is_compact_local_hms() {
         // 2026-06-03 10:39:12 UTC; formatted in local tz — assert shape, not tz.
-        let at = chrono::Utc.with_ymd_and_hms(2026, 6, 3, 10, 39, 12).unwrap();
+        let at = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 3, 10, 39, 12)
+            .unwrap();
         let prefix = queue_timestamp_prefix(at);
         assert!(prefix.starts_with('['), "prefix must open with '['");
-        assert!(prefix.ends_with("] "), "prefix must end with '] ' separator");
+        assert!(
+            prefix.ends_with("] "),
+            "prefix must end with '] ' separator"
+        );
         let inner = prefix
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix("] "))

@@ -130,7 +130,10 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
             store.close_session(id, cx).expect("close_session");
 
             assert!(store.session(id).is_none());
-            assert!(!store.supervisor_states.contains_key(&id), "supervisor_states leaked");
+            assert!(
+                !store.supervisor_states.contains_key(&id),
+                "supervisor_states leaked"
+            );
             assert!(
                 !store.background_agent_watchers.contains_key(&id),
                 "background_agent_watchers leaked"
@@ -139,13 +142,22 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
                 !store.background_shell_watchers.contains_key(&id),
                 "background_shell_watchers leaked"
             );
-            assert!(!store.backoff_timers.contains_key(&id), "backoff_timers leaked");
+            assert!(
+                !store.backoff_timers.contains_key(&id),
+                "backoff_timers leaked"
+            );
             assert!(
                 !store.parent_jsonl_scan_offsets.contains_key(&id),
                 "parent_jsonl_scan_offsets leaked"
             );
-            assert!(!store.judge_sessions.contains_key(&id), "judge_sessions leaked");
-            assert!(!store.auditor_sessions.contains_key(&id), "auditor_sessions leaked");
+            assert!(
+                !store.judge_sessions.contains_key(&id),
+                "judge_sessions leaked"
+            );
+            assert!(
+                !store.auditor_sessions.contains_key(&id),
+                "auditor_sessions leaked"
+            );
             assert!(
                 !store.metrics_emitter.last_emit.lock().contains_key(&id),
                 "metrics_emitter.last_emit leaked"
@@ -177,8 +189,9 @@ fn push_and_evict_transcripts_keeps_window() {
 #[gpui::test]
 async fn close_session_purges_inbox_attachments(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
-    let (inbox_dir, db) =
-        store.update(cx, |store, cx| (store.session_inbox_dir(id, cx), store.persistence()));
+    let (inbox_dir, db) = store.update(cx, |store, cx| {
+        (store.session_inbox_dir(id, cx), store.persistence())
+    });
     let db = db.expect("seeded store has persistence");
 
     std::fs::create_dir_all(&inbox_dir).unwrap();
@@ -194,7 +207,10 @@ async fn close_session_purges_inbox_attachments(cx: &mut gpui::TestAppContext) {
     .unwrap();
     assert!(file.exists());
     assert_eq!(
-        db.attachment_paths_for_session(id.to_string()).await.unwrap().len(),
+        db.attachment_paths_for_session(id.to_string())
+            .await
+            .unwrap()
+            .len(),
         1
     );
 
@@ -266,7 +282,10 @@ async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::Tes
         assert!(store.session(id).is_none(), "entity must be gone");
         assert!(
             !store.sessions_for(&sol).iter().any(|_| true)
-                || store.by_solution.get(&sol).map_or(true, |v| !v.contains(&id)),
+                || store
+                    .by_solution
+                    .get(&sol)
+                    .map_or(true, |v| !v.contains(&id)),
             "id must be removed from by_solution"
         );
     });
@@ -335,7 +354,9 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
     })
     .await
     .unwrap();
-    db.upsert_entry(id, 0, 0, 0, None, b"e".to_vec()).await.unwrap();
+    db.upsert_entry(id, 0, 0, 0, None, b"e".to_vec())
+        .await
+        .unwrap();
     db.save_supervisor_state(crate::supervisor::SupervisorState::new(id))
         .await
         .unwrap();
@@ -352,12 +373,18 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
             "by_solution entry for the deleted solution must be gone"
         );
     });
-    assert!(!agents_dir.exists(), ".agents tree must be wholesale-removed");
+    assert!(
+        !agents_dir.exists(),
+        ".agents tree must be wholesale-removed"
+    );
     assert!(
         db.list_for_solution(sol.clone()).await.unwrap().is_empty(),
         "session rows must be hard-deleted"
     );
-    assert!(db.load_entries(id).await.unwrap().is_empty(), "entries gone");
+    assert!(
+        db.load_entries(id).await.unwrap().is_empty(),
+        "entries gone"
+    );
     assert!(
         db.load_supervisor_states()
             .await
@@ -372,9 +399,7 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
 /// `<root>/.agents/<sid>/` on-disk tree, and keeps the supervisor_state row so a
 /// later reopen restores both the transcript and supervision settings.
 #[gpui::test]
-async fn close_session_is_soft_keeps_archive_dir_and_supervisor_row(
-    cx: &mut gpui::TestAppContext,
-) {
+async fn close_session_is_soft_keeps_archive_dir_and_supervisor_row(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
     let (archive_dir, db, sol) = store.update(cx, |store, cx| {
         let sol = store.session(id).unwrap().read(cx).solution_id.clone();
@@ -454,7 +479,9 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
         let solution_store = SolutionStore::for_test(cfg_path, cx);
         solutions::install_global_for_test(solution_store.clone(), cx);
         let sol = solution_store
-            .update(cx, |s, cx| s.create_solution("Sol", solutions_root.clone(), cx))
+            .update(cx, |s, cx| {
+                s.create_solution("Sol", solutions_root.clone(), cx)
+            })
             .expect("create_solution");
         let root = solution_store.read(cx).solutions()[0].root.clone();
         let member_path = root.join("kept-member");
@@ -478,7 +505,8 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
             (at_root, root.clone()),
             (orphan, root.join("removed-member")),
         ] {
-            let session = insert_cold_session(sid, sol.clone(), agent.clone(), None, None, store, cx);
+            let session =
+                insert_cold_session(sid, sol.clone(), agent.clone(), None, None, store, cx);
             session.update(cx, |s, _| s.cwd = cwd);
         }
         store.gc_orphan_members(cx);
@@ -486,9 +514,15 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
     cx.run_until_parked();
 
     store.update(cx, |store, _| {
-        assert!(store.session(under_member).is_some(), "member-dir session kept");
+        assert!(
+            store.session(under_member).is_some(),
+            "member-dir session kept"
+        );
         assert!(store.session(at_root).is_some(), "root session kept");
-        assert!(store.session(orphan).is_none(), "removed-member session purged");
+        assert!(
+            store.session(orphan).is_none(),
+            "removed-member session purged"
+        );
     });
 }
 
@@ -499,9 +533,15 @@ async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppConte
     // the root) + a persistence DB.
     let (store, seeded, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
     let sol = store.read_with(cx, |s, cx| {
-        s.session(seeded).expect("seeded").read(cx).solution_id.clone()
+        s.session(seeded)
+            .expect("seeded")
+            .read(cx)
+            .solution_id
+            .clone()
     });
-    let db = store.read_with(cx, |s, _| s.persistence()).expect("persistence");
+    let db = store
+        .read_with(cx, |s, _| s.persistence())
+        .expect("persistence");
 
     // Two persisted sessions in the same solution: one soft-closed 40 days ago
     // (past the 30d TTL → reap), one 5 days ago (inside it → keep).
@@ -509,7 +549,15 @@ async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppConte
     let recent = SolutionSessionId::new();
     store.update(cx, |store, cx| {
         for id in [old, recent] {
-            insert_cold_session(id, sol.clone(), SharedString::from("claude-acp"), None, None, store, cx);
+            insert_cold_session(
+                id,
+                sol.clone(),
+                SharedString::from("claude-acp"),
+                None,
+                None,
+                store,
+                cx,
+            );
             store.persist_session_row(id, cx);
         }
     });
@@ -520,11 +568,16 @@ async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppConte
     db.mark_closed(old, Some(Utc.timestamp_millis_opt(now - 40 * day).unwrap()))
         .await
         .unwrap();
-    db.mark_closed(recent, Some(Utc.timestamp_millis_opt(now - 5 * day).unwrap()))
-        .await
-        .unwrap();
+    db.mark_closed(
+        recent,
+        Some(Utc.timestamp_millis_opt(now - 5 * day).unwrap()),
+    )
+    .await
+    .unwrap();
 
-    store.update(cx, |store, cx| store.reap_stale_closed_sessions(sol.clone(), cx));
+    store.update(cx, |store, cx| {
+        store.reap_stale_closed_sessions(sol.clone(), cx)
+    });
     cx.run_until_parked();
 
     let ids: Vec<SolutionSessionId> = db
@@ -573,7 +626,10 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
             store.cold_close_solution(&sol, cx);
 
             assert!(store.session(id).is_none());
-            assert!(!store.supervisor_states.contains_key(&id), "supervisor_states leaked");
+            assert!(
+                !store.supervisor_states.contains_key(&id),
+                "supervisor_states leaked"
+            );
             assert!(
                 !store.background_agent_watchers.contains_key(&id),
                 "background_agent_watchers leaked"
@@ -582,8 +638,14 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
                 !store.background_shell_watchers.contains_key(&id),
                 "background_shell_watchers leaked"
             );
-            assert!(!store.backoff_timers.contains_key(&id), "backoff_timers leaked");
-            assert!(!store.judge_sessions.contains_key(&id), "judge_sessions leaked");
+            assert!(
+                !store.backoff_timers.contains_key(&id),
+                "backoff_timers leaked"
+            );
+            assert!(
+                !store.judge_sessions.contains_key(&id),
+                "judge_sessions leaked"
+            );
         });
     });
 }
@@ -684,7 +746,10 @@ fn user_reply_supersedes_in_flight_judge(cx: &mut TestAppContext) {
                 "in-flight judge must be torn down on a user reply"
             );
             assert!(
-                matches!(store.supervisor_states[&id].status, SupervisorStatus::Watching),
+                matches!(
+                    store.supervisor_states[&id].status,
+                    SupervisorStatus::Watching
+                ),
                 "supervisor returns to Watching after the reply, got {:?}",
                 store.supervisor_states[&id].status
             );
@@ -852,7 +917,11 @@ async fn close_session_releases_pooled_connection(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
     cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, _| {
-            assert_eq!(store.pool_size(), 1, "a spawned session holds one pooled connection");
+            assert_eq!(
+                store.pool_size(),
+                1,
+                "a spawned session holds one pooled connection"
+            );
         });
     });
 
@@ -1525,11 +1594,22 @@ async fn streaming_activity_clears_latched_errored_state(cx: &mut TestAppContext
         cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                let state = store.session(session_id).expect("session exists").read(cx).state.clone();
+                let state = store
+                    .session(session_id)
+                    .expect("session exists")
+                    .read(cx)
+                    .state
+                    .clone();
                 if want_running {
-                    assert!(matches!(state, SessionState::Running { .. }), "{ctx}: expected Running, got {state:?}");
+                    assert!(
+                        matches!(state, SessionState::Running { .. }),
+                        "{ctx}: expected Running, got {state:?}"
+                    );
                 } else {
-                    assert!(matches!(state, SessionState::Errored(_)), "{ctx}: expected Errored, got {state:?}");
+                    assert!(
+                        matches!(state, SessionState::Errored(_)),
+                        "{ctx}: expected Errored, got {state:?}"
+                    );
                 }
             });
         });
@@ -1542,20 +1622,31 @@ async fn streaming_activity_clears_latched_errored_state(cx: &mut TestAppContext
 
     // 2. An Observer breadcrumb (SystemNote) is editor-originated, not agent
     //    activity — it must NOT clear the error.
-    cx.update(|cx| acp_thread.update(cx, |t, cx| {
-        t.push_system_note(acp_thread::SystemNoteLevel::Observer, "Наблюдатель направил агента", cx);
-    }));
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_system_note(
+                acp_thread::SystemNoteLevel::Observer,
+                "Наблюдатель направил агента",
+                cx,
+            );
+        })
+    });
     cx.executor().run_until_parked();
     check(cx, false, "after SystemNote");
 
     // 3. A genuine new assistant entry (NewEntry) means the agent recovered —
     //    clears Errored -> Running.
-    cx.update(|cx| acp_thread.update(cx, |t, cx| {
-        t.push_assistant_content_block(
-            agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new("recovering".to_string())),
-            false, cx);
-    }));
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("recovering".to_string()),
+                ),
+                false,
+                cx,
+            );
+        })
+    });
     cx.executor().run_until_parked();
     check(cx, true, "after recovered NewEntry");
 
@@ -1565,14 +1656,96 @@ async fn streaming_activity_clears_latched_errored_state(cx: &mut TestAppContext
     cx.update(|cx| acp_thread.update(cx, |_t, cx| cx.emit(acp_thread::AcpThreadEvent::Error)));
     cx.executor().run_until_parked();
     check(cx, false, "after second Error");
-    cx.update(|cx| acp_thread.update(cx, |t, cx| {
-        t.push_assistant_content_block(
-            agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new(" more".to_string())),
-            false, cx);
-    }));
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(" more".to_string()),
+                ),
+                false,
+                cx,
+            );
+        })
+    });
     cx.executor().run_until_parked();
     check(cx, true, "after streaming EntryUpdated");
+}
+
+/// The stuck watchdog must NOT treat a usage/session-limit wall as a hang. A
+/// turn that hits the limit prints the wall as its last assistant message and
+/// then stalls (Running, silent past STUCK_TURN_SECS, no in-progress tool) —
+/// which looks wedged. Reconnecting + "carry on" there just re-hits the wall
+/// and burns quota (the reported loop). Instead the session is stopped with
+/// the wall message (NOT `reconnecting…`) and the supervisor is parked at
+/// `Stopped(Quota)` (no parseable reset in this message).
+#[gpui::test]
+async fn stuck_usage_limit_wall_stops_without_reconnect(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // The turn's last assistant message is the limit wall.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "You've hit your session limit".to_string(),
+                    ),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Force the wedged shape: Running, last activity well past STUCK_TURN_SECS
+    // (5 min), no in-progress tool. Set the stale timestamp AFTER the push
+    // (which bumps last_activity to now). Supervision on, to observe the stop.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            let session = store.session(session_id).unwrap();
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+                s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(6 * 60);
+            });
+            store.tick_stuck_sessions(cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let state = store.session(session_id).unwrap().read(cx).state.clone();
+            match state {
+                SessionState::Errored(msg) => {
+                    assert!(
+                        msg.contains("session limit"),
+                        "must stop with the wall message, got {msg:?}"
+                    );
+                    assert!(
+                        !msg.contains("reconnect"),
+                        "must NOT take the reconnect path, got {msg:?}"
+                    );
+                }
+                other => panic!("expected Errored(wall), got {other:?}"),
+            }
+            let st = store.supervisor_state(session_id).unwrap();
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Stopped(
+                    crate::supervisor::StoppedReason::Quota
+                ),
+                "supervisor parked at Stopped(Quota) for a no-reset limit"
+            );
+            assert!(!st.enabled);
+        });
+    });
 }
 
 #[gpui::test]
@@ -1816,7 +1989,10 @@ async fn take_pending_for_delivery_drains_pushes_and_formats(cx: &mut TestAppCon
         })
     });
     let text = mid.expect("pending present");
-    assert!(text.contains("hello"), "delivers user content, got {text:?}");
+    assert!(
+        text.contains("hello"),
+        "delivers user content, got {text:?}"
+    );
     assert!(
         !text.contains(crate::store::queue::QUEUE_HINT_LINE),
         "no hint mid-work, got {text:?}"
@@ -1945,7 +2121,12 @@ async fn take_pending_routes_by_target(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             assert_eq!(
-                store.session(session_id).unwrap().read(cx).pending_messages.len(),
+                store
+                    .session(session_id)
+                    .unwrap()
+                    .read(cx)
+                    .pending_messages
+                    .len(),
                 2,
                 "distinct targets must NOT merge into one bundle"
             );
@@ -1972,12 +2153,20 @@ async fn take_pending_routes_by_target(cx: &mut TestAppContext) {
         })
         .expect("teammate bundle delivered");
     assert!(sub.contains("for teammate"), "got {sub:?}");
-    assert!(!sub.contains("for main"), "must not leak the Main bundle, got {sub:?}");
+    assert!(
+        !sub.contains("for main"),
+        "must not leak the Main bundle, got {sub:?}"
+    );
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             assert_eq!(
-                store.session(session_id).unwrap().read(cx).pending_messages.len(),
+                store
+                    .session(session_id)
+                    .unwrap()
+                    .read(cx)
+                    .pending_messages
+                    .len(),
                 1,
                 "Main bundle stays queued after the teammate drains its own"
             );
@@ -1998,7 +2187,12 @@ async fn take_pending_routes_by_target(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             assert_eq!(
-                store.session(session_id).unwrap().read(cx).pending_messages.len(),
+                store
+                    .session(session_id)
+                    .unwrap()
+                    .read(cx)
+                    .pending_messages
+                    .len(),
                 0,
                 "queue empty after both addressees drained"
             );
@@ -2051,7 +2245,12 @@ async fn main_hook_never_drains_subagent_bundle(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             assert_eq!(
-                store.session(session_id).unwrap().read(cx).pending_messages.len(),
+                store
+                    .session(session_id)
+                    .unwrap()
+                    .read(cx)
+                    .pending_messages
+                    .len(),
                 1,
                 "subagent bundle stays queued for its own (now-gone) addressee"
             );
@@ -2108,7 +2307,12 @@ async fn take_pending_holds_image_bundle_for_idle_flush(cx: &mut TestAppContext)
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             assert_eq!(
-                store.session(session_id).unwrap().read(cx).pending_messages.len(),
+                store
+                    .session(session_id)
+                    .unwrap()
+                    .read(cx)
+                    .pending_messages
+                    .len(),
                 1,
                 "image bundle stays queued for the idle-flush (full-content re-send)"
             );
@@ -2137,9 +2341,7 @@ async fn take_pending_delivers_image_as_readable_path_mid_turn(cx: &mut TestAppC
                 .send_message_blocks(
                     session_id,
                     vec![
-                        acp::ContentBlock::Text(acp::TextContent::new(
-                            "look at this".to_string(),
-                        )),
+                        acp::ContentBlock::Text(acp::TextContent::new("look at this".to_string())),
                         // base64 "ZGF0YQ==" decodes to the bytes b"data".
                         acp::ContentBlock::Image(acp::ImageContent::new(
                             "ZGF0YQ==".to_string(),
@@ -2182,7 +2384,10 @@ async fn take_pending_delivers_image_as_readable_path_mid_turn(cx: &mut TestAppC
         "path {path:?} keeps the png extension"
     );
     let written = std::fs::read(&path).expect("inbox image file must exist");
-    assert_eq!(written, b"data", "inbox file must hold the decoded image bytes");
+    assert_eq!(
+        written, b"data",
+        "inbox file must hold the decoded image bytes"
+    );
     let _ = std::fs::remove_file(&path);
 
     // Queue is drained — nothing left for the idle-flush to re-send.
@@ -2190,7 +2395,12 @@ async fn take_pending_delivers_image_as_readable_path_mid_turn(cx: &mut TestAppC
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             assert!(
-                store.session(session_id).unwrap().read(cx).pending_messages.is_empty(),
+                store
+                    .session(session_id)
+                    .unwrap()
+                    .read(cx)
+                    .pending_messages
+                    .is_empty(),
                 "image bundle must be drained after mid-turn delivery"
             );
         });
@@ -2221,7 +2431,9 @@ fn stale_archive_dirs_gates_on_count_then_age() {
     };
 
     // <= the min-session gate: keep everything, even ancient archives.
-    let small: Vec<_> = (0..ARCHIVE_REAP_MIN_SESSIONS).map(|n| make(n, 999)).collect();
+    let small: Vec<_> = (0..ARCHIVE_REAP_MIN_SESSIONS)
+        .map(|n| make(n, 999))
+        .collect();
     assert!(
         stale_archive_dirs(root, &small, now).is_empty(),
         "small workspaces keep their full history"
@@ -2236,7 +2448,11 @@ fn stale_archive_dirs_gates_on_count_then_age() {
     metas.extend(stale.iter().cloned());
 
     let reaped = stale_archive_dirs(root, &metas, now);
-    assert_eq!(reaped.len(), stale.len(), "only the stale sessions are reaped");
+    assert_eq!(
+        reaped.len(),
+        stale.len(),
+        "only the stale sessions are reaped"
+    );
     for m in &stale {
         assert!(
             reaped.contains(&root.join(".agents").join(m.id.to_string())),
@@ -2775,8 +2991,15 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
             let sa = store.session(id_a).expect("session A restored");
             sa.read_with(cx, |s, _| {
                 assert!(s.is_cold(), "restored session should be cold");
-                assert_eq!(s.entries.len(), 2, "entries must hold the 2 restored entries");
-                assert_eq!(s.live_base, 0, "cold session has live_base = 0 (no live thread)");
+                assert_eq!(
+                    s.entries.len(),
+                    2,
+                    "entries must hold the 2 restored entries"
+                );
+                assert_eq!(
+                    s.live_base, 0,
+                    "cold session has live_base = 0 (no live thread)"
+                );
                 assert!(
                     matches!(
                         s.entries[0].kind,
@@ -2926,7 +3149,9 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
         chunks: vec![],
     };
     let assistant = crate::session_entry::SessionEntryKind::AssistantMessage {
-        chunks: vec![crate::session_entry::AssistantChunk::Message("reply".into())],
+        chunks: vec![crate::session_entry::AssistantChunk::Message(
+            "reply".into(),
+        )],
     };
     db.upsert_entry(
         id_a,
@@ -3042,14 +3267,30 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
         chunks: vec![],
     };
     let assistant = crate::session_entry::SessionEntryKind::AssistantMessage {
-        chunks: vec![crate::session_entry::AssistantChunk::Message("reply".into())],
+        chunks: vec![crate::session_entry::AssistantChunk::Message(
+            "reply".into(),
+        )],
     };
-    db.upsert_entry(id_a, 0, 1, 1_700_000_000_000, None, serde_json::to_vec(&user).unwrap())
-        .await
-        .expect("row 0");
-    db.upsert_entry(id_a, 1, 2, 1_700_000_001_000, None, serde_json::to_vec(&assistant).unwrap())
-        .await
-        .expect("row 1");
+    db.upsert_entry(
+        id_a,
+        0,
+        1,
+        1_700_000_000_000,
+        None,
+        serde_json::to_vec(&user).unwrap(),
+    )
+    .await
+    .expect("row 0");
+    db.upsert_entry(
+        id_a,
+        1,
+        2,
+        1_700_000_001_000,
+        None,
+        serde_json::to_vec(&assistant).unwrap(),
+    )
+    .await
+    .expect("row 1");
     const PERSISTED_CHANGE_SEQ: i64 = 9;
     db.save_change_seq(id_a, PERSISTED_CHANGE_SEQ)
         .await
@@ -3160,22 +3401,39 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
         chunks: vec![],
     };
     let assistant = crate::session_entry::SessionEntryKind::AssistantMessage {
-        chunks: vec![crate::session_entry::AssistantChunk::Message("reply".into())],
+        chunks: vec![crate::session_entry::AssistantChunk::Message(
+            "reply".into(),
+        )],
     };
-    db.upsert_entry(id_a, 0, 1, 1_700_000_000_000, None, serde_json::to_vec(&user).unwrap())
-        .await
-        .expect("row 0");
-    db.upsert_entry(id_a, 1, 2, 1_700_000_001_000, None, serde_json::to_vec(&assistant).unwrap())
-        .await
-        .expect("row 1");
+    db.upsert_entry(
+        id_a,
+        0,
+        1,
+        1_700_000_000_000,
+        None,
+        serde_json::to_vec(&user).unwrap(),
+    )
+    .await
+    .expect("row 0");
+    db.upsert_entry(
+        id_a,
+        1,
+        2,
+        1_700_000_001_000,
+        None,
+        serde_json::to_vec(&assistant).unwrap(),
+    )
+    .await
+    .expect("row 1");
     // Intentionally do NOT call save_change_seq → column stays NULL.
     db.update_tab_orders(solution_id.clone(), vec![id_a])
         .await
         .expect("tab order");
 
     cx.update(|cx| {
-        SolutionAgentStore::global(cx)
-            .update(cx, |store, cx| store.restore_open_tabs(solution_id.clone(), cx))
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.restore_open_tabs(solution_id.clone(), cx)
+        })
     })
     .await
     .expect("restore");
@@ -3306,7 +3564,10 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     // The migration (persist_all_rows) is spawned + detached; let it land.
     cx.run_until_parked();
 
-    let rows = db.load_entries(id_a).await.expect("load rows after migrate");
+    let rows = db
+        .load_entries(id_a)
+        .await
+        .expect("load rows after migrate");
     assert_eq!(rows.len(), 2, "migration must have written rows");
 
     // Second cold-restore: drop the in-memory session, restore again — now the
@@ -3342,7 +3603,11 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         store.update(cx, |store, cx| {
             let sa = store.session(id_a).expect("session A re-restored");
             sa.read_with(cx, |s, _| {
-                assert_eq!(s.entries.len(), 2, "2nd restore loads same entries from rows");
+                assert_eq!(
+                    s.entries.len(),
+                    2,
+                    "2nd restore loads same entries from rows"
+                );
             });
         });
     });
@@ -3446,7 +3711,10 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     cx.run_until_parked();
 
     // Confirm rows were written and metadata column was backfilled.
-    let rows = db.load_entries(id_a).await.expect("load rows after migrate");
+    let rows = db
+        .load_entries(id_a)
+        .await
+        .expect("load rows after migrate");
     assert_eq!(rows.len(), 1, "migration must have written 1 row");
     let metas = db
         .list_for_solution(solution_id.clone())
@@ -3594,7 +3862,10 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
 
     // Migration writes rows.
     cx.run_until_parked();
-    let rows = db.load_entries(id_a).await.expect("load rows after migrate");
+    let rows = db
+        .load_entries(id_a)
+        .await
+        .expect("load rows after migrate");
     assert_eq!(
         rows.len(),
         2,
@@ -4183,14 +4454,13 @@ fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
         SolutionAgentStore::init_global(cx, Arc::new(empty_registry));
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let meta =
-                store.build_session_meta(
-                    &SharedString::from("empty-adapter"),
-                    &solution,
-                    None,
-                    None,
-                    cx,
-                );
+            let meta = store.build_session_meta(
+                &SharedString::from("empty-adapter"),
+                &solution,
+                None,
+                None,
+                cx,
+            );
             assert!(meta.is_none(), "empty prompt yields None");
         });
     });
@@ -4336,10 +4606,7 @@ async fn append_stamps_entry_created_ms_once_per_index(cx: &mut TestAppContext) 
 
     let (stamp0, stamp1) = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        let session = store
-            .read(cx)
-            .session(session_id)
-            .expect("session exists");
+        let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
         assert_eq!(s.entries.len(), 2, "two appends → two entries");
         (s.entries[0].created_ms, s.entries[1].created_ms)
@@ -4366,10 +4633,7 @@ async fn append_stamps_entry_created_ms_once_per_index(cx: &mut TestAppContext) 
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        let session = store
-            .read(cx)
-            .session(session_id)
-            .expect("session exists");
+        let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
         assert_eq!(s.entries.len(), 2, "in-place update must not add an entry");
         assert_eq!(
@@ -4422,7 +4686,10 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
             );
             let kind = crate::session_entry::kind_from_payload(&row.payload)
                 .expect("payload decodes to a kind");
-            assert_eq!(kind, entry.kind, "row payload must decode to the entry kind");
+            assert_eq!(
+                kind, entry.kind,
+                "row payload must decode to the entry kind"
+            );
         }
     }
 
@@ -4483,7 +4750,11 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
     assert_rows_match(cx, &db, session_id).await;
     let remaining = db.load_entries(session_id).await.expect("load entries");
-    assert_eq!(remaining.len(), 1, "EntriesRemoved must delete the trailing row");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "EntriesRemoved must delete the trailing row"
+    );
 }
 
 /// Ephemeral supervisor judge/auditor sessions must leave NO durable trace: a
@@ -4609,10 +4880,7 @@ async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut Test
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        let session = store
-            .read(cx)
-            .session(session_id)
-            .expect("session exists");
+        let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
 
         // All three entries must be present (2 historical + 1 new).
@@ -4634,7 +4902,6 @@ async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut Test
         );
     });
 }
-
 
 #[gpui::test]
 async fn reset_context_clears_entries(cx: &mut TestAppContext) {
@@ -4724,12 +4991,13 @@ async fn entries_removed_truncates_entries(cx: &mut TestAppContext) {
 
     let stamp0 = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        let session = store
-            .read(cx)
-            .session(session_id)
-            .expect("session exists");
+        let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
-        assert_eq!(s.entries.len(), 2, "two appends → two entries before removal");
+        assert_eq!(
+            s.entries.len(),
+            2,
+            "two appends → two entries before removal"
+        );
         s.entries[0].created_ms
     });
 
@@ -4746,10 +5014,7 @@ async fn entries_removed_truncates_entries(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        let session = store
-            .read(cx)
-            .session(session_id)
-            .expect("session exists");
+        let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
         assert_eq!(
             s.entries.len(),
@@ -5009,7 +5274,8 @@ async fn final_streamed_message_is_visible_to_delta_poll_after_stop(cx: &mut Tes
     // Stream a long trailing tail into the assistant entry. It lands in the
     // streaming buffer and is revealed gradually — the final bytes only reach
     // the markdown when the buffer is flushed at end-of-turn.
-    const TAIL: &str = "this is the final sentence of the assistant's reply that must reach the phone.";
+    const TAIL: &str =
+        "this is the final sentence of the assistant's reply that must reach the phone.";
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
@@ -5032,7 +5298,9 @@ async fn final_streamed_message_is_visible_to_delta_poll_after_stop(cx: &mut Tes
             let _ = t.cancel(cx);
             let last = t.entries().len().saturating_sub(1);
             cx.emit(acp_thread::AcpThreadEvent::EntryUpdated(last));
-            cx.emit(acp_thread::AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
         });
     });
     cx.executor().run_until_parked();
@@ -5205,7 +5473,9 @@ async fn stopped_flushes_pending_entry_update_debounce_immediately(cx: &mut Test
     // advance.
     cx.update(|cx| {
         acp_thread.update(cx, |_t, cx| {
-            cx.emit(acp_thread::AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
         });
     });
     cx.executor().run_until_parked();
@@ -5536,8 +5806,12 @@ async fn registered_store_pull_drains_queue_and_returns_followup_text(cx: &mut T
     // A subagent's hook (agent_id present) must NOT drain the main queue —
     // otherwise a running Agent Teams teammate swallows the follow-up. It
     // stays queued for the main agent's next hook.
-    let sub_pull =
-        native.invoke_store_pull_for_test(&acp_session_id, Some("sub-agent-1"), false, &mut async_cx);
+    let sub_pull = native.invoke_store_pull_for_test(
+        &acp_session_id,
+        Some("sub-agent-1"),
+        false,
+        &mut async_cx,
+    );
     assert!(
         sub_pull.is_none(),
         "a subagent hook must not drain the main agent's queue, got {sub_pull:?}"
@@ -7678,10 +7952,7 @@ async fn new_entry_rebuilds_session_entries(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        let session = store
-            .read(cx)
-            .session(session_id)
-            .expect("session exists");
+        let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
         // Cold prefix is empty for a fresh session; live has 2 entries → entries must be 2.
         assert_eq!(
@@ -7692,7 +7963,10 @@ async fn new_entry_rebuilds_session_entries(cx: &mut TestAppContext) {
         );
         // The last entry must be the assistant message we just appended.
         assert!(
-            matches!(s.entries.last().unwrap().kind, SessionEntryKind::AssistantMessage { .. }),
+            matches!(
+                s.entries.last().unwrap().kind,
+                SessionEntryKind::AssistantMessage { .. }
+            ),
             "last entries element must be AssistantMessage, got {:?}",
             s.entries.last().unwrap().kind
         );
@@ -7767,8 +8041,7 @@ async fn entry_updated_preserves_created_ms(cx: &mut TestAppContext) {
         );
         // Entry 0's created_ms must be unchanged (no restamp on update).
         assert_eq!(
-            s.entries[0].created_ms,
-            original_entry0_created_ms,
+            s.entries[0].created_ms, original_entry0_created_ms,
             "EntryUpdated must not restamp entry 0's created_ms"
         );
         // Entry 1 must still exist.
@@ -7864,8 +8137,7 @@ async fn mod_seq_stamped_on_live_mutations(cx: &mut TestAppContext) {
             "entry1.mod_seq must remain 3 (unchanged by EntryUpdated on entry0)"
         );
         assert_eq!(
-            s.entries[0].created_ms,
-            original_entry0_created_ms,
+            s.entries[0].created_ms, original_entry0_created_ms,
             "EntryUpdated must not restamp entry0.created_ms"
         );
     });
@@ -8022,7 +8294,8 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
         store.update(cx, |store, cx| {
             let session = store.session(session_id).expect("session exists");
             session.update(cx, |s, cx| {
-                let stamped = crate::session_entry::rebuild_entries(&cold_entries, &[], &created_ms, 0, cx);
+                let stamped =
+                    crate::session_entry::rebuild_entries(&cold_entries, &[], &created_ms, 0, cx);
                 s.set_entries(stamped, cx);
                 s.init_change_seq_from_entries();
                 // Re-attach the live thread so live_base = 2 and the store
@@ -8042,14 +8315,8 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
         let session = store.read(cx).session(session_id).expect("session");
         let s = session.read(cx);
         assert_eq!(s.entries.len(), 2, "expected 2 cold entries");
-        assert_eq!(
-            s.entries[0].mod_seq, 1,
-            "cold entry[0].mod_seq must be 1"
-        );
-        assert_eq!(
-            s.entries[1].mod_seq, 2,
-            "cold entry[1].mod_seq must be 2"
-        );
+        assert_eq!(s.entries[0].mod_seq, 1, "cold entry[0].mod_seq must be 1");
+        assert_eq!(s.entries[1].mod_seq, 2, "cold entry[1].mod_seq must be 2");
         assert_eq!(
             s.change_seq, 5,
             "change_seq must be max(mod_seq)=2 + 3 watermark bumps after cold restore"
@@ -8308,9 +8575,7 @@ async fn mutate_state_bumps_state_watermark(cx: &mut TestAppContext) {
 /// test confirms the guard is specific to the ephemeral flag (and that internal
 /// bookkeeping — `state_seq` — still advances for the judge).
 #[gpui::test]
-async fn ephemeral_session_state_change_does_not_emit_workspace_event(
-    cx: &mut TestAppContext,
-) {
+async fn ephemeral_session_state_change_does_not_emit_workspace_event(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
 
     cx.update(editor_mcp::workspace_seq::install);
@@ -8397,7 +8662,12 @@ async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
     // Record the epoch before any reset.
     let epoch_before = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store.read(cx).session(session_id).expect("session").read(cx).epoch
+        store
+            .read(cx)
+            .session(session_id)
+            .expect("session")
+            .read(cx)
+            .epoch
     });
 
     // Fire a plain NewEntry — must NOT bump epoch.
@@ -8416,7 +8686,12 @@ async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
 
     let epoch_after_entry = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store.read(cx).session(session_id).expect("session").read(cx).epoch
+        store
+            .read(cx)
+            .session(session_id)
+            .expect("session")
+            .read(cx)
+            .epoch
     });
     assert_eq!(
         epoch_after_entry, epoch_before,
@@ -8434,7 +8709,12 @@ async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
 
     let epoch_after_reset = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store.read(cx).session(session_id).expect("session").read(cx).epoch
+        store
+            .read(cx)
+            .session(session_id)
+            .expect("session")
+            .read(cx)
+            .epoch
     });
     assert_eq!(
         epoch_after_reset,
@@ -8472,7 +8752,11 @@ async fn reset_context_with_queue_bumps_epoch_and_queue_watermark(cx: &mut TestA
                 .send_message_blocks(session_id, blocks, cx)
                 .detach_and_log_err(cx);
             let s = session.read(cx);
-            assert_eq!(s.pending_messages.len(), 1, "one bundle queued before /clear");
+            assert_eq!(
+                s.pending_messages.len(),
+                1,
+                "one bundle queued before /clear"
+            );
             (s.epoch, s.queue_seq)
         })
     });
@@ -8554,8 +8838,15 @@ async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppCont
     cx.executor().run_until_parked();
 
     // Sanity check: two rows must be persisted before the reset.
-    let rows_before = db.load_entries(session_id).await.expect("load entries before");
-    assert_eq!(rows_before.len(), 2, "two appends → two persisted rows before clear");
+    let rows_before = db
+        .load_entries(session_id)
+        .await
+        .expect("load entries before");
+    assert_eq!(
+        rows_before.len(),
+        2,
+        "two appends → two persisted rows before clear"
+    );
 
     // Capture the epoch as written to the DB before the reset.
     let epoch_in_db_before = db
@@ -8576,7 +8867,10 @@ async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppCont
     cx.executor().run_until_parked();
 
     // DB rows must be gone after the clear.
-    let rows_after = db.load_entries(session_id).await.expect("load entries after");
+    let rows_after = db
+        .load_entries(session_id)
+        .await
+        .expect("load entries after");
     assert_eq!(
         rows_after.len(),
         0,
@@ -8698,9 +8992,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
     // done in a previous session. The in-memory DB is keyed by thread name,
     // so a second `open` call below shares the same data.
     let session_id = crate::model::SolutionSessionId::new();
-    let db = Arc::new(
-        crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"),
-    );
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
     let state = crate::supervisor::SupervisorState {
         session_id,
         enabled: true,
@@ -8723,19 +9015,19 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
 
     // Create a fresh store (no prior in-memory state) and attach persistence.
     let registry = Arc::new(AdapterRegistry::new());
-    let store: gpui::Entity<SolutionAgentStore> = cx.update(|cx| {
-        cx.new(|cx| SolutionAgentStore::new_in_app(registry, cx))
-    });
+    let store: gpui::Entity<SolutionAgentStore> =
+        cx.update(|cx| cx.new(|cx| SolutionAgentStore::new_in_app(registry, cx)));
 
     // Pre-condition: the fresh store has no supervisor state for our session.
     let pre = store.read_with(cx, |s, _| s.supervisor_state(session_id));
-    assert!(pre.is_none(), "fresh store must not have supervisor state yet");
+    assert!(
+        pre.is_none(),
+        "fresh store must not have supervisor state yet"
+    );
 
     // Open the same shared in-memory DB and call set_persistence — this
     // must fire the one-time load.
-    let db2 = Arc::new(
-        crate::db::SolutionAgentDb::open(cx.executor()).expect("open db again"),
-    );
+    let db2 = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db again"));
     store.update(cx, |store, cx| {
         store.set_persistence(db2, cx);
     });
@@ -8785,10 +9077,16 @@ async fn restart_leaves_inherited_idle_until_fresh_activity(cx: &mut gpui::TestA
         });
         store.set_supervision_enabled(id, true, cx);
         // Restart/load path: we started watching just now, AFTER the last activity.
-        store.supervisor_states.get_mut(&id).unwrap().watch_started_ms = Some(now_ms);
+        store
+            .supervisor_states
+            .get_mut(&id)
+            .unwrap()
+            .watch_started_ms = Some(now_ms);
         store.tick_supervisor(cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Watching,
@@ -8805,7 +9103,9 @@ async fn restart_leaves_inherited_idle_until_fresh_activity(cx: &mut gpui::TestA
         st.watch_started_ms = Some(now_ms - 300_000);
         store.tick_supervisor(cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Judging,
@@ -8822,10 +9122,19 @@ async fn restart_leaves_inherited_idle_until_fresh_activity(cx: &mut gpui::TestA
             s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
         });
         store.set_supervision_enabled(id2, true, cx);
-        assert!(store.supervisor_states.get(&id2).unwrap().watch_started_ms.is_none());
+        assert!(
+            store
+                .supervisor_states
+                .get(&id2)
+                .unwrap()
+                .watch_started_ms
+                .is_none()
+        );
         store.tick_supervisor(cx);
     });
-    let st2 = store2.read_with(cx, |store, _| store.supervisor_state(id2)).unwrap();
+    let st2 = store2
+        .read_with(cx, |store, _| store.supervisor_state(id2))
+        .unwrap();
     assert_eq!(
         st2.status,
         crate::supervisor::SupervisorStatus::Judging,
@@ -8835,15 +9144,16 @@ async fn restart_leaves_inherited_idle_until_fresh_activity(cx: &mut gpui::TestA
 
 #[gpui::test]
 async fn toggle_supervision_persists_and_reads_back(cx: &mut gpui::TestAppContext) {
-    let (store, session_id, _tmp) =
-        crate::store::test_support::seed_store_with_session(cx).await;
+    let (store, session_id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
 
     store.update(cx, |store, cx| {
         store.set_supervision_enabled(session_id, true, cx);
         store.set_supervisor_prompt(session_id, Some("verify FORK.md updated".into()), cx);
     });
 
-    let st = store.read_with(cx, |store, _| store.supervisor_state(session_id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(session_id))
+        .unwrap();
     assert!(st.enabled);
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
     assert_eq!(st.custom_prompt.as_deref(), Some("verify FORK.md updated"));
@@ -8851,7 +9161,9 @@ async fn toggle_supervision_persists_and_reads_back(cx: &mut gpui::TestAppContex
     store.update(cx, |store, cx| {
         store.set_supervision_enabled(session_id, false, cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(session_id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(session_id))
+        .unwrap();
     assert!(!st.enabled);
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Disabled);
 }
@@ -8871,7 +9183,9 @@ async fn tick_fires_judge_after_threshold(cx: &mut gpui::TestAppContext) {
 
     store.update(cx, |store, cx| store.tick_supervisor(cx));
 
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Judging);
     assert!(st.last_fired_at.is_some());
 
@@ -8882,8 +9196,13 @@ async fn tick_fires_judge_after_threshold(cx: &mut gpui::TestAppContext) {
         }
         store.tick_supervisor(cx);
     });
-    let st2 = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
-    assert_eq!(st2.last_fired_at, st.last_fired_at, "must not re-fire while judging");
+    let st2 = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert_eq!(
+        st2.last_fired_at, st.last_fired_at,
+        "must not re-fire while judging"
+    );
 }
 
 /// Manual user-stop parks the supervisor in `Held`: even an idle, long-silent
@@ -8903,17 +9222,24 @@ async fn manual_stop_holds_supervisor_then_message_rearms(cx: &mut gpui::TestApp
         // The user manually stops the agent.
         store.hold_supervisor(id, cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Held,
         "manual stop parks the supervisor on hold"
     );
-    assert!(st.enabled, "Held keeps supervision enabled (it's a pause, not a disable)");
+    assert!(
+        st.enabled,
+        "Held keeps supervision enabled (it's a pause, not a disable)"
+    );
 
     // A tick while Held must NOT spawn a judge, despite the idle, silent session.
     store.update(cx, |store, cx| store.tick_supervisor(cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Held,
@@ -8921,8 +9247,12 @@ async fn manual_stop_holds_supervisor_then_message_rearms(cx: &mut gpui::TestApp
     );
 
     // The user sends a new message → re-arm to Watching.
-    store.update(cx, |store, cx| store.reset_supervisor_continue_counter(id, cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    store.update(cx, |store, cx| {
+        store.reset_supervisor_continue_counter(id, cx)
+    });
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Watching,
@@ -8949,7 +9279,9 @@ async fn typing_defers_supervisor_tick(cx: &mut gpui::TestAppContext) {
     });
 
     store.update(cx, |store, cx| store.tick_supervisor(cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Watching,
@@ -8963,7 +9295,9 @@ async fn typing_defers_supervisor_tick(cx: &mut gpui::TestAppContext) {
         }
     });
     store.update(cx, |store, cx| store.tick_supervisor(cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Judging,
@@ -9015,7 +9349,9 @@ async fn observer_nudge_held_while_typing_then_flushed(cx: &mut gpui::TestAppCon
             cx,
         );
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.consecutive_continues, 1,
         "the verdict is accepted (counter bumps) even though its nudge is held"
@@ -9039,7 +9375,9 @@ async fn observer_nudge_held_while_typing_then_flushed(cx: &mut gpui::TestAppCon
         });
         store.tick_supervisor(cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.pending_nudge, None,
         "once the user is quiet for the idle window, the held nudge flushes"
@@ -9099,7 +9437,9 @@ async fn disabling_supervision_interrupts_running_judge(cx: &mut gpui::TestAppCo
             cx,
         );
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.consecutive_continues, 0,
         "a verdict from a disabled supervisor is dropped (no nudge, no counter bump)"
@@ -9150,7 +9490,9 @@ async fn held_supervisor_drops_racing_verdict(cx: &mut gpui::TestAppContext) {
             cx,
         );
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.consecutive_continues, 0,
         "a verdict arriving after a manual Stop (Held) is dropped"
@@ -9175,16 +9517,12 @@ async fn user_send_discards_held_nudge(cx: &mut gpui::TestAppContext) {
             "my own reply".to_string(),
         ))];
         store
-            .send_message_blocks_targeted(
-                id,
-                blocks,
-                crate::model::QueueTarget::Main,
-                true,
-                cx,
-            )
+            .send_message_blocks_targeted(id, blocks, crate::model::QueueTarget::Main, true, cx)
             .detach();
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.pending_nudge, None,
         "the user's own message forgets the held observer nudge"
@@ -9238,7 +9576,9 @@ async fn changing_instruction_interrupts_running_judge(cx: &mut gpui::TestAppCon
             cx,
         );
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.consecutive_continues, 0,
         "a verdict from a judge interrupted by an instruction change is dropped"
@@ -9275,7 +9615,9 @@ async fn background_command_suppresses_supervisor_tick(cx: &mut gpui::TestAppCon
         store.set_supervision_enabled(id, true, cx);
         store.tick_supervisor(cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         SupervisorStatus::Watching,
@@ -9292,7 +9634,9 @@ async fn background_command_suppresses_supervisor_tick(cx: &mut gpui::TestAppCon
         });
         store.tick_supervisor(cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         SupervisorStatus::Judging,
@@ -9329,13 +9673,18 @@ async fn wait_is_one_shot_no_rejudge_until_deadline(cx: &mut gpui::TestAppContex
     // Parked with a future deadline: a tick must NOT fire a fresh judge despite
     // the session being silent for 10 minutes.
     store.update(cx, |store, cx| store.tick_supervisor(cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         SupervisorStatus::Watching,
         "a parked wait must not re-fire a judge"
     );
-    assert!(st.wait_until_ms.is_some(), "the wait deadline is still pending");
+    assert!(
+        st.wait_until_ms.is_some(),
+        "the wait deadline is still pending"
+    );
 
     // Force the deadline into the past → the mechanism wakes the agent itself
     // and clears the wait; it does NOT spawn a judge (status stays Watching).
@@ -9344,7 +9693,9 @@ async fn wait_is_one_shot_no_rejudge_until_deadline(cx: &mut gpui::TestAppContex
             Some(chrono::Utc::now().timestamp_millis() - 1_000);
         store.tick_supervisor(cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.wait_until_ms, None, "the elapsed wait is cleared");
     assert_eq!(
         st.status,
@@ -9366,21 +9717,32 @@ async fn trigger_count_increments_on_fire_and_resets_on_toggle(cx: &mut gpui::Te
         });
         store.set_supervision_enabled(id, true, cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
-    assert_eq!(st.trigger_count, 0, "a fresh enable starts the counter at 0");
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert_eq!(
+        st.trigger_count, 0,
+        "a fresh enable starts the counter at 0"
+    );
 
     // One fire → count 1.
     store.update(cx, |store, cx| store.tick_supervisor(cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.trigger_count, 1, "firing a judge increments the counter");
 
     // Toggle off then on → counter cleared both times.
     store.update(cx, |store, cx| store.set_supervision_enabled(id, false, cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.trigger_count, 0, "disabling clears the counter");
 
     store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.trigger_count, 0, "re-enabling keeps the counter at 0");
 }
 
@@ -9430,7 +9792,9 @@ async fn tick_sweeps_stuck_auditor(cx: &mut gpui::TestAppContext) {
 
     // The sweep is a pure cleanup — it must NOT pause/disable supervision
     // (an auditor failing is not the judge failing).
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert!(st.enabled, "auditor timeout must not disable supervision");
 }
 
@@ -9454,7 +9818,9 @@ async fn apply_continue_nudges_and_increments(cx: &mut gpui::TestAppContext) {
             cx,
         );
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.consecutive_continues, 1);
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
 
@@ -9485,7 +9851,9 @@ async fn apply_wait_sleeps_without_nudging(cx: &mut gpui::TestAppContext) {
             cx,
         );
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     // Wait must NOT count toward the consecutive-continue guard.
     assert_eq!(st.consecutive_continues, 0);
     // Stays Watching (the one-shot wait handler is gated on it).
@@ -9493,7 +9861,10 @@ async fn apply_wait_sleeps_without_nudging(cx: &mut gpui::TestAppContext) {
     // The one-shot wait commits a single wake deadline ~90s out (slack for
     // scheduling); the mechanism honors it in full without re-judging.
     let wake = st.wait_until_ms.expect("wait sets wait_until_ms");
-    assert!(wake >= before + 80_000, "wait wake ~90s out: {wake} vs {before}");
+    assert!(
+        wake >= before + 80_000,
+        "wait wake ~90s out: {wake} vs {before}"
+    );
     assert!(wake <= before + 100_000, "wait wake within clamp: {wake}");
 
     // The wait verdict was recorded to disk.
@@ -9524,7 +9895,9 @@ async fn apply_ask_agent_increments_and_records(cx: &mut gpui::TestAppContext) {
     });
     // ask_agent behaves like continue for the guard: counts toward the cap and
     // returns the session to Watching (it sent the question to the agent).
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.consecutive_continues, 1);
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
 
@@ -9533,7 +9906,10 @@ async fn apply_ask_agent_increments_and_records(cx: &mut gpui::TestAppContext) {
     let dir = crate::supervisor::supervisor_dir(&root, id);
     let recs = crate::supervisor::read_verdicts(&dir);
     assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0].action, Some(crate::supervisor::VerdictAction::AskAgent));
+    assert_eq!(
+        recs[0].action,
+        Some(crate::supervisor::VerdictAction::AskAgent)
+    );
 }
 
 #[gpui::test]
@@ -9558,12 +9934,18 @@ async fn fifteen_continues_force_ask(cx: &mut gpui::TestAppContext) {
         });
     }
 
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::WaitingUser);
 
     // User replies → counter resets, back to watching.
-    store.update(cx, |store, cx| store.reset_supervisor_continue_counter(id, cx));
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    store.update(cx, |store, cx| {
+        store.reset_supervisor_continue_counter(id, cx)
+    });
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.consecutive_continues, 0);
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
 }
@@ -9575,7 +9957,9 @@ async fn audit_escalate_pauses_supervision(cx: &mut gpui::TestAppContext) {
         store.set_supervision_enabled(id, true, cx);
         store.apply_audit_verdict(id, false, true, "supervisor is looping".into(), cx);
     });
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::WaitingUser);
 
     // An Audit-kind record must be on disk.
@@ -9653,7 +10037,12 @@ async fn escalate_sets_marker_and_waiting(cx: &mut gpui::TestAppContext) {
     });
     let (status, q) = store.read_with(cx, |store, cx| {
         let st = store.supervisor_state(id).unwrap();
-        let q = store.session(id).unwrap().read(cx).supervisor_question.clone();
+        let q = store
+            .session(id)
+            .unwrap()
+            .read(cx)
+            .supervisor_question
+            .clone();
         (st.status, q)
     });
     assert_eq!(status, crate::supervisor::SupervisorStatus::WaitingUser);
@@ -9676,7 +10065,9 @@ async fn user_reply_resumes_waiting_user_supervision(cx: &mut gpui::TestAppConte
     });
 
     let msg = |text: &str| {
-        vec![acp::ContentBlock::Text(acp::TextContent::new(text.to_string()))]
+        vec![acp::ContentBlock::Text(acp::TextContent::new(
+            text.to_string(),
+        ))]
     };
 
     // A supervisor nudge (from_user: false) must NOT resume — still WaitingUser.
@@ -9694,7 +10085,12 @@ async fn user_reply_resumes_waiting_user_supervision(cx: &mut gpui::TestAppConte
     let (status, q) = store.read_with(cx, |store, cx| {
         (
             store.supervisor_state(id).unwrap().status,
-            store.session(id).unwrap().read(cx).supervisor_question.clone(),
+            store
+                .session(id)
+                .unwrap()
+                .read(cx)
+                .supervisor_question
+                .clone(),
         )
     });
     assert_eq!(
@@ -9719,7 +10115,12 @@ async fn user_reply_resumes_waiting_user_supervision(cx: &mut gpui::TestAppConte
     let (status, q) = store.read_with(cx, |store, cx| {
         (
             store.supervisor_state(id).unwrap().status,
-            store.session(id).unwrap().read(cx).supervisor_question.clone(),
+            store
+                .session(id)
+                .unwrap()
+                .read(cx)
+                .supervisor_question
+                .clone(),
         )
     });
     assert_eq!(
@@ -9751,7 +10152,10 @@ async fn user_reply_rearms_supervision_after_done(cx: &mut gpui::TestAppContext)
         );
     });
     let st = store.read_with(cx, |store, _| store.supervisor_state(id).unwrap());
-    assert!(st.enabled, "Done parks in Held, it does NOT disable supervision");
+    assert!(
+        st.enabled,
+        "Done parks in Held, it does NOT disable supervision"
+    );
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Held,
@@ -9773,7 +10177,10 @@ async fn user_reply_rearms_supervision_after_done(cx: &mut gpui::TestAppContext)
             .detach();
     });
     let st = store.read_with(cx, |store, _| store.supervisor_state(id).unwrap());
-    assert!(st.enabled, "a user reply after Done must re-enable supervision");
+    assert!(
+        st.enabled,
+        "a user reply after Done must re-enable supervision"
+    );
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Watching,
@@ -9828,7 +10235,12 @@ async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
     });
     let (status, q) = store.read_with(cx, |store, cx| {
         let st = store.supervisor_state(id).unwrap();
-        let q = store.session(id).unwrap().read(cx).supervisor_question.clone();
+        let q = store
+            .session(id)
+            .unwrap()
+            .read(cx)
+            .supervisor_question
+            .clone();
         (st.status, q)
     });
     assert_eq!(status, crate::supervisor::SupervisorStatus::WaitingUser);
@@ -9848,7 +10260,12 @@ async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
         );
     });
     let q_after = store.read_with(cx, |store, cx| {
-        store.session(id).unwrap().read(cx).supervisor_question.clone()
+        store
+            .session(id)
+            .unwrap()
+            .read(cx)
+            .supervisor_question
+            .clone()
     });
     assert!(
         q_after.is_none(),
@@ -9856,7 +10273,9 @@ async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
     );
 
     // Verify the supervision state is parked on hold (Done → Held).
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Held,
@@ -9870,15 +10289,28 @@ async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
         store.escalate_to_user(id2, "still waiting?".into(), cx);
     });
     let q_before_disable = store2.read_with(cx, |store, cx| {
-        store.session(id2).unwrap().read(cx).supervisor_question.clone()
+        store
+            .session(id2)
+            .unwrap()
+            .read(cx)
+            .supervisor_question
+            .clone()
     });
-    assert!(q_before_disable.is_some(), "question must be set before disable");
+    assert!(
+        q_before_disable.is_some(),
+        "question must be set before disable"
+    );
 
     store2.update(cx, |store, cx| {
         store.set_supervision_enabled(id2, false, cx);
     });
     let q_after_disable = store2.read_with(cx, |store, cx| {
-        store.session(id2).unwrap().read(cx).supervisor_question.clone()
+        store
+            .session(id2)
+            .unwrap()
+            .read(cx)
+            .supervisor_question
+            .clone()
     });
     assert!(
         q_after_disable.is_none(),
@@ -10093,7 +10525,9 @@ async fn successful_turn_clears_pending_usage_limit_resume_gate(cx: &mut TestApp
 
     cx.update(|cx| {
         acp_thread.update(cx, |_t, cx| {
-            cx.emit(acp_thread::AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
         });
     });
     cx.executor().run_until_parked();

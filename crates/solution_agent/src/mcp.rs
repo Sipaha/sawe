@@ -1384,11 +1384,7 @@ pub struct QueuedBundleSummary {
 /// and the absolute `EntrySummary.index` of every surviving entry. A no-op
 /// when there are no user entries (nothing to anchor on → keep the window
 /// as-is, so the judge still sees *something*).
-fn apply_user_anchored_filter(
-    kept: &mut Vec<EntrySummary>,
-    lead: usize,
-    since_ms: Option<i64>,
-) {
+fn apply_user_anchored_filter(kept: &mut Vec<EntrySummary>, lead: usize, since_ms: Option<i64>) {
     if kept.is_empty() {
         return;
     }
@@ -1396,8 +1392,7 @@ fn apply_user_anchored_filter(
     // judge's previous-wake cutoff). An entry with no timestamp is kept (can't
     // prove it's old). With no `since_ms` every user entry anchors.
     let anchors = |e: &EntrySummary| {
-        e.role == EntryRoleDto::User
-            && since_ms.is_none_or(|s| e.created_ms.is_none_or(|c| c > s))
+        e.role == EntryRoleDto::User && since_ms.is_none_or(|s| e.created_ms.is_none_or(|c| c > s))
     };
     let has_user = kept.iter().any(anchors);
     if !has_user {
@@ -1844,7 +1839,9 @@ impl McpServerTool for GetSessionChangesTool {
                 wall.timestamp_millis()
             };
             let running_started_at_ms = match &session.state {
-                crate::model::SessionState::Running { started_at, .. } => instant_to_ms(*started_at),
+                crate::model::SessionState::Running { started_at, .. } => {
+                    instant_to_ms(*started_at)
+                }
                 _ => 0,
             };
             let stopping_started_at_ms = match &session.state {
@@ -2324,8 +2321,7 @@ fn live_auth_options_for_session(
     };
     for entry in thread.read(cx).entries() {
         if let acp_thread::AgentThreadEntry::ToolCall(call) = entry {
-            if let acp_thread::ToolCallStatus::WaitingForConfirmation { options, .. } =
-                &call.status
+            if let acp_thread::ToolCallStatus::WaitingForConfirmation { options, .. } = &call.status
             {
                 let buttons = crate::conversation_render::permission_buttons(options)
                     .into_iter()
@@ -5018,10 +5014,8 @@ impl McpServerTool for GetSupervisorStateTool {
                         [crate::supervisor::VerdictAction::Continue as usize],
                     verdicts_compact: stats.by_action
                         [crate::supervisor::VerdictAction::Compact as usize],
-                    verdicts_done: stats.by_action
-                        [crate::supervisor::VerdictAction::Done as usize],
-                    verdicts_ask: stats.by_action
-                        [crate::supervisor::VerdictAction::Ask as usize],
+                    verdicts_done: stats.by_action[crate::supervisor::VerdictAction::Done as usize],
+                    verdicts_ask: stats.by_action[crate::supervisor::VerdictAction::Ask as usize],
                     verdicts_ask_agent: stats.by_action
                         [crate::supervisor::VerdictAction::AskAgent as usize],
                     audits: stats.audits,
@@ -6312,9 +6306,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn supervisor_ephemeral_sessions_hidden_from_enumeration(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn supervisor_ephemeral_sessions_hidden_from_enumeration(cx: &mut gpui::TestAppContext) {
         // A supervised parent with one hidden ephemeral judge child. The judge
         // must NOT surface in either `list_sessions` (the parent does) or
         // `get_session_children` (an empty list — it's the only child).
@@ -6692,7 +6684,12 @@ mod tests {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
                 assert!(
-                    store.session(tabbed_id).unwrap().read(cx).tab_order.is_some(),
+                    store
+                        .session(tabbed_id)
+                        .unwrap()
+                        .read(cx)
+                        .tab_order
+                        .is_some(),
                     "a freshly created session must be pinned to the strip",
                 );
                 let id = SolutionSessionId::new();
@@ -7585,8 +7582,11 @@ mod tests {
     /// the same `_meta` claude_native stamps.
     async fn seed_mixed_subagent_session(
         cx: &mut gpui::TestAppContext,
-    ) -> (crate::model::SolutionSessionId, gpui::Entity<acp_thread::AcpThread>, tempfile::TempDir)
-    {
+    ) -> (
+        crate::model::SolutionSessionId,
+        gpui::Entity<acp_thread::AcpThread>,
+        tempfile::TempDir,
+    ) {
         let (session_id, acp_thread, tmp) = create_session_with_thread(cx).await;
         cx.update(|cx| {
             acp_thread.update(cx, |thread, cx| {
@@ -7753,9 +7753,7 @@ mod tests {
     /// returns NULL for a row-native session → the tool returned
     /// `session_not_found` even though the rows were present.
     #[gpui::test]
-    async fn read_session_history_closed_row_native_returns_entries(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn read_session_history_closed_row_native_returns_entries(cx: &mut gpui::TestAppContext) {
         use crate::session_entry::{SessionEntry, SessionEntryKind};
 
         // Set up a real DB so rows can be written + read by the tool.
@@ -7764,9 +7762,7 @@ mod tests {
         let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
         cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
         let executor = cx.executor();
-        let db = std::sync::Arc::new(
-            crate::db::SolutionAgentDb::open(executor).expect("open db"),
-        );
+        let db = std::sync::Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
         cx.update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
                 store.set_persistence(db.clone(), cx);
@@ -8074,7 +8070,11 @@ mod tests {
             cx,
         )
         .await;
-        assert_eq!(p1.changed_entries.len(), CHANGED_ENTRIES_PAGE, "page capped");
+        assert_eq!(
+            p1.changed_entries.len(),
+            CHANGED_ENTRIES_PAGE,
+            "page capped"
+        );
         assert!(p1.has_more, "more entries remain after page 1");
         assert_eq!(p1.current_seq, 10, "cursor advances to the 10th mod_seq");
         assert_eq!(p1.total_count, 15, "total_count is the full filtered count");
@@ -8093,7 +8093,10 @@ mod tests {
         .await;
         assert_eq!(p2.changed_entries.len(), 5, "remaining entries on page 2");
         assert!(!p2.has_more, "caught up after page 2");
-        assert_eq!(p2.current_seq, 15, "cursor at full change_seq when caught up");
+        assert_eq!(
+            p2.current_seq, 15,
+            "cursor at full change_seq when caught up"
+        );
     }
 
     #[gpui::test]
@@ -8168,9 +8171,7 @@ mod tests {
             matches!(result.state, Some(SessionStateDto::AwaitingInput)),
             "state still present on a later poll"
         );
-        let bundles = result
-            .pending_bundles
-            .expect("pending_bundles always Some");
+        let bundles = result.pending_bundles.expect("pending_bundles always Some");
         assert_eq!(bundles.len(), 1, "the queued bundle surfaces");
     }
 
@@ -8230,7 +8231,11 @@ mod tests {
         )
         .await;
         let sub_indices: Vec<usize> = sub.changed_entries.iter().map(|e| e.index).collect();
-        assert_eq!(sub_indices, vec![2], "sub1 filter keeps only the sub1 entry");
+        assert_eq!(
+            sub_indices,
+            vec![2],
+            "sub1 filter keeps only the sub1 entry"
+        );
         assert_eq!(sub.total_count, 1, "filtered total is the sub1 count");
 
         // __main__ filter → the three subagent_id == None entries (0, 1, 3).
@@ -8352,7 +8357,10 @@ mod tests {
             cx,
         )
         .await;
-        assert_eq!(result.total_count, 2, "total_count shrank to the new length");
+        assert_eq!(
+            result.total_count, 2,
+            "total_count shrank to the new length"
+        );
         assert!(
             result.removed_indices.is_empty(),
             "removed_indices stays empty under the tail-truncate model"
@@ -8421,10 +8429,7 @@ mod tests {
     #[test]
     fn user_anchored_filter_noop_without_user_entries() {
         use EntryRoleDto::*;
-        let mut kept = vec![
-            anchored_entry(0, Assistant),
-            anchored_entry(1, ToolCall),
-        ];
+        let mut kept = vec![anchored_entry(0, Assistant), anchored_entry(1, ToolCall)];
         apply_user_anchored_filter(&mut kept, 3, None);
         let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
         assert_eq!(indices, vec![0, 1], "no anchor → window kept as-is");
@@ -8447,7 +8452,7 @@ mod tests {
             at(2, User, 100), // old → must NOT anchor
             at(3, ToolCall, 180),
             at(4, Assistant, 190),
-            at(5, User, 200), // new → anchors, lead=2 keeps 3,4,5
+            at(5, User, 200),      // new → anchors, lead=2 keeps 3,4,5
             at(6, Assistant, 210), // resting turn → kept
         ];
         apply_user_anchored_filter(&mut kept, 2, Some(150));
@@ -8475,6 +8480,10 @@ mod tests {
         ];
         apply_user_anchored_filter(&mut kept, 3, Some(100));
         let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
-        assert_eq!(indices, vec![1], "all user turns pre-cutoff → only resting turn kept");
+        assert_eq!(
+            indices,
+            vec![1],
+            "all user turns pre-cutoff → only resting turn kept"
+        );
     }
 }

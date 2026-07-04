@@ -16,7 +16,11 @@ use super::{SolutionAgentStore, tests};
 /// on disk that later tasks resolve paths under).
 pub(crate) async fn seed_store_with_session(
     cx: &mut TestAppContext,
-) -> (Entity<SolutionAgentStore>, SolutionSessionId, tempfile::TempDir) {
+) -> (
+    Entity<SolutionAgentStore>,
+    SolutionSessionId,
+    tempfile::TempDir,
+) {
     let (solution_id, tmp, _project) = tests::setup_solution_and_project(cx).await;
     let registry = Arc::new(AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));

@@ -28,9 +28,9 @@ use crate::pool::SubprocessPool;
 mod connection_pool;
 mod queue;
 #[cfg(test)]
-pub(crate) mod tests;
-#[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+pub(crate) mod tests;
 
 pub(crate) use queue::{QUEUE_HINT_LINE, TS_PREFIX_CLOSE, TS_PREFIX_OPEN};
 
@@ -1156,7 +1156,11 @@ impl SolutionAgentStore {
         audit: bool,
         cx: &mut Context<Self>,
     ) {
-        let kind = if audit { "spawn_auditor" } else { "spawn_judge" };
+        let kind = if audit {
+            "spawn_auditor"
+        } else {
+            "spawn_judge"
+        };
         // One judge AND one auditor at most per supervised session at a time;
         // each kind guards only its own map so a judge doesn't block an auditor.
         let already_running = if audit {
@@ -1198,7 +1202,12 @@ impl SolutionAgentStore {
                     _ => None,
                 }
             };
-            (s.solution_id.clone(), s.agent_id.clone(), project, context_usage)
+            (
+                s.solution_id.clone(),
+                s.agent_id.clone(),
+                project,
+                context_usage,
+            )
         };
         let Some(project) = project else {
             log::debug!("{kind}({id}): session has no cached project (prebuilt/cold); skipped");
@@ -1524,16 +1533,13 @@ impl SolutionAgentStore {
     /// down so a verdict already in flight can't nudge the agent after the stop.
     pub(crate) fn hold_supervisor(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
         use crate::supervisor::SupervisorStatus;
-        let should_hold = self
-            .supervisor_states
-            .get(&id)
-            .is_some_and(|s| {
-                s.enabled
-                    && matches!(
-                        s.status,
-                        SupervisorStatus::Watching | SupervisorStatus::Judging
-                    )
-            });
+        let should_hold = self.supervisor_states.get(&id).is_some_and(|s| {
+            s.enabled
+                && matches!(
+                    s.status,
+                    SupervisorStatus::Watching | SupervisorStatus::Judging
+                )
+        });
         if !should_hold {
             return;
         }
@@ -1634,7 +1640,9 @@ impl SolutionAgentStore {
         }
         self.persist_supervisor_state(id, cx);
         if let Some(session) = self.session(id) {
-            session.update(cx, |s, _| s.supervisor_question = Some(question.clone().into()));
+            session.update(cx, |s, _| {
+                s.supervisor_question = Some(question.clone().into())
+            });
         }
         let title = "Sawe — Supervisor".to_string();
         let body = format!("🛡 {question}");
@@ -1873,18 +1881,20 @@ impl SolutionAgentStore {
                 // editor this way. Defer the call past the current update so the
                 // lease is released first (decision: never read an entity during
                 // its own mutation — snapshot before, or defer).
-                cx.defer(move |cx| match crate::compact::start_compact_for_session(id, cx) {
-                    Err(err) => {
-                        log::warn!("apply_verdict compact({id}): {err}");
-                    }
-                    Ok(outcome) if !outcome.queued => {
-                        log::warn!(
-                            "apply_verdict compact({id}): not queued: {:?}",
-                            outcome.reason
-                        );
-                    }
-                    Ok(_) => {}
-                });
+                cx.defer(
+                    move |cx| match crate::compact::start_compact_for_session(id, cx) {
+                        Err(err) => {
+                            log::warn!("apply_verdict compact({id}): {err}");
+                        }
+                        Ok(outcome) if !outcome.queued => {
+                            log::warn!(
+                                "apply_verdict compact({id}): not queued: {:?}",
+                                outcome.reason
+                            );
+                        }
+                        Ok(_) => {}
+                    },
+                );
             }
             VerdictAction::Done => {
                 // The supervisor considers the work complete. Don't switch
@@ -2009,89 +2019,7 @@ impl SolutionAgentStore {
         self.finish_judge(id, cx);
         match crate::supervisor::classify_judge_error(&message) {
             JudgeFailure::Quota => {
-                // A usage/session/weekly limit is a wall, not a transient error.
-                // If the observer is still enabled AND the message carries a
-                // parseable reset time, schedule an auto-resume: stay `Watching`
-                // with the watchdog gate set to `reset + jitter(2..=15min)`, so
-                // `tick_supervisor` re-fires a judge once the limit clears, which
-                // re-observes the idle/errored worker and nudges it to continue.
-                // The jitter avoids hammering the wall at the exact reset minute.
-                // Otherwise (observer off, or no reset time) fall back to a
-                // terminal `Stopped(Quota)`.
-                use rand::Rng as _;
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let enabled = self
-                    .supervisor_states
-                    .get(&id)
-                    .map(|s| s.enabled)
-                    .unwrap_or(false);
-                let resume_at_ms = if enabled {
-                    crate::supervisor::parse_usage_limit_reset_ms(&message, now_ms).map(|reset| {
-                        let jitter_ms = rand::rng().random_range(120_000i64..=900_000i64);
-                        reset + jitter_ms
-                    })
-                } else {
-                    None
-                };
-                match resume_at_ms {
-                    Some(resume_ms) => {
-                        if let Some(state) = self.supervisor_states.get_mut(&id) {
-                            state.status = SupervisorStatus::Watching;
-                            state.next_eligible_ms = Some(resume_ms);
-                            // Not a judge fault — don't count it toward the
-                            // transient-failure backoff exhaustion.
-                            state.backoff_attempt = 0;
-                        }
-                        let eta = chrono::DateTime::from_timestamp_millis(resume_ms)
-                            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                            .unwrap_or_else(|| "?".into());
-                        self.append_supervisor_diary_note(
-                            id,
-                            &format!(
-                                "usage limit hit; auto-resume scheduled ~{eta} local (reset + 2-15min jitter)"
-                            ),
-                            cx,
-                        );
-                        self.push_system_note(
-                            id,
-                            acp_thread::SystemNoteLevel::Info,
-                            format!(
-                                "Достигнут лимит claude. Наблюдатель продолжит сессию автоматически примерно в {eta}."
-                            ),
-                            cx,
-                        );
-                        // Hold a live timer until the resume moment so a wake
-                        // happens even if nothing else ticks the watchdog. The
-                        // gate itself is `next_eligible_ms`, re-checked in
-                        // `tick_supervisor`.
-                        let delay = std::time::Duration::from_millis(
-                            (resume_ms - now_ms).max(0) as u64,
-                        );
-                        let task = cx.spawn(async move |this, cx| {
-                            cx.background_executor().timer(delay).await;
-                            this.update(cx, |this, _cx| {
-                                this.backoff_timers.remove(&id);
-                            })
-                            .ok();
-                        });
-                        self.backoff_timers.insert(id, task);
-                    }
-                    None => {
-                        if let Some(state) = self.supervisor_states.get_mut(&id) {
-                            state.enabled = false;
-                            state.status = SupervisorStatus::Stopped(StoppedReason::Quota);
-                            state.next_eligible_ms = None;
-                        }
-                        self.backoff_timers.remove(&id);
-                        self.append_supervisor_diary_note(
-                            id,
-                            "supervisor stopped: provider quota / usage limit \
-                             (no reset time parsed or observer disabled)",
-                            cx,
-                        );
-                        self.clear_supervisor_question(id, cx);
-                    }
-                }
+                self.apply_usage_limit_stop(id, &message, cx);
             }
             JudgeFailure::Transient => {
                 let attempt = {
@@ -2146,6 +2074,104 @@ impl SolutionAgentStore {
                         .ok();
                     });
                     self.backoff_timers.insert(id, task);
+                }
+                self.persist_supervisor_state(id, cx);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+            }
+        }
+    }
+
+    /// Handle a usage / session / weekly limit wall for supervised session
+    /// `id`, described by `message`. A limit is a WALL, not a transient error
+    /// to retry or a hung subprocess to reconnect: if the observer is still
+    /// enabled AND `message` carries a parseable reset time, schedule an
+    /// auto-resume — stay `Watching` with the watchdog gate set to
+    /// `reset + jitter(2..=15min)`, so `tick_supervisor` re-fires a judge once
+    /// the limit clears (which re-observes the idle/errored worker and nudges
+    /// it to continue); the jitter avoids hammering the wall at the exact reset
+    /// minute, and a live timer is held so the wake happens even if nothing
+    /// else ticks. Otherwise (observer off, or no reset time) fall back to a
+    /// terminal `Stopped(Quota)`. Shared by the judge-failure path
+    /// (`on_judge_failed`) and the stuck-session watchdog (`tick_stuck_sessions`).
+    pub(crate) fn apply_usage_limit_stop(
+        &mut self,
+        id: SolutionSessionId,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::supervisor::{StoppedReason, SupervisorStatus};
+        {
+            use rand::Rng as _;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let enabled = self
+                .supervisor_states
+                .get(&id)
+                .map(|s| s.enabled)
+                .unwrap_or(false);
+            let resume_at_ms = if enabled {
+                crate::supervisor::parse_usage_limit_reset_ms(message, now_ms).map(|reset| {
+                    let jitter_ms = rand::rng().random_range(120_000i64..=900_000i64);
+                    reset + jitter_ms
+                })
+            } else {
+                None
+            };
+            match resume_at_ms {
+                Some(resume_ms) => {
+                    if let Some(state) = self.supervisor_states.get_mut(&id) {
+                        state.status = SupervisorStatus::Watching;
+                        state.next_eligible_ms = Some(resume_ms);
+                        // Not a judge fault — don't count it toward the
+                        // transient-failure backoff exhaustion.
+                        state.backoff_attempt = 0;
+                    }
+                    let eta = chrono::DateTime::from_timestamp_millis(resume_ms)
+                        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                        .unwrap_or_else(|| "?".into());
+                    self.append_supervisor_diary_note(
+                            id,
+                            &format!(
+                                "usage limit hit; auto-resume scheduled ~{eta} local (reset + 2-15min jitter)"
+                            ),
+                            cx,
+                        );
+                    self.push_system_note(
+                            id,
+                            acp_thread::SystemNoteLevel::Info,
+                            format!(
+                                "Достигнут лимит claude. Наблюдатель продолжит сессию автоматически примерно в {eta}."
+                            ),
+                            cx,
+                        );
+                    // Hold a live timer until the resume moment so a wake
+                    // happens even if nothing else ticks the watchdog. The
+                    // gate itself is `next_eligible_ms`, re-checked in
+                    // `tick_supervisor`.
+                    let delay =
+                        std::time::Duration::from_millis((resume_ms - now_ms).max(0) as u64);
+                    let task = cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(delay).await;
+                        this.update(cx, |this, _cx| {
+                            this.backoff_timers.remove(&id);
+                        })
+                        .ok();
+                    });
+                    self.backoff_timers.insert(id, task);
+                }
+                None => {
+                    if let Some(state) = self.supervisor_states.get_mut(&id) {
+                        state.enabled = false;
+                        state.status = SupervisorStatus::Stopped(StoppedReason::Quota);
+                        state.next_eligible_ms = None;
+                    }
+                    self.backoff_timers.remove(&id);
+                    self.append_supervisor_diary_note(
+                        id,
+                        "supervisor stopped: provider quota / usage limit \
+                             (no reset time parsed or observer disabled)",
+                        cx,
+                    );
+                    self.clear_supervisor_question(id, cx);
                 }
             }
         }
@@ -2208,9 +2234,12 @@ impl SolutionAgentStore {
     /// `Errored("reconnecting…")`), so the next tick won't re-fire for it.
     pub(crate) fn tick_stuck_sessions(&mut self, cx: &mut Context<Self>) {
         use crate::model::SessionState;
-        use acp_thread::{AgentThreadEntry, ToolCallStatus};
+        use acp_thread::{AgentThreadEntry, AssistantMessageChunk, ToolCallStatus};
         let now = Utc::now();
-        let stuck: Vec<SolutionSessionId> = self
+        // Each wedged session is tagged with `Some(limit_message)` when its
+        // stall is actually a usage/session/weekly-limit wall rather than a hung
+        // subprocess — those are recovered differently (see the loop below).
+        let stuck: Vec<(SolutionSessionId, Option<String>)> = self
             .sessions
             .iter()
             .filter_map(|(id, session)| {
@@ -2230,18 +2259,17 @@ impl SolutionAgentStore {
                 if silent_secs < STUCK_TURN_SECS as i64 {
                     return None;
                 }
+                let thread_ref = thread.read(cx);
                 // How long has the most-recent in-progress tool call been
                 // running? `None` = no tool is executing right now.
-                let active_tool_secs = thread.read(cx).entries().iter().rev().find_map(|e| {
-                    match e {
-                        AgentThreadEntry::ToolCall(tc)
-                            if matches!(tc.status, ToolCallStatus::InProgress) =>
-                        {
-                            let since = tc.status_started_at.unwrap_or(s.last_activity_at);
-                            Some(now.signed_duration_since(since).num_seconds())
-                        }
-                        _ => None,
+                let active_tool_secs = thread_ref.entries().iter().rev().find_map(|e| match e {
+                    AgentThreadEntry::ToolCall(tc)
+                        if matches!(tc.status, ToolCallStatus::InProgress) =>
+                    {
+                        let since = tc.status_started_at.unwrap_or(s.last_activity_at);
+                        Some(now.signed_duration_since(since).num_seconds())
                     }
+                    _ => None,
                 });
                 let wedged = match active_tool_secs {
                     // A tool IS running (foreground command) — leave it be unless
@@ -2250,22 +2278,87 @@ impl SolutionAgentStore {
                     // No tool executing + long silence → claude hung between steps.
                     None => true,
                 };
-                wedged.then_some(*id)
+                if !wedged {
+                    return None;
+                }
+                // Distinguish a usage/session-limit WALL from a genuine hang: a
+                // turn that hit the limit prints the wall as its last assistant
+                // message and then stalls (nothing ends the turn), so it looks
+                // silent-and-wedged. Reconnecting + "carry on" there just re-hits
+                // the wall and burns more quota (observed loop: repeated "You've
+                // hit your session limit" + a spurious "your process hung,
+                // continue" nudge). Detect it by scanning the latest assistant
+                // message so the loop can route it to quota recovery instead.
+                let limit_message = thread_ref
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find_map(|e| match e {
+                        AgentThreadEntry::AssistantMessage(m) => Some(
+                            m.chunks
+                                .iter()
+                                .map(|chunk| match chunk {
+                                    AssistantMessageChunk::Message { block }
+                                    | AssistantMessageChunk::Thought { block } => {
+                                        block.to_markdown(cx)
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                        _ => None,
+                    })
+                    .filter(|text| crate::supervisor::is_usage_limit_error(text));
+                Some((*id, limit_message))
             })
             .collect();
-        for id in stuck {
-            log::warn!(
-                target: "solution_agent::store",
-                "session={id} wedged in Running (no progress {STUCK_TURN_SECS}s, no live tool — \
-                 or a tool in-progress >{TOOL_STUCK_SECS}s) — auto-reconnecting \
-                 (respawn subprocess + replay transcript)"
-            );
-            self.append_supervisor_diary_note(
-                id,
-                "session wedged while Running (hung subprocess); auto-reconnect",
-                cx,
-            );
-            self.reconnect_agent(id, cx).detach_and_log_err(cx);
+        for (id, limit_message) in stuck {
+            match limit_message {
+                // Usage/session-limit wall, NOT a hang: stop the runaway turn and
+                // hand off to the shared quota handler (auto-resume at the reset
+                // time if supervised, else `Stopped(Quota)`) instead of
+                // reconnecting + nudging "continue" (which re-hits the wall).
+                Some(message) => {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "session={id} stalled on a usage/session-limit wall (not a hang) — \
+                         stopping turn + scheduling quota recovery, no reconnect"
+                    );
+                    self.append_supervisor_diary_note(
+                        id,
+                        "turn hit a usage/session limit while Running; stopped (no reconnect), \
+                         quota recovery scheduled",
+                        cx,
+                    );
+                    self.mutate_state(
+                        id,
+                        |st| *st = SessionState::Errored(SharedString::from(message.clone())),
+                        cx,
+                    );
+                    self.push_system_note(
+                        id,
+                        acp_thread::SystemNoteLevel::Error,
+                        "Достигнут лимит claude — текущий ход остановлен (без переподключения).",
+                        cx,
+                    );
+                    self.apply_usage_limit_stop(id, &message, cx);
+                }
+                // Genuine hang: reconnect (respawn subprocess + replay transcript).
+                None => {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "session={id} wedged in Running (no progress {STUCK_TURN_SECS}s, no live \
+                         tool — or a tool in-progress >{TOOL_STUCK_SECS}s) — auto-reconnecting \
+                         (respawn subprocess + replay transcript)"
+                    );
+                    self.append_supervisor_diary_note(
+                        id,
+                        "session wedged while Running (hung subprocess); auto-reconnect",
+                        cx,
+                    );
+                    self.reconnect_agent(id, cx).detach_and_log_err(cx);
+                }
+            }
         }
     }
 
@@ -2351,9 +2444,13 @@ impl SolutionAgentStore {
                 // work, so there is nothing for the supervisor to judge. Live =
                 // any background shell still `Running`, or any managed agent that
                 // has not hit a terminal stop.
-                let has_live_background_work = s.background_shells.values().any(|sh| {
-                    matches!(sh.state, crate::background_shell::ShellRuntimeState::Running)
-                }) || s.background_agents.values().any(|a| a.is_messageable());
+                let has_live_background_work =
+                    s.background_shells.values().any(|sh| {
+                        matches!(
+                            sh.state,
+                            crate::background_shell::ShellRuntimeState::Running
+                        )
+                    }) || s.background_agents.values().any(|a| a.is_messageable());
                 (
                     idle_or_errored,
                     s.last_activity_at.timestamp_millis(),
@@ -2387,8 +2484,8 @@ impl SolutionAgentStore {
             // a turn, which bumps `last_activity_at` past the baseline) does the
             // normal idle-nudge cycle re-engage. `None` (a fresh in-session
             // enable) is always eligible — its idle arose under our watch.
-            let eligible_for_watch = watch_started_ms
-                .is_none_or(|baseline| last_activity_ms > baseline);
+            let eligible_for_watch =
+                watch_started_ms.is_none_or(|baseline| last_activity_ms > baseline);
 
             // Flush a nudge that was held because the user was typing when the
             // judge finished (`send_supervisor_nudge`'s hold-on-typing). Deliver
@@ -4124,8 +4221,7 @@ impl SolutionAgentStore {
                     // (no rows) keep the blob path verbatim and lazily migrate to
                     // rows afterwards.
                     let epoch = epoch_per_session.get(id).copied().unwrap_or(0);
-                    let restored_change_seq =
-                        change_seq_per_session.get(id).copied().flatten();
+                    let restored_change_seq = change_seq_per_session.get(id).copied().flatten();
                     let rows = rows_per_session.remove(id);
                     // Only deserialize the blob in the legacy (no-rows) branch.
                     let persisted = if rows.is_some() {
@@ -4151,12 +4247,14 @@ impl SolutionAgentStore {
                             .map(|p| p.available_models.clone())
                             .unwrap_or_default()
                     };
-                    let restored_desired_model = meta.desired_model.clone().or_else(|| {
-                        persisted.as_ref().and_then(|p| p.desired_model.clone())
-                    });
-                    let restored_desired_effort = meta.desired_effort.clone().or_else(|| {
-                        persisted.as_ref().and_then(|p| p.desired_effort.clone())
-                    });
+                    let restored_desired_model = meta
+                        .desired_model
+                        .clone()
+                        .or_else(|| persisted.as_ref().and_then(|p| p.desired_model.clone()));
+                    let restored_desired_effort = meta
+                        .desired_effort
+                        .clone()
+                        .or_else(|| persisted.as_ref().and_then(|p| p.desired_effort.clone()));
                     let entries = if let Some(rows) = rows {
                         entries_from_rows(rows)
                     } else {
@@ -4187,11 +4285,7 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = entries;
-                        s.restore_change_seq(if migrating {
-                            None
-                        } else {
-                            restored_change_seq
-                        });
+                        s.restore_change_seq(if migrating { None } else { restored_change_seq });
                         if migrating {
                             s.bump_epoch();
                         } else {
@@ -4362,8 +4456,10 @@ impl SolutionAgentStore {
             // Fetch the ordered tab-strip list so we can stamp
             // `tab_order` on freshly-hydrated sessions. Sessions not
             // in this list get `tab_order = None` (closed/hidden tab).
-            let tabbed_ids: Vec<SolutionSessionId> =
-                db.list_open_tabs(solution_id.clone()).await.unwrap_or_default();
+            let tabbed_ids: Vec<SolutionSessionId> = db
+                .list_open_tabs(solution_id.clone())
+                .await
+                .unwrap_or_default();
             let tab_order_map: std::collections::HashMap<SolutionSessionId, i64> = tabbed_ids
                 .iter()
                 .enumerate()
@@ -4404,8 +4500,10 @@ impl SolutionAgentStore {
                 let rows = db.load_entries(meta.id).await?;
                 let epoch = db.load_epoch(meta.id).await?.unwrap_or(0);
                 epoch_per_session.insert(meta.id, epoch);
-                change_seq_per_session
-                    .insert(meta.id, db.load_change_seq(meta.id).await?.map(|v| v as u64));
+                change_seq_per_session.insert(
+                    meta.id,
+                    db.load_change_seq(meta.id).await?.map(|v| v as u64),
+                );
                 if rows.is_empty() {
                     if let Some(bytes) = db.load_blob(meta.id).await? {
                         blobs.insert(meta.id, bytes);
@@ -4476,11 +4574,7 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = entries;
-                        s.restore_change_seq(if migrating {
-                            None
-                        } else {
-                            restored_change_seq
-                        });
+                        s.restore_change_seq(if migrating { None } else { restored_change_seq });
                         if migrating {
                             s.bump_epoch();
                         } else {
@@ -4638,8 +4732,10 @@ impl SolutionAgentStore {
             if open_ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let tabbed_ids: Vec<SolutionSessionId> =
-                db.list_open_tabs(solution_id.clone()).await.unwrap_or_default();
+            let tabbed_ids: Vec<SolutionSessionId> = db
+                .list_open_tabs(solution_id.clone())
+                .await
+                .unwrap_or_default();
             let tab_order_map: std::collections::HashMap<SolutionSessionId, i64> = tabbed_ids
                 .iter()
                 .enumerate()
@@ -4736,11 +4832,7 @@ impl SolutionAgentStore {
             // Every other restored tab hydrates on its own detached task so a
             // big backlog can't block the foreground; each lands on its entity
             // and clears its spinner independently.
-            for sid in hydrated
-                .iter()
-                .copied()
-                .filter(|id| Some(*id) != priority)
-            {
+            for sid in hydrated.iter().copied().filter(|id| Some(*id) != priority) {
                 let db = db.clone();
                 let this = this.clone();
                 cx.spawn(async move |cx| {
@@ -4794,13 +4886,10 @@ impl SolutionAgentStore {
             let mut rows = Some(rows);
             if let Some(entity) = this.sessions.get(&session_id).cloned() {
                 entity.update(cx, |session, cx| {
-                    let entries = if let Some(rows) =
-                        rows.take().filter(|r| !r.is_empty())
-                    {
+                    let entries = if let Some(rows) = rows.take().filter(|r| !r.is_empty()) {
                         entries_from_rows(rows)
                     } else {
-                        let (cold_entries, created_ms) =
-                            cold_entries_from_persisted(persisted, cx);
+                        let (cold_entries, created_ms) = cold_entries_from_persisted(persisted, cx);
                         crate::session_entry::rebuild_entries(
                             &cold_entries,
                             &[],
@@ -4810,11 +4899,7 @@ impl SolutionAgentStore {
                         )
                     };
                     session.entries = entries;
-                    session.restore_change_seq(if migrating {
-                        None
-                    } else {
-                        restored_change_seq
-                    });
+                    session.restore_change_seq(if migrating { None } else { restored_change_seq });
                     if migrating {
                         session.bump_epoch();
                     } else {
@@ -6264,8 +6349,12 @@ impl SolutionAgentStore {
             return;
         };
         cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let (epoch, change_seq) =
-                cx.update(|cx| (session.read(cx).epoch as i64, session.read(cx).change_seq as i64));
+            let (epoch, change_seq) = cx.update(|cx| {
+                (
+                    session.read(cx).epoch as i64,
+                    session.read(cx).change_seq as i64,
+                )
+            });
             db.delete_entries_from(session_id, from_idx as i64)
                 .await
                 .log_err();
@@ -7709,7 +7798,8 @@ impl SolutionAgentStore {
                     .map(|(_, idx)| *idx)
                     .collect();
                 for entry_index in pending_throttled {
-                    self.entry_update_throttles.remove(&(session_id, entry_index));
+                    self.entry_update_throttles
+                        .remove(&(session_id, entry_index));
                     cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
                         session_id,
                         entry_index,
@@ -8062,7 +8152,13 @@ impl SolutionAgentStore {
                     })
                     .unwrap_or(false);
                 if !updated_is_system_note {
-                    self.mutate_state(session_id, |state| { state.clear_error_on_activity(); }, cx);
+                    self.mutate_state(
+                        session_id,
+                        |state| {
+                            state.clear_error_on_activity();
+                        },
+                        cx,
+                    );
                     // A streaming chunk or a tool-status transition is agent
                     // activity too, so it must reset the silence clock the
                     // stuck-session watchdog reads — exactly like `NewEntry`
@@ -8161,8 +8257,7 @@ impl SolutionAgentStore {
                     let s = session_entity.read(cx);
                     let live = s.acp_thread().map(|t| t.read(cx).entries()).unwrap_or(&[]);
                     live.get(*idx).map(|live_entry| {
-                        let mut entry =
-                            crate::session_entry::to_session_entry(live_entry, cx);
+                        let mut entry = crate::session_entry::to_session_entry(live_entry, cx);
                         // Preserve the creation time stamped at first append.
                         entry.created_ms = s
                             .entries
@@ -8360,13 +8455,14 @@ impl SolutionAgentStore {
         let is_supervisor_ephemeral = session.read(cx).is_supervisor_ephemeral;
         if !is_supervisor_ephemeral
             && let Some(decision) = notifier::decide_notification(
-            session_id,
-            &previous,
-            &next,
-            now,
-            is_focused,
-            has_pending_messages,
-        ) {
+                session_id,
+                &previous,
+                &next,
+                now,
+                is_focused,
+                has_pending_messages,
+            )
+        {
             let (title, body) = {
                 let s = session.read(cx);
                 let title = format!("Sawe — {} ({})", s.agent_id, s.title);
@@ -8487,8 +8583,7 @@ impl SolutionAgentStore {
         // releases the last Rc, so the subprocess exits now instead of
         // lingering for the 60s idle debounce.
         let mut pool = self.pool.lock();
-        let keys: Vec<(SolutionId, AgentServerId)> =
-            pool.keys_for_solution(solution_id).collect();
+        let keys: Vec<(SolutionId, AgentServerId)> = pool.keys_for_solution(solution_id).collect();
         for key in &keys {
             pool.remove(key);
         }

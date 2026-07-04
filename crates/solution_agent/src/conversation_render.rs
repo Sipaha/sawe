@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use crate::session_entry::{
+    AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel, ToolStatus,
+};
 use acp_thread::{
     AcpThread, AgentThreadEntry, ContentBlock, PermissionOptions, SelectedPermissionOutcome,
     SelectedPermissionParams, ToolCall, ToolCallContent, ToolCallStatus, UserMessageId,
-};
-use crate::session_entry::{
-    AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel, ToolStatus,
 };
 use agent_client_protocol::schema as acp;
 use base64::Engine;
@@ -465,10 +465,12 @@ pub(crate) fn render_entry(
                 )
                 .child(
                     // Width-bounded, `min_w_0` so the markdown body wraps.
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .child(render_span((entry_idx, 0), text_md, markdown_for, style)),
+                    div().w_full().min_w_0().child(render_span(
+                        (entry_idx, 0),
+                        text_md,
+                        markdown_for,
+                        style,
+                    )),
                 )
                 .into_any_element()
         }
@@ -630,7 +632,10 @@ fn strip_one_timestamp(segment: &str) -> &str {
     let is_hms = stamp.len() == 8
         && stamp.as_bytes()[2] == b':'
         && stamp.as_bytes()[5] == b':'
-        && stamp.bytes().enumerate().all(|(i, b)| i == 2 || i == 5 || b.is_ascii_digit());
+        && stamp
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 2 || i == 5 || b.is_ascii_digit());
     if is_hms {
         &rest[close + crate::store::TS_PREFIX_CLOSE.len()..]
     } else {
@@ -719,7 +724,11 @@ pub(crate) fn render_user_message(
                     .gap_1()
                     .items_center()
                     .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(color))
-                    .child(Label::new("Наблюдатель").size(LabelSize::XSmall).color(color)),
+                    .child(
+                        Label::new("Наблюдатель")
+                            .size(LabelSize::XSmall)
+                            .color(color),
+                    ),
             )
             .child(div().w_full().min_w_0().child(body))
             .child(render_floating_copy_button(
@@ -811,9 +820,7 @@ pub(crate) fn render_compaction_prompt_chip(
                         let markdown = markdown.clone();
                         let style = style.clone();
                         let raw_text = raw_text.clone();
-                        Some(cx.new(|cx| {
-                            CompactPromptPopover::new(markdown, style, raw_text, cx)
-                        }))
+                        Some(cx.new(|cx| CompactPromptPopover::new(markdown, style, raw_text, cx)))
                     })
                     .anchor(Anchor::TopLeft),
             ),
@@ -1195,7 +1202,8 @@ pub(crate) fn render_assistant_message(
             }
         }
         if !combined.is_empty() {
-            container = container.child(render_span((entry_idx, 0), &combined, markdown_for, style));
+            container =
+                container.child(render_span((entry_idx, 0), &combined, markdown_for, style));
             container = container.child(render_floating_copy_button(
                 SharedString::from(format!("copy-assistant-{entry_idx}")),
                 combined,
@@ -1366,8 +1374,8 @@ pub(crate) fn render_tool_call(
     // deliberate follow-up, not part of the live-counter surface.
     let elapsed_label = if matches!(status, ToolStatus::InProgress) {
         status_started_at.map(|started_ms| {
-            let elapsed_secs = ((chrono::Utc::now().timestamp_millis() - started_ms) / 1000)
-                .max(0) as u64;
+            let elapsed_secs =
+                ((chrono::Utc::now().timestamp_millis() - started_ms) / 1000).max(0) as u64;
             crate::status_row::format_elapsed(elapsed_secs)
         })
     } else {
@@ -1913,10 +1921,7 @@ mod tests {
 
     #[test]
     fn empty_entries_produce_empty_table() {
-        assert_eq!(
-            compute_rewind_table(&[]),
-            Vec::<Option<String>>::new()
-        );
+        assert_eq!(compute_rewind_table(&[]), Vec::<Option<String>>::new());
     }
 
     #[test]
@@ -1968,7 +1973,10 @@ mod tests {
 
     #[test]
     fn strip_injected_meta_removes_leading_timestamp() {
-        assert_eq!(super::strip_injected_meta("[10:39:12] actual user text"), "actual user text");
+        assert_eq!(
+            super::strip_injected_meta("[10:39:12] actual user text"),
+            "actual user text"
+        );
     }
 
     #[test]
@@ -1991,7 +1999,10 @@ mod tests {
     #[test]
     fn strip_injected_meta_passes_through_non_timestamp_bracket() {
         // A leading bracket that is NOT a valid HH:MM:SS must be left intact.
-        assert_eq!(super::strip_injected_meta("[not-a-timestamp] text"), "[not-a-timestamp] text");
+        assert_eq!(
+            super::strip_injected_meta("[not-a-timestamp] text"),
+            "[not-a-timestamp] text"
+        );
     }
 
     fn collect(text: &str, query: &str) -> Vec<Range<usize>> {

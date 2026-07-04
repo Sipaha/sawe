@@ -66,12 +66,7 @@ impl ReopenSessionModal {
         }
     }
 
-    fn reopen(
-        &mut self,
-        id: SolutionSessionId,
-        solution_id: SolutionId,
-        cx: &mut Context<Self>,
-    ) {
+    fn reopen(&mut self, id: SolutionSessionId, solution_id: SolutionId, cx: &mut Context<Self>) {
         let store = SolutionAgentStore::global(cx);
         store
             .update(cx, |store, cx| {
@@ -162,9 +157,9 @@ impl Render for ReopenSessionModal {
                                     ),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.reopen(id, solution_id.clone(), cx)
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.reopen(id, solution_id.clone(), cx)),
+                    ),
             );
         }
         container = container.child(list);

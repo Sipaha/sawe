@@ -11,7 +11,6 @@ pub mod background_agent;
 pub mod background_shell;
 pub mod claude_adapter;
 pub(crate) mod cold_persistence;
-pub mod session_entry;
 pub(crate) mod compact;
 pub(crate) mod conversation_render;
 pub(crate) mod db;
@@ -25,13 +24,14 @@ pub mod notifier;
 pub(crate) mod pool;
 pub mod rename_session_modal;
 pub mod reopen_session_modal;
-pub mod supervisor_instruction_modal;
+pub mod session_entry;
 pub mod session_view;
 pub(crate) mod slash_commands;
 pub mod status_item;
 pub(crate) mod status_row;
 pub mod store;
 pub mod supervisor;
+pub mod supervisor_instruction_modal;
 pub mod upload;
 
 pub use claude_native::ModelInfo;
@@ -47,7 +47,7 @@ pub use background_shell::{
 pub use model::{
     AgentServerId, SessionState, SolutionSession, SolutionSessionId, SolutionSessionMetadata,
 };
-pub use store::{SubagentView, EFFORT_LEVELS};
+pub use store::{EFFORT_LEVELS, SubagentView};
 
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};

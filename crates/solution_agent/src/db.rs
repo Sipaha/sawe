@@ -265,11 +265,7 @@ impl SolutionAgentDb {
         // `next_eligible_ms` gates the watchdog from re-firing a judge
         // during a transient-failure backoff. Added idempotently because the
         // table may already exist (from before this column) in a user DB.
-        apply_idempotent_add_column_to(
-            &connection,
-            "supervisor_state",
-            "next_eligible_ms INTEGER",
-        );
+        apply_idempotent_add_column_to(&connection, "supervisor_state", "next_eligible_ms INTEGER");
 
         // Count of supervisor firings since last (re)enable, surfaced next to
         // the status-row icon. Defaults 0 for pre-existing rows.
@@ -502,7 +498,15 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            insert_or_update_entry(&connection, &session_id.to_string(), idx, mod_seq, created_ms, subagent_id, payload)
+            insert_or_update_entry(
+                &connection,
+                &session_id.to_string(),
+                idx,
+                mod_seq,
+                created_ms,
+                subagent_id,
+                payload,
+            )
         })
     }
 
@@ -618,9 +622,7 @@ impl SolutionAgentDb {
         })
     }
 
-    pub fn load_supervisor_states(
-        &self,
-    ) -> Task<Result<Vec<crate::supervisor::SupervisorState>>> {
+    pub fn load_supervisor_states(&self) -> Task<Result<Vec<crate::supervisor::SupervisorState>>> {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
@@ -1353,7 +1355,8 @@ fn insert_or_update_entry(
     subagent_id: Option<String>,
     payload: Vec<u8>,
 ) -> Result<()> {
-    let mut stmt = connection.exec_bound::<(String, i64, i64, i64, Option<String>, Vec<u8>)>(indoc! {"
+    let mut stmt =
+        connection.exec_bound::<(String, i64, i64, i64, Option<String>, Vec<u8>)>(indoc! {"
         INSERT INTO solution_session_entries
             (session_id, idx, mod_seq, created_ms, subagent_id, payload)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -1363,15 +1366,20 @@ fn insert_or_update_entry(
             subagent_id = excluded.subagent_id,
             payload     = excluded.payload
     "})?;
-    stmt((session_id.to_string(), idx, mod_seq, created_ms, subagent_id, payload))?;
+    stmt((
+        session_id.to_string(),
+        idx,
+        mod_seq,
+        created_ms,
+        subagent_id,
+        payload,
+    ))?;
     Ok(())
 }
 
-fn select_entries_for_session(
-    connection: &Connection,
-    session_id: &str,
-) -> Result<Vec<EntryRow>> {
-    let mut stmt = connection.select_bound::<String, (i64, i64, i64, Option<String>, Vec<u8>)>(indoc! {"
+fn select_entries_for_session(connection: &Connection, session_id: &str) -> Result<Vec<EntryRow>> {
+    let mut stmt =
+        connection.select_bound::<String, (i64, i64, i64, Option<String>, Vec<u8>)>(indoc! {"
         SELECT idx, mod_seq, created_ms, subagent_id, payload
         FROM   solution_session_entries
         WHERE  session_id = ?
@@ -1380,21 +1388,19 @@ fn select_entries_for_session(
     let rows = stmt(session_id.to_string())?;
     Ok(rows
         .into_iter()
-        .map(|(idx, mod_seq, created_ms, subagent_id, payload)| EntryRow {
-            idx,
-            mod_seq,
-            created_ms,
-            subagent_id,
-            payload,
-        })
+        .map(
+            |(idx, mod_seq, created_ms, subagent_id, payload)| EntryRow {
+                idx,
+                mod_seq,
+                created_ms,
+                subagent_id,
+                payload,
+            },
+        )
         .collect())
 }
 
-fn delete_entries_from_idx(
-    connection: &Connection,
-    session_id: &str,
-    from_idx: i64,
-) -> Result<()> {
+fn delete_entries_from_idx(connection: &Connection, session_id: &str, from_idx: i64) -> Result<()> {
     let mut stmt = connection.exec_bound::<(String, i64)>(indoc! {"
         DELETE FROM solution_session_entries
         WHERE session_id = ? AND idx >= ?
@@ -1724,7 +1730,10 @@ mod tests {
         let got = all.iter().find(|s| s.session_id == id).unwrap();
         assert!(got.enabled);
         assert_eq!(got.consecutive_continues, 4);
-        assert_eq!(got.custom_prompt.as_deref(), Some("don't stop before tests pass"));
+        assert_eq!(
+            got.custom_prompt.as_deref(),
+            Some("don't stop before tests pass")
+        );
         assert_eq!(got.status, SupervisorStatus::Stopped(StoppedReason::Quota));
         assert_eq!(got.next_eligible_ms, Some(1_700_000_999_000));
     }
@@ -2204,15 +2213,23 @@ mod tests {
             .await
             .unwrap();
 
-        let mut by_ses1 = db.attachment_paths_for_session("ses-1".into()).await.unwrap();
+        let mut by_ses1 = db
+            .attachment_paths_for_session("ses-1".into())
+            .await
+            .unwrap();
         by_ses1.sort();
         assert_eq!(by_ses1, vec!["/inbox/a.png", "/inbox/b.png"]);
 
-        let by_sol_a = db.attachment_paths_for_solution("sol-a".into()).await.unwrap();
+        let by_sol_a = db
+            .attachment_paths_for_solution("sol-a".into())
+            .await
+            .unwrap();
         assert_eq!(by_sol_a.len(), 3);
 
         // Delete by session removes only that session's rows.
-        db.delete_attachments_for_session("ses-1".into()).await.unwrap();
+        db.delete_attachments_for_session("ses-1".into())
+            .await
+            .unwrap();
         assert!(
             db.attachment_paths_for_session("ses-1".into())
                 .await
@@ -2228,7 +2245,9 @@ mod tests {
         );
 
         // delete_for_solution cascades to attachment rows for that solution only.
-        db.delete_for_solution(SolutionId("sol-a".into())).await.unwrap();
+        db.delete_for_solution(SolutionId("sol-a".into()))
+            .await
+            .unwrap();
         assert!(
             db.attachment_paths_for_solution("sol-a".into())
                 .await
@@ -2370,32 +2389,37 @@ mod tests {
 
         // Every table is empty for the doomed solution's session.
         assert!(db.load_entries(doomed).await.unwrap().is_empty());
-        assert!(db
-            .attachment_paths_for_session(doomed.to_string())
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .load_background_agents(doomed.to_string())
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .load_background_shells(doomed.to_string())
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .load_supervisor_states()
-            .await
-            .unwrap()
-            .iter()
-            .all(|s| s.session_id != doomed));
-        assert!(db
-            .list_for_solution(SolutionId("sol-doomed".into()))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.attachment_paths_for_session(doomed.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.load_background_agents(doomed.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.load_background_shells(doomed.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.load_supervisor_states()
+                .await
+                .unwrap()
+                .iter()
+                .all(|s| s.session_id != doomed)
+        );
+        assert!(
+            db.list_for_solution(SolutionId("sol-doomed".into()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // The survivor solution's session keeps every row.
         assert_eq!(db.load_entries(keep).await.unwrap().len(), 1);
@@ -2407,19 +2431,26 @@ mod tests {
             1
         );
         assert_eq!(
-            db.load_background_agents(keep.to_string()).await.unwrap().len(),
+            db.load_background_agents(keep.to_string())
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            db.load_background_shells(keep.to_string()).await.unwrap().len(),
+            db.load_background_shells(keep.to_string())
+                .await
+                .unwrap()
+                .len(),
             1
         );
-        assert!(db
-            .load_supervisor_states()
-            .await
-            .unwrap()
-            .iter()
-            .any(|s| s.session_id == keep));
+        assert!(
+            db.load_supervisor_states()
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.session_id == keep)
+        );
         assert_eq!(
             db.list_for_solution(SolutionId("sol-keep".into()))
                 .await
@@ -2438,9 +2469,16 @@ mod tests {
         db.upsert_entry(session_id, 1, 10, 1_000, None, b"second".to_vec())
             .await
             .unwrap();
-        db.upsert_entry(session_id, 0, 5, 500, Some("agent-a".into()), b"first".to_vec())
-            .await
-            .unwrap();
+        db.upsert_entry(
+            session_id,
+            0,
+            5,
+            500,
+            Some("agent-a".into()),
+            b"first".to_vec(),
+        )
+        .await
+        .unwrap();
 
         let rows = db.load_entries(session_id).await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -2461,9 +2499,16 @@ mod tests {
         db.upsert_entry(session_id, 0, 1, 100, None, b"original".to_vec())
             .await
             .unwrap();
-        db.upsert_entry(session_id, 0, 2, 200, Some("sub".into()), b"updated".to_vec())
-            .await
-            .unwrap();
+        db.upsert_entry(
+            session_id,
+            0,
+            2,
+            200,
+            Some("sub".into()),
+            b"updated".to_vec(),
+        )
+        .await
+        .unwrap();
 
         let rows = db.load_entries(session_id).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -2543,7 +2588,11 @@ mod tests {
         // value back below an already-issued cursor.
         db.save_change_seq(meta.id, 10).await.unwrap();
         let guarded = db.load_change_seq(meta.id).await.unwrap();
-        assert_eq!(guarded, Some(42), "a lower write must not overwrite a higher durable change_seq");
+        assert_eq!(
+            guarded,
+            Some(42),
+            "a lower write must not overwrite a higher durable change_seq"
+        );
     }
 
     #[gpui::test]
@@ -2632,27 +2681,31 @@ mod tests {
 
         // Every table is empty for `target`.
         assert!(db.load_entries(target).await.unwrap().is_empty());
-        assert!(db
-            .attachment_paths_for_session(target.to_string())
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .load_background_agents(target.to_string())
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .load_background_shells(target.to_string())
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .load_supervisor_states()
-            .await
-            .unwrap()
-            .iter()
-            .all(|s| s.session_id != target));
+        assert!(
+            db.attachment_paths_for_session(target.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.load_background_agents(target.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.load_background_shells(target.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.load_supervisor_states()
+                .await
+                .unwrap()
+                .iter()
+                .all(|s| s.session_id != target)
+        );
         let listed = db
             .list_for_solution(SolutionId("sol-purge".into()))
             .await
@@ -2682,12 +2735,13 @@ mod tests {
                 .len(),
             1
         );
-        assert!(db
-            .load_supervisor_states()
-            .await
-            .unwrap()
-            .iter()
-            .any(|s| s.session_id == sibling));
+        assert!(
+            db.load_supervisor_states()
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.session_id == sibling)
+        );
         assert!(listed.iter().any(|m| m.id == sibling));
     }
 
@@ -2799,19 +2853,29 @@ mod tests {
 
         // `old` was soft-closed 40 days ago (past the 30d cutoff), `recent` 5
         // days ago (inside it), `open` is still open (no `closed_at`).
-        db.mark_closed(old_id, Some(Utc.timestamp_millis_opt(now - 40 * day).unwrap()))
-            .await
-            .unwrap();
-        db.mark_closed(recent_id, Some(Utc.timestamp_millis_opt(now - 5 * day).unwrap()))
-            .await
-            .unwrap();
+        db.mark_closed(
+            old_id,
+            Some(Utc.timestamp_millis_opt(now - 40 * day).unwrap()),
+        )
+        .await
+        .unwrap();
+        db.mark_closed(
+            recent_id,
+            Some(Utc.timestamp_millis_opt(now - 5 * day).unwrap()),
+        )
+        .await
+        .unwrap();
 
         let cutoff = now - 30 * day;
         let ids = db
             .list_sessions_closed_before(SolutionId("sol-reap".into()), cutoff)
             .await
             .unwrap();
-        assert_eq!(ids, vec![old_id], "only the long-ago-closed session is returned");
+        assert_eq!(
+            ids,
+            vec![old_id],
+            "only the long-ago-closed session is returned"
+        );
 
         // A reopen clears `closed_at`, so a restored session is no longer
         // eligible even though it was once closed long ago.
@@ -2820,7 +2884,10 @@ mod tests {
             .list_sessions_closed_before(SolutionId("sol-reap".into()), cutoff)
             .await
             .unwrap();
-        assert!(ids.is_empty(), "a reopened session is excluded (closed_at cleared)");
+        assert!(
+            ids.is_empty(),
+            "a reopened session is excluded (closed_at cleared)"
+        );
         let _ = (recent_id, open_id);
     }
 }

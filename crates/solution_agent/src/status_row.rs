@@ -1070,10 +1070,7 @@ fn supervisor_popover_menu(
         .map(|s| s.status.human_label())
         .unwrap_or("Off")
         .into();
-    let consecutive_continues = state
-        .as_ref()
-        .map(|s| s.consecutive_continues)
-        .unwrap_or(0);
+    let consecutive_continues = state.as_ref().map(|s| s.consecutive_continues).unwrap_or(0);
     let custom_prompt = state.as_ref().and_then(|s| s.custom_prompt.clone());
     // Read verdicts once; derive both the summary stats and the log rows
     // from the same vec to avoid two filesystem reads.
@@ -1100,7 +1097,11 @@ fn supervisor_popover_menu(
         };
         menu = menu.item(
             ui::ContextMenuEntry::new(toggle_label)
-                .icon(if enabled { IconName::EyeOff } else { IconName::Eye })
+                .icon(if enabled {
+                    IconName::EyeOff
+                } else {
+                    IconName::Eye
+                })
                 .icon_color(Color::Muted)
                 .handler(move |_window, cx| {
                     SolutionAgentStore::global(cx).update(cx, |store, cx| {
@@ -1126,10 +1127,7 @@ fn supervisor_popover_menu(
                     workspace.update(cx, |workspace, cx| {
                         workspace.toggle_modal(window, cx, move |window, cx| {
                             crate::supervisor_instruction_modal::SupervisorInstructionModal::new(
-                                session_id,
-                                current,
-                                window,
-                                cx,
+                                session_id, current, window, cx,
                             )
                         });
                     });

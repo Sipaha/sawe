@@ -1,7 +1,7 @@
 use gpui::{App, Context, IntoElement, ParentElement, Render, Styled, Subscription, Window, div};
 use ui::Label;
-use workspace::{HideStatusItem, StatusItemView};
 use workspace::item::ItemHandle;
+use workspace::{HideStatusItem, StatusItemView};
 
 use crate::model::SessionState;
 use crate::store::SolutionAgentStore;

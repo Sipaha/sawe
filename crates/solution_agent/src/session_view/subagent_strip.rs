@@ -617,11 +617,7 @@ mod tests {
         // The judge is parent-linked to the supervised session but is
         // excluded by collect_snapshots before compute_strip_rows runs.
         // We simulate this by simply not including it in the snapshot slice.
-        let rows = compute_strip_rows(
-            supervised.id,
-            &SolutionId("sol-a".into()),
-            &[supervised],
-        );
+        let rows = compute_strip_rows(supervised.id, &SolutionId("sol-a".into()), &[supervised]);
         assert!(
             rows.is_none(),
             "strip should hide when judge is excluded and only the supervised session remains"

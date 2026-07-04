@@ -639,7 +639,10 @@ pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
         time: NaiveTime,
         weekday: Option<Weekday>,
     ) -> Option<i64> {
-        let now = Utc.timestamp_millis_opt(now_ms).single()?.with_timezone(&tz);
+        let now = Utc
+            .timestamp_millis_opt(now_ms)
+            .single()?
+            .with_timezone(&tz);
         let mut date = now.date_naive();
         match weekday {
             Some(target) => {
@@ -784,7 +787,10 @@ mod tests {
     fn dir_is_under_agents_session_supervisor() {
         let root = std::path::Path::new("/tmp/sol");
         let dir = supervisor_dir(root, sid());
-        assert_eq!(dir, root.join(".agents").join("abcd1234").join("supervisor"));
+        assert_eq!(
+            dir,
+            root.join(".agents").join("abcd1234").join("supervisor")
+        );
     }
 
     #[test]
@@ -793,7 +799,10 @@ mod tests {
         let path = session_log_path(tmp.path(), sid());
         assert_eq!(
             path,
-            tmp.path().join(".agents").join("abcd1234").join("session-log.md")
+            tmp.path()
+                .join(".agents")
+                .join("abcd1234")
+                .join("session-log.md")
         );
         append_session_log(&path, "Compaction c01", "did the first thing", 0).unwrap();
         append_session_log(&path, "✓ Session complete (Supervisor)", "all done", 0).unwrap();
@@ -839,7 +848,9 @@ mod tests {
         let path = tmp.path().join("verdicts.jsonl");
         let mut body = String::new();
         for i in 0..1000 {
-            body.push_str(&format!("{{\"n\":{i},\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}\n"));
+            body.push_str(&format!(
+                "{{\"n\":{i},\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}\n"
+            ));
         }
         std::fs::write(&path, &body).unwrap();
         let before = std::fs::metadata(&path).unwrap().len();
@@ -901,7 +912,14 @@ mod tests {
         // disabled flag → never
         assert!(!should_fire(false, &watching, true, 0, 999_000, 60));
         // already judging → never
-        assert!(!should_fire(true, &SupervisorStatus::Judging, true, 0, 999_000, 60));
+        assert!(!should_fire(
+            true,
+            &SupervisorStatus::Judging,
+            true,
+            0,
+            999_000,
+            60
+        ));
         // not idle/errored (e.g. running) → never
         assert!(!should_fire(true, &watching, false, 0, 999_000, 60));
     }
@@ -927,7 +945,10 @@ mod tests {
         assert!(out.contains("187,000 / 200,000 tokens (94%)"));
         // The `--nc` bridge command is fully materialized for the judge.
         assert!(out.contains("/path/to/sawe --nc /run/sol/mcp.sock"));
-        assert!(!out.contains("{DIARY_PATH}"), "all placeholders substituted");
+        assert!(
+            !out.contains("{DIARY_PATH}"),
+            "all placeholders substituted"
+        );
         assert!(!out.contains("{BRIDGE_BIN}"));
         assert!(!out.contains("{SOCKET_PATH}"));
         assert!(!out.contains("{CUSTOM_PROMPT_SECTION}"));
@@ -955,10 +976,22 @@ mod tests {
 
     #[test]
     fn classify_error_quota_vs_transient() {
-        assert!(matches!(classify_judge_error("usage limit reached"), JudgeFailure::Quota));
-        assert!(matches!(classify_judge_error("Error: rate_limit_error"), JudgeFailure::Quota));
-        assert!(matches!(classify_judge_error("overloaded_error"), JudgeFailure::Transient));
-        assert!(matches!(classify_judge_error("connection reset"), JudgeFailure::Transient));
+        assert!(matches!(
+            classify_judge_error("usage limit reached"),
+            JudgeFailure::Quota
+        ));
+        assert!(matches!(
+            classify_judge_error("Error: rate_limit_error"),
+            JudgeFailure::Quota
+        ));
+        assert!(matches!(
+            classify_judge_error("overloaded_error"),
+            JudgeFailure::Transient
+        ));
+        assert!(matches!(
+            classify_judge_error("connection reset"),
+            JudgeFailure::Transient
+        ));
     }
 
     #[test]
@@ -980,7 +1013,9 @@ mod tests {
         assert!(!is_usage_limit_error("connection reset by peer"));
         // The session-limit message must classify as Quota (was Transient).
         assert!(matches!(
-            classify_judge_error("You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"),
+            classify_judge_error(
+                "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
+            ),
             JudgeFailure::Quota
         ));
     }
@@ -1006,9 +1041,7 @@ mod tests {
         // Use a fixed named tz in the message so the test is independent of the
         // machine's local zone. now = 10:00 UTC == 17:00 in Novosibirsk.
         let tz: Tz = "Asia/Novosibirsk".parse().unwrap();
-        let now = chrono::Utc
-            .with_ymd_and_hms(2026, 6, 29, 10, 0, 0)
-            .unwrap();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 29, 10, 0, 0).unwrap();
         use chrono::TimeZone as _;
         // "resets 9:00" (24h) — 9:00 already passed today (17:00 now) → tomorrow.
         let got = parse_usage_limit_reset_ms(

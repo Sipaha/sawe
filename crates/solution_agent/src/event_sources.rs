@@ -44,8 +44,8 @@ pub fn install(cx: &mut App) {
         subscriptions: Vec::new(),
     });
     coordinator.update(cx, |this, cx| {
-        this.subscriptions.push(
-            cx.subscribe(&store, |_this, _store, event, cx| {
+        this.subscriptions
+            .push(cx.subscribe(&store, |_this, _store, event, cx| {
                 emit_event_notification(event, cx);
                 // Coalesced "re-poll" signal: any change that advances a
                 // session's `change_seq` also emits a content-free
@@ -62,8 +62,7 @@ pub fn install(cx: &mut App) {
                         build_session_dirty_payload(id, cx),
                     );
                 }
-            }),
-        );
+            }));
     });
 
     cx.set_global(GlobalEventSourceCoordinator(coordinator));
@@ -73,7 +72,9 @@ pub fn install(cx: &mut App) {
 /// client should re-poll. `None` for lifecycle/tab/notify events that don't
 /// move a session's `change_seq`. Used to drive the `agent_session_dirty`
 /// convergence signal.
-fn dirty_target_session(event: &SolutionAgentStoreEvent) -> Option<crate::model::SolutionSessionId> {
+fn dirty_target_session(
+    event: &SolutionAgentStoreEvent,
+) -> Option<crate::model::SolutionSessionId> {
     use SolutionAgentStoreEvent::*;
     match event {
         SessionStateChanged(id)
@@ -113,106 +114,94 @@ pub(crate) fn build_session_dirty_payload(
 fn emit_event_notification(event: &SolutionAgentStoreEvent, cx: &mut App) {
     match event {
         SolutionAgentStoreEvent::SessionCreated {
-                    id,
-                    parent_session_id,
-                } => {
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_created",
-                        json!({
-                            "session_id": id.to_string(),
-                            // `null` (not omitted) for top-level sessions
-                            // so the wire shape is self-documenting: a
-                            // missing field looks like "old server"; an
-                            // explicit null looks like "top-level".
-                            "parent_session_id": parent_session_id.map(|p| p.to_string()),
-                        }),
-                    );
-                }
-                SolutionAgentStoreEvent::SessionClosed(id) => {
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_closed",
-                        json!({ "session_id": id.to_string() }),
-                    );
-                }
-                SolutionAgentStoreEvent::SessionStateChanged(id) => {
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_state_changed",
-                        json!({ "session_id": id.to_string() }),
-                    );
-                }
-                SolutionAgentStoreEvent::SessionTitleChanged(id) => {
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_title_changed",
-                        json!({ "session_id": id.to_string() }),
-                    );
-                }
-                SolutionAgentStoreEvent::SessionMessageAppended(id, entry_index) => {
-                    let payload = build_message_appended_payload(*id, *entry_index, cx);
-                    editor_mcp::emit_notification(cx, "agent_session_message_appended", payload);
-                }
-                SolutionAgentStoreEvent::SessionQueueChanged(id) => {
-                    let payload = build_queue_changed_payload(*id, cx);
-                    editor_mcp::emit_notification(cx, "agent_session_queue_changed", payload);
-                }
-                SolutionAgentStoreEvent::SessionSubagentsChanged(id) => {
-                    let payload = build_active_subagents_changed_payload(*id, cx);
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_active_subagents_changed",
-                        payload,
-                    );
-                }
-                SolutionAgentStoreEvent::SessionContextReset { id, context_count } => {
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_context_reset",
-                        json!({
-                            "session_id": id.to_string(),
-                            "context_count": context_count,
-                        }),
-                    );
-                }
-                SolutionAgentStoreEvent::SessionNotified(id, kind) => {
-                    let kind_str = match kind {
-                        NotifyKind::Completed => "completed",
-                        NotifyKind::AwaitingInput => "awaiting_input",
-                        NotifyKind::Errored => "errored",
-                    };
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_notification_sent",
-                        json!({
-                            "session_id": id.to_string(),
-                            "kind": kind_str,
-                        }),
-                    );
-                }
-                // `TabsChanged` drives `ConsolePanel` tab synchronisation
-                // via a separate per-panel subscriber; the workspace-
-                // events coordinator doesn't need to forward it
-                // (sequenced `workspace.session_{opened,closed}` already
-                // ride out from `persist_tab_order` itself).
-                SolutionAgentStoreEvent::TabsChanged { .. } => {}
-                SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(id) => {
-                    let payload = build_background_agents_changed_payload(*id, cx);
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_background_agents_changed",
-                        payload,
-                    );
-                }
-                SolutionAgentStoreEvent::SessionBackgroundShellsChanged(id) => {
-                    let payload = build_background_shells_changed_payload(*id, cx);
-                    editor_mcp::emit_notification(
-                        cx,
-                        "agent_session_background_shells_changed",
-                        payload,
-                    );
-                }
+            id,
+            parent_session_id,
+        } => {
+            editor_mcp::emit_notification(
+                cx,
+                "agent_session_created",
+                json!({
+                    "session_id": id.to_string(),
+                    // `null` (not omitted) for top-level sessions
+                    // so the wire shape is self-documenting: a
+                    // missing field looks like "old server"; an
+                    // explicit null looks like "top-level".
+                    "parent_session_id": parent_session_id.map(|p| p.to_string()),
+                }),
+            );
+        }
+        SolutionAgentStoreEvent::SessionClosed(id) => {
+            editor_mcp::emit_notification(
+                cx,
+                "agent_session_closed",
+                json!({ "session_id": id.to_string() }),
+            );
+        }
+        SolutionAgentStoreEvent::SessionStateChanged(id) => {
+            editor_mcp::emit_notification(
+                cx,
+                "agent_session_state_changed",
+                json!({ "session_id": id.to_string() }),
+            );
+        }
+        SolutionAgentStoreEvent::SessionTitleChanged(id) => {
+            editor_mcp::emit_notification(
+                cx,
+                "agent_session_title_changed",
+                json!({ "session_id": id.to_string() }),
+            );
+        }
+        SolutionAgentStoreEvent::SessionMessageAppended(id, entry_index) => {
+            let payload = build_message_appended_payload(*id, *entry_index, cx);
+            editor_mcp::emit_notification(cx, "agent_session_message_appended", payload);
+        }
+        SolutionAgentStoreEvent::SessionQueueChanged(id) => {
+            let payload = build_queue_changed_payload(*id, cx);
+            editor_mcp::emit_notification(cx, "agent_session_queue_changed", payload);
+        }
+        SolutionAgentStoreEvent::SessionSubagentsChanged(id) => {
+            let payload = build_active_subagents_changed_payload(*id, cx);
+            editor_mcp::emit_notification(cx, "agent_session_active_subagents_changed", payload);
+        }
+        SolutionAgentStoreEvent::SessionContextReset { id, context_count } => {
+            editor_mcp::emit_notification(
+                cx,
+                "agent_session_context_reset",
+                json!({
+                    "session_id": id.to_string(),
+                    "context_count": context_count,
+                }),
+            );
+        }
+        SolutionAgentStoreEvent::SessionNotified(id, kind) => {
+            let kind_str = match kind {
+                NotifyKind::Completed => "completed",
+                NotifyKind::AwaitingInput => "awaiting_input",
+                NotifyKind::Errored => "errored",
+            };
+            editor_mcp::emit_notification(
+                cx,
+                "agent_session_notification_sent",
+                json!({
+                    "session_id": id.to_string(),
+                    "kind": kind_str,
+                }),
+            );
+        }
+        // `TabsChanged` drives `ConsolePanel` tab synchronisation
+        // via a separate per-panel subscriber; the workspace-
+        // events coordinator doesn't need to forward it
+        // (sequenced `workspace.session_{opened,closed}` already
+        // ride out from `persist_tab_order` itself).
+        SolutionAgentStoreEvent::TabsChanged { .. } => {}
+        SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(id) => {
+            let payload = build_background_agents_changed_payload(*id, cx);
+            editor_mcp::emit_notification(cx, "agent_session_background_agents_changed", payload);
+        }
+        SolutionAgentStoreEvent::SessionBackgroundShellsChanged(id) => {
+            let payload = build_background_shells_changed_payload(*id, cx);
+            editor_mcp::emit_notification(cx, "agent_session_background_shells_changed", payload);
+        }
     }
 }
 
@@ -561,10 +550,16 @@ mod tests {
         use crate::store::SolutionAgentStoreEvent::*;
         let sid = crate::model::SolutionSessionId::new();
         // Transcript-advancing events signal a re-poll.
-        assert_eq!(dirty_target_session(&SessionMessageAppended(sid, 3)), Some(sid));
+        assert_eq!(
+            dirty_target_session(&SessionMessageAppended(sid, 3)),
+            Some(sid)
+        );
         assert_eq!(dirty_target_session(&SessionStateChanged(sid)), Some(sid));
         assert_eq!(dirty_target_session(&SessionQueueChanged(sid)), Some(sid));
-        assert_eq!(dirty_target_session(&SessionSubagentsChanged(sid)), Some(sid));
+        assert_eq!(
+            dirty_target_session(&SessionSubagentsChanged(sid)),
+            Some(sid)
+        );
         // Pure lifecycle events do NOT — nothing for a client to re-fetch.
         assert_eq!(dirty_target_session(&SessionClosed(sid)), None);
         assert_eq!(

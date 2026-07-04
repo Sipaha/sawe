@@ -460,6 +460,14 @@ The supervisor persists its **row** (`enabled`, `status`, `last_fired_at`, …) 
 
 How to apply: any supervisor field that is transient (lives in a runtime map, not the DB row) must be reconciled against the persisted `status` on load — a persisted status that implies live in-flight state (`Judging`) is a phantom after restart and must be coerced. The autonomous supervisor must never act on state it did not observe change: a wall-clock idle gate must require activity *after* this process began watching, not merely a stale persisted timestamp — otherwise reopening the editor retroactively "resumes" everything. Guarded by `judging_status_coerced_to_watching_on_load` (db) and `restart_leaves_inherited_idle_until_fresh_activity` (store).
 
+### 34. The hang watchdog treats a usage-limit wall as a wall, not a hang
+
+`tick_stuck_sessions` reconnects a session stuck `Running` with no streaming / tool activity for `STUCK_TURN_SECS` (the "hung subprocess" heuristic). But a turn that hits claude's usage/session/weekly limit prints the wall as its last assistant message and then **stalls without ending** — indistinguishable, by silence alone, from a hang. The watchdog would reconnect and send the "your process hung, carry on" continuation, which starts a fresh turn that re-hits the same wall → stall → reconnect → a quota-burning loop (reported live: repeated `You've hit your session limit` + a spurious *"твой процесс завис… продолжай"* nudge).
+
+Fix: before recovering a wedged session, scan its latest assistant message; if it matches `supervisor::is_usage_limit_error`, route it to `apply_usage_limit_stop` (stop the turn as `Errored(<wall>)` so tick_stuck — `Running`-only — can't re-fire; push a `system` note; schedule an auto-resume at the parsed reset time if the observer is enabled, else `Stopped(Quota)`) instead of `reconnect_agent`. Genuine hangs (no limit text) take the unchanged reconnect path. `apply_usage_limit_stop` is extracted from `on_judge_failed`'s `JudgeFailure::Quota` arm — the judge-failure path and the agent's-own-turn path now share one wall handler.
+
+How to apply: any "the session went silent / errored" recovery heuristic (reconnect, retry, nudge-continue) must first check whether the silence is a provider *wall* (`is_usage_limit_error` on the surfaced message) — a wall is recovered by waiting for the reset, never by retrying, which just re-hits it. Guarded by `stuck_usage_limit_wall_stops_without_reconnect`.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

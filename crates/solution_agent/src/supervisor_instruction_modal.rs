@@ -127,9 +127,13 @@ impl Render for SupervisorInstructionModal {
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(Button::new("supervisor-instruction-cancel", "Cancel").on_click(
-                        cx.listener(|this, _, window, cx| this.cancel(&menu::Cancel, window, cx)),
-                    ))
+                    .child(
+                        Button::new("supervisor-instruction-cancel", "Cancel").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.cancel(&menu::Cancel, window, cx)
+                            }),
+                        ),
+                    )
                     .child(
                         Button::new("supervisor-instruction-save", "Save")
                             .style(ButtonStyle::Filled)

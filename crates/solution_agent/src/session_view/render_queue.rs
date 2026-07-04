@@ -50,37 +50,36 @@ impl SolutionSessionView {
         // `Markdown::new` per frame would never finish parsing. `None` only
         // until that entity is ready (filled in on the next frame).
         let bubble = (|| {
-                let entity = self.pending_markdown.as_ref()?.clone();
-                let style = self.markdown_style_for_render.as_ref()?.clone();
-                let bubble_bg = cx.theme().colors().text_accent.opacity(0.06);
-                let border_color = cx.theme().colors().text_accent.opacity(0.4);
-                // Decode any image blocks in the bundle so the
-                // `spk-image://idx` URL handler can pop them up. Mirrors
-                // the live-user-message path in
-                // `render_user_message`.
-                let mut images: Vec<Arc<gpui::Image>> = Vec::new();
-                for bundle in &bundles {
-                    for block in &bundle.blocks {
-                        if let agent_client_protocol::schema::ContentBlock::Image(img) = block
-                            && let Some(decoded) = decode_image_local(img)
-                        {
-                            images.push(decoded);
-                        }
+            let entity = self.pending_markdown.as_ref()?.clone();
+            let style = self.markdown_style_for_render.as_ref()?.clone();
+            let bubble_bg = cx.theme().colors().text_accent.opacity(0.06);
+            let border_color = cx.theme().colors().text_accent.opacity(0.4);
+            // Decode any image blocks in the bundle so the
+            // `spk-image://idx` URL handler can pop them up. Mirrors
+            // the live-user-message path in
+            // `render_user_message`.
+            let mut images: Vec<Arc<gpui::Image>> = Vec::new();
+            for bundle in &bundles {
+                for block in &bundle.blocks {
+                    if let agent_client_protocol::schema::ContentBlock::Image(img) = block
+                        && let Some(decoded) = decode_image_local(img)
+                    {
+                        images.push(decoded);
                     }
                 }
-                let images_for_handler = images;
-                let body =
-                    MarkdownElement::new(entity, style).on_url_click(move |url, window, cx| {
-                        if let Some(idx_str) = url.strip_prefix("spk-image://")
-                            && let Ok(idx) = idx_str.parse::<usize>()
-                            && let Some(image) = images_for_handler.get(idx).cloned()
-                        {
-                            open_image_preview(image, window, cx);
-                            return;
-                        }
-                        cx.open_url(url.as_ref());
-                    });
-                Some(
+            }
+            let images_for_handler = images;
+            let body = MarkdownElement::new(entity, style).on_url_click(move |url, window, cx| {
+                if let Some(idx_str) = url.strip_prefix("spk-image://")
+                    && let Ok(idx) = idx_str.parse::<usize>()
+                    && let Some(image) = images_for_handler.get(idx).cloned()
+                {
+                    open_image_preview(image, window, cx);
+                    return;
+                }
+                cx.open_url(url.as_ref());
+            });
+            Some(
                     h_flex().w_full().child(
                         div()
                             .relative()

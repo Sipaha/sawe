@@ -313,9 +313,7 @@ mod tests {
 
     #[gpui::test]
     fn converts_user_and_assistant_messages(cx: &mut TestAppContext) {
-        use acp_thread::{
-            AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock,
-        };
+        use acp_thread::{AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock};
         cx.update(|cx| {
             let user = AgentThreadEntry::UserMessage(acp_thread::UserMessage {
                 id: None,
@@ -335,7 +333,8 @@ mod tests {
             let assistant = AgentThreadEntry::AssistantMessage(AssistantMessage {
                 chunks: vec![AssistantMessageChunk::Message {
                     block: ContentBlock::Markdown {
-                        markdown: cx.new(|cx| markdown::Markdown::new("hi there".into(), None, None, cx)),
+                        markdown: cx
+                            .new(|cx| markdown::Markdown::new("hi there".into(), None, None, cx)),
                     },
                 }],
                 indented: false,
@@ -377,7 +376,9 @@ mod tests {
             let entry = to_session_entry(&call, cx);
             assert_eq!(entry.subagent_id.as_deref(), Some("toolu_p"));
             match entry.kind {
-                SessionEntryKind::ToolCall { status, id, kind, .. } => {
+                SessionEntryKind::ToolCall {
+                    status, id, kind, ..
+                } => {
                     assert!(matches!(status, ToolStatus::InProgress));
                     assert_eq!(id, "tc_9");
                     assert!(matches!(kind, acp::ToolKind::Edit));
@@ -389,7 +390,10 @@ mod tests {
 
     #[gpui::test]
     fn converts_plan_and_compaction(cx: &mut TestAppContext) {
-        use acp_thread::{AgentThreadEntry, ContextCompaction, ContextCompactionId, ContextCompactionStatus, PlanEntry};
+        use acp_thread::{
+            AgentThreadEntry, ContextCompaction, ContextCompactionId, ContextCompactionStatus,
+            PlanEntry,
+        };
         cx.update(|cx| {
             let plan = AgentThreadEntry::CompletedPlan(vec![PlanEntry {
                 content: cx.new(|cx| markdown::Markdown::new("step one".into(), None, None, cx)),
@@ -404,10 +408,14 @@ mod tests {
             let compaction = AgentThreadEntry::ContextCompaction(ContextCompaction {
                 id: ContextCompactionId("cc_1".into()),
                 status: ContextCompactionStatus::Completed,
-                summary: Some(cx.new(|cx| markdown::Markdown::new("summary".into(), None, None, cx))),
+                summary: Some(
+                    cx.new(|cx| markdown::Markdown::new("summary".into(), None, None, cx)),
+                ),
             });
             match to_session_entry(&compaction, cx).kind {
-                SessionEntryKind::ContextCompaction { status, summary_md, .. } => {
+                SessionEntryKind::ContextCompaction {
+                    status, summary_md, ..
+                } => {
                     assert!(matches!(status, CompactionStatus::Completed));
                     assert_eq!(summary_md.as_deref(), Some("summary"));
                 }
@@ -423,7 +431,8 @@ mod tests {
             let entry = AgentThreadEntry::AssistantMessage(AssistantMessage {
                 chunks: vec![AssistantMessageChunk::Message {
                     block: ContentBlock::Markdown {
-                        markdown: cx.new(|cx| markdown::Markdown::new("**bold**".into(), None, None, cx)),
+                        markdown: cx
+                            .new(|cx| markdown::Markdown::new("**bold**".into(), None, None, cx)),
                     },
                 }],
                 indented: false,
@@ -459,7 +468,11 @@ mod tests {
         assert_eq!(back.mod_seq, entry.mod_seq);
         assert_eq!(back.subagent_id, entry.subagent_id);
         match back.kind {
-            SessionEntryKind::ToolCall { status, status_started_at, .. } => {
+            SessionEntryKind::ToolCall {
+                status,
+                status_started_at,
+                ..
+            } => {
                 assert!(matches!(status, ToolStatus::InProgress));
                 assert_eq!(status_started_at, Some(1_700_000_000_500));
             }

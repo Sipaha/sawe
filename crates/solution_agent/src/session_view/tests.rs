@@ -70,11 +70,8 @@ fn retain_images_with_live_placeholder_drops_removed_attachments() {
         data_base64: "x".to_string(),
         label: SharedString::from(label),
     };
-    let labels = |imgs: &[PendingImage]| {
-        imgs.iter()
-            .map(|i| i.label.to_string())
-            .collect::<Vec<_>>()
-    };
+    let labels =
+        |imgs: &[PendingImage]| imgs.iter().map(|i| i.label.to_string()).collect::<Vec<_>>();
 
     // User kept #1 and #3 but deleted #2's placeholder → #2 must be dropped.
     let mut images = vec![img("image #1"), img("image #2"), img("image #3")];
