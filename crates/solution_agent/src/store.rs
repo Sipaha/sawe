@@ -7118,6 +7118,25 @@ impl SolutionAgentStore {
                 return None;
             }
             shell.state = new_state.clone();
+            // A background command COMPLETING is fresh session activity: reset
+            // the silence clock. While it ran, `has_live_background_work` kept
+            // the supervisor quiet, but `last_activity_at` stayed frozen at
+            // launch — so the moment it finishes the accrued silence is already
+            // past `IDLE_THRESHOLD_SECS` and the judge would fire INSTANTLY,
+            // racing (and usually losing to) the agent resuming ON ITS OWN to
+            // read the result (a `Bash(run_in_background)` orphan continuation /
+            // `<task-notification>`). Bumping the clock here gives the agent a
+            // full fresh idle window to self-resume before the supervisor
+            // judges; if it genuinely doesn't, the judge fires after the window
+            // as intended. (The send-time session-idle re-check in
+            // `apply_verdict` is the backstop for the residual race.)
+            if matches!(
+                new_state,
+                crate::background_shell::ShellRuntimeState::Exited(_)
+                    | crate::background_shell::ShellRuntimeState::Killed
+            ) {
+                s.last_activity_at = Utc::now();
+            }
             Some(crate::db::BackgroundShellRow {
                 solution_session_id: session_id.to_string(),
                 shell_id: shell.id.as_str().to_string(),

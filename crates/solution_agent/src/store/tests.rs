@@ -6793,6 +6793,53 @@ fn register_background_shell(
     });
 }
 
+/// A background command COMPLETING must reset the session's silence clock.
+/// While it runs, `has_live_background_work` keeps the supervisor quiet but
+/// `last_activity_at` stays frozen at launch — so on completion the accrued
+/// silence is already past the threshold and the judge would fire instantly,
+/// racing the agent's own resume-to-read-the-result. Bumping the clock gives
+/// the agent a fresh idle window to self-resume first.
+#[gpui::test]
+async fn background_shell_completion_resets_silence_clock(cx: &mut TestAppContext) {
+    let (session_id, _acp_thread, _tmp) = create_session_with_thread(cx).await;
+    register_background_shell(cx, session_id, "bg-done");
+
+    // Freeze the clock 10 min back, as a long silent command would leave it.
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(600);
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .unwrap()
+                .update(cx, |s, _| s.last_activity_at = stale);
+            store.mark_background_shell_state(
+                session_id,
+                crate::background_shell::BackgroundShellId::new("bg-done".to_string()),
+                crate::background_shell::ShellRuntimeState::Exited(Some(0)),
+                cx,
+            );
+        });
+    });
+
+    let after = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .last_activity_at
+    });
+    assert!(
+        after > stale,
+        "a completed background command must reset the silence clock"
+    );
+    assert!(
+        chrono::Utc::now().signed_duration_since(after).num_seconds() < 60,
+        "last_activity must be bumped to ~now on completion, not left stale"
+    );
+}
+
 /// Task 8: a terminal `KillShell` tool_call whose `raw_input` carries the
 /// `shell_id` of a tracked background shell flips that shell to
 /// `ShellRuntimeState::Killed` and emits `SessionBackgroundShellsChanged`.
