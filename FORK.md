@@ -476,6 +476,15 @@ The final buffered assistant text of a turn is flushed into the entry markdown a
 
 How to apply: any code that ends a turn out-of-band (synthesizes `Stopped`/`Error`, force-idles, reconnects mid-turn) MUST call `flush_end_of_turn_tail` in the same synchronous step before the terminal emit — the reveal task won't have flushed the last bytes. Guarded by `flush_end_of_turn_tail_signals_last_entry` (acp_thread) + `errored_flushes_pending_entry_update_debounce_immediately` (store).
 
+### 36. Desktop "agent finished" notifications: fire only when truly quiescent, and click-to-focus the originating session
+
+Two refinements to the freedesktop desktop notifications (`solution_agent::notifier` + the new `crates/zed/src/notification_focus.rs`):
+
+- **"Truly done" gate (`decide_notification`).** The `Completed` toast must only fire when nothing more will happen without the user. Beyond the existing `has_pending_messages` suppression, two signals were added: `has_live_background_work` (idle OVER a running `background_shell` / messageable `background_agent` — it resumes on its own) and `supervisor_will_continue` (the Observer is enabled + `Watching`/`Judging` — it will auto-nudge, and fires its OWN `notify_supervisor_done` / `escalate_to_user` when work actually concludes). `AwaitingInput`/`Errored` still fire regardless (parked-needing-you / broken).
+- **Click-to-focus (`zed::notification_focus`).** `notifier::dispatch` now stamps each notification with `default_action("open")` (id already `dev.sawe.session-{sid}`). A single long-lived listener spawned in `notification_focus::init` (from `main.rs`, Linux/FreeBSD only) subscribes to the portal's `ActionInvoked` signal via one `ashpd::NotificationProxy` (the signal is on the shared portal object, so one proxy sees clicks for every notification we sent). On a click it parses the id → `SolutionSessionId` and runs a main-thread focus sequence: raise the window (`Window::activate_window`), activate the session's Solution (`MultiWorkspace::activate` — resolve the owning `Workspace` by worktree→`SolutionStore::solution_for_path`), reveal+focus the console (`Workspace::focus_panel::<ConsolePanel>`), and select the session's tab (`ConsolePanel::show_session`).
+
+How to apply: the click-routing lives in the `zed` crate because it spans `solution_agent`+`solutions`+`workspace`+`console_panel` (a cycle if placed lower). The window root is `MultiWorkspace` — enumerate via `cx.windows().filter_map(|w| w.downcast::<MultiWorkspace>())`. NOTE: `show_session` selects the tab but does NOT reveal the dock, so the explicit `focus_panel::<ConsolePanel>` call is required. Guarded by `notifier` unit tests (quiescence gate) + `notification_focus::tests` (id parsing); the actual portal click→focus is manual-verify only (no headless portal).
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

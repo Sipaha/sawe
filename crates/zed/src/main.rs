@@ -1,6 +1,7 @@
 // Disable command line from opening on release mode
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod notification_focus;
 mod reliability;
 mod zed;
 
@@ -893,6 +894,7 @@ fn main() {
         vim::init(cx);
         terminal_view::init(cx);
         console_panel::init(cx);
+        notification_focus::init(cx);
         journal::init(app_state.clone(), cx);
         encoding_selector::init(cx);
         language_selector::init(cx);

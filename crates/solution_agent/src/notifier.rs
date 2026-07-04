@@ -160,6 +160,11 @@ pub fn dispatch(decision: &NotificationDecision, title: &str, body: &str, _cx: &
                     &format!("dev.sawe.session-{session_id_str}"),
                     Notification::new(&title)
                         .body(body.as_str())
+                        // Clicking the notification body invokes this action;
+                        // `zed::notification_focus` listens for it and focuses
+                        // the originating session (window + Solution + console
+                        // tab). The id above carries the session id.
+                        .default_action("open")
                         .priority(priority),
                 )
                 .await
