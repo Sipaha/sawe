@@ -9999,6 +9999,14 @@ async fn fifteen_continues_force_ask(cx: &mut gpui::TestAppContext) {
 
     for _ in 0..15 {
         store.update(cx, |store, cx| {
+            // A judge only ever fires while the session is idle (`should_fire`),
+            // and `apply_verdict` now re-checks that at delivery. A real
+            // continue cycle returns to idle between nudges; this test fires
+            // them back-to-back with no live turn, so re-assert the idle
+            // premise each round (the previous nudge left the session Running).
+            if let Some(s) = store.session(id) {
+                s.update(cx, |s, _| s.state = crate::model::SessionState::Idle);
+            }
             store.supervisor_states.get_mut(&id).unwrap().status =
                 crate::supervisor::SupervisorStatus::Judging;
             store.apply_verdict(
@@ -10028,6 +10036,56 @@ async fn fifteen_continues_force_ask(cx: &mut gpui::TestAppContext) {
         .unwrap();
     assert_eq!(st.consecutive_continues, 0);
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
+}
+
+/// Send-time session-state re-check: a judge fires only while the session is
+/// idle, but its turn runs seconds→minutes and the agent can resume ON ITS
+/// OWN in the meantime (a `Bash(run_in_background)` continuation lands as an
+/// orphan result and flips the session back to `Running`). A `Continue`
+/// verdict delivered against a now-`Running` session must be DROPPED — not
+/// nudged/queued behind the live turn (the reported "supervisor reacted while
+/// the agent was still alive and the message got queued").
+#[gpui::test]
+async fn continue_verdict_dropped_when_agent_already_running(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
+
+    store.update(cx, |store, cx| {
+        // The judge fired while idle; by delivery the agent has resumed.
+        if let Some(s) = store.session(id) {
+            s.update(cx, |s, _| {
+                s.state = crate::model::SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+            });
+        }
+        store.supervisor_states.get_mut(&id).unwrap().status =
+            crate::supervisor::SupervisorStatus::Judging;
+        store.apply_verdict(
+            id,
+            crate::supervisor::VerdictAction::Continue,
+            "keep going".into(),
+            None,
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+
+    // The verdict is dropped: the continue counter never advanced (the drop
+    // returns before the Continue arm), and no nudge was queued behind the
+    // live turn.
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    assert_eq!(
+        st.consecutive_continues, 0,
+        "a verdict delivered while the agent is Running must be dropped, not acted on"
+    );
+    let queued = store.read_with(cx, |store, cx| {
+        store.session(id).unwrap().read(cx).pending_messages.len()
+    });
+    assert_eq!(queued, 0, "no spurious supervisor nudge queued behind the live turn");
 }
 
 #[gpui::test]

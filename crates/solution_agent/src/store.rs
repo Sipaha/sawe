@@ -1797,7 +1797,26 @@ impl SolutionAgentStore {
                 )
             })
             .unwrap_or((false, false));
-        let drop_verdict = verdict_superseded || !supervising;
+        // Send-time SESSION-state re-check: `should_fire` only lets a judge
+        // fire while the session is idle/errored, but the judge turn runs
+        // seconds→minutes and the agent can resume ON ITS OWN in the meantime
+        // (a `Bash(run_in_background)` continuation lands as an orphan result
+        // and flips the session back to `Running`; a tool-auth prompt →
+        // `AwaitingInput`). Delivering a nudge now would just queue a spurious
+        // extra turn behind the live one (the reported "supervisor reacted
+        // while the agent was still alive and the message got queued"). Drop
+        // the verdict unless the session is still genuinely idle/errored — the
+        // same premise `should_fire` required at the start.
+        let session_idle = self
+            .session(id)
+            .map(|s| {
+                matches!(
+                    s.read(cx).state,
+                    SessionState::Idle | SessionState::Errored(_)
+                )
+            })
+            .unwrap_or(true);
+        let drop_verdict = verdict_superseded || !supervising || !session_idle;
 
         if let Some(root) = self.solution_root_for(id, cx) {
             let dir = crate::supervisor::supervisor_dir(&root, id);
