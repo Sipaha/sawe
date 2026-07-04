@@ -8762,49 +8762,74 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
     );
 }
 
-/// Regression for "just reopened the editor and the observer fired instantly":
-/// a restored (restart-path) supervisor row carries a `watch_started_ms`
-/// baseline, and `tick_supervisor` floors the idle clock at it. So a session
-/// that loaded already-idle (its `last_activity_at` is stale, from before the
-/// restart) does NOT get a judge on the first tick — the clock has to accrue a
-/// full idle window from the baseline first. The SAME state with no baseline (a
-/// fresh in-session enable) fires immediately, proving the baseline is the gate.
+/// Regression for "reopened the editor and the observer fired on a parked
+/// session by itself": after a restart the operator resumes each session by
+/// hand — the supervisor must NOT auto-resume a session that was already idle
+/// before the restart. A restored row carries a `watch_started_ms` baseline;
+/// `tick_supervisor` fires only once the session produces genuinely-new
+/// activity THIS process (its `last_activity_at` moves past the baseline, e.g.
+/// a manual kick starts a turn). Three cases pin the whole gate.
 #[gpui::test]
-async fn restart_baseline_delays_inherited_idle(cx: &mut gpui::TestAppContext) {
+async fn restart_leaves_inherited_idle_until_fresh_activity(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // Case A — inherited idle (activity predates the watch baseline): the
+    // session was parked before the restart, so it stays untouched even though
+    // it is idle and silent well past the threshold.
     store.update(cx, |store, cx| {
         let session = store.session(id).unwrap();
         session.update(cx, |s, _| {
             s.state = crate::model::SessionState::Idle;
-            // Idle long enough to clear the threshold on the raw activity clock.
             s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
         });
         store.set_supervision_enabled(id, true, cx);
-        // Simulate the restart/load path: the process only just started watching.
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        // Restart/load path: we started watching just now, AFTER the last activity.
         store.supervisor_states.get_mut(&id).unwrap().watch_started_ms = Some(now_ms);
+        store.tick_supervisor(cx);
     });
-
-    store.update(cx, |store, cx| store.tick_supervisor(cx));
     let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Watching,
-        "an inherited idle session must NOT fire a judge on the first tick after restart"
+        "a session parked before the restart must NOT auto-resume on reopen"
     );
     assert!(st.last_fired_at.is_none(), "no judge should have fired");
 
-    // Drop the baseline (as a fresh in-session enable would have it) → the same
-    // idle, silent session now fires immediately.
+    // Case B — genuinely-new activity under our watch (a manual kick's turn
+    // completed: last_activity is now AFTER the baseline, and silent past the
+    // threshold): the normal idle-nudge cycle re-engages and fires.
     store.update(cx, |store, cx| {
-        store.supervisor_states.get_mut(&id).unwrap().watch_started_ms = None;
+        // Baseline sits 5 min back; the fresh activity landed 2 min ago.
+        let st = store.supervisor_states.get_mut(&id).unwrap();
+        st.watch_started_ms = Some(now_ms - 300_000);
         store.tick_supervisor(cx);
     });
     let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
     assert_eq!(
         st.status,
         crate::supervisor::SupervisorStatus::Judging,
-        "without a baseline the idle session fires as before"
+        "once the session has fresh activity under our watch, the cycle re-engages"
+    );
+
+    // Case C — a FRESH in-session enable (no baseline) is always eligible: its
+    // idle arose under our watch, so immediate-idle semantics are unchanged.
+    let (store2, id2, _tmp2) = crate::store::test_support::seed_store_with_session(cx).await;
+    store2.update(cx, |store, cx| {
+        let session = store.session(id2).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.set_supervision_enabled(id2, true, cx);
+        assert!(store.supervisor_states.get(&id2).unwrap().watch_started_ms.is_none());
+        store.tick_supervisor(cx);
+    });
+    let st2 = store2.read_with(cx, |store, _| store.supervisor_state(id2)).unwrap();
+    assert_eq!(
+        st2.status,
+        crate::supervisor::SupervisorStatus::Judging,
+        "a fresh in-session enable fires on idle as before (no baseline gate)"
     );
 }
 

@@ -29,17 +29,17 @@ So the status row sits at "reviewing" indefinitely.
 ## Fix (two reconciliations at load)
 
 - **`db::load_supervisor_states`:** coerce a persisted `Judging → Watching` and drop the stale `last_fired_at`. A cold-loaded row can never have a live judge, so `Judging` is always a phantom.
-- **`SupervisorState.watch_started_ms` (new transient field):** the restart/load path (`store::set_persistence`) stamps `watch_started_ms = now` on every loaded row; `tick_supervisor` floors `quiet_since_ms` at it (`.max(watch_started_ms.unwrap_or(0))`). An inherited-idle session then counts its silence from process start and waits a full `IDLE_THRESHOLD_SECS` before the first judge, instead of firing instantly. A **fresh in-session enable** (`set_supervision_enabled`) leaves the field `None` → floors at 0 → immediate-idle semantics unchanged (so existing in-session tests and behaviour are untouched).
+- **`SupervisorState.watch_started_ms` (new transient field):** the restart/load path (`store::set_persistence`) stamps `watch_started_ms = now` on every loaded row; `tick_supervisor` fires only when `last_activity_ms > watch_started_ms` — i.e. the session produced genuinely-new activity under THIS process's watch. A **fresh in-session enable** (`set_supervision_enabled`) leaves the field `None` (always eligible) → immediate-idle semantics unchanged (existing in-session tests and behaviour untouched).
 
-The feature is preserved, not disabled: a genuinely parked mid-task agent still auto-resumes after a restart — just after the idle grace window rather than the instant the window opens.
+## Product decision: inherited idle is left alone until a manual kick
 
-## Why not permanently suppress inherited idle?
+The operator's explicit rule: *"Если я закрывал редактор и потом открыл, то ожидаю, что все сессии только с ручного пинка пойдут дальше работать."* After a restart **nothing auto-resumes** — every session parked before the restart waits for a manual kick. Once the operator kicks a session and its turn completes (`last_activity_at` moves past the baseline), the normal autonomous idle-nudge cycle re-engages for it.
 
-Considered gating fire on `last_activity_ms > watch_started_ms` (never nudge a session that went idle before we started watching). Rejected: the autonomous supervisor's whole purpose is to keep incomplete work moving, so a reopened editor *should* resume a parked task — just not barge in the instant the window paints. Flooring the clock (delay) rather than gating on fresh activity (permanent suppress) keeps that behaviour while killing the "сразу" complaint.
+This is a stronger stance than "delay the first judge by an idle window" (the initially-shipped variant): the earlier variant would still auto-resume a parked task after the grace window, which the operator did not want. Gating on `last_activity_ms > watch_started_ms` (activity *after* we started watching) rather than flooring the silence clock is what enforces "manual kick only".
 
 ## Tests
 
 - `db::tests::judging_status_coerced_to_watching_on_load` — phantom `Judging` restored as `Watching`, `last_fired_at` cleared, other statuses preserved.
-- `store::tests::restart_baseline_delays_inherited_idle` — a restored row with `watch_started_ms = Some(now)` + stale `last_activity_at` does NOT fire on the first tick; dropping the baseline (fresh-enable shape) fires immediately.
+- `store::tests::restart_leaves_inherited_idle_until_fresh_activity` — three cases: (A) restored row + stale `last_activity_at` → no fire; (B) restored row whose activity now postdates the baseline (a completed manual kick) → fires; (C) fresh in-session enable (no baseline) → fires on idle as before.
 - `store::tests::supervisor_states_loaded_at_persistence_init` — extended to assert the load path stamps `watch_started_ms`.
-- Full `solution_agent` suite green (509 lib tests).
+- Full `solution_agent` suite green.

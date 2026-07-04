@@ -2375,17 +2375,20 @@ impl SolutionAgentStore {
             // Treat live human typing as activity: the supervisor's idle clock
             // counts silence from the LATER of the session's last activity and
             // the user's last keystroke, so a nudge never fires while the user
-            // is mid-message (note_user_input bumps `last_user_input_ms`). On the
-            // restart path the clock is ALSO floored at the watch baseline
-            // (`watch_started_ms`): a session that loaded already-idle (its last
-            // activity is from before the restart) counts its silence from when
-            // this process began watching, not from that stale timestamp — so
-            // reopening the editor delays the first judge by a full idle window
-            // instead of firing one instantly on inherited idle. `None` (a
-            // fresh in-session enable) floors at 0, i.e. no change.
-            let quiet_since_ms = last_activity_ms
-                .max(last_user_input_ms.unwrap_or(0))
-                .max(watch_started_ms.unwrap_or(0));
+            // is mid-message (note_user_input bumps `last_user_input_ms`).
+            let quiet_since_ms = last_activity_ms.max(last_user_input_ms.unwrap_or(0));
+
+            // Inherited idle after a restart is left ALONE until a manual kick.
+            // `watch_started_ms` is stamped only on the restart/load path; a
+            // session whose last activity predates it was already parked when the
+            // editor closed, so the supervisor must NOT auto-resume it on reopen
+            // — the operator resumes each session by hand, and only once it
+            // produces genuinely-new activity THIS process (a manual kick starts
+            // a turn, which bumps `last_activity_at` past the baseline) does the
+            // normal idle-nudge cycle re-engage. `None` (a fresh in-session
+            // enable) is always eligible — its idle arose under our watch.
+            let eligible_for_watch = watch_started_ms
+                .is_none_or(|baseline| last_activity_ms > baseline);
 
             // Flush a nudge that was held because the user was typing when the
             // judge finished (`send_supervisor_nudge`'s hold-on-typing). Deliver
@@ -2451,6 +2454,7 @@ impl SolutionAgentStore {
             }
 
             if now_ms >= next_eligible_ms.unwrap_or(0)
+                && eligible_for_watch
                 && crate::supervisor::should_fire(
                     enabled,
                     &status,
