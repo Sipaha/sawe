@@ -2357,6 +2357,23 @@ impl AcpThread {
         }
     }
 
+    /// Drain the streaming text buffer's tail straight into the last entry's
+    /// markdown and signal a re-sync of that entry. The reveal task emits a
+    /// per-tick `EntryUpdated`, but the FINAL buffered tail is flushed here
+    /// bypassing that task — without the explicit `EntryUpdated` the last bytes
+    /// of a turn never reach the persisted / MCP `session.entries`, so the
+    /// stored reply is truncated (the "mobile shows a stale intermediate step"
+    /// bug). MUST be called on every terminal event of a turn, in the same
+    /// synchronous step, BEFORE the `Stopped`/`Error` emit. The mainline
+    /// run-turn completion calls it; so must any code that synthesizes a
+    /// terminal event out-of-band (e.g. `claude_native`'s orphan-result path).
+    pub fn flush_end_of_turn_tail(&mut self, cx: &mut Context<Self>) {
+        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        if !self.entries.is_empty() {
+            cx.emit(AcpThreadEvent::EntryUpdated(self.entries.len() - 1));
+        }
+    }
+
     /// Spawns a foreground task that periodically drains
     /// `streaming_text_buffer.pending` into the target `Markdown` entity,
     /// producing smooth, continuous text output.
@@ -3108,16 +3125,7 @@ impl AcpThread {
 
                 match response {
                     Ok(r) => {
-                        Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
-                        // The end-of-turn flush dumps the buffer's tail straight
-                        // into the markdown — bypassing the reveal task's
-                        // per-tick `EntryUpdated`. Signal it so the persisted/MCP
-                        // `session.entries` re-syncs the final bytes; otherwise
-                        // the last buffered tail of every turn is dropped from the
-                        // stored entry (truncated reply on mobile / after reload).
-                        if !this.entries.is_empty() {
-                            cx.emit(AcpThreadEvent::EntryUpdated(this.entries.len() - 1));
-                        }
+                        this.flush_end_of_turn_tail(cx);
 
                         if r.stop_reason == acp::StopReason::MaxTokens {
                             this.had_error = true;
@@ -3199,11 +3207,7 @@ impl AcpThread {
                         Ok(Some(r))
                     }
                     Err(e) => {
-                        Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
-                        // Same end-of-turn tail re-sync as the Ok path above.
-                        if !this.entries.is_empty() {
-                            cx.emit(AcpThreadEvent::EntryUpdated(this.entries.len() - 1));
-                        }
+                        this.flush_end_of_turn_tail(cx);
 
                         this.had_error = true;
                         cx.emit(AcpThreadEvent::Error);
@@ -4012,6 +4016,64 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[gpui::test]
+    async fn flush_end_of_turn_tail_signals_last_entry(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let updated = Rc::new(std::cell::RefCell::new(Vec::<usize>::new()));
+        let _sub = cx.update(|cx| {
+            let updated = updated.clone();
+            cx.subscribe(&thread, move |_t, ev, _cx| {
+                if let AcpThreadEvent::EntryUpdated(i) = ev {
+                    updated.borrow_mut().push(*i);
+                }
+            })
+        });
+
+        // No entries yet → flush is a no-op (must NOT emit EntryUpdated(-1) etc).
+        thread.update(cx, |t, cx| t.flush_end_of_turn_tail(cx));
+        cx.executor().run_until_parked();
+        assert!(
+            updated.borrow().is_empty(),
+            "flush with no entries must not signal any entry"
+        );
+
+        // One assistant entry present. Isolate the flush's emit by clearing what
+        // the push itself produced.
+        thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                acp::ContentBlock::Text(acp::TextContent::new("partial".to_string())),
+                false,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        updated.borrow_mut().clear();
+
+        thread.update(cx, |t, cx| t.flush_end_of_turn_tail(cx));
+        cx.executor().run_until_parked();
+        assert_eq!(
+            *updated.borrow(),
+            vec![0],
+            "flush must signal an EntryUpdated for the last (only) entry so the \
+             persisted / MCP transcript re-syncs the final tail"
+        );
     }
 
     #[gpui::test]

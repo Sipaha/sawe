@@ -468,6 +468,14 @@ Fix: before recovering a wedged session, scan its latest assistant message; if i
 
 How to apply: any "the session went silent / errored" recovery heuristic (reconnect, retry, nudge-continue) must first check whether the silence is a provider *wall* (`is_usage_limit_error` on the surfaced message) — a wall is recovered by waiting for the reset, never by retrying, which just re-hits it. Guarded by `stuck_usage_limit_wall_stops_without_reconnect`.
 
+### 35. Every turn-end path must flush the end-of-turn tail into `session.entries`
+
+The final buffered assistant text of a turn is flushed into the entry markdown at run-turn completion, followed by an explicit `AcpThreadEvent::EntryUpdated(last)` — that emit is what makes the store re-convert the entry and **bump its `mod_seq`** (the reveal task's per-tick updates stop before the final tail). The mobile client's whole delta-sync (`get_session` / `get_session_changes` filter `mod_seq > since_seq`) reads `SolutionSession.entries`; if the tail never lands there with a bumped seq, NO client catch-up (reopen delta, full reload, safety-net poll, reconnect) can recover it — the reply is permanently truncated.
+
+`claude_native` synthesizes a terminal event **out of band** for an *orphan result* (claude emits a terminating `result` with no `prompt()` in flight — e.g. a `Bash(run_in_background=true)` continuation resuming on its own and emitting a second result). That path emitted `Stopped`/`Error` directly on the thread WITHOUT the tail flush, so the follow-up message's tail was lost from `session.entries` while `Idle` still propagated — the "mobile shows a stale intermediate step + Idle" bug. Fix: `AcpThread::flush_end_of_turn_tail` (new `pub` method = `flush_streaming_text` + `EntryUpdated(last)`, called by the mainline arms AND the orphan path). Secondary: the store's `Error`/`LoadError` arm now flushes pending entry-append throttles synchronously (`flush_pending_entry_appends`, shared with the `Stopped` arm) so a turn that errors while already `Errored` doesn't strand the final append on the 500 ms debounce.
+
+How to apply: any code that ends a turn out-of-band (synthesizes `Stopped`/`Error`, force-idles, reconnects mid-turn) MUST call `flush_end_of_turn_tail` in the same synchronous step before the terminal emit — the reveal task won't have flushed the last bytes. Guarded by `flush_end_of_turn_tail_signals_last_entry` (acp_thread) + `errored_flushes_pending_entry_update_debounce_immediately` (store).
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

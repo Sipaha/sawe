@@ -5569,6 +5569,35 @@ impl SolutionAgentStore {
     /// Pushes onto the live `AcpThread` so it flows through the normal
     /// NewEntry → persist → mobile-delta pipeline. No-op for a cold session
     /// (no live thread) — callers inject right after a resume, when one exists.
+    /// Synchronously flush every pending `EntryUpdated` append throttle for
+    /// `session_id`, emitting each entry's `SessionMessageAppended` now and
+    /// dropping its debounce slot (so its timer can't double-fire). Called on
+    /// terminal turn events (`Stopped`/`Error`): the last assistant text of a
+    /// turn arrives via a debounced `EntryUpdated`, and at turn end that pending
+    /// timer is the only signal carrying the final tail — flushing it here
+    /// guarantees the final entry's append + `agent_session_dirty` ride out
+    /// immediately instead of racing the turn-completion teardown.
+    pub(crate) fn flush_pending_entry_appends(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let pending_throttled: Vec<usize> = self
+            .entry_update_throttles
+            .keys()
+            .filter(|(sid, _)| *sid == session_id)
+            .map(|(_, idx)| *idx)
+            .collect();
+        for entry_index in pending_throttled {
+            self.entry_update_throttles
+                .remove(&(session_id, entry_index));
+            cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
+                session_id,
+                entry_index,
+            ));
+        }
+    }
+
     pub(crate) fn push_system_note(
         &mut self,
         session_id: SolutionSessionId,
@@ -7791,20 +7820,7 @@ impl SolutionAgentStore {
                 // when its timer elapses) guarantees the final entry's
                 // `SessionMessageAppended` + `agent_session_dirty` ride out
                 // immediately on the turn-completion tick.
-                let pending_throttled: Vec<usize> = self
-                    .entry_update_throttles
-                    .keys()
-                    .filter(|(sid, _)| *sid == session_id)
-                    .map(|(_, idx)| *idx)
-                    .collect();
-                for entry_index in pending_throttled {
-                    self.entry_update_throttles
-                        .remove(&(session_id, entry_index));
-                    cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
-                        session_id,
-                        entry_index,
-                    ));
-                }
+                self.flush_pending_entry_appends(session_id, cx);
                 self.mutate_state(session_id, |state| *state = SessionState::Idle, cx);
                 if let Some(s) = self.sessions.get(&session_id).cloned() {
                     s.update(cx, |s, _| {
@@ -8050,6 +8066,14 @@ impl SolutionAgentStore {
                 self.persist_session_row(session_id, cx);
             }
             acp_thread::AcpThreadEvent::Error | acp_thread::AcpThreadEvent::LoadError(_) => {
+                // Symmetric with the `Stopped` arm: flush any pending end-of-turn
+                // entry-append throttle synchronously so the final entry's
+                // `SessionMessageAppended` (+ `agent_session_dirty`) rides out on
+                // the turn-error tick rather than depending on the 500 ms timer —
+                // which, if `Running→Errored` doesn't change the state
+                // discriminant (already Errored), would be the only remaining
+                // dirty signal.
+                self.flush_pending_entry_appends(session_id, cx);
                 self.mutate_state(
                     session_id,
                     |state| *state = SessionState::Errored(SharedString::from("agent error")),

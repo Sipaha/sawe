@@ -1442,7 +1442,16 @@ async fn run_update_pump(
                         );
                         let reason = *reason;
                         thread
-                            .update(cx, |_thread, cx| {
+                            .update(cx, |thread, cx| {
+                                // Orphan-result turns bypass the run-turn
+                                // completion path, so the follow-up assistant
+                                // message's final buffered tail is never flushed
+                                // into `session.entries` — it stays truncated at
+                                // the last streamed intermediate step (the
+                                // "mobile shows a stale step + Idle" bug). Flush
+                                // it here, in the same step, before the terminal
+                                // emit, exactly as the mainline completion does.
+                                thread.flush_end_of_turn_tail(cx);
                                 cx.emit(AcpThreadEvent::Stopped(reason));
                             })
                             .ok();
@@ -1454,7 +1463,11 @@ async fn run_update_pump(
                              on the AcpThread instead of swallowing it (orphan error; detail={detail})"
                         );
                         thread
-                            .update(cx, |_thread, cx| {
+                            .update(cx, |thread, cx| {
+                                // See the orphan-Stop branch: flush the final
+                                // tail before the terminal emit so the last
+                                // assistant bytes reach `session.entries`.
+                                thread.flush_end_of_turn_tail(cx);
                                 cx.emit(AcpThreadEvent::Error);
                             })
                             .ok();

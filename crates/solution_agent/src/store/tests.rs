@@ -5511,6 +5511,86 @@ async fn stopped_flushes_pending_entry_update_debounce_immediately(cx: &mut Test
     );
 }
 
+/// Symmetric with `stopped_flushes_pending_entry_update_debounce_immediately`:
+/// a turn that ends via `Error` must ALSO flush the pending entry-update
+/// debounce synchronously, so the final entry's append (and its
+/// `agent_session_dirty`) reaches the client without waiting out the 500 ms
+/// window. Without the flush, a turn that errored while already `Errored`
+/// (state discriminant unchanged → no state dirty) would leave the last
+/// assistant bytes reachable only after the debounce timer — the tail-loss
+/// class this fix closes.
+#[gpui::test]
+async fn errored_flushes_pending_entry_update_debounce_immediately(cx: &mut TestAppContext) {
+    use agent_client_protocol::schema as acp;
+
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                acp::ContentBlock::Text(acp::TextContent::new("partial".to_string())),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let appended = Rc::new(std::cell::RefCell::new(0usize));
+    let _subscription = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let appended = appended.clone();
+        cx.subscribe(&store, move |_store, event, _cx| {
+            if let SolutionAgentStoreEvent::SessionMessageAppended(id, idx) = event
+                && *id == session_id
+                && *idx == 0
+            {
+                *appended.borrow_mut() += 1;
+            }
+        })
+    });
+
+    // Arm the 500 ms debounce with a streaming EntryUpdated — no append yet.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::EntryUpdated(0));
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(*appended.borrow(), 0, "debounced update must not emit yet");
+
+    // Turn errors. The Error handler must flush the pending slot synchronously.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Error);
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        *appended.borrow(),
+        1,
+        "Error must flush the pending entry-update debounce immediately, like Stopped"
+    );
+
+    let still_throttled = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store
+            .read(cx)
+            .entry_update_throttles
+            .contains_key(&(session_id, 0))
+    });
+    assert!(!still_throttled, "the flushed throttle slot must be cleared on Error");
+
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(2_500));
+    cx.executor().run_until_parked();
+    assert_eq!(
+        *appended.borrow(),
+        1,
+        "the cleared debounce timer must not double-emit after Error flushed it"
+    );
+}
+
 /// Path to the `claude_native` mock binary (a bash script) used by the
 /// integration tests in `crates/claude_native/tests/`. Reuses the same fixture
 /// here so a Phase-2 store-routing test can stand up a real
