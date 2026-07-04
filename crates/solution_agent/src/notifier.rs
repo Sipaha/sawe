@@ -26,14 +26,26 @@ pub struct NotificationDecision {
 /// regardless of elapsed time. When the originating session is currently
 /// focused in the UI, no notification fires.
 ///
-/// `has_pending_messages` lets the caller signal that the session is about
-/// to immediately start another turn (drain its `pending_messages` queue
-/// — see `SolutionAgentStore::handle_acp_event` Stopped branch). In that
-/// case we suppress `Completed` notifications: the user expects "all my
-/// queued follow-ups done" as one logical unit of work and a per-turn
-/// ping in the middle is noise. `AwaitingInput` and `Errored` still fire
-/// — those mean the session is actually parked / broken regardless of
-/// the queue.
+/// A `Completed` ("agent finished") notification must only fire when the
+/// session is GENUINELY quiescent — nothing more will happen without the
+/// user. Three signals suppress it (each meaning "more work is coming on its
+/// own"), while `AwaitingInput` and `Errored` always fire (those mean the
+/// session is parked-needing-you / broken regardless):
+///
+/// * `has_pending_messages` — the Stopped branch is about to drain the
+///   `pending_messages` queue into another turn. The user expects one ping
+///   at the end of all their queued follow-ups, not per-turn.
+/// * `has_live_background_work` — the agent went idle OVER a background
+///   command/agent it launched (`background_shells` still `Running`, or a
+///   messageable `background_agent`). It's waiting on that work and will
+///   resume on its own when it finishes (e.g. a `Bash(run_in_background)`
+///   continuation), so this idle is not "done".
+/// * `supervisor_will_continue` — the Observer is enabled and in an
+///   auto-driving state (`Watching`/`Judging`): it will judge this idle and
+///   likely nudge the agent onward without the user. The supervisor fires
+///   its OWN "work complete" / "needs you" notification when it actually
+///   concludes (`notify_supervisor_done` / `escalate_to_user`), so a
+///   per-turn `Completed` here is premature noise.
 pub fn decide_notification(
     session_id: SolutionSessionId,
     previous: &SessionState,
@@ -41,6 +53,8 @@ pub fn decide_notification(
     now: Instant,
     is_focused: bool,
     has_pending_messages: bool,
+    has_live_background_work: bool,
+    supervisor_will_continue: bool,
 ) -> Option<NotificationDecision> {
     let prev_started = match previous {
         SessionState::Running {
@@ -61,7 +75,9 @@ pub fn decide_notification(
         return None;
     }
 
-    if matches!(kind, NotifyKind::Completed) && has_pending_messages {
+    if matches!(kind, NotifyKind::Completed)
+        && (has_pending_messages || has_live_background_work || supervisor_will_continue)
+    {
         return None;
     }
 
@@ -172,7 +188,7 @@ mod tests {
         };
         let next = SessionState::Idle;
         assert_eq!(
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false),
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, false, false),
             None
         );
     }
@@ -187,7 +203,7 @@ mod tests {
         };
         let next = SessionState::Idle;
         let decision =
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false);
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, false, false);
         assert!(matches!(decision, Some(d) if d.kind == NotifyKind::Completed));
     }
 
@@ -201,7 +217,7 @@ mod tests {
         };
         let next = SessionState::Idle;
         assert_eq!(
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, true, false),
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, true, false, false, false),
             None
         );
     }
@@ -216,7 +232,7 @@ mod tests {
         };
         let next = SessionState::Errored("boom".into());
         let decision =
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false);
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, false, false);
         assert!(matches!(decision, Some(d) if d.kind == NotifyKind::Errored));
     }
 
@@ -234,7 +250,7 @@ mod tests {
         // the user wants one notification at the end of all their
         // follow-ups, not per-turn.
         assert_eq!(
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, true),
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, true, false, false),
             None
         );
     }
@@ -252,7 +268,57 @@ mod tests {
         // automatically — the user must approve a tool call. Notify
         // even with pending messages.
         let decision =
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, true);
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, true, false, false);
         assert!(matches!(decision, Some(d) if d.kind == NotifyKind::AwaitingInput));
+    }
+
+    #[test]
+    fn completed_suppressed_over_live_background_work() {
+        let started = Instant::now();
+        let now = started + NOTIFICATION_THRESHOLD;
+        let prev = SessionState::Running {
+            started_at: started,
+            notified: false,
+        };
+        let next = SessionState::Idle;
+        // The agent went idle OVER a still-running background command it
+        // launched — it will resume on its own, so this isn't "done".
+        assert_eq!(
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn completed_suppressed_while_supervisor_will_continue() {
+        let started = Instant::now();
+        let now = started + NOTIFICATION_THRESHOLD;
+        let prev = SessionState::Running {
+            started_at: started,
+            notified: false,
+        };
+        let next = SessionState::Idle;
+        // The Observer is enabled and auto-driving — it will judge this idle
+        // and likely nudge onward; its own done/ask notification is the real
+        // end-of-work signal, so the per-turn Completed is premature.
+        assert_eq!(
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn errored_notifies_even_with_background_work_and_supervisor() {
+        let started = Instant::now();
+        let now = started + Duration::from_secs(10);
+        let prev = SessionState::Running {
+            started_at: started,
+            notified: false,
+        };
+        let next = SessionState::Errored("boom".into());
+        // A break needs the user regardless of background work / supervisor.
+        let decision =
+            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, true, true);
+        assert!(matches!(decision, Some(d) if d.kind == NotifyKind::Errored));
     }
 }

@@ -8471,12 +8471,37 @@ impl SolutionAgentStore {
             .as_ref()
             .map(|f| f(session_id, cx))
             .unwrap_or(false);
-        let has_pending_messages = !session.read(cx).pending_messages.is_empty();
+        // "Agent finished" must only fire when the session is genuinely
+        // quiescent. Beyond a pending queue, two more things mean "more work
+        // is coming without the user": (a) the agent is idle OVER a live
+        // background command/agent it launched (it resumes on its own when
+        // that finishes — the same `has_live_background_work` the supervisor
+        // watchdog uses), and (b) the Observer is enabled and auto-driving
+        // (`Watching`/`Judging`) — it will nudge onward and fires its own
+        // done/ask notification when the work actually concludes.
+        let (has_pending_messages, has_live_background_work, is_supervisor_ephemeral) = {
+            let s = session.read(cx);
+            let has_live_background_work = s.background_shells.values().any(|sh| {
+                matches!(sh.state, crate::background_shell::ShellRuntimeState::Running)
+            }) || s.background_agents.values().any(|a| a.is_messageable());
+            (
+                !s.pending_messages.is_empty(),
+                has_live_background_work,
+                s.is_supervisor_ephemeral,
+            )
+        };
+        let supervisor_will_continue = self.supervisor_states.get(&session_id).is_some_and(|st| {
+            st.enabled
+                && matches!(
+                    st.status,
+                    crate::supervisor::SupervisorStatus::Watching
+                        | crate::supervisor::SupervisorStatus::Judging
+                )
+        });
         // Ephemeral supervisor judge/auditor sessions are invisible — no tray
         // toast for an Errored judge or one whose turn crosses JUDGE_TIMEOUT_SECS.
         // Same suppression intent as the wire emit above; internal bookkeeping
         // (state transitions, subagent GC, Stopping safety-net) already ran.
-        let is_supervisor_ephemeral = session.read(cx).is_supervisor_ephemeral;
         if !is_supervisor_ephemeral
             && let Some(decision) = notifier::decide_notification(
                 session_id,
@@ -8485,6 +8510,8 @@ impl SolutionAgentStore {
                 now,
                 is_focused,
                 has_pending_messages,
+                has_live_background_work,
+                supervisor_will_continue,
             )
         {
             let (title, body) = {
