@@ -7032,6 +7032,73 @@ async fn done_agent_removed_on_tick(cx: &mut TestAppContext) {
     });
 }
 
+/// Analogous to `background_shell_completion_resets_silence_clock`, for the
+/// MANAGED-agent path: a background agent reaching a terminal `stop_reason`
+/// must reset the session's silence clock, so the supervisor gives the parent a
+/// full idle window to resume on its own before judging (rather than firing the
+/// instant `has_live_background_work` flips false with silence already accrued).
+#[gpui::test]
+async fn background_agent_terminal_transition_resets_silence_clock(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc");
+
+    // A JSONL whose latest line is a terminal assistant stop.
+    let dir = tempfile::tempdir().unwrap();
+    let jsonl = dir.path().join("agent.jsonl");
+    std::fs::write(
+        &jsonl,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"bye"}],"stop_reason":"end_turn"}}"#,
+    )
+    .unwrap();
+
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(600);
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| {
+            s.last_activity_at = stale;
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: jsonl.clone().into(),
+                    registered_at: chrono::Utc::now(),
+                    // Currently NON-terminal — the refresh below observes the
+                    // transition INTO terminal.
+                    latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                        mtime: std::time::SystemTime::now(),
+                        activity_label: SharedString::from("Generating…"),
+                        stop_reason: None,
+                    }),
+                    last_offset: 0,
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+        });
+    });
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| {
+            s.refresh_background_agent_snapshot(session_id, bg_id.clone(), cx)
+        });
+    });
+
+    let after = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .last_activity_at
+    });
+    assert!(after > stale, "terminal transition must reset the silence clock");
+    assert!(
+        chrono::Utc::now().signed_duration_since(after).num_seconds() < 60,
+        "last_activity must be bumped to ~now, not left stale"
+    );
+}
+
 /// Task 9: an agent with a stale snapshot beyond
 /// `MANAGED_AGENT_STALE_TIMEOUT + MANAGED_AGENT_DEAD_LINGER`
 /// (V1 hardcoded: 120s + 300s = 420s) is removed on tick.

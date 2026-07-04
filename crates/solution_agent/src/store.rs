@@ -6969,8 +6969,23 @@ impl SolutionAgentStore {
                 // user-visible state.
                 ba.last_offset = new_offset;
                 if let Some(snap) = snapshot {
+                    // A managed background agent reaching a terminal stop is
+                    // fresh session activity — reset the silence clock so the
+                    // supervisor gives the parent a full idle window to resume
+                    // on its own before judging, exactly like a background shell
+                    // completing (`mark_background_shell_state`). Only on the
+                    // transition into terminal (a done agent's JSONL stops
+                    // growing, so this fires once).
+                    let was_terminal = ba
+                        .latest
+                        .as_ref()
+                        .is_some_and(|s| s.stop_reason.is_some());
+                    let now_terminal = snap.stop_reason.is_some();
                     ba.latest = Some(snap);
                     changed = true;
+                    if now_terminal && !was_terminal {
+                        s.last_activity_at = Utc::now();
+                    }
                 }
             }
         });
