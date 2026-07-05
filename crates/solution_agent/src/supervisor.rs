@@ -418,6 +418,24 @@ pub fn intent_path(dir: &Path) -> PathBuf {
     dir.join("user_intent.md")
 }
 
+/// Best-effort wipe of the observer's durable memory for a session — the diary,
+/// the verdict log, AND the distilled user-intent record. Called when the HUMAN
+/// manually clears (`/clear`) or compacts (`/compact`) the session, so the
+/// supervisor reasons from a clean slate afterwards instead of re-reading stale
+/// notes and re-litigating already-settled directives. Deliberately NOT called
+/// on an observer-initiated `compact` verdict — that path relies on
+/// `user_intent.md` surviving so the goal isn't lost when the transcript is
+/// wiped. Silent on a missing file (nothing to wipe); logs other IO errors.
+pub fn wipe_supervisor_memory(dir: &Path) {
+    for path in [diary_path(dir), verdicts_path(dir), intent_path(dir)] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("wipe_supervisor_memory: {}: {e}", path.display()),
+        }
+    }
+}
+
 /// Cumulative, compaction-surviving record of what was accomplished over a
 /// session's lifetime, at `<solution_root>/.agents/<session_id>/session-log.md`.
 /// Each custom compaction appends the agent's own `state.md` summary here, and
@@ -813,6 +831,29 @@ mod tests {
         assert!(contents.contains("all done"));
         // appends accumulate (compaction entry precedes the completion entry)
         assert!(contents.find("Compaction c01").unwrap() < contents.find("all done").unwrap());
+    }
+
+    #[test]
+    fn wipe_supervisor_memory_removes_the_three_files_and_tolerates_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(diary_path(dir), "diary").unwrap();
+        std::fs::write(verdicts_path(dir), "{}\n").unwrap();
+        std::fs::write(intent_path(dir), "intent").unwrap();
+        // An unrelated file in the same dir must survive the wipe.
+        let keep = dir.join("session-log.md");
+        std::fs::write(&keep, "log").unwrap();
+
+        wipe_supervisor_memory(dir);
+
+        assert!(!diary_path(dir).exists());
+        assert!(!verdicts_path(dir).exists());
+        assert!(!intent_path(dir).exists());
+        assert!(keep.exists(), "unrelated files are left untouched");
+
+        // Idempotent: a second wipe with the files already gone is a silent
+        // no-op (NotFound is swallowed), not a panic.
+        wipe_supervisor_memory(dir);
     }
 
     #[test]

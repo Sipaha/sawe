@@ -1096,6 +1096,36 @@ impl SolutionAgentStore {
         .detach();
     }
 
+    /// Wipe the observer's durable memory (diary, verdicts, user-intent) AND
+    /// reset its in-memory reasoning cursor for `id`, on a HUMAN-initiated
+    /// `/clear` or `/compact`. Gives the supervisor a clean slate so it doesn't
+    /// re-read stale notes or re-litigate settled directives after the user
+    /// reset the thread. NOT invoked on an observer-issued `compact` verdict
+    /// (that path keeps `user_intent.md`). See
+    /// [`crate::supervisor::wipe_supervisor_memory`].
+    pub(crate) fn wipe_supervisor_memory(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(root) = self.solution_root_for(id, cx) {
+            let dir = crate::supervisor::supervisor_dir(&root, id);
+            crate::supervisor::wipe_supervisor_memory(&dir);
+        }
+        // Reset the in-memory reasoning cursor too: the continue-loop counter
+        // and any parked/one-shot verdict state, so a stale nudge or wait can't
+        // fire against the freshly-cleared thread and the continue cadence
+        // restarts from zero. Leaves identity/config (enabled, status,
+        // custom_prompt, trigger_count) intact.
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            state.consecutive_continues = 0;
+            state.pending_nudge = None;
+            state.judge_superseded = false;
+            state.wait_until_ms = None;
+        }
+        self.persist_supervisor_state(id, cx);
+    }
+
     /// Resolve the root directory of the solution that owns `id`, via the
     /// `SolutionStore` global (the compact.rs pattern). Returns `None` when the
     /// session is unknown, the `SolutionStore` global is absent (headless /
@@ -1917,7 +1947,11 @@ impl SolutionAgentStore {
                 // lease is released first (decision: never read an entity during
                 // its own mutation — snapshot before, or defer).
                 cx.defer(
-                    move |cx| match crate::compact::start_compact_for_session(id, cx) {
+                    move |cx| match crate::compact::start_compact_for_session(
+                        id,
+                        crate::compact::CompactInitiator::Observer,
+                        cx,
+                    ) {
                         Err(err) => {
                             log::warn!("apply_verdict compact({id}): {err}");
                         }
@@ -5866,6 +5900,10 @@ impl SolutionAgentStore {
         let Some(session_entity) = self.sessions.get(&session_id).cloned() else {
             return Task::ready(Err(anyhow!("unknown session {session_id}")));
         };
+        // Human-initiated `/clear`: give the observer a clean slate (wipe its
+        // diary/verdicts/user-intent + reset its reasoning cursor) so it doesn't
+        // carry stale reasoning across the reset.
+        self.wipe_supervisor_memory(session_id, cx);
         // `project` is None for a COLD session (loaded from the DB, never
         // promoted to live this run) — the common case for `/clear` on a
         // session whose conversation was generated in a previous editor

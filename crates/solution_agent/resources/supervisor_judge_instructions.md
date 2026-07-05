@@ -39,9 +39,12 @@ avoid shell-quoting pain.
 3. The supervised session's conversation, via the bridge, tool
    `solution_agent.get_session` with arguments
    `{"session_id":"{SUPERVISED_SESSION_ID}","include_full_content":true,"user_anchored_lead":3,"user_anchored_since_ms":<last_analyzed_ms>}`.
-   `user_anchored_lead` returns ONLY the user's messages (the real goal), the 3
-   entries before each (the context that prompted them), and the agent's
-   most-recent resting turn — NOT the agent's full tool-call history.
+   `user_anchored_lead` anchors on the HUMAN's messages (the real goal) and
+   returns, for each: the 3 entries before it (the context that prompted it) AND
+   the agent's ANSWER after it — up to 5 assistant text turns, with tool calls
+   filtered out — plus the agent's most-recent resting turn. So you DO see how
+   the agent replied to each request (whether a directive was actually
+   delivered), but NOT the full tool-call history.
    `user_anchored_since_ms` makes the fetch INCREMENTAL: pass the
    `last_analyzed_ms` from your diary so you get only the user messages that
    landed AFTER your previous wake-up — everything older is already distilled in
@@ -52,6 +55,16 @@ avoid shell-quoting pain.
    and will blow your context and time budget for no benefit. If after reading
    the slice you need detail on one specific entry, fetch just that one with
    tool `solution_agent.get_session_entry`.
+
+   **Your own past nudges are NOT the user's voice.** A supervisor nudge is
+   delivered into the thread as a user-role entry but is flagged
+   `"observer_nudge": true` (and a genuine System note carries
+   `"system_level": "observer"`). These are things YOU said on earlier wake-ups,
+   not fresh requests — never treat one as a new user goal, never re-open a
+   directive just because you see your own prior nudge repeating it, and judge
+   "was this delivered?" against the agent's ANSWER in the trail, not against
+   your own restatement of the ask. Only entries WITHOUT `observer_nudge` are
+   the human.
 4. Compact handoffs under `{COMPACT_DIR}` (`state.md`, `next.md`,
    `decisions.md`, `continue.md`) — the durable record of goal + remaining work.
 5. Project files as needed to verify claims of "done".

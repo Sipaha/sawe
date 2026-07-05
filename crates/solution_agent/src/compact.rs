@@ -35,8 +35,20 @@ pub(crate) struct StartCompactOutcome {
 /// `SolutionSessionView` requires `&mut Window`, which the MCP path
 /// doesn't have. The desktop entry point handles cold separately via
 /// `start_compact_from_cold` on the navigator.
+/// Who triggered the compaction. A HUMAN-initiated `/compact` wipes the
+/// observer's memory (like `/clear`) so it reasons fresh afterwards; an
+/// OBSERVER-issued `compact` verdict must NOT wipe it (that path relies on
+/// `user_intent.md` surviving the transcript loss). See
+/// [`crate::supervisor::wipe_supervisor_memory`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactInitiator {
+    User,
+    Observer,
+}
+
 pub(crate) fn start_compact_for_session(
     session_id: SolutionSessionId,
+    initiator: CompactInitiator,
     cx: &mut App,
 ) -> Result<StartCompactOutcome> {
     let store = SolutionAgentStore::global(cx);
@@ -111,6 +123,12 @@ pub(crate) fn start_compact_for_session(
 
     let rendered = render_compact_prompt_inner(session_id, cx)?;
     store.update(cx, |store, cx| {
+        // Human `/compact`: reset the observer to a clean slate (same as
+        // `/clear`), so it doesn't re-litigate settled directives after the
+        // user rotated the context. Observer-issued compaction keeps its memory.
+        if initiator == CompactInitiator::User {
+            store.wipe_supervisor_memory(session_id, cx);
+        }
         store
             .send_message(session_id, rendered, cx)
             .detach_and_log_err(cx);
@@ -273,7 +291,7 @@ impl SolutionSessionView {
     /// calls back via `solution_agent.compact_session`.
     pub(crate) fn start_compact(&self, cx: &mut Context<Self>) {
         let session_id = self.session_id();
-        match start_compact_for_session(session_id, cx) {
+        match start_compact_for_session(session_id, CompactInitiator::User, cx) {
             Ok(StartCompactOutcome { queued: true, .. }) => {}
             Ok(StartCompactOutcome {
                 queued: false,
@@ -586,7 +604,7 @@ mod tests {
         });
 
         let outcome = cx
-            .update(|cx| start_compact_for_session(session_id, cx))
+            .update(|cx| start_compact_for_session(session_id, CompactInitiator::User, cx))
             .expect("start_compact_for_session dispatches");
 
         assert!(

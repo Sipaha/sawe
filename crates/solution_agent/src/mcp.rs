@@ -1222,6 +1222,17 @@ pub struct EntrySummary {
     /// by subagent tab — match against `SessionSummary::active_subagents[*].id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_id: Option<String>,
+    /// True for a `role == "user"` entry that is actually a SUPERVISOR
+    /// (observer) nudge, not a message the human typed. A nudge is delivered
+    /// into the thread AS a user message (so the agent acts on it) but carries
+    /// the `spk_observer_nudge` `_meta` marker (see
+    /// `acp_thread::is_observer_nudge_blocks`). Two consumers rely on this:
+    /// (1) the mobile / desktop clients render it as an Observer plaque instead
+    /// of a plain user bubble; (2) the Supervisor judge must NOT anchor on its
+    /// own past nudges as if they were fresh user goals (see
+    /// `apply_user_anchored_filter`). Always `false` for non-user entries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observer_nudge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1384,15 +1395,26 @@ pub struct QueuedBundleSummary {
 /// and the absolute `EntrySummary.index` of every surviving entry. A no-op
 /// when there are no user entries (nothing to anchor on → keep the window
 /// as-is, so the judge still sees *something*).
+/// Trail cap: how many of the agent's ASSISTANT text turns to keep after each
+/// user anchor. This is the agent's ANSWER to that message — the thing the
+/// judge must see to know a directive was delivered. Tool calls between them
+/// are skipped (noise), so this counts text turns, not raw entries.
+const USER_ANCHORED_TRAIL_ASSISTANT: usize = 5;
+
 fn apply_user_anchored_filter(kept: &mut Vec<EntrySummary>, lead: usize, since_ms: Option<i64>) {
     if kept.is_empty() {
         return;
     }
-    // A user entry anchors the slice only when it's newer than `since_ms` (the
-    // judge's previous-wake cutoff). An entry with no timestamp is kept (can't
-    // prove it's old). With no `since_ms` every user entry anchors.
+    // A user entry anchors the slice only when it's the HUMAN's own message —
+    // NEVER a supervisor nudge (those are user-role but carry the observer
+    // marker; anchoring on them makes the judge re-read its own past nudges as
+    // fresh user goals and loop) — AND newer than `since_ms` (the judge's
+    // previous-wake cutoff). An entry with no timestamp is kept (can't prove
+    // it's old). With no `since_ms` every human user entry anchors.
     let anchors = |e: &EntrySummary| {
-        e.role == EntryRoleDto::User && since_ms.is_none_or(|s| e.created_ms.is_none_or(|c| c > s))
+        e.role == EntryRoleDto::User
+            && !e.observer_nudge
+            && since_ms.is_none_or(|s| e.created_ms.is_none_or(|c| c > s))
     };
     let has_user = kept.iter().any(anchors);
     if !has_user {
@@ -1411,11 +1433,32 @@ fn apply_user_anchored_filter(kept: &mut Vec<EntrySummary>, lead: usize, since_m
         return;
     }
     let mut keep = vec![false; kept.len()];
-    for (pos, entry) in kept.iter().enumerate() {
-        if anchors(entry) {
-            let start = pos.saturating_sub(lead);
-            for flag in keep.iter_mut().take(pos + 1).skip(start) {
-                *flag = true;
+    for pos in 0..kept.len() {
+        if !anchors(&kept[pos]) {
+            continue;
+        }
+        // Lead: the anchor plus the `lead` entries before it (the context that
+        // prompted the user's message).
+        let start = pos.saturating_sub(lead);
+        for flag in keep.iter_mut().take(pos + 1).skip(start) {
+            *flag = true;
+        }
+        // Trail: the agent's answer — up to `USER_ANCHORED_TRAIL_ASSISTANT`
+        // assistant text turns after the anchor, skipping tool calls. Stop at
+        // the next user-role entry (the next anchor OR a supervisor nudge) so
+        // adjacent user messages never overlap and a nudge's own follow-up work
+        // isn't attributed to this message.
+        let mut assistant_kept = 0;
+        for j in (pos + 1)..kept.len() {
+            if kept[j].role == EntryRoleDto::User {
+                break;
+            }
+            if kept[j].role == EntryRoleDto::Assistant {
+                keep[j] = true;
+                assistant_kept += 1;
+                if assistant_kept >= USER_ANCHORED_TRAIL_ASSISTANT {
+                    break;
+                }
             }
         }
     }
@@ -2148,6 +2191,12 @@ fn summarize_entry(
     } else {
         None
     };
+    // A supervisor nudge is a user-role entry stamped with the
+    // `spk_observer_nudge` `_meta` marker on its chunks. Surface it so clients
+    // render the Observer plaque and the judge doesn't re-anchor on its own
+    // past nudges.
+    let observer_nudge = matches!(kind, SessionEntryKind::UserMessage { chunks, .. }
+        if acp_thread::is_observer_nudge_blocks(chunks));
 
     EntrySummary {
         role,
@@ -2162,6 +2211,7 @@ fn summarize_entry(
         client_send_ids,
         created_ms,
         subagent_id,
+        observer_nudge,
     }
 }
 
@@ -3850,7 +3900,11 @@ impl McpServerTool for StartCompactTool {
             .map_err(|e| anyhow!("bad session id: {e}"))?;
 
         let outcome = cx.update(|cx| -> Result<crate::compact::StartCompactOutcome> {
-            crate::compact::start_compact_for_session(session_id, cx)
+            crate::compact::start_compact_for_session(
+                session_id,
+                crate::compact::CompactInitiator::User,
+                cx,
+            )
         })?;
 
         let text = if outcome.queued {
@@ -8383,31 +8437,102 @@ mod tests {
             client_send_ids: Vec::new(),
             created_ms: None,
             subagent_id: None,
+            observer_nudge: false,
         }
     }
 
+    /// A user-role entry that is actually a supervisor nudge (the observer's
+    /// own voice), not the human's message.
+    fn nudge_entry(index: usize) -> EntrySummary {
+        let mut e = anchored_entry(index, EntryRoleDto::User);
+        e.observer_nudge = true;
+        e
+    }
+
     #[test]
-    fn user_anchored_filter_keeps_user_lead_and_resting_turn() {
+    fn user_anchored_filter_keeps_user_lead_trail_and_resting_turn() {
         use EntryRoleDto::*;
         // Timeline: assistant churn, a user turn, more churn, another user
         // turn, then a long agent tail. lead=2 → each user keeps itself + 2
-        // before; the final entry is always kept (the resting turn).
+        // before; the TRAIL keeps the agent's assistant answer after each user
+        // turn (skipping tool calls, stopping at the next user); the final
+        // entry is always kept (the resting turn).
         let mut kept = vec![
             anchored_entry(0, Assistant),
             anchored_entry(1, ToolCall),
             anchored_entry(2, Assistant),
-            anchored_entry(3, User), // keeps 1,2,3
+            anchored_entry(3, User), // lead keeps 1,2,3
             anchored_entry(4, ToolCall),
-            anchored_entry(5, Assistant),
+            anchored_entry(5, Assistant), // trail of #3 (tool 4 skipped), stops at user 7
             anchored_entry(6, ToolCall),
-            anchored_entry(7, User), // keeps 5,6,7
-            anchored_entry(8, Assistant),
+            anchored_entry(7, User), // lead keeps 5,6,7
+            anchored_entry(8, Assistant), // trail of #7
             anchored_entry(9, ToolCall),
-            anchored_entry(10, Assistant), // resting turn → kept
+            anchored_entry(10, Assistant), // trail of #7 + resting turn
         ];
         apply_user_anchored_filter(&mut kept, 2, None);
         let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
-        assert_eq!(indices, vec![1, 2, 3, 5, 6, 7, 10]);
+        assert_eq!(indices, vec![1, 2, 3, 5, 6, 7, 8, 10]);
+    }
+
+    /// The agent's answer to a user message survives even when buried behind a
+    /// pile of tool calls, and the trail caps at `USER_ANCHORED_TRAIL_ASSISTANT`
+    /// assistant text turns so a long tail can't blow the slice.
+    #[test]
+    fn user_anchored_filter_trail_skips_tool_calls_and_caps_assistant_turns() {
+        use EntryRoleDto::*;
+        let mut kept = vec![anchored_entry(0, User)];
+        // 3 tool calls, then the text answer, then 6 more assistant turns.
+        kept.push(anchored_entry(1, ToolCall));
+        kept.push(anchored_entry(2, ToolCall));
+        kept.push(anchored_entry(3, ToolCall));
+        for i in 4..=10 {
+            kept.push(anchored_entry(i, Assistant));
+        }
+        apply_user_anchored_filter(&mut kept, 0, None);
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        // Anchor 0; tool calls 1-3 dropped; assistant 4-8 kept (cap 5); 9
+        // dropped by the cap; 10 kept as the resting turn.
+        assert_eq!(indices, vec![0, 4, 5, 6, 7, 8, 10]);
+    }
+
+    /// A supervisor nudge is user-role but must NOT anchor the slice — otherwise
+    /// the judge re-reads its own past steering as a fresh user goal and loops.
+    /// The nudge itself still shows up (as trailing/lead context) but never
+    /// pulls a lead/trail window of its own.
+    #[test]
+    fn user_anchored_filter_ignores_observer_nudge_as_anchor() {
+        use EntryRoleDto::*;
+        let mut kept = vec![
+            anchored_entry(0, Assistant),
+            anchored_entry(1, User), // real anchor: lead keeps 0,1
+            anchored_entry(2, Assistant), // trail of #1
+            nudge_entry(3),          // observer nudge — NOT an anchor, stops #1 trail
+            anchored_entry(4, Assistant),
+            anchored_entry(5, ToolCall),
+            anchored_entry(6, Assistant), // resting turn
+        ];
+        apply_user_anchored_filter(&mut kept, 1, None);
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        // 4 and 5 belong to the nudge's follow-up work — not attributed to the
+        // human's message #1, and the nudge doesn't anchor them. Only the
+        // resting turn (6) rescues the tail.
+        assert_eq!(indices, vec![0, 1, 2, 6]);
+    }
+
+    /// Adjacent human messages must not overlap: each anchor's trail stops at
+    /// the next user turn, so an answer is attributed to exactly one message.
+    #[test]
+    fn user_anchored_filter_trail_stops_at_next_user_no_overlap() {
+        use EntryRoleDto::*;
+        let mut kept = vec![
+            anchored_entry(0, User), // lead keeps 0; trail stops immediately at user 1
+            anchored_entry(1, User), // lead keeps 0,1; trail keeps 2
+            anchored_entry(2, Assistant), // trail of #1 + resting turn
+        ];
+        apply_user_anchored_filter(&mut kept, 2, None);
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
     }
 
     #[test]
