@@ -7009,6 +7009,7 @@ async fn done_agent_removed_on_tick(cx: &mut TestAppContext) {
                         stop_reason: Some(SharedString::from("end_turn")),
                     }),
                     last_offset: 0,
+                    parent_tool_use_id: None,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -7071,6 +7072,7 @@ async fn background_agent_terminal_transition_resets_silence_clock(cx: &mut Test
                         stop_reason: None,
                     }),
                     last_offset: 0,
+                    parent_tool_use_id: None,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -7099,6 +7101,165 @@ async fn background_agent_terminal_transition_resets_silence_clock(cx: &mut Test
     );
 }
 
+/// Sub-task C (deferred #1): an async `Agent` teammate's demux `Teammate`
+/// stream — which phase 3 deliberately kept live past the spawn tool-call's
+/// terminal (that's only spawn-ack) — is auto-closed when the managed
+/// background agent reaches its REAL terminal `stop_reason`, via the
+/// `BackgroundAgent.parent_tool_use_id` → `StreamId::Teammate` mapping.
+#[gpui::test]
+async fn background_agent_terminal_closes_teammate_stream(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc");
+    let parent_toolu = SharedString::from("toolu_X");
+    let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let jsonl = dir.path().join("agent.jsonl");
+    std::fs::write(
+        &jsonl,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"bye"}],"stop_reason":"end_turn"}}"#,
+    )
+    .unwrap();
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            // A parent-thread entry tagged with the teammate's parent tool_use
+            // id → the demux produces a live `Teammate` stream.
+            s.set_entries(
+                vec![crate::session_entry::SessionEntry {
+                    created_ms: 0,
+                    mod_seq: 0,
+                    subagent_id: Some(parent_toolu.clone()),
+                    kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Message(
+                            "streaming".to_string(),
+                        )],
+                    },
+                }],
+                cx,
+            );
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: jsonl.clone().into(),
+                    registered_at: chrono::Utc::now(),
+                    // Currently NON-terminal so the refresh observes the edge.
+                    latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                        mtime: std::time::SystemTime::now(),
+                        activity_label: SharedString::from("Generating…"),
+                        stop_reason: None,
+                    }),
+                    last_offset: 0,
+                    parent_tool_use_id: Some(parent_toolu.clone()),
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+            assert!(
+                s.streams.contains_key(&teammate),
+                "teammate stream is live before the agent finishes"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| {
+            s.refresh_background_agent_snapshot(session_id, bg_id.clone(), cx)
+        });
+    });
+
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "teammate stream must be closed on the agent's real terminal"
+            );
+            assert!(
+                s.closed_streams.contains_key(&teammate),
+                "close reason recorded in the overlay"
+            );
+        });
+    });
+}
+
+/// Sub-task C negative case: a NON-terminal snapshot refresh must leave the
+/// teammate's demux stream live (only the terminal `stop_reason` closes it).
+#[gpui::test]
+async fn background_agent_non_terminal_leaves_teammate_stream(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("b41a03b799f542fed");
+    let parent_toolu = SharedString::from("toolu_Y");
+    let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let jsonl = dir.path().join("agent.jsonl");
+    // Latest line is a still-running assistant turn (no stop_reason).
+    std::fs::write(
+        &jsonl,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#,
+    )
+    .unwrap();
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![crate::session_entry::SessionEntry {
+                    created_ms: 0,
+                    mod_seq: 0,
+                    subagent_id: Some(parent_toolu.clone()),
+                    kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Message(
+                            "streaming".to_string(),
+                        )],
+                    },
+                }],
+                cx,
+            );
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: jsonl.clone().into(),
+                    registered_at: chrono::Utc::now(),
+                    latest: None,
+                    last_offset: 0,
+                    parent_tool_use_id: Some(parent_toolu.clone()),
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+        });
+    });
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| {
+            s.refresh_background_agent_snapshot(session_id, bg_id.clone(), cx)
+        });
+    });
+
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                s.streams.contains_key(&teammate),
+                "a non-terminal refresh must keep the teammate stream live"
+            );
+        });
+    });
+}
+
 /// Task 9: an agent with a stale snapshot beyond
 /// `MANAGED_AGENT_STALE_TIMEOUT + MANAGED_AGENT_DEAD_LINGER`
 /// (V1 hardcoded: 120s + 300s = 420s) is removed on tick.
@@ -7122,6 +7283,7 @@ async fn stale_agent_lingers_briefly_then_removed(cx: &mut TestAppContext) {
                         stop_reason: None,
                     }),
                     last_offset: 0,
+                    parent_tool_use_id: None,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -7164,6 +7326,7 @@ async fn fresh_agent_survives_tick(cx: &mut TestAppContext) {
                         stop_reason: None,
                     }),
                     last_offset: 0,
+                    parent_tool_use_id: None,
                 },
             );
             s.background_agent_order.push(bg_id.clone());

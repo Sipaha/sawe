@@ -6707,6 +6707,7 @@ mod tests {
                         stop_reason: Some(SharedString::from("end_turn")),
                     }),
                     last_offset: 42,
+                    parent_tool_use_id: None,
                 };
                 let second = BackgroundAgent {
                     id: BackgroundAgentId::new("b41a03b799f542fe"),
@@ -6714,6 +6715,7 @@ mod tests {
                     registered_at: chrono::Utc::now(),
                     latest: None,
                     last_offset: 0,
+                    parent_tool_use_id: None,
                 };
                 session.background_agent_order.push(first.id.clone());
                 session.background_agent_order.push(second.id.clone());

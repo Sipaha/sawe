@@ -124,6 +124,12 @@ pub struct BackgroundAgent {
     /// shrinks (truncation / replacement), so a rotated JSONL re-reads
     /// from the beginning rather than getting stuck past EOF.
     pub last_offset: u64,
+    /// The parent `Agent` spawn tool-call's tool_use id — the key of this
+    /// teammate's demux `Teammate` stream (StreamId::Teammate). Captured at
+    /// live registration so the stream can be auto-closed on the agent's real
+    /// terminal `stop_reason`. `None` when unknown (a DB cold-restore does not
+    /// persist it — those streams are hydration orphans, already Main-only).
+    pub parent_tool_use_id: Option<SharedString>,
 }
 
 impl BackgroundAgent {

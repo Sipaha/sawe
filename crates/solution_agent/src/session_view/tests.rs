@@ -168,6 +168,7 @@ fn make_background_agent(id: &str) -> crate::background_agent::BackgroundAgent {
         registered_at: chrono::Utc::now(),
         latest: None,
         last_offset: 0,
+        parent_tool_use_id: None,
     }
 }
 

@@ -816,6 +816,7 @@ mod tests {
                         stop_reason: None,
                     }),
                     last_offset: 30,
+                    parent_tool_use_id: None,
                 };
                 // Second: snapshot-less agent → Generating… default label.
                 let second = BackgroundAgent {
@@ -824,6 +825,7 @@ mod tests {
                     registered_at: chrono::Utc::now(),
                     latest: None,
                     last_offset: 0,
+                    parent_tool_use_id: None,
                 };
                 session.background_agent_order.push(first.id.clone());
                 session.background_agent_order.push(second.id.clone());

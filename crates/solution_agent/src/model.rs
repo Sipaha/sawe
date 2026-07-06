@@ -418,6 +418,32 @@ pub struct SolutionSession {
     /// still-present tagged entries. Value = the `Done` reason (surfaced as
     /// phase-4's `stream_removed` reason). `StreamId::Main` is never inserted.
     pub closed_streams: HashMap<crate::stream::StreamId, SharedString>,
+    /// Monotonic allocator for per-stream `seq` watermarks. Bumped (pre-increment)
+    /// whenever a stream's fingerprint changes across a `rebuild_streams`. The
+    /// wire delta (phase 4b) keys per-stream sync on `Stream.seq`; `seq` must
+    /// survive the full-replace rebuild, hence this side counter.
+    pub stream_seq_counter: u64,
+    /// Prior per-stream fingerprint `(source_entry_count, max_source_mod_seq)` +
+    /// the `seq` last assigned to it. `rebuild_streams` keeps a stream's seq when
+    /// its fingerprint is unchanged, else allocates `stream_seq_counter`. Ephemeral
+    /// (rebuilt from live state), not persisted.
+    pub stream_seqs: HashMap<crate::stream::StreamId, (u64, (usize, u64))>,
+    /// Cold-load hydration orphans: finished teammates re-demuxed from restored
+    /// tagged rows. Suppressed from the mirror while the session is cold, but —
+    /// unlike a permanent `closed_streams` Done-close — REOPENED if a live resume
+    /// streams new activity (an entry at index >= `hydration_watermark`) for that
+    /// toolu. A DB-restored async `Agent` carries no `parent_tool_use_id`, so its
+    /// stream can't be closed by the sub-task-C completion path; this overlay is
+    /// what keeps such a finished teammate collapsed until (and unless) it proves
+    /// live. Ephemeral, not persisted.
+    pub hydration_orphan_streams: std::collections::HashSet<crate::stream::StreamId>,
+    /// `entries.len()` captured when `hydrate_streams_main_only` ran — the boundary
+    /// between the restored cold prefix and any post-restart (resume-streamed)
+    /// entries. An orphan with an entry at index >= this boundary is being streamed
+    /// anew and is reopened; a purely-cold orphan (all entries below it) stays
+    /// suppressed. 0 when no hydration happened (the orphan set is then empty and
+    /// the check is skipped).
+    pub hydration_watermark: usize,
     /// `true` while a restored tab's `acp_thread_blob` is still being
     /// deserialised on a background task. Set by the lazy-hydration path
     /// ([`SolutionAgentStore::restore_open_tabs_lazy`]) when a placeholder
@@ -617,6 +643,10 @@ impl SolutionSession {
                 streams
             },
             closed_streams: HashMap::new(),
+            stream_seq_counter: 0,
+            stream_seqs: HashMap::new(),
+            hydration_orphan_streams: std::collections::HashSet::new(),
+            hydration_watermark: 0,
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,
@@ -694,7 +724,60 @@ impl SolutionSession {
         for id in self.closed_streams.keys() {
             streams.shift_remove(id); // Main is never inserted into closed_streams
         }
+        // Hydration orphans: suppressed unless a live resume is streaming fresh
+        // activity for them. An orphan whose entries all sit below the hydration
+        // watermark finished before the restart → stays collapsed; one with an
+        // entry at/after the watermark is being streamed anew → reopen it (it then
+        // gets a live bg-agent registration whose real stop_reason can close it via
+        // the permanent path, or it stays open if genuinely live). Keyed on a pure
+        // index watermark, not the thread handle, so cold == "no entries past the
+        // boundary yet" and the check is unit-testable.
+        if !self.hydration_orphan_streams.is_empty() {
+            let mut streamed_anew: std::collections::HashSet<crate::stream::StreamId> =
+                std::collections::HashSet::new();
+            for entry in self.entries.iter().skip(self.hydration_watermark) {
+                if let Some(toolu) = &entry.subagent_id {
+                    streamed_anew.insert(crate::stream::StreamId::Teammate(toolu.clone()));
+                }
+            }
+            for id in &self.hydration_orphan_streams {
+                if !streamed_anew.contains(id) {
+                    streams.shift_remove(id);
+                }
+            }
+        }
+        // Per-stream `seq` watermark maintained across the full-replace rebuild
+        // (demux discards `Stream.seq`). Fingerprint each stream by
+        // (source-entry count, max source mod_seq) over the PRE-coalesce entries:
+        // both advance on any append / in-place update (bump_change_seq re-stamps
+        // mod_seq monotonically) and a coalesce-merge advances the max even though
+        // the coalesced entry keeps the first fragment's mod_seq. Unchanged
+        // fingerprint ⇒ keep the prior seq; any change ⇒ next counter value.
+        let mut fingerprints: HashMap<crate::stream::StreamId, (usize, u64)> = HashMap::new();
+        for entry in &self.entries {
+            let id = match &entry.subagent_id {
+                None => crate::stream::StreamId::Main,
+                Some(toolu) => crate::stream::StreamId::Teammate(toolu.clone()),
+            };
+            let fp = fingerprints.entry(id).or_insert((0, 0));
+            fp.0 += 1;
+            fp.1 = fp.1.max(entry.mod_seq);
+        }
+        let mut next_seqs = HashMap::new();
+        for (id, stream) in &mut streams {
+            let fingerprint = fingerprints.get(id).copied().unwrap_or((0, 0));
+            let seq = match self.stream_seqs.get(id) {
+                Some(&(prev_seq, prev_fp)) if prev_fp == fingerprint => prev_seq,
+                _ => {
+                    self.stream_seq_counter += 1;
+                    self.stream_seq_counter
+                }
+            };
+            stream.seq = seq;
+            next_seqs.insert(id.clone(), (seq, fingerprint));
+        }
         self.streams = streams;
+        self.stream_seqs = next_seqs;
     }
 
     /// Auto-close a secondary stream on a genuine `Done` signal: record the id
@@ -705,14 +788,43 @@ impl SolutionSession {
         if matches!(id, crate::stream::StreamId::Main) {
             return;
         }
+        // A permanent Done-close outranks the reopenable hydration-orphan overlay:
+        // drop any orphan record for this id so post-watermark activity can't
+        // resurrect a stream the completion path (Task terminal / async-Agent
+        // stop_reason) has authoritatively finished.
+        self.hydration_orphan_streams.remove(&id);
         self.closed_streams.insert(id, reason);
         self.rebuild_streams();
     }
 
     /// Drop the whole close overlay so previously-closed streams reappear on the
     /// next rebuild. Used by the context reset/clear paths after `entries.clear()`.
+    /// Also drops the hydration-orphan overlay: a context reset wipes both
+    /// suppression categories.
     pub fn clear_closed_streams(&mut self) {
         self.closed_streams.clear();
+        self.hydration_orphan_streams.clear();
+        self.hydration_watermark = 0;
+    }
+
+    /// Cold-load hydration: a restored session's tagged rows belong to teammates
+    /// that finished before the restart, so collapse to a Main-only view by
+    /// recording every non-Main stream as a hydration orphan. Unlike a permanent
+    /// `close_stream` Done-close, an orphan REOPENS if a live resume streams new
+    /// activity for it (an entry at index >= the recorded watermark) — see
+    /// `rebuild_streams`. Call AFTER assigning `entries` on a cold-restore path.
+    pub fn hydrate_streams_main_only(&mut self) {
+        let orphans: Vec<crate::stream::StreamId> = self
+            .streams
+            .keys()
+            .filter(|id| !matches!(id, crate::stream::StreamId::Main))
+            .cloned()
+            .collect();
+        for id in orphans {
+            self.hydration_orphan_streams.insert(id);
+        }
+        self.hydration_watermark = self.entries.len();
+        self.rebuild_streams();
     }
 
     /// Allocate the next monotonic change sequence for this session. Pre-increment:
@@ -950,6 +1062,10 @@ mod tests {
                 streams
             },
             closed_streams: HashMap::new(),
+            stream_seq_counter: 0,
+            stream_seqs: HashMap::new(),
+            hydration_orphan_streams: std::collections::HashSet::new(),
+            hydration_watermark: 0,
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,
@@ -1167,6 +1283,256 @@ mod tests {
             s.clear_closed_streams();
             s.rebuild_streams();
             assert!(s.streams.contains_key(&t1), "cleared overlay → reopened");
+        });
+    }
+
+    fn msg_seq(text: &str, sub: Option<&str>, mod_seq: u64) -> SessionEntry {
+        use crate::session_entry::{AssistantChunk, SessionEntryKind};
+        SessionEntry {
+            created_ms: 0,
+            mod_seq,
+            subagent_id: sub.map(SharedString::from),
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.to_string())],
+            },
+        }
+    }
+
+    // Sub-task A: per-stream `seq` must be maintained across the full-replace
+    // `rebuild_streams` — allocated on first sight, KEPT while a stream's
+    // fingerprint `(source_entry_count, max_source_mod_seq)` is unchanged, and
+    // ADVANCED on any change (append / in-place update).
+    #[gpui::test]
+    fn stream_seq_allocated_kept_and_advanced_for_main(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(vec![msg_seq("a", None, 1)], cx);
+            let seq0 = s.streams[&StreamId::Main].seq;
+            assert!(seq0 > 0, "first sight allocates a nonzero seq");
+
+            // Identical fingerprint (same count + same max mod_seq) → seq kept.
+            s.set_entries(vec![msg_seq("a", None, 1)], cx);
+            assert_eq!(
+                s.streams[&StreamId::Main].seq, seq0,
+                "unchanged fingerprint must not bump seq"
+            );
+
+            // Append a Main entry (count + max mod_seq both rise) → seq advances.
+            s.set_entries(vec![msg_seq("a", None, 1), msg_seq("b", None, 2)], cx);
+            assert!(
+                s.streams[&StreamId::Main].seq > seq0,
+                "an appended entry must bump the stream's seq"
+            );
+        });
+    }
+
+    // Sub-task A, decision #5: a coalesce-merge keeps the FIRST fragment's
+    // mod_seq on the single coalesced stream entry, so a delta keyed on
+    // entry.mod_seq would miss the update. The per-stream seq (keyed on the
+    // SOURCE pre-coalesce fingerprint) MUST still advance even though the
+    // coalesced stream stays one entry long.
+    #[gpui::test]
+    fn stream_seq_advances_on_coalesce_merge_despite_single_entry(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            // Two consecutive Main assistant messages coalesce into ONE entry.
+            s.set_entries(vec![msg_seq("one ", None, 1), msg_seq("two", None, 2)], cx);
+            assert_eq!(
+                s.streams[&StreamId::Main].entries.len(),
+                1,
+                "consecutive same-source assistant messages coalesce"
+            );
+            let seq_before = s.streams[&StreamId::Main].seq;
+
+            // A THIRD assistant chunk coalesces too (stream stays one entry) but
+            // the source fingerprint's count + max mod_seq both rise.
+            s.set_entries(
+                vec![
+                    msg_seq("one ", None, 1),
+                    msg_seq("two ", None, 2),
+                    msg_seq("three", None, 3),
+                ],
+                cx,
+            );
+            assert_eq!(
+                s.streams[&StreamId::Main].entries.len(),
+                1,
+                "still one coalesced entry"
+            );
+            assert!(
+                s.streams[&StreamId::Main].seq > seq_before,
+                "seq must advance on a coalesce-merge the entry's mod_seq hides"
+            );
+        });
+    }
+
+    // Sub-task A: per-stream seqs are independent — changing one stream's
+    // entries must not bump the other stream's seq.
+    #[gpui::test]
+    fn stream_seq_is_per_stream_independent(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t1 = StreamId::Teammate(SharedString::from("T1"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![msg_seq("m", None, 1), msg_seq("t", Some("T1"), 2)],
+                cx,
+            );
+            let main0 = s.streams[&StreamId::Main].seq;
+            let t0 = s.streams[&t1].seq;
+
+            // Change ONLY the teammate stream (append a tagged entry).
+            s.set_entries(
+                vec![
+                    msg_seq("m", None, 1),
+                    msg_seq("t", Some("T1"), 2),
+                    msg_seq("t2", Some("T1"), 3),
+                ],
+                cx,
+            );
+            assert_eq!(s.streams[&StreamId::Main].seq, main0, "Main seq unchanged");
+            assert!(s.streams[&t1].seq > t0, "teammate seq advanced");
+
+            // Now change ONLY Main.
+            let t_now = s.streams[&t1].seq;
+            let main_now = s.streams[&StreamId::Main].seq;
+            s.set_entries(
+                vec![
+                    msg_seq("m", None, 1),
+                    msg_seq("m2", None, 4),
+                    msg_seq("t", Some("T1"), 2),
+                    msg_seq("t2", Some("T1"), 3),
+                ],
+                cx,
+            );
+            assert!(s.streams[&StreamId::Main].seq > main_now, "Main seq advanced");
+            assert_eq!(s.streams[&t1].seq, t_now, "teammate seq unchanged");
+        });
+    }
+
+    // Sub-task B: cold-load hydration collapses tagged rows to a Main-only view
+    // and records the watermark boundary between the cold prefix and any
+    // resume-streamed entries.
+    #[gpui::test]
+    fn hydrate_collapses_to_main_only_and_records_watermark(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t1 = StreamId::Teammate(SharedString::from("T1"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![msg_tagged("main", None), msg_tagged("sub", Some("T1"))],
+                cx,
+            );
+            assert!(s.streams.contains_key(&t1), "teammate present before hydrate");
+
+            s.hydrate_streams_main_only();
+            assert_eq!(s.streams.len(), 1, "only Main survives hydration");
+            assert!(s.streams.contains_key(&StreamId::Main));
+            assert!(!s.streams.contains_key(&t1), "teammate collapsed to Main-only");
+            assert_eq!(
+                s.hydration_watermark, 2,
+                "watermark pins the cold-prefix boundary at entries.len()"
+            );
+        });
+    }
+
+    // Sub-task B, THE REGRESSION this fix removes: a cold-restored finished
+    // teammate's tagged rows re-demux to a Live stream on every rebuild, but the
+    // hydration-orphan overlay must keep suppressing it when NO new activity has
+    // streamed past the watermark. (The old `clear_closed_streams`-on-attach
+    // guard reopened it into a permanent zombie tab.)
+    #[gpui::test]
+    fn hydration_orphan_stays_suppressed_without_new_activity(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t1 = StreamId::Teammate(SharedString::from("T1"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![msg_tagged("main", None), msg_tagged("sub", Some("T1"))],
+                cx,
+            );
+            s.hydrate_streams_main_only();
+            assert!(!s.streams.contains_key(&t1));
+
+            // A bare rebuild (no entry past the watermark) must NOT resurrect it.
+            s.rebuild_streams();
+            assert!(
+                !s.streams.contains_key(&t1),
+                "no post-watermark activity → orphan stays collapsed"
+            );
+        });
+    }
+
+    // Sub-task B: an orphan REOPENS when the resume streams a fresh tagged entry
+    // for it at an index at/after the watermark.
+    #[gpui::test]
+    fn hydration_orphan_reopens_on_post_watermark_activity(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t1 = StreamId::Teammate(SharedString::from("T1"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![msg_tagged("main", None), msg_tagged("sub", Some("T1"))],
+                cx,
+            );
+            s.hydrate_streams_main_only();
+            assert!(!s.streams.contains_key(&t1), "collapsed while cold");
+
+            // A resume streams a new T1-tagged entry at index 2 (>= watermark).
+            s.set_entries(
+                vec![
+                    msg_tagged("main", None),
+                    msg_tagged("sub", Some("T1")),
+                    msg_tagged("resumed", Some("T1")),
+                ],
+                cx,
+            );
+            assert!(
+                s.streams.contains_key(&t1),
+                "post-watermark tagged activity reopens the orphan"
+            );
+        });
+    }
+
+    // Sub-task B: a permanent Done-close (Task terminal / async-Agent stop_reason)
+    // is NOT reopenable — post-watermark activity for a permanently-closed stream
+    // must stay absent. This distinguishes the two overlays (the naive "reopen
+    // any suppressed id with live activity" fix would wrongly resurrect it).
+    #[gpui::test]
+    fn permanent_done_close_not_reopened_by_post_watermark_activity(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t2 = StreamId::Teammate(SharedString::from("T2"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![msg_tagged("main", None), msg_tagged("sub", Some("T2"))],
+                cx,
+            );
+            s.hydrate_streams_main_only();
+            // A real completion signal Done-closes T2 (moves it out of the orphan
+            // overlay into the permanent overlay).
+            s.close_stream(t2.clone(), SharedString::new_static("done"));
+            assert!(!s.streams.contains_key(&t2));
+            assert!(
+                !s.hydration_orphan_streams.contains(&t2),
+                "Done-close drops the reopenable orphan record"
+            );
+
+            // Even fresh post-watermark activity must not resurrect it.
+            s.set_entries(
+                vec![
+                    msg_tagged("main", None),
+                    msg_tagged("sub", Some("T2")),
+                    msg_tagged("more", Some("T2")),
+                ],
+                cx,
+            );
+            assert!(
+                !s.streams.contains_key(&t2),
+                "permanent Done-close outranks post-watermark activity"
+            );
         });
     }
 

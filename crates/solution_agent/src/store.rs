@@ -3601,8 +3601,10 @@ impl SolutionAgentStore {
                         // render reads from (phase 2c). Cold-load/hydration
                         // assigns `entries` directly, so without this the mirror
                         // stays Main-only-empty and a restored session paints
-                        // blank. `rebuild_streams` is an O(N) demux at load time.
-                        s.rebuild_streams();
+                        // blank. Collapse restored tagged rows to a Main-only
+                        // view (an O(N) demux at load time); the live thread
+                        // attached below reopens any still-live teammate.
+                        s.hydrate_streams_main_only();
                         // Legacy/migrating rows have no persisted change_seq and no
                         // pre-restart delta client → fall back to max(mod_seq).
                         s.restore_change_seq(if migrating {
@@ -4405,8 +4407,10 @@ impl SolutionAgentStore {
                         // Rebuild the per-source `streams` mirror (phase 2c) —
                         // the desktop render reads it, and this cold-load path
                         // assigns `entries` directly. Without it a restored
-                        // session renders blank.
-                        s.rebuild_streams();
+                        // session renders blank. Collapse tagged rows to a
+                        // Main-only view (no live thread here → teammates that
+                        // finished before the restart stay closed).
+                        s.hydrate_streams_main_only();
                         s.restore_change_seq(if migrating { None } else { restored_change_seq });
                         if migrating {
                             s.bump_epoch();
@@ -4699,8 +4703,10 @@ impl SolutionAgentStore {
                         // Rebuild the per-source `streams` mirror (phase 2c) —
                         // the desktop render reads it, and this cold-load path
                         // assigns `entries` directly. Without it a restored
-                        // session renders blank.
-                        s.rebuild_streams();
+                        // session renders blank. Collapse tagged rows to a
+                        // Main-only view (no live thread here → teammates that
+                        // finished before the restart stay closed).
+                        s.hydrate_streams_main_only();
                         s.restore_change_seq(if migrating { None } else { restored_change_seq });
                         if migrating {
                             s.bump_epoch();
@@ -5029,8 +5035,9 @@ impl SolutionAgentStore {
                     // Rebuild the per-source `streams` mirror (phase 2c) — the
                     // desktop render reads it; this cold-blob load assigns
                     // `entries` directly, so without it the restored session
-                    // paints blank.
-                    session.rebuild_streams();
+                    // paints blank. Collapse tagged rows to a Main-only view
+                    // (no live thread here → finished teammates stay closed).
+                    session.hydrate_streams_main_only();
                     session.restore_change_seq(if migrating { None } else { restored_change_seq });
                     if migrating {
                         session.bump_epoch();
@@ -7030,6 +7037,12 @@ impl SolutionAgentStore {
             if let Some((agent_id_str, output_file)) = announcement {
                 let canonical =
                     std::fs::read_link(&output_file).unwrap_or_else(|_| output_file.clone());
+                // Capture the parent `Agent` spawn tool-call's tool_use id
+                // BEFORE the `BackgroundAgentId::new` binding below shadows the
+                // outer `id` (= `snapshot.id`). This is the key of the teammate's
+                // demux `Teammate` stream, needed to auto-close it on the agent's
+                // real terminal `stop_reason`.
+                let parent_toolu = id.clone();
                 let id = crate::background_agent::BackgroundAgentId::new(agent_id_str);
                 let already = session_entity.read(cx).background_agents.contains_key(&id);
                 if !already {
@@ -7044,6 +7057,7 @@ impl SolutionAgentStore {
                                 registered_at: chrono::Utc::now(),
                                 latest: None,
                                 last_offset: 0,
+                                parent_tool_use_id: Some(parent_toolu),
                             },
                         );
                         s.background_agent_order.push(id_for_insert);
@@ -7203,6 +7217,7 @@ impl SolutionAgentStore {
         });
         let mut changed = false;
         session.update(cx, |s, _| {
+            let mut close_teammate: Option<(SharedString, SharedString)> = None; // (parent toolu, reason)
             if let Some(ba) = s.background_agents.get_mut(&agent_id) {
                 // Always advance the offset (or rewind on truncation —
                 // `tail_jsonl` already handled the reset). Only update
@@ -7223,12 +7238,27 @@ impl SolutionAgentStore {
                         .as_ref()
                         .is_some_and(|s| s.stop_reason.is_some());
                     let now_terminal = snap.stop_reason.is_some();
+                    let parent = ba.parent_tool_use_id.clone();
+                    let reason = snap.stop_reason.clone();
                     ba.latest = Some(snap);
                     changed = true;
                     if now_terminal && !was_terminal {
                         s.last_activity_at = Utc::now();
+                        if let Some(parent_toolu) = parent {
+                            close_teammate = Some((
+                                parent_toolu,
+                                reason.unwrap_or_else(|| gpui::SharedString::new_static("done")),
+                            ));
+                        }
                     }
                 }
+            }
+            // Auto-close the async `Agent` teammate's demux stream on its REAL
+            // terminal signal (deferred from phase 3, where the spawn tool-call
+            // terminal is only spawn-ack). Done after the `ba` borrow ends so
+            // `close_stream` can take `&mut s`.
+            if let Some((parent_toolu, reason)) = close_teammate {
+                s.close_stream(crate::stream::StreamId::Teammate(parent_toolu), reason);
             }
         });
         if changed {
@@ -7526,9 +7556,31 @@ impl SolutionAgentStore {
                         })
                         .cloned()
                         .collect();
+                    // Safety-net close of each reaped teammate's demux stream:
+                    // covers a missed terminal-transition edge in
+                    // `refresh_background_agent_snapshot` (e.g. an agent that
+                    // registered already-terminal, or one reaped as stale-dead).
+                    // Collect before removal so `close_stream` (which takes
+                    // `&mut s`) runs after the borrow ends; it is idempotent.
+                    let close_teammates: Vec<(SharedString, SharedString)> = candidates
+                        .iter()
+                        .filter_map(|id| {
+                            let ba = s.background_agents.get(id)?;
+                            let parent = ba.parent_tool_use_id.clone()?;
+                            let reason = ba
+                                .latest
+                                .as_ref()
+                                .and_then(|snap| snap.stop_reason.clone())
+                                .unwrap_or_else(|| gpui::SharedString::new_static("done"));
+                            Some((parent, reason))
+                        })
+                        .collect();
                     for id in &candidates {
                         s.background_agents.remove(id);
                         s.background_agent_order.retain(|x| x != id);
+                    }
+                    for (parent_toolu, reason) in close_teammates {
+                        s.close_stream(crate::stream::StreamId::Teammate(parent_toolu), reason);
                     }
                     candidates
                 });
@@ -7813,6 +7865,10 @@ impl SolutionAgentStore {
                             registered_at: chrono::Utc::now(),
                             latest: snap.clone(),
                             last_offset: *last_offset,
+                            // DB cold-restore does not persist the parent toolu;
+                            // the teammate's tagged rows are hydration orphans
+                            // (already collapsed to Main-only), so no stream to close.
+                            parent_tool_use_id: None,
                         },
                     );
                     s.background_agent_order.push(agent_id.clone());
