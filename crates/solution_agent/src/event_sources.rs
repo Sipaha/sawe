@@ -356,30 +356,16 @@ pub(crate) fn build_queue_changed_payload(
 }
 
 /// Build the JSON payload for an `agent_session_active_subagents_changed`
-/// notification. Walks the session's insertion-ordered subagent vec via
-/// the shared `mcp::build_active_subagents_vec` helper so the wire shape
-/// matches what `get_session` / `list_sessions` would have returned on a
-/// cold fetch — clients can apply either path interchangeably.
-///
-/// When the session is gone (race between close + queued notification),
-/// emits `active_subagents: []` so the consumer's "clear the strip"
-/// handler still fires correctly.
+/// notification. Since wire v5 this is a lean `{session_id}`-only dirty-poke:
+/// a teammate's friendly label now rides `StreamDto.label`, so the consumer
+/// just re-polls `streams` on a teammate register/deregister rather than
+/// applying a subagent list off this notification.
 pub(crate) fn build_active_subagents_changed_payload(
     session_id: crate::model::SolutionSessionId,
-    cx: &App,
+    _cx: &App,
 ) -> serde_json::Value {
-    let subagents: Vec<crate::mcp::SubagentDto> = SolutionAgentStore::try_global(cx)
-        .and_then(|store| {
-            store.read_with(cx, |store, cx| {
-                let session = store.session(session_id)?;
-                let session_ref = session.read(cx);
-                Some(crate::mcp::build_active_subagents_vec(session_ref))
-            })
-        })
-        .unwrap_or_default();
     json!({
         "session_id": session_id.to_string(),
-        "active_subagents": subagents,
     })
 }
 

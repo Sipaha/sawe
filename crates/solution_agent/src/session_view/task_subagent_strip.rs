@@ -18,8 +18,9 @@
 //! Async-Agent teammates now render as their `StreamId::Teammate` demux
 //! stream pill (phase 6d-B — the separate `Background` pill is gone; an
 //! async `Agent` already keeps a live teammate stream open, so it shows
-//! as a normal `Task` pill labelled from its JSONL snapshot's
-//! `activity_label`).
+//! as a normal `Task` pill). Every teammate pill's label reads
+//! `Stream.label` (enriched from `teammate_labels` at `rebuild_streams`,
+//! phase 6d-tail-2) — the single source of truth for the label.
 //!
 //! Inline Task pills deliberately omit a per-tab close button: per the
 //! plan, tabs disappear naturally when the parent `Task` ToolCall
@@ -46,34 +47,16 @@ pub(super) fn render_task_subagent_strip(
     // Snapshot label / id pairs so the click listeners (which need
     // `'static` data) don't have to borrow back through the session
     // entity inside their closures.
-    // Teammate tabs iterate `session.streams` in map order (phase 6c). The
-    // `∈ active_subagents` bridge filter is GONE (phase 6d-B): ALL live
-    // teammate streams render, async Agents included. The label is resolved
-    // per stream: a live inline Task uses its friendly `active_subagents`
-    // label; an async `Agent` (dropped from `active_subagents` at spawn-ack
-    // but keeping its teammate stream open) falls back to its JSONL snapshot's
-    // `activity_label`; failing both, the raw teammate id.
+    // Teammate tabs iterate `session.streams` in map order (phase 6c). ALL live
+    // teammate streams render, async Agents included. The friendly label now
+    // rides `Stream.label` (enriched from `teammate_labels` in `rebuild_streams`,
+    // phase 6d-tail-2), so the strip just reads `stream.label` — the single
+    // source of truth for both desktop and the mobile wire.
     let tabs: Vec<(SharedString, SharedString)> = session_ref
         .streams
-        .keys()
-        .filter_map(|sid| match sid {
-            crate::stream::StreamId::Teammate(id) => {
-                let label = session_ref
-                    .active_subagents
-                    .get(id)
-                    .map(|tab| tab.label.clone())
-                    .or_else(|| {
-                        session_ref
-                            .background_agents
-                            .values()
-                            .find(|ba| ba.parent_tool_use_id.as_ref() == Some(id))
-                            .and_then(|ba| {
-                                ba.latest.as_ref().map(|snap| snap.activity_label.clone())
-                            })
-                    })
-                    .unwrap_or_else(|| id.clone());
-                Some((id.clone(), label))
-            }
+        .iter()
+        .filter_map(|(sid, stream)| match sid {
+            crate::stream::StreamId::Teammate(id) => Some((id.clone(), stream.label.clone())),
             _ => None,
         })
         .collect();

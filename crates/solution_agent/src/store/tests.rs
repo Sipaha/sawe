@@ -6369,7 +6369,9 @@ async fn registered_store_pull_drains_queue_and_returns_followup_text(cx: &mut T
 }
 
 // ---------------------------------------------------------------------------
-// Etap 3: Subagent-tab lifecycle (`active_subagents` + insertion-order vec).
+// Etap 3: Subagent-tab lifecycle (`teammate_labels`). Since wire v5 the durable
+// friendly label rides `teammate_labels`; a teammate's rendered pill + wire label
+// come from `Stream.label` (enriched from that map at `rebuild_streams`).
 // These exercise `SolutionAgentStore::apply_subagent_lifecycle` through the
 // real `AcpThreadEvent::NewEntry` / `EntryUpdated` plumbing — by upserting
 // `acp::ToolCall` shapes directly on a live `AcpThread` and asserting how
@@ -6454,16 +6456,10 @@ async fn subagent_inprogress_task_registers_tab(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
-        assert_eq!(s.active_subagents.len(), 1, "one subagent tracked");
-        assert_eq!(
-            s.active_subagent_order.len(),
-            1,
-            "order vec parallel to map"
-        );
+        assert_eq!(s.teammate_labels.len(), 1, "one teammate label captured");
         let key = SharedString::from("toolu_task_1");
-        assert_eq!(s.active_subagent_order[0], key);
-        let tab = s.active_subagents.get(&key).expect("tab present");
-        assert_eq!(tab.label.as_ref(), "Loop agent 1");
+        let label = s.teammate_labels.get(&key).expect("label present");
+        assert_eq!(label.as_ref(), "Loop agent 1");
     });
     assert_eq!(
         *changed_count.borrow(),
@@ -6516,8 +6512,10 @@ async fn subagent_terminal_status_removes_tab(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
-        assert!(s.active_subagents.is_empty(), "tab removed on Completed");
-        assert!(s.active_subagent_order.is_empty(), "order vec drained");
+        assert!(
+            s.teammate_labels.is_empty(),
+            "label reclaimed on Completed (via close_stream)"
+        );
     });
     assert_eq!(
         *changed_count.borrow(),
@@ -6628,9 +6626,9 @@ async fn subagent_label_falls_back_to_subagent_type(cx: &mut TestAppContext) {
         let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
         let key = SharedString::from("toolu_long_abcd");
-        let tab = s.active_subagents.get(&key).expect("tab present");
+        let label = s.teammate_labels.get(&key).expect("label present");
         assert_eq!(
-            tab.label.as_ref(),
+            label.as_ref(),
             "general-purpose#abcd",
             "fallback label is `subagent_type#<short-id>`"
         );
@@ -6664,8 +6662,8 @@ async fn subagent_label_defaults_to_agent_short_id(cx: &mut TestAppContext) {
         let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
         let key = SharedString::from("toolu_xy12");
-        let tab = s.active_subagents.get(&key).expect("tab present");
-        assert_eq!(tab.label.as_ref(), "Agent xy12");
+        let label = s.teammate_labels.get(&key).expect("label present");
+        assert_eq!(label.as_ref(), "Agent xy12");
     });
 }
 
@@ -6695,8 +6693,10 @@ async fn non_task_tool_call_does_not_register_tab(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
-        assert!(s.active_subagents.is_empty(), "Bash is not a subagent");
-        assert!(s.active_subagent_order.is_empty(), "order vec untouched");
+        assert!(
+            s.teammate_labels.is_empty(),
+            "Bash is not a subagent — no label captured"
+        );
     });
     assert_eq!(
         *changed_count.borrow(),
@@ -6706,7 +6706,11 @@ async fn non_task_tool_call_does_not_register_tab(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn subagent_insertion_order_preserved(cx: &mut TestAppContext) {
+async fn subagent_registration_captures_all_labels(cx: &mut TestAppContext) {
+    // Since wire v5 the pill ORDER lives in `streams` (an IndexMap keyed by
+    // teammate first-appearance), not on `teammate_labels` (a plain map). This
+    // test now just proves every teammate's label is captured with its right
+    // value; stream order is covered by the demux / session_view tests.
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
     for (id, label) in [
@@ -6736,13 +6740,20 @@ async fn subagent_insertion_order_preserved(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
-        let order: Vec<&str> = s.active_subagent_order.iter().map(|s| s.as_ref()).collect();
-        assert_eq!(
-            order,
-            vec!["toolu_a", "toolu_b", "toolu_c"],
-            "tabs render in spawn order, not hash order"
-        );
-        assert_eq!(s.active_subagents.len(), 3);
+        assert_eq!(s.teammate_labels.len(), 3);
+        for (id, label) in [
+            ("toolu_a", "First"),
+            ("toolu_b", "Second"),
+            ("toolu_c", "Third"),
+        ] {
+            assert_eq!(
+                s.teammate_labels
+                    .get(&SharedString::from(id))
+                    .map(|l| l.as_ref()),
+                Some(label),
+                "label for {id} captured"
+            );
+        }
     });
 }
 
@@ -6797,16 +6808,15 @@ async fn duplicate_inprogress_does_not_re_register(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
         let s = session.read(cx);
-        assert_eq!(s.active_subagents.len(), 1, "single tab, not doubled");
-        assert_eq!(s.active_subagent_order.len(), 1, "order vec single entry");
-        let tab = s
-            .active_subagents
+        assert_eq!(s.teammate_labels.len(), 1, "single label, not doubled");
+        let label = s
+            .teammate_labels
             .get(&SharedString::from("toolu_dup"))
-            .expect("tab");
+            .expect("label");
         // Label is locked-in at first observation — the "Renamed" update is
         // ignored to preserve a stable user-facing pill across the streaming
         // raw_input chunks.
-        assert_eq!(tab.label.as_ref(), "Original");
+        assert_eq!(label.as_ref(), "Original");
     });
     assert_eq!(
         *changed_count.borrow(),
@@ -6859,7 +6869,7 @@ async fn subagent_failed_status_also_removes_tab(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session exists");
-        assert!(session.read(cx).active_subagents.is_empty());
+        assert!(session.read(cx).teammate_labels.is_empty());
     });
     assert_eq!(*changed_count.borrow(), 2, "add + remove on Failed");
 }
@@ -9197,7 +9207,7 @@ async fn subagent_spawn_bumps_subagents_watermark(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session");
         let s = session.read(cx);
-        assert_eq!(s.active_subagents.len(), 1, "one subagent tracked");
+        assert_eq!(s.teammate_labels.len(), 1, "one teammate label captured");
         assert!(s.subagents_seq > 0, "subagents_seq must advance off zero");
         assert_eq!(
             s.subagents_seq, s.change_seq,
@@ -9212,6 +9222,7 @@ async fn subagent_spawn_bumps_subagents_watermark(cx: &mut TestAppContext) {
 /// view) never learns the strip emptied and a finished subagent tab strands.
 #[gpui::test]
 async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
     // Strand a subagent pill: register an InProgress Task (non-terminal, so the
@@ -9242,9 +9253,30 @@ async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
                     started_at: std::time::Instant::now(),
                     notified: false,
                 };
+                // Seed a teammate-tagged entry so the demux produces a live
+                // `Teammate` stream — since wire v5 the →Idle GC sources stranded
+                // ids from `streams`, so a pill with no stream is not "stranded".
+                s.entries = vec![SessionEntry {
+                    created_ms: 1_700_000_000_000,
+                    mod_seq: 1,
+                    subagent_id: Some(SharedString::from("toolu_gc_1")),
+                    kind: SessionEntryKind::AssistantMessage {
+                        chunks: vec![AssistantChunk::Message("sub work".into())],
+                    },
+                }];
+                s.rebuild_streams();
             });
             let seq = session.read(cx).subagents_seq;
-            assert_eq!(session.read(cx).active_subagents.len(), 1, "pill stranded");
+            assert!(
+                session.read(cx).teammate_labels.contains_key("toolu_gc_1"),
+                "label captured"
+            );
+            assert!(
+                session.read(cx).streams.contains_key(
+                    &crate::stream::StreamId::Teammate(SharedString::from("toolu_gc_1"))
+                ),
+                "teammate stream stranded"
+            );
             seq
         })
     });
@@ -9263,8 +9295,11 @@ async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
         let session = store.read(cx).session(session_id).expect("session");
         let s = session.read(cx);
         assert!(
-            s.active_subagents.is_empty() && s.active_subagent_order.is_empty(),
-            "→Idle GC must clear the stranded strip"
+            s.teammate_labels.is_empty()
+                && !s.streams.contains_key(&crate::stream::StreamId::Teammate(
+                    SharedString::from("toolu_gc_1")
+                )),
+            "→Idle GC must close the stranded stream + reclaim its label"
         );
         assert!(
             s.subagents_seq > subagents_seq_after_spawn,
@@ -9279,10 +9314,9 @@ async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
     });
 }
 
-/// Phase 6c regression: the `→Idle` subagent-strip GC clears `active_subagents`,
-/// but the desktop snap-back (`next_selection_after_change`) now recovers a viewer
-/// pinned to a vanished tab by watching `session.streams`, NOT `active_subagents`.
-/// So the GC MUST also `close_stream` each stranded teammate — otherwise the stream
+/// Phase 6c regression: the `→Idle` subagent-strip GC sources stranded ids from
+/// `session.streams` (the desktop snap-back `next_selection_after_change` also
+/// watches `streams`), and MUST `close_stream` each stranded teammate — otherwise the stream
 /// keeps re-demuxing Live from its still-tagged `entries` and the viewer strands on
 /// a frozen, pill-less tab (the 14h-stuck-tab class this GC exists to prevent).
 #[gpui::test]
@@ -9332,7 +9366,10 @@ async fn idle_transition_gc_closes_stranded_teammate_stream(cx: &mut TestAppCont
                 s.rebuild_streams();
             });
             let s = session.read(cx);
-            assert!(s.active_subagents.contains_key("toolu_gc_2"), "pill stranded");
+            assert!(
+                s.teammate_labels.contains_key("toolu_gc_2"),
+                "label captured"
+            );
             assert!(
                 s.streams.contains_key(&teammate),
                 "teammate stream must exist before the GC"
@@ -9354,8 +9391,8 @@ async fn idle_transition_gc_closes_stranded_teammate_stream(cx: &mut TestAppCont
         let session = store.read(cx).session(session_id).expect("session");
         let s = session.read(cx);
         assert!(
-            s.active_subagents.is_empty(),
-            "→Idle GC must clear the stranded pill"
+            s.teammate_labels.is_empty(),
+            "→Idle GC must reclaim the stranded label"
         );
         assert!(
             !s.streams.contains_key(&teammate),
@@ -9364,6 +9401,114 @@ async fn idle_transition_gc_closes_stranded_teammate_stream(cx: &mut TestAppCont
         assert!(
             s.streams.contains_key(&crate::stream::StreamId::Main),
             "Main stream survives the GC"
+        );
+    });
+}
+
+/// The →Idle GC must EXCLUDE a live async `Agent` teammate — its stream outlives
+/// the parent turn (it closes on the real `stop_reason`, not on →Idle). Regression
+/// guard for the `async_parents` exclusion set (`store.rs`, sourced from
+/// `background_agents[*].parent_tool_use_id`): closing it here would suppress a
+/// still-streaming async teammate (decision #5) and drop its label.
+#[gpui::test]
+async fn idle_transition_gc_excludes_live_async_agent_teammate(cx: &mut TestAppContext) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // An async `Agent` spawn tool-call reaches terminal (Completed) at spawn-ack
+    // while the teammate keeps streaming — register it as an `Agent` (not `Task`)
+    // so the terminal path leaves its stream open.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.upsert_tool_call(
+                make_task_tool_call(
+                    "toolu_async_gc",
+                    "Agent",
+                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    Some("Async worker"),
+                    None,
+                ),
+                cx,
+            )
+            .expect("upsert agent");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from("toolu_async_gc"));
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+                // Live async teammate: a tagged entry (its demux stream) + a
+                // `background_agents` registration whose `parent_tool_use_id` is
+                // the teammate id — this is what marks it async-and-live for the
+                // →Idle exclusion set.
+                s.entries = vec![SessionEntry {
+                    created_ms: 1_700_000_000_000,
+                    mod_seq: 1,
+                    subagent_id: Some(SharedString::from("toolu_async_gc")),
+                    kind: SessionEntryKind::AssistantMessage {
+                        chunks: vec![AssistantChunk::Message("async work in flight".into())],
+                    },
+                }];
+                let bg_id = crate::background_agent::BackgroundAgentId::new("bg_async_gc");
+                s.background_agents.insert(
+                    bg_id.clone(),
+                    crate::background_agent::BackgroundAgent {
+                        id: bg_id.clone(),
+                        jsonl_path: "/nonexistent".into(),
+                        registered_at: chrono::Utc::now(),
+                        // No terminal stop_reason → still running.
+                        latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                            mtime: std::time::SystemTime::now(),
+                            activity_label: SharedString::from("Bash: cargo test"),
+                            stop_reason: None,
+                        }),
+                        last_offset: 0,
+                        parent_tool_use_id: Some(SharedString::from("toolu_async_gc")),
+                    },
+                );
+                s.background_agent_order.push(bg_id);
+                s.rebuild_streams();
+            });
+            let s = session.read(cx);
+            assert!(
+                s.streams.contains_key(&teammate),
+                "async teammate stream must exist before the GC"
+            );
+            assert!(
+                s.teammate_labels.contains_key("toolu_async_gc"),
+                "async teammate label captured at registration"
+            );
+        });
+    });
+
+    // →Idle: the GC fires, but the async teammate is excluded.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.mutate_state(session_id, |state| *state = SessionState::Idle, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert!(
+            s.streams.contains_key(&teammate),
+            "→Idle GC must NOT close a live async agent's teammate stream"
+        );
+        assert!(
+            s.teammate_labels.contains_key("toolu_async_gc"),
+            "→Idle GC must NOT drop a live async agent's label"
         );
     });
 }

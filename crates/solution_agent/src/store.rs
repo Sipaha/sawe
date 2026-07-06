@@ -20,7 +20,7 @@ use crate::db::SolutionAgentDb;
 use crate::metrics_emitter::MetricsEmitter;
 use crate::model::{
     AgentServerId, SessionContextCount, SessionState, SolutionSession, SolutionSessionId,
-    SolutionSessionMetadata, SubagentTab,
+    SolutionSessionMetadata,
 };
 use crate::notifier;
 use crate::pool::SubprocessPool;
@@ -273,13 +273,13 @@ pub enum SolutionAgentStoreEvent {
     /// mobile until the eventual flush, and vice-versa.
     SessionQueueChanged(SolutionSessionId),
     SessionNotified(SolutionSessionId, notifier::NotifyKind),
-    /// The session's [`SolutionSession::active_subagents`] map (and its
-    /// parallel `active_subagent_order` vector) changed: a `Task` / `Agent`
-    /// subagent was either spawned (parent ToolCall flipped to `InProgress`)
-    /// or finished (parent ToolCall flipped to a terminal status). Emitted
-    /// only when the map *actually* changed — a duplicate spawn event for a
-    /// known id, or a terminal status on an unknown id, is silently
-    /// ignored to keep the event stream debounce-friendly.
+    /// The session's teammate set changed: a `Task` / `Agent` subagent was
+    /// either spawned (parent ToolCall flipped to `InProgress`) or finished
+    /// (parent ToolCall flipped to a terminal status). Emitted only when the
+    /// set *actually* changed — a duplicate spawn event for a known id, or a
+    /// terminal status on an unknown id, is silently ignored to keep the event
+    /// stream debounce-friendly. Since wire v5 this drives a lean dirty-poke:
+    /// consumers re-poll `streams` rather than receive a subagent list.
     ///
     /// Subscribers: the session_view's subagent-tabs strip (Etap 4) and the
     /// MCP wire's `session_active_subagents_changed` notification (Etap 5),
@@ -1301,8 +1301,8 @@ impl SolutionAgentStore {
         // `create_session_with_parent` skips `open_session_in_strip` for any
         // parent-linked session (no `tab_order`, no `TabsChanged { opened }`),
         // so the ephemeral session never flickers a visible tab in the
-        // ConsolePanel strip on each idle wake-up. It is NOT registered in the
-        // parent's `active_subagents` map (that map is driven only by Task/Agent
+        // ConsolePanel strip on each idle wake-up. It does NOT produce a teammate
+        // stream on the parent (teammate streams are driven only by Task/Agent
         // ToolCall events on the parent's ACP thread, never by this create), so
         // it also stays out of the subagent strip and the
         // `agent_session_active_subagents_changed` wire surface. The verdict /
@@ -6298,10 +6298,12 @@ impl SolutionAgentStore {
             s.cwd = root;
             s.set_entries(entries, cx);
             if live_teammates {
-                // Register each distinct teammate id (from the just-demux'd streams)
-                // as a live inline Task so the desktop strip paints its pill — the
-                // phase-6c strip requires membership in BOTH `streams` and
-                // `active_subagents`. Debug/screenshot-only path.
+                // Capture a friendly label for each distinct teammate id (from the
+                // just-demux'd streams) so `rebuild_streams` enriches its
+                // `Stream.label` and the desktop strip paints a labelled pill. The
+                // `task-` prefix makes the label DISTINCT from the raw toolu so the
+                // screenshot gate visibly proves `teammate_labels`→`Stream.label`→
+                // pill (not the demux default). Debug/screenshot-only path.
                 let teammate_ids: Vec<SharedString> = s
                     .streams
                     .keys()
@@ -6311,15 +6313,13 @@ impl SolutionAgentStore {
                     })
                     .collect();
                 for toolu in teammate_ids {
-                    s.active_subagents.insert(
-                        toolu.clone(),
-                        crate::model::SubagentTab {
-                            label: toolu.clone(),
-                            started_at: chrono::Utc::now(),
-                        },
-                    );
-                    s.active_subagent_order.push(toolu);
+                    s.teammate_labels
+                        .insert(toolu.clone(), SharedString::from(format!("task-{}", toolu)));
                 }
+                // Re-enrich the already-demux'd teammate streams' labels now that
+                // `teammate_labels` is populated (the streams were built by
+                // `set_entries` above when the map was still empty).
+                s.rebuild_streams();
             }
             if let Some(command) = live_shell {
                 // Phase 6d-A screenshot gate: register ONE `Running` shell with a
@@ -6653,16 +6653,16 @@ impl SolutionAgentStore {
     /// Subagent-tab lifecycle hook. Inspects the entry at `entry_index` in
     /// the session's live `AcpThread` and:
     ///   * if it's a brand-new `Task`/`Agent` ToolCall in `InProgress` and
-    ///     not already tracked → registers it on
-    ///     `SolutionSession::active_subagents` (+ insertion-order vec) and
-    ///     emits [`SolutionAgentStoreEvent::SessionSubagentsChanged`];
+    ///     not already tracked → captures its friendly label in
+    ///     `SolutionSession::teammate_labels` and emits
+    ///     [`SolutionAgentStoreEvent::SessionSubagentsChanged`];
     ///   * if it's a tracked id whose status just flipped to a terminal
-    ///     state (`Completed`/`Failed`/`Rejected`/`Canceled`) → removes it
-    ///     and emits the same event.
+    ///     state (`Completed`/`Failed`/`Rejected`/`Canceled`) → closes the
+    ///     inline Task's stream (reclaiming its label) and emits the same event.
     ///
     /// Any other shape (non-tool entry, non-Task tool, status still
     /// `InProgress`/`Pending` on an already-tracked id, terminal status on
-    /// an unknown id) is a no-op and emits nothing. Map mutations are gated
+    /// an unknown id) is a no-op and emits nothing. Mutations are gated
     /// behind a structural check to keep `SessionSubagentsChanged` from
     /// firing on every chunk of a streaming Task subagent's body.
     ///
@@ -6941,7 +6941,7 @@ impl SolutionAgentStore {
             // InProgress→InProgress EntryUpdated as raw_input streams in) must
             // not re-insert or re-emit. Only the first observation registers
             // the tab.
-            let already_tracked = session_entity.read(cx).active_subagents.contains_key(&id);
+            let already_tracked = session_entity.read(cx).teammate_labels.contains_key(&id);
             if already_tracked {
                 // Label is intentionally locked at first observation. Later
                 // EntryUpdated events that finally fill in raw_input.description
@@ -6952,16 +6952,12 @@ impl SolutionAgentStore {
                 let label = snapshot
                     .label_from_raw_input
                     .unwrap_or_else(|| label_fallback(&id, snapshot.subagent_type.as_deref()));
-                let id_for_closure = id.clone();
+                // Capture the durable friendly label for BOTH inline `Task` and
+                // async `Agent` teammates (both are `is_task_like`). It rides
+                // `Stream.label` via `rebuild_streams` and is reclaimed when the
+                // teammate's stream closes (`close_stream`).
                 session_entity.update(cx, |s, _| {
-                    s.active_subagents.insert(
-                        id_for_closure.clone(),
-                        SubagentTab {
-                            label,
-                            started_at: chrono::Utc::now(),
-                        },
-                    );
-                    s.active_subagent_order.push(id_for_closure);
+                    s.teammate_labels.insert(id.clone(), label);
                 });
                 true
             }
@@ -6969,7 +6965,7 @@ impl SolutionAgentStore {
             // Symmetric defensive guard: a terminal-status EntryUpdated on an
             // id we never registered (e.g. the InProgress event arrived after
             // a status flip on a cold→live transition) is a no-op.
-            let tracked = session_entity.read(cx).active_subagents.contains_key(&id);
+            let tracked = session_entity.read(cx).teammate_labels.contains_key(&id);
             if tracked {
                 // Terminal status is a GENUINE "teammate done" signal ONLY for an
                 // inline `Task` (its tool-call stays InProgress for the whole run
@@ -6981,13 +6977,11 @@ impl SolutionAgentStore {
                 // teammate (decision #5: the parent-thread demux IS its source of
                 // truth). So auto-close the stream for `Task` only; the async
                 // `Agent`'s real done-signal (stop_reason / completion) drives its
-                // close in a later phase. The `active_subagents` removal (pill)
-                // still fires for both, unchanged.
+                // close in a later phase. `close_stream` reclaims the inline Task's
+                // `teammate_labels` entry; the async `Agent` keeps its label (its
+                // stream stays open past spawn-ack) and reclaims it on its own close.
                 let is_async_agent = tool_name_is_agent(snapshot.tool_name.as_deref());
                 session_entity.update(cx, |s, _| {
-                    s.active_subagents.remove(&id);
-                    s.active_subagent_order
-                        .retain(|tracked_id| tracked_id != &id);
                     if !is_async_agent {
                         s.close_stream(
                             crate::stream::StreamId::Teammate(id.clone()),
@@ -8761,31 +8755,46 @@ impl SolutionAgentStore {
         // catch-all the per-tool-call path misses.
         if !matches!(previous, SessionState::Idle) && matches!(next, SessionState::Idle) {
             let cleared = session.update(cx, |s, _| {
-                if !s.active_subagents.is_empty() || !s.active_subagent_order.is_empty() {
-                    // Close each stranded inline-Task teammate stream in lockstep
-                    // with clearing its pill. Since phase 6c the desktop snap-back
-                    // (`next_selection_after_change`) recovers a viewer pinned to a
-                    // vanished tab by watching `streams`, NOT `active_subagents`; if
-                    // we cleared the map here without also closing the stream, the
-                    // stream would keep re-demuxing Live from its still-tagged rows,
-                    // stranding the viewer on a frozen, pill-less tab (the exact
-                    // 14h-stuck-tab class this GC exists to prevent). Async `Agent`
-                    // teammates are already out of `active_subagents` (removed at
-                    // spawn-ack), so this only closes inline Tasks — never a
-                    // still-live async teammate's stream.
-                    let stranded: Vec<SharedString> = s.active_subagents.keys().cloned().collect();
-                    s.active_subagents.clear();
-                    s.active_subagent_order.clear();
-                    for id in stranded {
-                        s.close_stream(
-                            crate::stream::StreamId::Teammate(id),
-                            gpui::SharedString::new_static("orphaned"),
-                        );
-                    }
-                    true
-                } else {
-                    false
+                // Close each stranded inline-Task teammate stream on →Idle. The
+                // desktop snap-back (`next_selection_after_change`) recovers a
+                // viewer pinned to a vanished tab by watching `streams`, so sourcing
+                // the ids from `s.streams` teammate keys keeps the pill and the
+                // stream in lockstep — `close_stream` also reclaims each one's
+                // `teammate_labels` entry.
+                //
+                // Async `Agent` teammates OUTLIVE the parent turn (their stream
+                // closes on the real stop_reason via the background-agent GC), so
+                // they must be EXCLUDED here — identified by having a registered
+                // `background_agent` whose `parent_tool_use_id` is the stream id.
+                // Closing them here would suppress a still-live async teammate
+                // (decision #5) and drop its label.
+                let async_parents: std::collections::HashSet<SharedString> = s
+                    .background_agents
+                    .values()
+                    .filter_map(|ba| ba.parent_tool_use_id.clone())
+                    .collect();
+                let stranded: Vec<SharedString> = s
+                    .streams
+                    .keys()
+                    .filter_map(|id| match id {
+                        crate::stream::StreamId::Teammate(toolu)
+                            if !async_parents.contains(toolu) =>
+                        {
+                            Some(toolu.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if stranded.is_empty() {
+                    return false;
                 }
+                for id in stranded {
+                    s.close_stream(
+                        crate::stream::StreamId::Teammate(id),
+                        gpui::SharedString::new_static("orphaned"),
+                    );
+                }
+                true
             });
             // The clear is a strip mutation: route it through the watermark+emit
             // helper so `SessionSubagentsChanged` fires (desktop strip re-render)

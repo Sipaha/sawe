@@ -871,10 +871,11 @@ impl SolutionSessionView {
 
     /// React to `SessionBackgroundAgentsChanged`. Post-6d-B an async agent
     /// renders as its demux `Teammate` pill (no standalone `Background` tab),
-    /// so there is no selection to reconcile here — just repaint the strip so
-    /// a live async-agent's `activity_label` change refreshes its teammate
-    /// pill (the label is looked up by `parent_tool_use_id` off
-    /// `session.background_agents`).
+    /// so there is no selection to reconcile here. Post-6d-tail-2 the pill label
+    /// is `Stream.label` (sourced from `teammate_labels`, LOCKED at first
+    /// observation), so it no longer varies with `background_agents` — this
+    /// repaint just keeps the strip in sync with any other bg-agent-driven
+    /// affordance and is otherwise a cheap no-op. Kept for defensive freshness.
     pub(crate) fn on_background_agents_changed(&mut self, cx: &mut Context<Self>) {
         cx.notify();
     }

@@ -252,33 +252,6 @@ pub enum PersistedRole {
     Archived,
 }
 
-/// One in-flight subagent (`Task` / `Agent` claude tool call) tracked on a
-/// `SolutionSession`. Populated by the store's `handle_acp_event` lifecycle
-/// the moment the parent thread surfaces an `InProgress` Task/Agent ToolCall,
-/// and removed when that same call transitions to a terminal status. Lives
-/// only in memory — by design these are turn-scoped, so persisting them
-/// across editor restarts would risk rendering ghosts of subagents that
-/// already finished (and any restored session replays its parent turn's
-/// tool calls anyway, so a fresh tab can re-materialise from the replay).
-///
-/// Insertion order is preserved by a parallel `Vec<SharedString>` on
-/// `SolutionSession` (the map alone can't — `SharedString` hashes are
-/// random, so iteration order would be meaningless tab order in the UI).
-#[derive(Debug, Clone)]
-pub struct SubagentTab {
-    /// Human-readable label shown on the tab pill. Picked from the parent
-    /// tool call's `raw_input["description"]` when present (the agent author
-    /// wrote it), else `subagent_type#<short-id>`, else `Agent <short-id>`.
-    pub label: SharedString,
-    /// Wall-clock time the subagent was first observed in-flight. Stored as
-    /// `chrono::DateTime<Utc>` (not `std::time::Instant`) so the MCP wire
-    /// layer can serialize it as unix-millis without rebasing a monotonic
-    /// clock onto wall time at every emit. Useful for "running for Xs"
-    /// decorations in the tab pill; not load-bearing for tab lifecycle
-    /// (which keys off ToolCall status transitions).
-    pub started_at: DateTime<Utc>,
-}
-
 /// Sentinel stored in `SolutionSession::entry_created_ms` (and the persisted
 /// mirror) for an entry whose creation time was never captured — e.g. a
 /// message that predates the timestamp feature, surfaced through a resumed
@@ -526,29 +499,21 @@ pub struct SolutionSession {
     /// safety-net fire onto a now-Idle session and trigger a
     /// no-op (harmless) but spammy warn-log.
     pub stopping_safety_net: Option<Task<()>>,
-    /// In-flight `Task` / `Agent` subagents the parent thread has spawned.
-    /// Keyed by the parent tool call's `acp::ToolCallId` (cast to
-    /// `SharedString` for cheap clone-as-key use across the store + view).
-    /// See [`SubagentTab`] for the value docs. Updated by
-    /// `SolutionAgentStore::handle_acp_event` on `NewEntry` (add) and
-    /// `EntryUpdated` (remove on terminal status). Ephemeral — not
-    /// persisted across editor restarts; a resumed session re-materialises
-    /// its in-flight subagents from the replayed tool-call stream.
-    pub active_subagents: HashMap<SharedString, SubagentTab>,
-    /// Insertion order of `active_subagents` keys. The map's own iteration
-    /// order is `SharedString`-hash-dependent and therefore meaningless as
-    /// UI tab order; this vector preserves spawn order so "(Sub 1)
-    /// (Sub 2)" pills render the way the user expects (oldest first).
-    /// Always kept in lockstep with the map: every insert appends here,
-    /// every remove also drops the corresponding entry. Reads can rely on
-    /// `active_subagent_order.iter()` returning exactly the keys the map
-    /// holds — no holes, no duplicates.
-    pub active_subagent_order: Vec<SharedString>,
+    /// Durable friendly label for each teammate stream, keyed by the parent
+    /// tool call's `acp::ToolCallId` (`toolu_xxx`, cast to `SharedString`).
+    /// Captured once at registration for EVERY teammate — both an inline
+    /// `Task` and an async `Agent` — and removed when that teammate's demux
+    /// stream is closed (`close_stream`), NOT at the async spawn-ack (so a
+    /// still-streaming async teammate keeps its label). `rebuild_streams`
+    /// reads this to enrich each `StreamId::Teammate` stream's `Stream.label`,
+    /// which is then the single source of truth for the desktop strip AND the
+    /// mobile wire (`StreamDto.label`). Ephemeral — not persisted; a resumed
+    /// session re-captures labels from the replayed tool-call stream.
+    pub teammate_labels: HashMap<SharedString, SharedString>,
     /// Managed Agents (Claude Code's built-in async `Agent` tool dispatch)
-    /// the parent has launched in this session. Unlike `active_subagents`
-    /// which is keyed by parent tool_use id and clears on Task tool_call
-    /// terminal status, this map tracks Anthropic's standalone background
-    /// processes whose lifecycle is bound to a separate JSONL file on disk.
+    /// the parent has launched in this session. This map tracks Anthropic's
+    /// standalone background processes whose lifecycle is bound to a separate
+    /// JSONL file on disk.
     /// Persisted in `solution_session_background_agent`.
     pub background_agents:
         HashMap<background_agent::BackgroundAgentId, background_agent::BackgroundAgent>,
@@ -590,7 +555,7 @@ pub struct SolutionSession {
     pub queue_seq: u64,
     /// `change_seq` at this section's last change; ephemeral (rebuilt on restart
     /// per `init_change_seq_from_entries`). The mobile delta omits the section
-    /// when `watermark <= since_seq`. Tracks `active_subagents`.
+    /// when `watermark <= since_seq`. Tracks the teammate stream set.
     pub subagents_seq: u64,
     /// `change_seq` at this section's last change; ephemeral (rebuilt on restart
     /// per `init_change_seq_from_entries`). The mobile delta omits the section
@@ -662,8 +627,7 @@ impl SolutionSession {
             desired_effort: None,
             parent_session_id: None,
             stopping_safety_net: None,
-            active_subagents: HashMap::new(),
-            active_subagent_order: Vec::new(),
+            teammate_labels: HashMap::new(),
             background_agents: HashMap::new(),
             background_agent_order: Vec::new(),
             background_shells: HashMap::new(),
@@ -783,6 +747,21 @@ impl SolutionSession {
             };
             streams.insert(crate::stream::StreamId::Shell(id.clone()), stream);
         }
+        // Enrich each teammate stream's `label` from `teammate_labels` (the
+        // durable friendly label captured at registration). After this,
+        // `Stream.label` is the single source of truth for a teammate's display
+        // label on BOTH the desktop strip and the mobile wire (`StreamDto.label`).
+        // Fallback: keep the raw `toolu` when no label was captured. Main/Shell
+        // labels are set at their own construction and are untouched here.
+        for (id, stream) in streams.iter_mut() {
+            if let crate::stream::StreamId::Teammate(toolu) = id {
+                stream.label = self
+                    .teammate_labels
+                    .get(toolu)
+                    .cloned()
+                    .unwrap_or_else(|| toolu.clone());
+            }
+        }
         // Per-stream `seq` = the stream's high-water mark on the `change_seq`
         // axis (max `mod_seq` of its entries). `push_coalesced` keeps this
         // coalesce-aware, so it advances on append AND on a coalesce-merge the
@@ -811,6 +790,14 @@ impl SolutionSession {
         // resurrect a stream the completion path (Task terminal / async-Agent
         // stop_reason) has authoritatively finished.
         self.hydration_orphan_streams.remove(&id);
+        // Label cleanup is tied to stream close: a teammate's durable label
+        // lives only as long as its stream. Both the inline-Task terminal path
+        // and the async-Agent real-stop_reason path funnel through here, so this
+        // is the single point that reclaims a teammate label. Shell/Main ids have
+        // no `teammate_labels` entry → no-op.
+        if let crate::stream::StreamId::Teammate(toolu) = &id {
+            self.teammate_labels.remove(toolu);
+        }
         self.closed_streams.insert(id, reason);
         self.rebuild_streams();
     }
@@ -1133,8 +1120,7 @@ mod tests {
             desired_effort: None,
             parent_session_id: None,
             stopping_safety_net: None,
-            active_subagents: HashMap::new(),
-            active_subagent_order: Vec::new(),
+            teammate_labels: HashMap::new(),
             background_agents: HashMap::new(),
             background_agent_order: Vec::new(),
             background_shells: HashMap::new(),

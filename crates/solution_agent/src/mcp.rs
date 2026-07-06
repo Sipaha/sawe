@@ -262,37 +262,6 @@ pub struct SessionSummary {
     /// `solution.root`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// In-flight `Task` / `Agent` subagents the parent thread has spawned,
-    /// in spawn order. Mirrors `SolutionSession::active_subagent_order` +
-    /// `active_subagents` — the desktop session_view renders these as the
-    /// pill strip under the status row, and the mobile client mirrors the
-    /// same shape. Empty (and omitted) when the session has no subagents
-    /// currently in-flight (the typical state outside an active Task turn).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub active_subagents: Vec<SubagentDto>,
-}
-
-/// One in-flight subagent surfaced to MCP consumers. Mirrors the in-memory
-/// `SolutionSession::active_subagents` entry: an `id` (parent `Task`/`Agent`
-/// tool_use id, `toolu_xxx`) + the human-readable label that the desktop
-/// pill displays + the wall-clock start time as unix-millis (so mobile can
-/// render "running for Xs" without a separate clock-sync round-trip).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct SubagentDto {
-    /// Parent tool_use id (`toolu_xxx`) — matches every entry whose
-    /// `subagent_id` field equals this value, so the client filters its
-    /// conversation view by exact-id match.
-    pub id: String,
-    /// Tab label as picked by [`SolutionSession::active_subagents`]'s
-    /// label-fallback chain (`description` → `subagent_type#<short-id>` →
-    /// `Agent <short-id>`). Label-locked at first observation — late
-    /// `EntryUpdated`s that finally fill `raw_input.description` do NOT
-    /// relabel the tab to keep the strip stable.
-    pub label: String,
-    /// Unix-millis the subagent was first observed in-flight. Strictly
-    /// positive — there is no "missing" sentinel since the field is
-    /// always stamped on insert with `chrono::Utc::now()`.
-    pub started_at_ms: i64,
 }
 
 /// Wire identity of a stream. Tagged object (locked encoding — identical in the
@@ -576,43 +545,7 @@ pub fn session_summary(session: &SolutionSession, cx: &App) -> SessionSummary {
         acp_session_id: session.acp_session_id.0.to_string(),
         cwd: (!session.cwd.as_os_str().is_empty())
             .then(|| session.cwd.to_string_lossy().into_owned()),
-        active_subagents: build_active_subagents_vec(session),
     }
-}
-
-/// Walks `SolutionSession::active_subagent_order` in insertion order and
-/// converts each tracked subagent into its wire form. Skips ids that
-/// don't have a matching map entry (defensive — `active_subagent_order`
-/// is supposed to be kept 1:1 with `active_subagents`, so a mismatch is
-/// a bug worth logging). Shared by:
-///
-///   * `session_summary` — populates [`SessionSummary::active_subagents`]
-///     on `list_sessions` / `get_session`.
-///   * `event_sources::build_active_subagents_changed_payload` — wire
-///     payload for the live `agent_session_active_subagents_changed`
-///     notification.
-///
-/// Both paths must agree on the shape, hence the single helper.
-pub(crate) fn build_active_subagents_vec(
-    session: &crate::model::SolutionSession,
-) -> Vec<SubagentDto> {
-    let mut out = Vec::with_capacity(session.active_subagent_order.len());
-    for id in &session.active_subagent_order {
-        match session.active_subagents.get(id) {
-            Some(tab) => out.push(SubagentDto {
-                id: id.to_string(),
-                label: tab.label.to_string(),
-                started_at_ms: tab.started_at.timestamp_millis(),
-            }),
-            None => {
-                log::warn!(
-                    "active_subagent_order has id {id} with no matching active_subagents entry \
-                     (insertion-order vector drifted from the map — see store::apply_subagent_lifecycle)"
-                );
-            }
-        }
-    }
-    out
 }
 
 // =====================================================================
@@ -1012,7 +945,7 @@ pub struct EntrySummary {
     /// user / plan entries. Sourced from `AgentThreadEntry::subagent_id()`
     /// which itself reads `_meta.claudeCode.parentToolUseId` off the
     /// underlying `acp::Meta`. Lets the client filter the conversation view
-    /// by subagent tab — match against `SessionSummary::active_subagents[*].id`.
+    /// by teammate tab — match against a `StreamDto`'s `teammate` id in `streams`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_id: Option<String>,
     /// True for a `role == "user"` entry that is actually a SUPERVISOR
@@ -4965,12 +4898,11 @@ pub struct SeedColdSessionParams {
     /// Tab title (default `"Seed"`).
     pub title: Option<String>,
     pub entries: Vec<SeedColdSessionEntry>,
-    /// When true, register each distinct teammate `subagent_id` as a LIVE inline
-    /// Task in `active_subagents` (label = the id) so the desktop strip paints a
-    /// live teammate pill. A cold seed otherwise leaves `active_subagents` empty,
-    /// and since phase 6c the strip only shows a teammate whose stream is BOTH in
-    /// `session.streams` AND in `active_subagents`, so without this the pill is
-    /// (correctly) hidden. Default false = the finished/cold-load render state.
+    /// When true, capture a friendly label (`task-<id>`) for each distinct
+    /// teammate `subagent_id` in `teammate_labels` so `rebuild_streams` enriches
+    /// its `Stream.label` and the desktop strip paints a labelled teammate pill.
+    /// A cold seed otherwise leaves `teammate_labels` empty and the pill shows the
+    /// raw toolu. Default false = the finished/cold-load render state.
     pub live_teammates: bool,
     /// When set to a command string, register ONE `Running` background shell on
     /// the seeded session (phase 6d-A) so its derived `StreamId::Shell` tab
@@ -7182,39 +7114,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Etap 5: subagent_id + active_subagents on session DTOs.
+    // Etap 5: subagent_id + teammate streams on session DTOs.
     // -----------------------------------------------------------------
-
-    /// Seed the session's `active_subagents` map directly with two tabs
-    /// inserted in known order. Stays out of `apply_subagent_lifecycle` so
-    /// the test exercises the wire-shape path in isolation from claude's
-    /// `ToolCall` plumbing.
-    fn seed_subagent_tabs(
-        session_id: crate::model::SolutionSessionId,
-        labels: &[(&str, &str)],
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| {
-            let store = SolutionAgentStore::global(cx);
-            let session = store
-                .read(cx)
-                .session(session_id)
-                .expect("session must exist");
-            session.update(cx, |s, _| {
-                for (id, label) in labels {
-                    let id_shared = gpui::SharedString::from((*id).to_string());
-                    s.active_subagents.insert(
-                        id_shared.clone(),
-                        crate::model::SubagentTab {
-                            label: gpui::SharedString::from((*label).to_string()),
-                            started_at: chrono::Utc::now(),
-                        },
-                    );
-                    s.active_subagent_order.push(id_shared);
-                }
-            });
-        });
-    }
 
     #[gpui::test]
     async fn get_session_streams_list_main_first_then_teammate(cx: &mut gpui::TestAppContext) {
@@ -7507,9 +7408,10 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn build_active_subagents_changed_payload_shape(cx: &mut gpui::TestAppContext) {
+    async fn build_active_subagents_changed_payload_is_bare_session_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (session_id, _img, _tmp) = seed_session_with_image(cx).await;
-        seed_subagent_tabs(session_id, &[("toolu_one", "Alpha")], cx);
 
         cx.update(|cx| {
             let payload =
@@ -7519,19 +7421,13 @@ mod tests {
                 obj.get("session_id").and_then(|v| v.as_str()),
                 Some(session_id.to_string().as_str())
             );
-            let arr = obj
-                .get("active_subagents")
-                .and_then(|v| v.as_array())
-                .expect("active_subagents array");
-            assert_eq!(arr.len(), 1, "one seeded tab → one descriptor");
-            let entry = arr[0].as_object().expect("dto object");
-            assert_eq!(entry.get("id").and_then(|v| v.as_str()), Some("toolu_one"));
-            assert_eq!(entry.get("label").and_then(|v| v.as_str()), Some("Alpha"));
-            let started_at = entry
-                .get("started_at_ms")
-                .and_then(|v| v.as_i64())
-                .expect("started_at_ms");
-            assert!(started_at > 0, "started_at_ms must be positive");
+            // Wire v5: the notification is a lean `{session_id}`-only dirty-poke —
+            // no `active_subagents` list rides along (mobile re-polls `streams`).
+            assert!(
+                obj.get("active_subagents").is_none(),
+                "v5 dirty-poke must not carry a subagents list"
+            );
+            assert_eq!(obj.len(), 1, "payload carries session_id only");
         });
     }
 

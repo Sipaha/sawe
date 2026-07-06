@@ -96,7 +96,12 @@ impl McpServerTool for CapabilitiesTool {
             // streams; background agents render as their `kind: teammate` demux
             // stream; the separate `get_session_background_{shells,agents}` tools
             // are removed. HARD CUTOVER.
-            wire_schema_version: 4,
+            // v5 (per-source streams — labels on the stream):
+            // `SessionSummary.active_subagents` removed; a teammate stream's
+            // friendly label now rides `StreamDto.label`; the
+            // `agent_session_active_subagents_changed` notification is a bare
+            // `{session_id}` dirty-poke. HARD CUTOVER.
+            wire_schema_version: 5,
         };
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
