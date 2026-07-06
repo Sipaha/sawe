@@ -86,7 +86,12 @@ impl McpServerTool for CapabilitiesTool {
             binary_built_at,
             // v2: added `workspace.*` MCP namespace; renamed `SolutionSummary.window_open`
             // to `open` and `solution_agent.close_session` to `solution_agent.delete_session`.
-            wire_schema_version: 2,
+            // v3 (per-source streams, HARD CUTOVER): `solution_agent.get_session` /
+            // `get_session_changes` dropped the flat `active_subagents` +
+            // `subagent_filter` model for the per-stream `streams` descriptors +
+            // `stream_id` selector; `entries` / `changed_entries` `index` is now
+            // STREAM-LOCAL and the delta cursor is per-stream `seq`.
+            wire_schema_version: 3,
         };
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {

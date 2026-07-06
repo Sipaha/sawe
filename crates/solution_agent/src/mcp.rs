@@ -303,6 +303,117 @@ pub struct SubagentDto {
     pub started_at_ms: i64,
 }
 
+/// Wire identity of a stream. Tagged object (locked encoding — identical in the
+/// mobile client). `Shell` is defined for completeness but not produced this
+/// phase (the `streams` list carries Main + teammates only; shells/bg-agents stay
+/// separate tools until phase 6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamIdDto {
+    Main,
+    Teammate { toolu: String },
+    Shell { id: String },
+}
+
+impl StreamIdDto {
+    pub fn from_model(id: &crate::stream::StreamId) -> Self {
+        match id {
+            crate::stream::StreamId::Main => StreamIdDto::Main,
+            crate::stream::StreamId::Teammate(toolu) => StreamIdDto::Teammate {
+                toolu: toolu.to_string(),
+            },
+            crate::stream::StreamId::Shell(bsid) => StreamIdDto::Shell {
+                id: bsid.as_str().to_string(),
+            },
+        }
+    }
+
+    pub fn to_model(&self) -> crate::stream::StreamId {
+        match self {
+            StreamIdDto::Main => crate::stream::StreamId::Main,
+            StreamIdDto::Teammate { toolu } => {
+                crate::stream::StreamId::Teammate(SharedString::from(toolu.clone()))
+            }
+            StreamIdDto::Shell { id } => {
+                crate::stream::StreamId::Shell(crate::background_shell::BackgroundShellId::new(
+                    id.clone(),
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamKindDto {
+    Main,
+    Teammate,
+    Shell,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamStateDto {
+    Live,
+    Done { reason: String },
+}
+
+/// Descriptor of one live stream — id/kind/label/state/seq/total_count for ALL
+/// streams. Entries are NOT here; they ride the top-level `entries` /
+/// `changed_entries` for the client-SELECTED stream only (decision #7: bounds the
+/// payload, reuses the proven pagination; the descriptor list drives the tab strip).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct StreamDto {
+    pub id: StreamIdDto,
+    pub kind: StreamKindDto,
+    pub label: String,
+    pub state: StreamStateDto,
+    /// Per-stream delta watermark (max entry mod_seq). The client compares this to
+    /// its per-stream cursor to know a stream advanced; passes it back as
+    /// `since_seq` when it selects the stream.
+    pub seq: u64,
+    /// This stream's entry count (stream-local) — the client paginates the stream,
+    /// and tail-truncates its per-stream list to this on a rewind.
+    pub total_count: usize,
+}
+
+impl StreamDto {
+    pub fn from_stream(stream: &crate::stream::Stream) -> StreamDto {
+        let kind = match stream.kind {
+            crate::stream::StreamKind::Main => StreamKindDto::Main,
+            crate::stream::StreamKind::Teammate => StreamKindDto::Teammate,
+            crate::stream::StreamKind::Shell => StreamKindDto::Shell,
+        };
+        let state = match &stream.state {
+            crate::stream::StreamState::Live => StreamStateDto::Live,
+            crate::stream::StreamState::Done { reason } => StreamStateDto::Done {
+                reason: reason.to_string(),
+            },
+        };
+        StreamDto {
+            id: StreamIdDto::from_model(&stream.id),
+            kind,
+            label: stream.label.to_string(),
+            state,
+            seq: stream.seq,
+            total_count: stream.entries.len(),
+        }
+    }
+}
+
+/// The descriptor list served by BOTH `get_session` and `get_session_changes`
+/// (decision #7): one [`StreamDto`] per live stream in `session.streams`
+/// (IndexMap insertion order = Main first, teammates in first-seen order). The
+/// client diffs this against its held set to derive stream add/remove and drives
+/// its tab strip from it.
+pub(crate) fn build_streams_vec(session: &SolutionSession) -> Vec<StreamDto> {
+    session
+        .streams
+        .values()
+        .map(StreamDto::from_stream)
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ListSessionsResult {
     pub sessions: Vec<SessionSummary>,
@@ -1037,18 +1148,13 @@ pub struct GetSessionParams {
     /// window taken over ALL entries then filtered client-side could leave a
     /// tab empty — the bug this fixes). Mirrors the desktop
     /// `session_view::should_render_entry` rule so the wire is the single
-    /// source of truth for tab membership:
-    ///   * `None` / absent → no filter (every entry; back-compat).
-    ///   * `"__main__"` → the Main thread: entries with no `subagent_id`,
-    ///     UNLESS the session has zero active subagents, in which case every
-    ///     entry is returned (the desktop "no subagent strip → show all"
-    ///     bypass, so historical subagent entries don't vanish).
-    ///   * any other value → only entries whose `subagent_id` equals it (a
-    ///     specific Task/Agent subagent tab).
-    /// `total_count` on the result reflects the FILTERED total so the client
-    /// can paginate the tab correctly.
+    /// source of truth for tab membership. Selects WHICH stream's entries are
+    /// returned in `entries` (the descriptor list in `streams` is always the
+    /// full set). `None` / absent ⇒ Main. The result's `entries` / `total_count`
+    /// are that stream's (stream-local index), so the client paginates the
+    /// selected stream, not the whole session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagent_filter: Option<String>,
+    pub stream_id: Option<StreamIdDto>,
     /// Token-frugal transcript slice for the supervisor judge. When set,
     /// the response is reduced to only the entries that matter for judging
     /// "what is the real goal and did the agent stop short": every
@@ -1057,8 +1163,8 @@ pub struct GetSessionParams {
     /// (where the agent came to rest). Everything else — the agent's long
     /// tool-call/assistant churn — is dropped, so a judge no longer has to
     /// pull a 100k+-token full transcript into its clean context every
-    /// wake-up. Applied AFTER `subagent_filter`/index windows and BEFORE
-    /// `count`. `total_count` still reflects the unsliced filtered total so
+    /// wake-up. Applied AFTER the stream selection / index windows and BEFORE
+    /// `count`. `total_count` still reflects the unsliced selected-stream total so
     /// the judge can see how long the session actually is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_anchored_lead: Option<usize>,
@@ -1083,7 +1189,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
             before_index: Option<usize>,
             after_index: Option<usize>,
             count: Option<usize>,
-            subagent_filter: Option<String>,
+            stream_id: Option<StreamIdDto>,
             user_anchored_lead: Option<usize>,
             user_anchored_since_ms: Option<i64>,
         }
@@ -1095,7 +1201,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
             before_index: inner.before_index,
             after_index: inner.after_index,
             count: inner.count,
-            subagent_filter: inner.subagent_filter,
+            stream_id: inner.stream_id,
             user_anchored_lead: inner.user_anchored_lead,
             user_anchored_since_ms: inner.user_anchored_since_ms,
         })
@@ -1339,12 +1445,17 @@ pub struct GetSessionResult {
     /// the working directory the agent was launched with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Entries of the SELECTED stream (`stream_id`, default Main), with
+    /// STREAM-LOCAL 0-based `index` (position within that stream, not the flat
+    /// session). Paginated by `count`/`after_index`/`before_index` over the
+    /// selected stream's entries.
     pub entries: Vec<EntrySummary>,
-    /// R-6e: total entry count regardless of the `count`/`after_index`/
-    /// `before_index` pagination window applied to `entries`. Lets the client
-    /// render a "Load older" affordance and detect resume-time gaps. When a
-    /// `subagent_filter` is supplied this is the FILTERED total (entries of
-    /// that tab), so the client paginates the tab — not the whole session.
+    /// Total entry count of the SELECTED stream, regardless of the
+    /// `count`/`after_index`/`before_index` pagination window applied to
+    /// `entries`. Lets the client render a "Load older" affordance and
+    /// tail-truncate the selected stream. This is the selected stream's
+    /// `total_count` — the per-stream counts for every stream are also in the
+    /// `streams` descriptors.
     pub total_count: usize,
     /// Server-side `pending_messages` queue, one descriptor per bundle.
     /// Empty when the agent isn't holding any follow-up sends from
@@ -1354,21 +1465,23 @@ pub struct GetSessionResult {
     /// cross-client queue display.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_bundles: Vec<QueuedBundleSummary>,
-    /// Mirrors [`SessionSummary::active_subagents`] — the in-flight
-    /// `Task`/`Agent` pills the desktop renders under the status row.
-    /// Paired with the live `agent_session_active_subagents_changed`
-    /// notification this is the cold-start seed for the mobile's
-    /// subagent-tab strip. Empty (and omitted) when no Task subagents
-    /// are currently in-flight.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub active_subagents: Vec<SubagentDto>,
+    /// Descriptor list for ALL live streams (Main first, teammates in
+    /// first-seen order) — id/kind/label/state/seq/total_count per stream, no
+    /// entries. Drives the client's tab strip; the client diffs it against its
+    /// held set to derive stream add/remove. The selected stream's entries ride
+    /// the top-level `entries` field (decision #7). Always present (Main is
+    /// always a stream), so no `skip_serializing_if`.
+    pub streams: Vec<StreamDto>,
     /// Phase 5: the session's transcript epoch at load time. The cache-first
     /// mobile client seeds its delta cursor `(epoch, current_seq)` from this
     /// full load, then polls `get_session_changes`; a later epoch mismatch
     /// means the transcript was rotated (`/clear`) and the client full-reloads.
     pub epoch: u64,
-    /// Phase 5: the session's `change_seq` at load time — the high-water mark
-    /// the client passes as `since_seq` on its first `get_session_changes` poll.
+    /// Phase 4b: the SELECTED stream's watermark (`stream.seq` = max entry
+    /// mod_seq) at load time — the client passes it as `since_seq` on its first
+    /// `get_session_changes` poll for that stream. Equals this stream's descriptor
+    /// `seq` in `streams`; each other stream's cursor is seeded from its own
+    /// descriptor `seq`.
     pub current_seq: u64,
 }
 
@@ -1513,49 +1626,43 @@ impl McpServerTool for GetSessionTool {
             // live-only concern); harvest them off the live thread (empty
             // for cold sessions) and re-attach per tool-call id below.
             let live_auth_options = live_auth_options_for_session(session, cx);
-            let entries_ref: Vec<&crate::session_entry::SessionEntry> =
-                session.entries.iter().collect();
+            // Select the stream whose entries this call returns (decision #7:
+            // descriptors for ALL streams, entries for the SELECTED one).
+            // `None` ⇒ Main. A stream the client asked for that has since
+            // closed / never existed serves an empty transcript — the `streams`
+            // descriptor list below still reveals what streams actually exist.
+            let selected = input
+                .stream_id
+                .as_ref()
+                .map(StreamIdDto::to_model)
+                .unwrap_or(crate::stream::StreamId::Main);
+            let selected_stream = session.streams.get(&selected);
             let (entries, total_count) = {
                 // R-6e: index-anchored slice. `after_index` /
                 // `before_index` are exclusive bounds and `count`
                 // takes the LAST n entries within the bound (so the
                 // common "show me the newest 50" query is just
-                // `count=50` with no bounds).
+                // `count=50` with no bounds). Indices are STREAM-LOCAL
+                // (the enumerate position within the selected stream).
                 //
                 // We walk every entry (not just the kept ones) so
                 // `image_cursor` stays in lock-step with what a
                 // non-paginated call would have produced — that
                 // keeps `EntryImage.index` stable across paginated
                 // calls, which is the contract that lets the client
-                // rely on `spk-image://N` URLs in markdown.
+                // rely on `spk-image://N` URLs in markdown. The cursor is
+                // PER-STREAM now (image index space is scoped to the
+                // selected stream), matching `spk-image://N` inside this
+                // stream's served markdown.
                 let after = input.after_index;
                 let before = input.before_index;
-                // Per-tab filter applied BEFORE the index window so the tab's
-                // window is taken over the tab's OWN entries (see
-                // `GetSessionParams::subagent_filter`). Mirrors the desktop
-                // `session_view::should_render_entry`: when the session has no
-                // active subagent strip, every entry passes regardless of the
-                // requested filter (the "don't hide history" bypass).
-                let subagent_filter = input.subagent_filter.as_deref();
-                let active_empty = session.active_subagents.is_empty();
+                let stream_entries: &[crate::session_entry::SessionEntry] =
+                    selected_stream.map_or(&[][..], |s| s.entries.as_slice());
                 let mut image_cursor = 0usize;
                 let mut kept: Vec<EntrySummary> = Vec::new();
-                // `total_count` reflects the FILTERED set so the client
-                // paginates the tab, not the whole session.
-                let mut filtered_total = 0usize;
-                for (index, entry) in entries_ref.iter().enumerate() {
-                    let passes_filter = match subagent_filter {
-                        None => true,
-                        Some(_) if active_empty => true,
-                        Some("__main__") => entry.subagent_id.is_none(),
-                        Some(id) => entry.subagent_id.as_deref() == Some(id),
-                    };
-                    if passes_filter {
-                        filtered_total += 1;
-                    }
-                    let in_range = passes_filter
-                        && after.map_or(true, |a| index > a)
-                        && before.map_or(true, |b| index < b);
+                for (index, entry) in stream_entries.iter().enumerate() {
+                    let in_range =
+                        after.map_or(true, |a| index > a) && before.map_or(true, |b| index < b);
                     if in_range {
                         kept.push(summarize_entry(
                             entry,
@@ -1569,6 +1676,8 @@ impl McpServerTool for GetSessionTool {
                         image_cursor += count_images_in_entry(&entry.kind);
                     }
                 }
+                // `total_count` = the selected stream's pre-window entry count.
+                let stream_total = stream_entries.len();
                 // Judge-frugal slice (user messages + lead context + the
                 // resting turn), applied before `count` so a tail window
                 // still tails the anchored slice.
@@ -1578,14 +1687,14 @@ impl McpServerTool for GetSessionTool {
                 if let Some(n) = input.count {
                     if kept.len() > n {
                         // Take the last n. `EntrySummary.index`
-                        // preserves the absolute position so the
+                        // preserves the stream-local position so the
                         // client can still tell where it sits in
-                        // the session timeline.
+                        // the stream timeline.
                         let drop_count = kept.len() - n;
                         kept.drain(..drop_count);
                     }
                 }
-                (kept, filtered_total)
+                (kept, stream_total)
             };
             let summary = session_summary(session, cx);
             let pending_bundles = build_pending_bundle_summaries(session, cx);
@@ -1595,7 +1704,15 @@ impl McpServerTool for GetSessionTool {
             // UPDATE plus the deterministic restore seed absorb the residual
             // crash/reorder window, so the issued cursor stays restart-safe.
             let epoch = session.epoch;
-            let current_seq = session.change_seq;
+            // Per-stream cursor: seed `current_seq` from the SELECTED stream's own
+            // watermark (its `seq` = max entry mod_seq), not the global
+            // `change_seq`. This matches the same stream's descriptor `seq` in
+            // `streams` below AND the caught-up `current_seq` that
+            // `get_session_changes` hands out, so the client's per-stream cursor is
+            // uniform and monotonic (a global seed would start above the stream's
+            // watermark and then step DOWN on the first delta poll). 0 for a
+            // missing/empty selected stream.
+            let current_seq = selected_stream.map_or(0, |s| s.seq);
             Ok(GetSessionResult {
                 id: summary.id,
                 solution_id: summary.solution_id,
@@ -1611,7 +1728,7 @@ impl McpServerTool for GetSessionTool {
                 entries,
                 total_count,
                 pending_bundles,
-                active_subagents: summary.active_subagents,
+                streams: build_streams_vec(session),
                 epoch,
                 current_seq,
             })
@@ -1636,10 +1753,10 @@ fn default_true() -> bool {
     true
 }
 
-/// Mobile delta poll input. Returns only what changed since `since_seq`:
-/// entries with `mod_seq > since_seq` (passing the subagent filter), plus each
-/// section (state / queue / subagents) only when its watermark moved past
-/// `since_seq`. On epoch mismatch the result is a `reset` and the client
+/// Mobile delta poll input. Returns only what changed since `since_seq` FOR THE
+/// SELECTED stream: that stream's entries with `mod_seq > since_seq` (stream-local
+/// index), plus the always-present `streams` descriptor list and the session-level
+/// state/queue sections. On epoch mismatch the result is a `reset` and the client
 /// full-reloads via `get_session`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GetSessionChangesParams {
@@ -1651,12 +1768,12 @@ pub struct GetSessionChangesParams {
     /// means the transcript was rotated / reset under the client (a `/clear`
     /// or migration `bump_epoch`), so the delta is meaningless → `reset`.
     pub known_epoch: u64,
-    /// Per-tab filter, identical semantics to `GetSessionParams::subagent_filter`
-    /// (`None`/empty-active → all; `"__main__"` → entries with no `subagent_id`;
-    /// any other id → entries of that subagent). Applied to both
-    /// `changed_entries` and `total_count`.
+    /// The stream this poll's `changed_entries` / `total_count` belong to,
+    /// identical semantics to `GetSessionParams::stream_id` (`None` ⇒ Main).
+    /// `since_seq` is the client's last-seen seq FOR THIS STREAM (the descriptor
+    /// `seq`), not a global cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagent_filter: Option<String>,
+    pub stream_id: Option<StreamIdDto>,
     /// Whether to inline base64 image payloads on changed entries. Defaults
     /// true — the delta is the live render source.
     #[serde(default = "default_true")]
@@ -1672,7 +1789,7 @@ impl<'de> Deserialize<'de> for GetSessionChangesParams {
             since_seq: u64,
             known_epoch: u64,
             #[serde(default)]
-            subagent_filter: Option<String>,
+            stream_id: Option<StreamIdDto>,
             #[serde(default = "default_true")]
             include_images: bool,
         }
@@ -1681,7 +1798,7 @@ impl<'de> Deserialize<'de> for GetSessionChangesParams {
             session_id: inner.session_id,
             since_seq: inner.since_seq,
             known_epoch: inner.known_epoch,
-            subagent_filter: inner.subagent_filter,
+            stream_id: inner.stream_id,
             include_images: inner.include_images,
         })
     }
@@ -1699,16 +1816,18 @@ pub struct GetSessionChangesResult {
     /// other field is empty/absent, and the client must full-reload via
     /// `get_session`.
     pub reset: bool,
-    /// FILTERED total entry count (after the subagent filter, ignoring
-    /// `since_seq`). The client sets its list length to this after upserting
-    /// `changed_entries`, which drops any tail beyond the new count — the
-    /// shrink-detection signal under the tail-truncate model. Always sent.
+    /// The SELECTED stream's total entry count (`stream_id`, default Main),
+    /// ignoring `since_seq`. The client sets its per-stream list length to this
+    /// after upserting `changed_entries`, which drops any tail beyond the new
+    /// count — the shrink-detection signal under the tail-truncate model.
+    /// Always sent.
     ///
-    /// PARITY CONTRACT: `EntrySummary.index` is the ABSOLUTE (unfiltered)
-    /// position while `total_count` is the FILTERED length — exactly the shape
-    /// `get_session` returns. Both the delta applier and the full-load applier
-    /// in the mobile client rely on this being identical across the two RPCs;
-    /// keep this field's semantics in lockstep with `GetSessionResult::total_count`.
+    /// PARITY CONTRACT: `EntrySummary.index` is the STREAM-LOCAL position and
+    /// `total_count` is the selected stream's length — exactly the shape
+    /// `get_session` returns for the same `stream_id`. Both the delta applier and
+    /// the full-load applier in the mobile client rely on this being identical
+    /// across the two RPCs; keep this field's semantics in lockstep with
+    /// `GetSessionResult::total_count`.
     pub total_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_entries: Vec<EntrySummary>,
@@ -1735,10 +1854,15 @@ pub struct GetSessionChangesResult {
     /// is empty"; the client adopts it as the authoritative queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_bundles: Option<Vec<QueuedBundleSummary>>,
-    /// ALWAYS present on a non-`reset` response. An empty Vec means "the strip
-    /// is empty"; the client adopts it as the authoritative subagent strip.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_subagents: Option<Vec<SubagentDto>>,
+    /// Full descriptor list for ALL live streams, sent on EVERY poll (decision
+    /// #7) — reset or not. The client diffs it against its held set to derive
+    /// stream add/remove and refresh its tab strip. Empty is impossible (Main is
+    /// always present), but on a `reset` the client full-reloads and ignores it.
+    pub streams: Vec<StreamDto>,
+    /// Echoes the stream `changed_entries` / `total_count` belong to (the
+    /// request's `stream_id`, default Main), so the client attributes the delta
+    /// to the right per-stream cursor even if it multiplexes polls.
+    pub selected_stream_id: StreamIdDto,
 }
 
 /// Max `changed_entries` returned per `get_session_changes` call. A client
@@ -1775,33 +1899,31 @@ impl McpServerTool for GetSessionChangesTool {
             let session = entity.read(cx);
 
             let epoch = session.epoch;
-            // Pure-read cursor: `change_seq` persistence is *scheduled* before
-            // the matching section event (Task 5.1b); the detached write may
-            // land slightly later, but the `max()`-guarded UPDATE and the
-            // deterministic restore seed absorb the residual window, so the
-            // cursor handed out stays restart-safe.
-            let current_seq = session.change_seq;
 
-            // Subagent filter gate — identical to `get_session` so a tab's
-            // delta membership matches its full-load membership exactly.
-            let subagent_filter = input.subagent_filter.as_deref();
-            let active_empty = session.active_subagents.is_empty();
-            let passes_filter = |entry: &crate::session_entry::SessionEntry| match subagent_filter {
-                None => true,
-                Some(_) if active_empty => true,
-                Some("__main__") => entry.subagent_id.is_none(),
-                Some(id) => entry.subagent_id.as_deref() == Some(id),
-            };
+            // Select the stream this delta belongs to (decision #7: descriptors
+            // for ALL streams, entries for the SELECTED one). `None` ⇒ Main. A
+            // stream the client asked for that has since closed / never existed
+            // yields an empty delta — the `streams` descriptor list below reveals
+            // what streams actually exist so the client can re-select.
+            let selected = input
+                .stream_id
+                .as_ref()
+                .map(StreamIdDto::to_model)
+                .unwrap_or(crate::stream::StreamId::Main);
+            let selected_stream_id = StreamIdDto::from_model(&selected);
+            let selected_stream = session.streams.get(&selected);
 
             // Epoch mismatch: the client's cache is against a rotated/reset
-            // transcript. Return a `reset` with everything empty/absent; the
-            // client ignores `total_count` and full-reloads. We still compute
-            // the filtered count for schema completeness.
+            // transcript. Return a `reset` with the entry sections empty/absent;
+            // the client ignores them and full-reloads. The `streams` descriptor
+            // list is still populated (always-present, decision #7). `current_seq`
+            // is the selected stream's watermark for schema completeness.
+            let stream_seq = selected_stream.map_or(0, |s| s.seq);
             if input.known_epoch != epoch {
-                let total_count = session.entries.iter().filter(|e| passes_filter(e)).count();
+                let total_count = selected_stream.map_or(0, |s| s.entries.len());
                 return Ok(GetSessionChangesResult {
                     epoch,
-                    current_seq,
+                    current_seq: stream_seq,
                     reset: true,
                     total_count,
                     changed_entries: Vec::new(),
@@ -1809,18 +1931,29 @@ impl McpServerTool for GetSessionChangesTool {
                     removed_indices: Vec::new(),
                     state: None,
                     pending_bundles: None,
-                    active_subagents: None,
+                    streams: build_streams_vec(session),
+                    selected_stream_id,
                 });
             }
 
             let live_auth_options = live_auth_options_for_session(session, cx);
 
-            // Walk entries oldest-first with ONE `image_cursor`, advancing it
-            // over EVERY entry — including filtered-out and unchanged ones —
-            // exactly as `get_session` does (mcp.rs ~1343-1368). This keeps the
-            // global `EntryImage.index` / `spk-image://N` indices identical to
-            // what `get_session` returns for the same `subagent_filter`, so a
-            // delta-applied transcript renders byte-for-byte like a full load.
+            // Walk the SELECTED stream's entries oldest-first with ONE
+            // `image_cursor`, advancing it over EVERY entry — including unchanged
+            // ones — exactly as `get_session` does for the same stream. This
+            // keeps the per-stream `EntryImage.index` / `spk-image://N` indices
+            // identical to what `get_session` returns for the same `stream_id`,
+            // so a delta-applied transcript renders byte-for-byte like a full
+            // load. `index` is STREAM-LOCAL (the enumerate position within the
+            // selected stream), matching `get_session`.
+            //
+            // Delta key is `entry.mod_seq` (per-entry), which the stream mirror
+            // keeps coalesce-aware (`push_coalesced` raises the merged entry's
+            // mod_seq to the incoming max — decision #5), so a coalesce-merge
+            // update is NOT missed even though the coalesced entry's own first-
+            // fragment mod_seq is otherwise frozen.
+            let stream_entries: &[crate::session_entry::SessionEntry] =
+                selected_stream.map_or(&[][..], |s| s.entries.as_slice());
             let mut image_cursor = 0usize;
             // Collect each changed entry WITH its `mod_seq` so the page can be
             // taken in `mod_seq` order (the cursor axis), independent of index
@@ -1829,13 +1962,9 @@ impl McpServerTool for GetSessionChangesTool {
             // during this index-order walk, so reordering the Vec afterwards is
             // safe.
             let mut changed: Vec<(u64, EntrySummary)> = Vec::new();
-            let mut total_count = 0usize;
-            for (index, entry) in session.entries.iter().enumerate() {
-                let passes = passes_filter(entry);
-                if passes {
-                    total_count += 1;
-                }
-                if passes && entry.mod_seq > input.since_seq {
+            let total_count = stream_entries.len();
+            for (index, entry) in stream_entries.iter().enumerate() {
+                if entry.mod_seq > input.since_seq {
                     let summary = summarize_entry(
                         entry,
                         index,
@@ -1846,10 +1975,10 @@ impl McpServerTool for GetSessionChangesTool {
                     );
                     changed.push((entry.mod_seq, summary));
                 } else {
-                    // Skipped (filtered out OR unchanged): still advance the
-                    // cursor so later changed entries get global image indices
-                    // identical to get_session's. `summarize_entry` itself
-                    // advances the cursor; the skip branch must mirror that.
+                    // Skipped (unchanged): still advance the cursor so later
+                    // changed entries get per-stream image indices identical to
+                    // get_session's. `summarize_entry` itself advances the
+                    // cursor; the skip branch must mirror that.
                     image_cursor += count_images_in_entry(&entry.kind);
                 }
             }
@@ -1872,10 +2001,14 @@ impl McpServerTool for GetSessionChangesTool {
                     .collect();
                 (entries, page_last_seq)
             } else {
-                // Caught up entry-wise: hand out the full `change_seq` so a
-                // re-poll from here returns nothing and section watermarks drain.
+                // Caught up entry-wise: hand out the SELECTED STREAM's `seq`
+                // (its max entry mod_seq, 0 for an empty/missing stream) so the
+                // client's PER-STREAM cursor tracks that stream and a re-poll
+                // from here returns nothing. NOT `session.change_seq` — that is a
+                // session-global clock and would over-advance a lagging stream's
+                // cursor past its own unseen entries.
                 let entries = changed.into_iter().map(|(_, e)| e).collect();
-                (entries, current_seq)
+                (entries, stream_seq)
             };
 
             // Wall-clock anchors for the state DTO — same scheme as
@@ -1922,7 +2055,6 @@ impl McpServerTool for GetSessionChangesTool {
                 stopping_started_at_ms,
             ));
             let pending_bundles = Some(build_pending_bundle_summaries(session, cx));
-            let active_subagents = Some(build_active_subagents_vec(session));
 
             Ok(GetSessionChangesResult {
                 epoch,
@@ -1934,7 +2066,8 @@ impl McpServerTool for GetSessionChangesTool {
                 removed_indices: Vec::new(),
                 state,
                 pending_bundles,
-                active_subagents,
+                streams: build_streams_vec(session),
+                selected_stream_id,
             })
         })?;
 
@@ -5804,18 +5937,18 @@ mod tests {
         }
     }
 
-    /// Phase 5 Task 5.3 Part A: a full `get_session` load carries the session's
-    /// current `epoch` + `current_seq` so the cache-first mobile client can seed
-    /// its delta cursor from one fetch (then poll `get_session_changes`).
+    /// Phase 5 Task 5.3 Part A (phase-4b per-stream): a full `get_session` load
+    /// carries the session's `epoch` + the SELECTED stream's `current_seq` so the
+    /// cache-first mobile client can seed its per-stream delta cursor from one
+    /// fetch. `current_seq` is the selected stream's own watermark (its descriptor
+    /// `seq`), not the global `change_seq`.
     #[gpui::test]
     async fn get_session_seeds_delta_cursor_epoch_and_seq(cx: &mut gpui::TestAppContext) {
         let (session_id, _tmp) = seed_session_with_n_entries(cx, 3).await;
 
-        // Bump both watermarks the way the store would after activity, and
-        // rotate the epoch the way a `/clear` would.
+        // Rotate the epoch the way a `/clear` would.
         mutate_session(session_id, cx, |s| {
             s.epoch = 7;
-            s.change_seq = 42;
         });
 
         let result = GetSessionTool
@@ -5827,20 +5960,41 @@ mod tests {
                 &mut cx.to_async(),
             )
             .await
-            .expect("get_session");
+            .expect("get_session")
+            .structured_content;
 
+        assert_eq!(result.epoch, 7, "full load must carry the session's epoch");
+        // Per-stream cursor: `current_seq` == the selected (Main) stream's
+        // descriptor `seq`, and is a real (nonzero) watermark.
+        let main_seq = result
+            .streams
+            .iter()
+            .find(|s| s.id == StreamIdDto::Main)
+            .expect("Main descriptor present")
+            .seq;
         assert_eq!(
-            result.structured_content.epoch, 7,
-            "full load must carry the session's epoch"
+            result.current_seq, main_seq,
+            "current_seq is the SELECTED stream's watermark, matching its descriptor"
         );
-        assert_eq!(
-            result.structured_content.current_seq, 42,
-            "full load must carry the session's change_seq as current_seq"
-        );
+        assert!(result.current_seq > 0, "a stamped stream has a nonzero cursor");
 
-        // A further mutation that bumps change_seq is reflected on the next load.
+        // New Main activity advances that stream's watermark → the next load's
+        // cursor rises (a bare `change_seq` bump with no new entry does NOT).
+        let before = result.current_seq;
         mutate_session(session_id, cx, |s| {
-            s.change_seq = 43;
+            use crate::session_entry::{SessionEntry, SessionEntryKind};
+            let next = s.change_seq + 1;
+            s.change_seq = next;
+            s.entries.push(SessionEntry {
+                created_ms: 1_700_000_000_100,
+                mod_seq: next,
+                subagent_id: None,
+                kind: SessionEntryKind::UserMessage {
+                    id: None,
+                    content_md: "more".into(),
+                    chunks: vec![fake_user_text_chunk("more")],
+                },
+            });
         });
         let result = GetSessionTool
             .run(
@@ -5851,10 +6005,12 @@ mod tests {
                 &mut cx.to_async(),
             )
             .await
-            .expect("get_session");
-        assert_eq!(
-            result.structured_content.current_seq, 43,
-            "current_seq must track change_seq"
+            .expect("get_session")
+            .structured_content;
+        assert!(
+            result.current_seq > before,
+            "new Main-stream activity advances the per-stream cursor ({} !> {before})",
+            result.current_seq
         );
     }
 
@@ -5912,7 +6068,10 @@ mod tests {
                         },
                     },
                 ];
-                // Cold, row-native: NO live thread.
+                // Cold, row-native: NO live thread. The wire reads
+                // `session.streams`; a direct `entries` assignment bypasses
+                // `set_entries`, so demux the mirror by hand.
+                session.rebuild_streams();
                 assert!(session.acp_thread().is_none());
                 store.register_prebuilt_session(session, cx)
             })
@@ -7285,6 +7444,9 @@ mod tests {
                 if let Some(e) = s.entries.get_mut(2) {
                     e.created_ms = fake_ms + 1;
                 }
+                // The wire reads `session.streams`; refresh the mirror so the
+                // directly-stamped created_ms values propagate.
+                s.rebuild_streams();
             });
         });
 
@@ -7592,17 +7754,12 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn session_summary_lists_active_subagents_in_insertion_order(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (session_id, _img, _tmp) = seed_session_with_image(cx).await;
-        // Pick ids whose lexicographic order disagrees with insertion order
-        // so a hash-map iteration regression would visibly flip them.
-        seed_subagent_tabs(
-            session_id,
-            &[("toolu_zzz", "First"), ("toolu_aaa", "Second")],
-            cx,
-        );
+    async fn get_session_streams_list_main_first_then_teammate(cx: &mut gpui::TestAppContext) {
+        // Phase 4b: the wire tab strip is driven by the `streams` descriptor list
+        // (Main + teammates demuxed from tagged entries), not `active_subagents`.
+        // `seed_mixed_subagent_session` produces [u0, a1-main, s2(sub1), u3] so the
+        // demux yields Main + one Teammate(sub1) stream.
+        let (session_id, _thread, _tmp) = seed_mixed_subagent_session(cx).await;
 
         let result = GetSessionTool
             .run(
@@ -7615,24 +7772,24 @@ mod tests {
             .await
             .expect("get_session");
 
-        let active = &result.structured_content.active_subagents;
-        assert_eq!(active.len(), 2, "both seeded tabs surface on the wire");
+        let streams = &result.structured_content.streams;
+        assert_eq!(streams.len(), 2, "Main + one teammate stream");
+        assert_eq!(streams[0].id, StreamIdDto::Main, "Main is always first");
+        assert!(matches!(streams[0].kind, StreamKindDto::Main));
         assert_eq!(
-            active[0].id, "toolu_zzz",
-            "insertion order must win over lexicographic order"
+            streams[1].id,
+            StreamIdDto::Teammate {
+                toolu: "sub1".to_string()
+            },
+            "teammate stream keyed by its parent tool_use id"
         );
-        assert_eq!(active[0].label, "First");
-        assert!(
-            active[0].started_at_ms > 0,
-            "started_at_ms must be a real unix-millis stamp, got {}",
-            active[0].started_at_ms
-        );
-        assert_eq!(active[1].id, "toolu_aaa");
-        assert_eq!(active[1].label, "Second");
+        assert!(matches!(streams[1].kind, StreamKindDto::Teammate));
+        assert_eq!(streams[1].total_count, 1, "the one sub1-tagged entry");
+        assert!(streams[1].seq > 0, "teammate stream has a stamped watermark");
     }
 
     #[gpui::test]
-    async fn session_summary_active_subagents_empty_when_no_tabs(cx: &mut gpui::TestAppContext) {
+    async fn get_session_streams_main_only_when_no_teammates(cx: &mut gpui::TestAppContext) {
         let (session_id, _img, _tmp) = seed_session_with_image(cx).await;
 
         let result = GetSessionTool
@@ -7646,10 +7803,9 @@ mod tests {
             .await
             .expect("get_session");
 
-        assert!(
-            result.structured_content.active_subagents.is_empty(),
-            "no seeded tabs → empty active_subagents"
-        );
+        let streams = &result.structured_content.streams;
+        assert_eq!(streams.len(), 1, "no tagged entries → Main-only stream list");
+        assert_eq!(streams[0].id, StreamIdDto::Main);
     }
 
     #[gpui::test]
@@ -7729,10 +7885,15 @@ mod tests {
         });
         cx.executor().run_until_parked();
 
+        // The tagged chunk is demuxed into its teammate stream, so SELECT that
+        // stream (Main would not contain it — the whole point of the migration).
         let result = GetSessionTool
             .run(
                 GetSessionParams {
                     session_id: session_id.to_string(),
+                    stream_id: Some(StreamIdDto::Teammate {
+                        toolu: "toolu_parent_xyz".to_string(),
+                    }),
                     ..Default::default()
                 },
                 &mut cx.to_async(),
@@ -7745,7 +7906,7 @@ mod tests {
             .entries
             .iter()
             .find(|e| matches!(e.role, EntryRoleDto::Assistant))
-            .expect("assistant entry should be present");
+            .expect("assistant entry should be present in the teammate stream");
         assert_eq!(
             assistant.subagent_id.as_deref(),
             Some("toolu_parent_xyz"),
@@ -7800,16 +7961,16 @@ mod tests {
         (session_id, acp_thread, tmp)
     }
 
-    async fn get_session_filtered(
+    async fn get_session_stream(
         session_id: crate::model::SolutionSessionId,
-        filter: Option<&str>,
+        stream_id: Option<StreamIdDto>,
         cx: &mut gpui::TestAppContext,
     ) -> (Vec<Option<String>>, usize) {
         let result = GetSessionTool
             .run(
                 GetSessionParams {
                     session_id: session_id.to_string(),
-                    subagent_filter: filter.map(|s| s.to_string()),
+                    stream_id,
                     ..Default::default()
                 },
                 &mut cx.to_async(),
@@ -7826,44 +7987,35 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn get_session_subagent_filter_main_keeps_only_parent_entries(
+    async fn get_session_stream_selection_splits_main_and_teammate(
         cx: &mut gpui::TestAppContext,
     ) {
         let (session_id, _thread, _tmp) = seed_mixed_subagent_session(cx).await;
-        // A subagent strip is present ⇒ Main hides subagent entries.
-        seed_subagent_tabs(session_id, &[("sub1", "Sub One")], cx);
-
-        let (main_ids, main_total) = get_session_filtered(session_id, Some("__main__"), cx).await;
+        // Phase 4b: selecting a stream serves that stream's own entries. The
+        // sub1-tagged entry lives in the teammate stream, never in Main — there is
+        // no tag-then-filter and no "no strip → show all" bypass anymore.
+        let (main_ids, main_total) = get_session_stream(session_id, None, cx).await;
         assert!(
             main_ids.iter().all(|id| id.is_none()),
-            "Main filter must keep only parent (subagent_id == None) entries, got {main_ids:?}"
+            "Main stream has only parent (subagent_id == None) entries, got {main_ids:?}"
         );
         assert_eq!(main_ids.len(), 3, "u0 / a1-main / u3 are the Main entries");
-        assert_eq!(main_total, 3, "total_count reflects the FILTERED Main set");
+        assert_eq!(main_total, 3, "total_count is the Main stream's own count");
 
-        let (sub_ids, sub_total) = get_session_filtered(session_id, Some("sub1"), cx).await;
+        let (sub_ids, sub_total) = get_session_stream(
+            session_id,
+            Some(StreamIdDto::Teammate {
+                toolu: "sub1".to_string(),
+            }),
+            cx,
+        )
+        .await;
         assert_eq!(
             sub_ids,
             vec![Some("sub1".to_string())],
-            "sub1 filter keeps only that subagent's entry"
+            "the teammate stream holds only that teammate's entry"
         );
         assert_eq!(sub_total, 1);
-    }
-
-    #[gpui::test]
-    async fn get_session_subagent_filter_main_bypass_when_no_active_subagents(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (session_id, _thread, _tmp) = seed_mixed_subagent_session(cx).await;
-        // NO active subagents seeded ⇒ desktop "no strip → show all" bypass:
-        // even a `__main__` filter returns every entry so history doesn't vanish.
-        let (ids, total) = get_session_filtered(session_id, Some("__main__"), cx).await;
-        assert_eq!(ids.len(), 4, "bypass returns all 4 entries");
-        assert_eq!(total, 4);
-        assert!(
-            ids.iter().any(|id| id.as_deref() == Some("sub1")),
-            "bypass keeps the historical subagent entry, got {ids:?}"
-        );
     }
 
     #[gpui::test]
@@ -8111,12 +8263,21 @@ mod tests {
                             chunks: vec![AssistantChunk::Message("a1-main".into())],
                         },
                     },
+                    // Phase 4b: seed_delta_session is a MAIN-ONLY transcript so
+                    // stream-local Main indices equal the old absolute indices and
+                    // the Main-stream delta tests keep their [0..3] expectations.
+                    // This third entry is a USER message (not a second consecutive
+                    // assistant) so the Main stream's demux does NOT coalesce it
+                    // into entry 1 — the four entries stay distinct on the wire.
+                    // Teammate-stream selection is covered by dedicated tests.
                     SessionEntry {
                         created_ms: 1_700_000_000_002,
                         mod_seq: 3,
-                        subagent_id: Some(SharedString::from("sub1")),
-                        kind: SessionEntryKind::AssistantMessage {
-                            chunks: vec![AssistantChunk::Message("s2-sub".into())],
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: "u2".into(),
+                            chunks: vec![fake_user_text_chunk("u2")],
                         },
                     },
                     SessionEntry {
@@ -8134,6 +8295,9 @@ mod tests {
                     },
                 ];
                 session.change_seq = 4;
+                // The wire reads `session.streams`; direct `entries` assignment
+                // bypasses `set_entries`, so demux the mirror by hand.
+                session.rebuild_streams();
                 store.register_prebuilt_session(session, cx)
             })
         });
@@ -8153,7 +8317,13 @@ mod tests {
                 .read(cx)
                 .session(session_id)
                 .expect("session must exist");
-            session.update(cx, |s, _| f(s));
+            session.update(cx, |s, _| {
+                f(s);
+                // The wire now reads `session.streams`; a closure that assigns
+                // `s.entries` directly bypasses `set_entries`, so refresh the
+                // mirror. Idempotent for closures that only touch watermarks/state.
+                s.rebuild_streams();
+            });
         });
     }
 
@@ -8180,7 +8350,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: 2,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             cx,
@@ -8205,7 +8375,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: 4,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             cx,
@@ -8215,20 +8385,77 @@ mod tests {
         assert_eq!(none.total_count, 4);
     }
 
+    // Decision #5 end-to-end on the wire: two consecutive Main assistant messages
+    // coalesce into ONE stream entry that keeps the first fragment's position but
+    // whose delta key (mod_seq, made coalesce-aware in `push_coalesced`) advances
+    // to the LATEST fragment. A client caught up to the first fragment's seq MUST
+    // still receive the merged entry — the flat `entry.mod_seq` wire would have
+    // missed it (the coalesced entry froze at the first fragment's mod_seq).
+    #[gpui::test]
+    async fn get_session_changes_delivers_coalesce_merge_update(cx: &mut gpui::TestAppContext) {
+        let (session_id, _tmp) = seed_delta_session(cx).await;
+        mutate_session(session_id, cx, |s| {
+            use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+            let asst = |n: u64, text: &str| SessionEntry {
+                created_ms: 1_700_000_000_000 + n as i64,
+                mod_seq: n,
+                subagent_id: None,
+                kind: SessionEntryKind::AssistantMessage {
+                    chunks: vec![AssistantChunk::Message(text.into())],
+                },
+            };
+            s.entries = vec![asst(1, "first "), asst(2, "second")];
+            s.change_seq = 2;
+        });
+
+        // Caught up to the FIRST fragment's seq (1); the merged entry (mod_seq 2)
+        // must still come back, at stream-local index 0, as a single entry.
+        let delta = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 1,
+                known_epoch: 0,
+                stream_id: None,
+                include_images: false,
+            },
+            cx,
+        )
+        .await;
+        assert_eq!(
+            delta.changed_entries.len(),
+            1,
+            "the coalesce-merged entry is delivered despite the frozen first mod_seq"
+        );
+        assert_eq!(
+            delta.changed_entries[0].index, 0,
+            "stream-local index 0 (the coalesced count did not grow)"
+        );
+        assert_eq!(delta.total_count, 1, "Main coalesced the two fragments to one entry");
+        assert_eq!(
+            delta.current_seq, 2,
+            "cursor advances to the merged fragment's seq"
+        );
+    }
+
     #[gpui::test]
     async fn get_session_changes_paginates_changed_entries(cx: &mut gpui::TestAppContext) {
-        use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+        use crate::session_entry::{SessionEntry, SessionEntryKind};
         let (session_id, _tmp) = seed_delta_session(cx).await;
         // Replace with 15 entries (mod_seq 1..=15) so a since=0 poll exceeds the
         // 10-per-page cap.
         mutate_session(session_id, cx, |s| {
+            // USER messages (not consecutive assistant messages) so the Main
+            // stream's demux keeps all 15 distinct — assistant messages would
+            // coalesce into a single stream entry.
             s.entries = (1..=15u64)
                 .map(|n| SessionEntry {
                     created_ms: 1_700_000_000_000 + n as i64,
                     mod_seq: n,
                     subagent_id: None,
-                    kind: SessionEntryKind::AssistantMessage {
-                        chunks: vec![AssistantChunk::Message(format!("a{n}"))],
+                    kind: SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: format!("u{n}"),
+                        chunks: vec![fake_user_text_chunk(&format!("u{n}"))],
                     },
                 })
                 .collect();
@@ -8241,7 +8468,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: 0,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             cx,
@@ -8262,7 +8489,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: p1.current_seq,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             cx,
@@ -8298,7 +8525,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: 8,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             cx,
@@ -8317,11 +8544,9 @@ mod tests {
             "pending_bundles always present; empty Vec when the queue is empty"
         );
         assert!(
-            result
-                .active_subagents
-                .as_ref()
-                .is_some_and(|a| a.is_empty()),
-            "active_subagents always present; empty Vec when the strip is empty"
+            !result.streams.is_empty()
+                && result.streams.iter().any(|s| s.id == StreamIdDto::Main),
+            "streams descriptor list is always present (Main at minimum)"
         );
 
         // A non-empty queue surfaces in the same always-present section.
@@ -8338,7 +8563,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: 9,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             cx,
@@ -8369,7 +8594,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: 0,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             cx,
@@ -8382,58 +8607,93 @@ mod tests {
         assert!(result.removed_indices.is_empty());
         assert!(result.state.is_none());
         assert!(result.pending_bundles.is_none());
-        assert!(result.active_subagents.is_none());
+        // The `streams` descriptor list stays present even on a reset (decision #7)
+        // so the client can re-select a stream after a full reload.
+        assert!(
+            !result.streams.is_empty(),
+            "streams descriptor list present even on reset"
+        );
         // total_count is still the filtered count (client ignores it).
         assert_eq!(result.total_count, 4);
     }
 
     #[gpui::test]
-    async fn get_session_changes_subagent_filter_narrows_entries_and_total(
+    async fn get_session_changes_stream_selection_narrows_entries_and_total(
         cx: &mut gpui::TestAppContext,
     ) {
         let (session_id, _tmp) = seed_delta_session(cx).await;
-        // A subagent strip must be present, else the filter bypass kicks in.
-        seed_subagent_tabs(session_id, &[("sub1", "Sub One")], cx);
+        // Install a MIXED transcript: [m0, m1, s2(sub1), m3]. The delta serves the
+        // SELECTED stream's own entries with STREAM-LOCAL indices.
+        mutate_session(session_id, cx, |s| {
+            use crate::session_entry::{SessionEntry, SessionEntryKind};
+            // USER messages so the Main entries (m0/m1/m3) stay distinct — three
+            // consecutive assistant messages would coalesce into one stream entry.
+            let mk = |n: u64, sub: Option<&str>, text: &str| SessionEntry {
+                created_ms: 1_700_000_000_000 + n as i64,
+                mod_seq: n,
+                subagent_id: sub.map(SharedString::from),
+                kind: SessionEntryKind::UserMessage {
+                    id: None,
+                    content_md: text.into(),
+                    chunks: vec![fake_user_text_chunk(text)],
+                },
+            };
+            s.entries = vec![
+                mk(1, None, "m0"),
+                mk(2, None, "m1"),
+                mk(3, Some("sub1"), "s2"),
+                mk(4, None, "m3"),
+            ];
+            s.change_seq = 4;
+        });
 
-        // sub1 filter, since_seq 0 → only the sub1 entry (index 2).
+        // Teammate stream, since_seq 0 → its one entry at STREAM-LOCAL index 0.
         let sub = run_changes(
             GetSessionChangesParams {
                 session_id: session_id.to_string(),
                 since_seq: 0,
                 known_epoch: 0,
-                subagent_filter: Some("sub1".to_string()),
+                stream_id: Some(StreamIdDto::Teammate {
+                    toolu: "sub1".to_string(),
+                }),
                 include_images: false,
             },
             cx,
         )
         .await;
-        let sub_indices: Vec<usize> = sub.changed_entries.iter().map(|e| e.index).collect();
         assert_eq!(
-            sub_indices,
-            vec![2],
-            "sub1 filter keeps only the sub1 entry"
+            sub.changed_entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![0],
+            "teammate stream entry is stream-local index 0"
         );
-        assert_eq!(sub.total_count, 1, "filtered total is the sub1 count");
+        assert_eq!(sub.total_count, 1, "teammate stream's own count");
+        assert_eq!(
+            sub.selected_stream_id,
+            StreamIdDto::Teammate {
+                toolu: "sub1".to_string()
+            }
+        );
+        assert_eq!(sub.current_seq, 3, "caught-up cursor = the teammate stream seq");
 
-        // __main__ filter → the three subagent_id == None entries (0, 1, 3).
+        // Main stream → the three parent entries at stream-local indices 0,1,2.
         let main = run_changes(
             GetSessionChangesParams {
                 session_id: session_id.to_string(),
                 since_seq: 0,
                 known_epoch: 0,
-                subagent_filter: Some("__main__".to_string()),
+                stream_id: None,
                 include_images: false,
             },
             cx,
         )
         .await;
-        let main_indices: Vec<usize> = main.changed_entries.iter().map(|e| e.index).collect();
         assert_eq!(
-            main_indices,
-            vec![0, 1, 3],
-            "__main__ filter keeps subagent_id == None entries"
+            main.changed_entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "Main stream entries are stream-local 0,1,2"
         );
         assert_eq!(main.total_count, 3);
+        assert_eq!(main.selected_stream_id, StreamIdDto::Main);
     }
 
     #[gpui::test]
@@ -8465,7 +8725,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: 3,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: true,
             },
             cx,
@@ -8528,7 +8788,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 since_seq: 4,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             cx,

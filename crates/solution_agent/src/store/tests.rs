@@ -5377,7 +5377,7 @@ async fn final_streamed_message_is_visible_to_delta_poll_after_stop(cx: &mut Tes
                 session_id: session_id.to_string(),
                 since_seq: cursor_before_tail,
                 known_epoch: 0,
-                subagent_filter: None,
+                stream_id: None,
                 include_images: false,
             },
             &mut cx.to_async(),
