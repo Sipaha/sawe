@@ -6288,6 +6288,7 @@ impl SolutionAgentStore {
         solution_id: SolutionId,
         title: SharedString,
         entries: Vec<crate::session_entry::SessionEntry>,
+        live_teammates: bool,
         cx: &mut Context<Self>,
     ) -> SolutionSessionId {
         let session_id = SolutionSessionId::new();
@@ -6319,6 +6320,30 @@ impl SolutionAgentStore {
             s.title = title;
             s.cwd = root;
             s.set_entries(entries, cx);
+            if live_teammates {
+                // Register each distinct teammate id (from the just-demux'd streams)
+                // as a live inline Task so the desktop strip paints its pill — the
+                // phase-6c strip requires membership in BOTH `streams` and
+                // `active_subagents`. Debug/screenshot-only path.
+                let teammate_ids: Vec<SharedString> = s
+                    .streams
+                    .keys()
+                    .filter_map(|id| match id {
+                        crate::stream::StreamId::Teammate(toolu) => Some(toolu.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for toolu in teammate_ids {
+                    s.active_subagents.insert(
+                        toolu.clone(),
+                        crate::model::SubagentTab {
+                            label: toolu.clone(),
+                            started_at: chrono::Utc::now(),
+                        },
+                    );
+                    s.active_subagent_order.push(toolu);
+                }
+            }
             s
         });
         self.sessions.insert(session_id, entity);

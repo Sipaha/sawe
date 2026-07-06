@@ -5274,6 +5274,13 @@ pub struct SeedColdSessionParams {
     /// Tab title (default `"Seed"`).
     pub title: Option<String>,
     pub entries: Vec<SeedColdSessionEntry>,
+    /// When true, register each distinct teammate `subagent_id` as a LIVE inline
+    /// Task in `active_subagents` (label = the id) so the desktop strip paints a
+    /// live teammate pill. A cold seed otherwise leaves `active_subagents` empty,
+    /// and since phase 6c the strip only shows a teammate whose stream is BOTH in
+    /// `session.streams` AND in `active_subagents`, so without this the pill is
+    /// (correctly) hidden. Default false = the finished/cold-load render state.
+    pub live_teammates: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -5341,7 +5348,7 @@ impl McpServerTool for SeedColdSessionTool {
         let session_id = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.seed_cold_session(solution_id, title, entries, cx)
+                store.seed_cold_session(solution_id, title, entries, input.live_teammates, cx)
             })
         });
 
