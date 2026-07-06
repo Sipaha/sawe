@@ -4025,6 +4025,80 @@ async fn entries_removed_partial_rewind_preserves_token_state(cx: &mut TestAppCo
     });
 }
 
+/// Phase 4b regression: a rewind that splits a coalesced same-source assistant
+/// group must re-stamp the surviving boundary entry so the per-stream delta
+/// re-delivers it. Two consecutive parent `AssistantMessage`s coalesce into ONE
+/// stream entry (keeping the FIRST fragment's mod_seq); removing the later
+/// fragment shrinks that entry's content but leaves `total_count` unchanged, so
+/// without the re-stamp a delta client caught up past the coalesced seq would
+/// silently render stale text. The `EntriesRemoved` handler bumps the survivor's
+/// mod_seq so the stream watermark rises above every issued cursor.
+#[gpui::test]
+async fn entries_removed_restamps_survivor_on_coalesce_split(cx: &mut TestAppContext) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let asst = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::AssistantMessage {
+            chunks: vec![AssistantChunk::Message(text.into())],
+        },
+    };
+    let cursor_before = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, _| {
+                s.live_base = 0;
+                s.entries = vec![
+                    SessionEntry {
+                        created_ms: 1,
+                        mod_seq: 1,
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: "u".into(),
+                            chunks: vec![],
+                        },
+                    },
+                    asst(7, "a1 "),
+                    asst(8, "a2"),
+                ];
+                s.change_seq = 8;
+                s.rebuild_streams();
+            });
+            let s = session.read(cx);
+            let main = &s.streams[&crate::stream::StreamId::Main];
+            assert_eq!(main.entries.len(), 2, "user + coalesced(a1+a2)");
+            main.seq
+        })
+    });
+    assert_eq!(cursor_before, 8, "coalesced entry carries the first fragment's seq");
+
+    // Remove only the last fragment (a2) at global index 2 → splits the group.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::EntriesRemoved(2..3));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        let main = &s.streams[&crate::stream::StreamId::Main];
+        assert_eq!(main.entries.len(), 2, "user + a1 (a2 removed)");
+        assert!(
+            main.seq > cursor_before,
+            "survivor re-stamped so the delta re-delivers the shrunk entry (seq {} !> {cursor_before})",
+            main.seq,
+        );
+    });
+}
+
 /// User-facing `/clear` is intercepted client-side and routed through
 /// `reset_context`, which spawns a brand-new `AcpThread` (the old one
 /// is dropped without emitting any events). Without an explicit reset

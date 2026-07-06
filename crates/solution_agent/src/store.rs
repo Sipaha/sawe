@@ -8467,14 +8467,35 @@ impl SolutionAgentStore {
                 let global_truncate = cold_count + range.start;
                 session_entity.update(cx, |s, cx| {
                     s.entries.truncate(global_truncate);
+                    // Re-stamp the surviving boundary entry's mod_seq BEFORE the
+                    // rebuild. A truncate that splits a coalesced same-source
+                    // assistant group leaves the survivor's stream-mirror content
+                    // changed (a fragment removed) but its first-fragment mod_seq
+                    // unchanged — possibly BELOW a delta client's cursor — while the
+                    // stream's `total_count` is unchanged (the removed fragment was
+                    // coalesced INTO the survivor, not a separate stream entry). The
+                    // per-stream delta keys on `entry.mod_seq > since_seq`, so
+                    // without this bump it would silently miss the shrink and render
+                    // stale coalesced text. Stamping the last entry advances the
+                    // stream's seq past every issued cursor so the next delta
+                    // re-delivers the now-shorter entry. Harmless on a clean-boundary
+                    // truncate (an unchanged entry is re-sent once).
+                    let seq = s.bump_change_seq();
+                    if let Some(last) = s.entries.last_mut() {
+                        last.mod_seq = seq;
+                    }
                     s.rebuild_streams();
-                    s.bump_change_seq();
                     cx.notify();
                 });
                 // A rewind drops the removed rows: targeted delete keeps the
                 // persisted transcript in lockstep so a stale idx>=truncate row
                 // can't corrupt the next cold load.
                 self.persist_delete_from(session_id, global_truncate, cx);
+                // Persist the re-stamped survivor so its row's mod_seq (and any
+                // coalesce-boundary content) stays in lockstep with memory.
+                if global_truncate > 0 {
+                    self.persist_upsert_entry(session_id, global_truncate - 1, cx);
+                }
                 // The user-facing `/clear` does NOT reach this branch:
                 // it's intercepted client-side and routed through
                 // `reset_context` (which spawns a brand-new `AcpThread`
