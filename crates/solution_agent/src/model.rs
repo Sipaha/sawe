@@ -396,14 +396,20 @@ pub struct SolutionSession {
     /// detached. For sessions that have never been restored from cold (fresh sessions or sessions
     /// after `reset_context`/`rotate_context`), this is `0`.
     pub live_base: usize,
-    /// Store-maintained list of owned session entries for mobile delta-sync
-    /// (Phase 2+). Mutated only through `set_entries` setter.
+    /// Internal 1:1 mirror of the live `AcpThread.entries` — the mod_seq-carrying
+    /// ingest buffer and the INPUT to the per-source demux (`rebuild_streams`).
+    /// As of phase 6b this is NO LONGER the persisted authority (`streams[Main]`
+    /// is — see `persist_main_stream`) and, after the phase-6b revert of quick-fix
+    /// #3, MAY be torn / interleaved in memory (concurrent teammate chunks split a
+    /// parent bubble). That is harmless: render, wire, and persist all read the
+    /// coalesced `streams`; only a few dev/notification readers still touch flat
+    /// `entries` (see brief §D) and they stay 1:1-aligned with `AcpThread`.
+    /// Mutated only through `set_entries` setter or the store's ingest arms.
     pub entries: Vec<SessionEntry>,
     /// Per-source stream mirror of `entries`, maintained by `rebuild_streams`
-    /// after every `entries` mutation. Becomes the source of truth for
-    /// per-stream rendering + the wire (phases 2c-5); `entries` stays the ingest
-    /// target until phase 6 flips it to a derived shim. `StreamId::Main` is
-    /// always present.
+    /// after every `entries` mutation. Source of truth for per-stream rendering,
+    /// the wire (phases 2c-5), AND persistence (`streams[Main]`, phase 6b).
+    /// `StreamId::Main` is always present.
     pub streams: indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream>,
     /// Secondary streams auto-closed on a genuine `Done` signal. Currently fed
     /// only by an inline `Task` subagent's tool-call reaching a terminal status
@@ -434,6 +440,17 @@ pub struct SolutionSession {
     /// suppressed. 0 when no hydration happened (the orphan set is then empty and
     /// the check is skipped).
     pub hydration_watermark: usize,
+    /// Watermark for the incremental persist of the Main stream (phase 6b): the
+    /// `streams[StreamId::Main].seq` (= max `mod_seq` over Main's entries) as of
+    /// the last `persist_main_stream` flush. `persist_main_stream` only upserts
+    /// Main-local rows whose `mod_seq` exceeds this, then advances it — so a
+    /// steady-state ingest re-writes only the touched boundary entry, not the
+    /// whole transcript. Ephemeral, NOT persisted to the DB: reset to 0 on
+    /// `clear_closed_streams` (context reset / clear) and seeded to
+    /// `streams[Main].seq` at the end of `hydrate_streams_main_only` so freshly
+    /// loaded cold rows are not needlessly re-upserted on the first post-load
+    /// persist.
+    pub persisted_main_seq: u64,
     /// `true` while a restored tab's `acp_thread_blob` is still being
     /// deserialised on a background task. Set by the lazy-hydration path
     /// ([`SolutionAgentStore::restore_open_tabs_lazy`]) when a placeholder
@@ -635,6 +652,7 @@ impl SolutionSession {
             closed_streams: HashMap::new(),
             hydration_orphan_streams: std::collections::HashSet::new(),
             hydration_watermark: 0,
+            persisted_main_seq: 0,
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,
@@ -773,6 +791,10 @@ impl SolutionSession {
         self.closed_streams.clear();
         self.hydration_orphan_streams.clear();
         self.hydration_watermark = 0;
+        // A context reset / clear wipes the transcript, so the next persist must
+        // treat the (now-empty or fresh) Main stream as un-persisted and re-flush
+        // from seq 0 rather than skipping rows below a stale watermark.
+        self.persisted_main_seq = 0;
     }
 
     /// Cold-load hydration: a restored session's tagged rows belong to teammates
@@ -793,6 +815,38 @@ impl SolutionSession {
         }
         self.hydration_watermark = self.entries.len();
         self.rebuild_streams();
+        // Seed the persist watermark. All 4 cold-load sites call this, so it is
+        // the single init point for `persisted_main_seq` on a restored session.
+        //
+        // Decide whether the on-disk rows already match the Main-LOCAL layout
+        // `persist_main_stream` writes. When the flat mirror is LONGER than the
+        // Main stream, the persisted rows are the LEGACY pre-6b layout: extra
+        // teammate-tagged rows (and/or un-coalesced fragments) sit at global flat
+        // indices that do NOT line up with Main-local indices. A naive skip (seed
+        // = Main.seq) would then let the first incremental persist overwrite a
+        // Main row's slot with a different entry and strand the stale row forever
+        // (phase-6b keystone bug). Seed the watermark to 0 in that case so the
+        // first persist re-writes the ENTIRE Main stream at Main-local indices and
+        // `delete_entries_from(Main.len)` trims the leftovers — a one-time realign
+        // that self-heals the legacy layout. When the counts match, the rows are
+        // already Main-local (a clean 6b session, whose persisted rows ARE the
+        // coalesced Main stream), so seed to Main.seq and skip the redundant
+        // re-upsert. Keyed on the count (not `hydration_orphan_streams`, which is
+        // populated from the pre-rebuild `streams` snapshot and so may be empty on
+        // a direct-`entries`-assign cold-load) so it is independent of that path.
+        let main_len = self
+            .streams
+            .get(&crate::stream::StreamId::Main)
+            .map(|s| s.entries.len())
+            .unwrap_or(0);
+        self.persisted_main_seq = if self.entries.len() == main_len {
+            self.streams
+                .get(&crate::stream::StreamId::Main)
+                .map(|s| s.seq)
+                .unwrap_or(0)
+        } else {
+            0
+        };
     }
 
     /// Allocate the next monotonic change sequence for this session. Pre-increment:
@@ -1032,6 +1086,7 @@ mod tests {
             closed_streams: HashMap::new(),
             hydration_orphan_streams: std::collections::HashSet::new(),
             hydration_watermark: 0,
+            persisted_main_seq: 0,
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,

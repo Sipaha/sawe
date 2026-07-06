@@ -2211,20 +2211,30 @@ impl AcpThread {
 
         // For text chunks going to an existing Markdown block, buffer for smooth
         // streaming instead of appending all at once which may feel more choppy.
-        if let acp::ContentBlock::Text(text_content) = &chunk
-            && let Some((idx, markdown)) =
+        if let acp::ContentBlock::Text(text_content) = &chunk {
+            if let Some(markdown) =
                 self.streaming_markdown_target(is_thought, indented, &subagent_id)
-        {
-            cx.emit(AcpThreadEvent::EntryUpdated(idx));
-            self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
-            return;
+            {
+                let entries_len = self.entries.len();
+                cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
+                self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
+                return;
+            }
         }
 
         let language_registry = self.project.read(cx).languages().clone();
-        if let Some(idx) = self.coalesce_target_index(&subagent_id, indented)
-            && let Some(AgentThreadEntry::AssistantMessage(AssistantMessage { chunks, .. })) =
-                self.entries.get_mut(idx)
+        let entries_len = self.entries.len();
+        if let Some(last_entry) = self.entries.last_mut()
+            && let AgentThreadEntry::AssistantMessage(AssistantMessage {
+                chunks,
+                indented: existing_indented,
+                is_subagent_output: _,
+                subagent_id: existing_subagent_id,
+            }) = last_entry
+            && *existing_indented == indented
+            && *existing_subagent_id == subagent_id
         {
+            let idx = entries_len - 1;
             Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
             cx.emit(AcpThreadEvent::EntryUpdated(idx));
             match (chunks.last_mut(), is_thought) {
@@ -2261,57 +2271,23 @@ impl AcpThread {
         }
     }
 
-    /// Index of the `AssistantMessage` a chunk from `subagent_id` should append
-    /// to, or `None` to start a new entry. Scans back from the end, SKIPPING
-    /// entries produced by *other* sources, so a message stays a single bubble
-    /// even when a concurrent subagent's chunks / tool calls interleave between
-    /// its streamed deltas (the "torn message" bug: a claude async `Agent`
-    /// teammate streams into the parent thread concurrently with the parent, so
-    /// the parent's own deltas arrive split by the teammate's). Stops (→ new
-    /// entry) at this source's own tool call and at any structural entry
-    /// (plan / compaction / system note / user message); coalesces onto a
-    /// same-source `AssistantMessage` only when its `indented` flag matches.
-    fn coalesce_target_index(
-        &self,
-        subagent_id: &Option<SharedString>,
-        indented: bool,
-    ) -> Option<usize> {
-        for (idx, entry) in self.entries.iter().enumerate().rev() {
-            match entry {
-                AgentThreadEntry::AssistantMessage(message)
-                    if &message.subagent_id == subagent_id =>
-                {
-                    return (message.indented == indented).then_some(idx);
-                }
-                AgentThreadEntry::ToolCall(call) if &call.subagent_id == subagent_id => {
-                    return None;
-                }
-                // A different source's message / tool call is concurrent
-                // interleave — scan past it to reach this source's message.
-                AgentThreadEntry::AssistantMessage(_) | AgentThreadEntry::ToolCall(_) => {}
-                // Structural entries end the current message for every source.
-                AgentThreadEntry::UserMessage(_)
-                | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_)
-                | AgentThreadEntry::SystemNote(_) => return None,
-            }
-        }
-        None
-    }
-
     fn streaming_markdown_target(
         &self,
         is_thought: bool,
         indented: bool,
         subagent_id: &Option<SharedString>,
-    ) -> Option<(usize, Entity<Markdown>)> {
-        let idx = self.coalesce_target_index(subagent_id, indented)?;
-        let AgentThreadEntry::AssistantMessage(AssistantMessage { chunks, .. }) =
-            self.entries.get(idx)?
-        else {
-            return None;
-        };
-        if let [.., chunk] = chunks.as_slice() {
+    ) -> Option<Entity<Markdown>> {
+        let last_entry = self.entries.last()?;
+        if let AgentThreadEntry::AssistantMessage(AssistantMessage {
+            chunks,
+            indented: existing_indented,
+            subagent_id: existing_subagent_id,
+            ..
+        }) = last_entry
+            && *existing_indented == indented
+            && existing_subagent_id == subagent_id
+            && let [.., chunk] = chunks.as_slice()
+        {
             match (chunk, is_thought) {
                 (
                     AssistantMessageChunk::Message {
@@ -2324,7 +2300,7 @@ impl AcpThread {
                         block: ContentBlock::Markdown { markdown },
                     },
                     true,
-                ) => Some((idx, markdown.clone())),
+                ) => Some(markdown.clone()),
                 _ => None,
             }
         } else {
@@ -7338,112 +7314,6 @@ mod tests {
             };
             assert_eq!(a.subagent_id, Some(SharedString::from("T1")));
             assert_eq!(b.subagent_id, Some(SharedString::from("T2")));
-        });
-    }
-
-    #[gpui::test]
-    async fn test_parent_message_coalesces_across_interleaved_subagent_chunks(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
-            })
-            .await
-            .unwrap();
-
-        // Parent streams a message; a concurrent subagent chunk interleaves
-        // between the parent's two deltas; the parent resumes. The parent's
-        // deltas must stay ONE entry — the "torn message" bug started a fresh
-        // parent entry because coalescing only checked `entries.last()`, which
-        // was now the subagent chunk.
-        thread.update(cx, |thread, cx| {
-            for update in [
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Three ".into())),
-                acp::SessionUpdate::AgentMessageChunk(chunk_with_subagent("subagent noise", "T1")),
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("scouts".into())),
-            ] {
-                thread.handle_session_update(update, cx).unwrap();
-            }
-        });
-        thread.read_with(cx, |thread, _| {
-            assert_eq!(
-                thread.entries().len(),
-                2,
-                "parent message must stay one bubble across an interleaved subagent chunk"
-            );
-            let AgentThreadEntry::AssistantMessage(parent) = &thread.entries()[0] else {
-                panic!("expected parent AssistantMessage at index 0");
-            };
-            assert_eq!(parent.subagent_id, None);
-            let AgentThreadEntry::AssistantMessage(child) = &thread.entries()[1] else {
-                panic!("expected subagent AssistantMessage at index 1");
-            };
-            assert_eq!(child.subagent_id, Some(SharedString::from("T1")));
-        });
-    }
-
-    #[gpui::test]
-    async fn test_source_own_tool_call_is_a_message_boundary(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
-            })
-            .await
-            .unwrap();
-
-        // A parent message, the parent's OWN tool call, then more parent text.
-        // The tool call is a genuine message boundary, so the second text is a
-        // NEW entry — coalescing must not reach back PAST the source's own tool
-        // call (only past *other* sources' interleaved entries).
-        thread.update(cx, |thread, cx| {
-            thread
-                .handle_session_update(
-                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("before".into())),
-                    cx,
-                )
-                .unwrap();
-            let tool_call = acp::ToolCall::new(
-                acp::ToolCallId::new("call-parent-1".to_string()),
-                "Bash".to_string(),
-            )
-            .status(acp::ToolCallStatus::Pending);
-            thread
-                .handle_session_update(acp::SessionUpdate::ToolCall(tool_call), cx)
-                .unwrap();
-            thread
-                .handle_session_update(
-                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("after".into())),
-                    cx,
-                )
-                .unwrap();
-        });
-        thread.read_with(cx, |thread, _| {
-            assert_eq!(
-                thread.entries().len(),
-                3,
-                "the source's own tool call must break its message into two entries"
-            );
-            assert!(matches!(
-                &thread.entries()[0],
-                AgentThreadEntry::AssistantMessage(_)
-            ));
-            assert!(matches!(
-                &thread.entries()[1],
-                AgentThreadEntry::ToolCall(_)
-            ));
-            assert!(matches!(
-                &thread.entries()[2],
-                AgentThreadEntry::AssistantMessage(_)
-            ));
         });
     }
 

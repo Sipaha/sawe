@@ -104,6 +104,17 @@ pub struct SolutionAgentStore {
     /// breach — a continuously-streaming entry mustn't be able to starve
     /// the trailing-edge emit indefinitely.
     entry_update_throttles: HashMap<(SolutionSessionId, usize), EntryUpdateThrottle>,
+    /// One per-session chain that SERIALIZES the entry-row persist writes
+    /// (`persist_main_stream` / `persist_all_rows`). Each helper captures its
+    /// plan synchronously (in event order) then chains its detached DB work
+    /// behind the previous chain link (`prev.await` before touching the DB), so
+    /// the upsert + `delete_entries_from(main_len)` pairs apply in issue order.
+    /// Without this, GPUI's detached tasks have NO FIFO guarantee (a later
+    /// append's upsert can land before an earlier link's stale
+    /// `delete_entries_from` runs, silently deleting the just-written row —
+    /// phase-6b keystone bug). Stored as `Task<()>` so it stays alive across
+    /// links; removed on `purge_session_hard`.
+    entries_persist_chain: HashMap<SolutionSessionId, Task<()>>,
     /// One per-session background-agent watcher task — alive as long as
     /// the session has >=1 registered `background_agents`. Stored as
     /// `Task<()>` so dropping kills the watcher cleanly. Populated by
@@ -929,6 +940,7 @@ impl SolutionAgentStore {
             agent_models_probing: HashSet::new(),
             focus_resolver: None,
             entry_update_throttles: HashMap::new(),
+            entries_persist_chain: HashMap::new(),
             background_agent_watchers: HashMap::new(),
             background_shell_watchers: HashMap::new(),
             parent_jsonl_scan_offsets: HashMap::new(),
@@ -1435,6 +1447,9 @@ impl SolutionAgentStore {
         self.backoff_timers.remove(&id);
         self.parent_jsonl_scan_offsets.remove(&id);
         self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
+        // Drop the persist-serialization chain: a hard teardown abandons any
+        // in-flight entry-row write (the session's rows are being purged anyway).
+        self.entries_persist_chain.remove(&id);
         // The metrics throttle map is keyed by session id and is otherwise
         // never pruned — one entry would leak per closed session for the
         // editor's whole lifetime.
@@ -6318,7 +6333,7 @@ impl SolutionAgentStore {
         // `entries`, else a restored session renders blank. Lets the seed
         // double as a hydration-fix check.
         self.persist_session_row(session_id, cx);
-        self.persist_upsert_range(session_id, 0, cx);
+        self.persist_all_rows(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionCreated {
             id: session_id,
             parent_session_id: None,
@@ -6414,15 +6429,19 @@ impl SolutionAgentStore {
         }
     }
 
-    /// Phase 4 row tuple: `(idx, mod_seq, created_ms, subagent_id, payload)`
-    /// in the casts `upsert_entry` expects. An empty `payload` signals a serde
-    /// failure in `to_payload()` — callers MUST skip persisting it.
+    /// Persist row tuple: `(idx, mod_seq, created_ms, subagent_id, payload)` in
+    /// the casts `upsert_entry` expects. An empty `payload` signals a serde
+    /// failure in `to_payload()` — callers MUST skip persisting it. As of phase
+    /// 6b the authoritative rows are the Main stream's entries, so `idx` is the
+    /// entry's Main-LOCAL index and the persisted `subagent_id` is always `None`
+    /// (Main entries carry no tag). The `subagent_id` column survives as
+    /// vestigial for any legacy tagged rows still on disk.
     fn entry_row_tuple(
-        global_idx: usize,
+        idx: usize,
         entry: &crate::session_entry::SessionEntry,
     ) -> (i64, i64, i64, Option<String>, Vec<u8>) {
         (
-            global_idx as i64,
+            idx as i64,
             entry.mod_seq as i64,
             entry.created_ms,
             entry.subagent_id.as_ref().map(|s| s.to_string()),
@@ -6430,13 +6449,16 @@ impl SolutionAgentStore {
         )
     }
 
-    /// Flush the WHOLE transcript as rows: upsert every current entry, delete
-    /// any stale trailing rows beyond `entries.len()`, and save the epoch.
-    /// This is the path that handles clears/compactions and close — targeted
-    /// upserts alone would leave orphaned idx>len rows that corrupt the next
-    /// cold load. On empty `entries` it degrades to "delete all rows + save
-    /// epoch".
-    pub fn persist_all_rows(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
+    /// Flush the WHOLE Main stream as rows: upsert every current
+    /// `streams[StreamId::Main]` entry (keyed by Main-LOCAL index, subagent_id
+    /// always `None`), delete any stale trailing rows beyond the Main length, and
+    /// save the epoch. This is the path that handles clears/compactions and
+    /// close — targeted upserts alone would leave orphaned idx>len rows that
+    /// corrupt the next cold load. On an empty Main stream it degrades to
+    /// "delete all rows + save epoch". Since it re-writes the entire Main stream
+    /// it also resets `persisted_main_seq` to the Main stream's current `seq`
+    /// (the incremental `persist_main_stream` then skips these rows next time).
+    pub fn persist_all_rows(&mut self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
         if self.is_ephemeral_session(session_id, cx) {
             return;
         }
@@ -6446,22 +6468,30 @@ impl SolutionAgentStore {
         let Some(db) = self.persistence.clone() else {
             return;
         };
-        cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let (rows, len, epoch, change_seq) = cx.update(|cx| {
-                let s = session.read(cx);
-                let rows: Vec<_> = s
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
-                    .collect();
-                (
-                    rows,
-                    s.entries.len() as i64,
-                    s.epoch as i64,
-                    s.change_seq as i64,
-                )
-            });
+        // Capture the full-flush plan + advance the watermark SYNCHRONOUSLY (in
+        // event order), so a concurrent `persist_main_stream` doesn't re-upsert
+        // the rows this flush covers, and so the plan can't drift before the
+        // chained DB task runs.
+        let (rows, len, epoch, change_seq) = session.update(cx, |s, _| {
+            let main = s.streams.get(&crate::stream::StreamId::Main);
+            let main_entries = main.map(|stream| stream.entries.as_slice()).unwrap_or(&[]);
+            let rows: Vec<_> = main_entries
+                .iter()
+                .enumerate()
+                .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
+                .collect();
+            let len = main_entries.len() as i64;
+            s.persisted_main_seq = main.map(|stream| stream.seq).unwrap_or(0);
+            (rows, len, s.epoch as i64, s.change_seq as i64)
+        });
+        // Serialize behind this session's prior persist link (see
+        // `persist_main_stream`) — a full flush's `delete_entries_from(len)` must
+        // not race a concurrent incremental append's upsert.
+        let prev = self.entries_persist_chain.remove(&session_id);
+        let task = cx.spawn(async move |_this, _cx: &mut AsyncApp| {
+            if let Some(prev) = prev {
+                prev.await;
+            }
             for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
                 if payload.is_empty() {
                     log::warn!(
@@ -6477,18 +6507,22 @@ impl SolutionAgentStore {
             db.delete_entries_from(session_id, len).await.log_err();
             db.save_epoch(session_id, epoch).await.log_err();
             db.save_change_seq(session_id, change_seq).await.log_err();
-        })
-        .detach();
+        });
+        self.entries_persist_chain.insert(session_id, task);
     }
 
-    /// Upsert `entries[start_idx..]` (used by `NewEntry`, which can append more
-    /// than one entry via gap-fill) + save the epoch.
-    pub fn persist_upsert_range(
-        &self,
-        session_id: SolutionSessionId,
-        start_idx: usize,
-        cx: &mut Context<Self>,
-    ) {
+    /// Incremental persist of the Main stream (phase 6b's persist authority).
+    /// Reads `streams[StreamId::Main].entries` and upserts only the rows whose
+    /// `mod_seq` exceeds `persisted_main_seq` (keyed by Main-LOCAL index,
+    /// subagent_id always `None`), then always `delete_entries_from(main_len)` to
+    /// trim any torn/teammate leftover rows past the Main tail. The Main length
+    /// and the new watermark (`streams[Main].seq`) are captured — and
+    /// `persisted_main_seq` advanced — SYNCHRONOUSLY before spawning the detached
+    /// DB task, so a burst of ingest events each persist only their own delta and
+    /// never double-write a row. Replaces the old flat-index
+    /// `persist_upsert_range`/`persist_upsert_entry`/`persist_delete_from` calls
+    /// in the ingest arms.
+    pub fn persist_main_stream(&mut self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
         if self.is_ephemeral_session(session_id, cx) {
             return;
         }
@@ -6498,18 +6532,35 @@ impl SolutionAgentStore {
         let Some(db) = self.persistence.clone() else {
             return;
         };
-        cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let (rows, epoch, change_seq) = cx.update(|cx| {
-                let s = session.read(cx);
-                let rows: Vec<_> = s
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .skip(start_idx)
-                    .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
-                    .collect();
-                (rows, s.epoch as i64, s.change_seq as i64)
-            });
+        // Capture the persist plan + advance the watermark synchronously, so
+        // concurrent detached tasks can't each re-read the pre-advance value and
+        // redundantly upsert the same rows.
+        let (rows, main_len, epoch, change_seq) = session.update(cx, |s, _| {
+            let old_watermark = s.persisted_main_seq;
+            let main = s.streams.get(&crate::stream::StreamId::Main);
+            let main_entries = main.map(|stream| stream.entries.as_slice()).unwrap_or(&[]);
+            let watermark = main.map(|stream| stream.seq).unwrap_or(0);
+            let rows: Vec<_> = main_entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.mod_seq > old_watermark)
+                .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
+                .collect();
+            let main_len = main_entries.len() as i64;
+            s.persisted_main_seq = watermark;
+            (rows, main_len, s.epoch as i64, s.change_seq as i64)
+        });
+        // SERIALIZE behind this session's prior persist link: the plan above is
+        // captured in event order, but `delete_entries_from(main_len)` carries a
+        // point-in-time length — if a later append's upsert lands before an
+        // earlier link's stale delete runs (detached tasks are NOT FIFO), the
+        // just-appended row is deleted. Chaining `prev.await` first makes the
+        // upsert+delete pairs apply in issue order.
+        let prev = self.entries_persist_chain.remove(&session_id);
+        let task = cx.spawn(async move |_this, _cx: &mut AsyncApp| {
+            if let Some(prev) = prev {
+                prev.await;
+            }
             for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
                 if payload.is_empty() {
                     log::warn!(
@@ -6522,90 +6573,11 @@ impl SolutionAgentStore {
                     .await
                     .log_err();
             }
+            db.delete_entries_from(session_id, main_len).await.log_err();
             db.save_epoch(session_id, epoch).await.log_err();
             db.save_change_seq(session_id, change_seq).await.log_err();
-        })
-        .detach();
-    }
-
-    /// Upsert exactly `entries[global_idx]` (used by `EntryUpdated`) + save the
-    /// epoch.
-    pub fn persist_upsert_entry(
-        &self,
-        session_id: SolutionSessionId,
-        global_idx: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if self.is_ephemeral_session(session_id, cx) {
-            return;
-        }
-        let Some(session) = self.sessions.get(&session_id).cloned() else {
-            return;
-        };
-        let Some(db) = self.persistence.clone() else {
-            return;
-        };
-        cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let row = cx.update(|cx| {
-                let s = session.read(cx);
-                let epoch = s.epoch as i64;
-                let change_seq = s.change_seq as i64;
-                let row = s
-                    .entries
-                    .get(global_idx)
-                    .map(|entry| Self::entry_row_tuple(global_idx, entry));
-                (row, epoch, change_seq)
-            });
-            let (row, epoch, change_seq) = row;
-            if let Some((idx, mod_seq, created_ms, subagent_id, payload)) = row {
-                if payload.is_empty() {
-                    log::warn!(
-                        target: "solution_agent::store",
-                        "skipping empty-payload upsert for session={session_id} idx={idx}",
-                    );
-                } else {
-                    db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
-                        .await
-                        .log_err();
-                }
-            }
-            db.save_epoch(session_id, epoch).await.log_err();
-            db.save_change_seq(session_id, change_seq).await.log_err();
-        })
-        .detach();
-    }
-
-    /// Delete rows `idx >= from_idx` (used by `EntriesRemoved`) + save the
-    /// epoch.
-    pub fn persist_delete_from(
-        &self,
-        session_id: SolutionSessionId,
-        from_idx: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if self.is_ephemeral_session(session_id, cx) {
-            return;
-        }
-        let Some(session) = self.sessions.get(&session_id).cloned() else {
-            return;
-        };
-        let Some(db) = self.persistence.clone() else {
-            return;
-        };
-        cx.spawn(async move |_this, cx: &mut AsyncApp| {
-            let (epoch, change_seq) = cx.update(|cx| {
-                (
-                    session.read(cx).epoch as i64,
-                    session.read(cx).change_seq as i64,
-                )
-            });
-            db.delete_entries_from(session_id, from_idx as i64)
-                .await
-                .log_err();
-            db.save_epoch(session_id, epoch).await.log_err();
-            db.save_change_seq(session_id, change_seq).await.log_err();
-        })
-        .detach();
+        });
+        self.entries_persist_chain.insert(session_id, task);
     }
 
     /// Subscribe to a session's `AcpThread` event stream so that ACP-level
@@ -8097,9 +8069,9 @@ impl SolutionAgentStore {
                     }
                     additions
                 };
-                // Pre-extend length is the first index the upsert range must
-                // cover; captured before the closure so it survives for the
-                // post-update `persist_upsert_range` call.
+                // Pre-extend length is the first index the newly-stamped entries
+                // begin at; captured before the closure so we can stamp exactly
+                // the appended entries' `mod_seq`.
                 let first_new = session_entity.read(cx).entries.len();
                 session_entity.update(cx, |s, cx| {
                     s.entries.extend(new_entries);
@@ -8111,8 +8083,10 @@ impl SolutionAgentStore {
                     s.rebuild_streams();
                     cx.notify();
                 });
-                // Persist the newly-appended entries (+ any gap-fill) as rows.
-                self.persist_upsert_range(session_id, first_new, cx);
+                // Persist authority is `streams[Main]` (phase 6b): flush the Main
+                // stream incrementally after the rebuild so the coalesced,
+                // Main-local rows land — NOT the (possibly torn) flat entries.
+                self.persist_main_stream(session_id, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
                     session_id,
                     global_entry_index,
@@ -8467,35 +8441,39 @@ impl SolutionAgentStore {
                 let global_truncate = cold_count + range.start;
                 session_entity.update(cx, |s, cx| {
                     s.entries.truncate(global_truncate);
-                    // Re-stamp the surviving boundary entry's mod_seq BEFORE the
-                    // rebuild. A truncate that splits a coalesced same-source
-                    // assistant group leaves the survivor's stream-mirror content
-                    // changed (a fragment removed) but its first-fragment mod_seq
-                    // unchanged — possibly BELOW a delta client's cursor — while the
-                    // stream's `total_count` is unchanged (the removed fragment was
-                    // coalesced INTO the survivor, not a separate stream entry). The
-                    // per-stream delta keys on `entry.mod_seq > since_seq`, so
-                    // without this bump it would silently miss the shrink and render
-                    // stale coalesced text. Stamping the last entry advances the
-                    // stream's seq past every issued cursor so the next delta
-                    // re-delivers the now-shorter entry. Harmless on a clean-boundary
-                    // truncate (an unchanged entry is re-sent once).
-                    let seq = s.bump_change_seq();
-                    if let Some(last) = s.entries.last_mut() {
-                        last.mod_seq = seq;
-                    }
+                    // Rebuild the streams FIRST so `streams[Main]` reflects the
+                    // truncated, re-coalesced transcript, THEN re-stamp on Main.
                     s.rebuild_streams();
+                    // Decision #11 re-homed onto the Main stream (phase 6b): a
+                    // truncate that splits a coalesced same-source assistant group
+                    // leaves the Main-stream survivor's content changed (a fragment
+                    // removed) but its first-fragment mod_seq unchanged — possibly
+                    // BELOW a delta client's cursor or `persisted_main_seq` — while
+                    // the stream's `total_count` is unchanged (the removed fragment
+                    // was coalesced INTO the survivor, not a separate stream entry).
+                    // Since the per-stream wire delta AND `persist_main_stream` now
+                    // both key on the Main stream (`entry.mod_seq > watermark`), the
+                    // re-stamp must land on the Main stream's boundary entry, not
+                    // the flat one. Bump the surviving Main entry's mod_seq to a
+                    // fresh change_seq and lift `streams[Main].seq` to it so the
+                    // next delta re-delivers the now-shorter entry and
+                    // `persist_main_stream` re-upserts its row.
+                    let seq = s.bump_change_seq();
+                    if let Some(main) = s.streams.get_mut(&crate::stream::StreamId::Main)
+                        && let Some(last) = main.entries.last_mut()
+                    {
+                        last.mod_seq = seq;
+                        main.seq = seq;
+                    }
                     cx.notify();
                 });
-                // A rewind drops the removed rows: targeted delete keeps the
-                // persisted transcript in lockstep so a stale idx>=truncate row
-                // can't corrupt the next cold load.
-                self.persist_delete_from(session_id, global_truncate, cx);
-                // Persist the re-stamped survivor so its row's mod_seq (and any
-                // coalesce-boundary content) stays in lockstep with memory.
-                if global_truncate > 0 {
-                    self.persist_upsert_entry(session_id, global_truncate - 1, cx);
-                }
+                // Persist authority is `streams[Main]` (phase 6b): a rewind drops
+                // the removed rows and shrinks the coalesce survivor.
+                // `persist_main_stream` trims via `delete_entries_from(main_len)`
+                // AND re-upserts the re-stamped survivor (its mod_seq now exceeds
+                // `persisted_main_seq`), keeping the persisted transcript in lockstep
+                // so a stale idx>=len row can't corrupt the next cold load.
+                self.persist_main_stream(session_id, cx);
                 // The user-facing `/clear` does NOT reach this branch:
                 // it's intercepted client-side and routed through
                 // `reset_context` (which spawns a brand-new `AcpThread`
@@ -8675,10 +8653,14 @@ impl SolutionAgentStore {
                         s.rebuild_streams();
                         cx.notify();
                     });
-                    // Row upsert happens unconditionally on the in-memory update
-                    // (one cheap row); the 500ms/2s throttle above governs only
-                    // the MCP `SessionMessageAppended` emit, NOT this persist.
-                    self.persist_upsert_entry(session_id, global_idx, cx);
+                    // Row upsert happens unconditionally on the in-memory update;
+                    // the 500ms/2s throttle above governs only the MCP
+                    // `SessionMessageAppended` emit, NOT this persist. Persist
+                    // authority is `streams[Main]` (phase 6b): flush the Main
+                    // stream incrementally after the rebuild so the coalesced
+                    // Main-local row lands (the edited flat entry may map to a
+                    // coalesced Main entry at a different index).
+                    self.persist_main_stream(session_id, cx);
                 }
             }
             _ => {}

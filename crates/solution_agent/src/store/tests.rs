@@ -3860,7 +3860,13 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         });
     });
 
-    // Migration writes rows.
+    // Migration writes rows. As of phase 6b the persist authority is the
+    // COALESCED Main stream (`streams[StreamId::Main]`), not the flat `entries`:
+    // the two legacy assistant-shaped summaries are adjacent same-source
+    // (subagent_id None) messages, so demux merges them into ONE Main bubble and
+    // migration writes ONE row. That is still lossless — both summary texts are
+    // preserved as chunks inside the single coalesced row (asserted below) — and
+    // the next restore is row-native.
     cx.run_until_parked();
     let rows = db
         .load_entries(id_a)
@@ -3868,8 +3874,27 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         .expect("load rows after migrate");
     assert_eq!(
         rows.len(),
-        2,
-        "legacy migration must write rows so the next restore is row-native"
+        1,
+        "legacy migration writes the coalesced Main stream as one row-native entry"
+    );
+    // Losslessness at the persist authority: the single coalesced row must carry
+    // BOTH legacy summary texts (no history dropped by the coalesce-then-persist).
+    let migrated_kind = crate::session_entry::kind_from_payload(&rows[0].payload)
+        .expect("migrated row payload decodes to a kind");
+    let crate::session_entry::SessionEntryKind::AssistantMessage { chunks } = migrated_kind else {
+        panic!("legacy summaries must migrate as an AssistantMessage row");
+    };
+    let migrated_text: String = chunks
+        .iter()
+        .filter_map(|c| match c {
+            crate::session_entry::AssistantChunk::Message(m) => Some(m.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        migrated_text.contains("user said hello")
+            && migrated_text.contains("assistant replied hi"),
+        "coalesced migration row must preserve both legacy summaries, got: {migrated_text:?}"
     );
     // Blob must be PRESERVED (Task 5 owns blob removal + model/effort backfill).
     assert!(
@@ -4097,6 +4122,294 @@ async fn entries_removed_restamps_survivor_on_coalesce_split(cx: &mut TestAppCon
             main.seq,
         );
     });
+}
+
+/// Phase 6b keystone: after the #3 revert `AcpThread` (and thus the flat
+/// `session.entries` ingest mirror) may be TORN — a teammate chunk interleaved
+/// between two parent deltas splits the parent into two flat entries. But the
+/// PERSIST authority is now `streams[StreamId::Main]` (the coalesced demux), so
+/// the demux re-unites the parent into ONE Main bubble and `persist_main_stream`
+/// writes Main-LOCAL coalesced rows (subagent_id None), never the torn fragments.
+/// This pins the whole coupling: torn flat entries → one Main bubble → coalesced
+/// persisted rows → watermark advanced.
+#[gpui::test]
+async fn interleaved_flat_entries_persist_as_coalesced_main_rows(cx: &mut TestAppContext) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let asst = |n: u64, subagent: Option<&str>, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: subagent.map(SharedString::from),
+        kind: SessionEntryKind::AssistantMessage {
+            chunks: vec![AssistantChunk::Message(text.into())],
+        },
+    };
+
+    // Torn interleave: parent "Three ", teammate "noise", parent "scouts". In the
+    // flat ingest buffer the parent is SPLIT across indices 0 and 2 (index 1 is
+    // the teammate). The demux groups by source, so Main = coalesce(0, 2).
+    let (main_len, main_seq) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, cx| {
+                s.live_base = 0;
+                s.change_seq = 3;
+                s.set_entries(
+                    vec![
+                        asst(1, None, "Three "),
+                        asst(2, Some("T1"), "noise"),
+                        asst(3, None, "scouts"),
+                    ],
+                    cx,
+                );
+            });
+            let s = session.read(cx);
+            // Flat entries are TORN: three entries, the parent split at 0 and 2.
+            assert_eq!(s.entries.len(), 3, "flat ingest mirror stays torn");
+            assert_eq!(s.entries[0].subagent_id, None);
+            assert_eq!(
+                s.entries[1].subagent_id,
+                Some(SharedString::from("T1")),
+                "teammate chunk interleaves between the parent's two deltas"
+            );
+            assert_eq!(s.entries[2].subagent_id, None);
+            // But the demux re-unites the parent into ONE Main bubble.
+            let main = &s.streams[&crate::stream::StreamId::Main];
+            assert_eq!(
+                main.entries.len(),
+                1,
+                "the parent's two torn fragments coalesce into one Main bubble"
+            );
+            assert_eq!(main.entries[0].subagent_id, None);
+            assert!(
+                s.streams
+                    .contains_key(&crate::stream::StreamId::Teammate("T1".into())),
+                "the teammate gets its own stream, out of Main"
+            );
+            (main.entries.len(), main.seq)
+        })
+    });
+
+    // Persist the Main stream and let the detached task land.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.persist_main_stream(session_id, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // The persist watermark advanced to the Main stream's seq.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        assert_eq!(
+            session.read(cx).persisted_main_seq,
+            main_seq,
+            "persisted_main_seq advanced to the Main stream watermark"
+        );
+    });
+
+    // Persisted rows are the Main-LOCAL coalesced entries: exactly one row, no
+    // teammate fragment, subagent_id None, and losslessly carrying both parent
+    // deltas.
+    let rows = db.load_entries(session_id).await.expect("load rows");
+    assert_eq!(
+        rows.len(),
+        main_len,
+        "row count == streams[Main].entries.len() (coalesced, no teammate row)"
+    );
+    assert_eq!(rows[0].idx, 0, "Main-local index");
+    assert_eq!(
+        rows[0].subagent_id, None,
+        "persisted Main rows carry no subagent tag"
+    );
+    let kind = crate::session_entry::kind_from_payload(&rows[0].payload)
+        .expect("row payload decodes");
+    let crate::session_entry::SessionEntryKind::AssistantMessage { chunks } = kind else {
+        panic!("expected an AssistantMessage row");
+    };
+    let text: String = chunks
+        .iter()
+        .filter_map(|c| match c {
+            AssistantChunk::Message(m) => Some(m.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("Three ") && text.contains("scouts"),
+        "coalesced Main row must preserve both parent deltas, got: {text:?}"
+    );
+    assert!(
+        !text.contains("noise"),
+        "the teammate fragment must NOT leak into the persisted Main row"
+    );
+}
+
+/// Phase-6b keystone regression: a pre-6b session persisted teammate-tagged rows
+/// at GLOBAL flat indices, interleaved with Main rows. Under 6b, persistence keys
+/// on Main-LOCAL indices, so on cold-load the physical row layout no longer
+/// matches — the first incremental `persist_main_stream` would overwrite a Main
+/// slot with the wrong entry (losing a Main message) and strand the stale tagged
+/// row forever, unless the load forces a realign. `hydrate_streams_main_only`
+/// seeds `persisted_main_seq = 0` whenever a hydration orphan (a legacy tagged
+/// row) is present, so the first persist re-writes the WHOLE Main stream at
+/// Main-local indices and `delete_entries_from(Main.len)` trims the leftovers.
+#[gpui::test]
+async fn legacy_teammate_tagged_rows_realign_to_main_local_on_cold_load(
+    cx: &mut TestAppContext,
+) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let asst = |n: u64, subagent: Option<&str>, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: subagent.map(SharedString::from),
+        kind: SessionEntryKind::AssistantMessage {
+            chunks: vec![AssistantChunk::Message(text.into())],
+        },
+    };
+    let user = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+
+    // LEGACY on-disk layout: Main "alpha"@0, teammate "noise"@1, Main user
+    // "bravo"@2. "bravo" is a USER message so it does NOT coalesce with "alpha":
+    // Main is TWO entries whose Main-local indices (0, 1) differ from their
+    // physical row idx (0, 2). Write them straight to the DB as a pre-6b build
+    // would (tagged teammate row included).
+    let legacy = [
+        asst(1, None, "alpha"),
+        asst(2, Some("T1"), "noise"),
+        user(3, "bravo"),
+    ];
+    for (idx, entry) in legacy.iter().enumerate() {
+        db.upsert_entry(
+            session_id,
+            idx as i64,
+            entry.mod_seq as i64,
+            entry.created_ms,
+            entry.subagent_id.as_ref().map(|s| s.to_string()),
+            entry.to_payload(),
+        )
+        .await
+        .expect("seed legacy row");
+    }
+
+    // Cold-load: reconstruct the flat mirror from the legacy rows, then collapse
+    // to a Main-only view (records T1 as a hydration orphan → watermark seeded 0).
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, cx| {
+                s.entries = vec![
+                    asst(1, None, "alpha"),
+                    asst(2, Some("T1"), "noise"),
+                    user(3, "bravo"),
+                ];
+                s.hydrate_streams_main_only();
+                cx.notify();
+            });
+            let s = session.read(cx);
+            // The flat mirror (3) is longer than the Main stream (2) because of
+            // the tagged teammate row, so the realign trigger fires: watermark 0.
+            assert_eq!(
+                s.entries.len(),
+                3,
+                "flat mirror keeps the interleaved teammate row"
+            );
+            assert_eq!(
+                s.streams[&crate::stream::StreamId::Main].entries.len(),
+                2,
+                "Main = [alpha, bravo]; the teammate is excluded"
+            );
+            assert_eq!(
+                s.persisted_main_seq, 0,
+                "legacy layout (flat longer than Main) forces a realign: watermark 0"
+            );
+        });
+    });
+
+    // A live resume appends one more Main message; the ingest rebuilds streams and
+    // the first `persist_main_stream` after the realign-seed rewrites the Main
+    // stream in full.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, cx| {
+                // mod_seq 100 is comfortably above every loaded entry AND the 0
+                // realign watermark, so it — and the re-written A/B — all persist.
+                s.entries.push(asst(100, None, "charlie"));
+                s.rebuild_streams();
+                cx.notify();
+            });
+            store.persist_main_stream(session_id, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // The realign rewrote the whole Main stream at contiguous Main-LOCAL indices
+    // and trimmed the stale tagged row: 3 rows [alpha, bravo, charlie], all
+    // subagent_id None, "bravo" preserved (NOT lost), teammate "noise" gone.
+    let rows = db.load_entries(session_id).await.expect("load rows");
+    assert_eq!(
+        rows.len(),
+        3,
+        "exactly the 3 Main-local rows; the tagged teammate row was trimmed"
+    );
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.idx, i as i64, "contiguous Main-local index");
+        assert_eq!(
+            row.subagent_id, None,
+            "no teammate tag survives the realign"
+        );
+    }
+    let texts: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            match crate::session_entry::kind_from_payload(&r.payload).expect("decode") {
+                SessionEntryKind::AssistantMessage { chunks } => chunks
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantChunk::Message(m) => Some(m.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                SessionEntryKind::UserMessage { content_md, .. } => content_md,
+                _ => String::new(),
+            }
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["alpha", "bravo", "charlie"],
+        "Main entries preserved + realigned; teammate 'noise' is gone"
+    );
 }
 
 /// User-facing `/clear` is intercepted client-side and routed through
@@ -4735,7 +5048,11 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
         });
     });
 
-    // Assert the persisted rows match the in-memory entries exactly.
+    // Assert the persisted rows match the in-memory Main stream exactly. As of
+    // phase 6b the persist authority is `streams[StreamId::Main]` (coalesced,
+    // Main-local index), NOT the flat `entries` ingest buffer — a rewind that
+    // splits a coalesce group re-stamps the Main survivor's mod_seq without
+    // touching the flat entry, so the two mod_seqs legitimately diverge.
     async fn assert_rows_match(
         cx: &mut TestAppContext,
         db: &crate::db::SolutionAgentDb,
@@ -4744,19 +5061,24 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
         let entries = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             let session = store.read(cx).session(session_id).expect("session exists");
-            session.read(cx).entries.clone()
+            session
+                .read(cx)
+                .streams
+                .get(&crate::stream::StreamId::Main)
+                .map(|s| s.entries.clone())
+                .unwrap_or_default()
         });
         let rows = db.load_entries(session_id).await.expect("load entries");
         assert_eq!(
             rows.len(),
             entries.len(),
-            "row count must match in-memory entries"
+            "row count must match the in-memory Main stream"
         );
         for (idx, (row, entry)) in rows.iter().zip(entries.iter()).enumerate() {
             assert_eq!(row.idx, idx as i64, "rows must be in ascending idx order");
             assert_eq!(
                 row.mod_seq, entry.mod_seq as i64,
-                "row mod_seq must mirror the entry's mod_seq"
+                "row mod_seq must mirror the Main-stream entry's mod_seq"
             );
             let kind = crate::session_entry::kind_from_payload(&row.payload)
                 .expect("payload decodes to a kind");
