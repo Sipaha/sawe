@@ -30,6 +30,7 @@ pub(crate) mod slash_commands;
 pub mod status_item;
 pub(crate) mod status_row;
 pub mod store;
+pub mod stream;
 pub mod supervisor;
 pub mod supervisor_instruction_modal;
 pub mod upload;
