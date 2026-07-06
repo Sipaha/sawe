@@ -495,6 +495,12 @@ Three linked fixes to what the observer (judge) sees, all rooted in the same DTO
 
 How to apply: the observer/nudge distinction is INVISIBLE at `role` level (a nudge is user-role by design so the agent acts on it) — always gate on `observer_nudge`/`is_observer_nudge_blocks`, never on role alone. When adding a new compaction/clear entry point, thread `CompactInitiator` through it so the user-vs-observer wipe decision stays explicit.
 
+### 38. The Main chat tab never shows sub-agent-tagged entries — even when no sub-agent is active
+
+Sub-agent (`Task`/`Agent`) entries are stamped with the parent `toolu_xxx` id (`SessionEntry.subagent_id`), and the Main view filters them out (`SubagentView::matches_parent_entry` desktop / `filterEntriesBySubagent` mobile). But both surfaces used to **bypass** that filter whenever `active_subagents` was empty (desktop `should_render_entry`, mobile `ChatList`), on the theory that a hidden strip + dead `toolu_xxx` would make those rows vanish. Since `active_subagents` empties the moment a Task/Agent hits terminal status (not just on restart), the bypass fired at the *end of every sub-agent run* — dumping the whole sub-agent transcript into Main. Removed on both surfaces: Main is now always main-thread-only. Full story: `docs/findings/2026-07-06-subagent-entries-flood-main-after-finish.md`.
+
+How to apply: don't reintroduce an "empty active set ⇒ show everything" shortcut. The sub-agent's `Agent` tool call + its result summary are Main-thread entries (`subagent_id == None`) and stay in Main, so the essential report isn't lost — only the verbose interior steps are hidden once the sub-agent completes. If reviewing finished sub-agent work matters, add *persistent* (completed) sub-agent tabs, not a Main flood.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

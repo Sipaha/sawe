@@ -892,23 +892,24 @@ impl SolutionSessionView {
     }
 
     /// Returns `true` when `entry` should be visible under the current
-    /// `selected_subagent` tab. `None` selection ("Main") shows entries
-    /// whose `subagent_id` is also `None`; `Some(id)` shows only entries
-    /// stamped with that exact id. Plan-level entries and user messages
-    /// have no subagent affiliation, so they fall under "Main".
+    /// `selected_subagent` tab. `Main` shows entries whose `subagent_id`
+    /// is also `None`; `Task(id)` shows only entries stamped with that
+    /// exact id. Plan-level entries and user messages have no subagent
+    /// affiliation, so they fall under "Main".
     ///
-    /// Cold-restart bypass: when the session has no active subagents,
-    /// the strip is hidden anyway, so we render EVERY entry regardless
-    /// of `subagent_id`. Otherwise persisted entries stamped with a now-
-    /// dead `toolu_xxx` would silently disappear from Main after restart.
+    /// The Main view NEVER shows subagent-tagged entries, even when no
+    /// subagents are currently active (`active_subagents` empty / after a
+    /// restart). An earlier "cold-restart bypass" rendered every entry in
+    /// that state so a finished subagent's `toolu_xxx`-tagged rows wouldn't
+    /// vanish — but that dumped the whole subagent transcript back into Main
+    /// the instant the Task/Agent completed, which is exactly the leak the
+    /// tab split exists to prevent. The subagent's `Agent` tool call and its
+    /// result summary are Main-thread entries (`subagent_id == None`), so
+    /// they stay in Main; only the verbose interior steps are hidden.
     pub(crate) fn should_render_entry(
         &self,
         entry: &crate::session_entry::SessionEntry,
-        cx: &App,
     ) -> bool {
-        if self.session.read(cx).active_subagents.is_empty() {
-            return true;
-        }
         self.selected_subagent
             .matches_parent_entry(entry.subagent_id.as_ref())
     }
@@ -3065,7 +3066,7 @@ impl Render for SolutionSessionView {
                                 // `should_render_entry`'s Main-only
                                 // predicate and the entire transcript
                                 // would render blank.
-                                if !is_drill_in_inner && !this.should_render_entry(entry, cx) {
+                                if !is_drill_in_inner && !this.should_render_entry(entry) {
                                     return Empty.into_any_element();
                                 }
                                 let rewind_target = if supports_rewind
