@@ -91,7 +91,12 @@ impl McpServerTool for CapabilitiesTool {
             // `subagent_filter` model for the per-stream `streams` descriptors +
             // `stream_id` selector; `entries` / `changed_entries` `index` is now
             // STREAM-LOCAL and the delta cursor is per-stream `seq`.
-            wire_schema_version: 3,
+            // v4 (per-source streams — shells + background-agents folded onto
+            // `streams`): background shells now ride the wire as `kind: shell`
+            // streams; background agents render as their `kind: teammate` demux
+            // stream; the separate `get_session_background_{shells,agents}` tools
+            // are removed. HARD CUTOVER.
+            wire_schema_version: 4,
         };
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
