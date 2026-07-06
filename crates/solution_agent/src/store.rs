@@ -5858,6 +5858,7 @@ impl SolutionAgentStore {
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
                     s.entries.clear();
+                    s.clear_closed_streams();
                     s.rebuild_streams();
                     s.bump_epoch();
                     // `set_acp_thread` emits ThreadReplaced + notify;
@@ -6052,6 +6053,7 @@ impl SolutionAgentStore {
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
                     s.entries.clear();
+                    s.clear_closed_streams();
                     s.rebuild_streams();
                     s.bump_epoch();
                     // Cache the (possibly freshly-built headless) project so
@@ -6959,10 +6961,29 @@ impl SolutionAgentStore {
             // a status flip on a cold→live transition) is a no-op.
             let tracked = session_entity.read(cx).active_subagents.contains_key(&id);
             if tracked {
+                // Terminal status is a GENUINE "teammate done" signal ONLY for an
+                // inline `Task` (its tool-call stays InProgress for the whole run
+                // and completes only when the Task finishes). An async `Agent`
+                // teammate's spawn tool-call flips to Completed IMMEDIATELY at
+                // spawn-ack while the teammate keeps streaming `subagent_id`-tagged
+                // entries into the parent thread for minutes — so closing its
+                // demux `Teammate` stream here would suppress the still-live
+                // teammate (decision #5: the parent-thread demux IS its source of
+                // truth). So auto-close the stream for `Task` only; the async
+                // `Agent`'s real done-signal (stop_reason / completion) drives its
+                // close in a later phase. The `active_subagents` removal (pill)
+                // still fires for both, unchanged.
+                let is_async_agent = tool_name_is_agent(snapshot.tool_name.as_deref());
                 session_entity.update(cx, |s, _| {
                     s.active_subagents.remove(&id);
                     s.active_subagent_order
                         .retain(|tracked_id| tracked_id != &id);
+                    if !is_async_agent {
+                        s.close_stream(
+                            crate::stream::StreamId::Teammate(id.clone()),
+                            gpui::SharedString::new_static("done"),
+                        );
+                    }
                 });
                 true
             } else {
@@ -9219,6 +9240,23 @@ mod subagent_view_tests {
             !SubagentView::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"))
                 .is_parent_thread_view()
         );
+    }
+
+    #[test]
+    fn stream_auto_close_on_terminal_excludes_async_agent() {
+        // Phase 3 gate: a teammate stream auto-closes on the tool-call's
+        // TERMINAL status only for an inline `Task` (whose tool-call stays
+        // InProgress for the whole run → terminal == genuinely done). An async
+        // `Agent`'s spawn tool-call goes terminal at spawn-ack while the teammate
+        // streams on, so it must NOT auto-close here. The gate is
+        // `!tool_name_is_agent(tool_name)`.
+        assert!(!tool_name_is_agent(Some("Task")), "Task → auto-close");
+        assert!(tool_name_is_agent(Some("Agent")), "Agent → do NOT auto-close");
+        assert!(
+            tool_name_is_agent(Some("agent")),
+            "case-insensitive: agent → do NOT auto-close"
+        );
+        assert!(!tool_name_is_agent(None), "unknown tool → auto-close path");
     }
 
     #[test]

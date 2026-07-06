@@ -405,6 +405,19 @@ pub struct SolutionSession {
     /// target until phase 6 flips it to a derived shim. `StreamId::Main` is
     /// always present.
     pub streams: indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream>,
+    /// Secondary streams auto-closed on a genuine `Done` signal. Currently fed
+    /// only by an inline `Task` subagent's tool-call reaching a terminal status
+    /// (its tool-call stays InProgress for the whole run, so terminal == done).
+    /// An async `Agent` teammate is deliberately NOT closed here — its spawn
+    /// tool-call goes terminal at spawn-ack while the teammate streams on, so its
+    /// demux stream must stay live (its real done-signal drives its close in a
+    /// later phase). Ephemeral, NOT persisted: the tagged entries stay in
+    /// `entries` (persistence/flat wire untouched until later phases), so
+    /// `rebuild_streams` consults this overlay and removes the closed ids —
+    /// otherwise a finished teammate's stream would reappear from its
+    /// still-present tagged entries. Value = the `Done` reason (surfaced as
+    /// phase-4's `stream_removed` reason). `StreamId::Main` is never inserted.
+    pub closed_streams: HashMap<crate::stream::StreamId, SharedString>,
     /// `true` while a restored tab's `acp_thread_blob` is still being
     /// deserialised on a background task. Set by the lazy-hydration path
     /// ([`SolutionAgentStore::restore_open_tabs_lazy`]) when a placeholder
@@ -603,6 +616,7 @@ impl SolutionSession {
                 streams.insert(crate::stream::StreamId::Main, crate::stream::Stream::main());
                 streams
             },
+            closed_streams: HashMap::new(),
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,
@@ -676,7 +690,29 @@ impl SolutionSession {
     /// after every mutation of `entries` (see `set_entries` + the store's
     /// clear/extend/truncate/slot-write sites) or the mirror drifts.
     pub fn rebuild_streams(&mut self) {
-        self.streams = crate::stream::demux(&self.entries);
+        let mut streams = crate::stream::demux(&self.entries);
+        for id in self.closed_streams.keys() {
+            streams.shift_remove(id); // Main is never inserted into closed_streams
+        }
+        self.streams = streams;
+    }
+
+    /// Auto-close a secondary stream on a genuine `Done` signal: record the id
+    /// in the `closed_streams` overlay and rebuild so it drops out of the mirror
+    /// even though its tagged `entries` are still present. `StreamId::Main` is
+    /// never closable (a no-op) — the parent stream always stays live.
+    pub fn close_stream(&mut self, id: crate::stream::StreamId, reason: SharedString) {
+        if matches!(id, crate::stream::StreamId::Main) {
+            return;
+        }
+        self.closed_streams.insert(id, reason);
+        self.rebuild_streams();
+    }
+
+    /// Drop the whole close overlay so previously-closed streams reappear on the
+    /// next rebuild. Used by the context reset/clear paths after `entries.clear()`.
+    pub fn clear_closed_streams(&mut self) {
+        self.closed_streams.clear();
     }
 
     /// Allocate the next monotonic change sequence for this session. Pre-increment:
@@ -913,6 +949,7 @@ mod tests {
                 streams.insert(crate::stream::StreamId::Main, crate::stream::Stream::main());
                 streams
             },
+            closed_streams: HashMap::new(),
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,
@@ -1047,6 +1084,89 @@ mod tests {
                     .len(),
                 1
             );
+        });
+    }
+
+    fn msg_tagged(text: &str, sub: Option<&str>) -> SessionEntry {
+        use crate::session_entry::{AssistantChunk, SessionEntryKind};
+        SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: sub.map(SharedString::from),
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.to_string())],
+            },
+        }
+    }
+
+    #[gpui::test]
+    fn close_stream_removes_teammate_and_survives_rebuild(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t1 = StreamId::Teammate(SharedString::from("T1"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![msg_tagged("hi", None), msg_tagged("sub", Some("T1"))],
+                cx,
+            );
+            assert!(s.streams.contains_key(&t1), "teammate stream present");
+            s.close_stream(t1.clone(), SharedString::new_static("done"));
+            assert!(!s.streams.contains_key(&t1), "closed → absent from mirror");
+            // Entries are untouched, so a bare rebuild must NOT resurrect it.
+            s.rebuild_streams();
+            assert!(!s.streams.contains_key(&t1), "overlay survives rebuild");
+            assert_eq!(s.entries.len(), 2, "tagged entries stay in entries");
+        });
+    }
+
+    #[gpui::test]
+    fn close_stream_refuses_main(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, _| {
+            s.close_stream(StreamId::Main, SharedString::new_static("x"));
+            assert!(s.streams.contains_key(&StreamId::Main), "Main stays live");
+            assert!(s.closed_streams.is_empty(), "Main never enters overlay");
+        });
+    }
+
+    #[gpui::test]
+    fn closed_stream_does_not_block_a_different_teammate(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t1 = StreamId::Teammate(SharedString::from("T1"));
+        let t2 = StreamId::Teammate(SharedString::from("T2"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(vec![msg_tagged("sub", Some("T1"))], cx);
+            s.close_stream(t1.clone(), SharedString::new_static("done"));
+            // A later demux (via set_entries) that also carries T2 keeps T1
+            // closed (overlay) while T2 comes up fresh and live.
+            s.set_entries(
+                vec![msg_tagged("sub1", Some("T1")), msg_tagged("sub2", Some("T2"))],
+                cx,
+            );
+            assert!(!s.streams.contains_key(&t1), "T1 stays closed");
+            assert!(s.streams.contains_key(&t2), "T2 present");
+            assert_eq!(
+                s.streams[&t2].state,
+                crate::stream::StreamState::Live,
+                "T2 is live"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn clear_closed_streams_reopens(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t1 = StreamId::Teammate(SharedString::from("T1"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            s.set_entries(vec![msg_tagged("sub", Some("T1"))], cx);
+            s.close_stream(t1.clone(), SharedString::new_static("done"));
+            assert!(!s.streams.contains_key(&t1));
+            s.clear_closed_streams();
+            s.rebuild_streams();
+            assert!(s.streams.contains_key(&t1), "cleared overlay → reopened");
         });
     }
 
