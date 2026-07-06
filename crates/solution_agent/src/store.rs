@@ -6585,6 +6585,13 @@ impl SolutionAgentStore {
             /// stashes `agentId` + `output_file` here when the tool call
             /// completes). Empty for in-progress / non-Agent calls.
             raw_output_text: Option<String>,
+            /// The tool call's rendered content text (the `tool_result` body).
+            /// For an async `Agent` launch claude puts the "Async agent
+            /// launched successfully… agentId: … output_file: …" announcement
+            /// HERE (the tool_result content), NOT in `raw_output` — so the
+            /// managed-agent registration parses this as a fallback. Populated
+            /// only for terminal task-like calls; `None` otherwise.
+            content_text: Option<String>,
             /// Raw tool-call input JSON, captured so the background-shell
             /// branch can read `run_in_background` + `command` without
             /// re-borrowing the entry. `None` when the tool call has no
@@ -6640,6 +6647,22 @@ impl SolutionAgentStore {
                 .raw_output
                 .as_ref()
                 .and_then(|v| serde_json::to_string(v).ok());
+            // Only the terminal task-like branch reads the content (async-agent
+            // announcement fallback), so skip the string-building otherwise.
+            let content_text = if is_task_like && is_terminal {
+                let mut text = String::new();
+                for content in &call.content {
+                    if let acp_thread::ToolCallContent::ContentBlock(block) = content {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(block.to_markdown(cx));
+                    }
+                }
+                (!text.is_empty()).then_some(text)
+            } else {
+                None
+            };
             Snapshot {
                 id: SharedString::from(call.id.0.to_string()),
                 is_task_like,
@@ -6649,6 +6672,7 @@ impl SolutionAgentStore {
                 subagent_type,
                 tool_name: tool_name_owned,
                 raw_output_text,
+                content_text,
                 raw_input: call.raw_input.clone(),
             }
         };
@@ -6863,10 +6887,20 @@ impl SolutionAgentStore {
         // matches the pre-feature behaviour for `Task` and adds the strip
         // on top.
         if snapshot.is_terminal && tool_name_is_agent(snapshot.tool_name.as_deref()) {
-            let raw_output_text = snapshot.raw_output_text.unwrap_or_default();
-            if let Some((agent_id_str, output_file)) =
-                crate::background_agent::parse_managed_agent_announcement(&raw_output_text)
-            {
+            // The announcement (`agentId:` + `output_file:`) lives in the
+            // tool_result body, which the native adapter surfaces as the tool
+            // call's CONTENT, not `raw_output` (that stays null for an async
+            // `Agent` launch). Parse `raw_output` first for forward-compat with
+            // any dispatcher that stashes it there, then fall back to content —
+            // the current claude path. Without the content fallback the
+            // background-agent pill never registers, so an actively-streaming
+            // teammate shows no strip tab and its output (tagged in the parent
+            // thread) has nowhere to go but the Main tab.
+            let announcement = crate::background_agent::managed_agent_announcement(
+                snapshot.raw_output_text.as_deref(),
+                snapshot.content_text.as_deref(),
+            );
+            if let Some((agent_id_str, output_file)) = announcement {
                 let canonical =
                     std::fs::read_link(&output_file).unwrap_or_else(|_| output_file.clone());
                 let id = crate::background_agent::BackgroundAgentId::new(agent_id_str);

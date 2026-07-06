@@ -66,6 +66,25 @@ pub fn parse_managed_agent_announcement(raw_output: &str) -> Option<(String, Pat
     Some((id, PathBuf::from(path)))
 }
 
+/// Recover a terminal `Agent` tool call's managed-agent announcement, looking
+/// in `raw_output` first then the tool call's rendered `content`.
+///
+/// For an async `Agent` launch claude emits the announcement (`agentId:` +
+/// `output_file:`) in the tool_result BODY — which the native adapter surfaces
+/// as the tool call's content — and leaves `raw_output` null. Parsing only
+/// `raw_output` therefore never registers the background-agent strip pill, so
+/// an actively-streaming teammate shows no tab and its parent-thread-tagged
+/// output leaks into Main. `raw_output` is still tried first so a future
+/// dispatcher that stashes the announcement there keeps working.
+pub fn managed_agent_announcement(
+    raw_output: Option<&str>,
+    content: Option<&str>,
+) -> Option<(String, PathBuf)> {
+    raw_output
+        .and_then(parse_managed_agent_announcement)
+        .or_else(|| content.and_then(parse_managed_agent_announcement))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BackgroundAgentId(SharedString);
 
@@ -555,6 +574,40 @@ mod tests {
             path,
             PathBuf::from("/tmp/claude-1000/x/abc/tasks/a30f92a688e431edc.output")
         );
+    }
+
+    #[test]
+    fn managed_agent_announcement_falls_back_to_content_when_raw_output_null() {
+        // The real shape claude emits today: `raw_output` is null and the
+        // announcement rides in the tool_result body (the tool call's content).
+        let content = "````\n\
+             Async agent launched successfully. (This tool result is internal metadata.)\n\
+             agentId: a874596024f50661f (internal ID - do not mention to user.)\n\
+             The agent is working in the background.\n\
+             output_file: /tmp/claude-1000/-home-x/b618b048/tasks/a874596024f50661f.output\n\
+             ````";
+        let parsed = managed_agent_announcement(None, Some(content));
+        assert!(parsed.is_some(), "must parse the announcement out of content");
+        let (id, path) = parsed.unwrap();
+        assert_eq!(id, "a874596024f50661f");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/claude-1000/-home-x/b618b048/tasks/a874596024f50661f.output")
+        );
+    }
+
+    #[test]
+    fn managed_agent_announcement_prefers_raw_output_over_content() {
+        let raw = "agentId: a30f92a688e431edc\noutput_file: /tmp/raw/a30f92a688e431edc.output";
+        let content = "agentId: b111111111111111b\noutput_file: /tmp/content/b.output";
+        let (id, _) = managed_agent_announcement(Some(raw), Some(content)).unwrap();
+        assert_eq!(id, "a30f92a688e431edc", "raw_output wins when both present");
+    }
+
+    #[test]
+    fn managed_agent_announcement_none_when_neither_has_markers() {
+        assert!(managed_agent_announcement(None, None).is_none());
+        assert!(managed_agent_announcement(Some("no markers"), Some("also none")).is_none());
     }
 
     #[test]
