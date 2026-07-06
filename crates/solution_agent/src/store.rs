@@ -356,15 +356,20 @@ impl SubagentView {
     /// The per-source [`crate::stream::StreamId`] this view selects out of
     /// `SolutionSession.streams` (the maintained demux mirror the desktop
     /// render reads since phase 2c). `Main → StreamId::Main`,
-    /// `Task(toolu) → StreamId::Teammate(toolu)`. `Background`/`Shell` return
-    /// `None` — they source from disk (JSONL / `.output`), not the parent
-    /// thread demux. This is the single mapping the view's render, rewind, and
-    /// find paths all route through.
+    /// `Task(toolu) → StreamId::Teammate(toolu)`, and (phase 6d-A)
+    /// `Shell(id) → StreamId::Shell(id)` — the shell's derived, `Running`-only
+    /// stream, so the selected-shell body renders through the SAME
+    /// `selected_parent_stream_entries` path as Main/teammates instead of a
+    /// dedicated drill-in builder. `Background` still returns `None` — it
+    /// sources from a managed-agent JSONL on disk, not `session.streams`
+    /// (that fold is 6d-B). This is the single mapping the view's render,
+    /// rewind, and find paths all route through.
     pub fn parent_stream_id(&self) -> Option<crate::stream::StreamId> {
         match self {
             Self::Main => Some(crate::stream::StreamId::Main),
             Self::Task(id) => Some(crate::stream::StreamId::Teammate(id.clone())),
-            Self::Background(_) | Self::Shell(_) => None,
+            Self::Shell(id) => Some(crate::stream::StreamId::Shell(id.clone())),
+            Self::Background(_) => None,
         }
     }
 
@@ -6289,6 +6294,7 @@ impl SolutionAgentStore {
         title: SharedString,
         entries: Vec<crate::session_entry::SessionEntry>,
         live_teammates: bool,
+        live_shell: Option<String>,
         cx: &mut Context<Self>,
     ) -> SolutionSessionId {
         let session_id = SolutionSessionId::new();
@@ -6343,6 +6349,31 @@ impl SolutionAgentStore {
                     );
                     s.active_subagent_order.push(toolu);
                 }
+            }
+            if let Some(command) = live_shell {
+                // Phase 6d-A screenshot gate: register ONE `Running` shell with a
+                // synthetic snapshot so `rebuild_streams` folds it into
+                // `session.streams` as a `StreamId::Shell` tab. Debug-only path.
+                let shell_id = crate::background_shell::BackgroundShellId::new("seedshell");
+                s.background_shells.insert(
+                    shell_id.clone(),
+                    crate::background_shell::BackgroundShell {
+                        id: shell_id.clone(),
+                        command: SharedString::from(command),
+                        output_path: std::path::PathBuf::from("/tmp/sawe-seed-shell.output"),
+                        registered_at: chrono::Utc::now(),
+                        latest: Some(crate::background_shell::BackgroundShellSnapshot {
+                            mtime: std::time::SystemTime::now(),
+                            output_tail: SharedString::from(
+                                "seed shell output line 1\nseed shell output line 2\n",
+                            ),
+                        }),
+                        last_offset: 0,
+                        state: crate::background_shell::ShellRuntimeState::Running,
+                    },
+                );
+                s.background_shell_order.push(shell_id);
+                s.rebuild_streams();
             }
             s
         });
@@ -6851,6 +6882,10 @@ impl SolutionAgentStore {
                             },
                         );
                         s.background_shell_order.push(id_for_insert);
+                        // Phase 6d-A: the shell's derived `StreamId::Shell` tab
+                        // is produced by `rebuild_streams` from `background_shells`,
+                        // so every shell mutation must rebuild or the mirror drifts.
+                        s.rebuild_streams();
                     });
                     cx.emit(SolutionAgentStoreEvent::SessionBackgroundShellsChanged(
                         session_id,
@@ -7366,6 +7401,9 @@ impl SolutionAgentStore {
                     });
                 }
             }
+            // Phase 6d-A: refresh the derived Shell stream so its fenced body +
+            // mtime-based `seq` track the new tail.
+            s.rebuild_streams();
         });
         if changed {
             cx.emit(SolutionAgentStoreEvent::SessionBackgroundShellsChanged(
@@ -7421,7 +7459,7 @@ impl SolutionAgentStore {
             ) {
                 s.last_activity_at = Utc::now();
             }
-            Some(crate::db::BackgroundShellRow {
+            let row = crate::db::BackgroundShellRow {
                 solution_session_id: session_id.to_string(),
                 shell_id: shell.id.as_str().to_string(),
                 command: shell.command.to_string(),
@@ -7438,7 +7476,13 @@ impl SolutionAgentStore {
                         .map(|d| d.as_millis() as i64)
                 }),
                 state_text: new_state.to_state_text(),
-            })
+            };
+            // Phase 6d-A: a terminal flip (`Exited`/`Killed`) drops this shell
+            // from the derived stream mirror (only `Running` shells are folded
+            // in) — that IS the auto-close. Rebuild here now the `shell` borrow
+            // above has been released into the owned `row`.
+            s.rebuild_streams();
+            Some(row)
         });
         let Some(row) = row else {
             return;
@@ -7767,6 +7811,11 @@ impl SolutionAgentStore {
                         s.background_shells.remove(id);
                         s.background_shell_order.retain(|x| x != id);
                     }
+                    // Phase 6d-A: reaping a still-`Running`-but-stale shell drops
+                    // its derived stream; rebuild so the mirror matches the map.
+                    if !candidates.is_empty() {
+                        s.rebuild_streams();
+                    }
                     candidates
                 });
             if !to_remove.is_empty() {
@@ -7965,6 +8014,8 @@ impl SolutionAgentStore {
             if s.background_shells.remove(&id).is_some() {
                 s.background_shell_order.retain(|x| x != &id);
                 removed = true;
+                // Phase 6d-A: keep the derived stream mirror in sync on manual drop.
+                s.rebuild_streams();
             }
         });
         if !removed {
@@ -9362,24 +9413,27 @@ mod subagent_view_tests {
     }
 
     #[test]
-    fn subagent_view_parent_stream_id_maps_main_and_task() {
+    fn subagent_view_parent_stream_id_maps_main_task_and_shell() {
         use crate::stream::StreamId;
-        // Phase 2c: the desktop render resolves the selected view to a stream
-        // in `SolutionSession.streams` via this mapping. Main + Task select a
-        // parent-thread stream; drill-in views select none (they source from
-        // disk, not the demux mirror).
+        // Phase 2c/6d-A: the desktop render resolves the selected view to a
+        // stream in `SolutionSession.streams` via this mapping. Main + Task
+        // select a parent-thread stream; Shell selects its derived Shell stream
+        // (phase 6d-A). Only `Background` still sources from disk (JSONL), so it
+        // selects none.
         assert_eq!(SubagentView::Main.parent_stream_id(), Some(StreamId::Main));
         assert_eq!(
             SubagentView::Task("toolu_abc".into()).parent_stream_id(),
             Some(StreamId::Teammate("toolu_abc".into()))
         );
         assert_eq!(
-            SubagentView::Background(crate::background_agent::BackgroundAgentId::new("a30f"))
+            SubagentView::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"))
                 .parent_stream_id(),
-            None
+            Some(StreamId::Shell(crate::background_shell::BackgroundShellId::new(
+                "bvb4ful1z"
+            )))
         );
         assert_eq!(
-            SubagentView::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"))
+            SubagentView::Background(crate::background_agent::BackgroundAgentId::new("a30f"))
                 .parent_stream_id(),
             None
         );

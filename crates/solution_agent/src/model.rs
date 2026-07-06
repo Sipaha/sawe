@@ -752,6 +752,37 @@ impl SolutionSession {
                 }
             }
         }
+        // Phase 6d-A: fold each RUNNING background shell into the stream mirror
+        // as a `StreamId::Shell` tab, inserted AFTER Main + teammates (IndexMap
+        // insertion order) so shell pills sort last. Terminal (`Exited`/`Killed`)
+        // shells are SKIPPED — a shell stream exists only while `Running`, which
+        // is the product's auto-close (there is no dismissible terminal pill).
+        // Derived HERE (not injected anywhere else) so the next entries-driven
+        // rebuild can't wipe it; `background_shells` stays the source of truth.
+        // The label + body come from the `cx`-free `BackgroundShell` helpers, so
+        // this stays inside the `&mut self`/no-`cx` rebuild.
+        let shell_now = chrono::Utc::now();
+        for id in &self.background_shell_order {
+            let Some(shell) = self.background_shells.get(id) else {
+                continue;
+            };
+            if !matches!(
+                shell.state,
+                crate::background_shell::ShellRuntimeState::Running
+            ) {
+                continue;
+            }
+            let stream = crate::stream::Stream {
+                id: crate::stream::StreamId::Shell(id.clone()),
+                kind: crate::stream::StreamKind::Shell,
+                label: shell.stream_label(),
+                entries: vec![shell.stream_entry(shell_now)],
+                seq: 0,
+                state: crate::stream::StreamState::Live,
+                source: crate::stream::StreamSource::FileTail(shell.output_path.clone()),
+            };
+            streams.insert(crate::stream::StreamId::Shell(id.clone()), stream);
+        }
         // Per-stream `seq` = the stream's high-water mark on the `change_seq`
         // axis (max `mod_seq` of its entries). `push_coalesced` keeps this
         // coalesce-aware, so it advances on append AND on a coalesce-merge the
@@ -759,7 +790,8 @@ impl SolutionSession {
         // single axis is BOTH the descriptor watermark and the per-entry delta
         // cursor for the phase-4b wire. Monotonic per stream except across a
         // rewind/truncate, where the wire's `total_count` shrink drives the
-        // client's tail-truncate instead.
+        // client's tail-truncate instead. The shell streams inserted above pick
+        // up their `seq` from the derived entry's mtime-based `mod_seq` here too.
         for stream in streams.values_mut() {
             stream.seq = stream.entries.iter().map(|e| e.mod_seq).max().unwrap_or(0);
         }
@@ -1727,5 +1759,95 @@ mod tests {
                 assert!(w > 3, "watermark {w} must be strictly above max(mod_seq)=3");
             }
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6d-A — background shells folded into `streams` as Shell tabs
+    // -----------------------------------------------------------------------
+
+    fn insert_running_shell(s: &mut SolutionSession, id: &str, tail: Option<&str>) {
+        let shell_id = crate::background_shell::BackgroundShellId::new(id);
+        s.background_shells.insert(
+            shell_id.clone(),
+            crate::background_shell::BackgroundShell {
+                id: shell_id.clone(),
+                command: SharedString::from("echo hi"),
+                output_path: PathBuf::from("/tmp/x.output"),
+                registered_at: Utc::now(),
+                latest: tail.map(|t| crate::background_shell::BackgroundShellSnapshot {
+                    mtime: std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_720_000_000),
+                    output_tail: SharedString::from(t.to_string()),
+                }),
+                last_offset: 0,
+                state: crate::background_shell::ShellRuntimeState::Running,
+            },
+        );
+        s.background_shell_order.push(shell_id);
+    }
+
+    #[test]
+    fn rebuild_streams_folds_a_running_shell_into_a_shell_stream() {
+        use crate::stream::{StreamId, StreamKind, StreamState};
+        let mut s = build_session();
+        insert_running_shell(&mut s, "bvb4ful1z", Some("hello\n"));
+        s.rebuild_streams();
+
+        let sid = StreamId::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"));
+        let stream = s.streams.get(&sid).expect("running shell yields a Shell stream");
+        assert_eq!(stream.kind, StreamKind::Shell);
+        assert_eq!(stream.state, StreamState::Live);
+        assert_eq!(stream.entries.len(), 1, "one fenced-output entry");
+        // Shell streams sort AFTER Main (IndexMap insertion order = Main first).
+        let ids: Vec<&StreamId> = s.streams.keys().collect();
+        assert_eq!(ids.first(), Some(&&StreamId::Main));
+        assert_eq!(ids.last(), Some(&&sid));
+        // Per-stream `seq` picked up from the entry's mtime-based mod_seq.
+        assert_eq!(stream.seq, 1_720_000_000_000);
+    }
+
+    #[test]
+    fn rebuild_streams_auto_closes_a_terminal_shell() {
+        use crate::stream::StreamId;
+        let mut s = build_session();
+        insert_running_shell(&mut s, "bvb4ful1z", Some("hello\n"));
+        s.rebuild_streams();
+        let sid = StreamId::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"));
+        assert!(s.streams.contains_key(&sid), "running → present");
+
+        // Flip to a terminal state (as `mark_background_shell_state` would).
+        if let Some(shell) = s.background_shells.get_mut(
+            &crate::background_shell::BackgroundShellId::new("bvb4ful1z"),
+        ) {
+            shell.state = crate::background_shell::ShellRuntimeState::Exited(Some(0));
+        }
+        s.rebuild_streams();
+        assert!(
+            !s.streams.contains_key(&sid),
+            "a terminal shell is skipped → its stream auto-closes"
+        );
+        // Main is untouched.
+        assert!(s.streams.contains_key(&StreamId::Main));
+    }
+
+    #[test]
+    fn rebuild_streams_shell_streams_survive_an_entries_driven_rebuild() {
+        // The shell stream is DERIVED from `background_shells`, so a rebuild that
+        // also demuxes fresh `entries` must not wipe it.
+        use crate::stream::StreamId;
+        let mut s = build_session();
+        insert_running_shell(&mut s, "bvb4ful1z", Some("out\n"));
+        s.entries = vec![SessionEntry {
+            created_ms: 0,
+            mod_seq: 1,
+            subagent_id: None,
+            kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                chunks: vec![crate::session_entry::AssistantChunk::Message("main".into())],
+            },
+        }];
+        s.rebuild_streams();
+        let sid = StreamId::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"));
+        assert!(s.streams.contains_key(&sid), "shell survives an entries rebuild");
+        assert!(!s.streams[&StreamId::Main].entries.is_empty(), "Main demux still ran");
     }
 }

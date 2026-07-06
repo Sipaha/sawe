@@ -213,50 +213,63 @@ fn next_selection_after_background_change_passes_through_main_and_task() {
     );
 }
 
-fn make_background_shell(id: &str) -> crate::background_shell::BackgroundShell {
-    crate::background_shell::BackgroundShell {
-        id: crate::background_shell::BackgroundShellId::new(id),
-        command: SharedString::from("sleep 100"),
-        output_path: std::path::PathBuf::from("/dev/null"),
-        registered_at: chrono::Utc::now(),
-        latest: None,
-        last_offset: 0,
-        state: crate::background_shell::ShellRuntimeState::Running,
-    }
+/// Add a `StreamId::Shell` stream (as `rebuild_streams` would derive it for a
+/// `Running` shell) into a streams map, so the phase-6d-A selection snap sees
+/// the shell "present".
+fn with_shell_stream(
+    mut streams: indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream>,
+    id: &str,
+) -> indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream> {
+    use crate::stream::{Stream, StreamId, StreamKind, StreamSource, StreamState};
+    let bsid = crate::background_shell::BackgroundShellId::new(id);
+    streams.insert(
+        StreamId::Shell(bsid.clone()),
+        Stream {
+            id: StreamId::Shell(bsid),
+            kind: StreamKind::Shell,
+            label: SharedString::from(format!("{id}·cmd")),
+            entries: Vec::new(),
+            seq: 0,
+            state: StreamState::Live,
+            source: StreamSource::FileTail(std::path::PathBuf::from("/dev/null")),
+        },
+    );
+    streams
 }
 
 #[test]
-fn next_selection_after_shells_change_snaps_stale_shell_to_main() {
-    // Stale Shell id: the shell exited / was reaped and is no longer in
-    // the session map. Renderer would paint empty; this snap fires off
-    // the `SessionBackgroundShellsChanged` handler and restores Main.
+fn next_selection_after_change_snaps_stale_shell_to_main() {
+    // Phase 6d-A: a shell stream exists only while `Running`; when it
+    // auto-closes (terminal) or is reaped, its `StreamId::Shell` drops out of
+    // `streams`. The `SessionBackgroundShellsChanged` handler routes through
+    // `next_selection_after_change`, which then snaps the selection to Main.
     let stale = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
-    let shells = HashMap::new();
-    let next = SolutionSessionView::next_selection_after_shells_change(
+    let streams = streams_with_teammates(&["toolu_a"]); // no shell stream present
+    let next = SolutionSessionView::next_selection_after_change(
         &SubagentView::Shell(stale),
-        &shells,
+        &streams,
     );
     assert_eq!(next, SubagentView::Main);
 }
 
 #[test]
-fn next_selection_after_shells_change_keeps_live_shell() {
+fn next_selection_after_change_keeps_live_shell() {
+    // The selected shell's `StreamId::Shell` is still present (Running) → kept.
     let id = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
-    let mut shells = HashMap::new();
-    shells.insert(id.clone(), make_background_shell("bvb4ful1z"));
-    let next = SolutionSessionView::next_selection_after_shells_change(
+    let streams = with_shell_stream(streams_with_teammates(&[]), "bvb4ful1z");
+    let next = SolutionSessionView::next_selection_after_change(
         &SubagentView::Shell(id.clone()),
-        &shells,
+        &streams,
     );
     assert_eq!(next, SubagentView::Shell(id));
 }
 
 #[test]
-fn next_selection_after_change_preserves_shell_view() {
-    // Shell views render a background shell's live-tailed output, so a
-    // change in the Task subagent set must not perturb them.
+fn next_selection_after_change_preserves_shell_view_when_stream_present() {
+    // A change in the teammate set must not perturb a selected shell whose
+    // stream is still live.
     let shell_id = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
-    let streams = streams_with_teammates(&["toolu_a"]);
+    let streams = with_shell_stream(streams_with_teammates(&["toolu_a"]), "bvb4ful1z");
     let next = SolutionSessionView::next_selection_after_change(
         &SubagentView::Shell(shell_id.clone()),
         &streams,
@@ -316,113 +329,11 @@ fn unpack_recalled_bundle_handles_more_images_than_placeholders() {
     assert_eq!(images[0].label.as_ref(), "image #?");
 }
 
-// ---------------------------------------------------------------------------
-// Task 13 — Shell drill-in body
-// ---------------------------------------------------------------------------
-
-/// Pull the single `Markdown` source string out of the one
-/// `AssistantMessage` `build_shell_drill_in_entries` produces. Panics in
-/// test code (fine) if the shape isn't the expected single-chunk message.
-fn shell_entry_markdown(entries: &[acp_thread::AgentThreadEntry], cx: &gpui::App) -> String {
-    assert_eq!(entries.len(), 1, "shell drill-in builds exactly one entry");
-    let acp_thread::AgentThreadEntry::AssistantMessage(message) = &entries[0] else {
-        panic!("expected AssistantMessage, got {:?}", entries[0]);
-    };
-    assert_eq!(message.chunks.len(), 1, "single markdown chunk");
-    let acp_thread::AssistantMessageChunk::Message {
-        block: acp_thread::ContentBlock::Markdown { markdown },
-    } = &message.chunks[0]
-    else {
-        panic!("expected a Markdown Message chunk");
-    };
-    markdown.read(cx).source().to_string()
-}
-
-#[gpui::test]
-async fn build_shell_drill_in_entries_live_shell_renders_tail(cx: &mut gpui::TestAppContext) {
-    let mtime = std::time::SystemTime::now();
-    let shell = crate::background_shell::BackgroundShell {
-        id: crate::background_shell::BackgroundShellId::new("bvb4ful1z"),
-        command: SharedString::from("echo hello"),
-        output_path: std::path::PathBuf::from("/dev/null"),
-        registered_at: chrono::Utc::now(),
-        latest: Some(crate::background_shell::BackgroundShellSnapshot {
-            mtime,
-            output_tail: SharedString::from("hello world"),
-        }),
-        last_offset: 0,
-        state: crate::background_shell::ShellRuntimeState::Running,
-    };
-    let now = chrono::Utc::now();
-    let source = cx.update(|cx| {
-        let entries = super::build_shell_drill_in_entries(&shell, now, cx);
-        shell_entry_markdown(&entries, cx)
-    });
-    // Header carries the command, "running" state, and the short id.
-    assert!(
-        source.contains("echo hello"),
-        "header has command: {source}"
-    );
-    assert!(source.contains("running"), "header has state: {source}");
-    assert!(
-        source.contains("bvb4ful1z"),
-        "header has short id: {source}"
-    );
-    // Body carries the stdout tail inside a fenced code block.
-    assert!(
-        source.contains("hello world"),
-        "body has the tail: {source}"
-    );
-    assert!(source.contains("```"), "body is fenced: {source}");
-}
-
-#[gpui::test]
-async fn build_shell_drill_in_entries_no_snapshot_shows_placeholder(cx: &mut gpui::TestAppContext) {
-    let shell = make_background_shell("bvb4ful1z"); // latest: None
-    let now = chrono::Utc::now();
-    let source = cx.update(|cx| {
-        let entries = super::build_shell_drill_in_entries(&shell, now, cx);
-        shell_entry_markdown(&entries, cx)
-    });
-    assert!(
-        source.contains("No output captured yet."),
-        "muted placeholder body: {source}"
-    );
-}
-
-#[gpui::test]
-async fn build_shell_drill_in_entries_exited_state_label(cx: &mut gpui::TestAppContext) {
-    let mut shell = make_background_shell("bvb4ful1z");
-    shell.state = crate::background_shell::ShellRuntimeState::Exited(Some(137));
-    shell.latest = Some(crate::background_shell::BackgroundShellSnapshot {
-        mtime: std::time::SystemTime::now(),
-        output_tail: SharedString::from("done"),
-    });
-    let now = chrono::Utc::now();
-    let source = cx.update(|cx| {
-        let entries = super::build_shell_drill_in_entries(&shell, now, cx);
-        shell_entry_markdown(&entries, cx)
-    });
-    assert!(
-        source.contains("exited (137)"),
-        "exit code in state label: {source}"
-    );
-}
-
-#[gpui::test]
-async fn build_shell_drill_in_entries_stale_running_label(cx: &mut gpui::TestAppContext) {
-    // Running but with no fresh snapshot → flagged "running (stale)".
-    let shell = make_background_shell("bvb4ful1z"); // Running, latest: None
-    let now = chrono::Utc::now();
-    let source = cx.update(|cx| {
-        let entries = super::build_shell_drill_in_entries(&shell, now, cx);
-        shell_entry_markdown(&entries, cx)
-    });
-    assert!(
-        source.contains("running (stale)"),
-        "stale running label: {source}"
-    );
-}
+// The Shell drill-in body is now the derived `StreamId::Shell` stream entry,
+// built cx-free by `BackgroundShell::stream_entry` (phase 6d-A) — its content
+// (fenced tail / "No output captured yet." / state labels) is covered by the
+// unit tests in `background_shell.rs`, so the old `build_shell_drill_in_entries`
+// Markdown-shape tests (Task 13) were removed with that function.
 
 /// Phase 2c render-flip, drawn end-to-end: the virtualized `list_state` must be
 /// sized to the SELECTED stream's entry count, NOT the flat `session.entries`

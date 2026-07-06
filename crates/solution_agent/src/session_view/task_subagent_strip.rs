@@ -12,10 +12,11 @@
 //! "Main" pill would just waste a row of vertical space. Teammate tabs
 //! iterate `session.streams` in map order (phase 6c — insertion order
 //! matches teammate first-appearance, so tab order stays stable across
-//! renders). Background-agent / background-shell pills still iterate
-//! `background_agent_order` / `background_shell_order` (NOT the HashMaps
-//! directly) so their order matches spawn order; the HashMaps on their
-//! own have random hash-seed iteration order.
+//! renders). Background-SHELL pills also iterate `session.streams` now
+//! (phase 6d-A — shells are folded into the mirror as `StreamId::Shell`
+//! tabs, only while `Running`). Background-AGENT pills still iterate
+//! `background_agent_order` (NOT the HashMap directly) so their order
+//! matches spawn order — that fold is 6d-B.
 //!
 //! Inline Task pills deliberately omit a per-tab close button: per the
 //! plan, tabs disappear naturally when the parent `Task` ToolCall
@@ -27,7 +28,6 @@
 //! after a much longer linger window. `Done` pills (terminal
 //! stop_reason observed) auto-disappear and never render at all.
 
-use chrono::{DateTime, Utc};
 use gpui::{AnyElement, Entity, IntoElement, ParentElement, SharedString, Styled};
 use std::time::{Duration, SystemTime};
 use ui::prelude::*;
@@ -35,7 +35,7 @@ use ui::{Icon, IconName, IconSize, Label, LabelSize, Tooltip};
 
 use super::SolutionSessionView;
 use crate::background_agent::{BackgroundAgentId, BackgroundAgentSnapshot};
-use crate::background_shell::{BackgroundShellId, BackgroundShellSnapshot, ShellRuntimeState};
+use crate::background_shell::BackgroundShellId;
 use crate::model::SolutionSession;
 use crate::store::SubagentView;
 
@@ -98,29 +98,20 @@ pub(super) fn render_task_subagent_strip(
         })
         .filter(|(_, _, state)| *state != BackgroundAgentDisplayState::Done)
         .collect();
-    // Background-shell pill snapshot. Same up-front-collection rationale as
-    // `tabs` / `bg_agents`: the classifier borrows `session_ref`, but the
-    // listeners want owned `'static` data. Unlike agents, shells have no
-    // auto-hidden "Done" state — terminal shells stay in the strip (with a ×)
-    // until manually dismissed, so nothing is filtered out here.
-    let bg_shells: Vec<(BackgroundShellId, SharedString, ShellDisplayState)> = session_ref
-        .background_shell_order
+    // Background-shell pills (phase 6d-A): sourced from the derived
+    // `StreamId::Shell` streams in `session.streams` (a shell stream exists only
+    // while `Running`, so terminal shells have already auto-closed and drop out
+    // here — no `ShellDisplayState`, no × affordance). Insertion order in
+    // `streams` matches `background_shell_order`, so pill order stays stable.
+    let shell_streams: Vec<(BackgroundShellId, SharedString)> = session_ref
+        .streams
         .iter()
-        .filter_map(|id| {
-            session_ref.background_shells.get(id).map(|shell| {
-                let display_state = classify_background_shell_display(
-                    &shell.state,
-                    shell.latest.as_ref(),
-                    shell.registered_at,
-                    now,
-                    stale,
-                );
-                let label = shell_pill_label(id, &shell.command);
-                (id.clone(), label, display_state)
-            })
+        .filter_map(|(id, stream)| match id {
+            crate::stream::StreamId::Shell(bsid) => Some((bsid.clone(), stream.label.clone())),
+            _ => None,
         })
         .collect();
-    if tabs.is_empty() && bg_agents.is_empty() && bg_shells.is_empty() {
+    if tabs.is_empty() && bg_agents.is_empty() && shell_streams.is_empty() {
         return None;
     }
     let selected = view.selected_subagent.clone();
@@ -202,16 +193,14 @@ pub(super) fn render_task_subagent_strip(
             },
         ));
     }
-    for (id, label, state) in bg_shells {
+    for (id, label) in shell_streams {
         let is_active = matches!(&selected, SubagentView::Shell(s) if s == &id);
         let id_for_listener = id.clone();
-        let id_for_close = id.clone();
         let pill_id = SharedString::from(format!("task-subagent-strip-shell-{}", id));
-        row = row.child(background_shell_pill(
+        row = row.child(shell_pill(
             pill_id,
             label,
             is_active,
-            state,
             cx,
             move |this, _, _, cx| {
                 let next = SubagentView::Shell(id_for_listener.clone());
@@ -219,14 +208,6 @@ pub(super) fn render_task_subagent_strip(
                     this.selected_subagent = next;
                     cx.notify();
                 }
-            },
-            move |this, _, _, cx| {
-                let id = id_for_close.clone();
-                let session_id = this.session_id();
-                let store = crate::store::SolutionAgentStore::global(cx);
-                store.update(cx, |store, cx| {
-                    store.remove_background_shell(session_id, id, cx);
-                });
             },
         ));
     }
@@ -404,85 +385,16 @@ where
     pill_row.into_any_element()
 }
 
-/// Visual classification for a background-shell pill. Unlike the
-/// background-agent classifier there is no auto-hidden `Done` state: a
-/// terminal shell (`Exited`/`Killed`) keeps an explicit, colour-coded pill
-/// (with a × to dismiss) so the user can still drill into its output.
-///
-///   - `Running`: process still alive and its output was touched within the
-///     stale window. Accent pill.
-///   - `Exited(code)` / `Killed`: terminal states, surfaced verbatim with a ×.
-///   - `Stale`: still nominally `Running`, but no output activity for longer
-///     than the stale timeout — likely wedged. Warning-tinted + dismissible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShellDisplayState {
-    Running,
-    Exited(Option<i32>),
-    Killed,
-    Stale,
-}
-
-/// Pure classifier extracted from the render path so it's unit-testable
-/// without booting a GPUI context. Terminal `state` values pass through; a
-/// `Running` shell is `Stale` when its last-activity age (the snapshot mtime
-/// if present, else `registered_at`) exceeds `stale`, otherwise `Running`.
-pub(crate) fn classify_background_shell_display(
-    state: &ShellRuntimeState,
-    latest: Option<&BackgroundShellSnapshot>,
-    registered_at: DateTime<Utc>,
-    now: SystemTime,
-    stale: Duration,
-) -> ShellDisplayState {
-    match state {
-        ShellRuntimeState::Exited(code) => return ShellDisplayState::Exited(*code),
-        ShellRuntimeState::Killed => return ShellDisplayState::Killed,
-        ShellRuntimeState::Running => {}
-    }
-    // Last-activity instant: the snapshot mtime when we've tailed output,
-    // otherwise the registration time (a shell that never wrote output).
-    let last_activity = match latest {
-        Some(snap) => snap.mtime,
-        None => {
-            let secs = registered_at.timestamp().max(0) as u64;
-            SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-        }
-    };
-    let elapsed = now.duration_since(last_activity).unwrap_or_default();
-    if elapsed > stale {
-        ShellDisplayState::Stale
-    } else {
-        ShellDisplayState::Running
-    }
-}
-
-/// Build the pill label: `<short-id>·<command>`, with the command truncated to
-/// ~24 chars (the strip is narrow). The `Label` element also truncates on
-/// layout, but pre-trimming keeps the tooltip / element string short.
-fn shell_pill_label(id: &BackgroundShellId, command: &str) -> SharedString {
-    const CMD_CAP: usize = 24;
-    let cmd: String = if command.chars().count() > CMD_CAP {
-        let truncated: String = command.chars().take(CMD_CAP).collect();
-        format!("{truncated}…")
-    } else {
-        command.to_string()
-    };
-    SharedString::from(format!("{}·{}", id.short(), cmd))
-}
-
-/// One background-shell pill. Mirrors [`background_pill`] but prefixed with a
-/// terminal icon and coloured by [`ShellDisplayState`]. A × close affordance is
-/// shown for terminal/stale shells (`Exited`/`Killed`/`Stale`); a live
-/// `Running` shell has no × (it disappears via the terminal-state transition,
-/// not manual dismissal).
-#[allow(clippy::too_many_arguments)]
-fn background_shell_pill<F, G>(
+/// One background-shell pill (phase 6d-A). A shell stream exists only while
+/// `Running` (terminal shells auto-close and drop out of `session.streams`), so
+/// there is no per-state colouring and no × close affordance — just a bordered,
+/// terminal-icon-prefixed, accent pill mirroring [`background_pill`]'s shape.
+fn shell_pill<F>(
     id: SharedString,
     label: SharedString,
     is_active: bool,
-    state: ShellDisplayState,
     cx: &mut Context<SolutionSessionView>,
     on_click: F,
-    on_close: G,
 ) -> AnyElement
 where
     F: Fn(
@@ -491,47 +403,15 @@ where
             &mut Window,
             &mut Context<SolutionSessionView>,
         ) + 'static,
-    G: Fn(
-            &mut SolutionSessionView,
-            &gpui::ClickEvent,
-            &mut Window,
-            &mut Context<SolutionSessionView>,
-        ) + 'static,
 {
     let colors = cx.theme().colors();
-    let label_color = match state {
-        ShellDisplayState::Running => {
-            if is_active {
-                Color::Default
-            } else {
-                Color::Accent
-            }
-        }
-        ShellDisplayState::Exited(Some(0)) => Color::Success,
-        ShellDisplayState::Exited(_) => Color::Error,
-        ShellDisplayState::Killed => Color::Conflict,
-        ShellDisplayState::Stale => Color::Warning,
-    };
-    let border_color = if is_active {
-        colors.element_selected
+    let (label_color, border_color) = if is_active {
+        (Color::Default, colors.element_selected)
     } else {
-        match state {
-            ShellDisplayState::Running => colors.border,
-            ShellDisplayState::Exited(Some(0)) => cx.theme().status().success,
-            ShellDisplayState::Exited(_) => cx.theme().status().error,
-            ShellDisplayState::Killed => cx.theme().status().conflict,
-            ShellDisplayState::Stale => cx.theme().status().warning,
-        }
+        (Color::Accent, colors.border)
     };
-    let show_close = matches!(
-        state,
-        ShellDisplayState::Exited(_) | ShellDisplayState::Killed | ShellDisplayState::Stale
-    );
     let tooltip_text = SharedString::from(format!("Show {}", label));
-    // Per-pill unique id for the × button: a constant id would collide
-    // across multiple terminal/stale shell pills (duplicate ElementId).
-    let close_id = SharedString::from(format!("{id}-close"));
-    let mut pill_row = h_flex()
+    h_flex()
         .id(id)
         .flex_none()
         .h(px(24.0))
@@ -556,18 +436,8 @@ where
                 .size(LabelSize::Small)
                 .color(label_color)
                 .truncate(),
-        );
-    if show_close {
-        pill_row = pill_row.child(
-            h_flex()
-                .id(close_id)
-                .flex_none()
-                .px_1()
-                .child(Label::new("×").size(LabelSize::Small).color(Color::Muted))
-                .on_click(cx.listener(on_close)),
-        );
-    }
-    pill_row.into_any_element()
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -654,129 +524,4 @@ mod classifier_tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Task 12 — classify_background_shell_display
-    // -----------------------------------------------------------------------
-
-    fn shell_snap(mtime: SystemTime) -> BackgroundShellSnapshot {
-        BackgroundShellSnapshot {
-            mtime,
-            output_tail: SharedString::from("…"),
-        }
-    }
-
-    #[test]
-    fn shell_classifier_exited_zero() {
-        assert_eq!(
-            classify_background_shell_display(
-                &ShellRuntimeState::Exited(Some(0)),
-                None,
-                Utc::now(),
-                SystemTime::now(),
-                Duration::from_secs(120),
-            ),
-            ShellDisplayState::Exited(Some(0)),
-        );
-    }
-
-    #[test]
-    fn shell_classifier_exited_nonzero() {
-        assert_eq!(
-            classify_background_shell_display(
-                &ShellRuntimeState::Exited(Some(2)),
-                Some(&shell_snap(SystemTime::now())),
-                Utc::now(),
-                SystemTime::now(),
-                Duration::from_secs(120),
-            ),
-            ShellDisplayState::Exited(Some(2)),
-        );
-    }
-
-    #[test]
-    fn shell_classifier_killed() {
-        assert_eq!(
-            classify_background_shell_display(
-                &ShellRuntimeState::Killed,
-                None,
-                Utc::now(),
-                SystemTime::now(),
-                Duration::from_secs(120),
-            ),
-            ShellDisplayState::Killed,
-        );
-    }
-
-    #[test]
-    fn shell_classifier_running_fresh() {
-        assert_eq!(
-            classify_background_shell_display(
-                &ShellRuntimeState::Running,
-                Some(&shell_snap(SystemTime::now())),
-                Utc::now(),
-                SystemTime::now(),
-                Duration::from_secs(120),
-            ),
-            ShellDisplayState::Running,
-        );
-    }
-
-    #[test]
-    fn shell_classifier_running_old_activity_is_stale() {
-        assert_eq!(
-            classify_background_shell_display(
-                &ShellRuntimeState::Running,
-                Some(&shell_snap(SystemTime::now() - Duration::from_secs(300))),
-                Utc::now(),
-                SystemTime::now(),
-                Duration::from_secs(120),
-            ),
-            ShellDisplayState::Stale,
-        );
-    }
-
-    #[test]
-    fn shell_classifier_running_no_snapshot_old_registration_is_stale() {
-        // No snapshot → fall back to registered_at; an old registration with
-        // no output is a wedged shell that never wrote anything.
-        assert_eq!(
-            classify_background_shell_display(
-                &ShellRuntimeState::Running,
-                None,
-                Utc::now() - chrono::Duration::seconds(300),
-                SystemTime::now(),
-                Duration::from_secs(120),
-            ),
-            ShellDisplayState::Stale,
-        );
-    }
-
-    #[test]
-    fn shell_classifier_running_no_snapshot_fresh_registration_is_running() {
-        assert_eq!(
-            classify_background_shell_display(
-                &ShellRuntimeState::Running,
-                None,
-                Utc::now(),
-                SystemTime::now(),
-                Duration::from_secs(120),
-            ),
-            ShellDisplayState::Running,
-        );
-    }
-
-    #[test]
-    fn shell_pill_label_truncates_long_command() {
-        let id = BackgroundShellId::new("bvb4ful1z");
-        let label = shell_pill_label(&id, "cargo build --bin sawe --profile release-fast");
-        assert!(label.starts_with("bvb4ful1z·"));
-        assert!(label.ends_with('…'));
-    }
-
-    #[test]
-    fn shell_pill_label_keeps_short_command() {
-        let id = BackgroundShellId::new("abc");
-        let label = shell_pill_label(&id, "ls -la");
-        assert_eq!(label.as_ref(), "abc·ls -la");
-    }
 }

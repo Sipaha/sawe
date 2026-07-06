@@ -26,6 +26,8 @@ use serde_json::Value;
 use chrono::{DateTime, Utc};
 use gpui::SharedString;
 
+use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+
 /// Opaque identifier assigned by Claude Code to a background shell task.
 /// Short random token (e.g. `bvb4ful1z`), not a hex digest.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -102,6 +104,99 @@ pub struct BackgroundShellSnapshot {
     pub mtime: SystemTime,
     /// Trailing chunk of the shell's stdout/stderr, capped (later task).
     pub output_tail: SharedString,
+}
+
+impl BackgroundShell {
+    /// The strip/tab label for this shell's derived `StreamId::Shell` stream:
+    /// `<short-id>·<command>`, command truncated to ~24 chars (the strip is
+    /// narrow). Moved here from the desktop strip (phase 6d-A) so
+    /// `SolutionSession::rebuild_streams` — which is `cx`-free — can stamp
+    /// `Stream::label` from the same logic the old pill used.
+    pub fn stream_label(&self) -> SharedString {
+        const CMD_CAP: usize = 24;
+        let cmd: String = if self.command.chars().count() > CMD_CAP {
+            let truncated: String = self.command.chars().take(CMD_CAP).collect();
+            format!("{truncated}…")
+        } else {
+            self.command.to_string()
+        };
+        SharedString::from(format!("{}·{}", self.id.short(), cmd))
+    }
+
+    /// Convert this shell's last-observed snapshot into the single
+    /// fenced-output [`SessionEntry`] that is the body of its derived
+    /// `StreamId::Shell` stream (phase 6d-A). Mirrors the content the retired
+    /// `session_view::build_shell_drill_in_entries` produced, but as plain data
+    /// (no `Markdown` entity), so it is `cx`-free and can run inside
+    /// `SolutionSession::rebuild_streams`.
+    ///
+    /// `created_ms` and `mod_seq` both derive from the snapshot mtime (unix-ms;
+    /// `0` when there is no snapshot yet). mtime advances every time the shell
+    /// writes output, so a per-stream `seq` keyed on the entry `mod_seq` bumps
+    /// when the tail changes — that is the delta cursor the 6d-B wire will read.
+    /// `now` feeds only the human "observed X ago" header line and is a
+    /// parameter (not `Utc::now()` inline) so tests stay deterministic.
+    pub fn stream_entry(&self, now: DateTime<Utc>) -> SessionEntry {
+        let state_label = match (&self.state, self.latest.is_none()) {
+            // A shell still "running" but with no fresh snapshot is flagged
+            // stale so the body matches the old strip pill's wording.
+            (ShellRuntimeState::Running, true) => "running (stale)".to_string(),
+            (ShellRuntimeState::Running, false) => "running".to_string(),
+            (ShellRuntimeState::Exited(Some(code)), _) => format!("exited ({code})"),
+            (ShellRuntimeState::Exited(None), _) => "exited".to_string(),
+            (ShellRuntimeState::Killed, _) => "killed".to_string(),
+        };
+        let observed = match &self.latest {
+            Some(snapshot) => shell_relative_time(snapshot.mtime, now),
+            None => "no output yet".to_string(),
+        };
+        let header = format!(
+            "`{}` · {} · {} · {}",
+            self.command,
+            state_label,
+            observed,
+            self.id.short()
+        );
+        let body = match &self.latest {
+            Some(snapshot) => format!("```\n{}\n```", snapshot.output_tail),
+            None => "_No output captured yet._".to_string(),
+        };
+        let text = format!("{header}\n\n{body}");
+        let ms = self
+            .latest
+            .as_ref()
+            .and_then(|snap| snap.mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|dur| dur.as_millis() as u64);
+        SessionEntry {
+            created_ms: ms.map(|m| m as i64).unwrap_or(0),
+            mod_seq: ms.unwrap_or(0),
+            subagent_id: None,
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text)],
+            },
+        }
+    }
+}
+
+/// "X ago" formatter for a shell snapshot's `SystemTime` mtime. Converts to a
+/// UTC `DateTime` and formats relative to `now`; an mtime before the epoch
+/// (clock skew) or in the future degrades to `"just now"`. Lives here (moved
+/// from `session_view` with the shell drill-in in phase 6d-A) so the `cx`-free
+/// `stream_entry` normalizer can reuse it.
+fn shell_relative_time(mtime: SystemTime, now: DateTime<Utc>) -> String {
+    let secs = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(dur) => now.timestamp().saturating_sub(dur.as_secs() as i64).max(0),
+        Err(_) => return "just now".to_string(),
+    };
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
 }
 
 static SHELL_ID_RE: OnceLock<Regex> = OnceLock::new();
@@ -509,5 +604,91 @@ mod tests {
         let result = tail_output(std::path::Path::new("/nonexistent/path/foo.output"), 0);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6d-A — stream_label / stream_entry (the derived Shell stream)
+    // -----------------------------------------------------------------------
+
+    fn running_shell(command: &str, tail: Option<&str>) -> BackgroundShell {
+        BackgroundShell {
+            id: BackgroundShellId::new("bvb4ful1z"),
+            command: SharedString::from(command.to_string()),
+            output_path: PathBuf::from("/tmp/claude/tasks/bvb4ful1z.output"),
+            registered_at: chrono::Utc::now(),
+            latest: tail.map(|t| BackgroundShellSnapshot {
+                mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_720_000_000),
+                output_tail: SharedString::from(t.to_string()),
+            }),
+            last_offset: 0,
+            state: ShellRuntimeState::Running,
+        }
+    }
+
+    #[test]
+    fn stream_label_truncates_long_command() {
+        let shell = running_shell("cargo build --bin sawe --profile release-fast", None);
+        let label = shell.stream_label();
+        assert!(label.starts_with("bvb4ful1z·"));
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn stream_label_keeps_short_command() {
+        let mut shell = running_shell("ls -la", None);
+        shell.id = BackgroundShellId::new("abc");
+        assert_eq!(shell.stream_label().as_ref(), "abc·ls -la");
+    }
+
+    #[test]
+    fn stream_entry_with_snapshot_fences_output_and_derives_seq_from_mtime() {
+        let shell = running_shell("echo hi", Some("hello\nworld\n"));
+        let entry = shell.stream_entry(chrono::Utc::now());
+        assert!(entry.subagent_id.is_none());
+        // mtime = 1_720_000_000 s → unix-ms; both created_ms and mod_seq derive
+        // from it so a per-stream seq advances when the tail (and mtime) change.
+        assert_eq!(entry.mod_seq, 1_720_000_000_000);
+        assert_eq!(entry.created_ms, 1_720_000_000_000);
+        let SessionEntryKind::AssistantMessage { chunks } = &entry.kind else {
+            panic!("expected AssistantMessage");
+        };
+        let AssistantChunk::Message(text) = &chunks[0] else {
+            panic!("expected a plain Message chunk");
+        };
+        assert!(text.contains("```\nhello\nworld\n\n```"));
+        assert!(text.contains("`echo hi`"));
+    }
+
+    #[test]
+    fn stream_entry_exited_state_label_carries_exit_code() {
+        // A shell whose stream is derived after a terminal flip (rare — terminal
+        // shells are usually skipped by `rebuild_streams`) still labels its exit
+        // code, preserving the old drill-in wording.
+        let mut shell = running_shell("make", Some("done\n"));
+        shell.state = ShellRuntimeState::Exited(Some(137));
+        let entry = shell.stream_entry(chrono::Utc::now());
+        let SessionEntryKind::AssistantMessage { chunks } = &entry.kind else {
+            panic!("expected AssistantMessage");
+        };
+        let AssistantChunk::Message(text) = &chunks[0] else {
+            panic!("expected a plain Message chunk");
+        };
+        assert!(text.contains("exited (137)"), "state label: {text}");
+    }
+
+    #[test]
+    fn stream_entry_without_snapshot_is_no_output_and_zero_seq() {
+        let shell = running_shell("sleep 60", None);
+        let entry = shell.stream_entry(chrono::Utc::now());
+        assert_eq!(entry.mod_seq, 0);
+        assert_eq!(entry.created_ms, 0);
+        let SessionEntryKind::AssistantMessage { chunks } = &entry.kind else {
+            panic!("expected AssistantMessage");
+        };
+        let AssistantChunk::Message(text) = &chunks[0] else {
+            panic!("expected a plain Message chunk");
+        };
+        assert!(text.contains("_No output captured yet._"));
+        assert!(text.contains("running (stale)"));
     }
 }

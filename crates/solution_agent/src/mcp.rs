@@ -410,6 +410,10 @@ pub(crate) fn build_streams_vec(session: &SolutionSession) -> Vec<StreamDto> {
     session
         .streams
         .values()
+        // 6d-A: shells are in the model + desktop strip but held off the wire
+        // until the 6d-B `wire_schema_version` 3→4 bump ships with the mobile
+        // lockstep — so a v3 client keeps seeing exactly Main + teammates.
+        .filter(|stream| !matches!(stream.kind, crate::stream::StreamKind::Shell))
         .map(StreamDto::from_stream)
         .collect()
 }
@@ -1631,10 +1635,17 @@ impl McpServerTool for GetSessionTool {
             // `None` ⇒ Main. A stream the client asked for that has since
             // closed / never existed serves an empty transcript — the `streams`
             // descriptor list below still reveals what streams actually exist.
+            //
+            // 6d-A: a `Shell(...)` stream_id is coerced to Main so a v3 client
+            // can't select a shell stream over the wire (shells are held off the
+            // wire until 6d-B); its entries would be a shape a v3 client doesn't
+            // expect. The Shell streams are also absent from `build_streams_vec`,
+            // so the client never learns a shell stream_id to ask for.
             let selected = input
                 .stream_id
                 .as_ref()
                 .map(StreamIdDto::to_model)
+                .filter(|id| !matches!(id, crate::stream::StreamId::Shell(_)))
                 .unwrap_or(crate::stream::StreamId::Main);
             let selected_stream = session.streams.get(&selected);
             let (entries, total_count) = {
@@ -1905,10 +1916,15 @@ impl McpServerTool for GetSessionChangesTool {
             // stream the client asked for that has since closed / never existed
             // yields an empty delta — the `streams` descriptor list below reveals
             // what streams actually exist so the client can re-select.
+            //
+            // 6d-A: a `Shell(...)` stream_id is coerced to Main (shells are held
+            // off the wire until 6d-B); `selected_stream_id` below then reports
+            // Main, so the wire contract is unchanged.
             let selected = input
                 .stream_id
                 .as_ref()
                 .map(StreamIdDto::to_model)
+                .filter(|id| !matches!(id, crate::stream::StreamId::Shell(_)))
                 .unwrap_or(crate::stream::StreamId::Main);
             let selected_stream_id = StreamIdDto::from_model(&selected);
             let selected_stream = session.streams.get(&selected);
@@ -5281,6 +5297,12 @@ pub struct SeedColdSessionParams {
     /// `session.streams` AND in `active_subagents`, so without this the pill is
     /// (correctly) hidden. Default false = the finished/cold-load render state.
     pub live_teammates: bool,
+    /// When set to a command string, register ONE `Running` background shell on
+    /// the seeded session (phase 6d-A) so its derived `StreamId::Shell` tab
+    /// paints in the desktop strip and drill-in — lets the screenshot gate
+    /// exercise a live shell stream without a real `Bash(run_in_background)`
+    /// launch. Omitted = no shell. Debug/screenshot-only.
+    pub live_shell: Option<String>,
 }
 
 #[cfg(debug_assertions)]
@@ -5348,7 +5370,14 @@ impl McpServerTool for SeedColdSessionTool {
         let session_id = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.seed_cold_session(solution_id, title, entries, input.live_teammates, cx)
+                store.seed_cold_session(
+                    solution_id,
+                    title,
+                    entries,
+                    input.live_teammates,
+                    input.live_shell,
+                    cx,
+                )
             })
         });
 
