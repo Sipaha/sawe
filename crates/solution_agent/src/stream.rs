@@ -67,6 +67,18 @@ impl Stream {
         }
     }
 
+    pub fn teammate(id: SharedString) -> Self {
+        Stream {
+            id: StreamId::Teammate(id.clone()),
+            kind: StreamKind::Teammate,
+            label: id,
+            entries: Vec::new(),
+            seq: 0,
+            state: StreamState::Live,
+            source: StreamSource::ParentThreadDemux,
+        }
+    }
+
     /// Append `entry`, merging it into the previous entry when both are
     /// `AssistantMessage`. A stream is single-source, so a plain `last()` merge
     /// is correct: interleaving from *other* sources lives in *other* streams,
@@ -163,5 +175,16 @@ mod tests {
         s.push_coalesced(tool_call("tc1"));
         s.push_coalesced(tool_call("tc2"));
         assert_eq!(s.entries.len(), 2);
+    }
+
+    #[test]
+    fn teammate_stream_is_empty_live_teammate() {
+        let s = Stream::teammate(SharedString::from("toolu_abc"));
+        assert_eq!(s.id, StreamId::Teammate(SharedString::from("toolu_abc")));
+        assert_eq!(s.kind, StreamKind::Teammate);
+        assert_eq!(s.label.as_ref(), "toolu_abc");
+        assert!(s.entries.is_empty());
+        assert_eq!(s.state, StreamState::Live);
+        assert_eq!(s.source, StreamSource::ParentThreadDemux);
     }
 }
