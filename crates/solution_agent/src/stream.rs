@@ -91,6 +91,13 @@ impl Stream {
             && let SessionEntryKind::AssistantMessage { chunks } = &mut last.kind
         {
             chunks.extend(incoming.iter().cloned());
+            // The coalesced entry's `mod_seq` is the phase-4 wire delta key. A
+            // merge keeps the FIRST fragment's chunks in place but MUST advance
+            // the key so a client polling `entry.mod_seq > since_seq` sees the
+            // update (decision #5 — otherwise a coalesced-message update is
+            // silently missed). Stream entries are clones, so bumping this copy's
+            // mod_seq is local to the stream mirror.
+            last.mod_seq = last.mod_seq.max(entry.mod_seq);
             return;
         }
         self.entries.push(entry);
@@ -177,6 +184,22 @@ mod tests {
             panic!("expected AssistantMessage");
         };
         assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_merge_raises_merged_entry_mod_seq() {
+        let mut s = Stream::main();
+        let mut first = assistant("Three ");
+        first.mod_seq = 1;
+        let mut second = assistant("scouts");
+        second.mod_seq = 4;
+        s.push_coalesced(first);
+        s.push_coalesced(second);
+        assert_eq!(s.entries.len(), 1, "same-source assistant messages must merge");
+        assert_eq!(
+            s.entries[0].mod_seq, 4,
+            "a coalesce-merge must advance the frozen first-fragment mod_seq to the incoming max"
+        );
     }
 
     #[test]

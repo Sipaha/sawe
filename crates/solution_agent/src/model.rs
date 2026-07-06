@@ -418,16 +418,6 @@ pub struct SolutionSession {
     /// still-present tagged entries. Value = the `Done` reason (surfaced as
     /// phase-4's `stream_removed` reason). `StreamId::Main` is never inserted.
     pub closed_streams: HashMap<crate::stream::StreamId, SharedString>,
-    /// Monotonic allocator for per-stream `seq` watermarks. Bumped (pre-increment)
-    /// whenever a stream's fingerprint changes across a `rebuild_streams`. The
-    /// wire delta (phase 4b) keys per-stream sync on `Stream.seq`; `seq` must
-    /// survive the full-replace rebuild, hence this side counter.
-    pub stream_seq_counter: u64,
-    /// Prior per-stream fingerprint `(source_entry_count, max_source_mod_seq)` +
-    /// the `seq` last assigned to it. `rebuild_streams` keeps a stream's seq when
-    /// its fingerprint is unchanged, else allocates `stream_seq_counter`. Ephemeral
-    /// (rebuilt from live state), not persisted.
-    pub stream_seqs: HashMap<crate::stream::StreamId, (u64, (usize, u64))>,
     /// Cold-load hydration orphans: finished teammates re-demuxed from restored
     /// tagged rows. Suppressed from the mirror while the session is cold, but —
     /// unlike a permanent `closed_streams` Done-close — REOPENED if a live resume
@@ -643,8 +633,6 @@ impl SolutionSession {
                 streams
             },
             closed_streams: HashMap::new(),
-            stream_seq_counter: 0,
-            stream_seqs: HashMap::new(),
             hydration_orphan_streams: std::collections::HashSet::new(),
             hydration_watermark: 0,
             hydrating: false,
@@ -746,38 +734,18 @@ impl SolutionSession {
                 }
             }
         }
-        // Per-stream `seq` watermark maintained across the full-replace rebuild
-        // (demux discards `Stream.seq`). Fingerprint each stream by
-        // (source-entry count, max source mod_seq) over the PRE-coalesce entries:
-        // both advance on any append / in-place update (bump_change_seq re-stamps
-        // mod_seq monotonically) and a coalesce-merge advances the max even though
-        // the coalesced entry keeps the first fragment's mod_seq. Unchanged
-        // fingerprint ⇒ keep the prior seq; any change ⇒ next counter value.
-        let mut fingerprints: HashMap<crate::stream::StreamId, (usize, u64)> = HashMap::new();
-        for entry in &self.entries {
-            let id = match &entry.subagent_id {
-                None => crate::stream::StreamId::Main,
-                Some(toolu) => crate::stream::StreamId::Teammate(toolu.clone()),
-            };
-            let fp = fingerprints.entry(id).or_insert((0, 0));
-            fp.0 += 1;
-            fp.1 = fp.1.max(entry.mod_seq);
-        }
-        let mut next_seqs = HashMap::new();
-        for (id, stream) in &mut streams {
-            let fingerprint = fingerprints.get(id).copied().unwrap_or((0, 0));
-            let seq = match self.stream_seqs.get(id) {
-                Some(&(prev_seq, prev_fp)) if prev_fp == fingerprint => prev_seq,
-                _ => {
-                    self.stream_seq_counter += 1;
-                    self.stream_seq_counter
-                }
-            };
-            stream.seq = seq;
-            next_seqs.insert(id.clone(), (seq, fingerprint));
+        // Per-stream `seq` = the stream's high-water mark on the `change_seq`
+        // axis (max `mod_seq` of its entries). `push_coalesced` keeps this
+        // coalesce-aware, so it advances on append AND on a coalesce-merge the
+        // frozen first-fragment mod_seq would otherwise hide (decision #5). This
+        // single axis is BOTH the descriptor watermark and the per-entry delta
+        // cursor for the phase-4b wire. Monotonic per stream except across a
+        // rewind/truncate, where the wire's `total_count` shrink drives the
+        // client's tail-truncate instead.
+        for stream in streams.values_mut() {
+            stream.seq = stream.entries.iter().map(|e| e.mod_seq).max().unwrap_or(0);
         }
         self.streams = streams;
-        self.stream_seqs = next_seqs;
     }
 
     /// Auto-close a secondary stream on a genuine `Done` signal: record the id
@@ -1062,8 +1030,6 @@ mod tests {
                 streams
             },
             closed_streams: HashMap::new(),
-            stream_seq_counter: 0,
-            stream_seqs: HashMap::new(),
             hydration_orphan_streams: std::collections::HashSet::new(),
             hydration_watermark: 0,
             hydrating: false,
@@ -1298,10 +1264,10 @@ mod tests {
         }
     }
 
-    // Sub-task A: per-stream `seq` must be maintained across the full-replace
-    // `rebuild_streams` — allocated on first sight, KEPT while a stream's
-    // fingerprint `(source_entry_count, max_source_mod_seq)` is unchanged, and
-    // ADVANCED on any change (append / in-place update).
+    // Sub-task A: per-stream `seq` = max `mod_seq` of the stream's entries,
+    // recomputed on every full-replace `rebuild_streams` — nonzero once the
+    // stream has a stamped entry, UNCHANGED while its entries+mod_seqs are, and
+    // ADVANCED on any append / in-place re-stamp.
     #[gpui::test]
     fn stream_seq_allocated_kept_and_advanced_for_main(cx: &mut TestAppContext) {
         use crate::stream::StreamId;
@@ -1309,29 +1275,28 @@ mod tests {
         session.update(cx, |s, cx| {
             s.set_entries(vec![msg_seq("a", None, 1)], cx);
             let seq0 = s.streams[&StreamId::Main].seq;
-            assert!(seq0 > 0, "first sight allocates a nonzero seq");
+            assert_eq!(seq0, 1, "seq is the stream's max entry mod_seq");
 
-            // Identical fingerprint (same count + same max mod_seq) → seq kept.
+            // Same entries + same mod_seqs → max is unchanged → seq kept.
             s.set_entries(vec![msg_seq("a", None, 1)], cx);
             assert_eq!(
                 s.streams[&StreamId::Main].seq, seq0,
-                "unchanged fingerprint must not bump seq"
+                "unchanged entries must not bump seq"
             );
 
-            // Append a Main entry (count + max mod_seq both rise) → seq advances.
+            // Append a Main entry with a higher mod_seq → max rises → seq advances.
             s.set_entries(vec![msg_seq("a", None, 1), msg_seq("b", None, 2)], cx);
             assert!(
                 s.streams[&StreamId::Main].seq > seq0,
-                "an appended entry must bump the stream's seq"
+                "an appended entry with a higher mod_seq must bump the stream's seq"
             );
         });
     }
 
-    // Sub-task A, decision #5: a coalesce-merge keeps the FIRST fragment's
-    // mod_seq on the single coalesced stream entry, so a delta keyed on
-    // entry.mod_seq would miss the update. The per-stream seq (keyed on the
-    // SOURCE pre-coalesce fingerprint) MUST still advance even though the
-    // coalesced stream stays one entry long.
+    // Sub-task A, decision #5: `push_coalesced` advances the coalesced entry's
+    // mod_seq to the incoming max, so even though the merge keeps the stream one
+    // entry long the stream's `seq` (= max entry mod_seq) still rises — a delta
+    // keyed on it won't miss a coalesced-message update.
     #[gpui::test]
     fn stream_seq_advances_on_coalesce_merge_despite_single_entry(cx: &mut TestAppContext) {
         use crate::stream::StreamId;
@@ -1345,9 +1310,11 @@ mod tests {
                 "consecutive same-source assistant messages coalesce"
             );
             let seq_before = s.streams[&StreamId::Main].seq;
+            assert_eq!(seq_before, 2, "seq is the coalesced entries' max mod_seq");
 
             // A THIRD assistant chunk coalesces too (stream stays one entry) but
-            // the source fingerprint's count + max mod_seq both rise.
+            // its higher mod_seq is carried onto the coalesced entry by
+            // `push_coalesced`, so the stream's max mod_seq rises.
             s.set_entries(
                 vec![
                     msg_seq("one ", None, 1),
@@ -1361,9 +1328,9 @@ mod tests {
                 1,
                 "still one coalesced entry"
             );
-            assert!(
-                s.streams[&StreamId::Main].seq > seq_before,
-                "seq must advance on a coalesce-merge the entry's mod_seq hides"
+            assert_eq!(
+                s.streams[&StreamId::Main].seq, 3,
+                "seq must advance on a coalesce-merge the frozen first-fragment mod_seq hides"
             );
         });
     }
