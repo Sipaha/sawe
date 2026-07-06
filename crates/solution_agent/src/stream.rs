@@ -9,6 +9,7 @@
 use crate::background_shell::BackgroundShellId;
 use crate::session_entry::{SessionEntry, SessionEntryKind};
 use gpui::SharedString;
+use indexmap::IndexMap;
 use std::path::PathBuf;
 
 /// Which stream an entry belongs to. `Teammate` carries the parent `Agent`
@@ -94,6 +95,28 @@ impl Stream {
         }
         self.entries.push(entry);
     }
+}
+
+/// Group a flat, interleaved entry list into per-source streams, coalescing
+/// each stream's consecutive assistant messages. `Main` is always present
+/// (inserted first, possibly empty); teammate streams appear in first-seen
+/// order. Pure — a derived view over `session.entries`, not duplicated state.
+/// Shell streams are not produced here (their content lives outside `entries`).
+pub fn demux(entries: &[SessionEntry]) -> IndexMap<StreamId, Stream> {
+    let mut streams: IndexMap<StreamId, Stream> = IndexMap::new();
+    streams.insert(StreamId::Main, Stream::main());
+    for entry in entries {
+        let stream = match &entry.subagent_id {
+            None => streams
+                .get_mut(&StreamId::Main)
+                .expect("Main is inserted above"),
+            Some(toolu) => streams
+                .entry(StreamId::Teammate(toolu.clone()))
+                .or_insert_with(|| Stream::teammate(toolu.clone())),
+        };
+        stream.push_coalesced(entry.clone());
+    }
+    streams
 }
 
 #[cfg(test)]
@@ -186,5 +209,70 @@ mod tests {
         assert!(s.entries.is_empty());
         assert_eq!(s.state, StreamState::Live);
         assert_eq!(s.source, StreamSource::ParentThreadDemux);
+    }
+
+    fn assistant_tagged(text: &str, sub: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: sub.map(SharedString::from),
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.to_string())],
+            },
+        }
+    }
+
+    #[test]
+    fn demux_empty_yields_only_empty_main() {
+        let streams = demux(&[]);
+        assert_eq!(streams.len(), 1);
+        assert!(streams.contains_key(&StreamId::Main));
+        assert!(streams[&StreamId::Main].entries.is_empty());
+    }
+
+    #[test]
+    fn demux_reunites_a_parent_message_split_by_an_interleaved_teammate() {
+        // Flat, interleaved (as AcpThread would produce WITHOUT the backward-scan):
+        // parent "Three ", teammate chunk, parent "scouts".
+        let flat = vec![
+            assistant_tagged("Three ", None),
+            assistant_tagged("subagent noise", Some("T1")),
+            assistant_tagged("scouts", None),
+        ];
+        let streams = demux(&flat);
+        assert_eq!(streams.len(), 2, "Main + one teammate");
+        // Main: the two parent fragments are now adjacent → coalesced to ONE entry.
+        let main = &streams[&StreamId::Main];
+        assert_eq!(main.entries.len(), 1, "parent message reunited");
+        let SessionEntryKind::AssistantMessage { chunks } = &main.entries[0].kind else {
+            panic!("expected AssistantMessage");
+        };
+        assert_eq!(chunks.len(), 2);
+        // Teammate stream holds only its own entry.
+        let t1 = &streams[&StreamId::Teammate(SharedString::from("T1"))];
+        assert_eq!(t1.entries.len(), 1);
+        assert_eq!(t1.kind, StreamKind::Teammate);
+    }
+
+    #[test]
+    fn demux_orders_teammate_streams_by_first_appearance() {
+        let flat = vec![
+            assistant_tagged("m", None),
+            assistant_tagged("b", Some("T2")),
+            assistant_tagged("a", Some("T1")),
+        ];
+        let streams = demux(&flat);
+        let ids: Vec<&StreamId> = streams.keys().collect();
+        assert_eq!(ids[0], &StreamId::Main);
+        assert_eq!(ids[1], &StreamId::Teammate(SharedString::from("T2")));
+        assert_eq!(ids[2], &StreamId::Teammate(SharedString::from("T1")));
+    }
+
+    #[test]
+    fn demux_with_no_parent_entries_still_has_empty_main() {
+        let flat = vec![assistant_tagged("only sub", Some("T1"))];
+        let streams = demux(&flat);
+        assert!(streams[&StreamId::Main].entries.is_empty());
+        assert_eq!(streams[&StreamId::Teammate(SharedString::from("T1"))].entries.len(), 1);
     }
 }
