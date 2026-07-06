@@ -504,6 +504,12 @@ claude's `Agent` tool is an **async teammate** — the tool call returns a spawn
 
 How to apply: both fixes are load-bearing together — B alone hides the teammate's output from Main but (without A) leaves it invisible everywhere; A alone registers the pill but B's bypass still floods Main. Don't reintroduce an "empty active set ⇒ show everything" shortcut, and remember an async `Agent`'s useful metadata is in its CONTENT, not `raw_output`. The `Agent` spawn call itself is a Main-thread entry (`subagent_id == None`) so "spawned a teammate" still shows in Main; the teammate's interior lives in its Background tab (JSONL tail).
 
+### 39. Assistant-message coalescing skips *other* sources' interleaved entries (torn-message fix)
+
+A claude async `Agent` teammate streams into the PARENT thread concurrently with the parent, so the parent's own text deltas arrive interleaved with the teammate's `subagent_id`-tagged chunks. `AcpThread`'s coalescing keyed on `entries.last()`, so after an interleaved subagent chunk the parent's next delta started a fresh `AssistantMessage` — tearing one message into many bubbles (split even mid-word), on Main and mobile. Fixed with `AcpThread::coalesce_target_index`: a backward scan that skips *other* sources' entries and appends to the most recent same-source message, stopping at the source's OWN tool call or any structural entry (user msg / plan / compaction / system note). Both the streaming-buffer and non-buffer paths use it and emit `EntryUpdated(target_idx)` for the real (possibly non-last) entry. Full story: `docs/findings/2026-07-06-torn-message-interleaved-subagent-chunks.md`.
+
+How to apply: coalescing target ≠ `entries.last()` once concurrent subagents exist. If you add a new `AgentThreadEntry` variant, classify it in `coalesce_target_index` (source-bearing boundary vs structural boundary vs skippable) or streaming will mis-group. The sub-agent tab looks clean because it sources from the teammate's own JSONL, not the interleaved parent thread — a "renders fine on the sub tab but torn on Main" report is this bug.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.
