@@ -5822,6 +5822,7 @@ impl SolutionAgentStore {
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
                     s.entries.clear();
+                    s.rebuild_streams();
                     s.bump_epoch();
                     // `set_acp_thread` emits ThreadReplaced + notify;
                     // last so SessionView re-attaches against a fully
@@ -6015,6 +6016,7 @@ impl SolutionAgentStore {
                     s.cached_total_tokens = None;
                     s.last_turn_duration = None;
                     s.entries.clear();
+                    s.rebuild_streams();
                     s.bump_epoch();
                     // Cache the (possibly freshly-built headless) project so
                     // a subsequent reset/restart on this now-live session
@@ -7925,6 +7927,7 @@ impl SolutionAgentStore {
                     for (entry, seq) in s.entries[first_new..].iter_mut().zip(seqs) {
                         entry.mod_seq = seq;
                     }
+                    s.rebuild_streams();
                     cx.notify();
                 });
                 // Persist the newly-appended entries (+ any gap-fill) as rows.
@@ -8283,6 +8286,7 @@ impl SolutionAgentStore {
                 let global_truncate = cold_count + range.start;
                 session_entity.update(cx, |s, cx| {
                     s.entries.truncate(global_truncate);
+                    s.rebuild_streams();
                     s.bump_change_seq();
                     cx.notify();
                 });
@@ -8466,6 +8470,7 @@ impl SolutionAgentStore {
                             *slot = entry;
                             slot.mod_seq = seq;
                         }
+                        s.rebuild_streams();
                         cx.notify();
                     });
                     // Row upsert happens unconditionally on the in-memory update

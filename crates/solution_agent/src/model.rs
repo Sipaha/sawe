@@ -399,6 +399,12 @@ pub struct SolutionSession {
     /// Store-maintained list of owned session entries for mobile delta-sync
     /// (Phase 2+). Mutated only through `set_entries` setter.
     pub entries: Vec<SessionEntry>,
+    /// Per-source stream mirror of `entries`, maintained by `rebuild_streams`
+    /// after every `entries` mutation. Becomes the source of truth for
+    /// per-stream rendering + the wire (phases 2c-5); `entries` stays the ingest
+    /// target until phase 6 flips it to a derived shim. `StreamId::Main` is
+    /// always present.
+    pub streams: indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream>,
     /// `true` while a restored tab's `acp_thread_blob` is still being
     /// deserialised on a background task. Set by the lazy-hydration path
     /// ([`SolutionAgentStore::restore_open_tabs_lazy`]) when a placeholder
@@ -592,6 +598,11 @@ impl SolutionSession {
             flush_after_cancel: false,
             live_base: 0,
             entries: Vec::new(),
+            streams: {
+                let mut streams = indexmap::IndexMap::new();
+                streams.insert(crate::stream::StreamId::Main, crate::stream::Stream::main());
+                streams
+            },
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,
@@ -657,7 +668,15 @@ impl SolutionSession {
     /// the store to maintain the mobile delta-sync payload (Phase 2+).
     pub fn set_entries(&mut self, entries: Vec<SessionEntry>, cx: &mut Context<Self>) {
         self.entries = entries;
+        self.rebuild_streams();
         cx.notify();
+    }
+
+    /// Rebuild the `streams` mirror from the current `entries`. MUST be called
+    /// after every mutation of `entries` (see `set_entries` + the store's
+    /// clear/extend/truncate/slot-write sites) or the mirror drifts.
+    pub fn rebuild_streams(&mut self) {
+        self.streams = crate::stream::demux(&self.entries);
     }
 
     /// Allocate the next monotonic change sequence for this session. Pre-increment:
@@ -889,6 +908,11 @@ mod tests {
             flush_after_cancel: false,
             live_base: 0,
             entries: Vec::new(),
+            streams: {
+                let mut streams = indexmap::IndexMap::new();
+                streams.insert(crate::stream::StreamId::Main, crate::stream::Stream::main());
+                streams
+            },
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,
@@ -992,6 +1016,38 @@ mod tests {
         cx.run_until_parked();
         assert!(notified.get());
         session.read_with(cx, |s, _| assert_eq!(s.entries.len(), 1));
+    }
+
+    #[gpui::test]
+    fn streams_mirror_tracks_entries_via_set_entries(cx: &mut TestAppContext) {
+        use crate::session_entry::{AssistantChunk, SessionEntryKind};
+        use crate::stream::StreamId;
+        fn msg(text: &str, sub: Option<&str>) -> SessionEntry {
+            SessionEntry {
+                created_ms: 0,
+                mod_seq: 0,
+                subagent_id: sub.map(SharedString::from),
+                kind: SessionEntryKind::AssistantMessage {
+                    chunks: vec![AssistantChunk::Message(text.to_string())],
+                },
+            }
+        }
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            // A fresh session already carries a Main-only streams mirror.
+            assert_eq!(s.streams.len(), 1);
+            assert!(s.streams.contains_key(&StreamId::Main));
+            s.set_entries(vec![msg("hi", None), msg("sub", Some("T1"))], cx);
+            // Mirror now has Main + Teammate(T1), each with one entry.
+            assert_eq!(s.streams.len(), 2);
+            assert_eq!(s.streams[&StreamId::Main].entries.len(), 1);
+            assert_eq!(
+                s.streams[&StreamId::Teammate(SharedString::from("T1"))]
+                    .entries
+                    .len(),
+                1
+            );
+        });
     }
 
     #[gpui::test]
