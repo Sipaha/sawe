@@ -804,8 +804,13 @@ impl SolutionSession {
     /// activity for it (an entry at index >= the recorded watermark) — see
     /// `rebuild_streams`. Call AFTER assigning `entries` on a cold-restore path.
     pub fn hydrate_streams_main_only(&mut self) {
-        let orphans: Vec<crate::stream::StreamId> = self
-            .streams
+        // Derive orphans from a direct demux of the freshly-assigned `entries`,
+        // NOT from `self.streams`: all 4 cold-load sites assign `entries` and
+        // call this with no `rebuild_streams()` between, so `self.streams` is
+        // still the stale pre-load (Main-only) mirror here — reading its keys
+        // would record zero orphans and let the trailing `rebuild_streams()`
+        // resurrect finished teammates as zombie tabs (decision #16).
+        let orphans: Vec<crate::stream::StreamId> = crate::stream::demux(&self.entries)
             .keys()
             .filter(|id| !matches!(id, crate::stream::StreamId::Main))
             .cloned()
@@ -1456,6 +1461,40 @@ mod tests {
             assert_eq!(
                 s.hydration_watermark, 2,
                 "watermark pins the cold-prefix boundary at entries.len()"
+            );
+        });
+    }
+
+    // Decision #16: the cold-load sites assign `entries` DIRECTLY (no
+    // `set_entries`/`rebuild_streams` first), so `hydrate_streams_main_only`
+    // must derive orphans from a demux of the freshly-assigned entries, not
+    // from the still-stale `self.streams` mirror. This test reproduces that
+    // exact site — a direct-`entries`-assign, then hydrate — and asserts the
+    // teammate is recorded as an orphan AND suppressed from the rebuilt streams.
+    #[gpui::test]
+    fn hydrate_records_orphans_from_directly_assigned_entries(cx: &mut TestAppContext) {
+        use crate::stream::StreamId;
+        let t1 = StreamId::Teammate(SharedString::from("T1"));
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, _cx| {
+            // Mimic the cold-load path: assign `entries` directly, leaving
+            // `self.streams` as the stale Main-only mirror (the pre-fix bug's
+            // read source that recorded zero orphans).
+            s.entries = vec![msg_tagged("main", None), msg_tagged("sub", Some("T1"))];
+
+            s.hydrate_streams_main_only();
+
+            assert!(
+                s.hydration_orphan_streams.contains(&t1),
+                "teammate from directly-assigned entries must be recorded as an orphan"
+            );
+            assert!(
+                !s.streams.contains_key(&t1),
+                "the cold-restored teammate must be suppressed from the rebuilt streams"
+            );
+            assert!(
+                s.streams.contains_key(&StreamId::Main),
+                "Main survives hydration"
             );
         });
     }

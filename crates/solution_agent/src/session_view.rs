@@ -293,8 +293,8 @@ pub struct SolutionSessionView {
     /// Agent's standalone JSONL transcript (Task 11+). View-state only,
     /// not persisted across editor restarts (the selection is
     /// meaningless once the active set becomes empty). Auto-reset to
-    /// `Main` (or the next still-active `Task` id) when the selected
-    /// `Task` subagent finishes — see `next_selection_after_change`,
+    /// `Main` (never to another teammate) when the selected `Task`'s
+    /// teammate stream is removed — see `next_selection_after_change`,
     /// wired off `SessionSubagentsChanged`. `Background` selections
     /// pass through unchanged since their lifecycle is bound to the
     /// JSONL file on disk, not the parent thread.
@@ -861,52 +861,47 @@ impl SolutionSessionView {
         cx.notify();
     }
 
-    /// Snap-to-next helper extracted out of `on_subagents_changed` so
-    /// the lifecycle can be unit-tested without spinning up a full GPUI
-    /// view. Returns the new value for `selected_subagent` given the
-    /// current selection and the still-active subagent order. Pure —
-    /// no side effects. `Background` views are pass-through here — they
-    /// live in their own JSONL transcript and don't participate in the
-    /// parent thread's `active_subagents` lifecycle.
+    /// Selection-reconcile helper extracted out of `on_subagents_changed`
+    /// so the lifecycle can be unit-tested without spinning up a full GPUI
+    /// view. Returns the new value for `selected_subagent` given the current
+    /// selection and the session's live teammate `streams` (phase 6c). Pure —
+    /// no side effects. `Background`/`Shell` views are pass-through here — they
+    /// live in their own on-disk transcript and don't participate in the
+    /// parent thread's teammate-stream lifecycle.
     pub(crate) fn next_selection_after_change(
         current: &crate::store::SubagentView,
-        active_subagents: &HashMap<SharedString, crate::model::SubagentTab>,
-        active_subagent_order: &[SharedString],
+        streams: &indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream>,
     ) -> crate::store::SubagentView {
         use crate::store::SubagentView;
         match current {
             SubagentView::Main => SubagentView::Main,
             // Background + Shell both live in their own on-disk transcript
-            // and don't participate in the parent thread's
-            // `active_subagents` lifecycle — pass through unchanged.
+            // and don't participate in the parent thread's teammate-stream
+            // lifecycle — pass through unchanged.
             SubagentView::Background(_) | SubagentView::Shell(_) => current.clone(),
             SubagentView::Task(id) => {
-                if active_subagents.contains_key(id) {
-                    SubagentView::Task(id.clone())
+                // Spec (Stream lifecycle): force back to Main ONLY when the
+                // selected teammate's stream is removed — a plain fall-back,
+                // not a hop to some other still-live teammate.
+                if streams.contains_key(&crate::stream::StreamId::Teammate(id.clone())) {
+                    current.clone()
                 } else {
-                    match active_subagent_order.first() {
-                        Some(next_id) => SubagentView::Task(next_id.clone()),
-                        None => SubagentView::Main,
-                    }
+                    SubagentView::Main
                 }
             }
         }
     }
 
-    /// Reconcile `selected_subagent` with the session's current
-    /// `active_subagents` set. Called on every `SessionSubagentsChanged`
-    /// event for this session. If the current selection has disappeared,
-    /// snap to the next still-active id in `active_subagent_order` (else
-    /// fall back to `Main`). Always notifies — the tab strip itself
-    /// needs a repaint when the active set changes even if the selection
-    /// didn't move.
+    /// Reconcile `selected_subagent` with the session's current teammate
+    /// streams. Called on every `SessionSubagentsChanged` event for this
+    /// session. If the selected teammate's stream has disappeared, fall
+    /// back to `Main` (phase 6c — snap to Main only on stream removal).
+    /// Always notifies — the tab strip itself needs a repaint when the
+    /// active set changes even if the selection didn't move.
     pub(crate) fn on_subagents_changed(&mut self, cx: &mut Context<Self>) {
         let session = self.session.read(cx);
-        let next = Self::next_selection_after_change(
-            &self.selected_subagent,
-            &session.active_subagents,
-            &session.active_subagent_order,
-        );
+        let next =
+            Self::next_selection_after_change(&self.selected_subagent, &session.streams);
         if next != self.selected_subagent {
             self.selected_subagent = next;
         }

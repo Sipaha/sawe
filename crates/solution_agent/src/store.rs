@@ -8805,8 +8805,26 @@ impl SolutionAgentStore {
         if !matches!(previous, SessionState::Idle) && matches!(next, SessionState::Idle) {
             let cleared = session.update(cx, |s, _| {
                 if !s.active_subagents.is_empty() || !s.active_subagent_order.is_empty() {
+                    // Close each stranded inline-Task teammate stream in lockstep
+                    // with clearing its pill. Since phase 6c the desktop snap-back
+                    // (`next_selection_after_change`) recovers a viewer pinned to a
+                    // vanished tab by watching `streams`, NOT `active_subagents`; if
+                    // we cleared the map here without also closing the stream, the
+                    // stream would keep re-demuxing Live from its still-tagged rows,
+                    // stranding the viewer on a frozen, pill-less tab (the exact
+                    // 14h-stuck-tab class this GC exists to prevent). Async `Agent`
+                    // teammates are already out of `active_subagents` (removed at
+                    // spawn-ack), so this only closes inline Tasks — never a
+                    // still-live async teammate's stream.
+                    let stranded: Vec<SharedString> = s.active_subagents.keys().cloned().collect();
                     s.active_subagents.clear();
                     s.active_subagent_order.clear();
+                    for id in stranded {
+                        s.close_stream(
+                            crate::stream::StreamId::Teammate(id),
+                            gpui::SharedString::new_static("orphaned"),
+                        );
+                    }
                     true
                 } else {
                     false

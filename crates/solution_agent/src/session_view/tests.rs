@@ -5,7 +5,6 @@ use gpui::SharedString;
 
 use super::SolutionSessionView;
 use super::recall::unpack_recalled_bundle;
-use crate::model::SubagentTab;
 use crate::store::SubagentView;
 
 fn text_block(s: &str) -> acp::ContentBlock {
@@ -89,75 +88,73 @@ fn retain_images_with_live_placeholder_drops_removed_attachments() {
     assert!(all.is_empty());
 }
 
-fn make_tab(label: &str) -> SubagentTab {
-    SubagentTab {
-        label: SharedString::from(label.to_string()),
-        started_at: chrono::Utc::now(),
+/// Build a `session.streams`-shaped map: always a `Main` stream, plus one
+/// live `Teammate` stream per id (phase 6c — `next_selection_after_change`
+/// reads teammate presence from the stream map, not `active_subagents`).
+fn streams_with_teammates(
+    ids: &[&str],
+) -> indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream> {
+    use crate::stream::{Stream, StreamId};
+    let mut streams = indexmap::IndexMap::new();
+    streams.insert(StreamId::Main, Stream::main());
+    for id in ids {
+        let sid = SharedString::from(id.to_string());
+        streams.insert(StreamId::Teammate(sid.clone()), Stream::teammate(sid));
     }
+    streams
 }
 
 #[test]
 fn next_selection_after_change_keeps_still_active_selection() {
     let id_a = SharedString::from("toolu_a");
-    let id_b = SharedString::from("toolu_b");
-    let mut active: HashMap<SharedString, SubagentTab> = HashMap::new();
-    active.insert(id_a.clone(), make_tab("A"));
-    active.insert(id_b.clone(), make_tab("B"));
-    let order = vec![id_a.clone(), id_b];
+    let streams = streams_with_teammates(&["toolu_a", "toolu_b"]);
     let next = SolutionSessionView::next_selection_after_change(
         &SubagentView::Task(id_a.clone()),
-        &active,
-        &order,
+        &streams,
     );
     assert_eq!(
         next,
         SubagentView::Task(id_a),
-        "still-active selection must be preserved"
+        "a teammate whose stream is still present must be preserved"
     );
 }
 
 #[test]
-fn next_selection_after_change_snaps_to_next_when_current_removed() {
+fn next_selection_after_change_snaps_to_main_when_current_stream_removed() {
     let id_a = SharedString::from("toolu_a");
-    let id_b = SharedString::from("toolu_b");
-    let mut active: HashMap<SharedString, SubagentTab> = HashMap::new();
-    active.insert(id_b.clone(), make_tab("B"));
-    // `id_a` is gone but still asked-for; `id_b` remains, first in order.
-    let order = vec![id_b.clone()];
+    // `id_a`'s stream is gone; only `toolu_b` still has a live teammate stream.
+    let streams = streams_with_teammates(&["toolu_b"]);
     let next = SolutionSessionView::next_selection_after_change(
         &SubagentView::Task(id_a),
-        &active,
-        &order,
+        &streams,
     );
-    assert_eq!(next, SubagentView::Task(id_b));
+    assert_eq!(
+        next,
+        SubagentView::Main,
+        "a removed teammate stream snaps to Main, not to another teammate"
+    );
 }
 
 #[test]
 fn next_selection_after_change_falls_back_to_main_when_all_gone() {
     let id_a = SharedString::from("toolu_a");
-    let active: HashMap<SharedString, SubagentTab> = HashMap::new();
-    let order: Vec<SharedString> = Vec::new();
+    let streams = streams_with_teammates(&[]);
     let next = SolutionSessionView::next_selection_after_change(
         &SubagentView::Task(id_a),
-        &active,
-        &order,
+        &streams,
     );
     assert_eq!(
         next,
         SubagentView::Main,
-        "empty active set must collapse to Main"
+        "no teammate streams must collapse to Main"
     );
 }
 
 #[test]
 fn next_selection_after_change_main_stays_main() {
-    let id_a = SharedString::from("toolu_a");
-    let mut active: HashMap<SharedString, SubagentTab> = HashMap::new();
-    active.insert(id_a.clone(), make_tab("A"));
-    let order = vec![id_a];
+    let streams = streams_with_teammates(&["toolu_a"]);
     // Main was already selected — a strip change should not yank us into a tab.
-    let next =
-        SolutionSessionView::next_selection_after_change(&SubagentView::Main, &active, &order);
+    let next = SolutionSessionView::next_selection_after_change(&SubagentView::Main, &streams);
     assert_eq!(next, SubagentView::Main);
 }
 
@@ -259,14 +256,10 @@ fn next_selection_after_change_preserves_shell_view() {
     // Shell views render a background shell's live-tailed output, so a
     // change in the Task subagent set must not perturb them.
     let shell_id = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
-    let id_a = SharedString::from("toolu_a");
-    let mut active: HashMap<SharedString, SubagentTab> = HashMap::new();
-    active.insert(id_a.clone(), make_tab("A"));
-    let order = vec![id_a];
+    let streams = streams_with_teammates(&["toolu_a"]);
     let next = SolutionSessionView::next_selection_after_change(
         &SubagentView::Shell(shell_id.clone()),
-        &active,
-        &order,
+        &streams,
     );
     assert_eq!(next, SubagentView::Shell(shell_id));
 }
@@ -276,14 +269,10 @@ fn next_selection_after_change_preserves_background_view() {
     // Background views render a Managed Agent's standalone JSONL transcript,
     // so a change in the Task subagent set must not perturb them.
     let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92");
-    let id_a = SharedString::from("toolu_a");
-    let mut active: HashMap<SharedString, SubagentTab> = HashMap::new();
-    active.insert(id_a.clone(), make_tab("A"));
-    let order = vec![id_a];
+    let streams = streams_with_teammates(&["toolu_a"]);
     let next = SolutionSessionView::next_selection_after_change(
         &SubagentView::Background(bg_id.clone()),
-        &active,
-        &order,
+        &streams,
     );
     assert_eq!(next, SubagentView::Background(bg_id));
 }

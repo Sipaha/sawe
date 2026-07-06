@@ -9,11 +9,13 @@
 //!
 //! Hidden entirely when there are no active Task subagents AND no
 //! tracked background agents — a degenerate strip with only the
-//! "Main" pill would just waste a row of vertical space. Iteration
-//! over `active_subagent_order` / `background_agent_order` (NOT the
-//! HashMaps directly) so tab order matches spawn order and stays
-//! stable across renders; the HashMaps on their own have random
-//! hash-seed iteration order.
+//! "Main" pill would just waste a row of vertical space. Teammate tabs
+//! iterate `session.streams` in map order (phase 6c — insertion order
+//! matches teammate first-appearance, so tab order stays stable across
+//! renders). Background-agent / background-shell pills still iterate
+//! `background_agent_order` / `background_shell_order` (NOT the HashMaps
+//! directly) so their order matches spawn order; the HashMaps on their
+//! own have random hash-seed iteration order.
 //!
 //! Inline Task pills deliberately omit a per-tab close button: per the
 //! plan, tabs disappear naturally when the parent `Task` ToolCall
@@ -49,14 +51,21 @@ pub(super) fn render_task_subagent_strip(
     // Snapshot label / id pairs so the click listeners (which need
     // `'static` data) don't have to borrow back through the session
     // entity inside their closures.
+    // Teammate tabs iterate `session.streams` in map order (phase 6c). The
+    // `∈ active_subagents` filter is the behavior-preserving bridge until 6d:
+    // a live inline Task is in `active_subagents` AND has a teammate stream, so
+    // it shows; an async `Agent` teammate is dropped from `active_subagents` at
+    // spawn-ack but keeps its teammate stream open, so the filter excludes it
+    // here (it renders as its `bg_agents` pill instead, not double-pilled).
     let tabs: Vec<(SharedString, SharedString)> = session_ref
-        .active_subagent_order
-        .iter()
-        .filter_map(|id| {
-            session_ref
+        .streams
+        .keys()
+        .filter_map(|sid| match sid {
+            crate::stream::StreamId::Teammate(id) => session_ref
                 .active_subagents
                 .get(id)
-                .map(|tab| (id.clone(), tab.label.clone()))
+                .map(|tab| (id.clone(), tab.label.clone())),
+            _ => None,
         })
         .collect();
     // Background-agent pill snapshot. Computed up front (vs in the

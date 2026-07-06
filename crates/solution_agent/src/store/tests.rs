@@ -9281,6 +9281,95 @@ async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
     });
 }
 
+/// Phase 6c regression: the `→Idle` subagent-strip GC clears `active_subagents`,
+/// but the desktop snap-back (`next_selection_after_change`) now recovers a viewer
+/// pinned to a vanished tab by watching `session.streams`, NOT `active_subagents`.
+/// So the GC MUST also `close_stream` each stranded teammate — otherwise the stream
+/// keeps re-demuxing Live from its still-tagged `entries` and the viewer strands on
+/// a frozen, pill-less tab (the 14h-stuck-tab class this GC exists to prevent).
+#[gpui::test]
+async fn idle_transition_gc_closes_stranded_teammate_stream(cx: &mut TestAppContext) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // Strand an inline-Task pill (non-terminal, so the per-tool-call removal never
+    // fires) exactly like `idle_transition_gc_bumps_subagents_watermark`.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.upsert_tool_call(
+                make_task_tool_call(
+                    "toolu_gc_2",
+                    "Task",
+                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    Some("Worker"),
+                    None,
+                ),
+                cx,
+            )
+            .expect("upsert task");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from("toolu_gc_2"));
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+                // Seed a teammate-tagged entry so the demux produces a live
+                // `Teammate` stream (the pill alone doesn't create one).
+                s.entries = vec![SessionEntry {
+                    created_ms: 1_700_000_000_000,
+                    mod_seq: 1,
+                    subagent_id: Some(SharedString::from("toolu_gc_2")),
+                    kind: SessionEntryKind::AssistantMessage {
+                        chunks: vec![AssistantChunk::Message("sub work".into())],
+                    },
+                }];
+                s.rebuild_streams();
+            });
+            let s = session.read(cx);
+            assert!(s.active_subagents.contains_key("toolu_gc_2"), "pill stranded");
+            assert!(
+                s.streams.contains_key(&teammate),
+                "teammate stream must exist before the GC"
+            );
+        });
+    });
+
+    // Transition into Idle through `mutate_state` — the GC must fire.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.mutate_state(session_id, |state| *state = SessionState::Idle, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert!(
+            s.active_subagents.is_empty(),
+            "→Idle GC must clear the stranded pill"
+        );
+        assert!(
+            !s.streams.contains_key(&teammate),
+            "→Idle GC must close the stranded teammate stream (still-tagged rows notwithstanding)"
+        );
+        assert!(
+            s.streams.contains_key(&crate::stream::StreamId::Main),
+            "Main stream survives the GC"
+        );
+    });
+}
+
 /// Phase 5, Task 5.1: a discriminant-changing transition through `mutate_state`
 /// (Idle → Running) emits `SessionStateChanged` and must move `state_seq` to the
 /// freshly-allocated `change_seq`.
