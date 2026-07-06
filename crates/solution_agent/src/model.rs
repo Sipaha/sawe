@@ -1050,6 +1050,90 @@ mod tests {
         });
     }
 
+    /// Phase 2c render-flip: the desktop render sources the selected view's
+    /// entries from `streams[SubagentView::parent_stream_id()]`. This is the
+    /// end-to-end proof of the two things the screenshot gate checks — Main
+    /// EXCLUDES teammate entries (no blank/leaked rows), and the Task view
+    /// shows ONLY that teammate — including the per-stream coalescing that
+    /// makes two same-source assistant messages, split by an interleaved
+    /// other-source entry in the flat list, reunite into one bubble.
+    #[gpui::test]
+    fn selected_view_streams_split_main_and_teammate(cx: &mut TestAppContext) {
+        use crate::session_entry::{AssistantChunk, SessionEntryKind};
+        use crate::store::SubagentView;
+        use crate::stream::StreamId;
+        fn assistant(text: &str, sub: Option<&str>) -> SessionEntry {
+            SessionEntry {
+                created_ms: 0,
+                mod_seq: 0,
+                subagent_id: sub.map(SharedString::from),
+                kind: SessionEntryKind::AssistantMessage {
+                    chunks: vec![AssistantChunk::Message(text.to_string())],
+                },
+            }
+        }
+        fn user(text: &str) -> SessionEntry {
+            SessionEntry {
+                created_ms: 0,
+                mod_seq: 0,
+                subagent_id: None,
+                kind: SessionEntryKind::UserMessage {
+                    id: None,
+                    content_md: text.into(),
+                    chunks: vec![],
+                },
+            }
+        }
+        let session = cx.update(|cx| cx.new(|_| build_session()));
+        session.update(cx, |s, cx| {
+            // Flat interleaved transcript: two Main assistant messages that are
+            // NOT adjacent in the flat list (a teammate entry sits between
+            // them), and two adjacent teammate messages.
+            s.set_entries(
+                vec![
+                    user("hello"),                     // Main
+                    assistant("hi there", None),       // Main
+                    assistant("sub work 1", Some("toolu_1")), // teammate
+                    assistant("back to main", None),   // Main — reunites with "hi there"
+                    assistant("sub work 2", Some("toolu_1")), // teammate — reunites
+                ],
+                cx,
+            );
+
+            // Main view resolves to StreamId::Main: user + ONE coalesced
+            // assistant (the two Main assistants merged across the interleaved
+            // teammate entry). NO teammate entry leaks in.
+            let main_id = SubagentView::Main.parent_stream_id().unwrap();
+            let main = &s.streams[&main_id].entries;
+            assert_eq!(main.len(), 2, "user + one coalesced Main assistant");
+            assert!(
+                main.iter().all(|e| e.subagent_id.is_none()),
+                "Main must contain no teammate-tagged entries"
+            );
+
+            // Task(toolu_1) resolves to the Teammate stream: ONE coalesced
+            // assistant, tagged, and nothing from Main.
+            let task_id = SubagentView::Task("toolu_1".into())
+                .parent_stream_id()
+                .unwrap();
+            assert_eq!(task_id, StreamId::Teammate("toolu_1".into()));
+            let team = &s.streams[&task_id].entries;
+            assert_eq!(team.len(), 1, "two teammate messages coalesced into one");
+            assert_eq!(
+                team[0].subagent_id.as_deref(),
+                Some("toolu_1"),
+                "coalesced entry keeps the teammate tag"
+            );
+
+            // A selected teammate id with no entries has no stream → the render
+            // helper falls back to empty (renders "(no messages yet)").
+            assert!(
+                !s.streams
+                    .contains_key(&StreamId::Teammate("toolu_absent".into()))
+            );
+        });
+    }
+
     #[gpui::test]
     fn change_seq_is_monotonic_and_epoch_bumps(cx: &mut TestAppContext) {
         let session = cx.update(|cx| cx.new(|_| build_session()));

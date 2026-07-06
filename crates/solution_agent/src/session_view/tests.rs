@@ -433,3 +433,127 @@ async fn build_shell_drill_in_entries_stale_running_label(cx: &mut gpui::TestApp
         "stale running label: {source}"
     );
 }
+
+/// Phase 2c render-flip, drawn end-to-end: the virtualized `list_state` must be
+/// sized to the SELECTED stream's entry count, NOT the flat `session.entries`
+/// length. This is the direct "no trailing/misplaced blank rows" proof — the
+/// old model sized the list to the full flat count (Main + teammate rows) and
+/// rendered teammate rows as 0-height `Empty` under Main; the flip sizes it to
+/// the demux'd selected stream, so a teammate present adds no phantom slots.
+#[gpui::test]
+async fn render_sizes_list_state_to_selected_stream_not_flat_entries(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    use crate::store::SolutionAgentStore;
+    use gpui::VisualTestContext;
+    use std::sync::Arc;
+
+    fn assistant(text: &str, sub: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: sub.map(SharedString::from),
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.to_string())],
+            },
+        }
+    }
+    fn user(text: &str) -> SessionEntry {
+        SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        }
+    }
+
+    let (solution_id, _tmp, project) =
+        crate::store::tests::setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let workspace_window =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| {
+        workspace_window
+            .root(cx)
+            .expect("workspace window alive")
+            .downgrade()
+    });
+
+    // Cold session, interleaved Main+teammate transcript: 5 flat entries →
+    // Main stream has 2 (user + one coalesced assistant), teammate stream 1.
+    let session = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = crate::store::tests::insert_cold_session(
+                session_id,
+                solution_id.clone(),
+                agent_id.clone(),
+                Some(120_000),
+                Some(project.clone()),
+                store,
+                cx,
+            );
+            session.update(cx, |s, cx| {
+                s.set_entries(
+                    vec![
+                        user("hello"),
+                        assistant("hi there", None),
+                        assistant("sub 1", Some("toolu_1")),
+                        assistant("back to main", None),
+                        assistant("sub 2", Some("toolu_1")),
+                    ],
+                    cx,
+                );
+                assert_eq!(s.entries.len(), 5, "flat entries stay at 5");
+            });
+            session
+        })
+    });
+
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(session_id, session.clone(), workspace_weak.clone(), window, cx)
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.run_until_parked();
+
+    // Main selected (default): list sized to the Main STREAM (2), not the flat 5.
+    view_window
+        .update(vcx, |view, _window, _cx| {
+            assert_eq!(
+                view.list_state.item_count(),
+                2,
+                "Main list_state = Main stream count (2), teammate rows excluded — no blank slots"
+            );
+        })
+        .unwrap();
+
+    // Switch to the teammate tab; the list must resize to the teammate stream (1).
+    view_window
+        .update(vcx, |view, _window, cx| {
+            view.selected_subagent = SubagentView::Task("toolu_1".into());
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    view_window
+        .update(vcx, |view, _window, _cx| {
+            assert_eq!(
+                view.list_state.item_count(),
+                1,
+                "Task list_state = teammate stream count (1)"
+            );
+        })
+        .unwrap();
+}

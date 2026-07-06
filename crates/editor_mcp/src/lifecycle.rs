@@ -181,6 +181,7 @@ const GLOBAL_TOOLS: &[&str] = &[
     "windows.send_keystroke",
     "windows.send_text",
     "windows.click_at",
+    "windows.scroll_at",
     "windows.click_id",
     "windows.hover_at",
     "windows.hover_id",

@@ -4,7 +4,7 @@ use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;
 use gpui::{
     App, AsyncApp, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformInput, Point, px,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, px,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -701,6 +701,98 @@ fn dispatch_mouse_click(
         }),
         cx,
     );
+}
+
+// =====================================================================
+// windows.scroll_at
+// =====================================================================
+
+/// Scroll at a point by dispatching a `ScrollWheelEvent` there. `delta_y` is in
+/// pixels: POSITIVE scrolls the content UP toward older/earlier content (the
+/// natural "drag the surface up" / wheel-up direction on a chat list), NEGATIVE
+/// scrolls DOWN toward the tail. Lets an agent drive a virtualized list (e.g. a
+/// conversation) programmatically to screenshot off-screen regions without a
+/// real mouse wheel. The point (x, y) must be over the scrollable region.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+#[serde(default)]
+pub struct ScrollAtParams {
+    pub window_id: String,
+    pub x: f32,
+    pub y: f32,
+    pub delta_y: f32,
+    pub delta_x: f32,
+    pub modifiers: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ScrollAtParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            window_id: String,
+            x: f32,
+            y: f32,
+            delta_y: f32,
+            delta_x: f32,
+            modifiers: Vec<String>,
+        }
+        let i = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            window_id: i.window_id,
+            x: i.x,
+            y: i.y,
+            delta_y: i.delta_y,
+            delta_x: i.delta_x,
+            modifiers: i.modifiers,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct ScrollAtResult {
+    pub scrolled: bool,
+}
+
+#[derive(Clone)]
+pub struct ScrollAtTool;
+
+impl McpServerTool for ScrollAtTool {
+    type Input = ScrollAtParams;
+    type Output = ScrollAtResult;
+    const NAME: &'static str = "windows.scroll_at";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        let modifiers = parse_modifiers(&input.modifiers)?;
+        let position = Point::new(px(input.x), px(input.y));
+        let delta = ScrollDelta::Pixels(Point::new(px(input.delta_x), px(input.delta_y)));
+        let scrolled = cx.update(|cx| -> anyhow::Result<bool> {
+            let handle = find_window_by_id(&input.window_id, cx)?;
+            handle
+                .update(cx, |_view, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position,
+                            delta,
+                            modifiers,
+                            touch_phase: TouchPhase::Moved,
+                        }),
+                        cx,
+                    );
+                })
+                .map_err(|err| anyhow::anyhow!("scroll_at dispatch failed: {err}"))?;
+            Ok(true)
+        })?;
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: format!("scroll at ({}, {}) dy={}", input.x, input.y, input.delta_y),
+            }],
+            structured_content: ScrollAtResult { scrolled },
+        })
+    }
 }
 
 // =====================================================================

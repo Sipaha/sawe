@@ -113,6 +113,10 @@ pub fn register(cx: &mut App) {
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(PushSystemNoteTool);
     });
+    #[cfg(debug_assertions)]
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(SeedColdSessionTool);
+    });
 }
 
 // =====================================================================
@@ -5094,6 +5098,123 @@ impl McpServerTool for GetSupervisorStateTool {
             }
         });
 
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: serde_json::to_string(&result).unwrap_or_default(),
+            }],
+            structured_content: result,
+        })
+    }
+}
+
+// =====================================================================
+// solution_agent.seed_cold_session  (debug builds only)
+// =====================================================================
+
+/// Debug/verification-only tool: register a COLD session (no live claude
+/// subprocess) pre-populated with the given entries, so an agent driving the
+/// editor over MCP can screenshot arbitrary multi-stream render states — Main
+/// plus a `Task` teammate (any entry with a `subagent_id`), background shells,
+/// etc. — deterministically. The render path reads `session.streams` (rebuilt
+/// by `set_entries`), so a seeded cold session paints exactly like one hydrated
+/// from the DB. Compiled out of release builds via `#[cfg(debug_assertions)]`,
+/// so it never reaches a user binary or the mobile allow-list.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SeedColdSessionEntry {
+    /// `"user"` or `"assistant"` (default `"assistant"`).
+    pub role: String,
+    /// `toolu_…` teammate id, or omitted/empty for a Main entry.
+    pub subagent_id: Option<String>,
+    pub text: String,
+}
+
+/// Seed a COLD (no live agent) session in `solution_id`, pre-populated with
+/// `entries`, and open it in the solution's tab strip. Debug-only verification
+/// tool for screenshotting multi-stream render states (Main + `Task` teammate).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SeedColdSessionParams {
+    pub solution_id: String,
+    /// Tab title (default `"Seed"`).
+    pub title: Option<String>,
+    pub entries: Vec<SeedColdSessionEntry>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct SeedColdSessionResult {
+    pub session_id: String,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone)]
+pub struct SeedColdSessionTool;
+
+#[cfg(debug_assertions)]
+impl McpServerTool for SeedColdSessionTool {
+    type Input = SeedColdSessionParams;
+    type Output = SeedColdSessionResult;
+    const NAME: &'static str = "solution_agent.seed_cold_session";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.solution_id.is_empty(),
+            "invalid_params: solution_id is required"
+        );
+        let solution_id = SolutionId(input.solution_id);
+        let title = SharedString::from(input.title.unwrap_or_else(|| "Seed".to_string()));
+        // Give entries increasing timestamps so date separators render (Main
+        // reads "intact" with a real date header), starting from a fixed base
+        // for determinism.
+        const BASE_MS: i64 = 1_720_000_000_000;
+        let entries: Vec<crate::session_entry::SessionEntry> = input
+            .entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let subagent_id = e
+                    .subagent_id
+                    .filter(|s| !s.is_empty())
+                    .map(SharedString::from);
+                let is_user = e.role.eq_ignore_ascii_case("user");
+                let text = e.text;
+                let kind = if is_user {
+                    crate::session_entry::SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: text,
+                        chunks: vec![],
+                    }
+                } else {
+                    crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Message(text)],
+                    }
+                };
+                crate::session_entry::SessionEntry {
+                    created_ms: BASE_MS + (i as i64) * 1000,
+                    mod_seq: 0,
+                    subagent_id,
+                    kind,
+                }
+            })
+            .collect();
+
+        let session_id = cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.seed_cold_session(solution_id, title, entries, cx)
+            })
+        });
+
+        let result = SeedColdSessionResult {
+            session_id: session_id.to_string(),
+        };
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: serde_json::to_string(&result).unwrap_or_default(),

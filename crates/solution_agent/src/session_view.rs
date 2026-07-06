@@ -351,15 +351,25 @@ pub struct SolutionSessionView {
         std::time::SystemTime,
         u64,
     )>,
-    /// The drill-in selection (`Background(id)` or `Shell(id)`) rendered
-    /// on the previous frame, or `None` for a parent-thread view
-    /// (Main/Task). Tracked so a tab switch into / out of / between
-    /// drill-in views can reset `list_state` to the new entry count at
-    /// the next render — without this, swapping into a drill-in view that
-    /// has a different entry count than the parent thread would either
-    /// over- or under-size the virtualized list and silently truncate /
-    /// overflow the rendered rows.
-    prev_render_drill_in: Option<crate::store::SubagentView>,
+    /// Owned entries of the currently-selected *parent-thread* stream
+    /// (`Main` → `StreamId::Main`, `Task(toolu)` → `StreamId::Teammate(toolu)`),
+    /// cloned from `session.streams` (the maintained demux mirror) at the top
+    /// of `Render::render` by `build_main_stream_entries_for_render`. Empty for
+    /// drill-in views (Background/Shell), which source from their own vecs. The
+    /// non-drill-in render path — `collect_entry_texts`, `list_state` sizing,
+    /// the item processor, `recompute_rewind_table`, `recompute_matches` — reads
+    /// entries from HERE, indexing by per-stream position, instead of the flat
+    /// `session.entries` + a `should_render_entry` filter. This is the phase-2c
+    /// render flip: the selected stream is already demux'd + coalesced, so no
+    /// per-entry Main/Task filtering happens at render.
+    main_stream_entries_for_render: Vec<crate::session_entry::SessionEntry>,
+    /// The `SubagentView` rendered on the previous frame, or `None` before the
+    /// first paint. Tracked so ANY tab switch (Main↔Task↔Background↔Shell) can
+    /// reset `list_state` to the newly-selected view's entry count + tail-anchor
+    /// at the next render — each stream has its own per-stream index space now,
+    /// so their counts almost never match and a stale `list_state` would
+    /// over-/under-size the virtualized list and silently truncate / overflow.
+    prev_render_view: Option<crate::store::SubagentView>,
 }
 
 impl SolutionSessionView {
@@ -609,7 +619,8 @@ impl SolutionSessionView {
             background_entries_fingerprint: None,
             background_shell_entries_for_render: Vec::new(),
             background_shell_entries_fingerprint: None,
-            prev_render_drill_in: None,
+            main_stream_entries_for_render: Vec::new(),
+            prev_render_view: None,
         };
         // Detect any thread that is already attached at construction
         // (e.g. after `resume_session`) and wire its lifecycle hooks.
@@ -803,115 +814,51 @@ impl SolutionSessionView {
         }));
     }
 
-    /// Fine-grained reaction to thread mutations. Replaces the previous
-    /// "redraw the whole panel on every notify" approach: each event
-    /// kind translates into the smallest possible update of
-    /// `list_state` so the virtualized list only re-measures what
-    /// actually changed.
+    /// Fine-grained reaction to thread mutations. Since phase 2c, `list_state`
+    /// sizing is owned by the render path (it reconciles the virtualized list
+    /// to the SELECTED stream's entry count at the top of every `Render` —
+    /// grow/shrink by tail-splice — so no per-source stream re-indexing fights
+    /// it here). This handler no longer splices/remeasures `list_state`; it
+    /// only refreshes the index-derived caches (rewind table, find matches) and
+    /// notifies. Visible rows self-remeasure on every layout pass
+    /// (`list.rs::layout_items`), so streaming height growth needs no explicit
+    /// remeasure. `markdown_cache` self-heals: `ensure_markdown` replaces an
+    /// entry on text mismatch, and the render-top retain prunes keys past the
+    /// current stream length.
     fn on_thread_event(
         &mut self,
-        thread: Entity<acp_thread::AcpThread>,
+        _thread: Entity<acp_thread::AcpThread>,
         event: &acp_thread::AcpThreadEvent,
         cx: &mut Context<Self>,
     ) {
         use acp_thread::AcpThreadEvent::*;
-        // All `AcpThreadEvent` indices are local to the live thread, but
-        // the virtualized list is sized over the cold+live concatenation
-        // (see render path + `sync_thread_subscription`). Offset every
-        // index passed to `list_state` by the cold-prefix count so an
-        // EntryUpdated for live[5] doesn't accidentally remeasure
-        // cold[5].
-        let cold_offset = self.session.read(cx).live_base;
         match event {
             NewEntry => {
-                let live_count = thread.read(cx).entries().len();
-                if live_count > 0 {
-                    // Insert one Unmeasured slot at the new entry's
-                    // global index (cold + live - 1). The list will
-                    // measure it on the next layout pass; if
-                    // `FollowMode::Tail` is active, the viewport snaps
-                    // down to include it automatically.
-                    let global_idx = cold_offset + live_count - 1;
-                    self.list_state.splice(global_idx..global_idx, 1);
-                }
                 self.recompute_rewind_table(cx);
                 if self.find.is_some() {
                     self.recompute_matches(cx);
                 }
             }
-            EntryUpdated(idx) => {
-                // Streaming chunk arrived for live[*idx]; remeasure the
-                // corresponding global row so the list bumps its height
-                // to match the new rendered size. Without this the list
-                // keeps the pre-stream height and the new text overflows.
-                let global_idx = cold_offset + *idx;
-                self.list_state.remeasure_items(global_idx..global_idx + 1);
+            EntryUpdated(_idx) => {
                 if self.find.is_some() {
                     self.recompute_matches(cx);
                 }
             }
-            EntriesRemoved(range) => {
-                let global_range = (cold_offset + range.start)..(cold_offset + range.end);
-                self.list_state.splice(global_range.clone(), 0);
-                // Drop cached markdown entities for entries that no
-                // longer exist; rebuild the rewind table since
-                // truncation changes "which user message is next" for
-                // every surviving prior entry. The cache is keyed by
-                // GLOBAL index, matching how the render path looks
-                // entries up.
-                self.markdown_cache
-                    .retain(|(idx, _), _| !global_range.contains(idx));
+            EntriesRemoved(_range) => {
                 self.recompute_rewind_table(cx);
                 if self.find.is_some() {
                     self.recompute_matches(cx);
                 }
             }
-            ToolAuthorizationRequested(tool_call_id) | ToolAuthorizationReceived(tool_call_id) => {
-                // The tool call transitioned into/out of
-                // `WaitingForConfirmation`, which adds/removes the
-                // authorization buttons inside its bubble and so changes
-                // the row height. `upsert_tool_call_inner` already emitted
-                // a `NewEntry`/`EntryUpdated` before this event, but that
-                // fired before the status flipped to
-                // `WaitingForConfirmation`; remeasure the affected row by
-                // id so the buttons are laid out at the correct height
-                // promptly.
-                if let Some(local_idx) = thread.read(cx).entries().iter().position(|entry| {
-                    matches!(
-                        entry,
-                        AgentThreadEntry::ToolCall(call) if &call.id == tool_call_id
-                    )
-                }) {
-                    let global_idx = cold_offset + local_idx;
-                    self.list_state.remeasure_items(global_idx..global_idx + 1);
-                }
+            ToolAuthorizationRequested(_) | ToolAuthorizationReceived(_) => {
+                // No explicit remeasure: the authorization buttons change the
+                // row height, but that row is on-screen (the user is looking at
+                // the confirmation) and visible rows re-layout every pass. The
+                // `cx.notify()` below schedules that pass.
             }
             _ => {}
         }
         cx.notify();
-    }
-
-    /// Returns `true` when `entry` should be visible under the current
-    /// `selected_subagent` tab. `Main` shows entries whose `subagent_id`
-    /// is also `None`; `Task(id)` shows only entries stamped with that
-    /// exact id. Plan-level entries and user messages have no subagent
-    /// affiliation, so they fall under "Main".
-    ///
-    /// The Main view NEVER shows subagent-tagged entries, even when no
-    /// subagents are currently active (`active_subagents` empty / after a
-    /// restart). An earlier "cold-restart bypass" rendered every entry in
-    /// that state so a finished subagent's `toolu_xxx`-tagged rows wouldn't
-    /// vanish — but that dumped the whole subagent transcript back into Main
-    /// the instant the Task/Agent completed, which is exactly the leak the
-    /// tab split exists to prevent. The subagent's `Agent` tool call and its
-    /// result summary are Main-thread entries (`subagent_id == None`), so
-    /// they stay in Main; only the verbose interior steps are hidden.
-    pub(crate) fn should_render_entry(
-        &self,
-        entry: &crate::session_entry::SessionEntry,
-    ) -> bool {
-        self.selected_subagent
-            .matches_parent_entry(entry.subagent_id.as_ref())
     }
 
     /// Snap-to-next helper extracted out of `on_subagents_changed` so
@@ -1236,18 +1183,36 @@ impl SolutionSessionView {
             self.rewind_table.clear();
             return;
         }
-        // Project the unified `session.entries` to the `SessionEntry`
-        // UserMessage id (a String); `compute_rewind_table` walks it once.
-        // The String is resolved back to the live `UserMessageId` at the
-        // rewind action site (see `conversation_render::resolve_user_message_id`).
+        // Project the selected parent-thread stream's entries to their
+        // `SessionEntry` UserMessage id (a String); `compute_rewind_table`
+        // walks it once. The String is resolved back to the live `UserMessageId`
+        // at the rewind action site (`conversation_render::resolve_user_message_id`).
+        // Read from `session.streams` directly (NOT the render-frame field) so
+        // the table is current even when this runs from `on_thread_event`,
+        // before the next render refreshes `main_stream_entries_for_render`. It
+        // indexes per-stream, matching the render path's `rewind_table` lookup
+        // because both read the same demux mirror within a notify cycle. Drill-in
+        // views have no rewindable parent thread → empty table.
+        let Some(stream_id) = self.selected_subagent.parent_stream_id() else {
+            self.rewind_table.clear();
+            return;
+        };
         let user_ids: Vec<Option<String>> = session
-            .entries
-            .iter()
-            .map(|entry| match &entry.kind {
-                crate::session_entry::SessionEntryKind::UserMessage { id, .. } => id.clone(),
-                _ => None,
+            .streams
+            .get(&stream_id)
+            .map(|stream| {
+                stream
+                    .entries
+                    .iter()
+                    .map(|entry| match &entry.kind {
+                        crate::session_entry::SessionEntryKind::UserMessage { id, .. } => {
+                            id.clone()
+                        }
+                        _ => None,
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         self.rewind_table = crate::conversation_render::compute_rewind_table(&user_ids);
     }
 
@@ -1507,10 +1472,19 @@ impl SolutionSessionView {
         let query_lower = query.to_lowercase();
         let mut matches = Vec::new();
         let session = self.session.read(cx);
-        // Iterate the unified `session.entries` so `entry_idx` is the global
-        // index (matching `markdown_for_render`'s keys and the list dispatch),
-        // not the live-thread-only index the previous code used.
-        for (entry_idx, entry) in session.entries.iter().enumerate() {
+        // Iterate the selected parent-thread stream's entries so `entry_idx` is
+        // the per-stream index (matching `markdown_for_render`'s keys and the
+        // list dispatch). Read from `session.streams` directly, not the
+        // render-frame field, so a `recompute_matches` fired from
+        // `on_thread_event` reflects the just-mutated stream. Drill-in views
+        // don't support find over the parent thread → no matches.
+        let stream_entries: &[crate::session_entry::SessionEntry] = self
+            .selected_subagent
+            .parent_stream_id()
+            .and_then(|stream_id| session.streams.get(&stream_id))
+            .map(|s| s.entries.as_slice())
+            .unwrap_or_default();
+        for (entry_idx, entry) in stream_entries.iter().enumerate() {
             for (span_idx, text) in entry_text_spans(entry).into_iter().enumerate() {
                 find_all(&text, &query_lower, |range| {
                     matches.push(FindMatch {
@@ -2563,12 +2537,44 @@ pub enum SolutionSessionViewEvent {}
 impl EventEmitter<SolutionSessionViewEvent> for SolutionSessionView {}
 
 impl SolutionSessionView {
+    /// The entries of the parent-thread stream the current tab selects,
+    /// cloned out of `session.streams` (the maintained demux mirror). `Main`
+    /// reads `StreamId::Main`; `Task(toolu)` reads `StreamId::Teammate(toolu)`.
+    /// Drill-in views (`Background`/`Shell`) don't draw from the parent thread,
+    /// so they return empty here (their entries live in the drill-in vecs). A
+    /// selected teammate with no stream yet (finished / not-yet-seen) also
+    /// yields empty — rendered as "(no messages yet)", same as the old filter.
+    fn selected_parent_stream_entries(
+        &self,
+        cx: &App,
+    ) -> Vec<crate::session_entry::SessionEntry> {
+        let Some(stream_id) = self.selected_subagent.parent_stream_id() else {
+            return Vec::new();
+        };
+        self.session
+            .read(cx)
+            .streams
+            .get(&stream_id)
+            .map(|stream| stream.entries.clone())
+            .unwrap_or_default()
+    }
+
+    /// Populate `main_stream_entries_for_render` for this frame from the
+    /// selected parent-thread stream (empty for drill-in views). Called at the
+    /// top of `Render::render` after the drill-in builders so the rest of the
+    /// non-drill-in render path can index a single, already-filtered vec.
+    fn build_main_stream_entries_for_render(&mut self, cx: &App) {
+        self.main_stream_entries_for_render = self.selected_parent_stream_entries(cx);
+    }
+
     /// Walks the active thread once and returns the same per-entry
     /// per-span text shape `entry_text_spans` produces — but as cloned
     /// `String`s so the caller can release the session/thread borrow on
     /// `cx` before doing any mutating work (like ensuring the markdown
-    /// cache). Empty if there's no thread yet.
-    fn collect_entry_texts(&self, cx: &App) -> Vec<Vec<String>> {
+    /// cache). Empty if there's no thread yet. All three sources are owned
+    /// frame-local vecs on `self` (the two drill-in vecs + the selected-stream
+    /// vec), so no `cx` / session borrow is taken here.
+    fn collect_entry_texts(&self) -> Vec<Vec<String>> {
         use crate::store::SubagentView;
         // Background views source from `build_background_entries_for_render`
         // (already populated this frame by the render entry point); the
@@ -2589,12 +2595,11 @@ impl SolutionSessionView {
                 .map(entry_text_spans)
                 .collect();
         }
-        // The unified `session.entries` is the single cold+live source the
-        // store keeps in sync; it indexes 1:1 with the render path and the
-        // `markdown_for_render` cache (keyed by global entry index).
-        self.session
-            .read(cx)
-            .entries
+        // Non-drill-in (Main/Task): the selected stream's demux'd entries,
+        // populated this frame by `build_main_stream_entries_for_render`. Indexes
+        // 1:1 with the render path and the `markdown_for_render` cache (keyed by
+        // per-stream entry index).
+        self.main_stream_entries_for_render
             .iter()
             .map(entry_text_spans)
             .collect()
@@ -2693,29 +2698,35 @@ impl Render for SolutionSessionView {
         // below is just `is_background || is_shell`.
         let is_shell = self.build_background_shell_entries_for_render(cx);
         let is_drill_in = is_background || is_shell;
-        // List-state sizing key changes when we transition Main/Task ↔
-        // drill-in (Background/Shell), because the row counts almost never
-        // match. Reset here (before the processor + sizing pass) so the
-        // virtualized list doesn't draw stale rows from the old source.
-        // Keyed on the full `SubagentView` so flipping between two
-        // distinct drill-in pills also resets.
-        let cur_drill_in_key = match &self.selected_subagent {
-            view @ (crate::store::SubagentView::Background(_)
-            | crate::store::SubagentView::Shell(_)) => Some(view.clone()),
-            _ => None,
-        };
-        if cur_drill_in_key != self.prev_render_drill_in {
+        // Non-drill-in source-build, parallel to the two drill-in builders:
+        // populate `main_stream_entries_for_render` from the selected
+        // parent-thread stream (`session.streams[Main|Teammate]`, the maintained
+        // demux mirror) so the rest of the render pass sources the already-split,
+        // already-coalesced stream instead of the flat `session.entries` + a
+        // per-entry Main/Task filter. Empty for drill-in views. This is the
+        // phase-2c render flip.
+        self.build_main_stream_entries_for_render(cx);
+        // `list_state` is the render authority for row count. On ANY tab switch
+        // (Main↔Task↔Background↔Shell) the selected view's entry count changes —
+        // each stream now has its own per-stream index space, so the counts
+        // almost never match. Reset here (before the sizing/processor pass) to
+        // the new view's count + tail-anchor so the virtualized list doesn't
+        // draw stale rows from the old source. Same-view count drift (streaming
+        // growth / rewind shrink) is handled by the unconditional reconcile
+        // further down, which preserves scroll.
+        let cur_view_key = self.selected_subagent.clone();
+        if self.prev_render_view.as_ref() != Some(&cur_view_key) {
             let new_count = if is_background {
                 self.background_entries_for_render.len()
             } else if is_shell {
                 self.background_shell_entries_for_render.len()
             } else {
-                self.session.read(cx).entries.len()
+                self.main_stream_entries_for_render.len()
             };
             self.list_state.reset(new_count);
             self.list_state.set_follow_mode(FollowMode::Tail);
             self.list_state.scroll_to_end();
-            self.prev_render_drill_in = cur_drill_in_key;
+            self.prev_render_view = Some(cur_view_key);
         }
         // Pre-pass: build the list of (entry_idx, span_idx) → markdown
         // entity mappings. Done up-front so the borrow on `cx` released by
@@ -2732,7 +2743,7 @@ impl Render for SolutionSessionView {
         if self.has_in_progress_tool_call(cx) {
             self.ensure_tool_tick(cx);
         }
-        let texts_per_entry = self.collect_entry_texts(cx);
+        let texts_per_entry = self.collect_entry_texts();
         let (find_matches_owned, find_selected_for_md) = self
             .find
             .as_ref()
@@ -2882,65 +2893,37 @@ impl Render for SolutionSessionView {
                 // Empty / no-thread states render plain text; no point
                 // spinning up a `list(...)` widget when there's nothing
                 // to scroll through.
-                // `entries_count` covers the whole conversation. The
-                // non-drill-in path reads the store-maintained unified
-                // `session.entries` (cold prefix + live tail, kept in sync
-                // by the store on every thread event — see
-                // `session_entry::rebuild_entries`). The per-entry index
-                // passed to the list processor is the global index into
-                // that single vec.
+                // `entries_count` is the SELECTED view's row count. Non-drill-in
+                // (Main/Task) reads `main_stream_entries_for_render` — the
+                // selected stream's demux'd + coalesced entries (built this frame
+                // from `session.streams`). The per-entry index passed to the list
+                // processor is the position within that single vec.
                 let entries_count = if is_background {
                     self.background_entries_for_render.len()
                 } else if is_shell {
                     self.background_shell_entries_for_render.len()
                 } else {
-                    session.entries.len()
+                    self.main_stream_entries_for_render.len()
                 };
-                // Drill-in views grow their entry count between renders as
-                // new content lands (JSONL rows on disk for Background, a
-                // fresh snapshot for Shell); the parent-thread path syncs
-                // `list_state` size via `on_thread_event`. Without this
-                // catch-up the virtualized list would clamp to its
-                // previous size and silently drop the tail.
-                if is_drill_in && self.list_state.item_count() != entries_count {
+                // Render-authority reconcile (phase 2c): `list_state` is sized
+                // HERE, for EVERY view, to the selected stream's count. The
+                // tab-switch reset above handles view changes (reset + tail);
+                // this handles same-view count drift — a live thread appending
+                // (NewEntry no longer splices `list_state`; it just notifies),
+                // a cold blob hydrating (0→N), or a rewind truncating a suffix.
+                // Grow/shrink by TAIL-splice to preserve the scroll anchor:
+                // `reset()` nulls `logical_scroll_top`, which on the
+                // Bottom-aligned list snaps a scrolled-up reader back to the
+                // bottom on every tick (the "scroll bounces back" bug). With
+                // tail-follow armed the viewport still glues to the bottom when
+                // the user hasn't scrolled away.
+                if self.list_state.item_count() != entries_count {
                     let current = self.list_state.item_count();
                     if entries_count > current {
-                        // Growth (streaming new drill-in rows) — append the
-                        // delta instead of `reset()`. `reset()` nulls
-                        // `logical_scroll_top`, which on the Bottom-aligned list
-                        // snaps a scrolled-up reader back to the bottom on every
-                        // tick (the subagent-tab "scroll bounces back" bug).
-                        // Splicing at the tail preserves the scroll anchor (and
-                        // tail-follow keeps the bottom glued only when the user
-                        // hasn't scrolled away), exactly like the parent thread's
-                        // `on_thread_event` path.
                         self.list_state.splice(current..current, entries_count - current);
                     } else {
-                        // Shrank (rows removed / source replaced with fewer
-                        // entries) — rebuild fresh and start at the tail.
-                        self.list_state.reset(entries_count);
-                        self.list_state.set_follow_mode(FollowMode::Tail);
+                        self.list_state.splice(entries_count..current, 0);
                     }
-                }
-
-                // Cold-tab catch-up: a lazily-hydrated placeholder tab starts
-                // with `cold_entries` empty and `list_state` sized to 0; when
-                // its `acp_thread_blob` finishes loading on a background task
-                // `cold_entries` grows, but `sync_thread_subscription`
-                // early-returns (the thread entity id is still `None` →
-                // unchanged), so the virtualized list would stay at 0 rows and
-                // render nothing. Resize to the cold count here whenever there's
-                // no live thread and the counts diverge. Skipped for drill-in
-                // (handled just above) and once a live thread attaches (that
-                // path owns sizing via `sync_thread_subscription` /
-                // `on_thread_event`).
-                if !is_drill_in
-                    && session.acp_thread().is_none()
-                    && self.list_state.item_count() != entries_count
-                {
-                    self.list_state.reset(entries_count);
-                    self.list_state.set_follow_mode(FollowMode::Tail);
-                    self.list_state.scroll_to_end();
                 }
 
                 let conversation_body: AnyElement = if entries_count == 0 {
@@ -3003,11 +2986,13 @@ impl Render for SolutionSessionView {
                                 );
                                 let is_drill_in_inner = is_bg || is_shell_inner;
                                 let session = this.session.read(cx);
-                                // Single source of truth: the drill-in vecs
-                                // (Background/Shell) or the store-maintained
-                                // unified `session.entries`, both
-                                // `Vec<SessionEntry>`. `idx` is the global
-                                // index into whichever vec is active.
+                                // Single source of truth per view: the drill-in
+                                // vecs (Background/Shell) or, for Main/Task, the
+                                // selected stream's `main_stream_entries_for_render`
+                                // (built this frame from `session.streams`, already
+                                // demux'd + coalesced — so NO per-entry filter is
+                                // needed here). `idx` is the position within
+                                // whichever vec is active.
                                 //
                                 // The live thread handle (when one is
                                 // attached) is forwarded to `render_entry`
@@ -3039,17 +3024,17 @@ impl Render for SolutionSessionView {
                                 } else if let Some(thread_entity) = session.acp_thread() {
                                     let supports = thread_entity.read(cx).supports_truncate(cx);
                                     (
-                                        session.entries.get(idx),
+                                        this.main_stream_entries_for_render.get(idx),
                                         thread_entity.downgrade(),
                                         supports,
                                     )
                                 } else {
                                     // Cold tab (no live thread): entries paint
-                                    // from `session.entries`, but there's no
+                                    // from the selected stream, but there's no
                                     // thread to rewind against, so the handle
                                     // is invalid and rewind is off.
                                     (
-                                        session.entries.get(idx),
+                                        this.main_stream_entries_for_render.get(idx),
                                         gpui::WeakEntity::<acp_thread::AcpThread>::new_invalid(),
                                         false,
                                     )
@@ -3057,18 +3042,6 @@ impl Render for SolutionSessionView {
                                 let Some(entry) = entry_ref else {
                                     return Empty.into_any_element();
                                 };
-                                // Subagent-tab filter for parent-thread
-                                // sources only — Background entries are
-                                // already pre-filtered (they're a
-                                // standalone JSONL, not the parent thread
-                                // slice). Without this skip, every
-                                // Background entry would fail
-                                // `should_render_entry`'s Main-only
-                                // predicate and the entire transcript
-                                // would render blank.
-                                if !is_drill_in_inner && !this.should_render_entry(entry) {
-                                    return Empty.into_any_element();
-                                }
                                 let rewind_target = if supports_rewind
                                     && matches!(
                                         entry.kind,
@@ -3084,7 +3057,7 @@ impl Render for SolutionSessionView {
                                 };
                                 // Per-entry date-separator computation. Reads
                                 // the entry's own `created_ms` (and the
-                                // previous entry's) off `session.entries`; only
+                                // previous entry's) off the selected stream; only
                                 // `ms > 0` is a real time. Drill-in entries
                                 // carry `created_ms == 0` (no surfaced JSONL
                                 // timestamp), so the separator is suppressed.
@@ -3093,15 +3066,14 @@ impl Render for SolutionSessionView {
                                 } else if is_shell_inner {
                                     this.background_shell_entries_for_render.len()
                                 } else {
-                                    session.entries.len()
+                                    this.main_stream_entries_for_render.len()
                                 };
                                 let is_last = idx + 1 == entry_count;
                                 let entry_ms = |i: usize| -> Option<i64> {
                                     if is_drill_in_inner {
                                         return None;
                                     }
-                                    session
-                                        .entries
+                                    this.main_stream_entries_for_render
                                         .get(i)
                                         .map(|e| e.created_ms)
                                         .filter(|&ms| ms > 0)

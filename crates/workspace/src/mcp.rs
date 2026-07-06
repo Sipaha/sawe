@@ -39,6 +39,9 @@ pub fn register(cx: &mut App) {
         server.add_tool(windows::ClickAtTool);
     });
     editor_mcp::register_tool(cx, |server| {
+        server.add_tool(windows::ScrollAtTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
         server.add_tool(windows::ClickIdTool);
     });
     editor_mcp::register_tool(cx, |server| {

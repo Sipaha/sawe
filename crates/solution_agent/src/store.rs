@@ -342,6 +342,21 @@ impl SubagentView {
         }
     }
 
+    /// The per-source [`crate::stream::StreamId`] this view selects out of
+    /// `SolutionSession.streams` (the maintained demux mirror the desktop
+    /// render reads since phase 2c). `Main → StreamId::Main`,
+    /// `Task(toolu) → StreamId::Teammate(toolu)`. `Background`/`Shell` return
+    /// `None` — they source from disk (JSONL / `.output`), not the parent
+    /// thread demux. This is the single mapping the view's render, rewind, and
+    /// find paths all route through.
+    pub fn parent_stream_id(&self) -> Option<crate::stream::StreamId> {
+        match self {
+            Self::Main => Some(crate::stream::StreamId::Main),
+            Self::Task(id) => Some(crate::stream::StreamId::Teammate(id.clone())),
+            Self::Background(_) | Self::Shell(_) => None,
+        }
+    }
+
     /// Predicate for parent-thread entry filtering. `Main` matches
     /// only entries with no `subagent_id`; `Task(id)` matches only
     /// entries stamped with exactly that id; `Background` matches
@@ -3582,6 +3597,12 @@ impl SolutionAgentStore {
                         s.desired_effort = meta.desired_effort.clone();
                         s.cached_models = meta.cached_models.clone();
                         s.entries = entries;
+                        // Rebuild the per-source `streams` mirror the desktop
+                        // render reads from (phase 2c). Cold-load/hydration
+                        // assigns `entries` directly, so without this the mirror
+                        // stays Main-only-empty and a restored session paints
+                        // blank. `rebuild_streams` is an O(N) demux at load time.
+                        s.rebuild_streams();
                         // Legacy/migrating rows have no persisted change_seq and no
                         // pre-restart delta client → fall back to max(mod_seq).
                         s.restore_change_seq(if migrating {
@@ -4381,6 +4402,11 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = entries;
+                        // Rebuild the per-source `streams` mirror (phase 2c) —
+                        // the desktop render reads it, and this cold-load path
+                        // assigns `entries` directly. Without it a restored
+                        // session renders blank.
+                        s.rebuild_streams();
                         s.restore_change_seq(if migrating { None } else { restored_change_seq });
                         if migrating {
                             s.bump_epoch();
@@ -4670,6 +4696,11 @@ impl SolutionAgentStore {
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
                         s.entries = entries;
+                        // Rebuild the per-source `streams` mirror (phase 2c) —
+                        // the desktop render reads it, and this cold-load path
+                        // assigns `entries` directly. Without it a restored
+                        // session renders blank.
+                        s.rebuild_streams();
                         s.restore_change_seq(if migrating { None } else { restored_change_seq });
                         if migrating {
                             s.bump_epoch();
@@ -4995,6 +5026,11 @@ impl SolutionAgentStore {
                         )
                     };
                     session.entries = entries;
+                    // Rebuild the per-source `streams` mirror (phase 2c) — the
+                    // desktop render reads it; this cold-blob load assigns
+                    // `entries` directly, so without it the restored session
+                    // paints blank.
+                    session.rebuild_streams();
                     session.restore_change_seq(if migrating { None } else { restored_change_seq });
                     if migrating {
                         session.bump_epoch();
@@ -6212,6 +6248,74 @@ impl SolutionAgentStore {
         let mut ordered: Vec<SolutionSessionId> = pinned.into_iter().map(|(id, _)| id).collect();
         ordered.push(session_id);
         self.persist_tab_order(solution_id, ordered, cx);
+    }
+
+    /// Debug/verification only: register a COLD session (no live `AcpThread`)
+    /// pre-populated with `entries`, made UI-visible via `open_session_in_strip`,
+    /// then return its id. Exists so an agent driving the editor over MCP can
+    /// screenshot arbitrary multi-stream render states (Main + a Task teammate,
+    /// background shells, …) WITHOUT a live claude subprocess — the render path
+    /// reads `session.streams` (rebuilt by `set_entries`), so a seeded cold
+    /// session paints exactly like a hydrated one. Not compiled into release
+    /// builds (`debug_assertions`), so it never reaches a user binary.
+    #[cfg(debug_assertions)]
+    pub(crate) fn seed_cold_session(
+        &mut self,
+        solution_id: SolutionId,
+        title: SharedString,
+        entries: Vec<crate::session_entry::SessionEntry>,
+        cx: &mut Context<Self>,
+    ) -> SolutionSessionId {
+        let session_id = SolutionSessionId::new();
+        // Use the first member's path as cwd (falling back to the solution
+        // root) so the ConsolePanel's active-member tab filter
+        // (`tab_cwd_in_scope`: cwd must `starts_with` the active member) shows
+        // the seeded session instead of scoping it out.
+        let root = SolutionStore::try_global(cx)
+            .and_then(|store| {
+                store.read_with(cx, |s, _| {
+                    s.solutions().iter().find(|sol| sol.id == solution_id).map(
+                        |sol| {
+                            sol.members
+                                .first()
+                                .map(|m| m.local_path.clone())
+                                .unwrap_or_else(|| sol.root.clone())
+                        },
+                    )
+                })
+            })
+            .unwrap_or_default();
+        let entity = cx.new(|cx| {
+            let mut s = SolutionSession::new_idle(
+                session_id,
+                solution_id.clone(),
+                SharedString::from("claude-acp"),
+                acp::SessionId::new("seed-cold"),
+            );
+            s.title = title;
+            s.cwd = root;
+            s.set_entries(entries, cx);
+            s
+        });
+        self.sessions.insert(session_id, entity);
+        self.by_solution
+            .entry(solution_id)
+            .or_default()
+            .push(session_id);
+        self.open_session_in_strip(session_id, cx);
+        // Persist the metadata row + entry rows (with their `subagent_id` tags)
+        // so a restart reloads this session through the real cold-load /
+        // hydration path — which must `rebuild_streams()` after assigning
+        // `entries`, else a restored session renders blank. Lets the seed
+        // double as a hydration-fix check.
+        self.persist_session_row(session_id, cx);
+        self.persist_upsert_range(session_id, 0, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionCreated {
+            id: session_id,
+            parent_session_id: None,
+        });
+        cx.notify();
+        session_id
     }
 
     /// Metadata for the solution's explicitly-closed sessions (`closed_at`
@@ -9114,6 +9218,30 @@ mod subagent_view_tests {
         assert!(
             !SubagentView::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"))
                 .is_parent_thread_view()
+        );
+    }
+
+    #[test]
+    fn subagent_view_parent_stream_id_maps_main_and_task() {
+        use crate::stream::StreamId;
+        // Phase 2c: the desktop render resolves the selected view to a stream
+        // in `SolutionSession.streams` via this mapping. Main + Task select a
+        // parent-thread stream; drill-in views select none (they source from
+        // disk, not the demux mirror).
+        assert_eq!(SubagentView::Main.parent_stream_id(), Some(StreamId::Main));
+        assert_eq!(
+            SubagentView::Task("toolu_abc".into()).parent_stream_id(),
+            Some(StreamId::Teammate("toolu_abc".into()))
+        );
+        assert_eq!(
+            SubagentView::Background(crate::background_agent::BackgroundAgentId::new("a30f"))
+                .parent_stream_id(),
+            None
+        );
+        assert_eq!(
+            SubagentView::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"))
+                .parent_stream_id(),
+            None
         );
     }
 }
