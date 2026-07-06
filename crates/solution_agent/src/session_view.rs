@@ -289,15 +289,12 @@ pub struct SolutionSessionView {
     /// Currently selected subagent tab for the strip:
     /// `SubagentView::Main` = the parent thread view, `Task(toolu_id)` =
     /// an in-flight inline `Task`/`Agent` subagent filtered to entries
-    /// whose `subagent_id` matches, `Background(agent_id)` = a Managed
-    /// Agent's standalone JSONL transcript (Task 11+). View-state only,
-    /// not persisted across editor restarts (the selection is
-    /// meaningless once the active set becomes empty). Auto-reset to
-    /// `Main` (never to another teammate) when the selected `Task`'s
-    /// teammate stream is removed — see `next_selection_after_change`,
-    /// wired off `SessionSubagentsChanged`. `Background` selections
-    /// pass through unchanged since their lifecycle is bound to the
-    /// JSONL file on disk, not the parent thread.
+    /// whose `subagent_id` matches, `Shell(id)` = a background shell's
+    /// derived `StreamId::Shell` view. View-state only, not persisted
+    /// across editor restarts (the selection is meaningless once the
+    /// active set becomes empty). Auto-reset to `Main` (never to another
+    /// teammate) when the selected `Task`/`Shell` stream is removed — see
+    /// `next_selection_after_change`, wired off `SessionSubagentsChanged`.
     pub(crate) selected_subagent: crate::store::SubagentView,
     /// Background tick that wakes the view once a second while any
     /// visible tool call sits in `InProgress`, so the per-tool elapsed
@@ -306,35 +303,12 @@ pub struct SolutionSessionView {
     /// Self-cleared when no InProgress tool remains so the next
     /// transition can start a fresh tick.
     tool_tick: Option<Task<()>>,
-    /// Owned `AgentThreadEntry`s built from a Background view's JSONL
-    /// transcript. Populated by `build_background_entries_for_render`
-    /// at the top of `Render::render` whenever `selected_subagent ==
-    /// Background(id)`, cleared otherwise. The list processor reads
-    /// entries from here instead of `acp_thread.entries()` for the
-    /// duration of the frame. Owned (not borrowed) because
-    /// `jsonl_to_entries` builds fresh `Markdown` widgets and the
-    /// `AgentThreadEntry` enum is `!Clone`, so we can't materialise
-    /// the slice every closure invocation.
-    background_entries_for_render: Vec<crate::session_entry::SessionEntry>,
-    /// Freshness fingerprint of `background_entries_for_render`: the
-    /// `BackgroundAgentId` whose JSONL was last converted, plus the file
-    /// mtime + size at conversion time. On each Background render we
-    /// stat the JSONL (~one syscall, no read) and reuse the cached
-    /// `Vec<AgentThreadEntry>` when the fingerprint matches, so a 5 MiB
-    /// transcript doesn't get re-parsed + re-`Markdown`-allocated every
-    /// frame. Cleared whenever the view leaves Background or the
-    /// selected agent disappears.
-    background_entries_fingerprint: Option<(
-        crate::background_agent::BackgroundAgentId,
-        std::time::SystemTime,
-        u64,
-    )>,
     /// Owned entries of the currently-selected parent-stream view
     /// (`Main` → `StreamId::Main`, `Task(toolu)` → `StreamId::Teammate(toolu)`,
     /// and — phase 6d-A — `Shell(id)` → `StreamId::Shell(id)`), cloned from
     /// `session.streams` (the maintained demux mirror) at the top of
-    /// `Render::render` by `build_main_stream_entries_for_render`. Empty only for
-    /// the `Background` drill-in, which still sources from its own JSONL vec. The
+    /// `Render::render` by `build_main_stream_entries_for_render`. Empty when the
+    /// selected stream has no entries yet. The
     /// parent-stream render path — `collect_entry_texts`, `list_state` sizing,
     /// the item processor, `recompute_rewind_table`, `recompute_matches` — reads
     /// entries from HERE, indexing by per-stream position, instead of the flat
@@ -594,8 +568,6 @@ impl SolutionSessionView {
             resuming_markdown_source: SharedString::default(),
             selected_subagent: crate::store::SubagentView::default(),
             tool_tick: None,
-            background_entries_for_render: Vec::new(),
-            background_entries_fingerprint: None,
             main_stream_entries_for_render: Vec::new(),
             prev_render_view: None,
         };
@@ -842,9 +814,7 @@ impl SolutionSessionView {
     /// so the lifecycle can be unit-tested without spinning up a full GPUI
     /// view. Returns the new value for `selected_subagent` given the current
     /// selection and the session's `streams` (phase 6c teammates, phase 6d-A
-    /// shells). Pure — no side effects. `Background` stays a pass-through here —
-    /// it lives in its own on-disk JSONL transcript and doesn't participate in
-    /// the stream lifecycle (that fold is 6d-B).
+    /// shells). Pure — no side effects.
     pub(crate) fn next_selection_after_change(
         current: &crate::store::SubagentView,
         streams: &indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream>,
@@ -852,9 +822,6 @@ impl SolutionSessionView {
         use crate::store::SubagentView;
         match current {
             SubagentView::Main => SubagentView::Main,
-            // Background still lives in its own on-disk transcript and doesn't
-            // participate in the stream lifecycle — pass through unchanged.
-            SubagentView::Background(_) => current.clone(),
             SubagentView::Task(id) => {
                 // Spec (Stream lifecycle): force back to Main ONLY when the
                 // selected teammate's stream is removed — a plain fall-back,
@@ -894,69 +861,21 @@ impl SolutionSessionView {
         cx.notify();
     }
 
-    /// Pure carry-over fallback extracted out of
-    /// `on_background_agents_changed` so the snap-to-`Main`-when-stale
-    /// behaviour can be unit-tested without spinning up a full GPUI
-    /// view. Returns the new value for `selected_subagent`: identity
-    /// for non-`Background` selections; identity for `Background(id)`
-    /// when the id is still present; `Main` when it isn't. Pure — no
-    /// side effects.
-    pub(crate) fn next_selection_after_background_change(
-        current: &crate::store::SubagentView,
-        background_agents: &HashMap<
-            crate::background_agent::BackgroundAgentId,
-            crate::background_agent::BackgroundAgent,
-        >,
-    ) -> crate::store::SubagentView {
-        use crate::store::SubagentView;
-        match current {
-            SubagentView::Background(id) if !background_agents.contains_key(id) => {
-                SubagentView::Main
-            }
-            other => other.clone(),
-        }
-    }
-
     /// `true` when the compose row should be view-only (no input, no send,
-    /// no Submit).
-    ///
-    /// A live Agent Teams teammate's `Background` tab is now composable: a
-    /// follow-up typed there is routed to that teammate via its hook
-    /// (`QueueTarget::Subagent`, see `submit_compose_now`). A FINISHED (or
-    /// already-removed) teammate's tab stays view-only — there is no live
-    /// agent to receive input, so it would mis-route to the parent thread;
-    /// the fix there is still to flip back to `Main`. `Shell` tabs are never
-    /// composable. The structural (liveness-agnostic) part delegates to the
-    /// pure `compose_disabled_for` for unit-testability.
-    fn compose_disabled(&self, cx: &App) -> bool {
-        if let crate::store::SubagentView::Background(id) = &self.selected_subagent
-            && self
-                .session
-                .read(cx)
-                .background_agents
-                .get(id)
-                .is_some_and(|agent| agent.is_messageable())
-        {
-            return false;
-        }
+    /// no Submit). `Shell` tabs are never composable; `Task` is an inline
+    /// filtered slice of the parent thread and stays composable. Delegates to
+    /// the pure `compose_disabled_for` for unit-testability.
+    fn compose_disabled(&self, _cx: &App) -> bool {
         compose_disabled_for(&self.selected_subagent)
     }
 
-    /// React to `SessionBackgroundAgentsChanged`. If the currently
-    /// selected `Background(id)` view's agent has been removed from
-    /// `session.background_agents` (× close, healthcheck reaper, or a
-    /// startup-reconciliation drop), snap `selected_subagent` back to
-    /// `Main`. Without this the view would render an empty body and
-    /// the pill click handler couldn't recover until the user
-    /// happened to click another pill — see Task 11 notes.
+    /// React to `SessionBackgroundAgentsChanged`. Post-6d-B an async agent
+    /// renders as its demux `Teammate` pill (no standalone `Background` tab),
+    /// so there is no selection to reconcile here — just repaint the strip so
+    /// a live async-agent's `activity_label` change refreshes its teammate
+    /// pill (the label is looked up by `parent_tool_use_id` off
+    /// `session.background_agents`).
     pub(crate) fn on_background_agents_changed(&mut self, cx: &mut Context<Self>) {
-        let next = Self::next_selection_after_background_change(
-            &self.selected_subagent,
-            &self.session.read(cx).background_agents,
-        );
-        if next != self.selected_subagent {
-            self.selected_subagent = next;
-        }
         cx.notify();
     }
 
@@ -976,102 +895,6 @@ impl SolutionSessionView {
             self.selected_subagent = next;
         }
         cx.notify();
-    }
-
-    /// Populate `self.background_entries_for_render` from the selected
-    /// Background view's JSONL transcript and return `true`, so the
-    /// renderer knows to source list rows from that vec instead of the
-    /// parent thread. Returns `false` when the current view is Main /
-    /// Task (and clears any stale background entries to release the
-    /// owned `Markdown` widgets they carry).
-    ///
-    /// Capped at the last 5 MiB so a runaway transcript can't
-    /// unbounded-allocate. Reads are skipped via an mtime+size
-    /// fingerprint compare against `background_entries_fingerprint`,
-    /// so a sticky Background view that the file hasn't mutated
-    /// reuses its cached `Vec<AgentThreadEntry>` without re-parsing.
-    pub(crate) fn build_background_entries_for_render(&mut self, cx: &mut App) -> bool {
-        use crate::store::SubagentView;
-        let (selected_id, path) = match &self.selected_subagent {
-            // Only a `Background` view draws from a managed-agent JSONL here.
-            // `Shell` is now a parent-stream view (phase 6d-A: it renders through
-            // `main_stream_entries_for_render` from its derived `StreamId::Shell`),
-            // so this background-agent renderer paints nothing for it (nor for
-            // Main/Task) — it stays in the "clear + return false" arm.
-            SubagentView::Main | SubagentView::Task(_) | SubagentView::Shell(_) => {
-                if !self.background_entries_for_render.is_empty() {
-                    self.background_entries_for_render.clear();
-                }
-                self.background_entries_fingerprint = None;
-                return false;
-            }
-            SubagentView::Background(id) => {
-                match self.session.read(cx).background_agents.get(id) {
-                    Some(agent) => (id.clone(), agent.jsonl_path.clone()),
-                    None => {
-                        // Stale selection. `on_background_agents_changed`
-                        // will snap us back to Main on the next store
-                        // event tick; for this frame, paint empty.
-                        self.background_entries_for_render.clear();
-                        self.background_entries_fingerprint = None;
-                        return true;
-                    }
-                }
-            }
-        };
-        // Cheap freshness check: stat the file and compare mtime+size
-        // against the cached fingerprint. One syscall (~10µs) vs a
-        // 5 MiB read + parse + Markdown allocation (~1ms-10ms). A
-        // missing file or stat error falls through to the read path
-        // which produces an empty Vec and clears the fingerprint, so
-        // the next live JSONL write re-populates.
-        let stat = std::fs::metadata(&path).ok();
-        if let Some(meta) = stat.as_ref()
-            && let Ok(mtime) = meta.modified()
-        {
-            let size = meta.len();
-            let fresh = self.background_entries_fingerprint.as_ref().is_some_and(
-                |(cached_id, cached_mtime, cached_size)| {
-                    cached_id == &selected_id && *cached_mtime == mtime && *cached_size == size
-                },
-            );
-            if fresh {
-                return true;
-            }
-        }
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        const SOFT_CAP: usize = 5 * 1024 * 1024;
-        let trimmed: &str = if content.len() > SOFT_CAP {
-            // Drop the head; the visible scrollback is at the tail. A
-            // partial line at the cut point is fine — `jsonl_to_entries`
-            // silently skips malformed JSON rows. Walk forward to the
-            // next char boundary so a multi-byte UTF-8 in tool output
-            // can't panic the slice.
-            let mut start = content.len() - SOFT_CAP;
-            while start < content.len() && !content.is_char_boundary(start) {
-                start += 1;
-            }
-            &content[start..]
-        } else {
-            content.as_str()
-        };
-        let lines: Vec<&str> = trimmed.lines().collect();
-        // Project the JSONL-derived live entries onto owned `SessionEntry`s
-        // so the drill-in path feeds the same `SessionEntry` render seam as
-        // the main conversation. Drill-in entries carry no per-entry
-        // timestamp (the JSONL has its own that we don't surface yet), so
-        // `created_ms` stays 0 (filtered as "unknown" by the renderer).
-        let entries = crate::background_agent::jsonl_to_entries(&lines, cx);
-        self.background_entries_for_render = entries
-            .iter()
-            .map(|entry| crate::session_entry::to_session_entry(entry, cx))
-            .collect();
-        self.background_entries_fingerprint = stat.as_ref().and_then(|meta| {
-            meta.modified()
-                .ok()
-                .map(|mtime| (selected_id, mtime, meta.len()))
-        });
-        true
     }
 
     /// Recompute the cached "rewind target user message" for every
@@ -2321,13 +2144,9 @@ impl SolutionSessionView {
 
 /// Pure predicate: `true` when the compose row should be view-only
 /// for the given `selected_subagent`. Extracted as a free fn so
-/// `tests.rs` can exercise it without spinning up a full GPUI view —
-/// same pattern as `next_selection_after_background_change`.
+/// `tests.rs` can exercise it without spinning up a full GPUI view.
 pub(crate) fn compose_disabled_for(view: &crate::store::SubagentView) -> bool {
-    matches!(
-        view,
-        crate::store::SubagentView::Background(_) | crate::store::SubagentView::Shell(_)
-    )
+    matches!(view, crate::store::SubagentView::Shell(_))
 }
 
 #[cfg(test)]
@@ -2375,10 +2194,8 @@ impl SolutionSessionView {
     /// `session.streams` (the maintained demux mirror). `Main` reads
     /// `StreamId::Main`; `Task(toolu)` reads `StreamId::Teammate(toolu)`; and
     /// (phase 6d-A) `Shell(id)` reads its derived `StreamId::Shell(id)` stream
-    /// (its fenced-output entry). Only `Background` returns empty here — it is
-    /// the last remaining disk-sourced drill-in view (its JSONL entries live in
-    /// the drill-in vec until 6d-B). A selected teammate with no stream yet
-    /// (finished / not-yet-seen) also yields empty — rendered as
+    /// (its fenced-output entry). A selected teammate with no stream yet
+    /// (finished / not-yet-seen) yields empty — rendered as
     /// "(no messages yet)", same as the old filter.
     fn selected_parent_stream_entries(
         &self,
@@ -2396,34 +2213,22 @@ impl SolutionSessionView {
     }
 
     /// Populate `main_stream_entries_for_render` for this frame from the
-    /// selected stream (empty only for the `Background` disk drill-in). Called at the
-    /// top of `Render::render` after the drill-in builders so the rest of the
-    /// non-drill-in render path can index a single, already-filtered vec.
+    /// selected stream. Called at the top of `Render::render` so the rest of
+    /// the render path can index a single, already-filtered vec.
     fn build_main_stream_entries_for_render(&mut self, cx: &App) {
         self.main_stream_entries_for_render = self.selected_parent_stream_entries(cx);
     }
 
-    /// Walks the active thread once and returns the same per-entry
+    /// Walks the selected stream's entries and returns the same per-entry
     /// per-span text shape `entry_text_spans` produces — but as cloned
     /// `String`s so the caller can release the session/thread borrow on
     /// `cx` before doing any mutating work (like ensuring the markdown
-    /// cache). Empty if there's no thread yet. Both sources are owned
-    /// frame-local vecs on `self` (the `Background` drill-in vec + the
-    /// selected parent-stream vec), so no `cx` / session borrow is taken here.
+    /// cache). Empty if the stream has no entries yet. The source is the
+    /// owned frame-local `main_stream_entries_for_render` vec on `self`, so
+    /// no `cx` / session borrow is taken here.
     fn collect_entry_texts(&self) -> Vec<Vec<String>> {
-        use crate::store::SubagentView;
-        // The `Background` drill-in sources from `build_background_entries_for_render`
-        // (already populated this frame by the render entry point); the owned
-        // entries shadow the parent thread completely.
-        if matches!(self.selected_subagent, SubagentView::Background(_)) {
-            return self
-                .background_entries_for_render
-                .iter()
-                .map(entry_text_spans)
-                .collect();
-        }
-        // Every parent-stream view (Main/Task, and — phase 6d-A — Shell): the
-        // selected stream's demux'd entries, populated this frame by
+        // Every parent-stream view (Main/Task/Shell): the selected stream's
+        // demux'd entries, populated this frame by
         // `build_main_stream_entries_for_render`. Indexes 1:1 with the render
         // path and the `markdown_for_render` cache (keyed by per-stream entry
         // index).
@@ -2510,41 +2315,26 @@ impl Render for SolutionSessionView {
             task_subagent_strip::render_task_subagent_strip(self, &session, cx)
         };
 
-        // Background view source-switch. When `selected_subagent ==
-        // Background(id)`, this populates `background_entries_for_render`
-        // from the agent's JSONL transcript on disk so the rest of the
-        // render pass (text collection, markdown cache, processor
-        // closure) sources from there instead of the parent thread.
-        // `is_background` drives the list-state reset + processor
-        // dispatch below; the entries vec on `self` lives for the
-        // duration of this render frame.
-        let is_background = self.build_background_entries_for_render(cx);
-        // `Background` is the only remaining drill-in (phase 6d-A folded `Shell`
-        // into the parent-stream path via its derived `StreamId::Shell`).
-        let is_drill_in = is_background;
-        // Parent-stream source-build, parallel to the `Background` drill-in
-        // builder: populate `main_stream_entries_for_render` from the selected
-        // stream (`session.streams[Main|Teammate|Shell]`, the maintained demux
-        // mirror) so the rest of the render pass sources the already-split,
-        // already-coalesced stream instead of the flat `session.entries` + a
-        // per-entry Main/Task filter. Empty for the `Background` drill-in. This
-        // is the phase-2c render flip (extended to shells in 6d-A).
+        // Parent-stream source-build: populate `main_stream_entries_for_render`
+        // from the selected stream (`session.streams[Main|Teammate|Shell]`, the
+        // maintained demux mirror) so the rest of the render pass sources the
+        // already-split, already-coalesced stream instead of the flat
+        // `session.entries` + a per-entry Main/Task filter. This is the phase-2c
+        // render flip (extended to shells in 6d-A). Every view now sources from
+        // here — the last disk-sourced drill-in (`Background`) was folded away in
+        // 6d-B, so there is no source-switch to make.
         self.build_main_stream_entries_for_render(cx);
         // `list_state` is the render authority for row count. On ANY tab switch
-        // (Main↔Task↔Background↔Shell) the selected view's entry count changes —
-        // each stream now has its own per-stream index space, so the counts
-        // almost never match. Reset here (before the sizing/processor pass) to
-        // the new view's count + tail-anchor so the virtualized list doesn't
-        // draw stale rows from the old source. Same-view count drift (streaming
-        // growth / rewind shrink) is handled by the unconditional reconcile
-        // further down, which preserves scroll.
+        // (Main↔Task↔Shell) the selected view's entry count changes — each stream
+        // now has its own per-stream index space, so the counts almost never
+        // match. Reset here (before the sizing/processor pass) to the new view's
+        // count + tail-anchor so the virtualized list doesn't draw stale rows
+        // from the old source. Same-view count drift (streaming growth / rewind
+        // shrink) is handled by the unconditional reconcile further down, which
+        // preserves scroll.
         let cur_view_key = self.selected_subagent.clone();
         if self.prev_render_view.as_ref() != Some(&cur_view_key) {
-            let new_count = if is_background {
-                self.background_entries_for_render.len()
-            } else {
-                self.main_stream_entries_for_render.len()
-            };
+            let new_count = self.main_stream_entries_for_render.len();
             self.list_state.reset(new_count);
             self.list_state.set_follow_mode(FollowMode::Tail);
             self.list_state.scroll_to_end();
@@ -2721,11 +2511,7 @@ impl Render for SolutionSessionView {
                 // + coalesced entries (built this frame from `session.streams`).
                 // The per-entry index passed to the list processor is the position
                 // within that single vec.
-                let entries_count = if is_background {
-                    self.background_entries_for_render.len()
-                } else {
-                    self.main_stream_entries_for_render.len()
-                };
+                let entries_count = self.main_stream_entries_for_render.len();
                 // Render-authority reconcile (phase 2c): `list_state` is sized
                 // HERE, for EVERY view, to the selected stream's count. The
                 // tab-switch reset above handles view changes (reset + tail);
@@ -2748,8 +2534,8 @@ impl Render for SolutionSessionView {
                 }
 
                 let conversation_body: AnyElement = if entries_count == 0 {
-                    if !is_drill_in && session.hydrating && session.acp_thread().is_none() {
-                        // Lazily-hydrated background tab whose transcript blob
+                    if session.hydrating && session.acp_thread().is_none() {
+                        // Lazily-hydrated cold tab whose transcript blob
                         // hasn't landed yet — show a spinner, not
                         // "(no messages yet)", so the tab reads as "loading"
                         // rather than "this conversation is empty". Same
@@ -2797,20 +2583,13 @@ impl Render for SolutionSessionView {
                                 // populated up-front by the surrounding
                                 // Render call before the list element gets
                                 // painted.
-                                let is_bg = matches!(
-                                    this.selected_subagent,
-                                    crate::store::SubagentView::Background(_)
-                                );
-                                let is_drill_in_inner = is_bg;
                                 let session = this.session.read(cx);
-                                // Single source of truth per view: the `Background`
-                                // drill-in vec or, for every parent-stream view
-                                // (Main/Task/Shell), the selected stream's
-                                // `main_stream_entries_for_render` (built this frame
-                                // from `session.streams`, already demux'd +
-                                // coalesced — so NO per-entry filter is needed
-                                // here). `idx` is the position within whichever vec
-                                // is active.
+                                // Single source of truth per view: for every
+                                // parent-stream view (Main/Task/Shell), the selected
+                                // stream's `main_stream_entries_for_render` (built
+                                // this frame from `session.streams`, already demux'd
+                                // + coalesced — so NO per-entry filter is needed
+                                // here). `idx` is the position within that vec.
                                 //
                                 // The live thread handle (when one is
                                 // attached) is forwarded to `render_entry`
@@ -2819,24 +2598,15 @@ impl Render for SolutionSessionView {
                                 // String id back to a live `UserMessageId`)
                                 // and the `WaitingForConfirmation` permission
                                 // buttons (looked up by tool-call id on the
-                                // live thread). The `Background` drill-in never
-                                // has a rewindable parent thread — it belongs to
-                                // an independent Managed Agent process — so it
-                                // passes an invalid handle and no rewind. A
-                                // `Shell` stream's synthetic AssistantMessage
-                                // entries carry no `UserMessageId`, so they resolve
-                                // no rewind target even on a live thread.
+                                // live thread). A `Shell` stream's synthetic
+                                // AssistantMessage entries carry no `UserMessageId`,
+                                // so they resolve no rewind target even on a live
+                                // thread.
                                 let (entry_ref, thread_weak, supports_rewind): (
                                     Option<&crate::session_entry::SessionEntry>,
                                     gpui::WeakEntity<acp_thread::AcpThread>,
                                     bool,
-                                ) = if is_bg {
-                                    (
-                                        this.background_entries_for_render.get(idx),
-                                        gpui::WeakEntity::<acp_thread::AcpThread>::new_invalid(),
-                                        false,
-                                    )
-                                } else if let Some(thread_entity) = session.acp_thread() {
+                                ) = if let Some(thread_entity) = session.acp_thread() {
                                     let supports = thread_entity.read(cx).supports_truncate(cx);
                                     (
                                         this.main_stream_entries_for_render.get(idx),
@@ -2873,19 +2643,10 @@ impl Render for SolutionSessionView {
                                 // Per-entry date-separator computation. Reads
                                 // the entry's own `created_ms` (and the
                                 // previous entry's) off the selected stream; only
-                                // `ms > 0` is a real time. The `Background` drill-in
-                                // carries `created_ms == 0` (no surfaced JSONL
-                                // timestamp), so the separator is suppressed there.
-                                let entry_count = if is_bg {
-                                    this.background_entries_for_render.len()
-                                } else {
-                                    this.main_stream_entries_for_render.len()
-                                };
+                                // `ms > 0` is a real time.
+                                let entry_count = this.main_stream_entries_for_render.len();
                                 let is_last = idx + 1 == entry_count;
                                 let entry_ms = |i: usize| -> Option<i64> {
-                                    if is_drill_in_inner {
-                                        return None;
-                                    }
                                     this.main_stream_entries_for_render
                                         .get(i)
                                         .map(|e| e.created_ms)

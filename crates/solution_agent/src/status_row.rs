@@ -231,8 +231,8 @@ pub(crate) fn render_status_row(
     // On a Task subagent tab the meter shows the SUBAGENT's own context, not
     // the parent's — a Task is a separate agent with its own window. The id is
     // the parent `tool_use_id` the subagent usage is keyed by. `None` here =>
-    // Main tab (parent meter, as before). Background/Shell tabs hide the meter
-    // entirely (handled via `is_subagent_tab` below), so they never reach here.
+    // Main tab (parent meter, as before). Shell tabs hide the meter entirely
+    // (handled via `is_subagent_tab` below), so they never reach here.
     let task_subagent_id: Option<SharedString> = match &view.selected_subagent {
         crate::store::SubagentView::Task(id) => Some(id.clone()),
         _ => None,
@@ -531,12 +531,11 @@ pub(crate) fn render_status_row(
     };
 
     // The status row reflects the SELECTED tab, not always Main. A
-    // `Background`/`Shell` subagent has its own liveness/activity, so the
-    // badge shows THAT; `Main`/`Task` fold into the parent session state (a
-    // Task runs inside the parent turn, so the parent's Running/Idle is its
-    // status). On a subagent tab the token meter + compact/clear are
-    // session/Main-only concepts (we don't track a background agent's own
-    // tokens), so they're hidden from the row below.
+    // `Shell` subagent has its own liveness/activity, so the badge shows
+    // THAT; `Main`/`Task` fold into the parent session state (a Task runs
+    // inside the parent turn, so the parent's Running/Idle is its status). On
+    // a subagent tab the token meter + compact/clear are session/Main-only
+    // concepts, so they're hidden from the row below.
     let subagent_status: Option<(SharedString, bool)> = {
         use crate::store::SubagentView;
         let session_entity = SolutionAgentStore::global(cx)
@@ -544,24 +543,6 @@ pub(crate) fn render_status_row(
             .session(view.session_id());
         let session = session_entity.as_ref().map(|s| s.read(cx));
         match (&view.selected_subagent, session) {
-            (SubagentView::Background(id), Some(session)) => {
-                session.background_agents.get(id).map(|agent| {
-                    let running = agent
-                        .latest
-                        .as_ref()
-                        .map_or(true, |snap| snap.stop_reason.is_none());
-                    let label = if running {
-                        agent
-                            .latest
-                            .as_ref()
-                            .map(|snap| snap.activity_label.clone())
-                            .unwrap_or_else(|| SharedString::new_static("Starting…"))
-                    } else {
-                        SharedString::new_static("Done")
-                    };
-                    (label, running)
-                })
-            }
             (SubagentView::Shell(id), Some(session)) => {
                 session.background_shells.get(id).map(|shell| {
                     use crate::background_shell::ShellRuntimeState;
@@ -789,8 +770,8 @@ pub(crate) fn render_status_row(
             // as the separator before the agent/cwd labels either way.
             // Meter (text + bar) shows on Main AND Task tabs — on a Task tab
             // its data is the subagent's own context (sourced above). Hidden
-            // only on Background/Shell tabs (`is_subagent_tab`), where we don't
-            // track the agent's own tokens.
+            // only on Shell tabs (`is_subagent_tab`), where we don't track the
+            // agent's own tokens.
             .when(!is_subagent_tab, |this| {
                 this.child(
                     div().flex_none().child(

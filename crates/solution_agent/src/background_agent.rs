@@ -135,9 +135,10 @@ pub struct BackgroundAgent {
 impl BackgroundAgent {
     /// True while the managed agent is still running — no terminal
     /// `stop_reason` has been observed in its JSONL yet (or it has only
-    /// just registered, before any snapshot). A follow-up typed on its tab
-    /// can still reach it via its next hook; a finished agent's tab is
-    /// read-only. Drives `session_view::compose_disabled`.
+    /// just registered, before any snapshot). Since phase 6d-tail this only
+    /// feeds the supervisor's `has_live_background_work` gate (the compose row
+    /// no longer branches on it — async agents render as view-only `Task`
+    /// teammate tabs).
     pub fn is_messageable(&self) -> bool {
         self.latest
             .as_ref()

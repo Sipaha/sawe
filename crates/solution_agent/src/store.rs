@@ -311,44 +311,30 @@ impl EventEmitter<SolutionAgentStoreEvent> for SolutionAgentStore {}
 
 /// Which "view" of a session the user has selected — Main = parent
 /// thread only, Task(id) = an in-flight inline Task subagent's
-/// filtered slice, Background(id) = a Managed Agent's standalone
-/// JSONL transcript. Replaces the older `Option<SharedString>` shape
-/// where `None`=Main and `Some(id)` was ambiguously a Task id;
-/// adding Background made an explicit sum-type necessary.
+/// filtered slice, Shell(id) = a background shell's live-tailed output.
+/// Replaces the older `Option<SharedString>` shape where `None`=Main and
+/// `Some(id)` was ambiguously a Task id; the multi-source strip made an
+/// explicit sum-type necessary.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum SubagentView {
     #[default]
     Main,
     Task(SharedString),
-    Background(crate::background_agent::BackgroundAgentId),
     /// A background shell's (`Bash(run_in_background=true)`) live-tailed
-    /// output view. Like `Background`, it sources from disk rather than the
-    /// parent thread, so it is neither a parent-thread view nor a
-    /// parent-entry match. Drill-in body / pill rendering land in Tasks
-    /// 12/13.
+    /// output view. Since phase 6d-A it sources from its derived
+    /// `StreamId::Shell` stream (the same parent-stream render path as
+    /// Main/Task), not a dedicated drill-in.
     Shell(crate::background_shell::BackgroundShellId),
 }
 
 impl SubagentView {
-    /// True when the view sources its entries from the parent
-    /// `AcpThread.entries` (Main + Task filter both do); false when
-    /// the view sources from disk rather than the parent thread
-    /// (`Background` tails a managed-agent JSONL; `Shell` tails a
-    /// background-shell `.output` snapshot).
-    pub fn is_parent_thread_view(&self) -> bool {
-        matches!(self, Self::Main | Self::Task(_))
-    }
-
     /// The follow-up [`crate::model::QueueTarget`] for a message typed on
-    /// this tab. Only `Background` (an Agent Teams teammate) routes to a
-    /// subagent — `Task` (an inline filtered slice of the parent thread)
-    /// and `Shell` (a background shell) are not messageable, so they fall
-    /// back to `Main` like the parent view does.
+    /// this tab. Every current view routes to `Main`: `Task` is an inline
+    /// filtered slice of the parent thread and `Shell` is a background shell
+    /// — neither is messageable, so both fall back to `Main` like the parent
+    /// view does.
     pub fn queue_target(&self) -> crate::model::QueueTarget {
         match self {
-            Self::Background(id) => {
-                crate::model::QueueTarget::Subagent(SharedString::from(id.as_str().to_string()))
-            }
             Self::Main | Self::Task(_) | Self::Shell(_) => crate::model::QueueTarget::Main,
         }
     }
@@ -360,28 +346,13 @@ impl SubagentView {
     /// `Shell(id) → StreamId::Shell(id)` — the shell's derived, `Running`-only
     /// stream, so the selected-shell body renders through the SAME
     /// `selected_parent_stream_entries` path as Main/teammates instead of a
-    /// dedicated drill-in builder. `Background` still returns `None` — it
-    /// sources from a managed-agent JSONL on disk, not `session.streams`
-    /// (that fold is 6d-B). This is the single mapping the view's render,
-    /// rewind, and find paths all route through.
+    /// dedicated drill-in builder. This is the single mapping the view's
+    /// render, rewind, and find paths all route through.
     pub fn parent_stream_id(&self) -> Option<crate::stream::StreamId> {
         match self {
             Self::Main => Some(crate::stream::StreamId::Main),
             Self::Task(id) => Some(crate::stream::StreamId::Teammate(id.clone())),
             Self::Shell(id) => Some(crate::stream::StreamId::Shell(id.clone())),
-            Self::Background(_) => None,
-        }
-    }
-
-    /// Predicate for parent-thread entry filtering. `Main` matches
-    /// only entries with no `subagent_id`; `Task(id)` matches only
-    /// entries stamped with exactly that id; `Background` matches
-    /// nothing (it doesn't draw from parent entries).
-    pub fn matches_parent_entry(&self, entry_subagent: Option<&SharedString>) -> bool {
-        match (self, entry_subagent) {
-            (Self::Main, None) => true,
-            (Self::Task(sel), Some(eid)) => sel == eid,
-            _ => false,
         }
     }
 }
@@ -7947,96 +7918,6 @@ impl SolutionAgentStore {
         }
     }
 
-    /// User-initiated removal of a background-agent pill from the strip
-    /// (the × close affordance, only shown in the Dead state). Drops the
-    /// agent from the session's in-memory tracking, deletes the persisted
-    /// row, emits the change event so the UI re-renders, and — if this
-    /// was the session's last tracked agent — cancels the per-session
-    /// JSONL watcher task. No-op when the session or agent is already
-    /// gone (defensive against races with `tick_background_agents`).
-    pub fn remove_background_agent(
-        &mut self,
-        session_id: SolutionSessionId,
-        id: crate::background_agent::BackgroundAgentId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.session(session_id) else {
-            return;
-        };
-        let mut removed = false;
-        session.update(cx, |s, _| {
-            if s.background_agents.remove(&id).is_some() {
-                s.background_agent_order.retain(|x| x != &id);
-                removed = true;
-            }
-        });
-        if !removed {
-            return;
-        }
-        if let Some(db) = self.persistence.clone() {
-            let sid = session_id.to_string();
-            let aid = id.as_str().to_string();
-            cx.background_spawn(async move {
-                db.delete_background_agent(sid, aid).await.log_err();
-            })
-            .detach();
-        }
-        cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
-            session_id,
-        ));
-        // Drop the watcher when the session no longer tracks any agents
-        // — keeping a dangling notify-loop alive after the last pill is
-        // gone is wasted work and would also delay re-arming on a future
-        // re-registration (the watcher is `idempotent only when absent`).
-        if session.read(cx).background_agents.is_empty() {
-            self.background_agent_watchers.remove(&session_id);
-        }
-    }
-
-    /// Manually drop a tracked background shell — the × affordance on a
-    /// terminal/stale shell pill. Symmetric to [`Self::remove_background_agent`]:
-    /// removes from the `background_shells` map + `background_shell_order` vec,
-    /// fire-and-forgets the SQLite delete, emits
-    /// [`SolutionAgentStoreEvent::SessionBackgroundShellsChanged`], and drops the
-    /// fs-watch task once no shells remain. No-op when the session is gone or the
-    /// id isn't tracked.
-    pub fn remove_background_shell(
-        &mut self,
-        session_id: SolutionSessionId,
-        id: crate::background_shell::BackgroundShellId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.session(session_id) else {
-            return;
-        };
-        let mut removed = false;
-        session.update(cx, |s, _| {
-            if s.background_shells.remove(&id).is_some() {
-                s.background_shell_order.retain(|x| x != &id);
-                removed = true;
-                // Phase 6d-A: keep the derived stream mirror in sync on manual drop.
-                s.rebuild_streams();
-            }
-        });
-        if !removed {
-            return;
-        }
-        if let Some(db) = self.persistence.clone() {
-            let sid = session_id.to_string();
-            let shell_id = id.to_string();
-            cx.background_spawn(async move {
-                db.delete_background_shell(sid, shell_id).await.log_err();
-            })
-            .detach();
-        }
-        cx.emit(SolutionAgentStoreEvent::SessionBackgroundShellsChanged(
-            session_id,
-        ));
-        if session.read(cx).background_shells.is_empty() {
-            self.background_shell_watchers.remove(&session_id);
-        }
-    }
-
     fn handle_acp_event(
         &mut self,
         session_id: SolutionSessionId,
@@ -9360,42 +9241,6 @@ mod subagent_view_tests {
     use super::*;
 
     #[test]
-    fn subagent_view_main_matches_only_parentless_entries() {
-        let v = SubagentView::Main;
-        assert!(v.matches_parent_entry(None));
-        assert!(!v.matches_parent_entry(Some(&"toolu_xyz".into())));
-    }
-
-    #[test]
-    fn subagent_view_task_matches_exact_id() {
-        let v = SubagentView::Task("toolu_a".into());
-        assert!(v.matches_parent_entry(Some(&"toolu_a".into())));
-        assert!(!v.matches_parent_entry(Some(&"toolu_b".into())));
-        assert!(!v.matches_parent_entry(None));
-    }
-
-    #[test]
-    fn subagent_view_background_matches_no_parent_entry() {
-        let v = SubagentView::Background(crate::background_agent::BackgroundAgentId::new("a30f"));
-        assert!(!v.matches_parent_entry(None));
-        assert!(!v.matches_parent_entry(Some(&"toolu_x".into())));
-    }
-
-    #[test]
-    fn subagent_view_is_parent_thread_view() {
-        assert!(SubagentView::Main.is_parent_thread_view());
-        assert!(SubagentView::Task("x".into()).is_parent_thread_view());
-        assert!(
-            !SubagentView::Background(crate::background_agent::BackgroundAgentId::new("a30f"))
-                .is_parent_thread_view()
-        );
-        assert!(
-            !SubagentView::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"))
-                .is_parent_thread_view()
-        );
-    }
-
-    #[test]
     fn stream_auto_close_on_terminal_excludes_async_agent() {
         // Phase 3 gate: a teammate stream auto-closes on the tool-call's
         // TERMINAL status only for an inline `Task` (whose tool-call stays
@@ -9418,8 +9263,7 @@ mod subagent_view_tests {
         // Phase 2c/6d-A: the desktop render resolves the selected view to a
         // stream in `SolutionSession.streams` via this mapping. Main + Task
         // select a parent-thread stream; Shell selects its derived Shell stream
-        // (phase 6d-A). Only `Background` still sources from disk (JSONL), so it
-        // selects none.
+        // (phase 6d-A).
         assert_eq!(SubagentView::Main.parent_stream_id(), Some(StreamId::Main));
         assert_eq!(
             SubagentView::Task("toolu_abc".into()).parent_stream_id(),
@@ -9431,11 +9275,6 @@ mod subagent_view_tests {
             Some(StreamId::Shell(crate::background_shell::BackgroundShellId::new(
                 "bvb4ful1z"
             )))
-        );
-        assert_eq!(
-            SubagentView::Background(crate::background_agent::BackgroundAgentId::new("a30f"))
-                .parent_stream_id(),
-            None
         );
     }
 }
