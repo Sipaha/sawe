@@ -2374,6 +2374,27 @@ impl AcpThread {
         }
     }
 
+    /// Flush the streaming-reveal backlog into the last entry's markdown AND,
+    /// when the flush actually moved bytes, emit `EntryUpdated(last)` so a mirror
+    /// that re-projects a given entry only on `EntryUpdated` (the fork's
+    /// `session.entries`) picks up the flushed tail instead of dropping it (the
+    /// "message truncated mid-paragraph" bug). The MID-TURN twin of
+    /// `flush_end_of_turn_tail`, for the boundaries that flush a still-streaming
+    /// message WITHOUT ending the turn: `push_entry` (a tool call / plan / new
+    /// entry follows the text) and `cancel` (the streamed message survives).
+    /// `rewind` deliberately does NOT use this — it flushes then truncates the
+    /// flushed entry away (`EntriesRemoved`), so re-syncing its tail is moot.
+    fn flush_streaming_text_and_signal(&mut self, cx: &mut Context<Self>) {
+        let had_pending = self
+            .streaming_text_buffer
+            .as_ref()
+            .is_some_and(|b| !b.pending.is_empty());
+        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        if had_pending && !self.entries.is_empty() {
+            cx.emit(AcpThreadEvent::EntryUpdated(self.entries.len() - 1));
+        }
+    }
+
     /// Spawns a foreground task that periodically drains
     /// `streaming_text_buffer.pending` into the target `Markdown` entity,
     /// producing smooth, continuous text output.
@@ -2429,7 +2450,12 @@ impl AcpThread {
     }
 
     fn push_entry(&mut self, entry: AgentThreadEntry, cx: &mut Context<Self>) {
-        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        // Flush the streaming-reveal backlog into the PREVIOUS last entry and
+        // signal it, BEFORE appending the new entry — otherwise a long reply that
+        // streams faster than the reveal, then hits this boundary (a tool call /
+        // plan / interleaved subagent chunk starting a new entry), loses its
+        // flushed tail from the fork's `EntryUpdated`-driven mirror.
+        self.flush_streaming_text_and_signal(cx);
         self.entries.push(entry);
         cx.emit(AcpThreadEvent::NewEntry);
     }
@@ -3226,7 +3252,11 @@ impl AcpThread {
         };
         self.connection.cancel(&self.session_id, cx);
 
-        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        // A cancel mid-stream flushes the streamed message's backlog into its
+        // (surviving) entry; signal it so the mirror keeps the flushed tail
+        // (`mark_pending_entries_as_canceled` below only signals tool-call /
+        // compaction entries, not the streamed AssistantMessage).
+        self.flush_streaming_text_and_signal(cx);
         self.mark_pending_entries_as_canceled(cx);
 
         // Wait for the send task to complete
@@ -3300,6 +3330,9 @@ impl AcpThread {
             return Task::ready(Err(anyhow!("not supported")));
         };
 
+        // No `flush_streaming_text_and_signal` here: the flushed entry sits at/after
+        // the rewind point and is truncated away below (`EntriesRemoved`), so
+        // re-syncing its tail into the mirror would be immediately undone.
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         let telemetry = ActionLogTelemetry::from(&*self);
         cx.spawn(async move |this, cx| {
@@ -4073,6 +4106,83 @@ mod tests {
             vec![0],
             "flush must signal an EntryUpdated for the last (only) entry so the \
              persisted / MCP transcript re-syncs the final tail"
+        );
+    }
+
+    /// A mid-turn `push_entry` (here a tool call — the common "text then tool
+    /// call" case) must flush the streaming-reveal backlog into the PREVIOUS
+    /// entry AND emit `EntryUpdated` for it, so a mirror that re-projects an
+    /// entry only on `EntryUpdated` (the fork's `session.entries`) picks up the
+    /// flushed tail instead of dropping it (the "message truncated mid-paragraph"
+    /// bug). Without the emit, entry 0 sees only the streaming chunk's single
+    /// `EntryUpdated(0)` and the mirror keeps the partially-revealed prefix.
+    #[gpui::test]
+    async fn push_entry_flushes_streaming_backlog_and_signals_previous_entry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let updated = Rc::new(std::cell::RefCell::new(Vec::<usize>::new()));
+        let _sub = cx.update(|cx| {
+            let updated = updated.clone();
+            cx.subscribe(&thread, move |_t, ev, _cx| {
+                if let AcpThreadEvent::EntryUpdated(i) = ev {
+                    updated.borrow_mut().push(*i);
+                }
+            })
+        });
+
+        // First assistant text chunk → creates entry 0 (no streaming buffer yet).
+        thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                acp::ContentBlock::Text(acp::TextContent::new("visible prefix ".to_string())),
+                false,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        updated.borrow_mut().clear();
+
+        // Second chunk streams into the SAME message → buffered as `pending`
+        // (NOT yet appended to the markdown), emitting one EntryUpdated(0). Then,
+        // in the SAME synchronous block (so the reveal task can't tick and drain
+        // the backlog first), a boundary entry (a new tool call) is pushed —
+        // `push_entry` flushes the pending tail.
+        thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                acp::ContentBlock::Text(acp::TextContent::new("dropped tail".to_string())),
+                false,
+                cx,
+            );
+            let call = acp::ToolCall::new(
+                acp::ToolCallId::new("call-1".to_string()),
+                "Bash".to_string(),
+            )
+            .status(acp::ToolCallStatus::Pending);
+            t.upsert_tool_call(call, cx).expect("upsert tool call");
+        });
+        cx.executor().run_until_parked();
+
+        let entry0_updates = updated.borrow().iter().filter(|&&i| i == 0).count();
+        assert!(
+            entry0_updates >= 2,
+            "push_entry's streaming-backlog flush must emit EntryUpdated(0) in \
+             addition to the streaming chunk's, so the mirror re-syncs the flushed \
+             tail; got {entry0_updates} EntryUpdated(0) emit(s)"
         );
     }
 
