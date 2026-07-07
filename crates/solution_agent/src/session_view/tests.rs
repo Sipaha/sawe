@@ -3,7 +3,7 @@ use gpui::SharedString;
 
 use super::SolutionSessionView;
 use super::recall::unpack_recalled_bundle;
-use crate::store::SubagentView;
+use crate::stream::StreamId;
 
 fn text_block(s: &str) -> acp::ContentBlock {
     acp::ContentBlock::Text(acp::TextContent::new(s.to_string()))
@@ -107,12 +107,12 @@ fn next_selection_after_change_keeps_still_active_selection() {
     let id_a = SharedString::from("toolu_a");
     let streams = streams_with_teammates(&["toolu_a", "toolu_b"]);
     let next = SolutionSessionView::next_selection_after_change(
-        &SubagentView::Task(id_a.clone()),
+        &StreamId::Teammate(id_a.clone()),
         &streams,
     );
     assert_eq!(
         next,
-        SubagentView::Task(id_a),
+        StreamId::Teammate(id_a),
         "a teammate whose stream is still present must be preserved"
     );
 }
@@ -123,12 +123,12 @@ fn next_selection_after_change_snaps_to_main_when_current_stream_removed() {
     // `id_a`'s stream is gone; only `toolu_b` still has a live teammate stream.
     let streams = streams_with_teammates(&["toolu_b"]);
     let next = SolutionSessionView::next_selection_after_change(
-        &SubagentView::Task(id_a),
+        &StreamId::Teammate(id_a),
         &streams,
     );
     assert_eq!(
         next,
-        SubagentView::Main,
+        StreamId::Main,
         "a removed teammate stream snaps to Main, not to another teammate"
     );
 }
@@ -138,12 +138,12 @@ fn next_selection_after_change_falls_back_to_main_when_all_gone() {
     let id_a = SharedString::from("toolu_a");
     let streams = streams_with_teammates(&[]);
     let next = SolutionSessionView::next_selection_after_change(
-        &SubagentView::Task(id_a),
+        &StreamId::Teammate(id_a),
         &streams,
     );
     assert_eq!(
         next,
-        SubagentView::Main,
+        StreamId::Main,
         "no teammate streams must collapse to Main"
     );
 }
@@ -152,8 +152,8 @@ fn next_selection_after_change_falls_back_to_main_when_all_gone() {
 fn next_selection_after_change_main_stays_main() {
     let streams = streams_with_teammates(&["toolu_a"]);
     // Main was already selected — a strip change should not yank us into a tab.
-    let next = SolutionSessionView::next_selection_after_change(&SubagentView::Main, &streams);
-    assert_eq!(next, SubagentView::Main);
+    let next = SolutionSessionView::next_selection_after_change(&StreamId::Main, &streams);
+    assert_eq!(next, StreamId::Main);
 }
 
 /// Add a `StreamId::Shell` stream (as `rebuild_streams` would derive it for a
@@ -189,10 +189,10 @@ fn next_selection_after_change_snaps_stale_shell_to_main() {
     let stale = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
     let streams = streams_with_teammates(&["toolu_a"]); // no shell stream present
     let next = SolutionSessionView::next_selection_after_change(
-        &SubagentView::Shell(stale),
+        &StreamId::Shell(stale),
         &streams,
     );
-    assert_eq!(next, SubagentView::Main);
+    assert_eq!(next, StreamId::Main);
 }
 
 #[test]
@@ -201,10 +201,10 @@ fn next_selection_after_change_keeps_live_shell() {
     let id = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
     let streams = with_shell_stream(streams_with_teammates(&[]), "bvb4ful1z");
     let next = SolutionSessionView::next_selection_after_change(
-        &SubagentView::Shell(id.clone()),
+        &StreamId::Shell(id.clone()),
         &streams,
     );
-    assert_eq!(next, SubagentView::Shell(id));
+    assert_eq!(next, StreamId::Shell(id));
 }
 
 #[test]
@@ -214,20 +214,20 @@ fn next_selection_after_change_preserves_shell_view_when_stream_present() {
     let shell_id = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
     let streams = with_shell_stream(streams_with_teammates(&["toolu_a"]), "bvb4ful1z");
     let next = SolutionSessionView::next_selection_after_change(
-        &SubagentView::Shell(shell_id.clone()),
+        &StreamId::Shell(shell_id.clone()),
         &streams,
     );
-    assert_eq!(next, SubagentView::Shell(shell_id));
+    assert_eq!(next, StreamId::Shell(shell_id));
 }
 
 #[test]
 fn compose_disabled_predicate_returns_false_for_main() {
-    assert!(!super::compose_disabled_for(&SubagentView::Main));
+    assert!(!super::compose_disabled_for(&StreamId::Main));
 }
 
 #[test]
 fn compose_disabled_predicate_returns_false_for_task() {
-    assert!(!super::compose_disabled_for(&SubagentView::Task(
+    assert!(!super::compose_disabled_for(&StreamId::Teammate(
         SharedString::from("toolu_a")
     )));
 }
@@ -235,7 +235,7 @@ fn compose_disabled_predicate_returns_false_for_task() {
 #[test]
 fn compose_disabled_predicate_returns_true_for_shell() {
     let id = crate::background_shell::BackgroundShellId::new("x");
-    assert!(super::compose_disabled_for(&SubagentView::Shell(id)));
+    assert!(super::compose_disabled_for(&StreamId::Shell(id)));
 }
 
 #[test]
@@ -367,7 +367,7 @@ async fn render_sizes_list_state_to_selected_stream_not_flat_entries(
     // Switch to the teammate tab; the list must resize to the teammate stream (1).
     view_window
         .update(vcx, |view, _window, cx| {
-            view.selected_subagent = SubagentView::Task("toolu_1".into());
+            view.selected_stream = StreamId::Teammate("toolu_1".into());
             cx.notify();
         })
         .unwrap();

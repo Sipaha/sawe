@@ -33,7 +33,7 @@ use ui::{Icon, IconName, IconSize, Label, LabelSize, Tooltip};
 use super::SolutionSessionView;
 use crate::background_shell::BackgroundShellId;
 use crate::model::SolutionSession;
-use crate::store::SubagentView;
+use crate::stream::StreamId;
 
 /// Build the subagent-tabs strip. Returns `None` when the session
 /// has no in-flight subagents so the caller can `when_some(...)` the
@@ -76,17 +76,17 @@ pub(super) fn render_task_subagent_strip(
     if tabs.is_empty() && shell_streams.is_empty() {
         return None;
     }
-    let selected = view.selected_subagent.clone();
+    let selected = view.selected_stream.clone();
 
-    let main_active = matches!(selected, SubagentView::Main);
+    let main_active = matches!(selected, StreamId::Main);
     let main_pill = pill(
         SharedString::from("task-subagent-strip-main"),
         SharedString::from("Main"),
         main_active,
         cx,
         move |this, _, _, cx| {
-            if !matches!(this.selected_subagent, SubagentView::Main) {
-                this.selected_subagent = SubagentView::Main;
+            if !matches!(this.selected_stream, StreamId::Main) {
+                this.selected_stream = StreamId::Main;
                 cx.notify();
             }
         },
@@ -106,7 +106,7 @@ pub(super) fn render_task_subagent_strip(
         .child(main_pill);
 
     for (id, label) in tabs {
-        let is_active = matches!(&selected, SubagentView::Task(sel) if sel == &id);
+        let is_active = matches!(&selected, StreamId::Teammate(sel) if sel == &id);
         let id_for_listener = id.clone();
         let pill_id = SharedString::from(format!("task-subagent-strip-{}", id));
         row = row.child(pill(
@@ -115,16 +115,16 @@ pub(super) fn render_task_subagent_strip(
             is_active,
             cx,
             move |this, _, _, cx| {
-                let next = SubagentView::Task(id_for_listener.clone());
-                if this.selected_subagent != next {
-                    this.selected_subagent = next;
+                let next = StreamId::Teammate(id_for_listener.clone());
+                if this.selected_stream != next {
+                    this.selected_stream = next;
                     cx.notify();
                 }
             },
         ));
     }
     for (id, label) in shell_streams {
-        let is_active = matches!(&selected, SubagentView::Shell(s) if s == &id);
+        let is_active = matches!(&selected, StreamId::Shell(s) if s == &id);
         let id_for_listener = id.clone();
         let pill_id = SharedString::from(format!("task-subagent-strip-shell-{}", id));
         row = row.child(shell_pill(
@@ -133,9 +133,9 @@ pub(super) fn render_task_subagent_strip(
             is_active,
             cx,
             move |this, _, _, cx| {
-                let next = SubagentView::Shell(id_for_listener.clone());
-                if this.selected_subagent != next {
-                    this.selected_subagent = next;
+                let next = StreamId::Shell(id_for_listener.clone());
+                if this.selected_stream != next {
+                    this.selected_stream = next;
                     cx.notify();
                 }
             },

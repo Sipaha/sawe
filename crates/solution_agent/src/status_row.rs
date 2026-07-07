@@ -233,8 +233,8 @@ pub(crate) fn render_status_row(
     // the parent `tool_use_id` the subagent usage is keyed by. `None` here =>
     // Main tab (parent meter, as before). Shell tabs hide the meter entirely
     // (handled via `is_subagent_tab` below), so they never reach here.
-    let task_subagent_id: Option<SharedString> = match &view.selected_subagent {
-        crate::store::SubagentView::Task(id) => Some(id.clone()),
+    let task_subagent_id: Option<SharedString> = match &view.selected_stream {
+        crate::stream::StreamId::Teammate(id) => Some(id.clone()),
         _ => None,
     };
     let usage = if let Some(task_id) = task_subagent_id.as_ref() {
@@ -537,13 +537,13 @@ pub(crate) fn render_status_row(
     // a subagent tab the token meter + compact/clear are session/Main-only
     // concepts, so they're hidden from the row below.
     let subagent_status: Option<(SharedString, bool)> = {
-        use crate::store::SubagentView;
+        use crate::stream::StreamId;
         let session_entity = SolutionAgentStore::global(cx)
             .read(cx)
             .session(view.session_id());
         let session = session_entity.as_ref().map(|s| s.read(cx));
-        match (&view.selected_subagent, session) {
-            (SubagentView::Shell(id), Some(session)) => {
+        match (&view.selected_stream, session) {
+            (StreamId::Shell(id), Some(session)) => {
                 session.background_shells.get(id).map(|shell| {
                     use crate::background_shell::ShellRuntimeState;
                     match &shell.state {

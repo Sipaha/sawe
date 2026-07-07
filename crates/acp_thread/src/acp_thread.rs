@@ -1549,7 +1549,7 @@ pub struct AcpThread {
     token_usage: Option<TokenUsage>,
     /// Per-Task-subagent context usage, keyed by the subagent's parent
     /// `tool_use_id` (the same value `_meta.claudeCode.parentToolUseId`
-    /// carries and `SubagentView::Task(id)` selects on). A Task runs as a
+    /// carries and `StreamId::Teammate(id)` selects on). A Task runs as a
     /// separate agent with its own context window, so its usage is tracked
     /// apart from the parent `token_usage` — the status row shows THIS when
     /// the user drills into the Task tab instead of the parent's meter.

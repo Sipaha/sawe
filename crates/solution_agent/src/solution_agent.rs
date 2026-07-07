@@ -48,7 +48,7 @@ pub use background_shell::{
 pub use model::{
     AgentServerId, SessionState, SolutionSession, SolutionSessionId, SolutionSessionMetadata,
 };
-pub use store::{EFFORT_LEVELS, SubagentView};
+pub use store::EFFORT_LEVELS;
 
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};

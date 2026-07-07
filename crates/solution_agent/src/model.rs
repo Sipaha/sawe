@@ -261,7 +261,7 @@ pub enum PersistedRole {
 pub(crate) const NO_TIMESTAMP_MS: i64 = -1;
 
 /// Which agent a queued follow-up is addressed to. Stamped at enqueue from
-/// the tab the user typed it on (`session_view::selected_subagent`). The
+/// the tab the user typed it on (`session_view::selected_stream`). The
 /// firing hook's `agent_id` selects which bundles drain: the MAIN agent's
 /// hook (`agent_id == None`) drains [`QueueTarget::Main`] bundles; an Agent
 /// Teams teammate's hook (`agent_id == Some(x)`) drains only
@@ -1616,7 +1616,7 @@ mod tests {
     }
 
     /// Phase 2c render-flip: the desktop render sources the selected view's
-    /// entries from `streams[SubagentView::parent_stream_id()]`. This is the
+    /// entries from `streams[selected_stream]`. This is the
     /// end-to-end proof of the two things the screenshot gate checks — Main
     /// EXCLUDES teammate entries (no blank/leaked rows), and the Task view
     /// shows ONLY that teammate — including the per-stream coalescing that
@@ -1625,7 +1625,6 @@ mod tests {
     #[gpui::test]
     fn selected_view_streams_split_main_and_teammate(cx: &mut TestAppContext) {
         use crate::session_entry::{AssistantChunk, SessionEntryKind};
-        use crate::store::SubagentView;
         use crate::stream::StreamId;
         fn assistant(text: &str, sub: Option<&str>) -> SessionEntry {
             SessionEntry {
@@ -1668,7 +1667,7 @@ mod tests {
             // Main view resolves to StreamId::Main: user + ONE coalesced
             // assistant (the two Main assistants merged across the interleaved
             // teammate entry). NO teammate entry leaks in.
-            let main_id = SubagentView::Main.parent_stream_id().unwrap();
+            let main_id = StreamId::Main;
             let main = &s.streams[&main_id].entries;
             assert_eq!(main.len(), 2, "user + one coalesced Main assistant");
             assert!(
@@ -1678,9 +1677,7 @@ mod tests {
 
             // Task(toolu_1) resolves to the Teammate stream: ONE coalesced
             // assistant, tagged, and nothing from Main.
-            let task_id = SubagentView::Task("toolu_1".into())
-                .parent_stream_id()
-                .unwrap();
+            let task_id = StreamId::Teammate("toolu_1".into());
             assert_eq!(task_id, StreamId::Teammate("toolu_1".into()));
             let team = &s.streams[&task_id].entries;
             assert_eq!(team.len(), 1, "two teammate messages coalesced into one");

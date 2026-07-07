@@ -286,16 +286,16 @@ pub struct SolutionSessionView {
     /// keystroke bumps the supervisor's idle clock (`note_user_input`) so the
     /// observer never fires a nudge while the user is mid-message.
     _compose_subscription: Subscription,
-    /// Currently selected subagent tab for the strip:
-    /// `SubagentView::Main` = the parent thread view, `Task(toolu_id)` =
+    /// Currently selected stream tab for the strip:
+    /// `StreamId::Main` = the parent thread view, `Teammate(toolu_id)` =
     /// an in-flight inline `Task`/`Agent` subagent filtered to entries
     /// whose `subagent_id` matches, `Shell(id)` = a background shell's
     /// derived `StreamId::Shell` view. View-state only, not persisted
     /// across editor restarts (the selection is meaningless once the
     /// active set becomes empty). Auto-reset to `Main` (never to another
-    /// teammate) when the selected `Task`/`Shell` stream is removed — see
+    /// teammate) when the selected `Teammate`/`Shell` stream is removed — see
     /// `next_selection_after_change`, wired off `SessionSubagentsChanged`.
-    pub(crate) selected_subagent: crate::store::SubagentView,
+    pub(crate) selected_stream: crate::stream::StreamId,
     /// Background tick that wakes the view once a second while any
     /// visible tool call sits in `InProgress`, so the per-tool elapsed
     /// "Xs" badge in `render_tool_call` advances even when the agent
@@ -304,7 +304,7 @@ pub struct SolutionSessionView {
     /// transition can start a fresh tick.
     tool_tick: Option<Task<()>>,
     /// Owned entries of the currently-selected parent-stream view
-    /// (`Main` → `StreamId::Main`, `Task(toolu)` → `StreamId::Teammate(toolu)`,
+    /// (`Main` → `StreamId::Main`, `Teammate(toolu)` → `StreamId::Teammate(toolu)`,
     /// and — phase 6d-A — `Shell(id)` → `StreamId::Shell(id)`), cloned from
     /// `session.streams` (the maintained demux mirror) at the top of
     /// `Render::render` by `build_main_stream_entries_for_render`. Empty when the
@@ -316,13 +316,13 @@ pub struct SolutionSessionView {
     /// render flip: the selected stream is already demux'd + coalesced, so no
     /// per-entry Main/Task filtering happens at render.
     main_stream_entries_for_render: Vec<crate::session_entry::SessionEntry>,
-    /// The `SubagentView` rendered on the previous frame, or `None` before the
-    /// first paint. Tracked so ANY tab switch (Main↔Task↔Shell) can
+    /// The `StreamId` rendered on the previous frame, or `None` before the
+    /// first paint. Tracked so ANY tab switch (Main↔Teammate↔Shell) can
     /// reset `list_state` to the newly-selected view's entry count + tail-anchor
     /// at the next render — each stream has its own per-stream index space now,
     /// so their counts almost never match and a stale `list_state` would
     /// over-/under-size the virtualized list and silently truncate / overflow.
-    prev_render_view: Option<crate::store::SubagentView>,
+    prev_render_view: Option<crate::stream::StreamId>,
 }
 
 impl SolutionSessionView {
@@ -566,7 +566,7 @@ impl SolutionSessionView {
             pending_markdown_source: SharedString::default(),
             resuming_markdown: None,
             resuming_markdown_source: SharedString::default(),
-            selected_subagent: crate::store::SubagentView::default(),
+            selected_stream: crate::stream::StreamId::Main,
             tool_tick: None,
             main_stream_entries_for_render: Vec::new(),
             prev_render_view: None,
@@ -812,40 +812,40 @@ impl SolutionSessionView {
 
     /// Selection-reconcile helper extracted out of `on_subagents_changed`
     /// so the lifecycle can be unit-tested without spinning up a full GPUI
-    /// view. Returns the new value for `selected_subagent` given the current
+    /// view. Returns the new value for `selected_stream` given the current
     /// selection and the session's `streams` (phase 6c teammates, phase 6d-A
     /// shells). Pure — no side effects.
     pub(crate) fn next_selection_after_change(
-        current: &crate::store::SubagentView,
+        current: &crate::stream::StreamId,
         streams: &indexmap::IndexMap<crate::stream::StreamId, crate::stream::Stream>,
-    ) -> crate::store::SubagentView {
-        use crate::store::SubagentView;
+    ) -> crate::stream::StreamId {
+        use crate::stream::StreamId;
         match current {
-            SubagentView::Main => SubagentView::Main,
-            SubagentView::Task(id) => {
+            StreamId::Main => StreamId::Main,
+            StreamId::Teammate(id) => {
                 // Spec (Stream lifecycle): force back to Main ONLY when the
                 // selected teammate's stream is removed — a plain fall-back,
                 // not a hop to some other still-live teammate.
-                if streams.contains_key(&crate::stream::StreamId::Teammate(id.clone())) {
+                if streams.contains_key(&StreamId::Teammate(id.clone())) {
                     current.clone()
                 } else {
-                    SubagentView::Main
+                    StreamId::Main
                 }
             }
-            SubagentView::Shell(id) => {
+            StreamId::Shell(id) => {
                 // Phase 6d-A: a shell stream exists only while `Running`; when it
                 // auto-closes (terminal) or is reaped, its `StreamId::Shell` drops
                 // out of `streams` → snap the selected-shell tab back to Main.
-                if streams.contains_key(&crate::stream::StreamId::Shell(id.clone())) {
+                if streams.contains_key(&StreamId::Shell(id.clone())) {
                     current.clone()
                 } else {
-                    SubagentView::Main
+                    StreamId::Main
                 }
             }
         }
     }
 
-    /// Reconcile `selected_subagent` with the session's current teammate
+    /// Reconcile `selected_stream` with the session's current teammate
     /// streams. Called on every `SessionSubagentsChanged` event for this
     /// session. If the selected teammate's stream has disappeared, fall
     /// back to `Main` (phase 6c — snap to Main only on stream removal).
@@ -854,19 +854,19 @@ impl SolutionSessionView {
     pub(crate) fn on_subagents_changed(&mut self, cx: &mut Context<Self>) {
         let session = self.session.read(cx);
         let next =
-            Self::next_selection_after_change(&self.selected_subagent, &session.streams);
-        if next != self.selected_subagent {
-            self.selected_subagent = next;
+            Self::next_selection_after_change(&self.selected_stream, &session.streams);
+        if next != self.selected_stream {
+            self.selected_stream = next;
         }
         cx.notify();
     }
 
     /// `true` when the compose row should be view-only (no input, no send,
-    /// no Submit). `Shell` tabs are never composable; `Task` is an inline
+    /// no Submit). `Shell` tabs are never composable; `Teammate` is an inline
     /// filtered slice of the parent thread and stays composable. Delegates to
     /// the pure `compose_disabled_for` for unit-testability.
     fn compose_disabled(&self, _cx: &App) -> bool {
-        compose_disabled_for(&self.selected_subagent)
+        compose_disabled_for(&self.selected_stream)
     }
 
     /// React to `SessionBackgroundAgentsChanged`. Post-6d-B an async agent
@@ -889,11 +889,11 @@ impl SolutionSessionView {
     /// emitting this event, so the mirror is current here.
     pub(crate) fn on_background_shells_changed(&mut self, cx: &mut Context<Self>) {
         let next = Self::next_selection_after_change(
-            &self.selected_subagent,
+            &self.selected_stream,
             &self.session.read(cx).streams,
         );
-        if next != self.selected_subagent {
-            self.selected_subagent = next;
+        if next != self.selected_stream {
+            self.selected_stream = next;
         }
         cx.notify();
     }
@@ -922,13 +922,10 @@ impl SolutionSessionView {
         // indexes per-stream, matching the render path's `rewind_table` lookup
         // because both read the same demux mirror within a notify cycle. Drill-in
         // views have no rewindable parent thread → empty table.
-        let Some(stream_id) = self.selected_subagent.parent_stream_id() else {
-            self.rewind_table.clear();
-            return;
-        };
+        let stream_id = &self.selected_stream;
         let user_ids: Vec<Option<String>> = session
             .streams
-            .get(&stream_id)
+            .get(stream_id)
             .map(|stream| {
                 stream
                     .entries
@@ -953,13 +950,16 @@ impl SolutionSessionView {
     /// clears the cache when the queue becomes empty.
     /// The queued bundles addressed to the currently-selected tab — the only
     /// ones the ghost bubble and Up-arrow recall should surface. Post-migration
-    /// every tab routes its follow-ups to `Main` (`queue_target` is `Main` for
-    /// all of `Main`/`Task`/`Shell`), so this surfaces `Main`-targeted bundles.
-    /// The filter is retained (rather than hard-coded to `Main`) because the
-    /// queue can still hold bundles for several addressees and the mapping is
-    /// the single source of truth for "which bundles belong to this tab".
+    /// every tab routes its follow-ups to `Main` (teammate/shell tabs are
+    /// view-only since the per-source-streams fold), so this surfaces
+    /// `Main`-targeted bundles. The filter is retained (rather than hard-coded
+    /// to `Main`) because the queue can still hold bundles for several
+    /// addressees and it is the single source of truth for "which bundles
+    /// belong to this tab".
     pub(super) fn visible_pending_bundles(&self, cx: &App) -> Vec<crate::model::PendingBundle> {
-        let target = self.selected_subagent.queue_target();
+        // Every tab routes to Main — teammate/shell tabs are view-only since
+        // the per-source-streams fold.
+        let target = crate::model::QueueTarget::Main;
         self.session
             .read(cx)
             .pending_messages
@@ -1208,10 +1208,9 @@ impl SolutionSessionView {
         // render-frame field, so a `recompute_matches` fired from
         // `on_thread_event` reflects the just-mutated stream. Drill-in views
         // don't support find over the parent thread → no matches.
-        let stream_entries: &[crate::session_entry::SessionEntry] = self
-            .selected_subagent
-            .parent_stream_id()
-            .and_then(|stream_id| session.streams.get(&stream_id))
+        let stream_entries: &[crate::session_entry::SessionEntry] = session
+            .streams
+            .get(&self.selected_stream)
             .map(|s| s.entries.as_slice())
             .unwrap_or_default();
         for (entry_idx, entry) in stream_entries.iter().enumerate() {
@@ -1670,10 +1669,9 @@ impl SolutionSessionView {
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.list_state.scroll_to_end();
         let session_id = self.session_id;
-        // Route the follow-up: every tab (`Main`/`Task`/`Shell`) queues to the
-        // parent agent (`queue_target` is `Main` for all — teammate/async-agent
-        // tabs are view-only since the per-source-streams fold).
-        let target = self.selected_subagent.queue_target();
+        // Route the follow-up: every tab routes to Main — teammate/shell tabs
+        // are view-only since the per-source-streams fold.
+        let target = crate::model::QueueTarget::Main;
 
         if self.pending_images.is_empty() {
             let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(content))];
@@ -2144,10 +2142,10 @@ impl SolutionSessionView {
 }
 
 /// Pure predicate: `true` when the compose row should be view-only
-/// for the given `selected_subagent`. Extracted as a free fn so
+/// for the given `selected_stream`. Extracted as a free fn so
 /// `tests.rs` can exercise it without spinning up a full GPUI view.
-pub(crate) fn compose_disabled_for(view: &crate::store::SubagentView) -> bool {
-    matches!(view, crate::store::SubagentView::Shell(_))
+pub(crate) fn compose_disabled_for(view: &crate::stream::StreamId) -> bool {
+    matches!(view, crate::stream::StreamId::Shell(_))
 }
 
 #[cfg(test)]
@@ -2202,13 +2200,10 @@ impl SolutionSessionView {
         &self,
         cx: &App,
     ) -> Vec<crate::session_entry::SessionEntry> {
-        let Some(stream_id) = self.selected_subagent.parent_stream_id() else {
-            return Vec::new();
-        };
         self.session
             .read(cx)
             .streams
-            .get(&stream_id)
+            .get(&self.selected_stream)
             .map(|stream| stream.entries.clone())
             .unwrap_or_default()
     }
@@ -2333,7 +2328,7 @@ impl Render for SolutionSessionView {
         // from the old source. Same-view count drift (streaming growth / rewind
         // shrink) is handled by the unconditional reconcile further down, which
         // preserves scroll.
-        let cur_view_key = self.selected_subagent.clone();
+        let cur_view_key = self.selected_stream.clone();
         if self.prev_render_view.as_ref() != Some(&cur_view_key) {
             let new_count = self.main_stream_entries_for_render.len();
             self.list_state.reset(new_count);

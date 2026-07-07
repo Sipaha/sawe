@@ -2062,25 +2062,6 @@ fn queue_target_matches_hook_routes_by_agent_id() {
     assert!(!sub.matches_hook(None));
 }
 
-#[test]
-fn subagent_view_queue_target_always_routes_to_main() {
-    use crate::background_shell::BackgroundShellId;
-    use crate::model::QueueTarget;
-    use crate::store::SubagentView;
-    // Every current view is non-messageable and falls back to the parent
-    // thread: `Main` is the parent, `Task` is an inline filtered slice, and
-    // `Shell` is a background shell.
-    assert_eq!(SubagentView::Main.queue_target(), QueueTarget::Main);
-    assert_eq!(
-        SubagentView::Task(SharedString::from("toolu_1")).queue_target(),
-        QueueTarget::Main
-    );
-    assert_eq!(
-        SubagentView::Shell(BackgroundShellId::new("sh-1")).queue_target(),
-        QueueTarget::Main
-    );
-}
-
 /// A `Subagent`-targeted follow-up drains only on the matching teammate's
 /// hook; a non-matching teammate hook and the main agent's hook leave it
 /// queued, and the main agent's own bundle is independent.

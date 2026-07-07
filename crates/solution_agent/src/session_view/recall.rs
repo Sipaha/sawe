@@ -95,7 +95,9 @@ impl SolutionSessionView {
         // shouldn't happen since `submit_compose_now` rejects empty
         // submissions). Keeping the queue intact instead of silently draining
         // it is the safer default if that invariant ever breaks.
-        let target = self.selected_subagent.queue_target();
+        // Every tab routes to Main — teammate/shell tabs are view-only since
+        // the per-source-streams fold.
+        let target = crate::model::QueueTarget::Main;
         let idx = self
             .session
             .read(cx)

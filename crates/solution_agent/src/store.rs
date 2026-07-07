@@ -309,54 +309,6 @@ pub enum SolutionAgentStoreEvent {
 
 impl EventEmitter<SolutionAgentStoreEvent> for SolutionAgentStore {}
 
-/// Which "view" of a session the user has selected — Main = parent
-/// thread only, Task(id) = an in-flight inline Task subagent's
-/// filtered slice, Shell(id) = a background shell's live-tailed output.
-/// Replaces the older `Option<SharedString>` shape where `None`=Main and
-/// `Some(id)` was ambiguously a Task id; the multi-source strip made an
-/// explicit sum-type necessary.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub enum SubagentView {
-    #[default]
-    Main,
-    Task(SharedString),
-    /// A background shell's (`Bash(run_in_background=true)`) live-tailed
-    /// output view. Since phase 6d-A it sources from its derived
-    /// `StreamId::Shell` stream (the same parent-stream render path as
-    /// Main/Task), not a dedicated drill-in.
-    Shell(crate::background_shell::BackgroundShellId),
-}
-
-impl SubagentView {
-    /// The follow-up [`crate::model::QueueTarget`] for a message typed on
-    /// this tab. Every current view routes to `Main`: `Task` is an inline
-    /// filtered slice of the parent thread and `Shell` is a background shell
-    /// — neither is messageable, so both fall back to `Main` like the parent
-    /// view does.
-    pub fn queue_target(&self) -> crate::model::QueueTarget {
-        match self {
-            Self::Main | Self::Task(_) | Self::Shell(_) => crate::model::QueueTarget::Main,
-        }
-    }
-
-    /// The per-source [`crate::stream::StreamId`] this view selects out of
-    /// `SolutionSession.streams` (the maintained demux mirror the desktop
-    /// render reads since phase 2c). `Main → StreamId::Main`,
-    /// `Task(toolu) → StreamId::Teammate(toolu)`, and (phase 6d-A)
-    /// `Shell(id) → StreamId::Shell(id)` — the shell's derived, `Running`-only
-    /// stream, so the selected-shell body renders through the SAME
-    /// `selected_parent_stream_entries` path as Main/teammates instead of a
-    /// dedicated drill-in builder. This is the single mapping the view's
-    /// render, rewind, and find paths all route through.
-    pub fn parent_stream_id(&self) -> Option<crate::stream::StreamId> {
-        match self {
-            Self::Main => Some(crate::stream::StreamId::Main),
-            Self::Task(id) => Some(crate::stream::StreamId::Teammate(id.clone())),
-            Self::Shell(id) => Some(crate::stream::StreamId::Shell(id.clone())),
-        }
-    }
-}
-
 /// Compute the canonical subagents-dir path for a session. Mirrors
 /// Anthropic's `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/`
 /// layout. `encoded-cwd` is "every char in `cwd.to_string_lossy()`
@@ -9266,24 +9218,4 @@ mod subagent_view_tests {
         assert!(!tool_name_is_agent(None), "unknown tool → auto-close path");
     }
 
-    #[test]
-    fn subagent_view_parent_stream_id_maps_main_task_and_shell() {
-        use crate::stream::StreamId;
-        // Phase 2c/6d-A: the desktop render resolves the selected view to a
-        // stream in `SolutionSession.streams` via this mapping. Main + Task
-        // select a parent-thread stream; Shell selects its derived Shell stream
-        // (phase 6d-A).
-        assert_eq!(SubagentView::Main.parent_stream_id(), Some(StreamId::Main));
-        assert_eq!(
-            SubagentView::Task("toolu_abc".into()).parent_stream_id(),
-            Some(StreamId::Teammate("toolu_abc".into()))
-        );
-        assert_eq!(
-            SubagentView::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"))
-                .parent_stream_id(),
-            Some(StreamId::Shell(crate::background_shell::BackgroundShellId::new(
-                "bvb4ful1z"
-            )))
-        );
-    }
 }
