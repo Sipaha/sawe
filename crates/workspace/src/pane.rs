@@ -4175,46 +4175,34 @@ impl Pane {
     }
 }
 
+/// Whether this pane should render its New/Split/Zoom tab-bar buttons.
+///
+/// Fork divergence (FORK.md decision #41): upstream gates purely on keyboard
+/// focus (`has_focus`), so in a multi-pane Solution window these buttons vanish
+/// whenever focus is in a dock panel (the common case — the user works in the
+/// console/agent panel) and flicker on Solution switch. We also show them on the
+/// workspace's active center pane. Focusing a dock does not change the active
+/// pane, so this is flicker-free; in a split only the active pane qualifies.
+pub(crate) fn should_show_tab_bar_buttons(
+    pane: &Pane,
+    window: &mut Window,
+    cx: &mut Context<Pane>,
+) -> bool {
+    if pane.has_focus(window, cx) || pane.context_menu_focused(window, cx) {
+        return true;
+    }
+    let entity_id = cx.entity_id();
+    pane.workspace
+        .upgrade()
+        .is_some_and(|workspace| workspace.read(cx).active_pane().entity_id() == entity_id)
+}
+
 fn default_render_tab_bar_buttons(
     pane: &mut Pane,
     window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
-    let has_focus = pane.has_focus(window, cx);
-    let ctx_menu = pane.context_menu_focused(window, cx);
-    let show = has_focus || ctx_menu;
-    // TEMP flicker instrumentation: set SPK_TABBAR_DEBUG=1 to log every
-    // show<->hide transition (with the focus components that drive the gate)
-    // to /tmp/spk-tabbar-flicker.log. Remove once the flicker root cause is found.
-    if std::env::var_os("SPK_TABBAR_DEBUG").is_some() {
-        let pane_focused = pane.focus_handle.contains_focused(window, cx);
-        let item_focused = pane
-            .active_item()
-            .is_some_and(|item| item.item_focus_handle(cx).contains_focused(window, cx));
-        let window_focused = window.focused(cx);
-        let id = cx.entity_id();
-        thread_local! {
-            static TABBAR_FLICKER_LAST: std::cell::RefCell<std::collections::HashMap<gpui::EntityId, bool>> =
-                std::cell::RefCell::new(std::collections::HashMap::new());
-        }
-        let changed =
-            TABBAR_FLICKER_LAST.with(|m| m.borrow_mut().insert(id, show) != Some(show));
-        if changed {
-            use std::io::Write as _;
-            let line = format!(
-                "[tabbar-flicker] pane={id:?} show={show} has_focus={has_focus} ctx_menu={ctx_menu} pane_focused={pane_focused} item_focused={item_focused} window_focused={window_focused:?}\n"
-            );
-            eprint!("{line}");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/spk-tabbar-flicker.log")
-            {
-                let _ = f.write_all(line.as_bytes());
-            }
-        }
-    }
-    if !show {
+    if !should_show_tab_bar_buttons(pane, window, cx) {
         return (None, None);
     }
     let (can_clone, can_split_move) = match pane.active_item() {
@@ -5079,6 +5067,87 @@ mod tests {
                 "N5", "N6*",
             ],
             cx,
+        );
+    }
+
+    // Regression: the active center pane must render its New/Split/Zoom tab-bar
+    // buttons even when keyboard focus is elsewhere (e.g. in a dock panel). The
+    // old logic gated purely on `has_focus`, so an active-but-unfocused pane hid
+    // the buttons — the bug this fixes. A non-active, unfocused pane stays hidden.
+    #[gpui::test]
+    async fn test_should_show_tab_bar_buttons_on_active_pane_without_focus(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::dock::{DockPosition, test::TestPanel};
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        // Split so there is an active pane and a non-active pane. `add_pane`
+        // focuses the new pane, so after the split `second_pane` is both active
+        // and focused, and `first_pane` is neither.
+        let first_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let second_pane = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.split_pane(first_pane.clone(), SplitDirection::Right, window, cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().clone()),
+            second_pane,
+            "the newly split pane should be the active pane"
+        );
+
+        // Move keyboard focus into a dock panel, as happens when the user works
+        // in the console/agent panel. Focusing a dock does NOT change the
+        // workspace's active pane (only center-pane focus calls set_active_pane),
+        // so `second_pane` stays active while losing keyboard focus. (Blurring the
+        // window instead won't do: `Workspace::on_focus_lost` immediately refocuses
+        // the active pane, so a real in-tree focus target is required.)
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace
+                .right_dock()
+                .update(cx, |dock, cx| dock.set_open(true, window, cx));
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().clone()),
+            second_pane,
+            "focusing a dock panel must not change the active pane"
+        );
+
+        // Precondition: neither pane holds keyboard focus now.
+        assert!(
+            !second_pane.update_in(cx, |pane, window, cx| pane.has_focus(window, cx)),
+            "precondition: active pane must not hold keyboard focus"
+        );
+        assert!(
+            !first_pane.update_in(cx, |pane, window, cx| pane.has_focus(window, cx)),
+            "precondition: non-active pane must not hold keyboard focus"
+        );
+
+        // Core assertion: the active pane shows its buttons despite having no
+        // keyboard focus. Fails against the old `has_focus`-only gate.
+        assert!(
+            second_pane
+                .update_in(cx, |pane, window, cx| should_show_tab_bar_buttons(pane, window, cx)),
+            "active pane must show tab-bar buttons even without keyboard focus"
+        );
+
+        // The non-active, unfocused pane stays hidden (matches upstream's
+        // single-set behavior in a split).
+        assert!(
+            !first_pane
+                .update_in(cx, |pane, window, cx| should_show_tab_bar_buttons(pane, window, cx)),
+            "non-active unfocused pane must not show tab-bar buttons"
         );
     }
 
