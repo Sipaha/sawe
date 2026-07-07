@@ -4881,7 +4881,8 @@ impl McpServerTool for GetSupervisorStateTool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SeedColdSessionEntry {
-    /// `"user"` or `"assistant"` (default `"assistant"`).
+    /// `"user"`, `"assistant"` (default), or `"observer"`/`"system"` (an
+    /// agent-invisible Observer `System` bubble — FORK.md #29).
     pub role: String,
     /// `toolu_…` teammate id, or omitted/empty for a Main entry.
     pub subagent_id: Option<String>,
@@ -4953,9 +4954,19 @@ impl McpServerTool for SeedColdSessionTool {
                     .subagent_id
                     .filter(|s| !s.is_empty())
                     .map(SharedString::from);
-                let is_user = e.role.eq_ignore_ascii_case("user");
                 let text = e.text;
-                let kind = if is_user {
+                // `observer`/`system` seed an agent-invisible `System` bubble
+                // (Observer level) so the screenshot gate can exercise the
+                // supervisor Observer-bubble render (FORK.md #29) without a live
+                // judge cycle. `user` → UserMessage; anything else → assistant.
+                let kind = if e.role.eq_ignore_ascii_case("observer")
+                    || e.role.eq_ignore_ascii_case("system")
+                {
+                    crate::session_entry::SessionEntryKind::System {
+                        level: crate::session_entry::SystemEntryLevel::Observer,
+                        text_md: text,
+                    }
+                } else if e.role.eq_ignore_ascii_case("user") {
                     crate::session_entry::SessionEntryKind::UserMessage {
                         id: None,
                         content_md: text,

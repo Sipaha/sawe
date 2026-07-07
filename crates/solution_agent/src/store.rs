@@ -1615,8 +1615,9 @@ impl SolutionAgentStore {
     }
 
     /// Escalate a supervisor question to the user: set `WaitingUser`, store
-    /// the question on the session for the banner, fire a high-priority
-    /// desktop notification, and emit `SessionStateChanged`.
+    /// the question on the session for the banner, surface it in-chat as an
+    /// agent-invisible Observer bubble, fire a high-priority desktop
+    /// notification, and emit `SessionStateChanged`.
     pub(crate) fn escalate_to_user(
         &mut self,
         id: SolutionSessionId,
@@ -1632,6 +1633,18 @@ impl SolutionAgentStore {
                 s.supervisor_question = Some(question.clone().into())
             });
         }
+        // Surface the observer's question in the transcript as an Observer
+        // bubble (FORK.md #29 render — eye badge, Accent). It is a `SystemNote`,
+        // so it is DISPLAY-ONLY: the user reads it in-chat but the working agent
+        // never sees it (not sent to the agent / not in its transcript). This
+        // complements the persistent `supervisor_question` banner + the desktop
+        // toast below, so the ask isn't lost when the toast is dismissed.
+        self.push_system_note(
+            id,
+            acp_thread::SystemNoteLevel::Observer,
+            question.clone(),
+            cx,
+        );
         let title = "Sawe — Supervisor".to_string();
         let body = format!("🛡 {question}");
         crate::notifier::dispatch_raw(
@@ -1651,6 +1664,15 @@ impl SolutionAgentStore {
         reason: &str,
         cx: &mut Context<Self>,
     ) {
+        // In-chat Observer bubble (display-only, agent-invisible — see
+        // `escalate_to_user`) so the "work complete" verdict is visible in the
+        // transcript, not just as a transient desktop toast.
+        self.push_system_note(
+            id,
+            acp_thread::SystemNoteLevel::Observer,
+            format!("✓ Work complete: {reason}"),
+            cx,
+        );
         let title = "Sawe — Supervisor".to_string();
         let body = format!("✓ Work complete: {reason}");
         crate::notifier::dispatch_raw(
