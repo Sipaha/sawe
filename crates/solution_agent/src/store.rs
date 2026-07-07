@@ -846,6 +846,13 @@ impl SolutionAgentStore {
                 if this
                     .update(cx, |this, cx| {
                         this.tick_background_agents(cx);
+                        // Mid-session teammate-pill reconcile: closes finished
+                        // subagent streams the moment completion is provable, so a
+                        // long busy (never-Idle) session doesn't strand pills until
+                        // the →Idle GC (which only fires on the !Idle→Idle edge).
+                        // Runs AFTER the reap so a terminal async agent that the
+                        // reap already closed isn't re-examined.
+                        this.reconcile_all_finished_teammate_streams(cx);
                         this.scan_parent_jsonls_for_completions(cx);
                         this.tick_background_shells(cx);
                         this.tick_supervisor(cx);
@@ -7082,6 +7089,14 @@ impl SolutionAgentStore {
                 }
             }
         }
+
+        // Self-heal immediately when a Task terminalises: the mid-session
+        // reconcile is cheap for one session and catches the same terminal-but-
+        // missed cases the event-driven close above can drop (e.g. a Task whose
+        // tool-call flipped terminal on an EntryUpdated we didn't route through
+        // the `is_terminal` branch). It is SELECTIVE, so a still-live teammate
+        // in this session is untouched.
+        self.reconcile_finished_teammate_streams(session_id, cx);
     }
 
     /// Spawn (idempotently) a per-session watcher on the
@@ -7583,6 +7598,158 @@ impl SolutionAgentStore {
                     }
                 }
             }
+        }
+    }
+
+    /// One pass over every session's teammate pills, closing each stream whose
+    /// completion is provable. Runs on the 1 Hz tick so it fires mid-session,
+    /// unlike the →Idle GC. See
+    /// [`Self::reconcile_finished_teammate_streams`] for the per-session rules.
+    pub fn reconcile_all_finished_teammate_streams(&mut self, cx: &mut Context<Self>) {
+        let session_ids: Vec<SolutionSessionId> =
+            self.all_sessions().map(|e| e.read(cx).id).collect();
+        for session_id in session_ids {
+            self.reconcile_finished_teammate_streams(session_id, cx);
+        }
+    }
+
+    /// Mid-session SELECTIVE reconcile of a session's teammate (subagent) pills.
+    ///
+    /// Desktop strip pills mirror `session.streams`; a teammate pill vanishes
+    /// only when its `Teammate(toolu)` stream closes. The event-driven close
+    /// paths ([`Self::apply_subagent_lifecycle`] for inline `Task`s,
+    /// [`Self::refresh_background_agent_snapshot`] for async `Agent`s) can miss
+    /// their signal (a dropped `EntryUpdated`, a missed JSONL watcher write, a
+    /// last line that isn't terminal). The ONLY catch-all today is the →Idle
+    /// strip GC in [`Self::mutate_state`], which is gated on the `!Idle → Idle`
+    /// transition — so a session that stays busy for a long time NEVER runs it
+    /// and finished-teammate pills linger until the session finally goes Idle
+    /// (observed: ~1 hour). This reconcile closes such a stream the moment its
+    /// completion is provable, WITHOUT waiting for →Idle.
+    ///
+    /// Unlike the →Idle GC (which blanket-closes every non-async teammate
+    /// because Idle proves nothing is running), this must be SELECTIVE — some
+    /// teammates are genuinely still running mid-session. A `Teammate(toolu)`
+    /// stream is closed only when (any):
+    ///   1. it is NOT a registered async `Agent` and has no matching tool-call
+    ///      entry left in the thread (rewound/removed → orphaned);
+    ///   2. it is an inline `Task` (its spawn tool-call's `tool_name` is NOT
+    ///      agent) whose tool-call entry is TERMINAL; or
+    ///   3. it is an async `Agent` (some `background_agent` has
+    ///      `parent_tool_use_id == toolu`) whose latest snapshot either carries
+    ///      a terminal `stop_reason` OR is stale beyond
+    ///      [`MANAGED_AGENT_STALE_TIMEOUT_SECS`].
+    ///
+    /// It is NEVER closed for a live inline `Task` (tool-call present +
+    /// non-terminal), a fresh async `Agent` (snapshot recent, no stop_reason),
+    /// or — critically — an async `Agent` merely because its spawn tool-call is
+    /// terminal: that is spawn-ack, the teammate streams for minutes after, and
+    /// closing there is the pre-6c premature-close regression. Async
+    /// classification is by the `background_agents` map (NOT the tool-call
+    /// tool_name), so a spawn-ack terminal `Agent` whose registration is still
+    /// pending is kept via the tool_name guard below.
+    pub(crate) fn reconcile_finished_teammate_streams(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+        // Cheap read-side guard: the vast majority of sessions have no teammate
+        // pills, and `update` is not free.
+        let has_teammate = session.read(cx).streams.keys().any(|id| {
+            matches!(id, crate::stream::StreamId::Teammate(_))
+        });
+        if !has_teammate {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        let stale = std::time::Duration::from_secs(MANAGED_AGENT_STALE_TIMEOUT_SECS);
+        let closed_any = session.update(cx, |s, _| {
+            let teammate_ids: Vec<SharedString> = s
+                .streams
+                .keys()
+                .filter_map(|id| match id {
+                    crate::stream::StreamId::Teammate(toolu) => Some(toolu.clone()),
+                    _ => None,
+                })
+                .collect();
+            // (parent toolu, close reason)
+            let mut to_close: Vec<(SharedString, SharedString)> = Vec::new();
+            for toolu in teammate_ids {
+                // Async classification FIRST and by the `background_agents` map,
+                // not the tool-call tool_name: an async teammate's stream is kept
+                // alive by its registration + tagged entries, so it must never
+                // fall through to the tool-call rules below (rule 1 would close a
+                // live async whose spawn tool-call was rewound).
+                let async_agent = s
+                    .background_agents
+                    .values()
+                    .find(|ba| ba.parent_tool_use_id.as_ref() == Some(&toolu));
+                if let Some(ba) = async_agent {
+                    let terminal_stop = ba
+                        .latest
+                        .as_ref()
+                        .is_some_and(|snap| snap.stop_reason.is_some());
+                    let stale_mtime = ba.latest.as_ref().is_some_and(|snap| {
+                        now.duration_since(snap.mtime).unwrap_or_default() > stale
+                    });
+                    if terminal_stop || stale_mtime {
+                        let reason = ba
+                            .latest
+                            .as_ref()
+                            .and_then(|snap| snap.stop_reason.clone())
+                            .unwrap_or_else(|| gpui::SharedString::new_static("done"));
+                        to_close.push((toolu, reason));
+                    }
+                    // else: fresh async teammate still streaming → keep.
+                    continue;
+                }
+                // Not a registered async agent → an inline `Task` or an orphan.
+                let toolcall = s.entries.iter().find_map(|e| match &e.kind {
+                    crate::session_entry::SessionEntryKind::ToolCall {
+                        id,
+                        status,
+                        tool_name,
+                        ..
+                    } if id.as_str() == toolu.as_ref() => {
+                        Some((status.clone(), tool_name.clone()))
+                    }
+                    _ => None,
+                });
+                match toolcall {
+                    None => {
+                        // Rule 1: the spawn tool-call entry is gone (rewound /
+                        // removed) and this is not a live async agent → orphaned.
+                        to_close.push((toolu, gpui::SharedString::new_static("orphaned")));
+                    }
+                    Some((status, tool_name)) => {
+                        if tool_name_is_agent(tool_name.as_deref()) {
+                            // Spawn-ack terminal on an async `Agent` whose
+                            // background_agent registration hasn't landed yet:
+                            // the teammate keeps streaming. Keep it — the async
+                            // branch (once registered) or the background-agent GC
+                            // owns its real close. Closing here is the pre-6c
+                            // premature-close bug.
+                        } else if status.is_terminal() {
+                            // Rule 2: inline `Task` tool-call terminal → done.
+                            to_close.push((toolu, gpui::SharedString::new_static("done")));
+                        }
+                        // else: live inline `Task` (non-terminal) → keep.
+                    }
+                }
+            }
+            if to_close.is_empty() {
+                return false;
+            }
+            for (toolu, reason) in to_close {
+                s.close_stream(crate::stream::StreamId::Teammate(toolu), reason);
+            }
+            true
+        });
+        if closed_any {
+            self.mark_subagents_changed(session_id, cx);
         }
     }
 

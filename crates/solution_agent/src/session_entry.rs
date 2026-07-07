@@ -110,6 +110,18 @@ pub enum ToolStatus {
     Canceled,
 }
 
+impl ToolStatus {
+    /// A terminal tool-call status: the call has finished (successfully or not)
+    /// and will not transition again. Mirrors the `acp_thread::ToolCallStatus`
+    /// terminal set matched inline in `apply_subagent_lifecycle`.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Rejected | Self::Canceled
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PlanItem {
     pub content_md: String,

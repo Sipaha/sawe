@@ -7645,6 +7645,325 @@ async fn background_agent_non_terminal_leaves_teammate_stream(cx: &mut TestAppCo
     });
 }
 
+// --- Mid-session SELECTIVE teammate-pill reconcile
+// (`reconcile_finished_teammate_streams`) ---------------------------------
+//
+// These verify the busy-session leak fix: a finished-teammate pill must close
+// the moment its completion is provable, WITHOUT any →Idle transition (a long
+// busy session never fires the →Idle GC).
+
+/// Build a parent spawn tool-call entry (on the Main stream — `subagent_id`
+/// None) with the given owned-model `ToolStatus`.
+fn reconcile_toolcall_entry(
+    id: &str,
+    tool_name: &str,
+    status: crate::session_entry::ToolStatus,
+) -> crate::session_entry::SessionEntry {
+    use agent_client_protocol::schema as acp;
+    crate::session_entry::SessionEntry {
+        created_ms: 1_700_000_000_000,
+        mod_seq: 1,
+        subagent_id: None,
+        kind: crate::session_entry::SessionEntryKind::ToolCall {
+            id: id.to_string(),
+            label_md: "spawn".into(),
+            kind: acp::ToolKind::Think,
+            status,
+            content_md: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            tool_name: Some(tool_name.to_string()),
+            locations: Vec::new(),
+            status_started_at: None,
+        },
+    }
+}
+
+/// Build a teammate body entry tagged with `toolu` — this is what the demux
+/// turns into a `Teammate(toolu)` stream.
+fn reconcile_tagged_body(toolu: &str) -> crate::session_entry::SessionEntry {
+    crate::session_entry::SessionEntry {
+        created_ms: 1_700_000_000_001,
+        mod_seq: 2,
+        subagent_id: Some(SharedString::from(toolu.to_string())),
+        kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+            chunks: vec![crate::session_entry::AssistantChunk::Message(
+                "teammate work".into(),
+            )],
+        },
+    }
+}
+
+/// Rule 2: a NON-Idle (Running) session with an inline `Task` teammate whose
+/// spawn tool-call is `Completed` has its `Teammate` stream closed by the
+/// mid-session reconcile — no →Idle transition involved.
+#[gpui::test]
+async fn reconcile_closes_finished_inline_task_teammate_mid_session(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let toolu = "toolu_task_done";
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from(toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            s.teammate_labels
+                .insert(SharedString::from(toolu), SharedString::from("Worker"));
+            s.set_entries(
+                vec![
+                    reconcile_toolcall_entry(
+                        toolu,
+                        "Task",
+                        crate::session_entry::ToolStatus::Completed,
+                    ),
+                    reconcile_tagged_body(toolu),
+                ],
+                cx,
+            );
+            assert!(
+                s.streams.contains_key(&teammate),
+                "teammate stream is live before the reconcile"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reconcile_finished_teammate_streams(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "a terminal inline Task teammate must be reconciled closed mid-session"
+            );
+            assert!(
+                !matches!(s.state, SessionState::Idle),
+                "guard: the session never went Idle"
+            );
+        });
+    });
+}
+
+/// Do-NOT-close: an inline `Task` whose spawn tool-call is still `InProgress`
+/// is genuinely live mid-session — the reconcile must leave it.
+#[gpui::test]
+async fn reconcile_keeps_live_inline_task_teammate(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let toolu = "toolu_task_live";
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from(toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            s.set_entries(
+                vec![
+                    reconcile_toolcall_entry(
+                        toolu,
+                        "Task",
+                        crate::session_entry::ToolStatus::InProgress,
+                    ),
+                    reconcile_tagged_body(toolu),
+                ],
+                cx,
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reconcile_finished_teammate_streams(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                s.streams.contains_key(&teammate),
+                "a live (InProgress) inline Task teammate must survive the reconcile"
+            );
+        });
+    });
+}
+
+/// Rule 3 both ways: a fresh async `Agent` (recent snapshot, no stop_reason)
+/// survives while a stale-mtime one — AND one with a terminal stop_reason — are
+/// reconciled closed. A terminal async Agent's spawn tool-call being terminal is
+/// spawn-ack and is NOT what closes it; the background_agent snapshot is.
+#[gpui::test]
+async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let live_toolu = "toolu_async_live";
+    let stale_toolu = "toolu_async_stale";
+    let stop_toolu = "toolu_async_stop";
+    let live = crate::stream::StreamId::Teammate(SharedString::from(live_toolu));
+    let stale = crate::stream::StreamId::Teammate(SharedString::from(stale_toolu));
+    let stopped = crate::stream::StreamId::Teammate(SharedString::from(stop_toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            // Three async teammates, seeded via tagged body entries + their
+            // background_agent registrations (async classification is by the
+            // map, not by any tool-call entry — none is present here). The
+            // spawn tool-calls being terminal must NOT be what drives the close.
+            s.set_entries(
+                vec![
+                    reconcile_tagged_body(live_toolu),
+                    reconcile_tagged_body(stale_toolu),
+                    reconcile_tagged_body(stop_toolu),
+                ],
+                cx,
+            );
+            let register = |s: &mut crate::model::SolutionSession,
+                            bg: &str,
+                            parent: &str,
+                            snap: crate::background_agent::BackgroundAgentSnapshot| {
+                let bg_id = crate::background_agent::BackgroundAgentId::new(bg.to_string());
+                s.background_agents.insert(
+                    bg_id.clone(),
+                    crate::background_agent::BackgroundAgent {
+                        id: bg_id.clone(),
+                        jsonl_path: "/nonexistent".into(),
+                        registered_at: chrono::Utc::now(),
+                        latest: Some(snap),
+                        last_offset: 0,
+                        parent_tool_use_id: Some(SharedString::from(parent.to_string())),
+                    },
+                );
+                s.background_agent_order.push(bg_id);
+            };
+            register(
+                s,
+                "bg_live",
+                live_toolu,
+                crate::background_agent::BackgroundAgentSnapshot {
+                    mtime: std::time::SystemTime::now(),
+                    activity_label: SharedString::from("Generating…"),
+                    stop_reason: None,
+                },
+            );
+            register(
+                s,
+                "bg_stale",
+                stale_toolu,
+                crate::background_agent::BackgroundAgentSnapshot {
+                    // Older than MANAGED_AGENT_STALE_TIMEOUT_SECS (120s).
+                    mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(200),
+                    activity_label: SharedString::from("Generating…"),
+                    stop_reason: None,
+                },
+            );
+            register(
+                s,
+                "bg_stop",
+                stop_toolu,
+                crate::background_agent::BackgroundAgentSnapshot {
+                    mtime: std::time::SystemTime::now(),
+                    activity_label: SharedString::from("done"),
+                    stop_reason: Some(SharedString::from("end_turn")),
+                },
+            );
+            assert!(s.streams.contains_key(&live));
+            assert!(s.streams.contains_key(&stale));
+            assert!(s.streams.contains_key(&stopped));
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reconcile_finished_teammate_streams(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                s.streams.contains_key(&live),
+                "a fresh async agent (recent snapshot, no stop_reason) must survive"
+            );
+            assert!(
+                !s.streams.contains_key(&stale),
+                "an async agent stale beyond MANAGED_AGENT_STALE_TIMEOUT_SECS must be closed"
+            );
+            assert!(
+                !s.streams.contains_key(&stopped),
+                "an async agent with a terminal stop_reason must be closed"
+            );
+        });
+    });
+}
+
+/// Rule 1: a teammate stream whose parent tool-call entry has vanished from the
+/// thread (and which is not a registered async agent) is orphaned → closed.
+#[gpui::test]
+async fn reconcile_closes_teammate_whose_toolcall_vanished(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let toolu = "toolu_orphan";
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from(toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            // Only the tagged body entry — NO matching ToolCall entry and no
+            // background_agent registration → the spawn tool-call is "gone".
+            s.set_entries(vec![reconcile_tagged_body(toolu)], cx);
+            assert!(
+                s.streams.contains_key(&teammate),
+                "orphan teammate stream exists before the reconcile"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reconcile_finished_teammate_streams(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "a teammate whose spawn tool-call vanished must be reconciled closed"
+            );
+        });
+    });
+}
+
 /// Task 9: an agent with a stale snapshot beyond
 /// `MANAGED_AGENT_STALE_TIMEOUT + MANAGED_AGENT_DEAD_LINGER`
 /// (V1 hardcoded: 120s + 300s = 420s) is removed on tick.
