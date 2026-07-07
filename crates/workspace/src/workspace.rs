@@ -1687,6 +1687,21 @@ impl Workspace {
         }
 
         cx.on_focus_lost(window, |this, window, cx| {
+            // In a `MultiWorkspace` window the retained (background) workspaces keep
+            // this handler live. Focus is a shared-window resource, so a background
+            // workspace re-grabbing it clobbers the active one — the same class of
+            // "background must not act on the shared window" bug that
+            // `owns_window_chrome` already guards for the title/edited-indicator
+            // writers. Only the workspace that owns the window may re-grab focus.
+            // (Hardening: this also removes the theoretical cross-workspace
+            // `on_focus_lost` ping-pong on a Solution switch. That oscillation was
+            // hypothesized behind an observed tab-bar flicker but NOT reproduced in
+            // a unit test — the gpui test harness never fires `on_focus_lost` on a
+            // workspace switch — so this guard is shipped as a principled hardening,
+            // not a verified flicker fix.)
+            if !this.owns_window_chrome() {
+                return;
+            }
             let focus_handle = this.focus_handle(cx);
             window.focus(&focus_handle, cx);
         })

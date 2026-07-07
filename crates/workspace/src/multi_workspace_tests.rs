@@ -867,6 +867,50 @@ async fn test_remote_project_root_dir_changes_update_groups(cx: &mut TestAppCont
     });
 }
 
+// Guards the invariant the `on_focus_lost` refocus guard depends on: after a
+// switch, only the arriving workspace owns the shared window; the retained
+// (background) one does not. (`owns_window_chrome` is the same predicate the
+// guard reads, so this locks in that a background workspace is correctly
+// classified as non-owning and must not re-grab focus. The full cross-workspace
+// `on_focus_lost` ping-pong is real-platform-window-only — the gpui test harness
+// never fires `on_focus_lost` on a switch — so it cannot be asserted here.)
+#[gpui::test]
+async fn test_retained_workspace_does_not_own_shared_window(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file_a.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file_b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
+
+    // Adding a workspace activates it, mirroring a Solution switch.
+    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |mw, _window, cx| {
+        assert_eq!(
+            mw.workspace().entity_id(),
+            workspace_b.entity_id(),
+            "the newly activated workspace should be active"
+        );
+        assert!(
+            workspace_b.read(cx).owns_window_chrome(),
+            "the arriving (active) workspace must own the shared window"
+        );
+        assert!(
+            !workspace_a.read(cx).owns_window_chrome(),
+            "the retained background workspace must NOT own the shared window \
+             (so its on_focus_lost guard returns early instead of stealing focus)"
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_open_project_closes_empty_workspace_but_not_non_empty_ones(cx: &mut TestAppContext) {
     init_test(cx);
