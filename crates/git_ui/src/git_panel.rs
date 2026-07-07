@@ -3847,15 +3847,7 @@ impl GitPanel {
         let Some(member) = self.active_member(cx) else {
             return;
         };
-        let project = self.project.read(cx);
-        let new_repo = project
-            .repositories(cx)
-            .values()
-            .find(|repo| {
-                let dir = repo.read(cx).work_directory_abs_path.clone();
-                dir.starts_with(&member.local_path)
-            })
-            .cloned();
+        let new_repo = crate::repo_under_member(&self.project, &member, cx);
         if new_repo.as_ref().map(|r| r.entity_id())
             != self.active_repository.as_ref().map(|r| r.entity_id())
         {

@@ -90,6 +90,7 @@ pub struct ProjectDiff {
     review_comment_count: usize,
     _task: Task<Result<()>>,
     _subscription: Subscription,
+    _store_subscription: Option<Subscription>,
 }
 
 const CONFLICT_SORT_PREFIX: u64 = 1;
@@ -124,7 +125,9 @@ impl ProjectDiff {
     ) {
         telemetry::event!("Git Branch Diff Opened");
         let project = workspace.project().clone();
-        let Some(intended_repo) = project.read(cx).active_repository(cx) else {
+        let Some(intended_repo) = crate::active_member_repository(&project, cx)
+            .or_else(|| project.read(cx).active_repository(cx))
+        else {
             let workspace = cx.entity().downgrade();
             window
                 .spawn(cx, async |_cx| {
@@ -167,7 +170,9 @@ impl ProjectDiff {
         cx: &mut Context<Workspace>,
     ) {
         let project = workspace.project().clone();
-        let Some(repository) = project.read(cx).active_repository(cx) else {
+        let Some(repository) = crate::active_member_repository(&project, cx)
+            .or_else(|| project.read(cx).active_repository(cx))
+        else {
             let workspace = cx.entity().downgrade();
             window
                 .spawn(cx, async |_cx| {
@@ -340,7 +345,8 @@ impl ProjectDiff {
                 "Action"
             }
         );
-        let intended_repo = workspace.project().read(cx).active_repository(cx);
+        let intended_repo = crate::active_member_repository(workspace.project(), cx)
+            .or_else(|| workspace.project().read(cx).active_repository(cx));
 
         let existing = workspace
             .items_of_type::<Self>(cx)
@@ -555,6 +561,19 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Freshly-constructed HEAD "Uncommitted Changes" views (deploy_at,
+        // deploy_at_project_path, deserialize all funnel here) must target the active
+        // solution member's repo; BranchDiff::new seeds the vanilla GitStore default,
+        // which resolves to the wrong member in a Solution window. Merge/branch-diff
+        // views keep their explicitly chosen repo.
+        if matches!(branch_diff.read(cx).diff_base(), DiffBase::Head) {
+            if let Some(repo) = crate::active_member_repository(&project, cx) {
+                branch_diff.update(cx, |branch_diff, cx| {
+                    branch_diff.set_repo(Some(repo), cx);
+                });
+            }
+        }
+
         let focus_handle = cx.focus_handle();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
@@ -651,6 +670,28 @@ impl ProjectDiff {
             async |cx| Self::refresh(this, cx).await
         });
 
+        // Re-target the HEAD "Uncommitted Changes" view whenever the solution-wide
+        // active member flips, mirroring the git panel's own subscription so the
+        // multibuffer follows the same repo the panel does.
+        let store_subscription = solutions::SolutionStore::try_global(cx).map(|store| {
+            cx.subscribe_in(&store, window, |this, _store, event, _window, cx| {
+                if matches!(
+                    event,
+                    solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
+                ) {
+                    // Only the HEAD "Uncommitted Changes" view follows the active member;
+                    // a branch-diff view is pinned to its explicitly chosen repo+base.
+                    if matches!(this.branch_diff.read(cx).diff_base(), DiffBase::Head) {
+                        if let Some(repo) = crate::active_member_repository(&this.project, cx) {
+                            this.branch_diff.update(cx, |branch_diff, cx| {
+                                branch_diff.set_repo(Some(repo), cx);
+                            });
+                        }
+                    }
+                }
+            })
+        });
+
         Self {
             project,
             workspace: workspace.downgrade(),
@@ -666,6 +707,7 @@ impl ProjectDiff {
                 branch_diff_subscription,
                 Subscription::join(editor_subscription, review_comment_subscription),
             ),
+            _store_subscription: store_subscription,
         }
     }
 
@@ -2135,6 +2177,177 @@ mod tests {
 
         let text = String::from_utf8(fs.read_file_sync("/project/foo.txt").unwrap()).unwrap();
         assert_eq!(text, "foo\n");
+    }
+
+    struct TwoMemberSolution {
+        project: Entity<Project>,
+        sid: solutions::SolutionId,
+        catalog_b: solutions::CatalogId,
+        member_a_root: std::path::PathBuf,
+        member_b_root: std::path::PathBuf,
+    }
+
+    /// A Solution window spanning two repos: `memberA` (dirty, active member) and
+    /// `memberB` (clean). Installs the global `SolutionStore` so
+    /// `active_member_repository` resolves. Mirrors the git-panel test harness.
+    async fn setup_two_member_solution(cx: &mut TestAppContext) -> TwoMemberSolution {
+        init_test(cx);
+
+        // Build the solution + two members first so we know the root the FakeFs tree
+        // must live under (solution_for_path matches worktrees by root prefix).
+        let (sid, catalog_b, root) = cx.update(|cx| {
+            let store = solutions::SolutionStore::for_test(std::path::PathBuf::new(), cx);
+            let out = store.update(cx, |store, cx| {
+                let sid = store.create_for_test_minimal("diff-active-member", cx);
+                let root = store
+                    .solutions()
+                    .last()
+                    .expect("solution just created")
+                    .root
+                    .clone();
+                let catalog_a = solutions::CatalogId("member-a".into());
+                let catalog_b = solutions::CatalogId("member-b".into());
+                store.test_add_member_with_path(&sid, &catalog_a, root.join("memberA"));
+                store.test_add_member_with_path(&sid, &catalog_b, root.join("memberB"));
+                store.set_active_member(sid.clone(), catalog_a.clone(), cx);
+                (sid, catalog_b, root)
+            });
+            solutions::install_global_for_test(store, cx);
+            out
+        });
+
+        let member_a_root = root.join("memberA");
+        let member_b_root = root.join("memberB");
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            &root,
+            json!({
+                "memberA": {
+                    ".git": {},
+                    "a.txt": "A\n",
+                },
+                "memberB": {
+                    ".git": {},
+                    "b.txt": "B\n",
+                },
+            }),
+        )
+        .await;
+        // memberA dirty, memberB clean — the shape that used to render "no changes".
+        fs.set_status_for_repo(
+            &member_a_root.join(".git"),
+            &[("a.txt", git::status::StatusCode::Modified.worktree())],
+        );
+
+        let project = Project::test(
+            fs.clone(),
+            [member_a_root.as_path(), member_b_root.as_path()],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+
+        TwoMemberSolution {
+            project,
+            sid,
+            catalog_b,
+            member_a_root,
+            member_b_root,
+        }
+    }
+
+    // Regression for the Solution-window divergence: the git panel overrides its
+    // repo with the active member's, but ProjectDiff/BranchDiff used the vanilla
+    // `project.active_repository`, which resolves to a different (often clean) repo.
+    // `active_member_repository` is the shared resolver both surfaces now use, so we
+    // assert it tracks the active member across a switch. This directly proves the
+    // divergence is fixed; the full ProjectDiff multibuffer refresh is covered by the
+    // live MCP gate.
+    #[gpui::test]
+    async fn test_active_member_repository_follows_active_member(cx: &mut TestAppContext) {
+        let TwoMemberSolution {
+            project,
+            sid,
+            catalog_b,
+            member_a_root,
+            member_b_root,
+        } = setup_two_member_solution(cx).await;
+
+        let repo_dir = |cx: &mut TestAppContext| {
+            cx.read(|cx| {
+                crate::active_member_repository(&project, cx)
+                    .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
+            })
+        };
+
+        // Active member = A → the repo whose work directory is under memberA.
+        assert_eq!(
+            repo_dir(cx).as_deref(),
+            Some(member_a_root.as_path()),
+            "active member A must resolve to memberA's repo"
+        );
+
+        // Flip the active member; the resolver must now point at memberB's repo.
+        cx.update(|cx| {
+            solutions::SolutionStore::global(cx).update(cx, |store, cx| {
+                store.set_active_member(sid.clone(), catalog_b.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            repo_dir(cx).as_deref(),
+            Some(member_b_root.as_path()),
+            "after switching, active member B must resolve to memberB's repo"
+        );
+    }
+
+    // A freshly-constructed HEAD "Uncommitted Changes" ProjectDiff (the path taken by
+    // deploy_at_project_path / deserialize) must be seeded with the active member's
+    // repo by `new_impl`, not the vanilla GitStore default. The GitStore default here
+    // resolves to memberA (the first worktree), so we make memberB the active member to
+    // force the divergence the original bug hit: without the correction in `new_impl`
+    // the constructed view's branch_diff points at the GitStore default (memberA),
+    // reproducing "wrong member's repo"; with it, it follows the active member
+    // (memberB). This test fails without Change 1 and passes with it.
+    #[gpui::test]
+    async fn test_new_head_diff_seeds_active_member_repo(cx: &mut TestAppContext) {
+        let TwoMemberSolution {
+            project,
+            sid,
+            catalog_b,
+            member_b_root,
+            ..
+        } = setup_two_member_solution(cx).await;
+
+        // Make memberB the active member; GitStore's default active_repository stays
+        // memberA (first worktree), so active member and default now diverge.
+        cx.update(|cx| {
+            solutions::SolutionStore::global(cx).update(cx, |store, cx| {
+                store.set_active_member(sid.clone(), catalog_b.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let (multi_workspace, cx) = cx
+            .add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .new_window_entity(|window, cx| ProjectDiff::new(project.clone(), workspace, window, cx));
+        cx.run_until_parked();
+
+        let repo_dir = diff.read_with(cx, |diff, cx| {
+            diff.branch_diff
+                .read(cx)
+                .repo()
+                .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
+        });
+        assert_eq!(
+            repo_dir.as_deref(),
+            Some(member_b_root.as_path()),
+            "a fresh HEAD ProjectDiff must target the active member (memberB), not the GitStore default (memberA)"
+        );
     }
 
     #[gpui::test]

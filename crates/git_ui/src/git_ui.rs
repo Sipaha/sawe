@@ -34,7 +34,7 @@ use gpui::{
     SharedString, Subscription, Task, TaskExt, Window,
 };
 use menu::{Cancel, Confirm};
-use project::git_store::Repository;
+use project::{Project, git_store::Repository};
 use project_diff::ProjectDiff;
 use time::OffsetDateTime;
 use ui::prelude::*;
@@ -82,6 +82,47 @@ pub fn get_provider_icon(name: &str) -> IconName {
         "SourceHut" => IconName::Sourcehut,
         _ => IconName::Link,
     }
+}
+
+/// The repo whose git work directory lives under this solution member's local path.
+pub(crate) fn repo_under_member(
+    project: &Entity<Project>,
+    member: &solutions::SolutionMember,
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    project
+        .read(cx)
+        .repositories(cx)
+        .values()
+        .find(|repo| {
+            repo.read(cx)
+                .work_directory_abs_path
+                .clone()
+                .starts_with(&member.local_path)
+        })
+        .cloned()
+}
+
+/// If `project` belongs to a solution with an active member, the repo under that
+/// member. `None` when there is no solution, no active member, or no matching repo.
+pub(crate) fn active_member_repository(
+    project: &Entity<Project>,
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    let store = solutions::SolutionStore::try_global(cx)?;
+    let store = store.read(cx);
+    let solution = project
+        .read(cx)
+        .worktrees(cx)
+        .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))
+        .cloned()?;
+    let catalog = store.active_member(&solution.id)?;
+    let member = solution
+        .members
+        .iter()
+        .find(|member| &member.catalog_id == catalog)
+        .cloned()?;
+    repo_under_member(project, &member, cx)
 }
 
 pub fn init(cx: &mut App) {
