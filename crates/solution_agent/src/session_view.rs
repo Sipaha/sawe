@@ -317,7 +317,7 @@ pub struct SolutionSessionView {
     /// per-entry Main/Task filtering happens at render.
     main_stream_entries_for_render: Vec<crate::session_entry::SessionEntry>,
     /// The `SubagentView` rendered on the previous frame, or `None` before the
-    /// first paint. Tracked so ANY tab switch (Main↔Task↔Background↔Shell) can
+    /// first paint. Tracked so ANY tab switch (Main↔Task↔Shell) can
     /// reset `list_state` to the newly-selected view's entry count + tail-anchor
     /// at the next render — each stream has its own per-stream index space now,
     /// so their counts almost never match and a stale `list_state` would
@@ -952,11 +952,12 @@ impl SolutionSessionView {
     /// bundle's preview text changes (enqueue / merge / recall);
     /// clears the cache when the queue becomes empty.
     /// The queued bundles addressed to the currently-selected tab — the only
-    /// ones the ghost bubble and Up-arrow recall should surface. `Main` /
-    /// `Task` / `Shell` tabs see `Main`-targeted bundles; a teammate's
-    /// `Background` tab sees only that teammate's bundles. The full queue can
-    /// hold bundles for several addressees at once, so without this filter the
-    /// Main ghost would show a follow-up meant for a teammate (and vice-versa).
+    /// ones the ghost bubble and Up-arrow recall should surface. Post-migration
+    /// every tab routes its follow-ups to `Main` (`queue_target` is `Main` for
+    /// all of `Main`/`Task`/`Shell`), so this surfaces `Main`-targeted bundles.
+    /// The filter is retained (rather than hard-coded to `Main`) because the
+    /// queue can still hold bundles for several addressees and the mapping is
+    /// the single source of truth for "which bundles belong to this tab".
     pub(super) fn visible_pending_bundles(&self, cx: &App) -> Vec<crate::model::PendingBundle> {
         let target = self.selected_subagent.queue_target();
         self.session
@@ -1555,9 +1556,9 @@ impl SolutionSessionView {
 
     fn submit_compose_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compose_disabled(cx) {
-            // Background view: parent thread has no live agent for the
-            // selected Managed Agent. Silently drop — the UI also hides
-            // the Send button, this guard catches keybinding paths.
+            // Shell view: a read-only background-shell transcript, not a live
+            // agent — there is nothing to send to. Silently drop — the UI also
+            // hides the Send button, this guard catches keybinding paths.
             return;
         }
         let content = self.compose_editor.read(cx).text(cx);
@@ -1669,9 +1670,9 @@ impl SolutionSessionView {
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.list_state.scroll_to_end();
         let session_id = self.session_id;
-        // Route the follow-up to the tab it was typed on: the parent agent
-        // for `Main`/`Task`/`Shell`, or the specific Agent Teams teammate for
-        // a live `Background` tab (its hook, not the main agent's, drains it).
+        // Route the follow-up: every tab (`Main`/`Task`/`Shell`) queues to the
+        // parent agent (`queue_target` is `Main` for all — teammate/async-agent
+        // tabs are view-only since the per-source-streams fold).
         let target = self.selected_subagent.queue_target();
 
         if self.pending_images.is_empty() {
@@ -1893,10 +1894,9 @@ impl SolutionSessionView {
     /// and click.
     fn submit_compose_and_interrupt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compose_disabled(cx) {
-            // Background view: see `submit_compose_now`. Skip both the
-            // send AND the interrupt — interrupting the parent thread
-            // while the user is viewing a Managed Agent transcript
-            // would surprise them.
+            // Shell view: see `submit_compose_now`. Skip both the send AND the
+            // interrupt — interrupting the parent thread while the user is
+            // viewing a read-only background-shell transcript would surprise them.
             return;
         }
         let was_running = matches!(self.session.read(cx).state, SessionState::Running { .. });
@@ -2877,11 +2877,11 @@ impl Render for SolutionSessionView {
             })
             .when_some(task_subagent_strip, |this, strip| this.child(strip))
             .child(if self.compose_disabled(cx) {
-                // Background view: the parent thread has no agent
-                // attached to the selected Managed Agent, so any
-                // input would be misrouted to the parent. Render a
-                // view-only label that tells the user how to recover
-                // (flip the pill back to Main). Submit handlers
+                // Shell view: a read-only background-shell transcript,
+                // not a live agent — any input would be misrouted to
+                // the parent. Render a view-only label that tells the
+                // user how to recover (flip the pill back to Main).
+                // Submit handlers
                 // (`submit_compose_now` etc.) also early-return on
                 // this predicate as a belt-and-braces guard for any
                 // keybinding path that bypasses the button.

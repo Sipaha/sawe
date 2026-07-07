@@ -265,9 +265,10 @@ pub struct SessionSummary {
 }
 
 /// Wire identity of a stream. Tagged object (locked encoding — identical in the
-/// mobile client). `Shell` is defined for completeness but not produced this
-/// phase (the `streams` list carries Main + teammates only; shells/bg-agents stay
-/// separate tools until phase 6).
+/// mobile client). All three variants ride the wire: `Main`, `Teammate` (inline
+/// Task AND async `Agent` — the latter folded onto its demux stream in 6d-B),
+/// and `Shell` (background shells, folded onto `streams` as `kind: shell` in
+/// 6d-A/6d-B — no separate bg tools remain).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamIdDto {
