@@ -36,8 +36,10 @@
   "buffer_font_fallbacks": null,
   // The OpenType features to enable for text in the editor.
   "buffer_font_features": {
-    // Disable ligatures:
-    // "calt": false
+    // Sawe default: ligatures OFF — show the original source glyphs
+    // (`->`, `===`, `!=`, `>=`, `=>` render as-typed). Re-enable per-user
+    // with `"calt": true` in settings.json.
+    "calt": false
   },
   // The default font size for text in the editor
   "buffer_font_size": 15,
