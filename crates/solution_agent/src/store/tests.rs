@@ -9494,6 +9494,94 @@ async fn idle_transition_gc_excludes_live_async_agent_teammate(cx: &mut TestAppC
     });
 }
 
+/// The per-source-streams migration's stream-lifecycle (the →Idle strip GC +
+/// `close_stream` + `rebuild_streams`) must NOT touch `last_activity_at` — it is
+/// the supervisor's silence clock (`quiet_since_ms`), and a spurious bump on the
+/// →Idle transition would push the judge's deadline forward every idle tick and
+/// starve `should_fire` forever ("supervisor never fires" regression guard). The
+/// GC runs INSIDE `mutate_state(Idle)`, which must leave the clock alone; only
+/// the separate turn-completion path (a distinct statement) legitimately bumps it.
+#[gpui::test]
+async fn idle_transition_gc_does_not_bump_last_activity_at(cx: &mut TestAppContext) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    // A stranded inline-Task teammate (non-terminal, so the per-tool-call removal
+    // never fires) — exactly the input the →Idle GC closes.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.upsert_tool_call(
+                make_task_tool_call(
+                    "toolu_gc_clock",
+                    "Task",
+                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    Some("Worker"),
+                    None,
+                ),
+                cx,
+            )
+            .expect("upsert task");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // Pin the silence clock to a fixed instant in the past so any bump is visible.
+    let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_000_000)
+        .expect("valid timestamp");
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from("toolu_gc_clock"));
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+                s.entries = vec![SessionEntry {
+                    created_ms: 1_700_000_000_000,
+                    mod_seq: 1,
+                    subagent_id: Some(SharedString::from("toolu_gc_clock")),
+                    kind: SessionEntryKind::AssistantMessage {
+                        chunks: vec![AssistantChunk::Message("sub work".into())],
+                    },
+                }];
+                s.rebuild_streams();
+                s.last_activity_at = t0;
+            });
+            assert!(
+                session.read(cx).streams.contains_key(&teammate),
+                "teammate stream must exist before the GC"
+            );
+        });
+    });
+
+    // →Idle: the GC (close_stream over stranded teammates + rebuild_streams) runs
+    // inside this call.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.mutate_state(session_id, |state| *state = SessionState::Idle, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        assert!(
+            !s.streams.contains_key(&teammate),
+            "→Idle GC must have closed the stranded teammate stream"
+        );
+        assert_eq!(
+            s.last_activity_at, t0,
+            "→Idle GC / close_stream / rebuild_streams must NOT bump last_activity_at \
+             (it is the supervisor's silence clock — a bump here starves should_fire)"
+        );
+    });
+}
+
 /// Phase 5, Task 5.1: a discriminant-changing transition through `mutate_state`
 /// (Idle → Running) emits `SessionStateChanged` and must move `state_seq` to the
 /// freshly-allocated `change_seq`.
