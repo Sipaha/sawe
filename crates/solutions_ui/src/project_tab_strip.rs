@@ -277,7 +277,11 @@ impl Render for ProjectTabStrip {
                 .child(
                     div()
                         .h_full()
-                        .w(px(30.))
+                        // Square cell whose width is DERIVED from the strip
+                        // height (aspect 1:1), so the `+` stays centred in a
+                        // square if the row height ever changes — no hardcoded
+                        // side length coupled to a magic 30px.
+                        .aspect_square()
                         .flex()
                         .items_center()
                         .justify_center()
