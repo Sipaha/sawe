@@ -23,6 +23,33 @@ pub(crate) struct MemberLayoutState {
     apply_task: Option<Task<()>>,
 }
 
+struct ItemReconcilePlan {
+    /// Currently-open file paths not wanted by the target member.
+    to_close: Vec<PathBuf>,
+    /// Target paths not currently open, in target order.
+    to_open: Vec<PathBuf>,
+}
+
+/// Diff the currently-open file paths against the target member's open paths.
+/// Overlapping paths appear in neither list (left untouched — no close/reopen
+/// churn). If the two sets are identical, both lists are empty (zero churn).
+fn plan_item_reconcile(current: &[PathBuf], target: &[PathBuf]) -> ItemReconcilePlan {
+    let target_set: std::collections::HashSet<&PathBuf> = target.iter().collect();
+    let current_set: std::collections::HashSet<&PathBuf> = current.iter().collect();
+    ItemReconcilePlan {
+        to_close: current
+            .iter()
+            .filter(|p| !target_set.contains(*p))
+            .cloned()
+            .collect(),
+        to_open: target
+            .iter()
+            .filter(|p| !current_set.contains(*p))
+            .cloned()
+            .collect(),
+    }
+}
+
 /// Snapshot the outgoing active member's layout and apply the incoming
 /// member's, if it has one. `catalog == None` means the solution lost its
 /// last member: clear tracking without applying. First visit to a member
@@ -97,28 +124,68 @@ pub(crate) fn apply_active_member_change(
     // re-activating the final file so the tree reveals exactly once, at the end.
     workspace.set_active_entry_reveal_suppressed(true);
 
-    // Center pane: close all editor items, reopen the snapshot paths, activate
-    // the previously-active one. Async (open/close are Tasks); stored in
+    // Center pane: reconcile the currently-open editor items against the
+    // target member's snapshot. Overlapping files are left untouched (no
+    // close/reopen churn); only non-target files are closed and only the
+    // missing target files are opened. Async (open/close are Tasks); stored in
     // `apply_task` so a rapid re-switch cancels this one.
+    // Scope `current` to the ACTIVE pane — the same scope the close/open
+    // enactment below operates on. `open_item_abs_paths` is workspace-wide (all
+    // panes), which mis-plans under a split: a target file open only in a
+    // non-active pane would count as "already open" and never get opened into
+    // the active pane, and a stale file living only in a non-active pane would
+    // never match `close_ids` (leaking across switches). Deriving the paths via
+    // the SAME `project_path` → `absolute_path` chain as `close_ids` also keeps
+    // the two path representations identical. Target (`layout.open_paths`) stays
+    // workspace-wide, so `to_open` collapses the full snapshot into the active
+    // pane exactly as the old close-all/reopen-all did.
+    let current_paths: Vec<PathBuf> = {
+        let project = workspace.project().clone();
+        workspace
+            .active_pane()
+            .read(cx)
+            .items()
+            .filter_map(|item| {
+                item.project_path(cx)
+                    .and_then(|pp| project.read(cx).absolute_path(&pp, cx))
+            })
+            .collect()
+    };
+    let plan = plan_item_reconcile(&current_paths, &layout.open_paths);
     let task = cx.spawn_in(window, async move |workspace, cx| {
-        // Close the outgoing tabs as ONE batch: `close_items` removes every
-        // matching item in a single task. Awaiting each close in turn (the old
-        // `close_item_by_id` loop) spread the removals across frames, so tabs
-        // visibly vanished one by one; a single batched close collapses that to
-        // one repaint.
+        // Close ONLY the outgoing tabs the target doesn't want, as ONE batch:
+        // compute their item ids first, then `close_items` removes every
+        // matching item in a single task (one repaint). Items with no abs path
+        // (ProjectDiff, settings, welcome) are never matched, so they persist
+        // across the swap instead of being torn down and rebuilt.
         let close = workspace.update_in(cx, |ws, window, cx| {
+            let project = ws.project().clone();
             let pane = ws.active_pane().clone();
+            let to_close: std::collections::HashSet<PathBuf> =
+                plan.to_close.iter().cloned().collect();
+            let close_ids: std::collections::HashSet<gpui::EntityId> = pane
+                .read(cx)
+                .items()
+                .filter_map(|item| {
+                    let abs = item
+                        .project_path(cx)
+                        .and_then(|pp| project.read(cx).absolute_path(&pp, cx));
+                    abs.filter(|p| to_close.contains(p)).map(|_| item.item_id())
+                })
+                .collect();
             pane.update(cx, |pane, cx| {
-                pane.close_items(window, cx, SaveIntent::Skip, &|_| true)
+                pane.close_items(window, cx, SaveIntent::Skip, &move |id| {
+                    close_ids.contains(&id)
+                })
             })
         });
         if let Ok(close) = close {
             let _ = close.await;
         }
 
-        // Reopen the snapshot's tabs IN ORDER (order matters, so sequential).
-        // Reveal is suppressed, so these do not scroll the tree.
-        for path in &layout.open_paths {
+        // Open ONLY the missing target tabs IN ORDER (order matters, so
+        // sequential). Reveal is suppressed, so these do not scroll the tree.
+        for path in &plan.to_open {
             if let Ok(open) = workspace.update_in(cx, |ws, window, cx| {
                 let mut options = OpenOptions::default();
                 options.visible = Some(OpenVisible::None);
@@ -236,6 +303,49 @@ mod tests {
         })
     }
 
+    fn pb(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn plan_item_reconcile_identical_sets_is_zero_churn() {
+        let current = [pb("/a"), pb("/b"), pb("/c")];
+        let target = [pb("/a"), pb("/b"), pb("/c")];
+        let plan = plan_item_reconcile(&current, &target);
+        assert!(plan.to_close.is_empty(), "{:?}", plan.to_close);
+        assert!(plan.to_open.is_empty(), "{:?}", plan.to_open);
+    }
+
+    #[test]
+    fn plan_item_reconcile_drop_one_add_one() {
+        // current = {a, b}, target = {a, c}: b dropped, c added, a untouched.
+        let current = [pb("/a"), pb("/b")];
+        let target = [pb("/a"), pb("/c")];
+        let plan = plan_item_reconcile(&current, &target);
+        assert_eq!(plan.to_close, vec![pb("/b")]);
+        assert_eq!(plan.to_open, vec![pb("/c")]);
+    }
+
+    #[test]
+    fn plan_item_reconcile_disjoint_sets() {
+        let current = [pb("/a"), pb("/b")];
+        let target = [pb("/c"), pb("/d")];
+        let plan = plan_item_reconcile(&current, &target);
+        assert_eq!(plan.to_close, vec![pb("/a"), pb("/b")]);
+        assert_eq!(plan.to_open, vec![pb("/c"), pb("/d")]);
+    }
+
+    #[test]
+    fn plan_item_reconcile_to_open_preserves_target_order() {
+        // None of the target files are currently open: to_open must mirror
+        // target order exactly.
+        let current: [PathBuf; 0] = [];
+        let target = [pb("/z"), pb("/a"), pb("/m")];
+        let plan = plan_item_reconcile(&current, &target);
+        assert_eq!(plan.to_open, vec![pb("/z"), pb("/a"), pb("/m")]);
+        assert!(plan.to_close.is_empty());
+    }
+
     #[gpui::test]
     async fn member_switch_swaps_open_files(cx: &mut TestAppContext) {
         init_test(cx);
@@ -278,6 +388,140 @@ mod tests {
         let paths = open_paths(&workspace, cx);
         assert_eq!(paths.len(), 1, "B restores exactly its own tab: {paths:?}");
         assert!(paths[0].ends_with("b.txt"), "B restores b.txt: {paths:?}");
+    }
+
+    fn pane_abs_paths(
+        pane: &gpui::Entity<workspace::pane::Pane>,
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<String> {
+        workspace.update(cx, |ws, cx| {
+            let project = ws.project().clone();
+            pane.read(cx)
+                .items()
+                .filter_map(|item| {
+                    item.project_path(cx)
+                        .and_then(|pp| project.read(cx).absolute_path(&pp, cx))
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+                .collect()
+        })
+    }
+
+    /// Regression guard for the multi-pane scope of the reconcile plan.
+    /// `plan_item_reconcile`'s `current` and the close/open enactment must both
+    /// be scoped to the ACTIVE pane. If `current` were workspace-wide (all
+    /// panes), a target file open only in a NON-active pane would count as
+    /// "already open" and never get opened into the active pane, blanking it.
+    ///
+    /// Design note: the missing target file (x.txt) must NOT be the snapshot's
+    /// *active* path — otherwise the final `active_path` re-open (which always
+    /// targets the active pane) would open it regardless, masking the scope
+    /// bug. Here the active file is z.txt (already in the active pane) and the
+    /// file that must be *opened via `to_open`* is x.txt (present only in the
+    /// non-active pane), so the assertion truly exercises the plan's scope.
+    #[gpui::test]
+    async fn member_switch_reconciles_active_pane_under_split(cx: &mut TestAppContext) {
+        use workspace::SplitDirection;
+
+        fn sorted(mut v: Vec<String>) -> Vec<String> {
+            v.sort();
+            v
+        }
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/sol"),
+            json!({ "x.txt": "", "y.txt": "", "z.txt": "" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/sol").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let state = Rc::new(RefCell::new(MemberLayoutState::default()));
+
+        // Member A, first visit: open x.txt then z.txt in the single pane, so
+        // z.txt is the active item.
+        switch(&state, &workspace, cx, "sol", Some("A"));
+        open(&workspace, cx, path!("/sol/x.txt")).await;
+        open(&workspace, cx, path!("/sol/z.txt")).await;
+        let first_pane = workspace.update(cx, |ws, _| ws.active_pane().clone());
+
+        // Switch to B: snapshots A workspace-wide = {x.txt, z.txt}, active=z.txt.
+        switch(&state, &workspace, cx, "sol", Some("B"));
+
+        // Build B's split layout:
+        //   non-active pane  = {x.txt}
+        //   active pane      = {y.txt, z.txt}, active item z.txt
+        // so x.txt (a target file) lives ONLY in the non-active pane, and y.txt
+        // (a non-target file) sits in the active pane.
+        let second_pane = workspace.update_in(cx, |ws, window, cx| {
+            let active = ws.active_pane().clone();
+            ws.split_pane(active, SplitDirection::Right, window, cx)
+        });
+        cx.run_until_parked();
+        // Remove z.txt from the (now non-active) first pane, leaving it {x.txt}.
+        let z_in_first = first_pane.read_with(cx, |pane, cx| {
+            pane.items().find_map(|item| {
+                let abs = item
+                    .project_path(cx)
+                    .and_then(|pp| project.read(cx).absolute_path(&pp, cx))?;
+                abs.to_string_lossy().ends_with("z.txt").then(|| item.item_id())
+            })
+        });
+        if let Some(id) = z_in_first {
+            let t = workspace.update_in(cx, |_ws, window, cx| {
+                first_pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(id, workspace::SaveIntent::Skip, window, cx)
+                })
+            });
+            let _ = t.await;
+        }
+        open(&workspace, cx, path!("/sol/y.txt")).await;
+        open(&workspace, cx, path!("/sol/z.txt")).await;
+
+        // Sanity on the constructed split.
+        assert!(
+            workspace.update(cx, |ws, _| ws.active_pane().entity_id() == second_pane.entity_id()),
+            "the split's new pane must be active"
+        );
+        assert_eq!(
+            pane_abs_paths(&first_pane, &workspace, cx),
+            vec![path!("/sol/x.txt").to_string()],
+            "non-active pane holds only x.txt before the switch"
+        );
+        assert_eq!(
+            sorted(pane_abs_paths(&second_pane, &workspace, cx)),
+            sorted(vec![path!("/sol/y.txt").to_string(), path!("/sol/z.txt").to_string()]),
+            "active pane holds y.txt + z.txt before the switch"
+        );
+
+        // Back to A (target snapshot = {x.txt, z.txt}, active=z.txt). The
+        // scope-correct plan, using ACTIVE-pane current = {y.txt, z.txt}, must
+        // OPEN x.txt into the active pane (it lives only in the non-active pane)
+        // and CLOSE y.txt there. A workspace-wide `current` would see x.txt as
+        // "already open" and never open it — leaving the active pane without it.
+        switch(&state, &workspace, cx, "sol", Some("A"));
+
+        let active_paths = sorted(pane_abs_paths(
+            &workspace.update(cx, |ws, _| ws.active_pane().clone()),
+            &workspace,
+            cx,
+        ));
+        assert_eq!(
+            active_paths,
+            sorted(vec![path!("/sol/x.txt").to_string(), path!("/sol/z.txt").to_string()]),
+            "active pane must reconcile to {{x.txt, z.txt}}: x.txt opened despite \
+             living only in a non-active pane, y.txt closed: {active_paths:?}"
+        );
+
+        // The non-active first pane is left as it was: still x.txt, untouched.
+        assert_eq!(
+            pane_abs_paths(&first_pane, &workspace, cx),
+            vec![path!("/sol/x.txt").to_string()],
+            "the non-active pane must be left untouched by the swap"
+        );
     }
 
     /// The swap suppresses the project-panel reveal while it closes/reopens
