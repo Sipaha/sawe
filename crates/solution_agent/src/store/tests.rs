@@ -7919,6 +7919,94 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
     });
 }
 
+/// Snapshot-less async agent leak: an async `Agent` teammate whose JSONL never
+/// produced a parseable snapshot (`latest == None`) has no mtime to age from.
+/// Without the `registered_at` fallback its `Teammate` pill lingers forever
+/// (the →Idle GC excludes async parents). A stale registration (>120s) must be
+/// reconciled closed; a fresh one (<120s, still might snapshot) must survive.
+#[gpui::test]
+async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(
+    cx: &mut TestAppContext,
+) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let stale_toolu = "toolu_async_nosnap_stale";
+    let fresh_toolu = "toolu_async_nosnap_fresh";
+    let stale = crate::stream::StreamId::Teammate(SharedString::from(stale_toolu));
+    let fresh = crate::stream::StreamId::Teammate(SharedString::from(fresh_toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            s.set_entries(
+                vec![
+                    reconcile_tagged_body(stale_toolu),
+                    reconcile_tagged_body(fresh_toolu),
+                ],
+                cx,
+            );
+            let register = |s: &mut crate::model::SolutionSession,
+                            bg: &str,
+                            parent: &str,
+                            registered_at: chrono::DateTime<chrono::Utc>| {
+                let bg_id = crate::background_agent::BackgroundAgentId::new(bg.to_string());
+                s.background_agents.insert(
+                    bg_id.clone(),
+                    crate::background_agent::BackgroundAgent {
+                        id: bg_id.clone(),
+                        jsonl_path: "/nonexistent".into(),
+                        registered_at,
+                        // No parseable JSONL snapshot yet.
+                        latest: None,
+                        last_offset: 0,
+                        parent_tool_use_id: Some(SharedString::from(parent.to_string())),
+                    },
+                );
+                s.background_agent_order.push(bg_id);
+            };
+            // Registered > MANAGED_AGENT_STALE_TIMEOUT_SECS (120s) ago.
+            register(
+                s,
+                "bg_nosnap_stale",
+                stale_toolu,
+                chrono::Utc::now() - chrono::Duration::seconds(200),
+            );
+            // Registered just now — still might snapshot.
+            register(s, "bg_nosnap_fresh", fresh_toolu, chrono::Utc::now());
+            assert!(s.streams.contains_key(&stale));
+            assert!(s.streams.contains_key(&fresh));
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reconcile_finished_teammate_streams(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                !s.streams.contains_key(&stale),
+                "a snapshot-less async agent stale beyond MANAGED_AGENT_STALE_TIMEOUT_SECS \
+                 must age out via registered_at"
+            );
+            assert!(
+                s.streams.contains_key(&fresh),
+                "a snapshot-less async agent freshly registered must survive — the fallback \
+                 must not reap live-but-not-yet-snapshotted agents"
+            );
+        });
+    });
+}
+
 /// Rule 1: a teammate stream whose parent tool-call entry has vanished from the
 /// thread (and which is not a registered async agent) is orphaned → closed.
 #[gpui::test]

@@ -7581,14 +7581,25 @@ impl SolutionAgentStore {
                             let Some(ba) = s.background_agents.get(id) else {
                                 return false;
                             };
-                            let Some(snap) = ba.latest.as_ref() else {
-                                return false;
+                            // Age from the snapshot's mtime when one exists, else
+                            // from `registered_at` — mirroring the shell reaper.
+                            // A snapshot-less async agent (JSONL never parsed)
+                            // must still age out or its map entry (and stream)
+                            // would leak forever.
+                            let age = match ba.latest.as_ref() {
+                                Some(snap) => {
+                                    if snap.stop_reason.is_some() {
+                                        return true;
+                                    }
+                                    now.duration_since(snap.mtime).unwrap_or_default()
+                                }
+                                None => {
+                                    let registered: std::time::SystemTime =
+                                        ba.registered_at.into();
+                                    now.duration_since(registered).unwrap_or_default()
+                                }
                             };
-                            if snap.stop_reason.is_some() {
-                                return true;
-                            }
-                            let elapsed = now.duration_since(snap.mtime).unwrap_or_default();
-                            elapsed > expiry
+                            age > expiry
                         })
                         .cloned()
                         .collect();
@@ -7736,7 +7747,17 @@ impl SolutionAgentStore {
                     let stale_mtime = ba.latest.as_ref().is_some_and(|snap| {
                         now.duration_since(snap.mtime).unwrap_or_default() > stale
                     });
-                    if terminal_stop || stale_mtime {
+                    // An async agent whose JSONL never produced a parseable
+                    // snapshot (`latest == None`) has no mtime to age from, so
+                    // neither branch above ever fires and its `Teammate` pill
+                    // would linger forever (the →Idle GC excludes async parents).
+                    // Mirror the shell reaper's fallback: age from
+                    // `registered_at` and close once older than `stale`.
+                    let stale_no_snapshot = ba.latest.is_none() && {
+                        let registered: std::time::SystemTime = ba.registered_at.into();
+                        now.duration_since(registered).unwrap_or_default() > stale
+                    };
+                    if terminal_stop || stale_mtime || stale_no_snapshot {
                         let reason = ba
                             .latest
                             .as_ref()
