@@ -432,8 +432,16 @@ pub(crate) fn render_entry(
             let (icon, color, tag) = match level {
                 SystemEntryLevel::Info => (IconName::Info, Color::Muted, "System"),
                 SystemEntryLevel::Error => (IconName::Warning, Color::Error, "System"),
-                SystemEntryLevel::Observer => (IconName::Eye, Color::Accent, "Observer"),
+                // Agent-INVISIBLE observer note (the agent never sees this) — a
+                // crossed-eye icon + "только вам" tag + a dashed border mark it
+                // as private to the operator, visually distinct from the
+                // agent-VISIBLE observer nudge (plain eye, solid border,
+                // "агенту") rendered in `render_user_message` below.
+                SystemEntryLevel::Observer => {
+                    (IconName::EyeOff, Color::Accent, "Наблюдатель · только вам")
+                }
             };
+            let is_observer_note = matches!(level, SystemEntryLevel::Observer);
             // Editor-injected note (watchdog / supervisor / system) — NOT part
             // of the agent's context; the agent never sees these. Render it as a
             // readable message bubble with a system "plaque" badge (icon + tag)
@@ -455,6 +463,9 @@ pub(crate) fn render_entry(
                 .bg(bubble_bg)
                 .border_l_2()
                 .border_color(color.color(cx))
+                // Dashed left border = "not part of the agent's conversation
+                // stream" — reinforces that an observer note is operator-only.
+                .when(is_observer_note, |this| this.border_dashed())
                 .child(
                     // The "plaque": icon + tag, mirroring the system-note badge.
                     h_flex()
@@ -725,7 +736,11 @@ pub(crate) fn render_user_message(
                     .items_center()
                     .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(color))
                     .child(
-                        Label::new("Наблюдатель")
+                        // Agent-VISIBLE observer nudge (delivered into the thread
+                        // AS a message the agent acts on) — plain eye + solid
+                        // border (above) + "агенту", distinct from the
+                        // agent-invisible operator-only note (EyeOff, dashed).
+                        Label::new("Наблюдатель · агенту")
                             .size(LabelSize::XSmall)
                             .color(color),
                     ),

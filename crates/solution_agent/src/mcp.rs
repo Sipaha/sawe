@@ -4882,8 +4882,10 @@ impl McpServerTool for GetSupervisorStateTool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SeedColdSessionEntry {
-    /// `"user"`, `"assistant"` (default), or `"observer"`/`"system"` (an
-    /// agent-invisible Observer `System` bubble — FORK.md #29).
+    /// `"user"`, `"assistant"` (default), `"observer"`/`"system"` (an
+    /// agent-invisible Observer `System` bubble — FORK.md #29), or `"nudge"` (an
+    /// agent-VISIBLE observer nudge — a UserMessage carrying the observer-nudge
+    /// `_meta` marker; renders the "Наблюдатель · агенту" plaque).
     pub role: String,
     /// `toolu_…` teammate id, or omitted/empty for a Main entry.
     pub subagent_id: Option<String>,
@@ -4966,6 +4968,21 @@ impl McpServerTool for SeedColdSessionTool {
                     crate::session_entry::SessionEntryKind::System {
                         level: crate::session_entry::SystemEntryLevel::Observer,
                         text_md: text,
+                    }
+                } else if e.role.eq_ignore_ascii_case("nudge") {
+                    // Agent-VISIBLE observer nudge: a UserMessage whose chunk
+                    // carries the `spk_observer_nudge` `_meta` marker so
+                    // `render_user_message` paints the "Наблюдатель · агенту"
+                    // plaque (not a plain user bubble) — distinct from the
+                    // agent-invisible `observer` note above. Lets the screenshot
+                    // gate show both observer bubbles at once.
+                    crate::session_entry::SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: text.clone(),
+                        chunks: vec![acp::ContentBlock::Text(
+                            acp::TextContent::new(text)
+                                .meta(Some(acp_thread::meta_with_observer_nudge())),
+                        )],
                     }
                 } else if e.role.eq_ignore_ascii_case("user") {
                     crate::session_entry::SessionEntryKind::UserMessage {
