@@ -571,6 +571,16 @@ pub struct SolutionSession {
     /// so it remains readable at close time, when the in-flight judge/auditor
     /// maps have already dropped their handles.
     pub is_supervisor_ephemeral: bool,
+    /// True for internal one-shot AI-helper sessions (commit-message
+    /// generation, AI conflict/cherry-pick/rebase/explain — see
+    /// `message_generator::run_ephemeral_task`). Unlike
+    /// `is_supervisor_ephemeral` these are genuinely top-level, but they are
+    /// equally invisible to the wire: create/close/state-changed notifications
+    /// are suppressed so a connected mobile client never sees the create+close
+    /// churn of a brief helper it was never told about. The flag lives on the
+    /// entity (not a side map) so it stays readable at close time, mirroring
+    /// `is_supervisor_ephemeral`.
+    pub is_ephemeral: bool,
 }
 
 impl SolutionSession {
@@ -640,6 +650,7 @@ impl SolutionSession {
             state_seq: 0,
             supervisor_question: None,
             is_supervisor_ephemeral: false,
+            is_ephemeral: false,
         }
     }
 
@@ -1133,6 +1144,7 @@ mod tests {
             state_seq: 0,
             supervisor_question: None,
             is_supervisor_ephemeral: false,
+            is_ephemeral: false,
         }
     }
 

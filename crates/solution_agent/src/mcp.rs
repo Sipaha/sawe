@@ -2445,6 +2445,7 @@ impl McpServerTool for CreateSessionTool {
                     None,
                     None,
                     false,
+                    false,
                     cx,
                 )
             })
@@ -6115,6 +6116,7 @@ mod tests {
                     Some(parent_id),
                     None,
                     None,
+                    false,
                     false,
                     cx,
                 )

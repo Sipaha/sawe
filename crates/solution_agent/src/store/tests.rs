@@ -8651,6 +8651,7 @@ async fn create_child_session_is_not_pinned(cx: &mut TestAppContext) {
                     None,
                     None,
                     false,
+                    false,
                     cx,
                 )
             })
@@ -12057,4 +12058,164 @@ async fn rehit_error_keeps_pending_usage_limit_resume_gate(cx: &mut TestAppConte
             );
         });
     });
+}
+
+/// Regression (ghost console tabs): internal one-shot AI helpers
+/// (`message_generator::run_ephemeral_task`) go through
+/// `create_ephemeral_session`, which must NOT pin the session into the tab
+/// strip and must emit NO `SessionCreated` / `TabsChanged { opened }` — its
+/// lifetime is so brief that the console panel's async tab-add could lose the
+/// race to the synchronous tab-remove and strand an orphaned tab. A normal
+/// `create_session` DOES pin and DOES emit; this test asserts the contrast.
+#[gpui::test]
+async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(
+    cx: &mut TestAppContext,
+) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::new(connect_count.clone())),
+            );
+        });
+    });
+
+    let created = Rc::new(std::cell::RefCell::new(
+        Vec::<crate::model::SolutionSessionId>::new(),
+    ));
+    let opened = Rc::new(std::cell::RefCell::new(
+        Vec::<crate::model::SolutionSessionId>::new(),
+    ));
+    let closed = Rc::new(std::cell::RefCell::new(
+        Vec::<crate::model::SolutionSessionId>::new(),
+    ));
+    let _subscription = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let created = created.clone();
+        let opened = opened.clone();
+        let closed = closed.clone();
+        cx.subscribe(&store, move |_store, event, _cx| match event {
+            SolutionAgentStoreEvent::SessionCreated { id, .. } => {
+                created.borrow_mut().push(*id);
+            }
+            SolutionAgentStoreEvent::TabsChanged {
+                opened: opened_ids, ..
+            } => {
+                opened.borrow_mut().extend(opened_ids.iter().copied());
+            }
+            SolutionAgentStoreEvent::SessionClosed(id) => {
+                closed.borrow_mut().push(*id);
+            }
+            _ => {}
+        })
+    });
+
+    // Normal top-level session: pinned + SessionCreated + TabsChanged{opened}.
+    let normal_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session");
+    cx.executor().run_until_parked();
+
+    // Ephemeral one-shot session: NOT pinned, no SessionCreated.
+    let ephemeral_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_ephemeral_session(
+                    solution_id.clone(),
+                    agent_id.clone(),
+                    project.clone(),
+                    cx,
+                )
+            })
+        })
+        .await
+        .expect("create_ephemeral_session");
+    cx.executor().run_until_parked();
+
+    let (normal_tab_order, ephemeral_tab_order) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let store = store.read(cx);
+        let normal = store
+            .session(normal_id)
+            .expect("normal session exists")
+            .read(cx)
+            .tab_order;
+        let ephemeral = store
+            .session(ephemeral_id)
+            .expect("ephemeral session exists")
+            .read(cx)
+            .tab_order;
+        (normal, ephemeral)
+    });
+    assert!(
+        normal_tab_order.is_some(),
+        "a normal top-level session must be pinned into the tab strip",
+    );
+    assert_eq!(
+        ephemeral_tab_order, None,
+        "an ephemeral one-shot session must never be pinned",
+    );
+
+    let created = created.borrow().clone();
+    let opened = opened.borrow().clone();
+    assert_eq!(
+        created,
+        vec![normal_id],
+        "only the normal session may emit SessionCreated",
+    );
+    assert!(
+        !created.contains(&ephemeral_id),
+        "ephemeral session must emit no SessionCreated",
+    );
+    assert!(
+        opened.contains(&normal_id),
+        "normal session must appear in TabsChanged{{opened}}",
+    );
+    assert!(
+        !opened.contains(&ephemeral_id),
+        "ephemeral session must not appear in TabsChanged{{opened}}",
+    );
+
+    // Close side: closing a normal session emits `SessionClosed` (which
+    // `finalize_session_teardown` also mirrors to `workspace.session_deleted`
+    // via the same `was_ephemeral` gate); closing an ephemeral one-shot must
+    // emit NOTHING, so a wire client never sees a close for a session it was
+    // never told was created. Asserting the store `SessionClosed` event is the
+    // testable proxy for the wire suppression — both share the `was_ephemeral`
+    // gate, and the `WorkspaceEventCoordinator` isn't installed in this test.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.close_session(normal_id, cx).expect("close normal");
+            store
+                .close_session(ephemeral_id, cx)
+                .expect("close ephemeral");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let closed = closed.borrow().clone();
+    assert_eq!(
+        closed,
+        vec![normal_id],
+        "only the normal session may emit SessionClosed; the ephemeral one is suppressed",
+    );
+    assert!(
+        !closed.contains(&ephemeral_id),
+        "ephemeral session must emit no SessionClosed",
+    );
 }

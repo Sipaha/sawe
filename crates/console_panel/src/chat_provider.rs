@@ -129,6 +129,16 @@ impl ChatProvider {
         })
     }
 
+    /// Returns true when `session_id` still lives in the backing store.
+    /// Used by `ConsolePanel` to guard against pushing a tab for a session
+    /// that was created then closed (e.g. a fast internal one-shot helper)
+    /// while the panel awaited the async view build — the synchronous
+    /// close/remove would have already no-op'd (no tab yet), so without this
+    /// re-check the resolved add would strand an orphaned ghost tab.
+    pub fn session_exists(&self, session_id: SolutionSessionId, cx: &App) -> bool {
+        self.store.read(cx).session(session_id).is_some()
+    }
+
     /// Look up an existing session by id and build a view for it (no new
     /// session is created). Used by `ConsolePanel::load` when restoring a
     /// saved tab.

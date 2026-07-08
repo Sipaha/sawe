@@ -1746,6 +1746,18 @@ impl ConsolePanel {
                         // tab while we awaited the view. Drop ours.
                         return;
                     }
+                    // Race: the session was created then closed (e.g. a fast
+                    // internal one-shot helper) while we awaited the view
+                    // build. Its synchronous close/remove already ran and
+                    // found no tab — pushing one now would strand a ghost
+                    // tab that nothing removes. Drop ours instead.
+                    let still_exists = this
+                        .chat_provider
+                        .read(cx)
+                        .session_exists(id, cx);
+                    if !still_exists {
+                        return;
+                    }
                     this.tabs.push(ConsoleTab::Chat {
                         view,
                         session_id: id,

@@ -1280,6 +1280,10 @@ impl SolutionAgentStore {
             None,
             None,
             true,
+            // Not needed: the `parent_session_id = Some(id)` above already
+            // skips the strip pin, and `ephemeral_supervisor = true` already
+            // suppresses the `SessionCreated` emit.
+            false,
             cx,
         );
         let task = cx.spawn(async move |this, cx| {
@@ -2686,6 +2690,31 @@ impl SolutionAgentStore {
         self.create_session_with_cwd(solution_id, agent_id, project, None, None, None, cx)
     }
 
+    /// Create a hidden one-shot session for an internal AI helper (commit-message
+    /// generation, AI conflict-resolve, etc.). Unlike `create_session` it is NOT
+    /// pinned into the tab strip and emits no `SessionCreated`, so its brief
+    /// lifetime never surfaces a (possibly orphaned) console tab.
+    pub fn create_ephemeral_session(
+        &mut self,
+        solution_id: SolutionId,
+        agent_id: AgentServerId,
+        project: Entity<project::Project>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SolutionSessionId>> {
+        self.create_session_with_parent(
+            solution_id,
+            agent_id,
+            project,
+            None,  // cwd
+            None,  // parent_session_id
+            None,  // model
+            None,  // effort
+            false, // ephemeral_supervisor
+            true,  // ephemeral
+            cx,
+        )
+    }
+
     /// Same as `create_session`, but lets the caller pin the session's
     /// working directory to a specific path inside the solution (e.g.
     /// a member project root) instead of defaulting to `solution.root`.
@@ -2711,6 +2740,7 @@ impl SolutionAgentStore {
             None,
             model,
             effort,
+            false,
             false,
             cx,
         )
@@ -2738,6 +2768,16 @@ impl SolutionAgentStore {
         // caller can't set it after this task resolves because the emit has
         // already fired by then.
         ephemeral_supervisor: bool,
+        // True for internal one-shot AI helpers (commit-message generation,
+        // AI conflict/cherry-pick/rebase/explain — see
+        // `message_generator::run_ephemeral_task`). Unlike a supervisor
+        // ephemeral these are genuinely top-level (`parent_session_id = None`),
+        // so without this flag they would be pinned into the tab strip and
+        // emit `SessionCreated`. Their lifetime is so brief that the async
+        // console-panel tab-ADD can lose the race to the synchronous tab-REMOVE
+        // on close, orphaning a ghost tab. Setting this suppresses BOTH the
+        // strip pin and the `SessionCreated` emit so no tab is ever surfaced.
+        ephemeral: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<SolutionSessionId>> {
         let pair = (solution_id.clone(), agent_id.clone());
@@ -2850,6 +2890,7 @@ impl SolutionAgentStore {
                     s.cwd = session_cwd.clone();
                     s.parent_session_id = parent_session_id;
                     s.is_supervisor_ephemeral = ephemeral_supervisor;
+                    s.is_ephemeral = ephemeral;
                     // Persist the model the session was created on so it shows
                     // as selected in the status row and survives a cold reload.
                     s.desired_model = model.clone();
@@ -2880,7 +2921,7 @@ impl SolutionAgentStore {
                 // client would otherwise see a create+close pair every idle
                 // wake-up). They're never user-visible, so suppressing the
                 // store event at the source is the single cleanest chokepoint.
-                if !ephemeral_supervisor {
+                if !ephemeral_supervisor && !ephemeral {
                     cx.emit(SolutionAgentStoreEvent::SessionCreated {
                         id: session_id,
                         parent_session_id,
@@ -2902,7 +2943,7 @@ impl SolutionAgentStore {
             // open again. Sub-agents (parent_session_id set) live in the
             // subagent strip rather than as top-level tabs, so they are
             // intentionally NOT pinned.
-            if parent_session_id.is_none() {
+            if parent_session_id.is_none() && !ephemeral {
                 this.update(cx, |store, cx| {
                     store.open_session_in_strip(session_id, cx);
                     // Re-persist the metadata row now that `open_session_in_strip`
@@ -5101,7 +5142,7 @@ impl SolutionAgentStore {
         // entity below). Hidden supervisor judge/auditor sessions suppress all
         // close notifications, mirroring the create-side suppression so a
         // connected mobile client never sees their per-wake-up churn.
-        let was_ephemeral = session_read.is_supervisor_ephemeral;
+        let was_ephemeral = session_read.is_supervisor_ephemeral || session_read.is_ephemeral;
         let agent_id = session_read.agent_id.clone();
         // Capture the live connection + ACP session id BEFORE the entity drops,
         // so callers can tear down THIS session's `claude` subprocess and
@@ -8831,7 +8872,7 @@ impl SolutionAgentStore {
         // session's own state changes still emit (only the EPHEMERAL session's
         // do not), and the internal `SessionStateChanged` event is untouched —
         // `message_generator` relies on it to detect the judge going Idle.
-        if entity.read(cx).is_supervisor_ephemeral {
+        if entity.read(cx).is_supervisor_ephemeral || entity.read(cx).is_ephemeral {
             return;
         }
         let summary = entity.read_with(cx, |s, cx| crate::mcp::session_summary(s, cx));
