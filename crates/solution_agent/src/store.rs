@@ -1522,6 +1522,58 @@ impl SolutionAgentStore {
         }
     }
 
+    /// Re-arm supervision when a PARKED session resumes **on its own** — the
+    /// agent produced genuinely-new activity (a self-scheduled monitor /
+    /// `ScheduleWakeup` fired and continued the work, or a background task the
+    /// editor doesn't track came back) while the supervisor was parked. Two park
+    /// states rest on the premise "nothing moves until the human acts" and are
+    /// falsified by a self-resume, so they return to `Watching`:
+    /// * `WaitingUser` — an `ask` escalation ("Waiting for you").
+    /// * `Held` **when `held_by_done`** — a `done` verdict parked it ("On hold").
+    ///
+    /// A `Held` set by a MANUAL user Stop (`held_by_done == false`) is
+    /// deliberately EXCLUDED: only a human message may resume that (the "don't
+    /// drag it back before I decide" rule). This is the whole reason `held_by_done`
+    /// exists — `done` and manual-stop share the `Held` status but must not share
+    /// self-resume behaviour. No-op in any other state (already `Watching`,
+    /// `Disabled`, `Quota`/`ProviderError`), so it's safe to call on every agent
+    /// entry — the first self-resume entry re-arms and the rest early-return.
+    ///
+    /// Distinct from [`reset_supervisor_continue_counter`] (the HUMAN-message
+    /// re-arm, which resumes ALL of `Held`/`WaitingUser`/`Done`): a self-resume is
+    /// narrower — it must not resume a manual stop.
+    pub(crate) fn rearm_supervisor_on_self_activity(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::supervisor::SupervisorStatus;
+        {
+            let Some(state) = self.supervisor_states.get_mut(&id) else {
+                return;
+            };
+            let waiting = matches!(state.status, SupervisorStatus::WaitingUser);
+            let done_hold =
+                matches!(state.status, SupervisorStatus::Held) && state.held_by_done;
+            if !waiting && !done_hold {
+                return;
+            }
+            state.consecutive_continues = 0;
+            state.next_eligible_ms = None;
+            state.held_by_done = false;
+            // Both park states keep `enabled == true`; if the user disabled
+            // supervision the status would be `Disabled`, filtered out above. So
+            // the session is always eligible to return to active watching.
+            if state.enabled {
+                state.status = SupervisorStatus::Watching;
+            }
+        }
+        self.backoff_timers.remove(&id);
+        self.persist_supervisor_state(id, cx);
+        self.clear_supervisor_question(id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+    }
+
     /// Park the supervisor in `Held` because the HUMAN manually stopped the
     /// agent (Stop button / `cancel_turn`). Supervision stays enabled but must
     /// not re-engage on the current dialog state — no judge, no nudge — until the
@@ -1548,6 +1600,10 @@ impl SolutionAgentStore {
         self.finish_judge(id, cx);
         if let Some(state) = self.supervisor_states.get_mut(&id) {
             state.status = SupervisorStatus::Held;
+            // A MANUAL stop — NOT done-sourced. Only a human message may resume
+            // it; a self-resume must NOT re-arm it (the "don't drag it back"
+            // rule). Set explicitly so a stale `held_by_done` can't leak in.
+            state.held_by_done = false;
             state.next_eligible_ms = None;
         }
         self.backoff_timers.remove(&id);
@@ -1966,6 +2022,9 @@ impl SolutionAgentStore {
                 // behave identically.
                 if let Some(state) = self.supervisor_states.get_mut(&id) {
                     state.status = SupervisorStatus::Held;
+                    // Mark this Held as done-sourced (NOT a manual stop) so a
+                    // self-resume re-arms it — see `rearm_supervisor_on_self_activity`.
+                    state.held_by_done = true;
                     state.next_eligible_ms = None;
                 }
                 self.backoff_timers.remove(&id);
@@ -8093,6 +8152,11 @@ impl SolutionAgentStore {
                     if let Some(s) = self.sessions.get(&session_id).cloned() {
                         s.update(cx, |s, _| s.last_activity_at = Utc::now());
                     }
+                    // Genuinely-new agent activity (NOT a system note) on a
+                    // session parked in `WaitingUser`/`Stopped(Done)` means it
+                    // resumed on its own — re-arm supervision so the status stops
+                    // hanging at "waiting for user" while the agent works again.
+                    self.rearm_supervisor_on_self_activity(session_id, cx);
                 }
                 // First user message appends a NewEntry — refresh DB so the
                 // History popover preview stops being NULL.

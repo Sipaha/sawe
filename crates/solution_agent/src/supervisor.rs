@@ -242,6 +242,18 @@ pub struct SupervisorState {
     /// the user answered for themselves, so the stale observer nudge is
     /// forgotten. Reset to `None` on restart (a cold session has nothing held).
     pub pending_nudge: Option<String>,
+    /// TRANSIENT (not persisted): distinguishes the TWO sources of a `Held`
+    /// status. `Held` is shared by a manual user Stop (`hold_supervisor`, this is
+    /// `false`) and a `done` verdict (`apply_verdict`'s `Done` arm parks in
+    /// `Held` too, this is `true`). Only read while `status == Held`. It exists
+    /// because self-resume must re-arm a `done`-parked session (the agent
+    /// continued on its own → the "done" premise is false) but must NOT re-arm a
+    /// manually-stopped one (the user's "don't drag it back until I message"
+    /// rule) — see `rearm_supervisor_on_self_activity`. Both `Held`-entry sites
+    /// set it explicitly, so a stale value when not `Held` is never read. `false`
+    /// on restart (a cold-loaded `Held` row is treated as a manual stop — the
+    /// conservative default that won't auto-resume supervision).
+    pub held_by_done: bool,
     /// TRANSIENT (not persisted): a one-shot `wait` verdict's wake deadline
     /// (epoch-ms). The judge decides ONCE — "the agent is waiting on X, park
     /// until here" — and the mechanism honors that single timeout in FULL: while
@@ -283,6 +295,7 @@ impl SupervisorState {
             trigger_count: 0,
             last_user_input_ms: None,
             judge_superseded: false,
+            held_by_done: false,
             pending_nudge: None,
             wait_until_ms: None,
             watch_started_ms: None,

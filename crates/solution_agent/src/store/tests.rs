@@ -10538,6 +10538,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         trigger_count: 0,
         last_user_input_ms: None,
         judge_superseded: false,
+        held_by_done: false,
         pending_nudge: None,
         wait_until_ms: None,
         watch_started_ms: None,
@@ -11489,6 +11490,66 @@ async fn fifteen_continues_force_ask(cx: &mut gpui::TestAppContext) {
         .unwrap();
     assert_eq!(st.consecutive_continues, 0);
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
+}
+
+/// A session parked by the supervisor that resumes ON ITS OWN (the agent's
+/// self-scheduled monitor fires fresh activity, not a human message) must
+/// re-arm to `Watching` so the status stops hanging. This covers the two
+/// supervisor-parked states — `WaitingUser` (after `ask`) and `Held` with
+/// `held_by_done` (after `done`) — but a `Held` from a MANUAL user stop
+/// (`held_by_done == false`) must NOT re-arm on self-activity.
+#[gpui::test]
+async fn self_resume_rearms_parked_supervisor(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::SupervisorStatus;
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
+
+    // WaitingUser (ask escalation) → self-resume re-arms to Watching.
+    store.update(cx, |store, cx| {
+        store.supervisor_states.get_mut(&id).unwrap().status = SupervisorStatus::WaitingUser;
+        store.rearm_supervisor_on_self_activity(id, cx);
+    });
+    assert_eq!(
+        store
+            .read_with(cx, |store, _| store.supervisor_state(id))
+            .unwrap()
+            .status,
+        SupervisorStatus::Watching,
+    );
+
+    // Held from a `done` verdict (held_by_done) → self-resume re-arms to Watching
+    // and clears the flag.
+    store.update(cx, |store, cx| {
+        {
+            let st = store.supervisor_states.get_mut(&id).unwrap();
+            st.status = SupervisorStatus::Held;
+            st.held_by_done = true;
+        }
+        store.rearm_supervisor_on_self_activity(id, cx);
+    });
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert_eq!(st.status, SupervisorStatus::Watching);
+    assert!(!st.held_by_done);
+
+    // Held from a MANUAL user stop (held_by_done == false) → self-resume must NOT
+    // re-arm; the session stays On hold until the user sends a message.
+    store.update(cx, |store, cx| {
+        {
+            let st = store.supervisor_states.get_mut(&id).unwrap();
+            st.status = SupervisorStatus::Held;
+            st.held_by_done = false;
+        }
+        store.rearm_supervisor_on_self_activity(id, cx);
+    });
+    assert_eq!(
+        store
+            .read_with(cx, |store, _| store.supervisor_state(id))
+            .unwrap()
+            .status,
+        SupervisorStatus::Held,
+    );
 }
 
 /// Send-time session-state re-check: a judge fires only while the session is
