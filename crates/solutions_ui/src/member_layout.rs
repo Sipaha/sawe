@@ -184,14 +184,18 @@ pub(crate) fn apply_active_member_change(
         }
 
         // Open ONLY the missing target tabs, as ONE batch. `open_paths` opens
-        // the whole set in a single coordinated task, so the new tabs no longer
-        // pop in one-at-a-time the way a per-path awaited loop did (each await
-        // forced a repaint between opens). Reveal is suppressed, so these do not
-        // scroll the tree.
+        // the whole set in a single coordinated task and emits the project-panel
+        // reveal exactly ONCE (for its "winner" path), instead of the old
+        // per-path loop that fired a reveal per file — so the tree no longer
+        // jumps/highlights one file at a time. `focus: false` keeps the restore
+        // from stealing keyboard focus per file; the final active tab is focused
+        // once below. Reveal is also suppressed for the whole batch, so the tree
+        // does not scroll here.
         if !plan.to_open.is_empty() {
             let open = workspace.update_in(cx, |ws, window, cx| {
                 let mut options = OpenOptions::default();
                 options.visible = Some(OpenVisible::None);
+                options.focus = Some(false);
                 ws.open_paths(plan.to_open.clone(), options, None, window, cx)
             });
             if let Ok(open) = open {
