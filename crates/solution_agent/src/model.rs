@@ -401,10 +401,11 @@ pub struct SolutionSession {
     /// tagged rows. Suppressed from the mirror while the session is cold, but —
     /// unlike a permanent `closed_streams` Done-close — REOPENED if a live resume
     /// streams new activity (an entry at index >= `hydration_watermark`) for that
-    /// toolu. A DB-restored async `Agent` carries no `parent_tool_use_id`, so its
-    /// stream can't be closed by the sub-task-C completion path; this overlay is
-    /// what keeps such a finished teammate collapsed until (and unless) it proves
-    /// live. Ephemeral, not persisted.
+    /// toolu. Async `Agent` subagents do not survive an editor restart, so their
+    /// persisted `background_agents` rows are dropped on cold-load and never
+    /// re-registered (see `SolutionAgentStore::reconcile_background_agents_for`);
+    /// with no watcher re-armed, no new tagged rows arrive, so this overlay keeps
+    /// each such finished teammate collapsed permanently. Ephemeral, not persisted.
     pub hydration_orphan_streams: std::collections::HashSet<crate::stream::StreamId>,
     /// `entries.len()` captured when `hydrate_streams_main_only` ran — the boundary
     /// between the restored cold prefix and any post-restart (resume-streamed)

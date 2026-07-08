@@ -8437,11 +8437,13 @@ async fn reconciliation_drops_done_rows(cx: &mut TestAppContext) {
     });
 }
 
-/// Task 13: an alive row (file present, no terminal stop_reason on the
-/// tail) is re-registered with a snapshot — the render-side classifier
-/// then decides Running vs Dead based on mtime.
+/// Cold-load decision: even an "alive-looking" row (file present, no terminal
+/// stop_reason on the tail) is DROPPED, not re-registered — async `Agent`
+/// subagents do not survive an editor restart, so the persisted row is stale
+/// regardless of what its frozen JSONL tail shows. (Was `registers_alive_row`
+/// before the drop-on-cold-load decision.)
 #[gpui::test]
-async fn reconciliation_registers_alive_row(cx: &mut TestAppContext) {
+async fn reconciliation_drops_alive_row_too(cx: &mut TestAppContext) {
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("alive.jsonl");
@@ -8473,14 +8475,83 @@ async fn reconciliation_registers_alive_row(cx: &mut TestAppContext) {
         let s = SolutionAgentStore::global(cx);
         let session = s.read(cx).session(session_id).unwrap();
         let s = session.read(cx);
-        assert_eq!(s.background_agents.len(), 1);
         assert!(
-            s.background_agents
-                .values()
-                .next()
-                .unwrap()
-                .latest
-                .is_some()
+            s.background_agents.is_empty(),
+            "an alive-looking row must still be dropped on cold-load (agents don't survive restart)"
+        );
+    });
+}
+
+/// Cold-load decision: async `Agent` subagents do NOT survive an editor
+/// restart, so their persisted `background_agents` rows are stale and must be
+/// dropped — not restored — on cold-load. This seeds a row that under the OLD
+/// behavior WOULD have been re-registered (file present, no terminal
+/// `stop_reason` on the tail — i.e. the `reconciliation_registers_alive_row`
+/// case) and asserts that after `reconcile_background_agents_for` NOTHING is
+/// registered. Restoring it is what resurrected finished teammate pills after a
+/// restart; with no re-registration there is no watcher, so the teammate's
+/// stream stays a collapsed hydration orphan (no pill).
+///
+/// This test FAILS against the old restore behavior (which left
+/// `background_agents` non-empty) and passes with the drop-all change.
+#[gpui::test]
+async fn cold_load_drops_all_background_agents(cx: &mut TestAppContext) {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("alive.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    // Non-terminal tail line: no `stop_reason` → previously re-registered.
+    writeln!(
+        f,
+        r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"still working"}}]}}}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let rows = vec![
+        crate::db::BackgroundAgentRow {
+            solution_session_id: session_id.to_string(),
+            agent_id: "alive0000000000001".into(),
+            jsonl_path: path.to_string_lossy().into_owned(),
+            registered_at_ms: 0,
+            last_seen_label: None,
+            last_mtime_ms: None,
+            stop_reason: None,
+        },
+        crate::db::BackgroundAgentRow {
+            solution_session_id: session_id.to_string(),
+            agent_id: "alive0000000000002".into(),
+            jsonl_path: path.to_string_lossy().into_owned(),
+            registered_at_ms: 0,
+            last_seen_label: None,
+            last_mtime_ms: None,
+            stop_reason: None,
+        },
+    ];
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| {
+            s.reconcile_background_agents_for(session_id, rows, cx)
+        });
+    });
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        let s = session.read(cx);
+        assert!(
+            s.background_agents.is_empty(),
+            "cold-load must register NO background agents (they don't survive a restart)"
+        );
+        assert!(
+            s.background_agent_order.is_empty(),
+            "no agent order entries either"
+        );
+        assert!(
+            !s.streams
+                .keys()
+                .any(|id| matches!(id, crate::stream::StreamId::Teammate(_))),
+            "no teammate stream pill should be present after cold-load reconcile"
         );
     });
 }

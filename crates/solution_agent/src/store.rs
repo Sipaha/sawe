@@ -8008,90 +8008,39 @@ impl SolutionAgentStore {
         }
     }
 
-    /// Restore persisted background_agents for a freshly-hydrated session.
-    /// Per row, stats the JSONL file:
-    ///   * file missing → drop the SQLite row (best-effort).
-    ///   * file present, latest line carries `stop_reason` → drop the row
-    ///     (the agent finished while we were closed).
-    ///   * else → register with the live snapshot. The render-side
-    ///     classifier decides Dead vs Running based on mtime and
-    ///     `agent.managed_agent_stale_timeout_secs`, so we don't need to flag dead
-    ///     here.
-    /// Always called inside the foreground hydrate path with the DB rows
-    /// already loaded (caller pre-fetches off the foreground thread).
+    /// Purge stale persisted `background_agents` rows on cold-load — this is
+    /// NOT a restore pass.
+    ///
+    /// Async `Agent` subagents do not survive an editor restart: the `claude`
+    /// session restarts and the subagents are gone (they stop writing their
+    /// JSONL). So every persisted `BackgroundAgentRow` is stale by the time we
+    /// cold-hydrate. Re-registering them (the old behavior) is exactly what made
+    /// finished/dead teammate pills reappear in the console after a restart, and
+    /// they were never reaped. We therefore register NONE and drop ALL rows.
+    ///
+    /// Their teammate streams stay collapsed: the cold-load path
+    /// (`hydrate_streams_main_only`) already folds every tagged teammate stream
+    /// into `hydration_orphan_streams` (rendered Main-only, no pill). With
+    /// nothing re-registered here, there is no JSONL watcher, so no new tagged
+    /// entries ever arrive and the orphan is never reopened — it stays collapsed.
+    ///
+    /// Always called inside the foreground hydrate path with the DB rows already
+    /// loaded (caller pre-fetches off the foreground thread).
     pub(crate) fn reconcile_background_agents_for(
         &mut self,
-        session_id: SolutionSessionId,
+        _session_id: SolutionSessionId,
         rows: Vec<crate::db::BackgroundAgentRow>,
         cx: &mut Context<Self>,
     ) {
         if rows.is_empty() {
             return;
         }
-        let Some(session) = self.session(session_id) else {
-            return;
-        };
-
-        let mut to_drop_from_db: Vec<(String, String)> = Vec::new();
-        let mut to_register: Vec<(
-            crate::background_agent::BackgroundAgentId,
-            std::path::PathBuf,
-            Option<crate::background_agent::BackgroundAgentSnapshot>,
-            u64,
-        )> = Vec::new();
-
-        for row in rows {
-            let path = std::path::PathBuf::from(&row.jsonl_path);
-            let agent_id = crate::background_agent::BackgroundAgentId::new(row.agent_id.clone());
-            if !path.exists() {
-                to_drop_from_db.push((row.solution_session_id.clone(), row.agent_id));
-                continue;
-            }
-            let (snap, last_offset) = match crate::background_agent::tail_jsonl(&path, 0) {
-                Ok(t) => {
-                    let mtime = t.mtime;
-                    let s = t.last_line.map(|line| {
-                        let mut s = crate::background_agent::parse_jsonl_snapshot(&line);
-                        s.mtime = mtime;
-                        s
-                    });
-                    (s, t.new_offset)
-                }
-                Err(_) => (None, 0),
-            };
-            if let Some(ref s) = snap
-                && s.stop_reason.is_some()
-            {
-                to_drop_from_db.push((row.solution_session_id.clone(), row.agent_id));
-                continue;
-            }
-            to_register.push((agent_id, path, snap, last_offset));
-        }
-
-        if !to_register.is_empty() {
-            session.update(cx, |s, _| {
-                for (agent_id, path, snap, last_offset) in &to_register {
-                    s.background_agents.insert(
-                        agent_id.clone(),
-                        crate::background_agent::BackgroundAgent {
-                            id: agent_id.clone(),
-                            jsonl_path: path.clone(),
-                            registered_at: chrono::Utc::now(),
-                            latest: snap.clone(),
-                            last_offset: *last_offset,
-                            // DB cold-restore does not persist the parent toolu;
-                            // the teammate's tagged rows are hydration orphans
-                            // (already collapsed to Main-only), so no stream to close.
-                            parent_tool_use_id: None,
-                        },
-                    );
-                    s.background_agent_order.push(agent_id.clone());
-                }
-            });
-            cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
-                session_id,
-            ));
-        }
+        // Treat every persisted row as dead (see doc comment): the subagents did
+        // not survive the restart, so we drop all rows and register none.
+        let to_drop_from_db: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| (row.solution_session_id, row.agent_id))
+            .collect();
 
         if !to_drop_from_db.is_empty()
             && let Some(db) = self.persistence.clone()
@@ -8102,16 +8051,6 @@ impl SolutionAgentStore {
                 }
             })
             .detach();
-        }
-
-        if !session.read(cx).background_agents.is_empty()
-            && let Some(fs) = session
-                .read(cx)
-                .project
-                .as_ref()
-                .map(|p| p.read(cx).fs().clone())
-        {
-            self.ensure_background_agent_watcher(session_id, fs, cx);
         }
     }
 
