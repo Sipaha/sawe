@@ -2291,6 +2291,16 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// Is the currently-active drag (if any) carrying a payload of type `T`?
+    /// Lets a drop target distinguish "a drag it cares about is in flight" from
+    /// any unrelated drag (e.g. a panel resize), so it only reveals its drop
+    /// affordances for the former.
+    pub fn active_drag_is<T: Any>(&self) -> bool {
+        self.active_drag
+            .as_ref()
+            .is_some_and(|drag| drag.value.downcast_ref::<T>().is_some())
+    }
+
     /// Gets the cursor style of the currently active drag operation.
     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)

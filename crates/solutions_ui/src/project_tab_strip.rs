@@ -223,9 +223,11 @@ impl Render for ProjectTabStrip {
         // Only meaningful with at least two members. `flex_1` lets it absorb
         // any slack to the right of the last tab as a generous catch area;
         // `min_w` keeps it hittable even when the tabs already fill the strip.
-        // Only present while a tab drag is in flight — otherwise this empty
-        // catch area just reads as dead space to the right of the tabs.
-        let end_drop = (members.len() > 1 && cx.has_active_drag()).then(|| {
+        // Only present while a PROJECT-TAB drag is in flight — gating on
+        // `has_active_drag()` (any drag) made this empty catch area appear on
+        // unrelated drags too (e.g. resizing a panel), reading as dead space.
+        let is_tab_drag = cx.active_drag_is::<DraggedProjectTab>();
+        let end_drop = (members.len() > 1 && is_tab_drag).then(|| {
             let solution_id = solution_id.clone();
             let order = order.clone();
             div()
@@ -258,15 +260,30 @@ impl Render for ProjectTabStrip {
             .when_some(overflow_popover, |this, popover| {
                 this.child(div().px_1().child(popover))
             })
-            // Delimiter separating the tab zone from the trailing `+`.
-            .child(
-                div()
-                    .w(px(1.))
-                    .h(px(16.))
-                    .mx_1()
-                    .bg(cx.theme().colors().border_variant),
-            )
-            .child(div().px_1().child(plus_popover))
+            // Trailing `+`, hidden while a project tab of THIS strip is being
+            // dragged (the drop affordances own the trailing space then, and a
+            // stray `+` under the drag ghost reads as clutter). A subtle
+            // divider separates it from the tabs; the `+` sits in a square cell
+            // (side == strip height) snug after the tabs, so its centre is
+            // equidistant from the strip's top/bottom and from the last tab.
+            .when(!is_tab_drag, |this| {
+                this.child(
+                    div()
+                        .w(px(1.))
+                        .h(px(16.))
+                        .mr(px(2.))
+                        .bg(cx.theme().colors().border_variant),
+                )
+                .child(
+                    div()
+                        .h_full()
+                        .w(px(30.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(plus_popover),
+                )
+            })
             .into_any_element()
     }
 }

@@ -197,9 +197,11 @@ impl Render for SolutionTabStrip {
         // reliable, discoverable target. The end slot is the last tab's
         // index (`tab_count - 1`), matching what the last tab's own drop uses.
         let tab_count = tabs.len();
-        // Only present while a tab drag is in flight — otherwise this empty
-        // catch area just reads as dead space to the right of the tabs.
-        let end_drop = (tab_count > 1 && cx.has_active_drag()).then(|| {
+        // Only present while a SOLUTION-TAB drag is in flight — gating on
+        // `has_active_drag()` (any drag) made this empty catch area appear on
+        // unrelated drags too (e.g. resizing a panel), reading as dead space.
+        let is_tab_drag = cx.active_drag_is::<DraggedSolutionTab>();
+        let end_drop = (tab_count > 1 && is_tab_drag).then(|| {
             let multi_workspace = weak_multi_workspace.clone();
             let target = tab_count - 1;
             div()
@@ -238,15 +240,29 @@ impl Render for SolutionTabStrip {
                 },
             ))
             .when_some(end_drop, |this, zone| this.child(zone))
-            // Delimiter separating the tab zone from the trailing `+`.
-            .child(
-                div()
-                    .w(px(1.))
-                    .h(px(16.))
-                    .mx_1()
-                    .bg(cx.theme().colors().border_variant),
-            )
-            .child(div().px_1().child(plus_popover))
+            // Trailing `+`, hidden while a solution tab of THIS strip is being
+            // dragged (the drop affordances own the trailing space then). A
+            // subtle divider separates it from the tabs; the `+` sits in a
+            // square cell (side == strip height) snug after the tabs, so its
+            // centre is equidistant from the strip's top/bottom and the last tab.
+            .when(!is_tab_drag, |this| {
+                this.child(
+                    div()
+                        .w(px(1.))
+                        .h(px(16.))
+                        .mr(px(2.))
+                        .bg(cx.theme().colors().border_variant),
+                )
+                .child(
+                    div()
+                        .h_full()
+                        .w(px(30.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(plus_popover),
+                )
+            })
             .into_any_element()
     }
 }
