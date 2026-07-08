@@ -183,14 +183,18 @@ pub(crate) fn apply_active_member_change(
             let _ = close.await;
         }
 
-        // Open ONLY the missing target tabs IN ORDER (order matters, so
-        // sequential). Reveal is suppressed, so these do not scroll the tree.
-        for path in &plan.to_open {
-            if let Ok(open) = workspace.update_in(cx, |ws, window, cx| {
+        // Open ONLY the missing target tabs, as ONE batch. `open_paths` opens
+        // the whole set in a single coordinated task, so the new tabs no longer
+        // pop in one-at-a-time the way a per-path awaited loop did (each await
+        // forced a repaint between opens). Reveal is suppressed, so these do not
+        // scroll the tree.
+        if !plan.to_open.is_empty() {
+            let open = workspace.update_in(cx, |ws, window, cx| {
                 let mut options = OpenOptions::default();
                 options.visible = Some(OpenVisible::None);
-                ws.open_abs_path(path.clone(), options, window, cx)
-            }) {
+                ws.open_paths(plan.to_open.clone(), options, None, window, cx)
+            });
+            if let Ok(open) = open {
                 let _ = open.await;
             }
         }
