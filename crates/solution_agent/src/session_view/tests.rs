@@ -381,4 +381,30 @@ async fn render_sizes_list_state_to_selected_stream_not_flat_entries(
             );
         })
         .unwrap();
+
+    // Regression: a selected teammate stream that no longer exists (reaped while
+    // selected, with no Main pill to click back to when it's the only stream)
+    // must self-heal to Main on the next render instead of painting
+    // "(no messages yet)" over the live Main transcript.
+    view_window
+        .update(vcx, |view, _window, cx| {
+            view.selected_stream = StreamId::Teammate("toolu_ghost".into());
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    view_window
+        .update(vcx, |view, _window, _cx| {
+            assert_eq!(
+                view.selected_stream,
+                StreamId::Main,
+                "a dangling selected stream must snap back to Main"
+            );
+            assert_eq!(
+                view.list_state.item_count(),
+                2,
+                "after self-heal the list shows the Main stream (2), not an empty transcript"
+            );
+        })
+        .unwrap();
 }

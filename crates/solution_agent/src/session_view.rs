@@ -2212,6 +2212,22 @@ impl SolutionSessionView {
     /// selected stream. Called at the top of `Render::render` so the rest of
     /// the render path can index a single, already-filtered vec.
     fn build_main_stream_entries_for_render(&mut self, cx: &App) {
+        // Self-heal a dangling selection: a selected `Teammate`/`Shell` stream
+        // can be reaped (a finished subagent auto-removed, a stale async agent
+        // aged out) in a path that doesn't land the `SessionSubagentsChanged`
+        // snap on this view. Without this guard the render would size to the
+        // now-absent stream and paint "(no messages yet)" OVER a live Main
+        // transcript (the "my whole session went blank" bug). `Main` is never
+        // removed, so falling back to it every frame is always safe and makes
+        // the empty-over-live state impossible regardless of event delivery.
+        if !self
+            .session
+            .read(cx)
+            .streams
+            .contains_key(&self.selected_stream)
+        {
+            self.selected_stream = crate::stream::StreamId::Main;
+        }
         self.main_stream_entries_for_render = self.selected_parent_stream_entries(cx);
     }
 
