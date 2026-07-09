@@ -960,6 +960,17 @@ pub struct EntrySummary {
     /// `apply_user_anchored_filter`). Always `false` for non-user entries.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub observer_nudge: bool,
+    /// True for a `role == "user"` entry that is actually an EDITOR
+    /// reconnect-recovery prompt ("your process hung, the editor restarted it,
+    /// continue"), injected by the stuck-session watchdog and carrying the
+    /// `spk_editor_recovery` `_meta` marker (see
+    /// `acp_thread::is_editor_recovery_blocks`). Kept SEPARATE from
+    /// `observer_nudge` so clients don't mislabel an editor watchdog message as
+    /// the AI supervisor's voice. The Supervisor judge's user-anchored filter
+    /// excludes it too (it must not distill "your process hung" into
+    /// `user_intent.md`). Always `false` for non-user entries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub editor_recovery: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1148,6 +1159,7 @@ fn apply_user_anchored_filter(kept: &mut Vec<EntrySummary>, lead: usize, since_m
     let anchors = |e: &EntrySummary| {
         e.role == EntryRoleDto::User
             && !e.observer_nudge
+            && !e.editor_recovery
             && since_ms.is_none_or(|s| e.created_ms.is_none_or(|c| c > s))
     };
     let has_user = kept.iter().any(anchors);
@@ -1959,6 +1971,13 @@ fn summarize_entry(
     // past nudges.
     let observer_nudge = matches!(kind, SessionEntryKind::UserMessage { chunks, .. }
         if acp_thread::is_observer_nudge_blocks(chunks));
+    // An editor reconnect-recovery prompt ("your process hung, continue") is a
+    // SEPARATE non-human user-role entry — kept distinct from `observer_nudge` so
+    // clients don't mislabel an editor watchdog message as the AI supervisor's
+    // voice. The judge's user-anchored filter excludes BOTH (neither is a user
+    // goal — it must not distill "your process hung" into `user_intent.md`).
+    let editor_recovery = matches!(kind, SessionEntryKind::UserMessage { chunks, .. }
+        if acp_thread::is_editor_recovery_blocks(chunks));
 
     EntrySummary {
         role,
@@ -1974,6 +1993,7 @@ fn summarize_entry(
         created_ms,
         subagent_id,
         observer_nudge,
+        editor_recovery,
     }
 }
 
@@ -4484,8 +4504,11 @@ impl McpServerTool for SupervisorVerdictTool {
             crate::supervisor::VerdictAction::Ask | crate::supervisor::VerdictAction::AskAgent
         ) {
             anyhow::ensure!(
-                input.question.is_some(),
-                "invalid_params: actions \"ask\"/\"ask_agent\" require a question"
+                input
+                    .question
+                    .as_deref()
+                    .is_some_and(|q| !q.trim().is_empty()),
+                "invalid_params: actions \"ask\"/\"ask_agent\" require a non-empty question"
             );
         }
         let session_id = SolutionSessionId::parse(&input.session_id)
@@ -8217,6 +8240,7 @@ mod tests {
             created_ms: None,
             subagent_id: None,
             observer_nudge: false,
+            editor_recovery: false,
         }
     }
 
@@ -8225,6 +8249,13 @@ mod tests {
     fn nudge_entry(index: usize) -> EntrySummary {
         let mut e = anchored_entry(index, EntryRoleDto::User);
         e.observer_nudge = true;
+        e
+    }
+
+    /// A user-role entry that is actually an editor reconnect-recovery prompt.
+    fn recovery_entry(index: usize) -> EntrySummary {
+        let mut e = anchored_entry(index, EntryRoleDto::User);
+        e.editor_recovery = true;
         e
     }
 
@@ -8296,6 +8327,29 @@ mod tests {
         // 4 and 5 belong to the nudge's follow-up work — not attributed to the
         // human's message #1, and the nudge doesn't anchor them. Only the
         // resting turn (6) rescues the tail.
+        assert_eq!(indices, vec![0, 1, 2, 6]);
+    }
+
+    #[test]
+    fn user_anchored_filter_ignores_editor_recovery_as_anchor() {
+        use EntryRoleDto::*;
+        // An editor reconnect-recovery prompt is a user-role entry but NOT the
+        // human's voice — it must not anchor (the judge must not distill "your
+        // process hung" into a user goal). Same shape as the observer-nudge test.
+        let mut kept = vec![
+            anchored_entry(0, Assistant),
+            anchored_entry(1, User), // real anchor: lead keeps 0,1
+            anchored_entry(2, Assistant), // trail of #1
+            recovery_entry(3),       // editor recovery — NOT an anchor, stops #1 trail
+            anchored_entry(4, Assistant),
+            anchored_entry(5, ToolCall),
+            anchored_entry(6, Assistant), // resting turn
+        ];
+        apply_user_anchored_filter(&mut kept, 1, None);
+        let indices: Vec<usize> = kept.iter().map(|e| e.index).collect();
+        // 4,5 belong to the recovery's follow-up work — not attributed to the
+        // human's message #1, and recovery doesn't anchor them. Only the resting
+        // turn (6) rescues the tail.
         assert_eq!(indices, vec![0, 1, 2, 6]);
     }
 

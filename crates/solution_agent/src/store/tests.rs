@@ -12504,6 +12504,12 @@ fn tail_unanswered_user_detection() {
             acp::TextContent::new("nudge").meta(Some(acp_thread::meta_with_observer_nudge())),
         )])
     };
+    let recovery_user = || {
+        user(vec![acp::ContentBlock::Text(
+            acp::TextContent::new("your process hung, continue")
+                .meta(Some(acp_thread::meta_with_editor_recovery())),
+        )])
+    };
     let system = || SessionEntryKind::System {
         level: SystemEntryLevel::Info,
         text_md: "note".into(),
@@ -12526,6 +12532,11 @@ fn tail_unanswered_user_detection() {
     assert!(
         !tail(&[ent(nudge_user())]),
         "an observer nudge is the supervisor's voice, not the human's",
+    );
+    assert!(
+        !tail(&[ent(recovery_user())]),
+        "an editor reconnect-recovery prompt is not an unanswered human message \
+         (else a second consecutive hang points recovery at the editor's own prompt)",
     );
     assert!(
         !tail(&[ent(plain_user()), ent(nudge_user())]),

@@ -108,7 +108,12 @@ fn tail_is_unanswered_user_message(entries: &[crate::session_entry::SessionEntry
             matches!(
                 &e.kind,
                 SessionEntryKind::UserMessage { chunks, .. }
+                    // Exclude editor-injected non-human messages: an observer nudge
+                    // AND a prior reconnect-recovery prompt (else a SECOND
+                    // consecutive hang points the recovery at the editor's own
+                    // "your process hung" message).
                     if !acp_thread::is_observer_nudge_blocks(chunks)
+                        && !acp_thread::is_editor_recovery_blocks(chunks)
             )
         })
 }
@@ -5983,7 +5988,14 @@ impl SolutionAgentStore {
         self.send_message_blocks_targeted(
             session_id,
             vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new(prompt.to_string()),
+                // Stamp the editor-recovery `_meta` marker (invisible to the
+                // agent's text) so consumers that reason about "the user's goal"
+                // exclude it: the supervisor must not distill "your process hung"
+                // into `user_intent.md`, and `tail_is_unanswered_user_message`
+                // must not mistake THIS prompt for an unanswered human message on
+                // a second consecutive hang.
+                agent_client_protocol::schema::TextContent::new(prompt.to_string())
+                    .meta(Some(acp_thread::meta_with_editor_recovery())),
             )],
             crate::model::QueueTarget::Main,
             false,
