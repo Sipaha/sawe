@@ -1977,6 +1977,117 @@ async fn judge_spawn_skipped_when_solution_socket_unresolvable(cx: &mut TestAppC
     });
 }
 
+/// MEDIUM-hardening #5: the judge-stuck watchdog measures wall-clock from the
+/// fire, but a thorough judge (reading files, running read-only Bash) can run
+/// past `JUDGE_TIMEOUT_SECS` while still streaming. Once the wall-clock timeout
+/// is crossed, a judge whose OWN session is still active (recent
+/// `last_activity_at`) must be EXTENDED, not killed mid-verdict.
+#[gpui::test]
+async fn judge_past_timeout_but_streaming_is_not_killed(cx: &mut TestAppContext) {
+    let (supervised_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            store.set_supervision_enabled(supervised_id, true, cx);
+            let st = store.supervisor_states.get_mut(&supervised_id).unwrap();
+            st.status = crate::supervisor::SupervisorStatus::Judging;
+            st.last_fired_at =
+                Some(now_ms - (crate::supervisor::JUDGE_TIMEOUT_SECS as i64 + 60) * 1000);
+            let (solution_id, agent_id) = {
+                let s = store.session(supervised_id).unwrap();
+                let s = s.read(cx);
+                (s.solution_id.clone(), s.agent_id.clone())
+            };
+            // A judge session that streamed just now → still alive.
+            let judge_id = crate::model::SolutionSessionId::new();
+            let judge =
+                crate::store::tests::insert_cold_session(judge_id, solution_id, agent_id, None, None, store, cx);
+            judge.update(cx, |j, _| j.last_activity_at = chrono::Utc::now());
+            store.judge_sessions.insert(
+                supervised_id,
+                JudgeHandle {
+                    judge_id: Some(judge_id),
+                    started_ms: now_ms,
+                    _task: Task::ready(()),
+                },
+            );
+            store.tick_supervisor(cx);
+        });
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.supervisor_state(supervised_id).unwrap().status,
+                crate::supervisor::SupervisorStatus::Judging,
+                "a still-streaming judge past the wall-clock timeout must not be killed"
+            );
+            assert!(
+                store.judge_sessions.contains_key(&supervised_id),
+                "the judge handle is retained while it's alive"
+            );
+        });
+    });
+}
+
+/// Contrast to the liveness test: a judge past the wall-clock timeout whose own
+/// session has gone SILENT (no streaming) longer than `JUDGE_LIVENESS_SILENCE_SECS`
+/// is genuinely stuck → killed as a transient failure (backoff → Watching).
+#[gpui::test]
+async fn judge_past_timeout_and_silent_is_killed(cx: &mut TestAppContext) {
+    let (supervised_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            store.set_supervision_enabled(supervised_id, true, cx);
+            let st = store.supervisor_states.get_mut(&supervised_id).unwrap();
+            st.status = crate::supervisor::SupervisorStatus::Judging;
+            st.last_fired_at =
+                Some(now_ms - (crate::supervisor::JUDGE_TIMEOUT_SECS as i64 + 60) * 1000);
+            let (solution_id, agent_id) = {
+                let s = store.session(supervised_id).unwrap();
+                let s = s.read(cx);
+                (s.solution_id.clone(), s.agent_id.clone())
+            };
+            // A judge session silent well past the liveness window → dead.
+            let judge_id = crate::model::SolutionSessionId::new();
+            let judge =
+                crate::store::tests::insert_cold_session(judge_id, solution_id, agent_id, None, None, store, cx);
+            judge.update(cx, |j, _| {
+                j.last_activity_at = chrono::Utc::now()
+                    - chrono::Duration::seconds(
+                        crate::supervisor::JUDGE_LIVENESS_SILENCE_SECS as i64 + 30,
+                    );
+            });
+            store.judge_sessions.insert(
+                supervised_id,
+                JudgeHandle {
+                    judge_id: Some(judge_id),
+                    started_ms: now_ms,
+                    _task: Task::ready(()),
+                },
+            );
+            store.tick_supervisor(cx);
+        });
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_ne!(
+                store.supervisor_state(supervised_id).unwrap().status,
+                crate::supervisor::SupervisorStatus::Judging,
+                "a silent (dead) judge past the timeout must be un-wedged"
+            );
+            assert!(
+                !store.judge_sessions.contains_key(&supervised_id),
+                "the dead judge handle is reaped"
+            );
+        });
+    });
+}
+
 #[gpui::test]
 async fn tool_authorization_request_transitions_to_awaiting_input(cx: &mut TestAppContext) {
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;

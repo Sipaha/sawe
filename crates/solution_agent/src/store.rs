@@ -2831,14 +2831,39 @@ impl SolutionAgentStore {
                 let fired_at = last_fired_at.unwrap_or(0);
                 let stuck_ms = now_ms.saturating_sub(fired_at);
                 if stuck_ms >= (crate::supervisor::JUDGE_TIMEOUT_SECS as i64) * 1000 {
-                    if self.judge_sessions.contains_key(&id) {
-                        // A real judge was registered and then timed out / ended
-                        // without a verdict. If it stalled on the usage wall (its
-                        // own transcript shows it — the judge hits the same
-                        // account wall as the worker), route to QUOTA recovery
-                        // (schedule the reset-time resume) instead of a transient
-                        // failure that spirals to a false `Stopped(ProviderError)`
-                        // (finding #3). Otherwise it's a genuine timeout.
+                    // `Some(judge_id)` = a real judge handle is registered (the
+                    // inner `judge_id` may still be `None` if its session hasn't
+                    // been created yet); `None` = phantom (spawn early-returned).
+                    if let Some(judge_id) = self.judge_sessions.get(&id).map(|h| h.judge_id) {
+                        // LIVENESS (finding #5): the wall-clock timeout is crossed,
+                        // but don't kill a judge that is still demonstrably working.
+                        // Check the judge SESSION's own activity clock — a streaming
+                        // judge bumps it on every thinking/text/tool event — and
+                        // extend while it progresses, up to a hard cap that still
+                        // catches a runaway (infinite-thinking) judge.
+                        let judge_silent_ms = judge_id
+                            .and_then(|jid| self.session(jid))
+                            .map(|js| {
+                                now_ms.saturating_sub(
+                                    js.read(cx).last_activity_at.timestamp_millis(),
+                                )
+                            });
+                        let judge_alive = judge_silent_ms.is_some_and(|ms| {
+                            ms < (crate::supervisor::JUDGE_LIVENESS_SILENCE_SECS as i64) * 1000
+                        });
+                        let under_hard_cap =
+                            stuck_ms < (crate::supervisor::JUDGE_HARD_TIMEOUT_SECS as i64) * 1000;
+                        if judge_alive && under_hard_cap {
+                            // Still streaming — leave it be; re-check next tick.
+                            continue;
+                        }
+                        // A real judge that timed out / ended / went silent without
+                        // a verdict. If it stalled on the usage wall (its own
+                        // transcript shows it — the judge hits the same account wall
+                        // as the worker), route to QUOTA recovery (schedule the
+                        // reset-time resume) instead of a transient failure that
+                        // spirals to a false `Stopped(ProviderError)` (finding #3).
+                        // Otherwise it's a genuine timeout.
                         let message = self
                             .judge_wall_message(id, cx)
                             .unwrap_or_else(|| "judge timed out / ended without verdict".to_string());

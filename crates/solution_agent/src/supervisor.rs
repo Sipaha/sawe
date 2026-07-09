@@ -21,6 +21,20 @@ pub const BACKOFF_SCHEDULE_MINS: [u64; 8] = [1, 1, 2, 3, 5, 10, 30, 60];
 /// uniformly catches crash, error, AND silent-end with no fragile state plumbing.
 pub const JUDGE_TIMEOUT_SECS: u64 = 5 * 60;
 
+/// Liveness grace for the judge-stuck watchdog: `JUDGE_TIMEOUT_SECS` measures
+/// wall-clock from the fire, but a THOROUGH judge (reading files, running
+/// read-only Bash to inspect the work) can legitimately take longer than 5 min
+/// while still streaming. Killing it there charges a bogus transient failure and
+/// discards a nearly-complete verdict. So once the wall-clock timeout is crossed,
+/// only declare the judge dead if its OWN session has been silent (no streaming /
+/// tool activity) for this long — otherwise extend and re-check next tick.
+pub const JUDGE_LIVENESS_SILENCE_SECS: u64 = 90;
+
+/// Absolute cap on a single judge turn regardless of liveness — a judge that
+/// streams forever (a runaway thinking loop) is still killed here so it can't pin
+/// `Judging` indefinitely. Comfortably above any legitimate read-only review.
+pub const JUDGE_HARD_TIMEOUT_SECS: u64 = 20 * 60;
+
 /// Watchdog grace period for a meta-auditor that errored or ended WITHOUT
 /// calling `supervisor_audit_verdict`. Unlike the judge, an auditor spawns
 /// while the supervised session is `Watching` (not `Judging`), so the
