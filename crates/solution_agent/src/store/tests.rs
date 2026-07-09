@@ -8661,11 +8661,10 @@ async fn killed_shell_removed_on_tick(cx: &mut TestAppContext) {
     });
 }
 
-/// Task 10 — THE leak-prevention case: a still-`Running` shell whose
-/// `latest.mtime` is older than stale+linger (420s) is reaped on tick. In the
-/// current build a completed shell almost never flips to `Exited` (the
-/// `<task-notification>` signal is dormant), so without this staleness arm the
-/// finished shell would leak as a "Running" pill forever.
+/// Task 10 / #9 — the runaway backstop: a still-`Running` shell that never
+/// completes and never prints is reaped even with a LIVE parent once its
+/// `latest.mtime` crosses [`BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS`] (60min).
+/// Here the mtime is 10,000s (≈2.8h) old — well past the cap — so it ages out.
 #[gpui::test]
 async fn stale_running_shell_removed_on_tick(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
@@ -8690,15 +8689,15 @@ async fn stale_running_shell_removed_on_tick(cx: &mut TestAppContext) {
         let session = s.read(cx).session(session_id).unwrap();
         assert!(
             session.read(cx).background_shells.is_empty(),
-            "stale-Running shell (mtime beyond stale+linger) must be reaped \
-             on tick — else it leaks as a Running pill forever"
+            "stale-Running shell past the live-parent hard cap must be reaped \
+             on tick — else a runaway leaks as a Running pill forever"
         );
     });
 }
 
-/// Task 10: a Running shell with NO snapshot but a stale `registered_at`
-/// (zero output, long since launched) must still age out via the
-/// registered_at fallback.
+/// Task 10 / #9: a Running shell with NO snapshot but a `registered_at` past the
+/// live-parent hard cap (zero output, long since launched) still ages out via
+/// the registered_at fallback.
 #[gpui::test]
 async fn stale_running_shell_no_snapshot_removed_on_tick(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
@@ -8753,6 +8752,97 @@ async fn fresh_running_shell_survives_tick(cx: &mut TestAppContext) {
         assert!(
             session.read(cx).background_shells.contains_key(&shell_id),
             "fresh Running shell must survive a tick"
+        );
+    });
+}
+
+/// #9: a still-`Running` shell whose parent agent is ALIVE (live `acp_thread`),
+/// silent past the ordinary ~7min stale+linger but still under the live-parent
+/// hard cap, must NOT be reaped — output-silence is not death (a long silent
+/// build/`sleep`), and keeping it preserves the `has_live_background_work`
+/// supervisor-suppression. Previously it was dropped at ~7min, losing the
+/// suppression while the command was still running.
+#[gpui::test]
+async fn stale_running_shell_with_live_parent_survives_below_cap(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let shell_id = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
+    insert_test_background_shell(
+        cx,
+        session_id,
+        &shell_id,
+        crate::background_shell::ShellRuntimeState::Running,
+        Some(crate::background_shell::BackgroundShellSnapshot {
+            // 600s: past STALE+DEAD_LINGER (420s) but well under the 60min cap.
+            mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+            output_tail: SharedString::from("...quiet build"),
+        }),
+        chrono::Utc::now(),
+    );
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| s.tick_background_shells(cx));
+    });
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        assert!(
+            session.read(cx).background_shells.contains_key(&shell_id),
+            "a silent-but-Running shell with a live parent must survive past the \
+             ~7min stale mark (its completion still arrives via the JSONL scan), \
+             so the supervisor stays suppressed"
+        );
+    });
+}
+
+/// #9: the same silent-`Running` shell whose parent subprocess is GONE (a cold
+/// session with no `acp_thread` — reconnect / crash / close) IS reaped at the
+/// ordinary ~7min stale+linger: no completion notification can ever arrive for
+/// an orphan, so the leak guard still applies.
+#[gpui::test]
+fn stale_running_shell_reaped_when_parent_gone(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let session_id = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let id = SolutionSessionId::new();
+            insert_cold_session(
+                id,
+                SolutionId("sol-a".into()),
+                SharedString::from("claude-acp"),
+                None,
+                None,
+                store,
+                cx,
+            );
+            id
+        })
+    });
+    let shell_id = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
+    insert_test_background_shell(
+        cx,
+        session_id,
+        &shell_id,
+        crate::background_shell::ShellRuntimeState::Running,
+        Some(crate::background_shell::BackgroundShellSnapshot {
+            // 600s: past STALE+DEAD_LINGER (420s), under the 60min live-parent cap
+            // — but this parent has NO acp_thread, so the ordinary timeout applies.
+            mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+            output_tail: SharedString::from("...orphaned"),
+        }),
+        chrono::Utc::now(),
+    );
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| s.tick_background_shells(cx));
+    });
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        assert!(
+            session.read(cx).background_shells.is_empty(),
+            "a stale Running shell whose parent subprocess is gone (no acp_thread) \
+             is an orphan and must be reaped at the ordinary stale+linger timeout"
         );
     });
 }

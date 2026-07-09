@@ -41,6 +41,18 @@ pub(crate) use queue::{QUEUE_HINT_LINE, TS_PREFIX_CLOSE, TS_PREFIX_OPEN};
 // candidate for tear-down; dead-linger = grace period before reaping.
 const MANAGED_AGENT_STALE_TIMEOUT_SECS: u64 = 120;
 const MANAGED_AGENT_DEAD_LINGER_SECS: u64 = 300;
+/// Hard cap on how long a still-`Running` background shell whose PARENT agent
+/// subprocess is still alive may go silent before it's reaped anyway. While the
+/// parent is alive, a completing shell is flipped to `Exited` by the
+/// parent-JSONL `<task-notification>` scan, so a mere output-silence is NOT
+/// death (a long silent build / `sleep` / quiet `curl`) — the shell is kept,
+/// which preserves the `has_live_background_work` supervisor-suppression instead
+/// of reaping it at the ~7min `STALE + DEAD_LINGER` mark (hardening #9). This cap
+/// still ages out a runaway that never completes and never prints. A shell whose
+/// parent subprocess is GONE (reconnect / crash / close → no `acp_thread`, so no
+/// completion notification can ever arrive) is reaped on the ordinary
+/// `STALE + DEAD_LINGER` timeout instead — that orphan is the real leak case.
+const BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS: u64 = 60 * 60;
 /// How long a session may sit in `Running` with zero streaming activity AND no
 /// in-progress tool call before the stuck-session watchdog
 /// ([`SolutionAgentStore::tick_stuck_sessions`]) treats its subprocess as
@@ -8227,12 +8239,9 @@ impl SolutionAgentStore {
     /// (orange pill) is rendering-side using the same stale timeout —
     /// the tick just drops the entries that have fully expired.
     pub fn tick_background_agents(&mut self, cx: &mut Context<Self>) {
-        use ::agent_settings::AgentSettings;
-        let (stale_secs, linger_secs) = (
-            MANAGED_AGENT_STALE_TIMEOUT_SECS,
-            MANAGED_AGENT_DEAD_LINGER_SECS,
+        let expiry = std::time::Duration::from_secs(
+            MANAGED_AGENT_STALE_TIMEOUT_SECS + MANAGED_AGENT_DEAD_LINGER_SECS,
         );
-        let expiry = std::time::Duration::from_secs(stale_secs + linger_secs);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();
@@ -8601,13 +8610,25 @@ impl SolutionAgentStore {
     /// stops advancing once the command finishes) when a snapshot exists, else
     /// from `registered_at` (a shell that produced zero output and finished must
     /// still age out).
+    ///
+    /// The staleness threshold for a still-`Running` shell depends on whether its
+    /// PARENT agent subprocess is still alive (hardening #9). Output-silence is
+    /// NOT death: a long silent build/`sleep` produces no output but is running.
+    /// While the parent is alive its completion WILL be marked `Exited` by the
+    /// parent-JSONL scan when it finishes, so a silent-Running shell is kept up to
+    /// the generous [`BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS`] cap — preserving the
+    /// `has_live_background_work` supervisor-suppression instead of dropping it at
+    /// ~7min and letting the supervisor act while background work is still live.
+    /// Only when the parent subprocess is GONE (no `acp_thread` → no completion
+    /// can ever arrive, the documented orphan-leak case) does the ordinary
+    /// `STALE + DEAD_LINGER` timeout apply. Terminal (`Exited`/`Killed`) shells
+    /// are always reaped immediately, regardless of parent state.
     pub fn tick_background_shells(&mut self, cx: &mut Context<Self>) {
-        use ::agent_settings::AgentSettings;
-        let (stale_secs, linger_secs) = (
-            MANAGED_AGENT_STALE_TIMEOUT_SECS,
-            MANAGED_AGENT_DEAD_LINGER_SECS,
+        let expiry = std::time::Duration::from_secs(
+            MANAGED_AGENT_STALE_TIMEOUT_SECS + MANAGED_AGENT_DEAD_LINGER_SECS,
         );
-        let expiry = std::time::Duration::from_secs(stale_secs + linger_secs);
+        let live_parent_cap =
+            std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();
@@ -8620,6 +8641,18 @@ impl SolutionAgentStore {
             }
             let to_remove: Vec<crate::background_shell::BackgroundShellId> =
                 session.update(cx, |s, _| {
+                    // A live `acp_thread` means the owning agent subprocess is
+                    // still up, so a completing shell's `<task-notification>` will
+                    // still reach the parent-JSONL scan; a silent-Running shell is
+                    // presumed alive and only aged out at the generous cap. No
+                    // thread (reconnect / crash / close) → the shell is orphaned
+                    // and can never be flipped `Exited`, so the ordinary staleness
+                    // timeout applies.
+                    let running_stale_threshold = if s.acp_thread().is_some() {
+                        live_parent_cap
+                    } else {
+                        expiry
+                    };
                     let candidates: Vec<crate::background_shell::BackgroundShellId> = s
                         .background_shell_order
                         .iter()
@@ -8644,7 +8677,7 @@ impl SolutionAgentStore {
                                     now.duration_since(registered).unwrap_or_default()
                                 }
                             };
-                            age > expiry
+                            age > running_stale_threshold
                         })
                         .cloned()
                         .collect();
