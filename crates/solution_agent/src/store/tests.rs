@@ -11552,6 +11552,110 @@ async fn self_resume_rearms_parked_supervisor(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// A phantom `Judging` (the fire set `Judging` but the judge SPAWN early-returned
+/// because the cold session has no project → no judge handle registered) must
+/// un-wedge to `Watching` WITHOUT being charged as a judge failure — otherwise
+/// repeated phantoms spiral to a false `Stopped(ProviderError)` that silently
+/// kills supervision (finding #2).
+#[gpui::test]
+async fn phantom_judging_unwedges_without_false_provider_error(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::SupervisorStatus;
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        if let Some(s) = store.session(id) {
+            s.update(cx, |s, _| s.state = crate::model::SessionState::Idle);
+        }
+        store.set_supervision_enabled(id, true, cx);
+        // Phantom: Judging, fired past the timeout, but NO judge handle exists.
+        let st = store.supervisor_states.get_mut(&id).unwrap();
+        st.status = SupervisorStatus::Judging;
+        st.last_fired_at = Some(
+            chrono::Utc::now().timestamp_millis()
+                - (crate::supervisor::JUDGE_TIMEOUT_SECS as i64 + 10) * 1000,
+        );
+        assert!(
+            !store.judge_sessions.contains_key(&id),
+            "precondition: no real judge handle (the spawn early-returned)"
+        );
+        store.tick_supervisor(cx);
+    });
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Watching,
+        "phantom Judging must un-wedge to Watching, not die as ProviderError"
+    );
+    assert_eq!(
+        st.backoff_attempt, 0,
+        "a phantom judge must NOT be charged as a transient failure"
+    );
+    assert!(st.enabled, "supervision must stay enabled");
+}
+
+/// A meta-auditor spawns while the session is `Watching` and runs for minutes;
+/// if the user manually stops the agent (`Held`) meanwhile, a late audit
+/// `escalate` must NOT force `WaitingUser` — that would override the manual-stop
+/// rule (a `WaitingUser` is re-armed by self-activity). It must still fire on an
+/// actively-supervised session.
+#[gpui::test]
+async fn late_audit_escalate_respects_manual_stop(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::SupervisorStatus;
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
+
+    // Manual stop → Held; a racing auditor escalate must be dropped.
+    store.update(cx, |store, cx| {
+        {
+            let st = store.supervisor_states.get_mut(&id).unwrap();
+            st.status = SupervisorStatus::Held;
+            st.held_by_done = false;
+        }
+        store.apply_audit_verdict(id, /* ok */ false, /* escalate */ true, "loop?".into(), cx);
+    });
+    assert_eq!(
+        store
+            .read_with(cx, |store, _| store.supervisor_state(id))
+            .unwrap()
+            .status,
+        SupervisorStatus::Held,
+        "a late audit escalate must not override a manual stop",
+    );
+
+    // Disabled → also dropped (no spurious WaitingUser / toast on a session the
+    // user switched off).
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, false, cx);
+        store.apply_audit_verdict(id, false, true, "loop?".into(), cx);
+    });
+    assert!(
+        !matches!(
+            store
+                .read_with(cx, |store, _| store.supervisor_state(id))
+                .unwrap()
+                .status,
+            SupervisorStatus::WaitingUser
+        ),
+        "a late audit escalate must not escalate a disabled session",
+    );
+
+    // On an actively-Watching session the escalate DOES fire → WaitingUser.
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.supervisor_states.get_mut(&id).unwrap().status = SupervisorStatus::Watching;
+        store.apply_audit_verdict(id, false, true, "loop?".into(), cx);
+    });
+    assert_eq!(
+        store
+            .read_with(cx, |store, _| store.supervisor_state(id))
+            .unwrap()
+            .status,
+        SupervisorStatus::WaitingUser,
+        "an audit escalate on an actively-supervised session must fire",
+    );
+}
+
 /// Send-time session-state re-check: a judge fires only while the session is
 /// idle, but its turn runs seconds→minutes and the agent can resume ON ITS
 /// OWN in the meantime (a `Bash(run_in_background)` continuation lands as an

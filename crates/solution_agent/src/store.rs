@@ -1514,7 +1514,22 @@ impl SolutionAgentStore {
 
         self.finish_auditor(id, cx);
 
-        if escalate || !ok {
+        // Send-time gate (mirrors `apply_verdict`, FORK #31): the auditor spawned
+        // while the session was `Watching` and ran for minutes; if it has since
+        // been manually stopped (`Held`), disabled, or walled (`Stopped`), a late
+        // `escalate` must NOT force `WaitingUser` — that overrides the manual-stop
+        // rule (a `WaitingUser` is re-armed by self-activity — FORK #44) and
+        // toasts a session the user switched off. The record is still logged above
+        // for the audit trail; we just don't ACT on a now-stale escalation.
+        let supervising = self.supervisor_states.get(&id).is_some_and(|s| {
+            s.enabled
+                && !matches!(
+                    s.status,
+                    crate::supervisor::SupervisorStatus::Held
+                        | crate::supervisor::SupervisorStatus::Stopped(_)
+                )
+        });
+        if (escalate || !ok) && supervising {
             self.escalate_to_user(id, format!("Supervisor meta-audit: {reasoning}"), cx);
         }
 
@@ -1644,10 +1659,15 @@ impl SolutionAgentStore {
         if !should_hold {
             return;
         }
-        // Tear down an in-flight judge: at user-stop time the session is usually
-        // Running (status Watching, no judge), but if a judge had just spawned it
-        // would otherwise still deliver a verdict and possibly nudge the agent.
+        // Tear down an in-flight judge AND a racing meta-auditor: at user-stop
+        // time the session is usually Running (status Watching, no judge), but if
+        // a judge/auditor had just spawned it would otherwise still deliver a
+        // verdict and nudge/escalate the agent after the user stopped it. (The
+        // auditor spawns while `Watching`, so `finish_judge` alone misses it — a
+        // late audit `escalate` would force `WaitingUser`, which self-resumes,
+        // dragging back the very session the user manually stopped.)
         self.finish_judge(id, cx);
+        self.finish_auditor(id, cx);
         if let Some(state) = self.supervisor_states.get_mut(&id) {
             state.status = SupervisorStatus::Held;
             // A MANUAL stop — NOT done-sourced. Only a human message may resume
@@ -2615,11 +2635,32 @@ impl SolutionAgentStore {
                 let fired_at = last_fired_at.unwrap_or(0);
                 let stuck_ms = now_ms.saturating_sub(fired_at);
                 if stuck_ms >= (crate::supervisor::JUDGE_TIMEOUT_SECS as i64) * 1000 {
-                    self.on_judge_failed(
-                        id,
-                        "judge timed out / ended without verdict".to_string(),
-                        cx,
-                    );
+                    if self.judge_sessions.contains_key(&id) {
+                        // A real judge was registered and then timed out / ended
+                        // without a verdict — charge the transient-failure backoff.
+                        self.on_judge_failed(
+                            id,
+                            "judge timed out / ended without verdict".to_string(),
+                            cx,
+                        );
+                    } else {
+                        // PHANTOM `Judging` (finding #2): the fire set `Judging` +
+                        // `last_fired_at`, but the judge SPAWN early-returned (a
+                        // cold session with no project / no live thread), so no
+                        // judge handle was ever registered. This is NOT a timed-out
+                        // judge — charging it as a transient failure would, over
+                        // repeated phantoms, spiral to a FALSE
+                        // `Stopped(ProviderError)` that silently kills supervision
+                        // (and breaks the "продолжит автоматически" quota promise on
+                        // a cold-restored tab). Un-wedge to `Watching` with NO
+                        // penalty; the fire re-engages once the session warms up.
+                        if let Some(st) = self.supervisor_states.get_mut(&id) {
+                            st.status = crate::supervisor::SupervisorStatus::Watching;
+                            st.last_fired_at = None;
+                        }
+                        self.persist_supervisor_state(id, cx);
+                        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+                    }
                 }
                 continue;
             }
