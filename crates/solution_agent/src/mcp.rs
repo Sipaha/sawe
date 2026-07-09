@@ -4389,14 +4389,19 @@ impl McpServerTool for ForceIdleTool {
 // =====================================================================
 
 /// Record the judge's verdict for a supervised session and execute the
-/// corresponding action (`continue`, `compact`, `done`, or `ask`).
+/// corresponding action (`continue`, `wait`, `compact`, `done`, `ask_agent`,
+/// or `ask`).
 ///
 /// - `continue`: increment the guard counter, send a nudge message, and
 ///   return the session to `Watching`.
 /// - `compact`: queue a compact-context prompt on the session.
-/// - `done`: mark supervision stopped (`Done`) and log completion.
+/// - `done`: park supervision in `Held` (the "done" standby — the operator's
+///   next message OR the agent's own self-resume re-arms it) and log completion.
 /// - `ask`: pause supervision in `WaitingUser` and escalate the question
 ///   to the operator.
+/// - `ask_agent`: send a `question` to the WORKING agent (counts toward the
+///   nudge guard, like `continue`).
+/// - `wait`: sleep one-shot for `wait_seconds` (a self-clocked async task).
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct SupervisorVerdictParams {
     pub session_id: String,
@@ -4411,7 +4416,8 @@ pub struct SupervisorVerdictParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
     /// Sleep duration for action == "wait", in seconds. Clamped to
-    /// [10, 300]; defaults to 120 when absent. Ignored for other actions.
+    /// [10, 1800] (30 min); defaults to 120 when absent. Ignored for other
+    /// actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_seconds: Option<u64>,
 }

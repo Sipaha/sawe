@@ -27,8 +27,15 @@ req='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"<TOOL>","ar
 ```
 
 The response is one JSON-RPC line; the data is in `.result.structuredContent`.
-No `initialize` handshake is needed. (You read `{VERDICTS_PATH}` and
-`{DIARY_PATH}` directly with `cat`/Read — only the verdict goes over the bridge.)
+No `initialize` handshake is needed. The `sleep` is your response deadline, not
+the `timeout` — the bridge exits when stdin closes, so a reply slower than the
+`sleep` is silently dropped; raise the `sleep` for a slow read. (You read
+`{VERDICTS_PATH}` and `{DIARY_PATH}` directly with `cat`/Read — only the verdict
+goes over the bridge.)
+
+Also read `{INTENT_PATH}` if it exists — the supervisor's own durable record of
+the user's goal — and judge the supervisor's nudges against THAT goal, not some
+drift. It also records the user's language.
 
 ## Required final step
 
@@ -36,6 +43,8 @@ Submit through the bridge — tool `solution_agent.supervisor_audit_verdict`,
 arguments
 `{"session_id":"{SUPERVISED_SESSION_ID}","ok":<true|false>,"action":"<continue_supervision|escalate>","reasoning":"<short>"}`
 (`ok:true` lets supervision continue, `ok:false`/`escalate` forces human
-escalation). CHECK the response comes back `isError:false`; retry on error.
+escalation. `ok:false` forces escalation regardless of `action`. On `escalate`
+your `reasoning` is surfaced to the operator — write it in the **user's
+language**.) CHECK the response comes back `isError:false`; retry on error.
 
 {CUSTOM_PROMPT_SECTION}
