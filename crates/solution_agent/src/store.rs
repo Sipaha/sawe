@@ -1461,6 +1461,50 @@ impl SolutionAgentStore {
         }
     }
 
+    /// Scan the CURRENT turn of `id`'s transcript for a provider usage/session-
+    /// limit wall: the text of the latest assistant message, but only when that
+    /// text matches [`is_usage_limit_error`]. Shared by the judge-wall probe and
+    /// the fast-`Error` arm so both classify a wall by the exact same rule (the
+    /// stuck-turn watchdog inlines the same scan because it runs mid-iteration
+    /// over `self.sessions`, where a second `&self` borrow would be awkward).
+    ///
+    /// The reverse scan STOPS at the user message that opened the current turn:
+    /// a bare `AcpThreadEvent::Error` carries no payload and fires for any failed
+    /// turn (dead subprocess, network drop on resume, MaxTokens), so without this
+    /// anchor a STALE prior-turn wall — still the transcript's last assistant
+    /// message — would reclassify a later transient error as a fresh wall and
+    /// park supervision on a bogus ~24h resume (or a permanent `Stopped(Quota)`
+    /// for a no-reset phrasing). Only an assistant message NEWER than the last
+    /// user message — i.e. produced by the turn that just errored — may classify.
+    fn session_wall_message(&self, id: SolutionSessionId, cx: &App) -> Option<String> {
+        let session = self.session(id)?;
+        let thread = session.read(cx).acp_thread()?.clone();
+        let text = thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                acp_thread::AgentThreadEntry::AssistantMessage(m) => Some(Some(
+                    m.chunks
+                        .iter()
+                        .map(|chunk| match chunk {
+                            acp_thread::AssistantMessageChunk::Message { block }
+                            | acp_thread::AssistantMessageChunk::Thought { block } => {
+                                block.to_markdown(cx)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )),
+                // Turn boundary — an error before this turn streamed any
+                // assistant chunk must not inherit a previous turn's wall.
+                acp_thread::AgentThreadEntry::UserMessage(_) => Some(None),
+                _ => None,
+            })??;
+        crate::supervisor::is_usage_limit_error(&text).then_some(text)
+    }
+
     /// If session `id`'s in-flight JUDGE has itself stalled on a usage/session
     /// limit wall — its last assistant message IS the wall text — return that
     /// text. The judge is a claude session on the same account and hits the same
@@ -1474,24 +1518,7 @@ impl SolutionAgentStore {
     /// judge's own rate-limit-code *analysis* doesn't false-match.
     fn judge_wall_message(&self, id: SolutionSessionId, cx: &App) -> Option<String> {
         let judge_id = self.judge_sessions.get(&id)?.judge_id?;
-        let session = self.session(judge_id)?;
-        let thread = session.read(cx).acp_thread()?.clone();
-        let text = thread.read(cx).entries().iter().rev().find_map(|e| match e {
-            acp_thread::AgentThreadEntry::AssistantMessage(m) => Some(
-                m.chunks
-                    .iter()
-                    .map(|chunk| match chunk {
-                        acp_thread::AssistantMessageChunk::Message { block }
-                        | acp_thread::AssistantMessageChunk::Thought { block } => {
-                            block.to_markdown(cx)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
-            _ => None,
-        })?;
-        crate::supervisor::is_usage_limit_error(&text).then_some(text)
+        self.session_wall_message(judge_id, cx)
     }
 
     /// Drop all per-session in-memory runtime maps for `id`: supervisor control
@@ -8823,7 +8850,7 @@ impl SolutionAgentStore {
                 }
                 self.persist_session_row(session_id, cx);
             }
-            acp_thread::AcpThreadEvent::Error | acp_thread::AcpThreadEvent::LoadError(_) => {
+            acp_thread::AcpThreadEvent::Error => {
                 // Symmetric with the `Stopped` arm: flush any pending end-of-turn
                 // entry-append throttle synchronously so the final entry's
                 // `SessionMessageAppended` (+ `agent_session_dirty`) rides out on
@@ -8831,6 +8858,58 @@ impl SolutionAgentStore {
                 // which, if `Running→Errored` doesn't change the state
                 // discriminant (already Errored), would be the only remaining
                 // dirty signal.
+                self.flush_pending_entry_appends(session_id, cx);
+                // A provider usage/session-limit wall can arrive as a fast `Error`
+                // (not only as the silent stall the stuck-turn watchdog catches):
+                // the worker's fast-error path lands here before the watchdog's
+                // silence window elapses. The generic "agent error" string would
+                // then bury the reset time. Classify the wall from the session's
+                // own last assistant message and, for a SUPERVISED session, hand
+                // off to quota recovery so the observer schedules an auto-resume at
+                // the reset (mirroring the stuck-watchdog wall branch). For an
+                // unsupervised session, at least surface the wall text so the user
+                // sees when it resets. `apply_usage_limit_stop` is intentionally
+                // NOT called in the unsupervised case: it would leave a diary
+                // breadcrumb for a session that has no observer.
+                match self.session_wall_message(session_id, cx) {
+                    Some(wall) => {
+                        let supervised = self
+                            .supervisor_states
+                            .get(&session_id)
+                            .is_some_and(|s| s.enabled);
+                        self.mutate_state(
+                            session_id,
+                            |state| {
+                                *state = SessionState::Errored(SharedString::from(wall.clone()))
+                            },
+                            cx,
+                        );
+                        if supervised {
+                            self.push_system_note(
+                                session_id,
+                                acp_thread::SystemNoteLevel::Error,
+                                "Достигнут лимит claude — текущий ход остановлен.",
+                                cx,
+                            );
+                            self.apply_usage_limit_stop(session_id, &wall, cx);
+                        }
+                    }
+                    None => {
+                        self.mutate_state(
+                            session_id,
+                            |state| {
+                                *state = SessionState::Errored(SharedString::from("agent error"))
+                            },
+                            cx,
+                        );
+                    }
+                }
+            }
+            acp_thread::AcpThreadEvent::LoadError(_) => {
+                // A thread load/reconnect failure — distinct from a turn wall, so
+                // no wall-classification here (a stale prior wall in the transcript
+                // must not schedule a spurious resume). Flush + generic error,
+                // same as before.
                 self.flush_pending_entry_appends(session_id, cx);
                 self.mutate_state(
                     session_id,

@@ -1748,6 +1748,192 @@ async fn stuck_usage_limit_wall_stops_without_reconnect(cx: &mut TestAppContext)
     });
 }
 
+/// MEDIUM-hardening #1: a usage/session-limit wall can arrive as a fast
+/// `AcpThreadEvent::Error` (the worker's fast-error path), not only as the
+/// silent stall the stuck-turn watchdog catches. For a SUPERVISED session the
+/// Error arm must classify the wall from the session's own last assistant
+/// message and hand off to quota recovery — scheduling an auto-resume at the
+/// reset — instead of latching the generic "agent error" and losing the reset.
+#[gpui::test]
+async fn error_arm_supervised_wall_schedules_resume(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx)
+        });
+    });
+
+    // The turn's last assistant message is a limit wall WITH a parseable reset.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
+                            .to_string(),
+                    ),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // The fast-error wall (not a silent stall).
+    cx.update(|cx| acp_thread.update(cx, |_t, cx| cx.emit(acp_thread::AcpThreadEvent::Error)));
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let state = store.session(session_id).unwrap().read(cx).state.clone();
+            match state {
+                SessionState::Errored(msg) => assert!(
+                    msg.contains("session limit"),
+                    "Error arm must surface the wall text, got {msg:?}"
+                ),
+                other => panic!("expected Errored(wall), got {other:?}"),
+            }
+            let st = store.supervisor_state(session_id).unwrap();
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Watching,
+                "a parseable-reset wall parks Watching (not Stopped)"
+            );
+            assert!(
+                st.next_eligible_ms.is_some(),
+                "an auto-resume must be scheduled at the reset"
+            );
+            assert!(
+                store.backoff_timers.contains_key(&session_id),
+                "the resume wake timer must be armed"
+            );
+        });
+    });
+}
+
+/// The same fast-error wall on an UNSUPERVISED session must still surface the
+/// wall text (so the user sees when it resets) rather than the generic "agent
+/// error" — but must NOT fabricate a supervisor row or schedule a resume.
+#[gpui::test]
+async fn error_arm_unsupervised_wall_surfaces_text_without_resume(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "You've hit your session limit".to_string(),
+                    ),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| acp_thread.update(cx, |_t, cx| cx.emit(acp_thread::AcpThreadEvent::Error)));
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let state = store.session(session_id).unwrap().read(cx).state.clone();
+            match state {
+                SessionState::Errored(msg) => {
+                    assert!(
+                        msg.contains("session limit"),
+                        "must surface the wall text, got {msg:?}"
+                    );
+                    assert_ne!(msg.as_ref(), "agent error");
+                }
+                other => panic!("expected Errored(wall), got {other:?}"),
+            }
+            assert!(
+                store.supervisor_states.get(&session_id).is_none(),
+                "no supervisor row may be fabricated for an unsupervised session",
+            );
+        });
+    });
+}
+
+/// Regression for the turn-boundary anchor in `session_wall_message`: after a
+/// wall latches, the observer sends a `continue` user message and the resumed
+/// turn fast-errors BEFORE streaming any assistant chunk (dead subprocess /
+/// network drop on wake). The stale prior-turn wall is still the transcript's
+/// last assistant message — but the scan must stop at the intervening user
+/// message and classify this as a plain transient error ("agent error"), NOT a
+/// fresh wall. Otherwise supervision is parked on a bogus ~24h resume.
+#[gpui::test]
+async fn error_arm_stale_wall_behind_user_message_is_not_reclassified(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx)
+        });
+    });
+
+    // A prior turn's wall, then the observer's `continue` nudge as a fresh user
+    // message opening a new (failing) turn that streams nothing.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
+                            .to_string(),
+                    ),
+                ),
+                false,
+                cx,
+            );
+            t.push_user_content_block(
+                None,
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("continue".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // The resumed turn fast-errors with no assistant output this turn.
+    cx.update(|cx| acp_thread.update(cx, |_t, cx| cx.emit(acp_thread::AcpThreadEvent::Error)));
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let state = store.session(session_id).unwrap().read(cx).state.clone();
+            match state {
+                SessionState::Errored(msg) => assert_eq!(
+                    msg.as_ref(),
+                    "agent error",
+                    "a stale wall behind a user message must NOT reclassify a transient error"
+                ),
+                other => panic!("expected Errored(agent error), got {other:?}"),
+            }
+            let st = store.supervisor_state(session_id).unwrap();
+            assert!(
+                st.next_eligible_ms.is_none(),
+                "no bogus resume may be scheduled from a stale wall"
+            );
+            assert!(
+                !store.backoff_timers.contains_key(&session_id),
+                "no resume wake timer may be armed from a stale wall"
+            );
+        });
+    });
+}
+
 #[gpui::test]
 async fn tool_authorization_request_transitions_to_awaiting_input(cx: &mut TestAppContext) {
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
