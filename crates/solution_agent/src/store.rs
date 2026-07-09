@@ -63,6 +63,40 @@ const TOOL_STUCK_SECS: u64 = 20 * 60;
 const RECONNECT_CONTINUATION_PROMPT: &str = "Твой процесс завис, поэтому редактор перезапустил его. \
      История и контекст сохранены — продолжай работу с того места, на котором остановился.";
 
+/// Continuation sent after [`SolutionAgentStore::reconnect_agent`] when the
+/// wedge happened on an UNANSWERED user message — the transcript tail is a human
+/// message with no assistant reply after it (the agent hung *before* it started
+/// answering). The generic "carry on where you left off" prompt is actively
+/// WRONG here: there was no work in progress to resume, and telling a fresh
+/// subprocess to "continue" makes it treat the replayed user message as
+/// already-handled history and skip it — the reported "my message never reached
+/// you" bug. So point it explicitly at the user's message instead.
+const RECONNECT_UNANSWERED_USER_PROMPT: &str = "Твой процесс завис, не успев ответить на \
+     ПОСЛЕДНЕЕ сообщение пользователя (оно выше в истории). История и контекст сохранены. \
+     Перечитай это сообщение и выполни его сейчас — НЕ считай его уже обработанным.";
+
+/// True when the transcript tail is an UNANSWERED human message: scanning from
+/// the end past editor-injected `System` notes, the first real entry is a
+/// `UserMessage` that is NOT a supervisor observer-nudge. This is the "agent
+/// hung before it answered the user" shape — distinct from a mid-work wedge
+/// (tail is an assistant/tool entry), which the generic continuation handles.
+/// An observer nudge tail is excluded: it's the supervisor's own voice, not the
+/// human's, and the generic "carry on" is right for it.
+fn tail_is_unanswered_user_message(entries: &[crate::session_entry::SessionEntry]) -> bool {
+    use crate::session_entry::SessionEntryKind;
+    entries
+        .iter()
+        .rev()
+        .find(|e| !matches!(e.kind, SessionEntryKind::System { .. }))
+        .is_some_and(|e| {
+            matches!(
+                &e.kind,
+                SessionEntryKind::UserMessage { chunks, .. }
+                    if !acp_thread::is_observer_nudge_blocks(chunks)
+            )
+        })
+}
+
 pub struct SolutionAgentStore {
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
@@ -5632,6 +5666,12 @@ impl SolutionAgentStore {
         // reconnect of an already-idle session was_running == false → no
         // spurious nudge.
         let was_running = matches!(session.read(cx).state, SessionState::Running { .. });
+        // Also capture — BEFORE cold-ize drops the live thread — whether the
+        // wedge happened on an unanswered human message (transcript tail is a
+        // non-nudge `UserMessage`). If so the continuation must point the fresh
+        // subprocess AT that message rather than tell it to "carry on", or the
+        // message is silently dropped (see `RECONNECT_UNANSWERED_USER_PROMPT`).
+        let tail_unanswered_user = tail_is_unanswered_user_message(&session.read(cx).entries);
         let project = match session.read(cx).project.clone() {
             Some(project) => project,
             None => {
@@ -5706,7 +5746,12 @@ impl SolutionAgentStore {
                     "Агент не отвечал — переподключил сессию (история и контекст сохранены).",
                     cx,
                 );
-                store.maybe_send_reconnect_continuation(resumed, was_running, cx);
+                store.maybe_send_reconnect_continuation(
+                    resumed,
+                    was_running,
+                    tail_unanswered_user,
+                    cx,
+                );
             })
             .ok();
             Ok(resumed)
@@ -5718,26 +5763,36 @@ impl SolutionAgentStore {
     /// instead of parking at Idle — but ONLY when the session was actually
     /// Running (mid-turn) at reconnect time (`was_running`). A reconnect of an
     /// already-idle session (e.g. a manual MCP reconnect) gets no spurious
-    /// nudge. The prompt is a "carry on" instruction, deliberately NOT a replay
-    /// of the interrupted turn (replaying could re-run tool calls whose side
-    /// effects already landed). `from_user: false`: editor-originated, so it
-    /// must not reset the supervisor's continue counter / resume a
+    /// nudge. The prompt is normally a "carry on" instruction, deliberately NOT
+    /// a replay of the interrupted turn (replaying could re-run tool calls whose
+    /// side effects already landed) — EXCEPT when `tail_unanswered_user` says the
+    /// wedge happened on an unanswered human message, where it instead points the
+    /// agent AT that message (`RECONNECT_UNANSWERED_USER_PROMPT`) so it isn't
+    /// dropped as already-handled history. `from_user: false`: editor-originated,
+    /// so it must not reset the supervisor's continue counter / resume a
     /// `WaitingUser` hold.
     pub(crate) fn maybe_send_reconnect_continuation(
         &mut self,
         session_id: SolutionSessionId,
         was_running: bool,
+        tail_unanswered_user: bool,
         cx: &mut Context<Self>,
     ) {
         if !was_running {
             return;
         }
+        // When the wedge happened on an unanswered human message, drive the
+        // fresh subprocess AT that message — a generic "carry on" would make it
+        // treat the replayed message as already-handled and drop it.
+        let prompt = if tail_unanswered_user {
+            RECONNECT_UNANSWERED_USER_PROMPT
+        } else {
+            RECONNECT_CONTINUATION_PROMPT
+        };
         self.send_message_blocks_targeted(
             session_id,
             vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new(
-                    RECONNECT_CONTINUATION_PROMPT.to_string(),
-                ),
+                agent_client_protocol::schema::TextContent::new(prompt.to_string()),
             )],
             crate::model::QueueTarget::Main,
             false,

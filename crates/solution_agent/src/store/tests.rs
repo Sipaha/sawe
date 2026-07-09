@@ -12129,6 +12129,36 @@ fn thread_has_continuation(
     })
 }
 
+/// Helper: does any UserMessage in the session's live thread contain `needle`?
+fn last_user_text_contains(
+    store: &SolutionAgentStore,
+    session_id: SolutionSessionId,
+    needle: &str,
+    cx: &gpui::App,
+) -> bool {
+    let Some(thread) = store
+        .session(session_id)
+        .and_then(|s| s.read(cx).acp_thread().cloned())
+    else {
+        return false;
+    };
+    thread.read(cx).entries().iter().any(|e| {
+        if let acp_thread::AgentThreadEntry::UserMessage(msg) = e {
+            let text: String = msg
+                .chunks
+                .iter()
+                .filter_map(|b| match b {
+                    acp::ContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            text.contains(needle)
+        } else {
+            false
+        }
+    })
+}
+
 #[gpui::test]
 async fn reconnect_continues_a_wedged_running_session(cx: &mut TestAppContext) {
     // #6: the watchdog only reconnects sessions wedged mid-turn, so once the
@@ -12149,7 +12179,12 @@ async fn reconnect_continues_a_wedged_running_session(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            store.maybe_send_reconnect_continuation(session_id, /* was_running */ true, cx)
+            store.maybe_send_reconnect_continuation(
+                session_id,
+                /* was_running */ true,
+                /* tail_unanswered_user */ false,
+                cx,
+            )
         });
     });
     cx.executor().run_until_parked();
@@ -12176,7 +12211,12 @@ async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            store.maybe_send_reconnect_continuation(session_id, /* was_running */ false, cx)
+            store.maybe_send_reconnect_continuation(
+                session_id,
+                /* was_running */ false,
+                /* tail_unanswered_user */ false,
+                cx,
+            )
         });
     });
     cx.executor().run_until_parked();
@@ -12190,6 +12230,97 @@ async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
     assert!(
         !continued,
         "no continuation prompt for a reconnect of an already-idle session",
+    );
+}
+
+/// The regression this session shipped: a wedge that happened on an UNANSWERED
+/// user message must re-engage the fresh subprocess with the "you didn't answer
+/// the user's last message" prompt, NOT the generic "carry on" — otherwise the
+/// replayed human message is treated as already-handled and silently dropped.
+#[gpui::test]
+async fn reconnect_on_unanswered_user_message_points_at_it(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.maybe_send_reconnect_continuation(
+                session_id,
+                /* was_running */ true,
+                /* tail_unanswered_user */ true,
+                cx,
+            )
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let (has_unanswered_prompt, has_generic) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let unanswered = last_user_text_contains(store, session_id, "НЕ считай его уже", cx);
+            let generic = last_user_text_contains(store, session_id, "продолжай работу с того места", cx);
+            (unanswered, generic)
+        })
+    });
+    assert!(
+        has_unanswered_prompt,
+        "an unanswered-user wedge must send the 'you didn't answer the user' continuation",
+    );
+    assert!(
+        !has_generic,
+        "the generic 'carry on' prompt must NOT be used when the tail is an unanswered user message",
+    );
+}
+
+#[test]
+fn tail_unanswered_user_detection() {
+    use crate::session_entry::{
+        AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel,
+    };
+    use agent_client_protocol::schema as acp;
+    let ent = |kind| SessionEntry {
+        created_ms: 0,
+        mod_seq: 0,
+        subagent_id: None,
+        kind,
+    };
+    let user = |chunks: Vec<acp::ContentBlock>| SessionEntryKind::UserMessage {
+        id: None,
+        content_md: "hi".into(),
+        chunks,
+    };
+    let plain_user = || user(vec![]);
+    let nudge_user = || {
+        user(vec![acp::ContentBlock::Text(
+            acp::TextContent::new("nudge").meta(Some(acp_thread::meta_with_observer_nudge())),
+        )])
+    };
+    let system = || SessionEntryKind::System {
+        level: SystemEntryLevel::Info,
+        text_md: "note".into(),
+    };
+    let assistant = || SessionEntryKind::AssistantMessage {
+        chunks: vec![AssistantChunk::Message("ok".into())],
+    };
+
+    use super::tail_is_unanswered_user_message as tail;
+    assert!(!tail(&[]), "empty transcript is not an unanswered-user tail");
+    assert!(tail(&[ent(plain_user())]), "bare trailing user message");
+    assert!(
+        tail(&[ent(plain_user()), ent(system())]),
+        "a trailing System note is skipped over",
+    );
+    assert!(
+        !tail(&[ent(plain_user()), ent(assistant())]),
+        "an assistant reply after the user message = answered",
+    );
+    assert!(
+        !tail(&[ent(nudge_user())]),
+        "an observer nudge is the supervisor's voice, not the human's",
+    );
+    assert!(
+        !tail(&[ent(plain_user()), ent(nudge_user())]),
+        "a nudge after the human message means the tail is not a bare unanswered human message",
     );
 }
 
