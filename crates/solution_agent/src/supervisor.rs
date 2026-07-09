@@ -597,20 +597,29 @@ pub fn should_fire(
 ///   "rate_limit_error" / "usage limit reached" / "insufficient quota"   (API)
 pub fn is_usage_limit_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
+    // ANCHORED to wall-shaped phrasings, NOT loose single words. This runs over
+    // the agent's *whole* last assistant message (`tick_stuck_sessions`) — and an
+    // agent working on rate-limiting / billing / quota code writes exactly those
+    // words in prose ("added rate limit handling; insufficient test coverage").
+    // A false positive there is dangerous: it SKIPS the reconnect a real hang
+    // needs AND stops supervision as `Stopped(Quota)`. So bare "quota" /
+    // "insufficient" / "billing" / "credit" / "rate limit" (space) are gone;
+    // only the specific claude wall phrasings + API error codes remain (finding
+    // #4). Every documented real wall is still covered (see the test).
     m.contains("usage limit")
         || m.contains("session limit")
         || m.contains("weekly limit")
-        || m.contains("rate_limit")
-        || m.contains("rate limit")
-        || m.contains("quota")
-        || m.contains("insufficient")
-        || m.contains("billing")
-        || m.contains("credit")
-        // Subscription phrasings that don't contain any of the words above:
-        || m.contains("hit your limit")
-        || m.contains("reached your limit")
         || m.contains("limit · resets")
         || m.contains("limit reached")
+        || m.contains("hit your limit")
+        || m.contains("reached your limit")
+        || m.contains("rate_limit") // API error CODE (rate_limit_error) — underscore, not prose
+        || m.contains("rate limit reached")
+        || m.contains("rate limit exceeded")
+        || m.contains("insufficient quota")
+        || m.contains("quota exceeded")
+        || m.contains("exceeded your quota")
+        || m.contains("credit balance") // "your credit balance is too low"
 }
 
 pub fn classify_judge_error(message: &str) -> JudgeFailure {
@@ -697,7 +706,29 @@ pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
                 let today = tz.from_local_datetime(&date.and_time(time)).single();
                 match today {
                     Some(dt) if dt.timestamp_millis() > now_ms => Some(dt.timestamp_millis()),
-                    _ => tz
+                    // Today's time is already PAST. The stuck watchdog reads the
+                    // wall ~5 min after it printed, so a session wall's "resets
+                    // 8:20pm" is routinely a few minutes stale by the time we parse
+                    // it — the limit reset moments ago. Rolling a full day here
+                    // (`+1 day`) parks an autonomous session ~24 h for a wall that
+                    // already cleared (finding #6). So if it's only RECENTLY past
+                    // (within the grace window), resume ≈ now. Only when it's past
+                    // by MORE than the grace (e.g. a weekly limit whose time-of-day
+                    // printed without a weekday, hours past) do we under-estimate
+                    // to tomorrow — which self-corrects when the re-hit reschedules.
+                    Some(dt) => {
+                        const RESET_GRACE_MS: i64 = 60 * 60 * 1000;
+                        let past_by = now_ms - dt.timestamp_millis();
+                        if (0..=RESET_GRACE_MS).contains(&past_by) {
+                            Some(now_ms)
+                        } else {
+                            tz.from_local_datetime(&(date + Duration::days(1)).and_time(time))
+                                .single()
+                                .map(|dt| dt.timestamp_millis())
+                        }
+                    }
+                    // Ambiguous/non-existent local time (DST gap): fall to tomorrow.
+                    None => tz
                         .from_local_datetime(&(date + Duration::days(1)).and_time(time))
                         .single()
                         .map(|dt| dt.timestamp_millis()),
@@ -1065,6 +1096,19 @@ mod tests {
         // Non-limit errors do not.
         assert!(!is_usage_limit_error("overloaded_error"));
         assert!(!is_usage_limit_error("connection reset by peer"));
+        // Prose about rate-limiting / quotas / billing must NOT be mistaken for a
+        // wall (finding #4) — else a real hang skips reconnect and supervision
+        // dies as Stopped(Quota). These are the exact words an agent writes when
+        // working ON such code.
+        assert!(!is_usage_limit_error(
+            "added rate limit handling; insufficient test coverage remains"
+        ));
+        assert!(!is_usage_limit_error(
+            "checked the user's remaining credit and billing status in the invoice module"
+        ));
+        assert!(!is_usage_limit_error(
+            "the quota field defaults to 100 when the billing plan is free"
+        ));
         // The session-limit message must classify as Quota (was Transient).
         assert!(matches!(
             classify_judge_error(
@@ -1108,6 +1152,23 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn parse_reset_recent_past_resumes_now_not_tomorrow() {
+        use chrono::TimeZone as _;
+        // A session wall "resets 8:20pm (Novosibirsk)" read 5 min LATE (the stuck
+        // watchdog only notices ~5 min after the wall printed). The limit reset
+        // moments ago; rolling to tomorrow would over-park ~24 h (finding #6).
+        // 8:20pm Novosibirsk (UTC+7) == 13:20 UTC; now = 13:25 UTC (== 8:25pm).
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 29, 13, 25, 0).unwrap();
+        let got = parse_usage_limit_reset_ms(
+            "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)",
+            now.timestamp_millis(),
+        )
+        .expect("parse");
+        // Resumes ~now (reset just passed), NOT tomorrow.
+        assert_eq!(got, now.timestamp_millis());
     }
 
     #[test]

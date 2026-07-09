@@ -988,6 +988,44 @@ impl SolutionAgentStore {
         .detach();
     }
 
+    /// Reload session `id`'s persisted supervisor row into the in-memory map when
+    /// the session is reopened IN-PROCESS (a soft/cold close evicted the runtime
+    /// state via `evict_session_runtime_maps`, but `load_supervisor_states` only
+    /// runs once at startup). Without this a reopened session shows the observer
+    /// OFF even though its persisted row says `enabled` — silent unsupervision —
+    /// and the stale `enabled=true` row then RESURRECTS supervision on the NEXT
+    /// editor restart, on a session the user believed unsupervised (finding #5).
+    /// No-op if the state is already live (never evicted / re-enabled since the
+    /// close) so an in-session toggle isn't clobbered. Anchors `watch_started_ms
+    /// = now` like the startup load so a pre-close idle session isn't judged the
+    /// instant it reopens.
+    fn reload_supervisor_state_for(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        if self.supervisor_states.contains_key(&id) {
+            return;
+        }
+        let Some(db) = self.persistence.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let states = db
+                .load_supervisor_states()
+                .await
+                .log_err()
+                .unwrap_or_default();
+            this.update(cx, |this, _| {
+                if this.supervisor_states.contains_key(&id) {
+                    return;
+                }
+                if let Some(mut st) = states.into_iter().find(|s| s.session_id == id) {
+                    st.watch_started_ms = Some(chrono::Utc::now().timestamp_millis());
+                    this.supervisor_states.entry(id).or_insert(st);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Returns the database handle if set. Used by the navigator to list
     /// historic sessions (those persisted across editor restarts) for the
     /// "Resume" / "Continue last session" affordances.
@@ -1416,6 +1454,39 @@ impl SolutionAgentStore {
                 self.close_session(auditor_id, cx).log_err();
             }
         }
+    }
+
+    /// If session `id`'s in-flight JUDGE has itself stalled on a usage/session
+    /// limit wall — its last assistant message IS the wall text — return that
+    /// text. The judge is a claude session on the same account and hits the same
+    /// wall in the same "print the wall, then stall without ending the turn"
+    /// shape as the worker (FORK #34); it's exempt from `tick_stuck_sessions`, so
+    /// the ONLY thing that notices is the judge timeout — which otherwise routes
+    /// the generic timeout string to a *transient* failure that spirals to a
+    /// false `Stopped(ProviderError)` instead of scheduling the reset-time resume
+    /// (finding #3). Returning the wall text lets the timeout path route to quota
+    /// recovery. Detection is anchored (`is_usage_limit_error`, finding #4) so the
+    /// judge's own rate-limit-code *analysis* doesn't false-match.
+    fn judge_wall_message(&self, id: SolutionSessionId, cx: &App) -> Option<String> {
+        let judge_id = self.judge_sessions.get(&id)?.judge_id?;
+        let session = self.session(judge_id)?;
+        let thread = session.read(cx).acp_thread()?.clone();
+        let text = thread.read(cx).entries().iter().rev().find_map(|e| match e {
+            acp_thread::AgentThreadEntry::AssistantMessage(m) => Some(
+                m.chunks
+                    .iter()
+                    .map(|chunk| match chunk {
+                        acp_thread::AssistantMessageChunk::Message { block }
+                        | acp_thread::AssistantMessageChunk::Thought { block } => {
+                            block.to_markdown(cx)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        })?;
+        crate::supervisor::is_usage_limit_error(&text).then_some(text)
     }
 
     /// Drop all per-session in-memory runtime maps for `id`: supervisor control
@@ -2637,12 +2708,16 @@ impl SolutionAgentStore {
                 if stuck_ms >= (crate::supervisor::JUDGE_TIMEOUT_SECS as i64) * 1000 {
                     if self.judge_sessions.contains_key(&id) {
                         // A real judge was registered and then timed out / ended
-                        // without a verdict — charge the transient-failure backoff.
-                        self.on_judge_failed(
-                            id,
-                            "judge timed out / ended without verdict".to_string(),
-                            cx,
-                        );
+                        // without a verdict. If it stalled on the usage wall (its
+                        // own transcript shows it — the judge hits the same
+                        // account wall as the worker), route to QUOTA recovery
+                        // (schedule the reset-time resume) instead of a transient
+                        // failure that spirals to a false `Stopped(ProviderError)`
+                        // (finding #3). Otherwise it's a genuine timeout.
+                        let message = self
+                            .judge_wall_message(id, cx)
+                            .unwrap_or_else(|| "judge timed out / ended without verdict".to_string());
+                        self.on_judge_failed(id, message, cx);
                     } else {
                         // PHANTOM `Judging` (finding #2): the fire set `Judging` +
                         // `last_fired_at`, but the judge SPAWN early-returned (a
@@ -4934,6 +5009,10 @@ impl SolutionAgentStore {
                     if !rows.is_empty() {
                         this.reconcile_background_agents_for(*sid, rows, cx);
                     }
+                    // Reload the supervisor row a soft/cold close evicted, so a
+                    // reopened session resumes supervision (and doesn't surprise-
+                    // resurrect it on the next restart) — finding #5.
+                    this.reload_supervisor_state_for(*sid, cx);
                 }
                 // Background shell rows are ephemeral: the subprocess and
                 // its /tmp output file are both gone after a restart. Drop
@@ -5101,6 +5180,13 @@ impl SolutionAgentStore {
                     // comment for why).
                     this.sessions.insert(meta.id, entity);
                     hydrated.push(meta.id);
+                    // Reload the supervisor row a soft/cold close evicted so a
+                    // reopened session resumes supervision. This lazy console-panel
+                    // hydration path usually WINS the reopen race against
+                    // `hydrate_all_for_solution`, so the reload must live here too
+                    // or finding #5 reproduces on a normal window reopen. Idempotent
+                    // (its own `contains_key` guard) if both paths run.
+                    this.reload_supervisor_state_for(meta.id, cx);
                 }
                 if let Some(coord) =
                     editor_mcp::workspace_seq::WorkspaceEventCoordinator::try_global(cx)

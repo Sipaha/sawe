@@ -14,10 +14,10 @@ judge-timeout classifier, the reconnect↔observer boundary — did not.
 |---|---|---|
 | 1 | `apply_audit_verdict` has no send-time gate → a late audit `escalate` clobbers `Held`/`Disabled`, violating the manual-stop rule (FORK #44) | **DONE** |
 | 2 | Any judge-spawn early-return leaves status pinned `Judging` → backoff spiral → false `Stopped(ProviderError)` (breaks scheduled quota resume across restart; first-enable of a cold session) | **DONE** |
-| 3 | A judge that stalls on the usage wall is classified Transient not Quota → supervision dies as `ProviderError` instead of scheduling the reset-time resume | TODO |
-| 4 | `is_usage_limit_error` over the whole last assistant message → prose false-positive turns a real hang into `Stopped(Quota)` + skips reconnect | TODO |
-| 5 | Close-then-reopen (tab/solution) loses supervision in-process, and resurrects it on the next restart (`enabled=true` row never reloaded in rehydrate paths) | TODO |
-| 6 | Stale wall text + 5-min stuck delay → reset time rolls to tomorrow (~24h over-park) | TODO |
+| 3 | A judge that stalls on the usage wall is classified Transient not Quota → supervision dies as `ProviderError` instead of scheduling the reset-time resume | **DONE** |
+| 4 | `is_usage_limit_error` over the whole last assistant message → prose false-positive turns a real hang into `Stopped(Quota)` + skips reconnect | **DONE** |
+| 5 | Close-then-reopen (tab/solution) loses supervision in-process, and resurrects it on the next restart (`enabled=true` row never reloaded in rehydrate paths) | **DONE** |
+| 6 | Stale wall text + 5-min stuck delay → reset time rolls to tomorrow (~24h over-park) | **DONE** |
 | 7 | Observer and reconnect watchdog interleave (no mutual exclusion; reconnect doesn't bump `last_activity_at`) → judge fires mid-reconnect; double-resume race | TODO |
 | 8 | `wait_until_ms` not cleared by agent activity → mechanical wake nudge fires at a session that already resumed AND finished | TODO |
 | 9 | Observer-issued `compact` resets the consecutive-continue cap (goes through the `from_user:true` funnel) | TODO |

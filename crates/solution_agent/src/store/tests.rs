@@ -11552,6 +11552,39 @@ async fn self_resume_rearms_parked_supervisor(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// A soft/cold close evicts the in-memory supervisor row; reopening the session
+/// IN-PROCESS must reload it from the DB, so supervision resumes (and doesn't
+/// silently surprise-resurrect on the next restart) — finding #5.
+#[gpui::test]
+async fn reopen_reloads_evicted_supervisor_state(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    // Enable supervision and let the row persist to the DB.
+    store.update(cx, |store, cx| store.set_supervision_enabled(id, true, cx));
+    cx.run_until_parked();
+
+    // Simulate a soft close: evict the in-memory supervisor state (the DB row
+    // survives, as it does for a real soft close).
+    store.update(cx, |store, _| {
+        store.supervisor_states.remove(&id);
+    });
+    assert!(
+        store
+            .read_with(cx, |store, _| store.supervisor_state(id))
+            .is_none(),
+        "precondition: the in-memory state was evicted"
+    );
+
+    // Reopen (the hydrate path) reloads it.
+    store.update(cx, |store, cx| store.reload_supervisor_state_for(id, cx));
+    cx.run_until_parked();
+
+    let st = store.read_with(cx, |store, _| store.supervisor_state(id));
+    assert!(
+        st.as_ref().is_some_and(|s| s.enabled),
+        "reopen must reload the evicted supervisor row with enabled preserved"
+    );
+}
+
 /// A phantom `Judging` (the fire set `Judging` but the judge SPAWN early-returned
 /// because the cold session has no project → no judge handle registered) must
 /// un-wedge to `Watching` WITHOUT being charged as a judge failure — otherwise
