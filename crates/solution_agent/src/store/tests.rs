@@ -1934,6 +1934,49 @@ async fn error_arm_stale_wall_behind_user_message_is_not_reclassified(cx: &mut T
     });
 }
 
+/// MEDIUM-hardening #3: the judge submits its verdict via the solution-scoped
+/// `supervisor_verdict` tool, which is served ONLY on the per-solution socket —
+/// the editor-global socket doesn't carry it. If the per-solution socket can't
+/// be resolved (startup race / socket not opened — which is the case in this
+/// headless test, where no MCP `ActiveServer` global exists), spawning a judge
+/// briefed with the global socket would guarantee a JUDGE_TIMEOUT → bogus
+/// backoff spiral. Instead the spawn is skipped and the supervisor reverts
+/// `Judging → Watching` so the next tick retries once the socket is up.
+#[gpui::test]
+async fn judge_spawn_skipped_when_solution_socket_unresolvable(cx: &mut TestAppContext) {
+    let (session_id, _acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            // The caller (tick_supervisor) flips to Judging before spawn_judge.
+            store.supervisor_states.get_mut(&session_id).unwrap().status =
+                crate::supervisor::SupervisorStatus::Judging;
+            store.spawn_judge(session_id, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert!(
+                !store.judge_sessions.contains_key(&session_id),
+                "no judge handle when the per-solution socket can't be resolved"
+            );
+            let st = store.supervisor_state(session_id).unwrap();
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Watching,
+                "a skipped judge spawn reverts Judging → Watching so the next tick retries"
+            );
+            assert!(
+                st.next_eligible_ms.is_some(),
+                "the retry is gated so the 1 Hz tick doesn't re-fire→re-skip every second"
+            );
+        });
+    });
+}
+
 #[gpui::test]
 async fn tool_authorization_request_transitions_to_awaiting_input(cx: &mut TestAppContext) {
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;

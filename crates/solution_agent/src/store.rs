@@ -55,6 +55,13 @@ const STUCK_TURN_SECS: u64 = 5 * 60;
 /// wedging mid-tool.
 const TOOL_STUCK_SECS: u64 = 20 * 60;
 
+/// Retry delay when a judge/auditor spawn is skipped because the per-solution
+/// MCP socket (which serves the scoped verdict tools) isn't resolvable yet.
+/// Gates the next fire so a sustained socket outage doesn't re-fire→re-skip on
+/// every 1 Hz tick (flooding the diary / DB). Short enough that a brief startup
+/// race barely delays the first real judge.
+const JUDGE_SPAWN_RETRY_MS: i64 = 15_000;
+
 /// Continuation prompt sent to the agent after [`SolutionAgentStore::reconnect_agent`]
 /// brings a wedged (mid-turn) session back, so it resumes instead of parking at
 /// Idle. Deliberately a fresh "carry on" instruction, NOT a replay of the
@@ -1314,16 +1321,52 @@ impl SolutionAgentStore {
             .and_then(|s| s.custom_prompt.clone());
         // The judge talks to the editor over the `--nc` socket bridge from
         // Bash (claude does NOT reliably register the editor's
-        // `solution_agent.*` MCP tools — see supervisor instructions). Resolve
-        // the same per-solution socket the subagent bridge uses, falling back
-        // to the editor-global socket exactly like `sawe_mcp_bridge_server`.
+        // `solution_agent.*` MCP tools — see supervisor instructions). It submits
+        // its verdict via `supervisor_verdict` / `supervisor_audit_verdict`, which
+        // are SOLUTION-SCOPED tools served ONLY on the per-solution socket — the
+        // editor-global socket does not carry them. So resolve the per-solution
+        // socket EXACTLY (no global fallback): briefing a judge with the global
+        // socket would leave it unable to ever submit → JUDGE_TIMEOUT → a bogus
+        // transient-failure backoff that, repeated, spirals to a false
+        // `Stopped(ProviderError)` that silently kills supervision. If the socket
+        // isn't up yet (startup race, solution socket not opened), skip this spawn
+        // and stay `Watching` so the next tick retries once it's available.
         let bridge_bin = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "sawe".to_string());
-        let socket_path = editor_mcp::solution_socket_for_path(cx, &solution_root)
-            .unwrap_or_else(editor_mcp::socket_path)
-            .to_string_lossy()
-            .into_owned();
+        let Some(socket_path) = editor_mcp::solution_socket_for_path(cx, &solution_root) else {
+            log::warn!(
+                "{kind}({id}): per-solution MCP socket not resolvable; skipping spawn (will retry)"
+            );
+            self.append_supervisor_diary_note(
+                id,
+                "judge/auditor spawn skipped: per-solution MCP socket not up \
+                 (verdict tool unreachable on the global socket); staying Watching, will retry",
+                cx,
+            );
+            // The caller flipped a JUDGE to `Judging` before calling us; revert so
+            // the judge-stuck watchdog doesn't later mistake a never-spawned judge
+            // for a crashed one and charge a bogus backoff. (An AUDITOR is spawned
+            // while `Watching`, so this guard is a no-op for it.) Gate the next
+            // fire ~15s out instead of leaving immediate re-eligibility: the fire
+            // path cleared `next_eligible_ms`, so without this the 1 Hz tick would
+            // re-fire → re-skip every second for the whole outage, appending a
+            // diary line + two DB writes per second and rotating the judge's real
+            // diary memory out under `DIARY_LOG_MAX_BYTES`. The gate also preserves
+            // the `next_eligible_ms`-is-some bypass of the inherited-idle guard so
+            // a restart-scheduled resume racing the socket isn't silently dropped.
+            if let Some(state) = self.supervisor_states.get_mut(&id)
+                && matches!(state.status, crate::supervisor::SupervisorStatus::Judging)
+            {
+                state.status = crate::supervisor::SupervisorStatus::Watching;
+                state.next_eligible_ms =
+                    Some(chrono::Utc::now().timestamp_millis() + JUDGE_SPAWN_RETRY_MS);
+                self.persist_supervisor_state(id, cx);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+            }
+            return;
+        };
+        let socket_path = socket_path.to_string_lossy().into_owned();
         let briefing =
             crate::supervisor::build_judge_briefing(&crate::supervisor::JudgeBriefingContext {
                 supervised_session_id: id.to_string(),
