@@ -1977,6 +1977,82 @@ async fn judge_spawn_skipped_when_solution_socket_unresolvable(cx: &mut TestAppC
     });
 }
 
+/// LOW-hardening #8: the verdict tool passes no token figure (always `None` in
+/// production), so `VerdictRecord.tokens` — and the `total_tokens` stat — read 0.
+/// `apply_verdict` now fills it from the live judge session's own usage.
+#[gpui::test]
+async fn acted_verdict_records_judge_tokens(cx: &mut TestAppContext) {
+    let (supervised_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(supervised_id, true, cx);
+            store.supervisor_states.get_mut(&supervised_id).unwrap().status =
+                crate::supervisor::SupervisorStatus::Judging;
+            // Idle so the verdict is ACTED (not dropped by the send-time gate).
+            store.session(supervised_id).unwrap().update(cx, |s, _| {
+                s.state = SessionState::Idle;
+            });
+            let (solution_id, agent_id) = {
+                let s = store.session(supervised_id).unwrap();
+                let s = s.read(cx);
+                (s.solution_id.clone(), s.agent_id.clone())
+            };
+            // A judge session carrying a known token figure.
+            let judge_id = crate::model::SolutionSessionId::new();
+            let judge = crate::store::tests::insert_cold_session(
+                judge_id,
+                solution_id,
+                agent_id,
+                Some(4321),
+                None,
+                store,
+                cx,
+            );
+            judge.update(cx, |j, _| j.cached_total_tokens = Some(4321));
+            store.judge_sessions.insert(
+                supervised_id,
+                JudgeHandle {
+                    judge_id: Some(judge_id),
+                    started_ms: chrono::Utc::now().timestamp_millis(),
+                    _task: Task::ready(()),
+                },
+            );
+            store.apply_verdict(
+                supervised_id,
+                crate::supervisor::VerdictAction::Continue,
+                "keep going".into(),
+                None,
+                None,
+                // Production passes None here; the judge-session fill supplies it.
+                None,
+                None,
+                cx,
+            );
+        });
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let root = store.solution_root_for_app(supervised_id, cx).expect("root");
+            let dir = crate::supervisor::supervisor_dir(&root, supervised_id);
+            let recs = crate::supervisor::read_verdicts(&dir);
+            assert_eq!(recs.len(), 1);
+            assert!(!recs[0].dropped, "verdict must be acted for this assertion");
+            assert_eq!(
+                recs[0].tokens,
+                Some(4321),
+                "the acted verdict records the judge session's token usage"
+            );
+            assert_eq!(
+                crate::supervisor::verdict_stats(&recs).total_tokens,
+                4321,
+                "total_tokens is no longer always 0"
+            );
+        });
+    });
+}
+
 /// MEDIUM-hardening #5: the judge-stuck watchdog measures wall-clock from the
 /// fire, but a thorough judge (reading files, running read-only Bash) can run
 /// past `JUDGE_TIMEOUT_SECS` while still streaming. Once the wall-clock timeout

@@ -1581,6 +1581,21 @@ impl SolutionAgentStore {
         self.session_wall_message(judge_id, cx)
     }
 
+    /// Cumulative tokens the ephemeral judge/auditor session `judge_id` reported
+    /// (live `TokenUsage.used_tokens`, else the cached mirror). Read at
+    /// verdict/audit time — while the ephemeral session is still alive, before
+    /// `finish_judge`/`finish_auditor` reaps it — so a `VerdictRecord` can record
+    /// what the supervisor's own review turn cost (the verdict tool itself has no
+    /// token figure to pass). `None` when the session is gone or has no usage yet.
+    fn ephemeral_session_tokens(&self, judge_id: Option<SolutionSessionId>, cx: &App) -> Option<u64> {
+        let session = self.session(judge_id?)?;
+        let session = session.read(cx);
+        session
+            .acp_thread()
+            .and_then(|t| t.read(cx).token_usage().map(|u| u.used_tokens))
+            .or(session.cached_total_tokens)
+    }
+
     /// Drop all per-session in-memory runtime maps for `id`: supervisor control
     /// state, the background-agent / background-shell watcher tasks, the
     /// transient-failure backoff timer, the parent-jsonl scan cursor, and the
@@ -1691,7 +1706,13 @@ impl SolutionAgentStore {
                 reasoning: reasoning.clone(),
                 message: None,
                 question: None,
-                tokens: None,
+                // Same as the verdict path: fill from the live auditor session's
+                // usage (read before `finish_auditor` reaps it) so the audit's
+                // cost is recorded rather than always `None`.
+                tokens: self.ephemeral_session_tokens(
+                    self.auditor_sessions.get(&id).and_then(|h| h.judge_id),
+                    cx,
+                ),
                 dropped: audit_dropped,
             };
             crate::supervisor::append_verdict(&dir, &rec).log_err();
@@ -2156,7 +2177,17 @@ impl SolutionAgentStore {
                 reasoning: reasoning.clone(),
                 message: message.clone(),
                 question: question.clone(),
-                tokens,
+                // The verdict tool has no token figure to pass (`tokens` is
+                // `None` in production); fill it from the live judge session's
+                // own usage — read here while the judge is still alive, before
+                // `finish_judge` below reaps it — so `total_tokens` reflects the
+                // supervisor's real cost instead of always reading 0.
+                tokens: tokens.or_else(|| {
+                    self.ephemeral_session_tokens(
+                        self.judge_sessions.get(&id).and_then(|h| h.judge_id),
+                        cx,
+                    )
+                }),
                 // Record whether this verdict is about to be dropped by the
                 // send-time gate so the meta-auditor / `verdict_stats` don't
                 // miscount a superseded verdict as an acted nudge.
