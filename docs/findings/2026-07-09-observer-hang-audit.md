@@ -33,7 +33,7 @@ judge-timeout classifier, the reconnect↔observer boundary — did not.
 - `TOOL_STUCK_SECS`=20min hard-kills legitimately long foreground tools → possible duplicate build/deploy. (check process/terminal liveness before reconnect)
 - No watchdog on the reconnect itself → a failed/hung `resume_session` strands the session `Errored("reconnecting…")` forever. (retry-once-then-notify)
 - **DONE** Agent-side wall as an `Error` event loses its text (`Errored("agent error")`) → reset time unrecoverable. (fixed `284435a46b`: split `Error`/`LoadError` arms; new `session_wall_message` helper — turn-boundary-anchored so a stale prior-turn wall can't reclassify a later transient error — routes a supervised wall to `apply_usage_limit_stop`, surfaces the text for an unsupervised session)
-- Dropped verdicts logged indistinguishably from acted ones → auditor miscounts. (add `dropped: true` to `VerdictRecord`)
+- **DONE** Dropped verdicts logged indistinguishably from acted ones → auditor miscounts. (fixed `0327770edb`: `dropped: bool` on `VerdictRecord` set from the send-time gate on both verdict + audit paths; `verdict_stats` skips them, status-row marks `⊘`, auditor instructions ignore `dropped:true`)
 - `VerdictRecord.tokens` always `None` in production → `total_tokens` stat permanently 0. (fill from judge token usage, or drop the field)
 - Zero-output long background shells reaped as stale at ~7min → lose `has_live_background_work` suppression. (degrades gracefully to a `wait`)
 - **DONE** Empty `question` passes validation (`is_some()` not non-empty) → empty banner + toast. (now requires a non-empty trimmed question)
