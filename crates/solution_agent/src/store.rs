@@ -54,6 +54,35 @@ const STUCK_TURN_SECS: u64 = 5 * 60;
 /// builds/tests aren't killed; covers a command that hangs forever or claude
 /// wedging mid-tool.
 const TOOL_STUCK_SECS: u64 = 20 * 60;
+/// Output-silence window for an in-progress foreground tool past
+/// [`TOOL_STUCK_SECS`]. A display-only terminal's output (claude-acp's path)
+/// each rides a `ToolCallUpdate` that bumps `last_activity_at`, so for that path
+/// the session silence clock (`silent_secs`) already tracks how long ago the
+/// command last printed. Only when a tool that has already run past
+/// `TOOL_STUCK_SECS` has ALSO been silent this long (and has no running OS
+/// process — [`acp_thread::Terminal::is_process_running`], the signal for the
+/// real-PTY path whose output does NOT bump the clock) do we treat it as truly
+/// hung and reconnect. Must be well above [`STUCK_TURN_SECS`] or it would never
+/// spare a tool the candidate gate hasn't already cleared: a legitimately long
+/// command that printed within this window is left alone (hardening #7); a truly
+/// wedged one prints nothing and crosses it.
+const TOOL_OUTPUT_SILENCE_SECS: u64 = 15 * 60;
+
+/// Decide whether a silent-for-[`STUCK_TURN_SECS`] `Running` turn is wedged,
+/// given its newest in-progress tool call as `(tool_secs, shows_liveness)` —
+/// how long that tool has been running and whether it's still making progress.
+/// `None` means no tool is executing (claude hung between steps → wedged). A
+/// running tool is wedged only once it has exceeded [`TOOL_STUCK_SECS`] AND is
+/// no longer showing liveness (hardening #7 — a live long build isn't killed).
+/// Pure so the decision is unit-testable without a live thread.
+fn turn_is_wedged(active_tool: Option<(i64, bool)>) -> bool {
+    match active_tool {
+        Some((tool_secs, shows_liveness)) => {
+            tool_secs >= TOOL_STUCK_SECS as i64 && !shows_liveness
+        }
+        None => true,
+    }
+}
 
 /// Per-attempt timeout for a reconnect's `resume_session` (subprocess respawn +
 /// ACP handshake). A dead subprocess can start but never complete the handshake,
@@ -2748,14 +2777,19 @@ impl SolutionAgentStore {
     ///
     /// A genuinely-busy turn IS distinguishable from a hang: when claude blocks
     /// on a slow FOREGROUND command it leaves that tool call in
-    /// [`ToolCallStatus::InProgress`] for the command's whole duration (the
-    /// command streams nothing, so `last_activity_at` is frozen — but the tool
-    /// is demonstrably still running). So we only treat a silent turn as wedged
-    /// when there is NO in-progress tool call. When there IS one we leave it
-    /// alone until that single tool has itself been in-progress for an
-    /// unreasonable [`TOOL_STUCK_SECS`] (backstop for a command that truly hangs
-    /// forever, or claude wedging mid-tool). Background (`run_in_background`)
-    /// commands don't block claude, so they keep streaming and never get here.
+    /// [`ToolCallStatus::InProgress`] for the command's whole duration. So we
+    /// only treat a silent turn as wedged when there is NO in-progress tool call.
+    /// When there IS one we leave it alone until that single tool has both
+    /// exceeded an unreasonable [`TOOL_STUCK_SECS`] AND stopped showing liveness
+    /// — no output for [`TOOL_OUTPUT_SILENCE_SECS`] and no running OS process. A
+    /// display-only command's output each bumps `last_activity_at` (it rides a
+    /// `ToolCallUpdate`), so `silent_secs` already measures how long ago it last
+    /// printed; a real client-side PTY's output does not, so that path is covered
+    /// by [`acp_thread::Terminal::is_process_running`]. A build/deploy that keeps
+    /// printing (or whose process is alive) is therefore never reconnected out
+    /// from under itself (hardening #7); only one that truly hangs (silent, no
+    /// live process) is. Background (`run_in_background`) commands don't block
+    /// claude, so they keep streaming and never get here.
     ///
     /// Recovery is [`reconnect_agent`] — non-destructive: it respawns the
     /// subprocess and replays the same transcript, keeping the conversation.
@@ -2789,25 +2823,31 @@ impl SolutionAgentStore {
                     return None;
                 }
                 let thread_ref = thread.read(cx);
-                // How long has the most-recent in-progress tool call been
-                // running? `None` = no tool is executing right now.
-                let active_tool_secs = thread_ref.entries().iter().rev().find_map(|e| match e {
+                // The most-recent in-progress tool call as `(secs_running,
+                // shows_liveness)`. `None` = no tool is executing right now. A
+                // foreground build/deploy is "alive" — and so must NOT be
+                // reconnected out from under itself (hardening #7) — when its OS
+                // process is still running (real client-side PTY) OR it printed
+                // within `TOOL_OUTPUT_SILENCE_SECS`. For the display-only path
+                // (claude-acp) each output chunk bumps `last_activity_at`, so
+                // `silent_secs` is exactly the time since the command last
+                // printed; the real-PTY path's output does not, so it's covered
+                // by the direct process check.
+                let active_tool = thread_ref.entries().iter().rev().find_map(|e| match e {
                     AgentThreadEntry::ToolCall(tc)
                         if matches!(tc.status, ToolCallStatus::InProgress) =>
                     {
                         let since = tc.status_started_at.unwrap_or(s.last_activity_at);
-                        Some(now.signed_duration_since(since).num_seconds())
+                        let tool_secs = now.signed_duration_since(since).num_seconds();
+                        let pty_running =
+                            tc.terminals().any(|term| term.read(cx).is_process_running(cx));
+                        let shows_liveness = pty_running
+                            || silent_secs < TOOL_OUTPUT_SILENCE_SECS as i64;
+                        Some((tool_secs, shows_liveness))
                     }
                     _ => None,
                 });
-                let wedged = match active_tool_secs {
-                    // A tool IS running (foreground command) — leave it be unless
-                    // it has itself been stuck for an unreasonable time.
-                    Some(tool_secs) => tool_secs >= TOOL_STUCK_SECS as i64,
-                    // No tool executing + long silence → claude hung between steps.
-                    None => true,
-                };
-                if !wedged {
+                if !turn_is_wedged(active_tool) {
                     return None;
                 }
                 // Distinguish a usage/session-limit WALL from a genuine hang: a
@@ -2877,8 +2917,9 @@ impl SolutionAgentStore {
                     log::warn!(
                         target: "solution_agent::store",
                         "session={id} wedged in Running (no progress {STUCK_TURN_SECS}s, no live \
-                         tool — or a tool in-progress >{TOOL_STUCK_SECS}s) — auto-reconnecting \
-                         (respawn subprocess + replay transcript)"
+                         tool — or a tool in-progress >{TOOL_STUCK_SECS}s with no output for \
+                         >{TOOL_OUTPUT_SILENCE_SECS}s) — auto-reconnecting (respawn subprocess + \
+                         replay transcript)"
                     );
                     self.append_supervisor_diary_note(
                         id,

@@ -11350,6 +11350,28 @@ async fn observer_nudge_held_while_typing_then_flushed(cx: &mut gpui::TestAppCon
     );
 }
 
+/// Stuck-watchdog decision (#7): a session silent past `STUCK_TURN_SECS` is
+/// wedged when no tool is running (hung between steps), or when its in-progress
+/// tool has BOTH exceeded `TOOL_STUCK_SECS` AND stopped showing liveness. A long
+/// foreground build that keeps streaming output (`shows_liveness == true`) is
+/// never wedged, so it isn't reconnected out from under itself.
+#[test]
+fn turn_wedged_decision_gates_on_tool_liveness() {
+    // No in-progress tool: claude hung between steps → wedged.
+    assert!(turn_is_wedged(None));
+    // A young tool (under the backstop) is never wedged, live or not.
+    assert!(!turn_is_wedged(Some((60, false))));
+    assert!(!turn_is_wedged(Some((60, true))));
+    // Past the backstop but STILL streaming output (live build) → NOT wedged.
+    assert!(!turn_is_wedged(Some((TOOL_STUCK_SECS as i64 + 1, true))));
+    // Past the backstop AND no liveness (truly hung command) → wedged.
+    assert!(turn_is_wedged(Some((TOOL_STUCK_SECS as i64 + 1, false))));
+    // Exactly at the backstop with no liveness → wedged (the bound is `>=`).
+    assert!(turn_is_wedged(Some((TOOL_STUCK_SECS as i64, false))));
+    // At the backstop but live → not wedged.
+    assert!(!turn_is_wedged(Some((TOOL_STUCK_SECS as i64, true))));
+}
+
 /// Verdict authentication (#6): a `supervisor_verdict` call is honoured only
 /// when its nonce matches the in-flight judge's briefing nonce. A wrong nonce is
 /// rejected without touching state (the real judge can still submit); a matching

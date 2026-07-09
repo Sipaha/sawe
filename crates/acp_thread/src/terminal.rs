@@ -278,6 +278,25 @@ impl Terminal {
         &self.terminal
     }
 
+    /// Whether a real client-side PTY process backing this terminal is still
+    /// running. Used by the stuck-session watchdog to avoid reconnecting a
+    /// session out from under a legitimately long foreground build/deploy
+    /// whose OS process is genuinely alive (hardening #7).
+    ///
+    /// Display-only terminals — the path claude-acp uses to stream command
+    /// output — have no client-side OS process (`task: None`) and always return
+    /// `false` here; their liveness is inferred separately by the watchdog from
+    /// the session silence clock, because each output chunk rides a
+    /// `ToolCallUpdate` that bumps `last_activity_at`. A real client-side PTY's
+    /// output does NOT bump that clock, so this direct process check is the only
+    /// liveness signal for that path.
+    pub fn is_process_running(&self, cx: &App) -> bool {
+        matches!(
+            self.terminal.read(cx).task().map(|task| &task.status),
+            Some(terminal::TaskStatus::Running)
+        )
+    }
+
     pub fn to_markdown(&self, cx: &App) -> String {
         format!(
             "Terminal:\n```\n{}\n```\n",

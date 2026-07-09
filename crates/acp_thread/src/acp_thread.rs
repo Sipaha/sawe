@@ -4281,6 +4281,73 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn display_only_terminal_reports_no_running_process(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let terminal_id = acp::TerminalId::new(uuid::Uuid::new_v4().to_string());
+        let lower = cx.new(|cx| {
+            let builder = ::terminal::TerminalBuilder::new_display_only(
+                ::terminal::terminal_settings::CursorShape::default(),
+                ::terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            );
+            builder.subscribe(cx)
+        });
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "cargo build".to_string(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower.clone(),
+                },
+                cx,
+            );
+        });
+
+        // Feed it output: a display-only terminal has no client-side OS process,
+        // so `is_process_running` must stay `false` regardless — the watchdog
+        // must NOT infer liveness from it and instead falls back to the session
+        // silence clock for this path (hardening #7). A `true` here would mask a
+        // genuine hang forever.
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Output {
+                    terminal_id: terminal_id.clone(),
+                    data: b"   Compiling solution_agent\n".to_vec(),
+                },
+                cx,
+            );
+        });
+        let running = thread.read_with(cx, |thread, cx| {
+            let term = thread.terminal(terminal_id.clone()).unwrap();
+            term.read_with(cx, |t, cx| t.is_process_running(cx))
+        });
+        assert!(
+            !running,
+            "a display-only terminal reports no running OS process"
+        );
+    }
+
+    #[gpui::test]
     async fn test_status_started_at_set_when_tool_call_enters_in_progress(
         cx: &mut gpui::TestAppContext,
     ) {
