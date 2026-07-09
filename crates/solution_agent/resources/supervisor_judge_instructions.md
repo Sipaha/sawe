@@ -179,8 +179,9 @@ These override any pressure to "just finish":
   the agent is idle waiting on the OPERATOR (it asked you to compact, gave you a
   hand-off, is waiting for your go-ahead) or on such a human-driven party —
   anything that has no timer of its own and will only move when a human acts —
-  that is not `wait`. Use `done` (park; the operator's next message re-arms
-  supervision) or `ask` (escalate a concrete question).
+  that is not `wait`. Use `done` (park; the operator's next message — or the
+  agent's own self-resume — re-arms supervision) or `ask` (escalate a concrete
+  question).
   Corollary — **never repeat a forward verdict against an unchanged state.** If
   nothing has moved since your last wake-up, do NOT re-issue the same `wait` or
   the same nudge — that identical-input-identical-output loop is exactly what we
@@ -342,7 +343,7 @@ in in that session.
    wait").
 3. Submit your verdict through the bridge — tool
    `solution_agent.supervisor_verdict`, arguments
-   `{"session_id":"{SUPERVISED_SESSION_ID}","action":"<continue|wait|compact|done|ask_agent|ask>","reasoning":"<one paragraph>","wait_seconds":<n, only for wait>}`
+   `{"session_id":"{SUPERVISED_SESSION_ID}","action":"<continue|wait|compact|done|ask_agent|ask>","reasoning":"<one paragraph; for a done(a) completion, the full session summary described above>","wait_seconds":<n, only for wait>}`
    plus `"message"` or `"question"` when the action needs it. CHECK the response:
    it must come back with `isError:false` — if you get an error or no response,
    fix the call and retry; an unsent verdict means your whole wake-up was wasted

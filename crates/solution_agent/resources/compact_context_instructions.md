@@ -104,7 +104,7 @@ above files and is briefing a fresh agent. It must:
   of the user's standing directives and constraints (e.g. "user required V at
   every stage"); this transcript is about to be wiped, so instruct the new
   agent to read that file and honor it. If the file is absent (supervision
-  off), skip this.
+  off, or its memory was reset by a manual `/clear`/`/compact`), skip this.
 - Reference `state.md`, `decisions.md`, `next.md` by their full
   absolute paths (they live in `COMPACT_DIR` — i.e. under
   `<solution_root>/.agents/<SESSION_ID>/c<NN>/`). The new session
