@@ -75,6 +75,22 @@ const RECONNECT_UNANSWERED_USER_PROMPT: &str = "Твой процесс зави
      ПОСЛЕДНЕЕ сообщение пользователя (оно выше в истории). История и контекст сохранены. \
      Перечитай это сообщение и выполни его сейчас — НЕ считай его уже обработанным.";
 
+/// Classify a `done` verdict's `reasoning`. `done` has two modes (see
+/// `supervisor_judge_instructions.md`): a genuine completion, or a PARK awaiting
+/// the operator. The judge prefixes a park's reasoning with the `PARK:` token, so
+/// this returns `(is_park, body)` where `body` is the reasoning with that
+/// internal token stripped — used both to label the session log / notification
+/// honestly (a stall must not read as a finished task) AND to keep the raw
+/// `PARK:` marker out of user-visible text. Robust leading-token check, NOT a
+/// fuzzy parse: a missing token degrades to a completion (a real completion is
+/// never mislabeled a park, only the reverse).
+fn classify_done_reasoning(reasoning: &str) -> (bool, &str) {
+    match reasoning.trim_start().strip_prefix("PARK:") {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, reasoning),
+    }
+}
+
 /// True when the transcript tail is an UNANSWERED human message: scanning from
 /// the end past editor-injected `System` notes, the first real entry is a
 /// `UserMessage` that is NOT a supervisor observer-nudge. This is the "agent
@@ -1758,31 +1774,42 @@ impl SolutionAgentStore {
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
     }
 
-    /// Notify the user that the supervisor considers the task complete.
+    /// Notify the user that the supervisor concluded the turn — a genuine
+    /// completion (`is_park == false`) or a PARK awaiting the operator
+    /// (`is_park == true`). `reason` is the human-facing body with the internal
+    /// `PARK:` marker already stripped (see `classify_done_reasoning`), so a park
+    /// is never announced as "Work complete" and the raw token never leaks.
     pub(crate) fn notify_supervisor_done(
         &mut self,
         id: SolutionSessionId,
+        is_park: bool,
         reason: &str,
         cx: &mut Context<Self>,
     ) {
+        let label = if is_park {
+            "⏸ Parked — awaiting you"
+        } else {
+            "✓ Work complete"
+        };
         // In-chat Observer bubble (display-only, agent-invisible — see
-        // `escalate_to_user`) so the "work complete" verdict is visible in the
-        // transcript, not just as a transient desktop toast.
+        // `escalate_to_user`) so the verdict is visible in the transcript, not
+        // just as a transient desktop toast.
         self.push_system_note(
             id,
             acp_thread::SystemNoteLevel::Observer,
-            format!("✓ Work complete: {reason}"),
+            format!("{label}: {reason}"),
             cx,
         );
         let title = "Sawe — Supervisor".to_string();
-        let body = format!("✓ Work complete: {reason}");
-        crate::notifier::dispatch_raw(
-            id,
-            crate::notifier::NotifyKind::Completed,
-            &title,
-            &body,
-            cx,
-        );
+        let body = format!("{label}: {reason}");
+        // A park is "the agent is blocked on YOU" — the same attention class as
+        // `AwaitingInput` (→ high-priority toast), not a genuine completion.
+        let kind = if is_park {
+            crate::notifier::NotifyKind::AwaitingInput
+        } else {
+            crate::notifier::NotifyKind::Completed
+        };
+        crate::notifier::dispatch_raw(id, kind, &title, &body, cx);
     }
 
     /// Send a supervisor-generated nudge message. Unlike the public
@@ -2064,19 +2091,26 @@ impl SolutionAgentStore {
                 self.backoff_timers.remove(&id);
                 self.persist_supervisor_state(id, cx);
                 self.clear_supervisor_question(id, cx);
-                // Append the supervisor's completion summary (the judge's
-                // `reasoning`, which the briefing asks it to make a thorough
-                // session wrap-up) to the cumulative session log.
+                // Append the supervisor's summary to the cumulative session log,
+                // labeling a PARK-awaiting-operator distinctly from a genuine
+                // completion and keeping the raw `PARK:` marker out of the log
+                // body (see `classify_done_reasoning`).
+                let (is_park, done_body) = classify_done_reasoning(&reasoning);
+                let done_header = if is_park {
+                    "⏸ Session parked — awaiting operator (Supervisor)"
+                } else {
+                    "✓ Session complete (Supervisor)"
+                };
                 if let Some(root) = self.solution_root_for(id, cx) {
                     crate::supervisor::append_session_log(
                         &crate::supervisor::session_log_path(&root, id),
-                        "✓ Session complete (Supervisor)",
-                        &reasoning,
+                        done_header,
+                        done_body,
                         chrono::Utc::now().timestamp_millis(),
                     )
                     .log_err();
                 }
-                self.notify_supervisor_done(id, &reasoning, cx);
+                self.notify_supervisor_done(id, is_park, done_body, cx);
             }
             VerdictAction::Ask => {
                 self.escalate_to_user(id, question.unwrap_or_default(), cx);

@@ -12273,6 +12273,32 @@ async fn reconnect_on_unanswered_user_message_points_at_it(cx: &mut TestAppConte
 }
 
 #[test]
+fn classify_done_reasoning_park_vs_completion() {
+    use super::classify_done_reasoning;
+    // Genuine completion: not a park, body unchanged.
+    assert_eq!(
+        classify_done_reasoning("Shipped everything, all tests green."),
+        (false, "Shipped everything, all tests green."),
+    );
+    // Park: flagged, and the `PARK:` token is stripped from the body.
+    assert_eq!(
+        classify_done_reasoning("PARK: blocked on the operator's branch decision"),
+        (true, "blocked on the operator's branch decision"),
+    );
+    // Leading whitespace before the token is tolerated.
+    assert_eq!(
+        classify_done_reasoning("   PARK: awaiting go-ahead"),
+        (true, "awaiting go-ahead"),
+    );
+    // The token must be a PREFIX — a mid-sentence "PARK" (even with a colon) is
+    // a completion, body untouched.
+    assert_eq!(
+        classify_done_reasoning("Completed the PARK: feature end to end."),
+        (false, "Completed the PARK: feature end to end."),
+    );
+}
+
+#[test]
 fn tail_unanswered_user_detection() {
     use crate::session_entry::{
         AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel,
