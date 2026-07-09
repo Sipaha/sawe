@@ -12059,6 +12059,52 @@ async fn compact_verdict_does_not_reenter_store(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// A parked one-shot `wait` must be cancelled when the agent's own turn
+/// completes (`Stopped`) — otherwise, if the agent self-resumed and FINISHED
+/// before the wait deadline, the mechanism would still wake it at the deadline
+/// to "check the task you were waiting on" minutes after it already did it
+/// (finding #8). A user message already clears the wait; an agent completion
+/// must too.
+#[gpui::test]
+async fn agent_completion_clears_parked_wait(cx: &mut gpui::TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            // A one-shot wait is parked, deadline well in the future.
+            store
+                .supervisor_states
+                .get_mut(&session_id)
+                .unwrap()
+                .wait_until_ms = Some(chrono::Utc::now().timestamp_millis() + 600_000);
+        });
+    });
+    // The agent self-resumed and its turn ran to completion before the deadline.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let thread = session.read(cx).acp_thread().cloned().unwrap();
+        thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                agent_client_protocol::schema::StopReason::EndTurn,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+    let wait = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .supervisor_state(session_id)
+            .unwrap()
+            .wait_until_ms
+    });
+    assert!(
+        wait.is_none(),
+        "a completed turn must cancel the parked one-shot wait (finding #8)"
+    );
+}
+
 #[gpui::test]
 async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;

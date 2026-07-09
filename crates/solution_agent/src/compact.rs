@@ -122,15 +122,32 @@ pub(crate) fn start_compact_for_session(
     }
 
     let rendered = render_compact_prompt_inner(session_id, cx)?;
+    let is_user = initiator == CompactInitiator::User;
     store.update(cx, |store, cx| {
         // Human `/compact`: reset the observer to a clean slate (same as
         // `/clear`), so it doesn't re-litigate settled directives after the
         // user rotated the context. Observer-issued compaction keeps its memory.
-        if initiator == CompactInitiator::User {
+        if is_user {
             store.wipe_supervisor_memory(session_id, cx);
         }
+        // `from_user = is_user`: an OBSERVER-issued compact must NOT go through
+        // the `from_user: true` funnel — that would reset the consecutive-continue
+        // cap / audit cadence (the observer's own action masquerading as a human
+        // reply), defeating the anti-loop guards on a cap-exempt verdict (finding
+        // #9). A genuine user `/compact` keeps the funnel (it IS a human action).
+        // Both still wake a cold session (the wake path is independent of
+        // `from_user`).
+        let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
+            agent_client_protocol::schema::TextContent::new(rendered),
+        )];
         store
-            .send_message(session_id, rendered, cx)
+            .send_message_blocks_targeted(
+                session_id,
+                blocks,
+                crate::model::QueueTarget::Main,
+                is_user,
+                cx,
+            )
             .detach_and_log_err(cx);
     });
     Ok(StartCompactOutcome {

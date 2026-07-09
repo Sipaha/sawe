@@ -18,10 +18,10 @@ judge-timeout classifier, the reconnect↔observer boundary — did not.
 | 4 | `is_usage_limit_error` over the whole last assistant message → prose false-positive turns a real hang into `Stopped(Quota)` + skips reconnect | **DONE** |
 | 5 | Close-then-reopen (tab/solution) loses supervision in-process, and resurrects it on the next restart (`enabled=true` row never reloaded in rehydrate paths) | **DONE** |
 | 6 | Stale wall text + 5-min stuck delay → reset time rolls to tomorrow (~24h over-park) | **DONE** |
-| 7 | Observer and reconnect watchdog interleave (no mutual exclusion; reconnect doesn't bump `last_activity_at`) → judge fires mid-reconnect; double-resume race | TODO |
-| 8 | `wait_until_ms` not cleared by agent activity → mechanical wake nudge fires at a session that already resumed AND finished | TODO |
-| 9 | Observer-issued `compact` resets the consecutive-continue cap (goes through the `from_user:true` funnel) | TODO |
-| 10 | Compact refusal invisible to the mechanism (only `log::warn!`) → cap-exempt `compact` re-issued every ~60s | TODO |
+| 7 | Observer and reconnect watchdog interleave (no mutual exclusion; reconnect doesn't bump `last_activity_at`) → judge fires mid-reconnect; double-resume race | **DONE** |
+| 8 | `wait_until_ms` not cleared by agent activity → mechanical wake nudge fires at a session that already resumed AND finished | **DONE** |
+| 9 | Observer-issued `compact` resets the consecutive-continue cap (goes through the `from_user:true` funnel) | **DONE** |
+| 10 | Compact refusal invisible to the mechanism (only `log::warn!`) → cap-exempt `compact` re-issued every ~60s | **DONE** |
 
 ## Hardening ideas
 

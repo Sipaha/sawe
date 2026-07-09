@@ -2145,24 +2145,46 @@ impl SolutionAgentStore {
                 // editor this way. Defer the call past the current update so the
                 // lease is released first (decision: never read an entity during
                 // its own mutation — snapshot before, or defer).
-                cx.defer(
-                    move |cx| match crate::compact::start_compact_for_session(
+                cx.defer(move |cx| {
+                    let outcome = crate::compact::start_compact_for_session(
                         id,
                         crate::compact::CompactInitiator::Observer,
                         cx,
-                    ) {
-                        Err(err) => {
-                            log::warn!("apply_verdict compact({id}): {err}");
+                    );
+                    // A compact can be SILENTLY refused (session busy, conversation
+                    // too short, no headroom) and the refusal never reaches the
+                    // judge — so a cap-EXEMPT `compact` verdict can loop every idle
+                    // tick. Record the refusal in the observer's diary (which the
+                    // judge reads each wake-up) so the "don't re-issue compact if
+                    // the transcript didn't rotate" prompt rule can actually fire
+                    // (finding #10).
+                    let note = match &outcome {
+                        Err(err) => Some(format!("compact verdict could not run: {err}")),
+                        Ok(o) if !o.queued => {
+                            let reason = o.reason.as_deref().unwrap_or("unknown reason");
+                            // "session is busy" is a transient race-window refusal
+                            // (the agent started a turn between the verdict and the
+                            // deferred compact) — it self-resolves and has nothing
+                            // to do with transcript rotation, so don't mislead the
+                            // judge into deferring compaction. Only diary the
+                            // rotation-relevant refusals (too short / no headroom).
+                            if reason.starts_with("session is busy") {
+                                None
+                            } else {
+                                Some(format!(
+                                    "compact verdict REFUSED ({reason}); do not re-issue compact until the transcript rotates"
+                                ))
+                            }
                         }
-                        Ok(outcome) if !outcome.queued => {
-                            log::warn!(
-                                "apply_verdict compact({id}): not queued: {:?}",
-                                outcome.reason
-                            );
-                        }
-                        Ok(_) => {}
-                    },
-                );
+                        Ok(_) => None,
+                    };
+                    if let Some(note) = note {
+                        log::warn!("apply_verdict compact({id}): {note}");
+                        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                            store.append_supervisor_diary_note(id, &note, cx);
+                        });
+                    }
+                });
             }
             VerdictAction::Done => {
                 // The supervisor considers the work complete. Don't switch
@@ -5893,6 +5915,14 @@ impl SolutionAgentStore {
         session.update(cx, |s, cx| {
             s.state = SessionState::Errored(SharedString::from("reconnecting…"));
             s.set_acp_thread(None, cx);
+            // Bump the activity clock so the SUPERVISOR tick doesn't treat the
+            // mid-reconnect `Errored` session as idle-eligible and fire a judge
+            // INTO a transient state — wasting a judge turn and risking a
+            // verdict that lands during the reconnect (which would kick a second
+            // concurrent `resume_session` — finding #7). The reconnect's own
+            // continuation prompt bumps it again on completion, so a normal
+            // (sub-`IDLE_THRESHOLD`) reconnect is fully covered.
+            s.last_activity_at = chrono::Utc::now();
         });
         self.mark_state_changed(session_id, cx);
         let resume = self.resume_session(meta, project, cx);
@@ -8489,6 +8519,23 @@ impl SolutionAgentStore {
                 // re-hit of the wall arrives as `Error`, not `Stopped`, so the
                 // gate survives that case.
                 self.clear_resume_gate_on_agent_response(session_id, cx);
+                // A completed turn is genuinely-new state: cancel any parked
+                // one-shot `wait`. Otherwise, if the agent self-resumed and
+                // FINISHED before the wait deadline, the mechanism would still
+                // wake it at the deadline ("the task you were waiting on should be
+                // done — check it") minutes after it already did exactly that
+                // (finding #8). A user message already clears this in the send
+                // funnel; an agent-side completion must too.
+                if self
+                    .supervisor_states
+                    .get(&session_id)
+                    .is_some_and(|s| s.wait_until_ms.is_some())
+                {
+                    if let Some(state) = self.supervisor_states.get_mut(&session_id) {
+                        state.wait_until_ms = None;
+                    }
+                    self.persist_supervisor_state(session_id, cx);
+                }
                 // Snapshot the Running turn's elapsed time BEFORE the
                 // state flip — `mutate_state` overwrites `started_at`
                 // with `SessionState::Idle` so we can't recover it
