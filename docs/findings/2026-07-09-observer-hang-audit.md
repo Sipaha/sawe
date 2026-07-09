@@ -27,7 +27,7 @@ judge-timeout classifier, the reconnect↔observer boundary — did not.
 
 - Verdict tools unauthenticated — any client on the per-solution socket (incl. the worker) can submit verdicts for any session. (nonce in briefing + require in-flight `judge_sessions`)
 - Double-submit likely by-design (bridge exits on stdin EOF; prompt says retry on empty) → duplicate `apply_verdict`. (idempotency key / nonce)
-- Judge briefing can bake in the global socket where the verdict tool doesn't exist → guaranteed timeout → spiral (compounds #2). (skip-with-diary, or add verdict tools to `GLOBAL_TOOLS`)
+- **DONE** Judge briefing can bake in the global socket where the verdict tool doesn't exist → guaranteed timeout → spiral (compounds #2). (fixed `19b647ec25`: verdict tools are solution-scoped, so removed the global fallback — on unresolvable socket, skip-with-diary + revert Judging→Watching + gate next fire ~15s to avoid a 1 Hz re-fire flood. NOT added to `GLOBAL_TOOLS`: that would remove them from the per-solution socket the judge normally uses)
 - **DONE** Reconnect continuation prompts are unmarked user-role messages → judge may distill them into `user_intent.md`; `tail_is_unanswered_user_message` misclassifies a prior continuation. (fixed: `spk_editor_recovery` marker; excluded in tail-detector + judge filter via separate `editor_recovery` DTO field)
 - `JUDGE_TIMEOUT_SECS` measures wall-clock from fire, not judge liveness → a thorough judge is killed mid-verdict. (check judge session `last_activity_at`/streaming before declaring dead)
 - `TOOL_STUCK_SECS`=20min hard-kills legitimately long foreground tools → possible duplicate build/deploy. (check process/terminal liveness before reconnect)
