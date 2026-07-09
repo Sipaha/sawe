@@ -1159,11 +1159,15 @@ fn supervisor_popover_menu(
                         }
                     }
                 };
+                // A dropped verdict is excluded from the counts in the header
+                // above; mark it here too (`⊘`) so the list and header agree —
+                // otherwise "Verdicts: 0" could sit above a plausible-looking row.
+                let dropped_prefix = if record.dropped { "⊘ " } else { "" };
                 let reasoning = if record.reasoning.chars().count() > 60 {
                     let truncated: String = record.reasoning.chars().take(57).collect();
-                    format!("{action_icon} {truncated}…")
+                    format!("{dropped_prefix}{action_icon} {truncated}…")
                 } else {
-                    format!("{action_icon} {}", record.reasoning)
+                    format!("{dropped_prefix}{action_icon} {}", record.reasoning)
                 };
                 menu = menu.header(SharedString::from(reasoning));
             }
