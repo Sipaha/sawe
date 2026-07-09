@@ -1,10 +1,13 @@
 # Compact this session and prepare a clean handoff
 
-The user has triggered the **Compact Context** action because this session
-is approaching its context budget. Your job now is to capture every load-
-bearing piece of state from the current conversation into durable files,
-then ask the editor to start a fresh session that will pick up exactly
-where this one left off — minus the ballast.
+Compaction of this session has been triggered — by the user via the **Compact
+Context** action, OR by the session's autonomous supervisor when it judged the
+context near-full — because this session is approaching its context budget.
+(Don't assume a human is present and watching: if the supervisor triggered this,
+you are running unattended.) Your job now is to capture every load-bearing piece
+of state from the current conversation into durable files, then ask the editor to
+start a fresh session that will pick up exactly where this one left off — minus
+the ballast.
 
 The editor has injected the variables you need below; do not invent
 paths, do not write files anywhere else.
@@ -37,10 +40,21 @@ Before writing anything, classify the conversation:
   in-flight feature with obvious next steps. Capture the plan; the
   continuation prompt should resume that plan.
 - **B. Multiple possible next steps, none picked.** The conversation
-  branched and you are unsure which direction to take. **Stop and ask
-  the user** which direction to compact toward — do NOT call the MCP
-  tool until they answer. Once they answer, treat their reply as case
-  A and proceed.
+  branched and you are unsure which direction to take. FIRST read the
+  supervisor's user-intent record if it exists
+  (`<solution_root>/.agents/<SESSION_ID>/supervisor/user_intent.md`) — if the
+  standing intent there settles which direction to compact toward, treat this
+  as case A and proceed, do NOT stop. Only if the ambiguity SURVIVES that file
+  **stop and ask the user** which direction to compact toward (do NOT call the
+  MCP tool until they answer; once they do, treat their reply as case A). But
+  if this compaction was supervisor-triggered (no human present), you cannot
+  block on a human — pick the best-supported direction from the intent record
+  and the conversation, compact toward it, and note the uncertainty in
+  `continue.md` rather than stalling. (How to tell you're unattended: you still
+  have the full conversation here — if there is no genuine, non-observer-nudge
+  human message in the recent turns and the last thing driving you was a
+  supervisor nudge or an auto-compact, assume the supervisor triggered this and
+  do NOT wait for a human.)
 - **C. No clear forward task** (exploration, debugging, post-mortem
   with no commitments). Skip the "next task" assumptions; just dump
   what was *learned* so the next session can pick up cold without
