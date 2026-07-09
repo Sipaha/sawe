@@ -123,6 +123,18 @@ pub struct VerdictRecord {
     pub question: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
+    /// The judge PRODUCED this verdict but the send-time gate dropped it — it was
+    /// never delivered (superseded by a fresh user reply, supervision turned off /
+    /// `Held` / `Stopped`, or the session resumed on its own mid-judge). Logged
+    /// for the audit trail but excluded from [`verdict_stats`] and flagged to the
+    /// meta-auditor so a dropped verdict is not miscounted as an acted nudge.
+    /// `#[serde(default)]` keeps pre-field records readable (they read as acted).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dropped: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,11 +562,14 @@ pub fn read_verdicts(dir: &Path) -> Vec<VerdictRecord> {
 }
 
 pub fn verdict_stats(records: &[VerdictRecord]) -> VerdictStats {
-    let mut stats = VerdictStats {
-        total: records.len(),
-        ..Default::default()
-    };
+    let mut stats = VerdictStats::default();
     for rec in records {
+        // A dropped verdict was produced but never delivered — counting it would
+        // inflate the acted-nudge tally the meta-auditor reasons about.
+        if rec.dropped {
+            continue;
+        }
+        stats.total += 1;
         if matches!(rec.kind, VerdictKind::Audit) {
             stats.audits += 1;
         }
@@ -913,6 +928,7 @@ mod tests {
             message: None,
             question: None,
             tokens: Some(1234),
+            dropped: false,
         };
         append_verdict(dir, &rec).unwrap();
         // a corrupt line must not poison the reader
@@ -974,6 +990,25 @@ mod tests {
         assert_eq!(s.total_tokens, 300);
     }
 
+    #[test]
+    fn stats_excludes_dropped_records() {
+        let mut dropped = mk(VerdictAction::Continue, 999);
+        dropped.dropped = true;
+        let recs = vec![
+            mk(VerdictAction::Continue, 100),
+            dropped,
+            mk(VerdictAction::Compact, 50),
+        ];
+        let s = verdict_stats(&recs);
+        assert_eq!(s.total, 2, "dropped verdict excluded from total");
+        assert_eq!(
+            s.by_action[VerdictAction::Continue as usize], 1,
+            "only the acted Continue counts"
+        );
+        assert_eq!(s.by_action[VerdictAction::Compact as usize], 1);
+        assert_eq!(s.total_tokens, 150, "dropped verdict's tokens excluded");
+    }
+
     fn mk(action: VerdictAction, tokens: u64) -> VerdictRecord {
         VerdictRecord {
             ts_ms: 0,
@@ -984,6 +1019,7 @@ mod tests {
             message: None,
             question: None,
             tokens: if tokens > 0 { Some(tokens) } else { None },
+            dropped: false,
         }
     }
 

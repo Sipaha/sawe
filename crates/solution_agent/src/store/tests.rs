@@ -11217,6 +11217,17 @@ async fn held_supervisor_drops_racing_verdict(cx: &mut gpui::TestAppContext) {
         st.consecutive_continues, 0,
         "a verdict arriving after a manual Stop (Held) is dropped"
     );
+    // The dropped verdict is still logged, but flagged `dropped:true` so the
+    // meta-auditor / `verdict_stats` don't miscount it as an acted nudge.
+    store.read_with(cx, |store, cx| {
+        let root = store.solution_root_for_app(id, cx).expect("solution root");
+        let dir = crate::supervisor::supervisor_dir(&root, id);
+        let recs = crate::supervisor::read_verdicts(&dir);
+        assert_eq!(recs.len(), 1, "the dropped verdict is still recorded");
+        assert!(recs[0].dropped, "a gated verdict must be marked dropped");
+        let stats = crate::supervisor::verdict_stats(&recs);
+        assert_eq!(stats.total, 0, "verdict_stats excludes the dropped verdict");
+    });
 }
 
 /// The user sending their own message forgets a nudge that was parked waiting
@@ -11544,10 +11555,17 @@ async fn apply_continue_nudges_and_increments(cx: &mut gpui::TestAppContext) {
     assert_eq!(st.consecutive_continues, 1);
     assert_eq!(st.status, crate::supervisor::SupervisorStatus::Watching);
 
-    // Verdict was recorded to disk.
+    // Verdict was recorded to disk — acted, so NOT flagged dropped and counted.
     let root = crate::store::test_support::session_solution_root(&store, id, cx);
     let dir = crate::supervisor::supervisor_dir(&root, id);
-    assert_eq!(crate::supervisor::read_verdicts(&dir).len(), 1);
+    let recs = crate::supervisor::read_verdicts(&dir);
+    assert_eq!(recs.len(), 1);
+    assert!(!recs[0].dropped, "an acted verdict must NOT be marked dropped");
+    assert_eq!(
+        crate::supervisor::verdict_stats(&recs).total,
+        1,
+        "verdict_stats counts an acted verdict"
+    );
 }
 
 #[gpui::test]
@@ -11873,6 +11891,24 @@ async fn late_audit_escalate_respects_manual_stop(cx: &mut gpui::TestAppContext)
         SupervisorStatus::WaitingUser,
         "an audit escalate on an actively-supervised session must fire",
     );
+
+    // Each `apply_audit_verdict` logs a `VerdictRecord`; the two gated escalates
+    // (Held, Disabled) must be flagged `dropped`, only the actively-Watching one
+    // is acted — so `verdict_stats` counts exactly one.
+    store.read_with(cx, |store, cx| {
+        let root = store.solution_root_for_app(id, cx).expect("solution root");
+        let dir = crate::supervisor::supervisor_dir(&root, id);
+        let recs = crate::supervisor::read_verdicts(&dir);
+        assert_eq!(recs.len(), 3, "all three audit verdicts are logged");
+        assert!(recs[0].dropped, "the Held-gated escalate is marked dropped");
+        assert!(recs[1].dropped, "the Disabled-gated escalate is marked dropped");
+        assert!(!recs[2].dropped, "the Watching escalate is acted, not dropped");
+        assert_eq!(
+            crate::supervisor::verdict_stats(&recs).total,
+            1,
+            "verdict_stats counts only the acted audit escalate"
+        );
+    });
 }
 
 /// Send-time session-state re-check: a judge fires only while the session is

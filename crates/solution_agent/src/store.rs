@@ -1600,6 +1600,27 @@ impl SolutionAgentStore {
     ) {
         use crate::supervisor::{VerdictKind, VerdictRecord};
 
+        // Send-time gate (mirrors `apply_verdict`, FORK #31): the auditor spawned
+        // while the session was `Watching` and ran for minutes; if it has since
+        // been manually stopped (`Held`), disabled, or walled (`Stopped`), a late
+        // `escalate` must NOT force `WaitingUser` — that overrides the manual-stop
+        // rule (a `WaitingUser` is re-armed by self-activity — FORK #44) and
+        // toasts a session the user switched off. Computed BEFORE the append so the
+        // record can carry `dropped` — a gated escalation is still logged for the
+        // audit trail, just marked as not-acted so it isn't miscounted.
+        let supervising = self.supervisor_states.get(&id).is_some_and(|s| {
+            s.enabled
+                && !matches!(
+                    s.status,
+                    crate::supervisor::SupervisorStatus::Held
+                        | crate::supervisor::SupervisorStatus::Stopped(_)
+                )
+        });
+        // This audit wanted an action (escalate, or a failed audit) but the gate
+        // suppressed it. A clean pass (`ok && !escalate`) is NOT dropped — the
+        // no-op IS its outcome.
+        let audit_dropped = (escalate || !ok) && !supervising;
+
         if let Some(root) = self.solution_root_for(id, cx) {
             let dir = crate::supervisor::supervisor_dir(&root, id);
             let rec = VerdictRecord {
@@ -1611,27 +1632,13 @@ impl SolutionAgentStore {
                 message: None,
                 question: None,
                 tokens: None,
+                dropped: audit_dropped,
             };
             crate::supervisor::append_verdict(&dir, &rec).log_err();
         }
 
         self.finish_auditor(id, cx);
 
-        // Send-time gate (mirrors `apply_verdict`, FORK #31): the auditor spawned
-        // while the session was `Watching` and ran for minutes; if it has since
-        // been manually stopped (`Held`), disabled, or walled (`Stopped`), a late
-        // `escalate` must NOT force `WaitingUser` — that overrides the manual-stop
-        // rule (a `WaitingUser` is re-armed by self-activity — FORK #44) and
-        // toasts a session the user switched off. The record is still logged above
-        // for the audit trail; we just don't ACT on a now-stale escalation.
-        let supervising = self.supervisor_states.get(&id).is_some_and(|s| {
-            s.enabled
-                && !matches!(
-                    s.status,
-                    crate::supervisor::SupervisorStatus::Held
-                        | crate::supervisor::SupervisorStatus::Stopped(_)
-                )
-        });
         if (escalate || !ok) && supervising {
             self.escalate_to_user(id, format!("Supervisor meta-audit: {reasoning}"), cx);
         }
@@ -2090,6 +2097,10 @@ impl SolutionAgentStore {
                 message: message.clone(),
                 question: question.clone(),
                 tokens,
+                // Record whether this verdict is about to be dropped by the
+                // send-time gate so the meta-auditor / `verdict_stats` don't
+                // miscount a superseded verdict as an acted nudge.
+                dropped: drop_verdict,
             };
             crate::supervisor::append_verdict(&dir, &rec).log_err();
         }

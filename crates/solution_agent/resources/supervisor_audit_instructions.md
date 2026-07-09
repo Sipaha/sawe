@@ -4,6 +4,13 @@ issued several consecutive `continue` verdicts for session
 diary at `{DIARY_PATH}`. Decide whether the supervisor is making real progress
 or is stuck repeating itself / missing a problem that needs the human.
 
+A verdict-log line with `"dropped":true` was PRODUCED by the supervisor but
+never delivered to the working agent (it was superseded by a fresh user reply,
+or supervision was off / paused / stopped by the time it landed). Treat those
+lines as NOT acted on: they show what the supervisor was thinking, but they did
+not nudge the agent — do not count them when judging whether nudges are
+repetitive or whether the agent is actually being pushed.
+
 ## What to look for
 
 - Are the `reasoning` strings in the verdict log substantively different from
