@@ -12681,6 +12681,61 @@ async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
     );
 }
 
+/// MEDIUM-hardening #4: a reconnect whose `resume_session` never completes
+/// (dead subprocess / unsupported backend) must NOT strand the session at the
+/// transient `Errored("reconnecting…")` forever. After one bounded retry it
+/// surfaces the failure and lands a CLEAR terminal error the user can act on.
+/// The mock backend can't load/resume, so `resume_session` fails fast twice —
+/// exercising the retry-then-notify path without waiting on the timeout.
+#[gpui::test]
+async fn reconnect_resume_failure_surfaces_after_retry(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    // Look wedged mid-turn so `reconnect_agent` runs its normal path.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.session(session_id).unwrap().update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+            });
+        });
+    });
+
+    let task = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.reconnect_agent(session_id, cx))
+    });
+    let result = task.await;
+    cx.executor().run_until_parked();
+
+    assert!(
+        result.is_err(),
+        "a reconnect whose resume can't complete must report failure"
+    );
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let state = store.session(session_id).unwrap().read(cx).state.clone();
+            match state {
+                SessionState::Errored(msg) => {
+                    assert!(
+                        msg.contains("перезапустите"),
+                        "terminal error must carry actionable guidance (not stuck at \
+                         reconnecting…), got {msg:?}"
+                    );
+                    assert!(
+                        !msg.contains("reconnecting"),
+                        "must not be left in the transient reconnecting state, got {msg:?}"
+                    );
+                }
+                other => panic!("expected Errored(actionable), got {other:?}"),
+            }
+        });
+    });
+}
+
 /// The regression this session shipped: a wedge that happened on an UNANSWERED
 /// user message must re-engage the fresh subprocess with the "you didn't answer
 /// the user's last message" prompt, NOT the generic "carry on" — otherwise the

@@ -55,6 +55,12 @@ const STUCK_TURN_SECS: u64 = 5 * 60;
 /// wedging mid-tool.
 const TOOL_STUCK_SECS: u64 = 20 * 60;
 
+/// Per-attempt timeout for a reconnect's `resume_session` (subprocess respawn +
+/// ACP handshake). A dead subprocess can start but never complete the handshake,
+/// hanging the resume forever and stranding the session at `Errored("reconnecting…")`.
+/// Generous enough for a slow cold start; a timeout is retried once, then surfaced.
+const RECONNECT_RESUME_TIMEOUT_SECS: u64 = 60;
+
 /// Retry delay when a judge/auditor spawn is skipped because the per-solution
 /// MCP socket (which serves the scoped verdict tools) isn't resolvable yet.
 /// Gates the next fire so a sustained socket outage doesn't re-fire→re-skip on
@@ -123,6 +129,17 @@ fn tail_is_unanswered_user_message(entries: &[crate::session_entry::SessionEntry
                         && !acp_thread::is_editor_recovery_blocks(chunks)
             )
         })
+}
+
+/// Human-readable reason a reconnect resume attempt did not succeed, folding the
+/// two failure shapes `with_timeout` produces — `Err(timeout)` and `Ok(Err(resume
+/// error))` — into one string for the log.
+fn reconnect_attempt_error(outcome: Result<Result<SolutionSessionId>>) -> String {
+    match outcome {
+        Ok(Ok(_)) => "ok".to_string(),
+        Ok(Err(err)) => err.to_string(),
+        Err(timeout) => timeout.to_string(),
+    }
 }
 
 pub struct SolutionAgentStore {
@@ -6011,9 +6028,75 @@ impl SolutionAgentStore {
             s.last_activity_at = chrono::Utc::now();
         });
         self.mark_state_changed(session_id, cx);
+        // Retry material for a second attempt (see the spawn): `meta`/`project`
+        // are moved into the first `resume_session`, so clone them first.
+        let meta_retry = meta.clone();
+        let project_retry = project.clone();
         let resume = self.resume_session(meta, project, cx);
         cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let resumed = resume.await?;
+            let timeout = std::time::Duration::from_secs(RECONNECT_RESUME_TIMEOUT_SECS);
+            // Attempt 1, bounded: a resume that hangs on a dead-subprocess
+            // handshake must not strand the session at `Errored("reconnecting…")`
+            // forever. `with_timeout` drops (cancels) the resume task on timeout.
+            let resumed = match crate::message_generator::with_timeout(resume, timeout, cx).await {
+                Ok(Ok(resumed)) => resumed,
+                first => {
+                    log::warn!(
+                        "session={session_id} reconnect resume attempt 1 failed ({}); retrying once",
+                        reconnect_attempt_error(first)
+                    );
+                    this.update(cx, |store, cx| {
+                        // Force a fresh subprocess on the retry: attempt 1 may
+                        // have pooled a half-dead connection.
+                        store.pool.lock().remove(&pair);
+                        // Re-bump the activity clock so the supervisor tick doesn't
+                        // fire a judge INTO the still-transient reconnecting state
+                        // during attempt 2 (finding #7): attempt 1 timing out at
+                        // RECONNECT_RESUME_TIMEOUT_SECS would otherwise cross
+                        // IDLE_THRESHOLD_SECS exactly as attempt 2 begins. No await
+                        // between the timeout and this bump, so no tick interleaves.
+                        if let Some(s) = store.sessions.get(&session_id).cloned() {
+                            s.update(cx, |s, _| s.last_activity_at = chrono::Utc::now());
+                        }
+                    })
+                    .ok();
+                    let retry = this
+                        .update(cx, |store, cx| {
+                            store.resume_session(meta_retry, project_retry, cx)
+                        })?;
+                    match crate::message_generator::with_timeout(retry, timeout, cx).await {
+                        Ok(Ok(resumed)) => resumed,
+                        second => {
+                            let detail = reconnect_attempt_error(second);
+                            log::error!(
+                                "session={session_id} reconnect resume failed after retry ({detail})"
+                            );
+                            // Leave a CLEAR, actionable terminal error (not the
+                            // transient "reconnecting…" that never resolves). The
+                            // guidance rides in the state string itself, NOT a
+                            // system note: the session is cold here (its thread was
+                            // dropped at reconnect start and never re-grafted), and
+                            // `push_system_note` no-ops without a live thread — the
+                            // Errored state is the only surface the user still sees.
+                            this.update(cx, |store, cx| {
+                                store.mutate_state(
+                                    session_id,
+                                    |st| {
+                                        *st = SessionState::Errored(SharedString::from(
+                                            "переподключение не удалось — перезапустите агента (Restart)",
+                                        ))
+                                    },
+                                    cx,
+                                );
+                            })
+                            .ok();
+                            return Err(anyhow!(
+                                "reconnect of session {session_id} failed after retry: {detail}"
+                            ));
+                        }
+                    }
+                }
+            };
             // Leave a visible breadcrumb in the conversation so the user knows
             // the editor recovered the session (vs it silently coming back).
             this.update(cx, |store, cx| {

@@ -234,7 +234,7 @@ fn pick_active_solution(repo_work_dir: Option<&Path>, cx: &gpui::App) -> Result<
         .ok_or_else(|| anyhow!("no active Solution to host the ephemeral AI task"))
 }
 
-async fn with_timeout<F, T>(fut: F, timeout: Duration, cx: &AsyncApp) -> Result<T>
+pub(crate) async fn with_timeout<F, T>(fut: F, timeout: Duration, cx: &AsyncApp) -> Result<T>
 where
     F: std::future::Future<Output = T>,
 {
