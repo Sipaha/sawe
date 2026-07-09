@@ -32,7 +32,7 @@ judge-timeout classifier, the reconnect↔observer boundary — did not.
 - `JUDGE_TIMEOUT_SECS` measures wall-clock from fire, not judge liveness → a thorough judge is killed mid-verdict. (check judge session `last_activity_at`/streaming before declaring dead)
 - `TOOL_STUCK_SECS`=20min hard-kills legitimately long foreground tools → possible duplicate build/deploy. (check process/terminal liveness before reconnect)
 - No watchdog on the reconnect itself → a failed/hung `resume_session` strands the session `Errored("reconnecting…")` forever. (retry-once-then-notify)
-- Agent-side wall as an `Error` event loses its text (`Errored("agent error")`) → reset time unrecoverable if the judge's failure is also a stall. (run anchored `is_usage_limit_error` in the Error arm)
+- **DONE** Agent-side wall as an `Error` event loses its text (`Errored("agent error")`) → reset time unrecoverable. (fixed `284435a46b`: split `Error`/`LoadError` arms; new `session_wall_message` helper — turn-boundary-anchored so a stale prior-turn wall can't reclassify a later transient error — routes a supervised wall to `apply_usage_limit_stop`, surfaces the text for an unsupervised session)
 - Dropped verdicts logged indistinguishably from acted ones → auditor miscounts. (add `dropped: true` to `VerdictRecord`)
 - `VerdictRecord.tokens` always `None` in production → `total_tokens` stat permanently 0. (fill from judge token usage, or drop the field)
 - Zero-output long background shells reaped as stale at ~7min → lose `has_live_background_work` suppression. (degrades gracefully to a `wait`)
