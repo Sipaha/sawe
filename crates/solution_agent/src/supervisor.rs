@@ -373,6 +373,12 @@ pub struct JudgeBriefingContext {
     /// Absolute path to this Solution's MCP unix socket (the per-solution
     /// `mcp.sock`). Target of the `--nc` bridge pipe above.
     pub socket_path: String,
+    /// Single-use credential minted for THIS briefing (see [`new_verdict_nonce`]).
+    /// The judge/auditor must echo it back in its `supervisor_verdict` /
+    /// `supervisor_audit_verdict` call; the store rejects any verdict whose nonce
+    /// doesn't match the in-flight ephemeral session's stored nonce. Any other
+    /// client on the per-solution socket lacks it, so it can't forge a verdict.
+    pub nonce: String,
 }
 
 const JUDGE_INSTRUCTIONS: &str = include_str!("../resources/supervisor_judge_instructions.md");
@@ -430,8 +436,55 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         .replace("{COMPACT_DIR}", &ctx.compact_dir)
         .replace("{BRIDGE_BIN}", &ctx.bridge_bin)
         .replace("{SOCKET_PATH}", &ctx.socket_path)
+        .replace("{VERDICT_NONCE}", &ctx.nonce)
         .replace("{CONTEXT_USAGE_SECTION}", &context_section)
         .replace("{CUSTOM_PROMPT_SECTION}", &custom_section)
+}
+
+/// Mint a fresh single-use credential for one judge/auditor briefing. It rides
+/// in the briefing plaintext ([`JudgeBriefingContext::nonce`], `{VERDICT_NONCE}`)
+/// — the only side channel the ephemeral `claude` subprocess has — and must be
+/// echoed by the `supervisor_verdict` / `supervisor_audit_verdict` call, which
+/// the store checks against the in-flight session's stored nonce before acting.
+/// 32 chars over a 36-symbol alphabet ≈ 165 bits: unguessable by another client
+/// racing on the same per-solution socket. Same rejection-sampling scheme as
+/// [`crate::model::SolutionSessionId::new`] so the distribution stays uniform.
+pub fn new_verdict_nonce() -> String {
+    use rand::RngCore as _;
+    const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    const LEN: usize = 32;
+    let mut rng = rand::rng();
+    let mut buf = [0u8; 1];
+    let mut out = String::with_capacity(LEN);
+    for _ in 0..LEN {
+        loop {
+            rng.fill_bytes(&mut buf);
+            let x = buf[0] as usize;
+            if x < 252 {
+                out.push(ALPHABET[x % 36] as char);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Constant-time-ish equality for a verdict nonce, so a forged-verdict attempt
+/// on the local socket can't byte-by-byte time its way to the real credential.
+/// The threat model is low (local socket, own agent) but the check is cheap and
+/// removes the trivial short-circuit `==` leak. Length mismatch short-circuits
+/// (nonces are fixed-length, so an equal-length compare is the only case that
+/// matters).
+pub fn verdict_nonce_matches(expected: &str, provided: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), provided.as_bytes());
+    if a.is_empty() || a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub fn supervisor_dir(solution_root: &Path, session_id: SolutionSessionId) -> PathBuf {
@@ -1072,6 +1125,7 @@ mod tests {
             audit: false,
             bridge_bin: "/path/to/sawe".into(),
             socket_path: "/run/sol/mcp.sock".into(),
+            nonce: "noncevalue123".into(),
         };
         let out = build_judge_briefing(&ctx);
         assert!(out.contains("abcd1234"));
@@ -1080,12 +1134,15 @@ mod tests {
         assert!(out.contains("187,000 / 200,000 tokens (94%)"));
         // The `--nc` bridge command is fully materialized for the judge.
         assert!(out.contains("/path/to/sawe --nc /run/sol/mcp.sock"));
+        // The verdict nonce reaches the briefing verbatim so the judge can echo it.
+        assert!(out.contains("noncevalue123"));
         assert!(
             !out.contains("{DIARY_PATH}"),
             "all placeholders substituted"
         );
         assert!(!out.contains("{BRIDGE_BIN}"));
         assert!(!out.contains("{SOCKET_PATH}"));
+        assert!(!out.contains("{VERDICT_NONCE}"));
         assert!(!out.contains("{CUSTOM_PROMPT_SECTION}"));
         assert!(!out.contains("{CONTEXT_USAGE_SECTION}"));
     }
@@ -1103,6 +1160,7 @@ mod tests {
             audit: false,
             bridge_bin: "/path/to/sawe".into(),
             socket_path: "/run/sol/mcp.sock".into(),
+            nonce: "n".into(),
         };
         let out = build_judge_briefing(&ctx);
         assert!(!out.contains("{CUSTOM_PROMPT_SECTION}"));

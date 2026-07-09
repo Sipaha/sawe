@@ -4425,6 +4425,10 @@ impl McpServerTool for ForceIdleTool {
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct SupervisorVerdictParams {
     pub session_id: String,
+    /// The single-use nonce from your briefing (the `{VERDICT_NONCE}` value).
+    /// Echo it verbatim — a verdict without the matching nonce is rejected as
+    /// unauthorized.
+    pub nonce: String,
     /// One of: "continue", "compact", "done", "ask", "ask_agent", "wait".
     pub action: String,
     pub reasoning: String,
@@ -4448,6 +4452,7 @@ impl<'de> Deserialize<'de> for SupervisorVerdictParams {
         #[serde(default, deny_unknown_fields)]
         struct Inner {
             session_id: String,
+            nonce: String,
             action: String,
             reasoning: String,
             message: Option<String>,
@@ -4457,6 +4462,7 @@ impl<'de> Deserialize<'de> for SupervisorVerdictParams {
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             session_id: inner.session_id,
+            nonce: inner.nonce,
             action: inner.action,
             reasoning: inner.reasoning,
             message: inner.message,
@@ -4514,26 +4520,35 @@ impl McpServerTool for SupervisorVerdictTool {
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
 
-        cx.update(|cx| {
+        let outcome = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.apply_verdict(
+                store.apply_verdict_authenticated(
                     session_id,
+                    &input.nonce,
                     action,
                     input.reasoning,
                     input.message,
                     input.question,
-                    None,
                     input.wait_seconds,
                     cx,
-                );
-            });
+                )
+            })
         });
 
+        let text = match outcome {
+            crate::store::VerdictAuth::Applied => "recorded",
+            // Idempotent no-op — reported as success so a retrying judge stops.
+            crate::store::VerdictAuth::NoInFlight => {
+                "no active supervision for this session (already processed or superseded); ignored"
+            }
+            crate::store::VerdictAuth::Unauthorized => anyhow::bail!(
+                "unauthorized: verdict nonce does not match the active judge briefing for this session"
+            ),
+        };
+
         Ok(ToolResponse {
-            content: vec![ToolResponseContent::Text {
-                text: "recorded".into(),
-            }],
+            content: vec![ToolResponseContent::Text { text: text.into() }],
             structured_content: SupervisorVerdictResult {},
         })
     }
@@ -4553,6 +4568,10 @@ impl McpServerTool for SupervisorVerdictTool {
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct SupervisorAuditVerdictParams {
     pub session_id: String,
+    /// The single-use nonce from your briefing (the `{VERDICT_NONCE}` value).
+    /// Echo it verbatim — an audit verdict without the matching nonce is
+    /// rejected as unauthorized.
+    pub nonce: String,
     /// Whether the supervisor is making real progress (`true`) or is stuck /
     /// missing a problem the human should see (`false`).
     pub ok: bool,
@@ -4567,6 +4586,7 @@ impl<'de> Deserialize<'de> for SupervisorAuditVerdictParams {
         #[serde(default, deny_unknown_fields)]
         struct Inner {
             session_id: String,
+            nonce: String,
             ok: bool,
             action: String,
             reasoning: String,
@@ -4574,6 +4594,7 @@ impl<'de> Deserialize<'de> for SupervisorAuditVerdictParams {
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             session_id: inner.session_id,
+            nonce: inner.nonce,
             ok: inner.ok,
             action: inner.action,
             reasoning: inner.reasoning,
@@ -4613,17 +4634,32 @@ impl McpServerTool for SupervisorAuditVerdictTool {
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
 
-        cx.update(|cx| {
+        let outcome = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.apply_audit_verdict(session_id, input.ok, escalate, input.reasoning, cx);
-            });
+                store.apply_audit_verdict_authenticated(
+                    session_id,
+                    &input.nonce,
+                    input.ok,
+                    escalate,
+                    input.reasoning,
+                    cx,
+                )
+            })
         });
 
+        let text = match outcome {
+            crate::store::VerdictAuth::Applied => "recorded",
+            crate::store::VerdictAuth::NoInFlight => {
+                "no active auditor for this session (already processed); ignored"
+            }
+            crate::store::VerdictAuth::Unauthorized => anyhow::bail!(
+                "unauthorized: audit nonce does not match the active auditor briefing for this session"
+            ),
+        };
+
         Ok(ToolResponse {
-            content: vec![ToolResponseContent::Text {
-                text: "recorded".into(),
-            }],
+            content: vec![ToolResponseContent::Text { text: text.into() }],
             structured_content: SupervisorAuditVerdictResult {},
         })
     }

@@ -115,6 +115,7 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: None,
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -123,6 +124,7 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: None,
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -619,6 +621,7 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
                 JudgeHandle {
                     judge_id: None,
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -680,6 +683,7 @@ fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: Some(judge),
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -697,6 +701,7 @@ fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: None,
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -735,6 +740,7 @@ fn user_reply_supersedes_in_flight_judge(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: None,
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -801,6 +807,7 @@ fn verdict_applies_while_judge_in_flight(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: None,
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -2015,6 +2022,7 @@ async fn acted_verdict_records_judge_tokens(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: Some(judge_id),
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -2085,6 +2093,7 @@ async fn judge_past_timeout_but_streaming_is_not_killed(cx: &mut TestAppContext)
                 JudgeHandle {
                     judge_id: Some(judge_id),
                     started_ms: now_ms,
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -2142,6 +2151,7 @@ async fn judge_past_timeout_and_silent_is_killed(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: Some(judge_id),
                     started_ms: now_ms,
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -11282,6 +11292,7 @@ async fn observer_nudge_held_while_typing_then_flushed(cx: &mut gpui::TestAppCon
             JudgeHandle {
                 judge_id: None,
                 started_ms: now,
+                nonce: String::new(),
                 _task: Task::ready(()),
             },
         );
@@ -11339,6 +11350,161 @@ async fn observer_nudge_held_while_typing_then_flushed(cx: &mut gpui::TestAppCon
     );
 }
 
+/// Verdict authentication (#6): a `supervisor_verdict` call is honoured only
+/// when its nonce matches the in-flight judge's briefing nonce. A wrong nonce is
+/// rejected without touching state (the real judge can still submit); a matching
+/// nonce applies the verdict AND reaps the judge handle, so a duplicate re-submit
+/// (bridge-EOF retry) then finds no in-flight judge and is an idempotent no-op —
+/// no second nudge, no double counter bump.
+#[gpui::test]
+async fn verdict_nonce_authenticates_and_dedups(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::{SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        });
+        store.set_supervision_enabled(id, true, cx);
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(st) = store.supervisor_states.get_mut(&id) {
+            st.status = SupervisorStatus::Judging;
+            st.last_fired_at = Some(now);
+        }
+        store.judge_sessions.insert(
+            id,
+            JudgeHandle {
+                judge_id: None,
+                started_ms: now,
+                nonce: "goodnonce".into(),
+                _task: Task::ready(()),
+            },
+        );
+        // Park the delivered nudge (user "typing") so the accepted verdict bumps
+        // the counter without needing a live thread to deliver into.
+        store.note_user_input(id);
+
+        // Wrong nonce → rejected, no state change, judge still in flight.
+        let bad = store.apply_verdict_authenticated(
+            id,
+            "wrongnonce",
+            VerdictAction::Continue,
+            "forged".into(),
+            Some("Continue please.".into()),
+            None,
+            None,
+            cx,
+        );
+        assert!(
+            matches!(bad, VerdictAuth::Unauthorized),
+            "a mismatched nonce is rejected"
+        );
+        assert!(
+            store.judge_sessions.contains_key(&id),
+            "a rejected verdict must NOT reap the judge handle"
+        );
+        assert_eq!(
+            store.supervisor_state(id).unwrap().consecutive_continues,
+            0,
+            "a rejected verdict does not act"
+        );
+
+        // Correct nonce → applied (counter bumps, nudge parked) and handle reaped.
+        let ok = store.apply_verdict_authenticated(
+            id,
+            "goodnonce",
+            VerdictAction::Continue,
+            "keep going".into(),
+            Some("Continue please.".into()),
+            None,
+            None,
+            cx,
+        );
+        assert!(matches!(ok, VerdictAuth::Applied), "matching nonce applies");
+        assert!(
+            !store.judge_sessions.contains_key(&id),
+            "applying a verdict reaps the judge handle"
+        );
+        let st = store.supervisor_state(id).unwrap();
+        assert_eq!(st.consecutive_continues, 1, "the verdict acted");
+        assert_eq!(st.pending_nudge.as_deref(), Some("Continue please."));
+
+        // Duplicate re-submit (bridge-EOF retry) → no in-flight judge → no-op.
+        let dup = store.apply_verdict_authenticated(
+            id,
+            "goodnonce",
+            VerdictAction::Continue,
+            "retry".into(),
+            Some("Continue please.".into()),
+            None,
+            None,
+            cx,
+        );
+        assert!(
+            matches!(dup, VerdictAuth::NoInFlight),
+            "a re-submit after the handle is reaped is a no-op, not a second act"
+        );
+        assert_eq!(
+            store.supervisor_state(id).unwrap().consecutive_continues,
+            1,
+            "the duplicate did NOT bump the counter again"
+        );
+    });
+}
+
+/// Audit-verdict authentication (#6): the meta-auditor path enforces the same
+/// nonce + in-flight-handle gate, keyed on `auditor_sessions`.
+#[gpui::test]
+async fn audit_verdict_nonce_authenticates_and_dedups(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        let now = chrono::Utc::now().timestamp_millis();
+        store.auditor_sessions.insert(
+            id,
+            JudgeHandle {
+                judge_id: None,
+                started_ms: now,
+                nonce: "auditnonce".into(),
+                _task: Task::ready(()),
+            },
+        );
+
+        // Wrong nonce → rejected, auditor handle preserved.
+        let bad =
+            store.apply_audit_verdict_authenticated(id, "nope", false, true, "forged".into(), cx);
+        assert!(matches!(bad, VerdictAuth::Unauthorized));
+        assert!(
+            store.auditor_sessions.contains_key(&id),
+            "a rejected audit verdict must NOT reap the auditor handle"
+        );
+
+        // Correct nonce → applied, handle reaped.
+        let ok = store.apply_audit_verdict_authenticated(
+            id,
+            "auditnonce",
+            true,
+            false,
+            "healthy".into(),
+            cx,
+        );
+        assert!(matches!(ok, VerdictAuth::Applied));
+        assert!(!store.auditor_sessions.contains_key(&id));
+
+        // Re-submit → no in-flight auditor → idempotent no-op.
+        let dup = store.apply_audit_verdict_authenticated(
+            id,
+            "auditnonce",
+            true,
+            false,
+            "retry".into(),
+            cx,
+        );
+        assert!(matches!(dup, VerdictAuth::NoInFlight));
+    });
+}
+
 /// Audit / interrupt: turning supervision OFF while a judge is mid-review tears
 /// the judge down immediately, discards any held nudge, and a verdict that still
 /// races out of the torn-down judge is dropped by the send-time gate (no nudge,
@@ -11360,6 +11526,7 @@ async fn disabling_supervision_interrupts_running_judge(cx: &mut gpui::TestAppCo
             JudgeHandle {
                 judge_id: None,
                 started_ms: now,
+                nonce: String::new(),
                 _task: Task::ready(()),
             },
         );
@@ -11416,6 +11583,7 @@ async fn held_supervisor_drops_racing_verdict(cx: &mut gpui::TestAppContext) {
             JudgeHandle {
                 judge_id: None,
                 started_ms: now,
+                nonce: String::new(),
                 _task: Task::ready(()),
             },
         );
@@ -11510,6 +11678,7 @@ async fn changing_instruction_interrupts_running_judge(cx: &mut gpui::TestAppCon
             JudgeHandle {
                 judge_id: None,
                 started_ms: now,
+                nonce: String::new(),
                 _task: Task::ready(()),
             },
         );
@@ -11725,6 +11894,7 @@ async fn tick_sweeps_stuck_auditor(cx: &mut gpui::TestAppContext) {
             JudgeHandle {
                 judge_id: None,
                 started_ms: now - timeout_ms - 1_000,
+                nonce: String::new(),
                 _task: Task::ready(()),
             },
         );
@@ -11733,6 +11903,7 @@ async fn tick_sweeps_stuck_auditor(cx: &mut gpui::TestAppContext) {
             JudgeHandle {
                 judge_id: None,
                 started_ms: now,
+                nonce: String::new(),
                 _task: Task::ready(()),
             },
         );
@@ -12294,6 +12465,7 @@ fn visible_session_count_excludes_live_auditors(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: Some(auditor),
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );
@@ -12307,6 +12479,7 @@ fn visible_session_count_excludes_live_auditors(cx: &mut TestAppContext) {
                 JudgeHandle {
                     judge_id: None,
                     started_ms: chrono::Utc::now().timestamp_millis(),
+                    nonce: String::new(),
                     _task: Task::ready(()),
                 },
             );

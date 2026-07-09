@@ -279,7 +279,33 @@ struct JudgeHandle {
     /// without this timestamp the handle would leak forever and meta-audit would
     /// be permanently disabled for that session.
     started_ms: i64,
+    /// Single-use credential minted at spawn ([`crate::supervisor::new_verdict_nonce`])
+    /// and baked into this session's briefing. The `supervisor_verdict` /
+    /// `supervisor_audit_verdict` call must echo it or the store rejects the
+    /// verdict as unauthorized — a client on the per-solution socket that never
+    /// saw the briefing can't forge one. Removing the handle (`finish_judge` /
+    /// `finish_auditor`) invalidates the nonce, which also makes a duplicate
+    /// re-submit (bridge-EOF retry) a no-op instead of a second `apply_verdict`.
+    nonce: String,
     _task: Task<()>,
+}
+
+/// Outcome of an authenticated verdict submission from the MCP boundary
+/// (`apply_verdict_authenticated` / `apply_audit_verdict_authenticated`).
+pub(crate) enum VerdictAuth {
+    /// Nonce matched the in-flight judge/auditor; the verdict was applied.
+    Applied,
+    /// No in-flight judge/auditor for this session, so nothing was applied.
+    /// This is the idempotent case: the first (successful OR gate-dropped)
+    /// verdict already reaped the handle, so a bridge-EOF retry lands here and
+    /// is a no-op. Reported to the caller as SUCCESS so a retrying judge stops
+    /// re-submitting. A stray verdict for a session that never had a judge also
+    /// lands here — harmless, since nothing is mutated.
+    NoInFlight,
+    /// A judge/auditor IS in flight but the supplied nonce is wrong — a forged
+    /// or stale verdict. Rejected without touching any state (the real judge can
+    /// still submit with the correct nonce).
+    Unauthorized,
 }
 
 /// Metadata captured by [`SolutionAgentStore::teardown_session_runtime`] while
@@ -1384,6 +1410,11 @@ impl SolutionAgentStore {
             return;
         };
         let socket_path = socket_path.to_string_lossy().into_owned();
+        // One-time credential for this briefing: the judge/auditor echoes it in
+        // its verdict call and the store checks it against the handle's nonce
+        // (see `apply_verdict_authenticated`). Minted before the briefing so it
+        // rides into the template, and stored on the handle below.
+        let nonce = crate::supervisor::new_verdict_nonce();
         let briefing =
             crate::supervisor::build_judge_briefing(&crate::supervisor::JudgeBriefingContext {
                 supervised_session_id: id.to_string(),
@@ -1406,6 +1437,7 @@ impl SolutionAgentStore {
                 audit,
                 bridge_bin,
                 socket_path,
+                nonce: nonce.clone(),
             });
 
         // Spawn the judge/auditor as a CHILD of the supervised session
@@ -1478,6 +1510,7 @@ impl SolutionAgentStore {
         let handle = JudgeHandle {
             judge_id: None,
             started_ms: chrono::Utc::now().timestamp_millis(),
+            nonce,
             _task: task,
         };
         if audit {
@@ -2087,6 +2120,68 @@ impl SolutionAgentStore {
         // continue-cap counter (apply_verdict just incremented it) nor be
         // mistaken for a human reply that resumes a `WaitingUser` pause.
         self.send_message_blocks_targeted(id, blocks, crate::model::QueueTarget::Main, false, cx)
+    }
+
+    /// Authenticated entry point for the `supervisor_verdict` MCP tool. Verifies
+    /// the caller-supplied `nonce` against the in-flight judge's stored nonce
+    /// before applying the verdict, so an arbitrary client on the per-solution
+    /// socket can't forge one. The nonce check doubles as an idempotency guard:
+    /// applying the first verdict reaps the judge handle (`finish_judge`), so a
+    /// duplicate re-submit (the bridge exits on stdin EOF and the judge is told
+    /// to retry on an empty reply) finds no in-flight judge and is a no-op.
+    /// Internal/test callers use [`apply_verdict`](Self::apply_verdict) directly
+    /// (trusted, un-authenticated).
+    pub(crate) fn apply_verdict_authenticated(
+        &mut self,
+        id: SolutionSessionId,
+        nonce: &str,
+        action: crate::supervisor::VerdictAction,
+        reasoning: String,
+        message: Option<String>,
+        question: Option<String>,
+        wait_seconds: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> VerdictAuth {
+        // Resolve the nonce match into a bool BEFORE the `&mut self` call so the
+        // `&self.judge_sessions` borrow ends first.
+        let matched = self
+            .judge_sessions
+            .get(&id)
+            .map(|handle| crate::supervisor::verdict_nonce_matches(&handle.nonce, nonce));
+        match matched {
+            Some(true) => {
+                self.apply_verdict(id, action, reasoning, message, question, None, wait_seconds, cx);
+                VerdictAuth::Applied
+            }
+            Some(false) => VerdictAuth::Unauthorized,
+            None => VerdictAuth::NoInFlight,
+        }
+    }
+
+    /// Authenticated entry point for the `supervisor_audit_verdict` MCP tool.
+    /// Same nonce + in-flight-handle gate as [`apply_verdict_authenticated`],
+    /// keyed on `auditor_sessions`.
+    pub(crate) fn apply_audit_verdict_authenticated(
+        &mut self,
+        id: SolutionSessionId,
+        nonce: &str,
+        ok: bool,
+        escalate: bool,
+        reasoning: String,
+        cx: &mut Context<Self>,
+    ) -> VerdictAuth {
+        let matched = self
+            .auditor_sessions
+            .get(&id)
+            .map(|handle| crate::supervisor::verdict_nonce_matches(&handle.nonce, nonce));
+        match matched {
+            Some(true) => {
+                self.apply_audit_verdict(id, ok, escalate, reasoning, cx);
+                VerdictAuth::Applied
+            }
+            Some(false) => VerdictAuth::Unauthorized,
+            None => VerdictAuth::NoInFlight,
+        }
     }
 
     /// Record the judge's verdict, tear down the judge session, and execute the

@@ -48,10 +48,16 @@ drift. It also records the user's language.
 
 Submit through the bridge — tool `solution_agent.supervisor_audit_verdict`,
 arguments
-`{"session_id":"{SUPERVISED_SESSION_ID}","ok":<true|false>,"action":"<continue_supervision|escalate>","reasoning":"<short>"}`
-(`ok:true` lets supervision continue, `ok:false`/`escalate` forces human
-escalation. `ok:false` forces escalation regardless of `action`. On `escalate`
-your `reasoning` is surfaced to the operator — write it in the **user's
-language**.) CHECK the response comes back `isError:false`; retry on error.
+`{"session_id":"{SUPERVISED_SESSION_ID}","nonce":"{VERDICT_NONCE}","ok":<true|false>,"action":"<continue_supervision|escalate>","reasoning":"<short>"}`
+(the `nonce` is a one-time credential unique to THIS audit — copy it verbatim
+from the value above; a verdict without the matching nonce is rejected as
+unauthorized. `ok:true` lets supervision continue, `ok:false`/`escalate` forces
+human escalation. `ok:false` forces escalation regardless of `action`. On
+`escalate` your `reasoning` is surfaced to the operator — write it in the
+**user's language**.) CHECK the response comes back `isError:false` (`recorded`).
+An "unauthorized" reply means a mistyped nonce — re-copy and retry; a "no active
+auditor … ignored" reply means it already landed or the audit was torn down
+while you ran (either way you are DONE, do not re-send); otherwise retry on a
+genuine error.
 
 {CUSTOM_PROMPT_SECTION}

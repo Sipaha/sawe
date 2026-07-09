@@ -334,11 +334,19 @@ in in that session.
    wait").
 3. Submit your verdict through the bridge — tool
    `solution_agent.supervisor_verdict`, arguments
-   `{"session_id":"{SUPERVISED_SESSION_ID}","action":"<continue|wait|compact|done|ask_agent|ask>","reasoning":"<one paragraph; for a done(a) completion, the full session summary described above>","wait_seconds":<n, only for wait>}`
-   plus `"message"` or `"question"` when the action needs it. CHECK the response:
-   it must come back with `isError:false` — if you get an error or no response,
-   fix the call and retry; an unsent verdict means your whole wake-up was wasted
-   and the agent stays stalled. Do NOT send any message to the working session
-   yourself — the editor performs the action from your verdict.
+   `{"session_id":"{SUPERVISED_SESSION_ID}","nonce":"{VERDICT_NONCE}","action":"<continue|wait|compact|done|ask_agent|ask>","reasoning":"<one paragraph; for a done(a) completion, the full session summary described above>","wait_seconds":<n, only for wait>}`
+   plus `"message"` or `"question"` when the action needs it. The `nonce` is a
+   one-time credential unique to THIS wake-up — copy it verbatim from the value
+   above; a verdict without the matching nonce is rejected as unauthorized. CHECK
+   the response: `recorded` (with `isError:false`) means it landed. An
+   `isError:true` "unauthorized" reply means you mistyped the nonce — re-copy it
+   and retry. A reply that says "no active supervision … ignored" means either
+   your verdict already landed on an earlier attempt (a slow/empty bridge reply
+   the first time) or supervision was torn down while you ran — either way you
+   are DONE, do NOT re-send. Otherwise, on a genuine
+   error or a truly empty reply, fix the call and retry; an unsent verdict means
+   your whole wake-up was wasted and the agent stays stalled. Do NOT send any
+   message to the working session yourself — the editor performs the action from
+   your verdict.
 
 {CUSTOM_PROMPT_SECTION}
