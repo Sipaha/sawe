@@ -1,6 +1,6 @@
 # God-object refactor — Tier 4 (audit-driven full decomposition)
 
-**Status:** in progress
+**Status:** complete
 **Date:** 2026-07-10
 **Owner:** supervisor session
 **Predecessors:** tier1/2/3 (complete). Source: an architecture audit
@@ -119,4 +119,13 @@ entry-persistence cluster (430 lines on the #35/#40 path — risk/reward inverte
 - `0e776a17e7` — A7: `solutions/mcp/project_files.rs` 1826 → 216 (+fs_ops/buffer_ops/code_nav); `workspace_state.rs` 1278 → 549 (+visual_structure/diagnostics).
 - `bcee43a347` — A9: `solutions/store.rs` 1602 → 948 (+catalog/lifecycle/members).
 
-### Stage B — pending (store.rs cluster relocations)
+### Stage B — COMPLETE (`store.rs` 7998 → 3559, −55%; 563 green after every commit; whole-binary clean)
+- `1b8b6305cc` + `4aacf94e98` — B2: background-teammate reconciler → `store/teammate_reconciler.rs` (1570). store.rs 7998 → 6463.
+- `cb3f183f98` + `39fac793bb` + `a390733186` — B3: hydration/resume → `store/hydration.rs` (1703; `resume_session` its own commit). 6463 → 4803.
+- `3fd3c626fe` + `6ee6d3155b` — B5: teardown/archive-GC → `store/teardown.rs` (489). 4803 → 4339.
+- `790021aacf` — B4: `handle_acp_event` (786-line #35/#44 nexus, moved whole verbatim) → `store/acp_event.rs` (795). 4339 → 3559.
+
+All relocations verbatim (independently diff-verified, zero logic hunks); hardening #35/#40/#43/#44/#47/#48 preserved byte-for-byte; test-bucket `crate::store::X` paths preserved via `pub(crate) use` re-exports (some `#[cfg(test)]`-gated).
+
+## Final store/ module tree (from a 10,191-line monolith at session start)
+`store.rs` 3559 (coordinator) · `supervisor_engine.rs` 2183 · `hydration.rs` 1703 · `teammate_reconciler.rs` 1570 · `queue.rs` 908 · `acp_event.rs` 795 · `teardown.rs` 489 · `connection_pool.rs` 200 · `test_support.rs` 90 · `tests.rs` 9 (root) + `tests/` subject tree.
