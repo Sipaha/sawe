@@ -25,6 +25,7 @@ use crate::model::{
 };
 use crate::notifier;
 use crate::pool::SubprocessPool;
+use crate::teammate_watchers::TeammateWatchers;
 
 mod connection_pool;
 mod queue;
@@ -235,30 +236,12 @@ pub struct SolutionAgentStore {
     /// phase-6b keystone bug). Stored as `Task<()>` so it stays alive across
     /// links; removed on `purge_session_hard`.
     entries_persist_chain: HashMap<SolutionSessionId, Task<()>>,
-    /// One per-session background-agent watcher task — alive as long as
-    /// the session has >=1 registered `background_agents`. Stored as
-    /// `Task<()>` so dropping kills the watcher cleanly. Populated by
-    /// `ensure_background_agent_watcher` (called from the tool-call
-    /// handler in a later task of the Background Agents Strip plan).
-    background_agent_watchers: HashMap<SolutionSessionId, gpui::Task<()>>,
-    /// One per-session background-shell watcher task — alive as long as the
-    /// session has >=1 registered `background_shells`. Stored as `Task<()>`
-    /// so dropping kills the watcher cleanly. Populated by
-    /// `ensure_background_shell_watcher` (called from the tool-call handler
-    /// when claude announces a `Bash(run_in_background=true)` launch). Keyed
-    /// by `session_id` and structurally identical to
-    /// `background_agent_watchers` (separate map so the two pipelines arm /
-    /// cancel independently).
-    background_shell_watchers: HashMap<SolutionSessionId, gpui::Task<()>>,
-    /// Forward-only scan cursor into each session's PARENT session JSONL
-    /// transcript, used by `scan_parent_jsonl_for_completions` to detect
-    /// `<task-notification>` completion lines on the 1 Hz tick. Lazily
-    /// initialised to the file's CURRENT length the first time a session is
-    /// scanned — so we only observe completions FORWARD from editor launch
-    /// and never re-flip shells off historical notifications. Cleared for a
-    /// session once it has no `background_shells`, so a future shell re-arms
-    /// from the then-current EOF.
-    parent_jsonl_scan_offsets: HashMap<SolutionSessionId, u64>,
+    /// Per-session teammate-watching state (survey cluster C10): the managed-
+    /// agent + background-shell JSONL/`.output` watcher tasks and the
+    /// forward-only parent-JSONL scan cursors. The arming / tailing methods
+    /// below stay on `Store` (they read `sessions`, spawn on `Context<Store>`,
+    /// and emit store events) but route their map-state access through this.
+    teammate_watchers: TeammateWatchers,
     /// Throttler for `workspace.session_metrics_changed` notifications.
     /// Caps emit rate at ~1 per 2 seconds per session so chatty fields
     /// (`last_activity_at`, `total_tokens`, `max_tokens`) don't flood
@@ -1022,9 +1005,7 @@ impl SolutionAgentStore {
             focus_resolver: None,
             entry_update_throttles: HashMap::new(),
             entries_persist_chain: HashMap::new(),
-            background_agent_watchers: HashMap::new(),
-            background_shell_watchers: HashMap::new(),
-            parent_jsonl_scan_offsets: HashMap::new(),
+            teammate_watchers: TeammateWatchers::new(),
             metrics_emitter: MetricsEmitter::new(),
             _solution_subscription: solution_subscription,
             _bg_agents_tick: Some(bg_agents_tick),
@@ -1683,10 +1664,8 @@ impl SolutionAgentStore {
     /// run separately while the supervised session is still reachable).
     fn evict_session_runtime_maps(&mut self, id: SolutionSessionId) {
         self.supervisor_states.remove(&id);
-        self.background_agent_watchers.remove(&id);
-        self.background_shell_watchers.remove(&id);
+        self.teammate_watchers.forget_session(id);
         self.backoff_timers.remove(&id);
-        self.parent_jsonl_scan_offsets.remove(&id);
         self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
         // Drop the persist-serialization chain: a hard teardown abandons any
         // in-flight entry-row write (the session's rows are being purged anyway).
@@ -7833,7 +7812,7 @@ impl SolutionAgentStore {
         fs: Arc<dyn fs::Fs>,
         cx: &mut Context<Self>,
     ) {
-        if self.background_agent_watchers.contains_key(&session_id) {
+        if self.teammate_watchers.has_agent_watcher(session_id) {
             return;
         }
         let Some(session) = self.session(session_id) else {
@@ -7881,7 +7860,7 @@ impl SolutionAgentStore {
                 }
             }
         });
-        self.background_agent_watchers.insert(session_id, task);
+        self.teammate_watchers.arm_agent_watcher(session_id, task);
     }
 
     /// Tail the JSONL file for `agent_id` on `session_id`, parse the
@@ -7989,7 +7968,7 @@ impl SolutionAgentStore {
         tasks_dir: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        if self.background_shell_watchers.contains_key(&session_id) {
+        if self.teammate_watchers.has_shell_watcher(session_id) {
             return;
         }
         let task = cx.spawn(async move |this, cx| {
@@ -8019,7 +7998,7 @@ impl SolutionAgentStore {
                 }
             }
         });
-        self.background_shell_watchers.insert(session_id, task);
+        self.teammate_watchers.arm_shell_watcher(session_id, task);
     }
 
     /// Live-tail the `.output` file for `shell_id` on `session_id`, write
@@ -8517,7 +8496,7 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.session(session_id) else {
-            self.parent_jsonl_scan_offsets.remove(&session_id);
+            self.teammate_watchers.clear_scan_offset(session_id);
             return;
         };
         let (has_shells, any_running, cwd, acp_session_id) = {
@@ -8537,7 +8516,7 @@ impl SolutionAgentStore {
         };
         if !has_shells {
             // Re-arm from the then-current EOF the next time a shell registers.
-            self.parent_jsonl_scan_offsets.remove(&session_id);
+            self.teammate_watchers.clear_scan_offset(session_id);
             return;
         }
         if !any_running {
@@ -8554,13 +8533,13 @@ impl SolutionAgentStore {
         let len = metadata.len();
         // Lazy-init: first sight pins the cursor at the current EOF so we only
         // observe completions forward from now.
-        let offset = match self.parent_jsonl_scan_offsets.get(&session_id) {
+        let offset = match self.teammate_watchers.scan_offset(session_id) {
             Some(off) => {
                 // Truncation / rotation: cursor past EOF → re-read from start.
-                if *off > len { 0 } else { *off }
+                if off > len { 0 } else { off }
             }
             None => {
-                self.parent_jsonl_scan_offsets.insert(session_id, len);
+                self.teammate_watchers.set_scan_offset(session_id, len);
                 return;
             }
         };
@@ -8573,8 +8552,8 @@ impl SolutionAgentStore {
         };
         // Advance the cursor past the bytes we've fully consumed (the last
         // complete newline), leaving any trailing partial line for next tick.
-        self.parent_jsonl_scan_offsets
-            .insert(session_id, offset + consumed);
+        self.teammate_watchers
+            .set_scan_offset(session_id, offset + consumed);
         if lines.is_empty() {
             return;
         }

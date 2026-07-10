@@ -33,6 +33,7 @@ pub(crate) mod status_row;
 pub mod store;
 pub mod stream;
 pub mod supervisor;
+pub(crate) mod teammate_watchers;
 pub mod supervisor_instruction_modal;
 pub mod upload;
 

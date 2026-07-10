@@ -99,10 +99,10 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
             store
                 .supervisor_states
                 .insert(id, crate::supervisor::SupervisorState::new(id));
-            store.background_agent_watchers.insert(id, Task::ready(()));
-            store.background_shell_watchers.insert(id, Task::ready(()));
+            store.teammate_watchers.arm_agent_watcher(id, Task::ready(()));
+            store.teammate_watchers.arm_shell_watcher(id, Task::ready(()));
             store.backoff_timers.insert(id, Task::ready(()));
-            store.parent_jsonl_scan_offsets.insert(id, 0);
+            store.teammate_watchers.set_scan_offset(id, 0);
             store
                 .metrics_emitter
                 .last_emit
@@ -137,11 +137,11 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
                 "supervisor_states leaked"
             );
             assert!(
-                !store.background_agent_watchers.contains_key(&id),
+                !store.teammate_watchers.has_agent_watcher(id),
                 "background_agent_watchers leaked"
             );
             assert!(
-                !store.background_shell_watchers.contains_key(&id),
+                !store.teammate_watchers.has_shell_watcher(id),
                 "background_shell_watchers leaked"
             );
             assert!(
@@ -149,7 +149,7 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
                 "backoff_timers leaked"
             );
             assert!(
-                !store.parent_jsonl_scan_offsets.contains_key(&id),
+                !store.teammate_watchers.has_scan_offset(id),
                 "parent_jsonl_scan_offsets leaked"
             );
             assert!(
@@ -612,10 +612,10 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
             store
                 .supervisor_states
                 .insert(id, crate::supervisor::SupervisorState::new(id));
-            store.background_agent_watchers.insert(id, Task::ready(()));
-            store.background_shell_watchers.insert(id, Task::ready(()));
+            store.teammate_watchers.arm_agent_watcher(id, Task::ready(()));
+            store.teammate_watchers.arm_shell_watcher(id, Task::ready(()));
             store.backoff_timers.insert(id, Task::ready(()));
-            store.parent_jsonl_scan_offsets.insert(id, 0);
+            store.teammate_watchers.set_scan_offset(id, 0);
             store.judge_sessions.insert(
                 id,
                 JudgeHandle {
@@ -634,11 +634,11 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
                 "supervisor_states leaked"
             );
             assert!(
-                !store.background_agent_watchers.contains_key(&id),
+                !store.teammate_watchers.has_agent_watcher(id),
                 "background_agent_watchers leaked"
             );
             assert!(
-                !store.background_shell_watchers.contains_key(&id),
+                !store.teammate_watchers.has_shell_watcher(id),
                 "background_shell_watchers leaked"
             );
             assert!(
