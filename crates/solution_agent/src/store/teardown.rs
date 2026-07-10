@@ -306,4 +306,184 @@ impl SolutionAgentStore {
         }
         cx.notify();
     }
+
+    /// Drop all per-session in-memory runtime maps for `id`: supervisor control
+    /// state, the background-agent / background-shell watcher tasks, the
+    /// transient-failure backoff timer, the parent-jsonl scan cursor, and the
+    /// per-entry update throttles. Shared by every session-teardown path
+    /// (`close_session`, `cold_close_solution`, `gc_orphan_solutions`) so none of
+    /// these maps accumulates stale entries over a long-lived editor process —
+    /// each was previously only pruned on its own narrow path (or, for
+    /// `supervisor_states`, never), leaking one entry per closed session.
+    /// Does NOT touch the DB, emit events, release the pool, or reap an in-flight
+    /// judge/auditor — callers handle those (`finish_judge`/`finish_auditor` must
+    /// run separately while the supervised session is still reachable).
+    fn evict_session_runtime_maps(&mut self, id: SolutionSessionId) {
+        self.supervisor_states.remove(&id);
+        self.teammate_watchers.forget_session(id);
+        self.backoff_timers.remove(&id);
+        self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
+        // Drop the persist-serialization chain: a hard teardown abandons any
+        // in-flight entry-row write (the session's rows are being purged anyway).
+        self.entries_persist_chain.remove(&id);
+        // The metrics throttle map is keyed by session id and is otherwise
+        // never pruned — one entry would leak per closed session for the
+        // editor's whole lifetime.
+        self.metrics_emitter.clear_session(&id);
+        self.raw_transcript_history.remove(&id);
+    }
+
+    /// Tear down the IN-MEMORY runtime state shared by every per-session
+    /// teardown path ([`close_session`](Self::close_session) and
+    /// [`purge_session_hard`](Self::purge_session_hard)): reap any in-flight
+    /// judge/auditor, cancel an in-flight turn, drop the live entity (releasing
+    /// its `Project`/worktree fd), remove the id from `by_solution` (dropping the
+    /// solution key when it empties), and evict every per-session runtime map.
+    /// Returns the metadata the callers need to finish the DB/disk/pool side
+    /// (captured BEFORE the entity dropped), or `None` when `id` wasn't
+    /// hydrated. This is the single canonical in-memory teardown primitive — no
+    /// call site re-implements finish_judge/cancel/evict inline.
+    fn teardown_session_runtime(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> Option<SessionTeardown> {
+        // Reap any in-flight ephemeral judge/auditor FIRST, while the supervised
+        // session is still reachable. Each closes its own hidden child session
+        // (releasing that child's pooled `claude` subprocess + refcount);
+        // skipping this strands the judge/auditor open forever — its pool
+        // refcount never releases, so its subprocess never hits the idle
+        // shutdown debounce and lingers for the editor's whole lifetime (the
+        // dozens-of-orphaned-`claude`-processes leak on a long supervised run).
+        // No-ops when `id` has no live judge/auditor (incl. when `id` is itself
+        // an ephemeral child — those are never keys in these maps).
+        self.finish_judge(id, cx);
+        self.finish_auditor(id, cx);
+        if let Some(entity) = self.sessions.get(&id)
+            && matches!(entity.read(cx).state, SessionState::Running { .. })
+        {
+            self.cancel_turn(id, cx).log_err();
+        }
+        let removed = self.sessions.remove(&id)?;
+        let session_read = removed.read(cx);
+        // If the session is being torn down with queued messages still
+        // unflushed, surface them in the log — teardown silently drops
+        // everything in `pending_messages` (no Stopped event ever fires for the
+        // torn-down thread).
+        if !session_read.pending_messages.is_empty() {
+            let previews: Vec<String> = session_read
+                .pending_messages
+                .iter()
+                .map(|b| queue::summarize_blocks_for_log(&b.blocks))
+                .collect();
+            log::warn!(
+                target: "solution_agent::queue",
+                "session={id} dropped {} queued bundle(s) on teardown — content: [{}]",
+                session_read.pending_messages.len(),
+                previews.join(" | "),
+            );
+        }
+        let solution_id = session_read.solution_id.clone();
+        // Captured while the entity is still live (the flag is dropped with the
+        // entity below). Hidden supervisor judge/auditor sessions suppress all
+        // close notifications, mirroring the create-side suppression so a
+        // connected mobile client never sees their per-wake-up churn.
+        let was_ephemeral = session_read.is_supervisor_ephemeral || session_read.is_ephemeral;
+        let agent_id = session_read.agent_id.clone();
+        // Capture the live connection + ACP session id BEFORE the entity drops,
+        // so callers can tear down THIS session's `claude` subprocess and
+        // release the pool refcount. `None` for a cold/restored session that was
+        // never spawned on the pool — those neither hold a subprocess nor a
+        // refcount to release.
+        let pool_teardown = session_read.acp_thread().map(|thread| {
+            let thread = thread.read(cx);
+            (thread.connection().clone(), thread.session_id().clone())
+        });
+        drop(session_read);
+        if let Some(list) = self.by_solution.get_mut(&solution_id) {
+            list.retain(|sid| *sid != id);
+            if list.is_empty() {
+                self.by_solution.remove(&solution_id);
+            }
+        }
+        // Drop ALL per-session runtime maps for the torn-down session (entry
+        // throttles, supervisor state, background watchers, backoff timer,
+        // parent-jsonl cursor) — each holds a live `Task` and/or grows one entry
+        // per closed session, so leaving them leaks for the process lifetime.
+        self.evict_session_runtime_maps(id);
+        Some(SessionTeardown {
+            solution_id,
+            agent_id,
+            pool_teardown,
+            was_ephemeral,
+        })
+    }
+
+    /// Emit the per-session close notifications (`SessionClosed` +
+    /// `workspace.session_deleted`) and tear down the pool side of the session.
+    /// Shared close-out tail of [`close_session`](Self::close_session) and
+    /// [`purge_session_hard`](Self::purge_session_hard). The pooled
+    /// `ClaudeNativeConnection` is shared across the `(solution, agent)` pair and
+    /// OUTLIVES the session, so dropping the `SolutionSession` + its `AcpThread`
+    /// does NOT remove the session from the connection's `sessions` map — this
+    /// session's `claude` subprocess would leak. Explicitly close the ACP session
+    /// (claude_native removes the `SessionState` and kills its process) and
+    /// release the pool refcount so the connection itself shuts down once its
+    /// last session closes.
+    fn finalize_session_teardown(
+        &mut self,
+        id: SolutionSessionId,
+        teardown: SessionTeardown,
+        cx: &mut Context<Self>,
+    ) {
+        if !teardown.was_ephemeral {
+            cx.emit(SolutionAgentStoreEvent::SessionClosed(id));
+            // Guard with `try_global` so test contexts that don't install the
+            // MCP layer don't panic.
+            if let Some(coord) =
+                editor_mcp::workspace_seq::WorkspaceEventCoordinator::try_global(cx)
+            {
+                coord.emit_sequenced(
+                    cx,
+                    "workspace.session_deleted",
+                    serde_json::json!({
+                        "solution_id": teardown.solution_id.as_str(),
+                        "session_id": id.to_string(),
+                    }),
+                );
+            }
+        }
+        if let Some((connection, acp_session_id)) = teardown.pool_teardown {
+            if connection.supports_close_session() {
+                connection.close_session(&acp_session_id, cx).detach();
+            }
+            self.pool_release_session((teardown.solution_id, teardown.agent_id), cx);
+        }
+    }
+
+    pub fn close_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) -> Result<()> {
+        // Delete the session's inbox attachments (files + DB rows) while the
+        // session is still in `self.sessions` (the inbox dir resolves from its
+        // solution root). The pixels survive as base64 in the persisted entries,
+        // so reopen is unaffected. Must run BEFORE teardown (it needs the entity).
+        self.purge_session_attachments(id, cx);
+        // Flush the latest transcript while the session is still live, so a later
+        // "Reopen Closed Chat" restores the full conversation. The in-flight-turn
+        // cancel + entity drop happen inside `teardown_session_runtime`.
+        self.persist_all_rows(id, cx);
+        let teardown = self
+            .teardown_session_runtime(id, cx)
+            .ok_or_else(|| anyhow!("unknown session {id}"))?;
+        // Soft-close: keep the persisted blob so downstream tooling
+        // (MCP read_session_history, future "View archived sessions"
+        // UI, etc.) can still read the transcript. The supervisor_state row is
+        // also kept — `load_supervisor_states` restores it on reopen. Hard-delete
+        // only happens via `purge_session_hard` / `purge_solution_fully`.
+        if let Some(db) = &self.persistence {
+            db.mark_closed(id, Some(Utc::now())).detach_and_log_err(cx);
+        }
+        self.finalize_session_teardown(id, teardown, cx);
+        cx.notify();
+        Ok(())
+    }
 }
