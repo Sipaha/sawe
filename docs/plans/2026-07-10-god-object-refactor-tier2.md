@@ -1,6 +1,6 @@
 # God-object refactor — Tier 2 (structural seams)
 
-**Status:** in progress
+**Status:** complete (T2-A + T2-B shipped; remaining store sub-objects deferred — see finding below)
 **Date:** 2026-07-10
 **Owner:** supervisor session
 **Predecessor:** [`2026-07-10-god-object-refactor-tier1.md`](2026-07-10-god-object-refactor-tier1.md) (complete)
@@ -103,16 +103,36 @@ Any C6 unit tests move next to the type or stay green via the delegates.
 
 Commit: `solution_agent: Extract model/effort catalog into ModelCatalog`
 
-## Remaining store sub-objects (next round, NOT this dispatch)
+## Remaining store sub-objects — DEFERRED (finding from T2-B)
 
-After T2-B lands clean, tackle sequentially (all edit `store.rs`, so they
-CANNOT parallelize with each other):
-- **PoolManager** — owns `pool`; methods already in `store/connection_pool.rs`.
-- **ArchiveGc** — stateless GC fns (`reap_stale_*`, `stale_archive_dirs`,
-  `prune_raw_transcripts`, `push_and_evict_transcripts`, path helpers).
-- **TeammateWatchers** (C10) — owns `background_agent_watchers`,
-  `background_shell_watchers`, `parent_jsonl_scan_offsets` (moderate coupling:
-  reaches back into `sessions` + the event hub via a callback).
+**T2-B changed the calculus.** The coupling audit found the survey's "C6 is
+the cleanest seam / easiest win" claim was optimistic: the model/effort
+*fields* were C6-local, but every C6 *method* is intrinsically Store-coupled
+(reads `sessions`, mutates session entities, calls `persist_session_row`,
+emits `SolutionAgentStoreEvent`, spawns on `Context<Store>`). So the methods
+stayed on Store and `store.rs` shrank by only **9 lines** — the win was
+encapsulating state ownership + the probe-dedup invariant in a focused type,
+not reducing the coordinator.
+
+The lesson generalizes: **`store.rs` is a genuine coordinator, not flat
+bloat.** Field-ownership extraction of the remaining sub-objects would repeat
+the ModelCatalog outcome — small line reduction, real churn against the most
+delicate file in the crate (watchdog/reconnect hardening #5–#9), for marginal
+gain. The remaining items are therefore **deferred, not cancelled**:
+
+- **PoolManager** — `pool` methods (`pool_release_session` etc.) read
+  `sessions`/emit events → same coupling; low yield.
+- **ArchiveGc** — the pure halves (`stale_archive_dirs`,
+  `push_and_evict_transcripts`) are *already* extracted + unit-tested; the
+  `reap_stale_*` orchestration is Store-coupled. Little left to gain.
+- **TeammateWatchers** (C10) — the strongest remaining candidate (a cohesive
+  ~3-map watcher subsystem), but the survey flags it reaches back into
+  `sessions` + the event hub. Worth doing ONLY if a future change to the
+  teammate-watching subsystem makes the extraction pay for itself. Revisit
+  then, not speculatively.
+
+Real further reduction of `store.rs` needs the Tier-3 work (trait seams to move
+*orchestration*, not just fields) — explicitly out of scope.
 
 ## Sequencing / dispatch
 
@@ -123,14 +143,17 @@ CANNOT parallelize with each other):
 
 ## Acceptance criteria
 
-- [ ] T2-A: the 5 clusters moved to `session_view/<cluster>.rs`; root reduced;
-      `Render::render` stays in root. Build + tests green (same counts).
-- [ ] T2-B: `ModelCatalog` owns the model/effort state; Store delegates;
-      no caller changed; coupling of `adapters` reported and handled correctly.
-      Build + tests green.
-- [ ] Whole-binary `cargo build --bin sawe` clean at integration.
-- [ ] `docs/INDEX.md` updated; this doc flipped to `complete`.
+- [x] T2-A: 5 clusters moved to `session_view/{find,compose,expanded,paste,lifecycle}.rs`;
+      root 3044 → 1864; `Render::render` stays in root. 563 tests green.
+- [x] T2-B: `ModelCatalog` owns the model/effort maps + probe-dedup invariant;
+      external call surface preserved (methods stayed on Store per the `&mut Store`
+      escape clause — see finding); `adapters` correctly kept on Store (used
+      externally). 563 tests green.
+- [x] Whole-binary `cargo build --bin sawe` clean (EXIT 0) with both landed.
+- [x] `docs/INDEX.md` updated; this doc flipped to `complete`.
+- [~] Remaining store sub-objects deferred with rationale (not a blocker).
 
 ## Commit log
 
-(to be filled as work lands)
+- `ceb233f8e7` — T2-B: `solution_agent: Extract model/effort catalog into ModelCatalog`
+- `1dafbc0bcf` — T2-A: `solution_agent: Extract session_view clusters into satellite submodules` (cherry-picked from worktree `0bf8a03f9a`)
