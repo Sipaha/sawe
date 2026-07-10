@@ -18,6 +18,16 @@ pub fn cache_path(cache_root: &Path, remote_url: &str) -> PathBuf {
     cache_root.join(repo_key(remote_url))
 }
 
+/// A usable cache is a bare mirror produced by [`clone_from_remote`] (bare repo
+/// → `HEAD` at the top level, no `.git` worktree). A leftover normal clone (has
+/// `.git/`), an empty directory from a half-finished add, or any other garbage
+/// is NOT usable: cloning from it with `git clone --local` would propagate only
+/// the default branch (see the comment on `clone_from_remote`). Such a directory
+/// must be wiped and re-cloned rather than trusted.
+fn is_usable_mirror(path: &Path) -> bool {
+    path.join("HEAD").is_file() && !path.join(".git").exists()
+}
+
 pub async fn ensure_cache(
     cache_root: &Path,
     remote_url: &str,
@@ -25,7 +35,15 @@ pub async fn ensure_cache(
 ) -> Result<PathBuf> {
     let path = cache_path(cache_root, remote_url);
     if path.exists() {
-        return Ok(path);
+        if is_usable_mirror(&path) {
+            return Ok(path);
+        }
+        // Stale (pre-mirror normal clone) or partial cache: wipe so the clone
+        // below starts clean — `git clone` refuses a non-empty target.
+        let doomed = path.clone();
+        smol::unblock(move || std::fs::remove_dir_all(&doomed))
+            .await
+            .ok();
     }
     clone_from_remote(remote_url, &path, on_progress).await?;
     Ok(path)
@@ -88,13 +106,46 @@ mod tests {
     #[test]
     fn ensure_cache_returns_existing_path() {
         let dir = tempdir().expect("tempdir");
+        let bare = smol::block_on(test_support::make_bare_with_one_commit(dir.path()));
         let cache_root = dir.path().join("cache");
-        let url = "git@x:foo.git";
-        let pre = cache_path(&cache_root, url);
-        std::fs::create_dir_all(&pre).expect("pre-create");
+        let url = bare.to_str().expect("path to str").to_string();
+        let pre = cache_path(&cache_root, &url);
+        // A usable cache is a bare mirror; seed one and mark it so we can prove
+        // ensure_cache reused it (rather than wiping + re-cloning).
+        std::fs::create_dir_all(pre.parent().expect("cache root parent")).expect("mkdir root");
+        smol::block_on(crate::git::test_support::run(
+            &["clone", "--mirror", "--quiet", &url, pre.to_str().expect("path str")],
+            None,
+        ));
+        std::fs::write(pre.join("SENTINEL"), "x").expect("write sentinel");
 
         let path =
-            smol::block_on(ensure_cache(&cache_root, url, |_| {})).expect("returns existing");
+            smol::block_on(ensure_cache(&cache_root, &url, |_| {})).expect("returns existing");
         assert_eq!(path, pre);
+        assert!(pre.join("SENTINEL").exists(), "cache was re-cloned, not reused");
+    }
+
+    #[test]
+    fn ensure_cache_rewipes_non_mirror_cache() {
+        let dir = tempdir().expect("tempdir");
+        let bare = smol::block_on(test_support::make_bare_with_one_commit(dir.path()));
+        let cache_root = dir.path().join("cache");
+        let url = bare.to_str().expect("path to str").to_string();
+        let pre = cache_path(&cache_root, &url);
+
+        // Simulate a pre-mirror cache: a normal (non-bare) clone with `.git/`.
+        std::fs::create_dir_all(pre.parent().expect("cache root parent")).expect("mkdir root");
+        smol::block_on(crate::git::test_support::run(
+            &["clone", "--quiet", &url, pre.to_str().expect("path str")],
+            None,
+        ));
+        assert!(pre.join(".git").exists(), "precondition: normal clone");
+        std::fs::write(pre.join("SENTINEL"), "x").expect("write sentinel");
+
+        let path =
+            smol::block_on(ensure_cache(&cache_root, &url, |_| {})).expect("re-clones as mirror");
+        assert_eq!(path, pre);
+        assert!(!pre.join("SENTINEL").exists(), "stale cache was not wiped");
+        assert!(is_usable_mirror(&pre), "re-cloned cache is not a bare mirror");
     }
 }

@@ -45,12 +45,22 @@ pub async fn clone_from_remote(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    // `--mirror` (bare, refspec `+refs/*:refs/*`) is load-bearing, not an
+    // optimization. This is the catalog *cache*, and the only consumer is
+    // `clone_local` (`git clone --local <cache> <target>`), which copies the
+    // source's local `refs/heads/*` — NOT its remote-tracking refs. A plain
+    // `git clone` leaves every branch except the default one under
+    // `refs/remotes/origin/*`, so cloning from such a cache would propagate
+    // ONLY the default branch to the member checkout (the rest silently
+    // vanish). A mirror puts every branch (and tag) under `refs/heads/*`, so
+    // `clone_local` faithfully reproduces the full remote.
     let mut cmd = Command::new("git");
     cmd.arg("clone")
+        .arg("--mirror")
         .arg("--progress")
         .arg(remote_url)
         .arg(target);
-    drain_command(&mut cmd, on_progress, &format!("git clone {remote_url}")).await
+    drain_command(&mut cmd, on_progress, &format!("git clone --mirror {remote_url}")).await
 }
 
 pub async fn set_remote_url(repo: &Path, name: &str, url: &str) -> Result<()> {
