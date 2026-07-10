@@ -18,6 +18,12 @@ pub fn init(cx: &mut gpui::App) {
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
+            // No project directory to run in (an empty solution has 0
+            // worktrees) → refuse. A non-empty solution or a plain folder has a
+            // worktree and is allowed.
+            if !panel::workspace_has_worktree(workspace, cx) {
+                return;
+            }
             if let Some(panel) = workspace.panel::<ConsolePanel>(cx) {
                 panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
             }

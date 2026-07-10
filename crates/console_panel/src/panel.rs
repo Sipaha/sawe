@@ -54,6 +54,16 @@ pub fn active_solution_id_for_workspace(workspace: &Workspace, cx: &App) -> Opti
     None
 }
 
+/// Whether the workspace has any project directory to run a terminal in. An
+/// empty Solution has 0 member projects → 0 worktrees, so a terminal has
+/// nowhere to run and is refused. A Solution with members (or a plain folder)
+/// has ≥1 worktree and is allowed. Takes `&Workspace` directly so it is safe
+/// to call from action handlers that already hold the `Workspace` leased
+/// (reading the entity via `cx` there would double-lease-panic).
+pub fn workspace_has_worktree(workspace: &Workspace, cx: &App) -> bool {
+    workspace.project().read(cx).worktrees(cx).next().is_some()
+}
+
 /// Folder of the solution's *active* project — the one selected in the
 /// project tab strip — falling back to the solution root when there is no
 /// active member. Used as the `cwd` for new terminals / AI chats started
@@ -809,6 +819,14 @@ impl ConsolePanel {
         let active_path = active_solution_id
             .as_ref()
             .and_then(|id| active_member_path(id, cx));
+        // A terminal needs a project directory to run in. An empty solution has
+        // 0 worktrees, so grey out "New Terminal" (the action handlers enforce
+        // the same rule for the keyboard path). A non-empty solution or a plain
+        // folder has a worktree and is allowed.
+        let has_project = self
+            .workspace
+            .upgrade()
+            .is_some_and(|ws| workspace_has_worktree(ws.read(cx), cx));
         // Read the project handle here, in render context, where nothing is
         // leased — `add_chat_tab_with_cwd` no longer reads it from the
         // Workspace entity (see its doc comment: the action path holds the
@@ -841,21 +859,33 @@ impl ConsolePanel {
                     let project = project.clone();
                     let weak_self = weak_self.clone();
                     Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                        // New Terminal in the active project's folder (falls
-                        // back to terminal settings when there's no active
-                        // solution, i.e. `active_path` is `None`).
+                        // New Terminal in the active project's folder. Disabled
+                        // when there's no active project (empty / no solution) —
+                        // there's nowhere to run it.
                         let menu = {
                             let weak_self = weak_self.clone();
                             let cwd = active_path.clone();
-                            menu.entry("New Terminal", None, move |window, cx| {
-                                if let Some(panel) = weak_self.upgrade() {
-                                    panel.update(cx, |panel, cx| {
-                                        panel.add_terminal_tab(cwd.clone(), window, cx);
-                                    });
-                                }
-                            })
+                            let label = if has_project {
+                                "New Terminal"
+                            } else {
+                                "New Terminal (no project)"
+                            };
+                            menu.item(
+                                ui::ContextMenuEntry::new(label)
+                                    .disabled(!has_project)
+                                    .handler(move |window, cx| {
+                                        if let Some(panel) = weak_self.upgrade() {
+                                            panel.update(cx, |panel, cx| {
+                                                panel.add_terminal_tab(cwd.clone(), window, cx);
+                                            });
+                                        }
+                                    }),
+                            )
                         };
-                        // New AI Chat in the active project's folder.
+                        // New AI Chat in the active project's folder. Enabled
+                        // only when there's an active project (an empty / absent
+                        // solution can't resolve one, so `active_solution_id` is
+                        // `None` and this falls to the disabled branch).
                         let menu = if let (Some(solution_id), Some(project)) =
                             (active_solution_id.clone(), project.clone())
                         {
@@ -877,7 +907,7 @@ impl ConsolePanel {
                         } else {
                             menu.action_disabled_when(
                                 true,
-                                "New AI Chat (no active solution)",
+                                "New AI Chat (no project)",
                                 NewChat.boxed_clone(),
                             )
                         };
@@ -1024,6 +1054,11 @@ impl ConsolePanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        // No project directory to run in (an empty solution has 0 worktrees) →
+        // refuse both the center-pane and the console-panel spawn below.
+        if !workspace_has_worktree(workspace, cx) {
+            return;
+        }
         let center_pane = workspace.active_pane();
         let center_pane_has_focus = center_pane.focus_handle(cx).contains_focused(window, cx);
         let active_center_item_is_terminal = center_pane
@@ -1978,11 +2013,24 @@ mod tests {
     async fn bootstrap_panel(
         cx: &mut TestAppContext,
     ) -> (gpui::WindowHandle<Workspace>, Entity<ConsolePanel>) {
+        bootstrap_panel_with_worktrees(cx, &["/root"]).await
+    }
+
+    /// Like [`bootstrap_panel`] but with an explicit worktree set — pass `&[]`
+    /// to model an empty solution (no project directory).
+    async fn bootstrap_panel_with_worktrees(
+        cx: &mut TestAppContext,
+        worktrees: &[&str],
+    ) -> (gpui::WindowHandle<Workspace>, Entity<ConsolePanel>) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/root", serde_json::json!({})).await;
-        let project = Project::test(fs, ["/root".as_ref()], cx).await;
+        for wt in worktrees {
+            fs.insert_tree(*wt, serde_json::json!({})).await;
+        }
+        let paths: Vec<&std::path::Path> =
+            worktrees.iter().map(|p| std::path::Path::new(p)).collect();
+        let project = Project::test(fs, paths, cx).await;
 
         let connect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         cx.update(|cx| {
@@ -2045,6 +2093,35 @@ mod tests {
             assert!(matches!(p.tabs[0], ConsoleTab::Terminal { .. }));
             assert_eq!(p.active_index, Some(0));
         });
+    }
+
+    #[gpui::test]
+    async fn workspace_has_worktree_gates_on_project_dirs(cx: &mut TestAppContext) {
+        // The signal the terminal entry points (keyboard `NewTerminal`,
+        // `handle_new_terminal`, and the "+" menu's disabled state) use to
+        // block a terminal in an empty solution: no worktree => no project
+        // directory => refuse; a worktree present => allow.
+        cx.executor().allow_parking();
+
+        let (empty_window, _empty_panel) = bootstrap_panel_with_worktrees(cx, &[]).await;
+        empty_window
+            .update(cx, |workspace, _window, cx| {
+                assert!(
+                    !workspace_has_worktree(workspace, cx),
+                    "an empty solution (no worktrees) must report no project"
+                );
+            })
+            .unwrap();
+
+        let (window, _panel) = bootstrap_panel_with_worktrees(cx, &["/root"]).await;
+        window
+            .update(cx, |workspace, _window, cx| {
+                assert!(
+                    workspace_has_worktree(workspace, cx),
+                    "a solution with a project worktree must report a project"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
