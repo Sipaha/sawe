@@ -759,6 +759,50 @@ impl SolutionSession {
             };
             streams.insert(crate::stream::StreamId::Shell(id.clone()), stream);
         }
+        // Fold each LIVE background AGENT into the mirror as its
+        // `StreamId::Teammate(parent_tool_use_id)` tab. A fully detached async
+        // `Agent` (its own `output_file`, no parent-thread interleaving)
+        // produces NO `subagent_id`-tagged entries, so the `demux` above never
+        // builds its stream — without this fold it has a `background_agents`
+        // entry + a `latest` snapshot but no stream and therefore no pill
+        // (phase 6d-B removed the dedicated Background pill on the assumption
+        // that every async agent rides a demux teammate stream, which detached
+        // ones do not). Mirrors the shell fold above: only agents still running
+        // (`is_messageable`) are folded — a terminal one is dropped by
+        // `tick_background_agents` — and an existing demux stream (the agent DID
+        // interleave) is never clobbered.
+        let agent_now = chrono::Utc::now();
+        for id in &self.background_agent_order {
+            let Some(agent) = self.background_agents.get(id) else {
+                continue;
+            };
+            if !agent.is_messageable() {
+                continue;
+            }
+            let Some(parent_toolu) = agent.parent_tool_use_id.clone() else {
+                continue;
+            };
+            let key = crate::stream::StreamId::Teammate(parent_toolu);
+            // Respect an existing demux stream (don't clobber real entries) AND
+            // the age-out: `reconcile_finished_teammate_streams` closes a stale /
+            // done agent's stream via `closed_streams` (removed at the top of
+            // this fn), and the agent lingers in `background_agents` for its
+            // dead-linger window — without this guard the fold would re-add the
+            // just-closed pill every rebuild and the age-out could never win.
+            if streams.contains_key(&key) || self.closed_streams.contains_key(&key) {
+                continue;
+            }
+            let stream = crate::stream::Stream {
+                id: key.clone(),
+                kind: crate::stream::StreamKind::Teammate,
+                label: agent.stream_label(),
+                entries: vec![agent.stream_entry(agent_now)],
+                seq: 0,
+                state: crate::stream::StreamState::Live,
+                source: crate::stream::StreamSource::FileTail(agent.jsonl_path.clone()),
+            };
+            streams.insert(key, stream);
+        }
         // Enrich each teammate stream's `label` from `teammate_labels` (the
         // durable friendly label captured at registration). After this,
         // `Stream.label` is the single source of truth for a teammate's display

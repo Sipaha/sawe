@@ -788,6 +788,70 @@
         assert_eq!(stream.seq, 1_720_000_000_000);
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 6d-B follow-up — detached background AGENTS folded into `streams`
+    // as Teammate tabs (they have no `subagent_id`-tagged parent-thread entries
+    // for `demux` to build a stream from).
+    // -----------------------------------------------------------------------
+
+    fn insert_agent(
+        s: &mut SolutionSession,
+        agent_id: &str,
+        parent_toolu: &str,
+        stop_reason: Option<&str>,
+    ) {
+        let id = crate::background_agent::BackgroundAgentId::new(agent_id);
+        s.background_agents.insert(
+            id.clone(),
+            crate::background_agent::BackgroundAgent {
+                id: id.clone(),
+                jsonl_path: PathBuf::from("/tmp/a.output"),
+                registered_at: Utc::now(),
+                latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                    mtime: std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_720_000_000),
+                    activity_label: SharedString::from("Bash: cargo test"),
+                    stop_reason: stop_reason.map(SharedString::from),
+                }),
+                last_offset: 0,
+                parent_tool_use_id: Some(SharedString::from(parent_toolu)),
+            },
+        );
+        s.background_agent_order.push(id);
+    }
+
+    #[test]
+    fn rebuild_streams_folds_a_live_background_agent_into_a_teammate_stream() {
+        use crate::stream::{StreamId, StreamKind, StreamState};
+        let mut s = build_session();
+        insert_agent(&mut s, "ade80a6e3fce0efbe", "toolu_parent1", None);
+        s.rebuild_streams();
+
+        let sid = StreamId::Teammate(SharedString::from("toolu_parent1"));
+        let stream = s
+            .streams
+            .get(&sid)
+            .expect("a live detached background agent yields a Teammate stream/pill");
+        assert_eq!(stream.kind, StreamKind::Teammate);
+        assert_eq!(stream.state, StreamState::Live);
+        assert_eq!(stream.entries.len(), 1, "one activity-snapshot entry");
+        assert_eq!(stream.seq, 1_720_000_000_000);
+    }
+
+    #[test]
+    fn rebuild_streams_skips_a_terminal_background_agent() {
+        use crate::stream::StreamId;
+        let mut s = build_session();
+        insert_agent(&mut s, "ade80a6e3fce0efbe", "toolu_parent1", Some("end_turn"));
+        s.rebuild_streams();
+
+        let sid = StreamId::Teammate(SharedString::from("toolu_parent1"));
+        assert!(
+            s.streams.get(&sid).is_none(),
+            "a terminal (stop_reason) agent is not folded — tick_background_agents drops it"
+        );
+    }
+
     #[test]
     fn rebuild_streams_auto_closes_a_terminal_shell() {
         use crate::stream::StreamId;

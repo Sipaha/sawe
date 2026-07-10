@@ -30,6 +30,8 @@ use agent_client_protocol::schema as acp;
 use chrono::{DateTime, Utc};
 use gpui::{App, AppContext, SharedString};
 use markdown::Markdown;
+
+use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
 use regex::Regex;
 use serde_json::Value;
 
@@ -143,6 +145,75 @@ impl BackgroundAgent {
         self.latest
             .as_ref()
             .map_or(true, |snapshot| snapshot.stop_reason.is_none())
+    }
+
+    /// Fallback stream label for this agent's derived `StreamId::Teammate`
+    /// pill. `rebuild_streams` overrides it from `teammate_labels` when the
+    /// spawn captured a friendly name; this shows when it didn't.
+    pub fn stream_label(&self) -> SharedString {
+        SharedString::from(format!("Agent {}", self.id.short()))
+    }
+
+    /// Convert this agent's last-observed snapshot into the single
+    /// [`SessionEntry`] body of its derived `StreamId::Teammate` stream — the
+    /// analogue of `BackgroundShell::stream_entry` (phase 6d-A). Plain data (no
+    /// `Markdown` entity) so it can run inside the `cx`-free
+    /// `SolutionSession::rebuild_streams`. The full JSONL transcript lives in
+    /// `jsonl_path` and is intentionally NOT inlined — only the tailed one-line
+    /// `activity_label` snapshot is shown, mirroring the pill's status.
+    pub fn stream_entry(&self, now: DateTime<Utc>) -> SessionEntry {
+        let (activity, observed, done) = match &self.latest {
+            Some(snap) => (
+                snap.activity_label.to_string(),
+                agent_relative_time(snap.mtime, now),
+                snap.stop_reason.is_some(),
+            ),
+            None => (
+                "Starting…".to_string(),
+                "no output yet".to_string(),
+                false,
+            ),
+        };
+        let state_label = if done { "done" } else { "running" };
+        let header = format!(
+            "Agent {} · {} · {}",
+            self.id.short(),
+            state_label,
+            observed
+        );
+        let text = format!("{header}\n\n{activity}");
+        let ms = self
+            .latest
+            .as_ref()
+            .and_then(|snap| snap.mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|dur| dur.as_millis() as u64);
+        SessionEntry {
+            created_ms: ms.map(|m| m as i64).unwrap_or(0),
+            mod_seq: ms.unwrap_or(0),
+            subagent_id: None,
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text)],
+            },
+        }
+    }
+}
+
+/// "X ago" formatter for a background-agent snapshot's `SystemTime` mtime.
+/// Mirrors `background_shell`'s private helper; kept `cx`-free so
+/// `stream_entry` can run inside `SolutionSession::rebuild_streams`.
+fn agent_relative_time(mtime: SystemTime, now: DateTime<Utc>) -> String {
+    let secs = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(dur) => now.timestamp().saturating_sub(dur.as_secs() as i64).max(0),
+        Err(_) => return "just now".to_string(),
+    };
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
     }
 }
 
