@@ -233,6 +233,28 @@ pub struct BackgroundAgentSnapshot {
 /// as `Generating…` so a pathological line can't blow our memory.
 const JSONL_LINE_CAP: usize = 64 * 1024;
 
+/// Whether an assistant message's `stop_reason` means the agent is **DONE**,
+/// as opposed to pausing mid-loop.
+///
+/// This is load-bearing: a `stop_reason` of `tool_use` (the reason on EVERY
+/// assistant message that invokes a tool — i.e. almost every message a working
+/// agent emits) means the agent loop CONTINUES. Treating it as terminal reaps a
+/// live agent on its very first tool call, which killed the strip pill after
+/// ~15-30s, dropped the `background_agents` entry, and lied to the supervisor's
+/// `has_live_background_work` gate.
+///
+/// Allow-list rather than deny-list on purpose: an unrecognised reason is read
+/// as NON-terminal, so the worst case is a pill that lingers until the
+/// `MANAGED_AGENT_STALE_TIMEOUT_SECS` mtime reap (a self-healing backstop). The
+/// inverse mistake — reading an unknown reason as terminal — silently kills a
+/// running agent's tab with no backstop at all.
+fn is_terminal_stop_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "end_turn" | "max_tokens" | "stop_sequence" | "refusal"
+    )
+}
+
 /// Pure JSON → snapshot. Public so the watcher (Task 7) can feed it
 /// arbitrary strings; never panics, returns `Generating…` for any
 /// shape it doesn't recognise.
@@ -260,7 +282,7 @@ pub fn parse_jsonl_snapshot(line: &str) -> BackgroundAgentSnapshot {
             let stop_reason = message
                 .get("stop_reason")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
+                .filter(|s| is_terminal_stop_reason(s))
                 .map(SharedString::from);
             let label = derive_assistant_label(&message);
             BackgroundAgentSnapshot {
@@ -787,6 +809,45 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"stop_reason":"end_turn"}}"#;
         let snap = parse_jsonl_snapshot(line);
         assert_eq!(snap.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    /// The regression that killed a live agent's pill ~15-30s in: an assistant
+    /// message that invokes a tool carries `stop_reason: "tool_use"`, which is a
+    /// mid-loop pause, NOT the end of the agent's work.
+    #[test]
+    fn parse_jsonl_snapshot_tool_use_stop_reason_is_not_terminal() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo build"}}],"stop_reason":"tool_use"}}"#;
+        let snap = parse_jsonl_snapshot(line);
+        assert_eq!(snap.activity_label.as_ref(), "Bash: cargo build");
+        assert!(
+            snap.stop_reason.is_none(),
+            "a tool_use stop means the agent loop continues"
+        );
+    }
+
+    #[test]
+    fn parse_jsonl_snapshot_pause_turn_and_unknown_stops_are_not_terminal() {
+        for reason in ["pause_turn", "something_new"] {
+            let line = format!(
+                r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"…"}}],"stop_reason":"{reason}"}}}}"#
+            );
+            let snap = parse_jsonl_snapshot(&line);
+            assert!(
+                snap.stop_reason.is_none(),
+                "{reason} must not reap a live agent (the stale-mtime reap is the backstop)"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_jsonl_snapshot_other_terminal_stops_are_terminal() {
+        for reason in ["max_tokens", "stop_sequence", "refusal"] {
+            let line = format!(
+                r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"…"}}],"stop_reason":"{reason}"}}}}"#
+            );
+            let snap = parse_jsonl_snapshot(&line);
+            assert_eq!(snap.stop_reason.as_deref(), Some(reason));
+        }
     }
 
     #[test]
