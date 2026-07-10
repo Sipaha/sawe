@@ -577,15 +577,20 @@ impl SolutionAgentStore {
         // `try_global` (the public sentinel for "is solutions::init done?").
         let solution_subscription = SolutionStore::try_global(cx)
             .map(|store| cx.subscribe(&store, Self::on_solution_event));
-        // 1 Hz background-agent healthcheck. Drops done agents and prunes
-        // long-dead ones; rendering-side "dead" detection (orange pill) uses
-        // `agent.managed_agent_stale_timeout_secs` directly off the snapshot mtime, so
-        // the tick is only responsible for eventual cleanup, not the
-        // first-observation transition.
+        // 0.2 Hz store healthcheck (every 5s). Drives eventual cleanup only —
+        // reaping done/stale agents + shells, backstop pill-close, completion
+        // scan, supervisor/stuck watchdogs. All of these compare wall-clock
+        // timestamps (stale thresholds are in seconds, e.g. 120s), so the poll
+        // period only bounds detection LATENCY, not the thresholds themselves;
+        // 5s keeps that latency imperceptible while cutting the idle wakeup rate
+        // 5×. NOT on this clock: the user-visible "Xs" elapsed badge has its own
+        // 1s repaint timer in `session_view`, and terminal tool-calls close
+        // their pill event-driven immediately — this tick is the backstop for
+        // the cases no event covers (staleness, missed terminals).
         let bg_agents_tick = cx.spawn(async move |this, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_secs(1))
+                    .timer(std::time::Duration::from_secs(5))
                     .await;
                 if this
                     .update(cx, |this, cx| {
