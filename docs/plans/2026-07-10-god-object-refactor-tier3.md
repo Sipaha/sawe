@@ -1,6 +1,6 @@
 # God-object refactor — Tier 3 (store.rs supervisor relocation)
 
-**Status:** in progress
+**Status:** complete
 **Date:** 2026-07-10
 **Owner:** supervisor session
 **Predecessors:** [`tier1`](2026-07-10-god-object-refactor-tier1.md) (complete),
@@ -97,13 +97,39 @@ Commit subjects: `solution_agent: Relocate supervisor <group> into store/supervi
 
 ## Acceptance criteria
 
-- [ ] C2 (~40 methods + `JudgeHandle`/`VerdictAuth`) relocated to
-      `store/supervisor_engine.rs`; `store.rs` ~10161 → ~8200.
-- [ ] Behavior byte-for-byte unchanged; #5–#9 semantics preserved.
-- [ ] `cargo test -p solution_agent` = 563 green after each commit.
-- [ ] Whole-binary `cargo build --bin sawe` clean.
-- [ ] `FORK.md` + `docs/INDEX.md` updated; this doc flipped to `complete`.
+- [x] C2 (36 methods + `JudgeHandle`/`VerdictAuth`) relocated to
+      `store/supervisor_engine.rs`; `store.rs` 10161 → 7998, new file 2183 lines.
+- [x] Behavior byte-for-byte unchanged (per-method text diff = 0); #5–#9 semantics preserved.
+- [x] `cargo test -p solution_agent` = 563 green after each commit.
+- [x] Whole-binary `cargo build --bin sawe` clean (EXIT 0).
+- [x] `FORK.md` updated; this doc flipped to `complete`.
 
 ## Commit log
 
-(to be filled as work lands)
+1. `solution_agent: Relocate supervisor leaf helpers into store/supervisor_engine.rs`
+   — `JudgeHandle` + `VerdictAuth` type defs (both moved, `JudgeHandle` struct+fields
+   bumped `pub(crate)` for the Store fields / tests.rs constructors; re-exported via
+   `pub(crate) use supervisor_engine::{JudgeHandle, VerdictAuth}` mirroring the queue
+   idiom); leaf methods `persist_supervisor_state`, `solution_root_for{,_app}`,
+   `session_wall_message`, `judge_wall_message`, `ephemeral_session_tokens`,
+   `append_supervisor_diary_note`.
+2. `solution_agent: Relocate supervisor spawn/verdict core into store/supervisor_engine.rs`
+   — `spawn_judge`, `spawn_auditor`, `spawn_ephemeral_supervisor_session`,
+   `finish_judge`, `finish_auditor`, `apply_verdict{,_authenticated}`,
+   `apply_audit_verdict{,_authenticated}`, `on_judge_failed`, `apply_usage_limit_stop`
+   (Compact-arm `cx.defer` + `SolutionAgentStore::global` re-acquire moved verbatim).
+3. `solution_agent: Relocate supervisor state-transition and nudge methods into store/supervisor_engine.rs`
+   — `set_supervision_enabled`, `set_supervisor_prompt`, `reload_supervisor_state_for`,
+   `supervisor_state`, `wipe_supervisor_memory`, `reset_supervisor_continue_counter`,
+   `rearm_supervisor_on_self_activity`, `hold_supervisor`, `supersede_judge_on_user_reply`,
+   `note_user_input`, `clear_supervisor_question`, `escalate_to_user`,
+   `notify_supervisor_done`, `send_supervisor_nudge`, `deliver_nudge_now`,
+   `prune_raw_transcripts`.
+4. `solution_agent: Relocate supervisor watchdogs into store/supervisor_engine.rs`
+   — `tick_stuck_sessions`, `tick_supervisor` (the #5/#7/#9 hardening) moved alone for
+   clean bisect. Final visibility re-tightened: `pub(super)` kept only on the four
+   methods still called from `store.rs`/tests (`solution_root_for`, `session_wall_message`,
+   `reload_supervisor_state_for`, `prune_raw_transcripts`); the three temporarily-bumped
+   helpers now fully internal (`ephemeral_session_tokens`, `judge_wall_message`,
+   `deliver_nudge_now`) returned to private.
+5. FORK.md touched-files row + this doc flipped to complete (`cargo build --bin sawe` EXIT 0).
