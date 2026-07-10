@@ -2358,58 +2358,6 @@ impl Workspace {
         }
     }
 
-    /// Capture the live dock layout (open/closed, active panel index, and
-    /// active-panel size per side) so it can be re-applied to a sibling
-    /// `Workspace`. Used by `MultiWorkspace::activate` to keep panel layout
-    /// unified across Solution switches.
-    pub fn capture_dock_layout(&self, cx: &App) -> crate::dock::DockLayout {
-        let side = |dock: &Entity<Dock>| {
-            let dock = dock.read(cx);
-            crate::dock::DockSideLayout {
-                is_open: dock.is_open(),
-                active_panel_index: dock.active_panel_index(),
-                size: dock.active_panel_size(),
-            }
-        };
-        crate::dock::DockLayout {
-            left: side(&self.left_dock),
-            right: side(&self.right_dock),
-            bottom: side(&self.bottom_dock),
-        }
-    }
-
-    /// Apply a previously-captured [`crate::dock::DockLayout`] to this
-    /// workspace's docks. Safe-apply throughout: `activate_panel` is only
-    /// called when the dock actually has that panel index, `set_open` is a
-    /// no-op when already in the target state, and the size is pushed only
-    /// onto the now-active panel of an open side.
-    pub fn apply_dock_layout(
-        &self,
-        layout: &crate::dock::DockLayout,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        for (dock, side) in [
-            (&self.left_dock, &layout.left),
-            (&self.right_dock, &layout.right),
-            (&self.bottom_dock, &layout.bottom),
-        ] {
-            dock.update(cx, |dock, cx| {
-                if let Some(index) = side.active_panel_index
-                    && index < dock.panels_len()
-                {
-                    dock.activate_panel(index, window, cx);
-                }
-                dock.set_open(side.is_open, window, cx);
-                if let (Some(size_state), Some(active_panel)) =
-                    (side.size, dock.active_panel().cloned())
-                {
-                    dock.set_panel_size_state(active_panel.as_ref(), size_state, cx);
-                }
-            });
-        }
-    }
-
     /// Returns which dock currently has focus, or `None` if focus is in the
     /// center pane or elsewhere. Does NOT fall back to any global state.
     pub fn focused_dock_position(&self, window: &Window, cx: &App) -> Option<DockPosition> {

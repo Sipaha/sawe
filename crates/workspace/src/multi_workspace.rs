@@ -1513,22 +1513,18 @@ impl MultiWorkspace {
         let workspace_was_retained = self.is_workspace_retained(&workspace);
         let should_retain_workspaces = self.multi_workspace_enabled(cx);
 
-        // Capture the leaving workspace's dock layout so the arriving one
-        // adopts it below — panel layout (visibility / active panel / size)
-        // is a single shared layout across the window, not per-Solution.
-        let dock_layout = old_active_workspace.read(cx).capture_dock_layout(cx);
-
         if should_retain_workspaces && !old_active_was_retained {
             let key = old_active_workspace.read(cx).project_group_key(cx);
             self.retain_workspace(old_active_workspace.clone(), key, cx);
         }
 
-        // Panel layout is a single SHARED layout across the window: the
-        // arriving workspace adopts the layout the user last had (captured
-        // from the leaving workspace above), applied after it is activated
-        // below. Each retained `Workspace` still owns its own `Dock`
-        // entities, so we replay the layout onto them rather than sharing
-        // the docks themselves.
+        // Dock layout is per-Solution: each retained `Workspace` owns its own
+        // `Dock` entities and keeps its own visibility / active-panel / size
+        // state. Switching Solutions leaves the arriving one's docks exactly as
+        // the user last left them — project-bound panels (git graph, project
+        // tree, git panel) must NOT leak across Solutions, since the member
+        // projects differ per Solution. (Within a single Solution, per-member
+        // dock state is handled separately by `solutions_ui::member_layout`.)
         if !workspace_was_retained {
             self.register_workspace(&workspace, window, cx);
 
@@ -1570,12 +1566,6 @@ impl MultiWorkspace {
         // workspace (which is now the chrome owner per `owns_window_chrome`).
         self.active_workspace.update(cx, |workspace, cx| {
             workspace.refresh_window_state(window, cx);
-        });
-
-        // Adopt the shared dock layout so panel visibility / active panel /
-        // size stay identical across Solution switches.
-        self.active_workspace.update(cx, |workspace, cx| {
-            workspace.apply_dock_layout(&dock_layout, window, cx);
         });
 
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace });

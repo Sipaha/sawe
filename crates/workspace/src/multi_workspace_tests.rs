@@ -255,6 +255,63 @@ async fn test_reorder_workspaces_moves_tab(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_dock_layout_is_per_solution_not_shared(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+
+    // Retain both workspaces so switching activates a sibling rather than
+    // recreating one.
+    let ws_a = multi_workspace.update(cx, |mw, cx| {
+        mw.open_sidebar(cx);
+        mw.workspace().clone()
+    });
+    let ws_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b, window, cx)
+    });
+
+    let dock_a = ws_a.read_with(cx, |ws, _| ws.bottom_dock().clone());
+    let dock_b = ws_b.read_with(cx, |ws, _| ws.bottom_dock().clone());
+
+    // Open Solution A's bottom dock, then activate Solution B.
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(ws_a.clone(), None, window, cx);
+    });
+    dock_a.update_in(cx, |dock, window, cx| dock.set_open(true, window, cx));
+    assert!(dock_a.read_with(cx, |d, _| d.is_open()));
+    assert!(
+        !dock_b.read_with(cx, |d, _| d.is_open()),
+        "Solution B's dock starts closed"
+    );
+
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(ws_b.clone(), None, window, cx);
+    });
+
+    // The crux: switching to Solution B must NOT carry A's open bottom dock
+    // over. Dock layout is per-Solution (project-bound panels don't leak).
+    assert!(
+        !dock_b.read_with(cx, |d, _| d.is_open()),
+        "activating Solution B must not adopt Solution A's dock layout"
+    );
+
+    // And switching back leaves A's dock exactly as the user left it.
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(ws_a.clone(), None, window, cx);
+    });
+    assert!(
+        dock_a.read_with(cx, |d, _| d.is_open()),
+        "Solution A keeps its own open dock across the round-trip"
+    );
+}
+
+#[gpui::test]
 async fn test_open_new_window_does_not_open_sidebar_on_existing_window(cx: &mut TestAppContext) {
     init_test(cx);
 

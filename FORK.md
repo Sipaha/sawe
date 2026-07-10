@@ -264,31 +264,38 @@ list is recoverable). Snapshots are runtime-only — losing them across
 an editor restart is acceptable, persistence would mean keeping the
 map in sync with potentially-stale paths.
 
-Dock (panel) layout, by contrast, is **unified across Solutions** — a
-single shared layout, NOT per-Solution. The earlier per-Solution dock
-snapshot (`SolutionStore::dock_snapshots` / `SolutionDockSnapshot`, plus
-the orchestrator's capture-on-switch-out / restore-on-switch-in) was
-**removed**: the product decision is that panel visibility, active
-panel, and width/height should be consistent everywhere, so panel state
-set in one Solution carries to the others. The real user switch path is
-`MultiWorkspace::activate` (each Solution is its own retained
-`Workspace` with its own three `Dock` entities — the tab-strip click /
-keyboard cycle activate a different workspace, not the in-place
-worktree-swap). `activate` now captures the leaving workspace's layout
-via `Workspace::capture_dock_layout` (a `workspace::dock::DockLayout`:
-per side `is_open`, `active_panel_index`, active-panel `PanelSizeState`)
-and replays it onto the arriving workspace via
-`Workspace::apply_dock_layout`, so the active workspace always adopts
-the last layout. Each `Workspace` still persists its own dock state to
-its workspace-DB row + the KVP panel-size store, so layout survives
-restart; siblings converge to the shared layout on first switch.
-`solutions_ui::switch` (the MCP-only `solutions.switch` in-place path)
-leaves docks untouched for the same reason. Index-based panel
-identification is safe because panel registration order is deterministic
-and identical across every `Workspace` in the process. Dock-*side*
-moves (dragging a panel from right to bottom) are not yet propagated —
-only open/active/size — but that gesture is rare and each side stays
-internally consistent.
+Dock (panel) layout is **per-Solution** — each Solution keeps its own
+dock layout, and switching Solutions does NOT carry panel state across.
+Each Solution is its own retained `Workspace` with its own three `Dock`
+entities (the tab-strip click / keyboard cycle activate a different
+workspace, not the in-place worktree-swap), and each `Workspace` already
+holds + persists its own live dock state (its workspace-DB row + the KVP
+panel-size store). `MultiWorkspace::activate` therefore does **nothing**
+to the docks — the arriving Solution's workspace simply renders whatever
+layout the user last left it with. `solutions_ui::switch` (the MCP-only
+`solutions.switch` in-place path) likewise leaves docks untouched.
+
+Why per-Solution (2026-07-10): a Solution's *member projects differ*, and
+the bottom dock's git-graph panel, the left dock's project tree, and the
+git panel are all **project-bound**. Unifying their open/active/size
+state across Solutions leaked one Solution's panel layout onto another
+whose projects it doesn't describe. The general rule the user set:
+**anything bound to a project must not be shared across Solutions.**
+
+This **reverts** the earlier "single shared layout" decision
+(`fef6e1e34c`, 2026-06-29), which captured the leaving workspace's layout
+via `Workspace::capture_dock_layout` and replayed it onto the arriving
+one via `Workspace::apply_dock_layout` inside `activate`. Both methods and
+the `workspace::dock::DockLayout` / `DockSideLayout` types were **removed**
+— nothing else used them. (Note this is the *second* reversal on this
+axis: `b30df54c67` (2026-05-21) first made it per-Solution via a
+`SolutionDockSnapshot`; `fef6e1e34c` unified it; this restores per-Solution
+without reintroducing the snapshot machinery — the retained per-`Workspace`
+`Dock` entities carry the state for free.)
+
+Within a single Solution, per-*member* dock state (open/active only; sizes
+stay shared) is a separate mechanism — see decision #28
+(`solutions_ui::member_layout`), which is orthogonal to this and unaffected.
 
 ### 15. mold mandatory for x86_64-linux builds
 
