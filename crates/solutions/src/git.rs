@@ -45,22 +45,34 @@ pub async fn clone_from_remote(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    // `--mirror` (bare, refspec `+refs/*:refs/*`) is load-bearing, not an
-    // optimization. This is the catalog *cache*, and the only consumer is
-    // `clone_local` (`git clone --local <cache> <target>`), which copies the
-    // source's local `refs/heads/*` — NOT its remote-tracking refs. A plain
-    // `git clone` leaves every branch except the default one under
-    // `refs/remotes/origin/*`, so cloning from such a cache would propagate
-    // ONLY the default branch to the member checkout (the rest silently
-    // vanish). A mirror puts every branch (and tag) under `refs/heads/*`, so
-    // `clone_local` faithfully reproduces the full remote.
+    // `--bare` is load-bearing, not an optimization. This is the catalog
+    // *cache*, and the only consumer is `clone_local` (`git clone --local
+    // <cache> <target>`), which copies the source's local `refs/heads/*` — NOT
+    // its remote-tracking refs. A plain `git clone` leaves every branch except
+    // the default one under `refs/remotes/origin/*`, so cloning from such a
+    // cache would propagate ONLY the default branch to the member checkout (the
+    // rest silently vanish). `--bare` puts every branch (and tag) under
+    // `refs/heads/*`, so `clone_local` faithfully reproduces the full remote —
+    // WITHOUT the server-side `refs/pull/*` (GitHub) / `refs/merge-requests/*`
+    // (GitLab) / pipeline refs that `--mirror` (`+refs/*:refs/*`) would drag in
+    // and bloat the cache with.
     let mut cmd = Command::new("git");
     cmd.arg("clone")
-        .arg("--mirror")
+        .arg("--bare")
         .arg("--progress")
         .arg(remote_url)
         .arg(target);
-    drain_command(&mut cmd, on_progress, &format!("git clone --mirror {remote_url}")).await
+    drain_command(&mut cmd, on_progress, &format!("git clone --bare {remote_url}")).await?;
+    // `git clone --bare` leaves NO fetch refspec, so a later `refresh_cache`
+    // (`git fetch --all`) would no-op on branches. Set the heads refspec
+    // explicitly so refreshes keep every branch current (tags follow the
+    // fetched commits automatically).
+    run_git(
+        target,
+        &["config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"],
+        |_| {},
+    )
+    .await
 }
 
 pub async fn set_remote_url(repo: &Path, name: &str, url: &str) -> Result<()> {

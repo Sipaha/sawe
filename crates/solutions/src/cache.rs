@@ -18,11 +18,12 @@ pub fn cache_path(cache_root: &Path, remote_url: &str) -> PathBuf {
     cache_root.join(repo_key(remote_url))
 }
 
-/// A usable cache is a bare mirror produced by [`clone_from_remote`] (bare repo
-/// → `HEAD` at the top level, no `.git` worktree). A leftover normal clone (has
-/// `.git/`), an empty directory from a half-finished add, or any other garbage
-/// is NOT usable: cloning from it with `git clone --local` would propagate only
-/// the default branch (see the comment on `clone_from_remote`). Such a directory
+/// A usable cache is the bare clone produced by [`clone_from_remote`] (bare
+/// repo → `HEAD` at the top level, no `.git` worktree; both `--bare` and the
+/// former `--mirror` satisfy this). A leftover normal clone (has `.git/`), an
+/// empty directory from a half-finished add, or any other garbage is NOT
+/// usable: cloning from it with `git clone --local` would propagate only the
+/// default branch (see the comment on `clone_from_remote`). Such a directory
 /// must be wiped and re-cloned rather than trusted.
 fn is_usable_mirror(path: &Path) -> bool {
     path.join("HEAD").is_file() && !path.join(".git").exists()
@@ -41,9 +42,14 @@ pub async fn ensure_cache(
         // Stale (pre-mirror normal clone) or partial cache: wipe so the clone
         // below starts clean — `git clone` refuses a non-empty target.
         let doomed = path.clone();
-        smol::unblock(move || std::fs::remove_dir_all(&doomed))
-            .await
-            .ok();
+        if let Err(err) = smol::unblock(move || std::fs::remove_dir_all(&doomed)).await {
+            // Don't swallow it: a failed wipe surfaces downstream as git's
+            // misleading "destination path already exists" — log the real cause.
+            log::warn!(
+                "solutions cache: failed to wipe stale cache {}: {err}",
+                path.display()
+            );
+        }
     }
     clone_from_remote(remote_url, &path, on_progress).await?;
     Ok(path)
@@ -55,7 +61,11 @@ pub async fn refresh_cache(
     on_progress: impl FnMut(GitProgress),
 ) -> Result<PathBuf> {
     let path = cache_path(cache_root, remote_url);
-    if !path.exists() {
+    // A missing OR stale (pre-mirror, non-bare) cache must go through
+    // `ensure_cache`, which wipes + re-clones as a mirror. `fetch --all` on a
+    // normal clone only updates `refs/remotes/*`, so refreshing one in place
+    // would leave `clone_local` still propagating just the default branch.
+    if !path.exists() || !is_usable_mirror(&path) {
         return ensure_cache(cache_root, remote_url, on_progress).await;
     }
     fetch_all(&path, on_progress).await?;
