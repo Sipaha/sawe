@@ -118,18 +118,26 @@ The lesson generalizes: **`store.rs` is a genuine coordinator, not flat
 bloat.** Field-ownership extraction of the remaining sub-objects would repeat
 the ModelCatalog outcome — small line reduction, real churn against the most
 delicate file in the crate (watchdog/reconnect hardening #5–#9), for marginal
-gain. The remaining items are therefore **deferred, not cancelled**:
+gain. **TeammateWatchers was then attempted anyway (user asked to push further) and
+CONFIRMED the finding — arguably worse than ModelCatalog:**
 
-- **PoolManager** — `pool` methods (`pool_release_session` etc.) read
-  `sessions`/emit events → same coupling; low yield.
-- **ArchiveGc** — the pure halves (`stale_archive_dirs`,
-  `push_and_evict_transcripts`) are *already* extracted + unit-tested; the
-  `reap_stale_*` orchestration is Store-coupled. Little left to gain.
-- **TeammateWatchers** (C10) — the strongest remaining candidate (a cohesive
-  ~3-map watcher subsystem), but the survey flags it reaches back into
-  `sessions` + the event hub. Worth doing ONLY if a future change to the
-  teammate-watching subsystem makes the extraction pay for itself. Revisit
-  then, not speculatively.
+- **TeammateWatchers** (C10) — DONE, commit `f6b9480653`. Audit showed all 13
+  C10 methods are 100% Store-coupled (spawn on `Context<Store>`, read
+  `sessions`, emit events); the maps are touched at only 5 sites. Extraction
+  moved just the 3 fields into a 112-line `teammate_watchers.rs`; `store.rs`
+  shrank **21 lines**. No behavior/invariant encapsulated (unlike ModelCatalog's
+  probe-dedup). Behavior-preserving, 563 tests green. Kept for the modest
+  readability win (coordinator no longer names 3 raw watcher fields; forward-only
+  cursor + arm-once invariants now documented in one place).
+
+**DECISION — stop `store.rs` field-extraction here.** Two data points
+(ModelCatalog −9, TeammateWatchers −21) prove the pattern: `store.rs` methods
+are intrinsically Store-coupled, so moving *fields* churns the crate's most
+delicate file (watchdog hardening #5–#9) for marginal shrink.
+
+- **PoolManager** / **ArchiveGc** — NOT done. Same coupling → same marginal
+  outcome. Do them only if a concrete feature change to those subsystems makes
+  the extraction pay for itself.
 
 Real further reduction of `store.rs` needs the Tier-3 work (trait seams to move
 *orchestration*, not just fields) — explicitly out of scope.
@@ -157,3 +165,4 @@ Real further reduction of `store.rs` needs the Tier-3 work (trait seams to move
 
 - `ceb233f8e7` — T2-B: `solution_agent: Extract model/effort catalog into ModelCatalog`
 - `1dafbc0bcf` — T2-A: `solution_agent: Extract session_view clusters into satellite submodules` (cherry-picked from worktree `0bf8a03f9a`)
+- `f6b9480653` — TeammateWatchers: `solution_agent: Extract teammate watcher state into TeammateWatchers` (marginal — confirmed the store-coordinator finding; last store field-extraction)
