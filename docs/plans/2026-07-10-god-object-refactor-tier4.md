@@ -110,4 +110,13 @@ entry-persistence cluster (430 lines on the #35/#40 path — risk/reward inverte
 `store/queue.rs`, `message_generator.rs` (already right-shaped).
 
 ## Commit log
-(filled as work lands)
+
+### Stage A — COMPLETE (whole-binary build clean; solution_agent 563 · solutions 146 · solutions_ui 34)
+- `662f0891de` — A1: `store/tests.rs` 13584 → 9 (root) + `store/tests/{supervisor,teammate_reconciler,hydration,teardown,model_catalog,misc,common}.rs` (199 tests classified).
+- `20526785b0` — A6: `supervisor.rs` 1323 → 23 + `supervisor/{state,persistence,briefing,tests}.rs` (true sub-modules, GPUI-decoupled).
+- `51b4104255` — A10: `model.rs` 1849 → 1014; test module → `model/tests.rs` (834).
+- `0527355c99` — A8: `solutions_ui/modals.rs` 1055 → 97 + 7 per-modal files.
+- `0e776a17e7` — A7: `solutions/mcp/project_files.rs` 1826 → 216 (+fs_ops/buffer_ops/code_nav); `workspace_state.rs` 1278 → 549 (+visual_structure/diagnostics).
+- `bcee43a347` — A9: `solutions/store.rs` 1602 → 948 (+catalog/lifecycle/members).
+
+### Stage B — pending (store.rs cluster relocations)
