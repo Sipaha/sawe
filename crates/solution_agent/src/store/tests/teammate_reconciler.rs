@@ -1017,6 +1017,7 @@ async fn done_agent_removed_on_tick(cx: &mut TestAppContext) {
                     }),
                     last_offset: 0,
                     parent_tool_use_id: None,
+                    latest_seq: 0,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1080,6 +1081,7 @@ async fn background_agent_terminal_transition_resets_silence_clock(cx: &mut Test
                     }),
                     last_offset: 0,
                     parent_tool_use_id: None,
+                    latest_seq: 0,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1106,6 +1108,96 @@ async fn background_agent_terminal_transition_resets_silence_clock(cx: &mut Test
         chrono::Utc::now().signed_duration_since(after).num_seconds() < 60,
         "last_activity must be bumped to ~now, not left stale"
     );
+}
+
+/// Regression for the "frozen pill" bug: a detached agent's folded pill body +
+/// wire `seq` derive from `ba.latest` ONLY inside `rebuild_streams`, so a
+/// non-terminal snapshot advance in `refresh_background_agent_snapshot` MUST
+/// rebuild — otherwise the pill shows its first-observed state forever while the
+/// agent runs (and mobile delta clients get no updates because `seq` never
+/// advances). Mirrors the shell twin's unconditional rebuild.
+#[gpui::test]
+async fn refresh_rebuilds_a_detached_agent_pill_so_it_is_not_frozen(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("bg_refresh");
+    let parent_toolu = SharedString::from("toolu_refresh");
+    let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let jsonl = dir.path().join("agent.jsonl");
+    // A NON-terminal tool_use line → activity advances, no stop_reason.
+    std::fs::write(
+        &jsonl,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+    )
+    .unwrap();
+
+    // Register a DETACHED agent (no tagged parent-thread entries) with a stale
+    // initial snapshot; the fold builds the pill.
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| {
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: jsonl.clone().into(),
+                    registered_at: chrono::Utc::now(),
+                    latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                        mtime: std::time::SystemTime::UNIX_EPOCH,
+                        activity_label: SharedString::from("Starting…"),
+                        stop_reason: None,
+                    }),
+                    last_offset: 0,
+                    parent_tool_use_id: Some(parent_toolu.clone()),
+                    latest_seq: 0,
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+            s.rebuild_streams();
+        });
+    });
+
+    let (before_seq, before_body) = cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
+        session.read_with(cx, |s, _| {
+            let stream = s.streams.get(&teammate).expect("folded pill present");
+            (stream.seq, format!("{:?}", stream.entries))
+        })
+    });
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| {
+            s.refresh_background_agent_snapshot(session_id, bg_id.clone(), cx)
+        });
+    });
+
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
+        session.read_with(cx, |s, _| {
+            let stream = s
+                .streams
+                .get(&teammate)
+                .expect("pill still present (agent still running)");
+            assert!(
+                stream.seq > before_seq,
+                "refresh must rebuild so the wire seq advances off the change_seq axis"
+            );
+            assert_ne!(
+                format!("{:?}", stream.entries),
+                before_body,
+                "refresh must rebuild so the pill body reflects the new activity"
+            );
+        });
+    });
 }
 
 /// Sub-task C (deferred #1): an async `Agent` teammate's demux `Teammate`
@@ -1161,6 +1253,7 @@ async fn background_agent_terminal_closes_teammate_stream(cx: &mut TestAppContex
                     }),
                     last_offset: 0,
                     parent_tool_use_id: Some(parent_toolu.clone()),
+                    latest_seq: 0,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1240,6 +1333,7 @@ async fn background_agent_non_terminal_leaves_teammate_stream(cx: &mut TestAppCo
                     latest: None,
                     last_offset: 0,
                     parent_tool_use_id: Some(parent_toolu.clone()),
+                    latest_seq: 0,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1473,6 +1567,7 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
                         latest: Some(snap),
                         last_offset: 0,
                         parent_tool_use_id: Some(SharedString::from(parent.to_string())),
+                        latest_seq: 0,
                     },
                 );
                 s.background_agent_order.push(bg_id);
@@ -1586,6 +1681,7 @@ async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(
                         latest: None,
                         last_offset: 0,
                         parent_tool_use_id: Some(SharedString::from(parent.to_string())),
+                        latest_seq: 0,
                     },
                 );
                 s.background_agent_order.push(bg_id);
@@ -1663,6 +1759,7 @@ async fn fold_does_not_resurrect_a_reaped_detached_agent_pill(cx: &mut TestAppCo
                     latest: None, // snapshot-less → ages from registered_at
                     last_offset: 0,
                     parent_tool_use_id: Some(SharedString::from(toolu)),
+                    latest_seq: 0,
                 },
             );
             s.background_agent_order.push(bg_id);
@@ -1768,6 +1865,7 @@ async fn stale_agent_lingers_briefly_then_removed(cx: &mut TestAppContext) {
                     }),
                     last_offset: 0,
                     parent_tool_use_id: None,
+                    latest_seq: 0,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1811,6 +1909,7 @@ async fn fresh_agent_survives_tick(cx: &mut TestAppContext) {
                     }),
                     last_offset: 0,
                     parent_tool_use_id: None,
+                    latest_seq: 0,
                 },
             );
             s.background_agent_order.push(bg_id.clone());

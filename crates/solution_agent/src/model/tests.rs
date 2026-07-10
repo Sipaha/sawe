@@ -815,6 +815,9 @@
                 }),
                 last_offset: 0,
                 parent_tool_use_id: Some(SharedString::from(parent_toolu)),
+                // Distinctive change_seq-axis stamp — the fold entry's mod_seq
+                // (and thus stream.seq) must ride this, NOT the mtime.
+                latest_seq: 7,
             },
         );
         s.background_agent_order.push(id);
@@ -835,7 +838,10 @@
         assert_eq!(stream.kind, StreamKind::Teammate);
         assert_eq!(stream.state, StreamState::Live);
         assert_eq!(stream.entries.len(), 1, "one activity-snapshot entry");
-        assert_eq!(stream.seq, 1_720_000_000_000);
+        assert_eq!(
+            stream.seq, 7,
+            "stream.seq rides the change_seq-axis latest_seq, not the mtime"
+        );
     }
 
     #[test]

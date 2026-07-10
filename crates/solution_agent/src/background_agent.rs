@@ -132,6 +132,13 @@ pub struct BackgroundAgent {
     /// terminal `stop_reason`. `None` when unknown (a DB cold-restore does not
     /// persist it — those streams are hydration orphans, already Main-only).
     pub parent_tool_use_id: Option<SharedString>,
+    /// `change_seq`-axis stamp for the folded-pill `stream_entry`'s `mod_seq`
+    /// (bumped in `refresh_background_agent_snapshot` each time `latest`
+    /// advances). MUST be on the same monotonic axis as demux entries: the
+    /// folded pill and a later demux stream can share one `Teammate(toolu)` id,
+    /// so a mtime-millis stamp (~1.7e12) here would collapse the stream's wire
+    /// `seq` when demux takes over and strand the mobile delta cursor.
+    pub latest_seq: u64,
 }
 
 impl BackgroundAgent {
@@ -145,13 +152,6 @@ impl BackgroundAgent {
         self.latest
             .as_ref()
             .map_or(true, |snapshot| snapshot.stop_reason.is_none())
-    }
-
-    /// Fallback stream label for this agent's derived `StreamId::Teammate`
-    /// pill. `rebuild_streams` overrides it from `teammate_labels` when the
-    /// spawn captured a friendly name; this shows when it didn't.
-    pub fn stream_label(&self) -> SharedString {
-        SharedString::from(format!("Agent {}", self.id.short()))
     }
 
     /// Convert this agent's last-observed snapshot into the single
@@ -182,14 +182,18 @@ impl BackgroundAgent {
             observed
         );
         let text = format!("{header}\n\n{activity}");
-        let ms = self
+        let created_ms = self
             .latest
             .as_ref()
             .and_then(|snap| snap.mtime.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|dur| dur.as_millis() as u64);
+            .map(|dur| dur.as_millis() as i64)
+            .unwrap_or(0);
         SessionEntry {
-            created_ms: ms.map(|m| m as i64).unwrap_or(0),
-            mod_seq: ms.unwrap_or(0),
+            created_ms,
+            // `mod_seq` rides the `change_seq` axis (NOT the mtime), so the
+            // folded pill's wire `seq` stays compatible with a demux stream that
+            // may later claim the same `Teammate(toolu)` id.
+            mod_seq: self.latest_seq,
             subagent_id: None,
             kind: SessionEntryKind::AssistantMessage {
                 chunks: vec![AssistantChunk::Message(text)],

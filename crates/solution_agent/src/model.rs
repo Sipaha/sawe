@@ -782,7 +782,7 @@ impl SolutionSession {
             let Some(parent_toolu) = agent.parent_tool_use_id.clone() else {
                 continue;
             };
-            let key = crate::stream::StreamId::Teammate(parent_toolu);
+            let key = crate::stream::StreamId::Teammate(parent_toolu.clone());
             // Respect an existing demux stream (don't clobber real entries) AND
             // the age-out: `reconcile_finished_teammate_streams` closes a stale /
             // done agent's stream via `closed_streams` (removed at the top of
@@ -795,7 +795,10 @@ impl SolutionSession {
             let stream = crate::stream::Stream {
                 id: key.clone(),
                 kind: crate::stream::StreamKind::Teammate,
-                label: agent.stream_label(),
+                // Placeholder — the teammate-label enrichment pass below
+                // overwrites this with `teammate_labels[toolu]` (or the raw
+                // toolu when none was captured), the single label source.
+                label: parent_toolu,
                 entries: vec![agent.stream_entry(agent_now)],
                 seq: 0,
                 state: crate::stream::StreamState::Live,

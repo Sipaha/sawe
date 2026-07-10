@@ -270,6 +270,10 @@ impl SolutionAgentStore {
         let mut changed = false;
         session.update(cx, |s, _| {
             let mut close_teammate: Option<(SharedString, SharedString)> = None; // (parent toolu, reason)
+            // Allocate the pill's next `change_seq`-axis stamp BEFORE the
+            // `get_mut` borrow (both need `&mut s`). Only consumed when this
+            // tail yields a new snapshot.
+            let next_seq = snapshot.as_ref().map(|_| s.bump_change_seq());
             if let Some(ba) = s.background_agents.get_mut(&agent_id) {
                 // Always advance the offset (or rewind on truncation —
                 // `tail_jsonl` already handled the reset). Only update
@@ -293,6 +297,7 @@ impl SolutionAgentStore {
                     let parent = ba.parent_tool_use_id.clone();
                     let reason = snap.stop_reason.clone();
                     ba.latest = Some(snap);
+                    ba.latest_seq = next_seq.unwrap_or(ba.latest_seq);
                     changed = true;
                     if now_terminal && !was_terminal {
                         s.last_activity_at = Utc::now();
@@ -311,6 +316,13 @@ impl SolutionAgentStore {
             // `close_stream` can take `&mut s`.
             if let Some((parent_toolu, reason)) = close_teammate {
                 s.close_stream(crate::stream::StreamId::Teammate(parent_toolu), reason);
+            } else if changed {
+                // The folded pill's body + `seq` derive from `ba.latest` ONLY
+                // inside `rebuild_streams`, so a non-terminal snapshot advance
+                // must rebuild or the pill freezes at its first-observed state
+                // (mirrors the shell twin's unconditional rebuild). The terminal
+                // path already rebuilt via `close_stream`.
+                s.rebuild_streams();
             }
         });
         if changed {
@@ -976,6 +988,7 @@ impl SolutionAgentStore {
                                 latest: None,
                                 last_offset: 0,
                                 parent_tool_use_id: Some(parent_toolu),
+                                latest_seq: 0,
                             },
                         );
                         s.background_agent_order.push(id_for_insert);
@@ -1144,7 +1157,7 @@ impl SolutionAgentStore {
     }
 
     /// One pass over every session's teammate pills, closing each stream whose
-    /// completion is provable. Runs on the 1 Hz tick so it fires mid-session,
+    /// completion is provable. Runs on the 5s tick so it fires mid-session,
     /// unlike the →Idle GC. See
     /// [`Self::reconcile_finished_teammate_streams`] for the per-session rules.
     pub fn reconcile_all_finished_teammate_streams(&mut self, cx: &mut Context<Self>) {
@@ -1307,7 +1320,7 @@ impl SolutionAgentStore {
 
     /// One pass over every session: incrementally tail the PARENT session
     /// JSONL for `<task-notification>` lines and flip matching tracked shells
-    /// to their terminal [`ShellRuntimeState`]. Runs on the same 1 Hz tick as
+    /// to their terminal [`ShellRuntimeState`]. Runs on the same 5s tick as
     /// the reap pass, BEFORE it, so a freshly-Exited shell is flipped this
     /// tick (and the reap can later drop it once stale).
     pub fn scan_parent_jsonls_for_completions(&mut self, cx: &mut Context<Self>) {
@@ -1404,7 +1417,7 @@ impl SolutionAgentStore {
         }
     }
 
-    /// 1 Hz healthcheck for background shells, the analog of
+    /// 5s healthcheck for background shells, the analog of
     /// [`tick_background_agents`]. Reaps a shell when it is in a terminal
     /// state (`Exited`/`Killed`) OR when it has gone stale beyond
     /// `managed_agent_stale_timeout_secs + managed_agent_dead_linger_secs`.
