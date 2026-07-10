@@ -147,7 +147,7 @@ impl SolutionAgentStore {
     /// (finding #3). Returning the wall text lets the timeout path route to quota
     /// recovery. Detection is anchored (`is_usage_limit_error`, finding #4) so the
     /// judge's own rate-limit-code *analysis* doesn't false-match.
-    pub(super) fn judge_wall_message(&self, id: SolutionSessionId, cx: &App) -> Option<String> {
+    fn judge_wall_message(&self, id: SolutionSessionId, cx: &App) -> Option<String> {
         let judge_id = self.judge_sessions.get(&id)?.judge_id?;
         self.session_wall_message(judge_id, cx)
     }
@@ -158,7 +158,7 @@ impl SolutionAgentStore {
     /// `finish_judge`/`finish_auditor` reaps it — so a `VerdictRecord` can record
     /// what the supervisor's own review turn cost (the verdict tool itself has no
     /// token figure to pass). `None` when the session is gone or has no usage yet.
-    pub(super) fn ephemeral_session_tokens(&self, judge_id: Option<SolutionSessionId>, cx: &App) -> Option<u64> {
+    fn ephemeral_session_tokens(&self, judge_id: Option<SolutionSessionId>, cx: &App) -> Option<u64> {
         let session = self.session(judge_id?)?;
         let session = session.read(cx);
         session
@@ -1692,7 +1692,7 @@ impl SolutionAgentStore {
     /// unconditionally (the hold-on-typing decision lives in the callers:
     /// [`send_supervisor_nudge`] parks it when the user is mid-message,
     /// `tick_supervisor` flushes a parked nudge once the user is quiet).
-    pub(super) fn deliver_nudge_now(
+    fn deliver_nudge_now(
         &mut self,
         id: SolutionSessionId,
         content: String,
@@ -1714,6 +1714,470 @@ impl SolutionAgentStore {
         // continue-cap counter (apply_verdict just incremented it) nor be
         // mistaken for a human reply that resumes a `WaitingUser` pause.
         self.send_message_blocks_targeted(id, blocks, crate::model::QueueTarget::Main, false, cx)
+    }
+
+    /// Recovery sweep for wedged sessions. A session stuck in `Running` with
+    /// no streaming / tool activity for [`STUCK_TURN_SECS`] has a hung or dead
+    /// claude subprocess: a healthy turn streams thinking / text / tool calls
+    /// well within that window, each of which bumps `last_activity_at` (so the
+    /// silence clock self-resets on any progress). A cleanly *exited*
+    /// subprocess is already recovered by the connection's EOF path (it fails
+    /// the pending prompt → `Errored`); this catches the harder hung-but-alive
+    /// case the EOF path can't see.
+    ///
+    /// A genuinely-busy turn IS distinguishable from a hang: when claude blocks
+    /// on a slow FOREGROUND command it leaves that tool call in
+    /// [`ToolCallStatus::InProgress`] for the command's whole duration. So we
+    /// only treat a silent turn as wedged when there is NO in-progress tool call.
+    /// When there IS one we leave it alone until that single tool has both
+    /// exceeded an unreasonable [`TOOL_STUCK_SECS`] AND stopped showing liveness
+    /// — no output for [`TOOL_OUTPUT_SILENCE_SECS`] and no running OS process. A
+    /// display-only command's output each bumps `last_activity_at` (it rides a
+    /// `ToolCallUpdate`), so `silent_secs` already measures how long ago it last
+    /// printed; a real client-side PTY's output does not, so that path is covered
+    /// by [`acp_thread::Terminal::is_process_running`]. A build/deploy that keeps
+    /// printing (or whose process is alive) is therefore never reconnected out
+    /// from under itself (hardening #7); only one that truly hangs (silent, no
+    /// live process) is. Background (`run_in_background`) commands don't block
+    /// claude, so they keep streaming and never get here.
+    ///
+    /// Recovery is [`reconnect_agent`] — non-destructive: it respawns the
+    /// subprocess and replays the same transcript, keeping the conversation.
+    /// `reconnect_agent` synchronously flips the session out of `Running` (to
+    /// `Errored("reconnecting…")`), so the next tick won't re-fire for it.
+    pub(crate) fn tick_stuck_sessions(&mut self, cx: &mut Context<Self>) {
+        use crate::model::SessionState;
+        use acp_thread::{AgentThreadEntry, AssistantMessageChunk, ToolCallStatus};
+        let now = Utc::now();
+        // Each wedged session is tagged with `Some(limit_message)` when its
+        // stall is actually a usage/session/weekly-limit wall rather than a hung
+        // subprocess — those are recovered differently (see the loop below).
+        let stuck: Vec<(SolutionSessionId, Option<String>)> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let s = session.read(cx);
+                // Live, project-backed, non-ephemeral sessions mid-turn only.
+                // (Ephemeral judge/auditor sessions are short-lived and cold /
+                // prebuilt sessions have nothing to reconnect.)
+                if s.is_supervisor_ephemeral
+                    || s.project.is_none()
+                    || !matches!(s.state, SessionState::Running { .. })
+                {
+                    return None;
+                }
+                let thread = s.acp_thread()?;
+                let silent_secs = now.signed_duration_since(s.last_activity_at).num_seconds();
+                // Not silent long enough yet → claude is clearly alive.
+                if silent_secs < STUCK_TURN_SECS as i64 {
+                    return None;
+                }
+                let thread_ref = thread.read(cx);
+                // The most-recent in-progress tool call as `(secs_running,
+                // shows_liveness)`. `None` = no tool is executing right now. A
+                // foreground build/deploy is "alive" — and so must NOT be
+                // reconnected out from under itself (hardening #7) — when its OS
+                // process is still running (real client-side PTY) OR it printed
+                // within `TOOL_OUTPUT_SILENCE_SECS`. For the display-only path
+                // (claude-acp) each output chunk bumps `last_activity_at`, so
+                // `silent_secs` is exactly the time since the command last
+                // printed; the real-PTY path's output does not, so it's covered
+                // by the direct process check.
+                let active_tool = thread_ref.entries().iter().rev().find_map(|e| match e {
+                    AgentThreadEntry::ToolCall(tc)
+                        if matches!(tc.status, ToolCallStatus::InProgress) =>
+                    {
+                        let since = tc.status_started_at.unwrap_or(s.last_activity_at);
+                        let tool_secs = now.signed_duration_since(since).num_seconds();
+                        let pty_running =
+                            tc.terminals().any(|term| term.read(cx).is_process_running(cx));
+                        let shows_liveness = pty_running
+                            || silent_secs < TOOL_OUTPUT_SILENCE_SECS as i64;
+                        Some((tool_secs, shows_liveness))
+                    }
+                    _ => None,
+                });
+                if !turn_is_wedged(active_tool) {
+                    return None;
+                }
+                // Distinguish a usage/session-limit WALL from a genuine hang: a
+                // turn that hit the limit prints the wall as its last assistant
+                // message and then stalls (nothing ends the turn), so it looks
+                // silent-and-wedged. Reconnecting + "carry on" there just re-hits
+                // the wall and burns more quota (observed loop: repeated "You've
+                // hit your session limit" + a spurious "your process hung,
+                // continue" nudge). Detect it by scanning the latest assistant
+                // message so the loop can route it to quota recovery instead.
+                let limit_message = thread_ref
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find_map(|e| match e {
+                        AgentThreadEntry::AssistantMessage(m) => Some(
+                            m.chunks
+                                .iter()
+                                .map(|chunk| match chunk {
+                                    AssistantMessageChunk::Message { block }
+                                    | AssistantMessageChunk::Thought { block } => {
+                                        block.to_markdown(cx)
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                        _ => None,
+                    })
+                    .filter(|text| crate::supervisor::is_usage_limit_error(text));
+                Some((*id, limit_message))
+            })
+            .collect();
+        for (id, limit_message) in stuck {
+            match limit_message {
+                // Usage/session-limit wall, NOT a hang: stop the runaway turn and
+                // hand off to the shared quota handler (auto-resume at the reset
+                // time if supervised, else `Stopped(Quota)`) instead of
+                // reconnecting + nudging "continue" (which re-hits the wall).
+                Some(message) => {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "session={id} stalled on a usage/session-limit wall (not a hang) — \
+                         stopping turn + scheduling quota recovery, no reconnect"
+                    );
+                    self.append_supervisor_diary_note(
+                        id,
+                        "turn hit a usage/session limit while Running; stopped (no reconnect), \
+                         quota recovery scheduled",
+                        cx,
+                    );
+                    self.mutate_state(
+                        id,
+                        |st| *st = SessionState::Errored(SharedString::from(message.clone())),
+                        cx,
+                    );
+                    self.push_system_note(
+                        id,
+                        acp_thread::SystemNoteLevel::Error,
+                        "Достигнут лимит claude — текущий ход остановлен (без переподключения).",
+                        cx,
+                    );
+                    self.apply_usage_limit_stop(id, &message, cx);
+                }
+                // Genuine hang: reconnect (respawn subprocess + replay transcript).
+                None => {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "session={id} wedged in Running (no progress {STUCK_TURN_SECS}s, no live \
+                         tool — or a tool in-progress >{TOOL_STUCK_SECS}s with no output for \
+                         >{TOOL_OUTPUT_SILENCE_SECS}s) — auto-reconnecting (respawn subprocess + \
+                         replay transcript)"
+                    );
+                    self.append_supervisor_diary_note(
+                        id,
+                        "session wedged while Running (hung subprocess); auto-reconnect",
+                        cx,
+                    );
+                    self.reconnect_agent(id, cx).detach_and_log_err(cx);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn tick_supervisor(&mut self, cx: &mut Context<Self>) {
+        use crate::model::SessionState;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Auditor-stuck sweep: a meta-auditor spawns while the supervised
+        // session is `Watching` (not `Judging`), so the judge-stuck timeout in
+        // the per-session loop below never catches it. An auditor that
+        // errors/ends WITHOUT calling `supervisor_audit_verdict` would leave its
+        // `auditor_sessions` handle live forever and permanently disable
+        // meta-audit for that session. Clean up any auditor older than the
+        // timeout so the next audit cycle can spawn fresh. No supervision
+        // backoff is applied — the auditor failing is not the judge failing.
+        let stale_auditors: Vec<SolutionSessionId> = self
+            .auditor_sessions
+            .iter()
+            .filter(|(_, handle)| {
+                now_ms.saturating_sub(handle.started_ms)
+                    >= (crate::supervisor::AUDITOR_TIMEOUT_SECS as i64) * 1000
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale_auditors {
+            self.finish_auditor(id, cx);
+            self.append_supervisor_diary_note(
+                id,
+                "meta-auditor timed out / ended without verdict; handle cleaned up",
+                cx,
+            );
+        }
+
+        let session_ids: Vec<SolutionSessionId> = self
+            .supervisor_states
+            .iter()
+            .filter(|(_, st)| st.enabled)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in session_ids {
+            let Some(state) = self.supervisor_states.get(&id) else {
+                continue;
+            };
+            let enabled = state.enabled;
+            let status = state.status.clone();
+            let next_eligible_ms = state.next_eligible_ms;
+            let last_fired_at = state.last_fired_at;
+            let last_user_input_ms = state.last_user_input_ms;
+            // Anchors the idle clock to "since this process started watching",
+            // set only on the restart/load path (`set_persistence`). A session
+            // whose supervision was enabled fresh THIS process leaves it `None`
+            // (no baseline → normal immediate idle semantics).
+            let watch_started_ms = state.watch_started_ms;
+
+            // Judge-stuck watchdog: a judge that errored / ended WITHOUT calling
+            // its verdict tool leaves the session pinned in `Judging` forever
+            // (finish_judge never ran), so the watchdog would never re-fire.
+            // Treat an over-long `Judging` window as a transient failure. This
+            // single timeout uniformly catches crash, error, AND silent-end
+            // without per-judge session-state subscriptions.
+            if matches!(status, crate::supervisor::SupervisorStatus::Judging) {
+                // A `Judging` status with no `last_fired_at` is a corrupt/phantom
+                // wedge (currently unreachable — every fire sets it and the DB
+                // load coerces `Judging`+`None` → `Watching`). Treat `None` as
+                // "already stuck" (`0`, i.e. infinitely old) so it un-wedges
+                // immediately rather than being pinned forever by `now_ms`.
+                let fired_at = last_fired_at.unwrap_or(0);
+                let stuck_ms = now_ms.saturating_sub(fired_at);
+                if stuck_ms >= (crate::supervisor::JUDGE_TIMEOUT_SECS as i64) * 1000 {
+                    // `Some(judge_id)` = a real judge handle is registered (the
+                    // inner `judge_id` may still be `None` if its session hasn't
+                    // been created yet); `None` = phantom (spawn early-returned).
+                    if let Some(judge_id) = self.judge_sessions.get(&id).map(|h| h.judge_id) {
+                        // LIVENESS (finding #5): the wall-clock timeout is crossed,
+                        // but don't kill a judge that is still demonstrably working.
+                        // Check the judge SESSION's own activity clock — a streaming
+                        // judge bumps it on every thinking/text/tool event — and
+                        // extend while it progresses, up to a hard cap that still
+                        // catches a runaway (infinite-thinking) judge.
+                        let judge_silent_ms = judge_id
+                            .and_then(|jid| self.session(jid))
+                            .map(|js| {
+                                now_ms.saturating_sub(
+                                    js.read(cx).last_activity_at.timestamp_millis(),
+                                )
+                            });
+                        let judge_alive = judge_silent_ms.is_some_and(|ms| {
+                            ms < (crate::supervisor::JUDGE_LIVENESS_SILENCE_SECS as i64) * 1000
+                        });
+                        let under_hard_cap =
+                            stuck_ms < (crate::supervisor::JUDGE_HARD_TIMEOUT_SECS as i64) * 1000;
+                        if judge_alive && under_hard_cap {
+                            // Still streaming — leave it be; re-check next tick.
+                            continue;
+                        }
+                        // A real judge that timed out / ended / went silent without
+                        // a verdict. If it stalled on the usage wall (its own
+                        // transcript shows it — the judge hits the same account wall
+                        // as the worker), route to QUOTA recovery (schedule the
+                        // reset-time resume) instead of a transient failure that
+                        // spirals to a false `Stopped(ProviderError)` (finding #3).
+                        // Otherwise it's a genuine timeout.
+                        let message = self
+                            .judge_wall_message(id, cx)
+                            .unwrap_or_else(|| "judge timed out / ended without verdict".to_string());
+                        self.on_judge_failed(id, message, cx);
+                    } else {
+                        // PHANTOM `Judging` (finding #2): the fire set `Judging` +
+                        // `last_fired_at`, but the judge SPAWN early-returned (a
+                        // cold session with no project / no live thread), so no
+                        // judge handle was ever registered. This is NOT a timed-out
+                        // judge — charging it as a transient failure would, over
+                        // repeated phantoms, spiral to a FALSE
+                        // `Stopped(ProviderError)` that silently kills supervision
+                        // (and breaks the "продолжит автоматически" quota promise on
+                        // a cold-restored tab). Un-wedge to `Watching` with NO
+                        // penalty; the fire re-engages once the session warms up.
+                        if let Some(st) = self.supervisor_states.get_mut(&id) {
+                            st.status = crate::supervisor::SupervisorStatus::Watching;
+                            st.last_fired_at = None;
+                        }
+                        self.persist_supervisor_state(id, cx);
+                        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+                    }
+                }
+                continue;
+            }
+
+            let Some(session) = self.session(id) else {
+                continue;
+            };
+            let (idle_or_errored, last_activity_ms, has_live_background_work) = {
+                let s = session.read(cx);
+                let idle_or_errored =
+                    matches!(s.state, SessionState::Idle | SessionState::Errored(_));
+                // A session sitting idle OVER a background command/agent it
+                // launched is legitimately idle — the agent is waiting on that
+                // work, so there is nothing for the supervisor to judge. Live =
+                // any background shell still `Running`, or any managed agent that
+                // has not hit a terminal stop.
+                let has_live_background_work =
+                    s.background_shells.values().any(|sh| {
+                        matches!(
+                            sh.state,
+                            crate::background_shell::ShellRuntimeState::Running
+                        )
+                    }) || s.background_agents.values().any(|a| a.is_messageable());
+                (
+                    idle_or_errored,
+                    s.last_activity_at.timestamp_millis(),
+                    has_live_background_work,
+                )
+            };
+
+            // Don't fire the supervisor while a background command/agent is
+            // running: the agent's idleness is expected (it's waiting on that
+            // work), and hung background work is already watched elsewhere (the
+            // background-shell watcher + the `Running`-stuck watchdog). Stay
+            // quiet like we do while the user types; the supervisor re-engages
+            // once the work finishes and the agent goes genuinely idle. This is
+            // what keeps the judge from firing a stream of `wait` verdicts over
+            // a session parked on a long build/test.
+            if has_live_background_work {
+                continue;
+            }
+            // Treat live human typing as activity: the supervisor's idle clock
+            // counts silence from the LATER of the session's last activity and
+            // the user's last keystroke, so a nudge never fires while the user
+            // is mid-message (note_user_input bumps `last_user_input_ms`).
+            let quiet_since_ms = last_activity_ms.max(last_user_input_ms.unwrap_or(0));
+
+            // Inherited idle after a restart is left ALONE until a manual kick.
+            // `watch_started_ms` is stamped only on the restart/load path; a
+            // session whose last activity predates it was already parked when the
+            // editor closed, so the supervisor must NOT auto-resume it on reopen
+            // — the operator resumes each session by hand, and only once it
+            // produces genuinely-new activity THIS process (a manual kick starts
+            // a turn, which bumps `last_activity_at` past the baseline) does the
+            // normal idle-nudge cycle re-engage. `None` (a fresh in-session
+            // enable) is always eligible — its idle arose under our watch.
+            let eligible_for_watch = watch_started_ms
+                .is_none_or(|baseline| last_activity_ms > baseline)
+                // A session with a SCHEDULED fire (`next_eligible_ms` — a
+                // usage-limit auto-resume or a transient-failure backoff) is not
+                // plain inherited idle: the schedule is explicit intent. Honor
+                // it across a restart, or `watch_started_ms` would gate it out
+                // forever and silently break the "observer will auto-continue at
+                // HH:MM" promise (the plain-idle "manual kick" rule still applies
+                // to sessions with no schedule).
+                || next_eligible_ms.is_some();
+
+            // Flush a nudge that was held because the user was typing when the
+            // judge finished (`send_supervisor_nudge`'s hold-on-typing). Deliver
+            // it once the user has been quiet for the standard idle window and
+            // the session is idle — the "user changed their mind and stopped
+            // writing" case. A genuine user SEND would already have discarded it
+            // via the `from_user` funnel. Never fire a FRESH judge while a nudge
+            // is still parked (that would double up), so `continue` regardless.
+            let has_pending = self
+                .supervisor_states
+                .get(&id)
+                .is_some_and(|s| s.pending_nudge.is_some());
+            if has_pending {
+                // The held nudge only applies while we're still actively
+                // `Watching`. If the session moved to a paused state since the
+                // nudge was parked (user hit Stop → `Held`, supervisor
+                // escalated → `WaitingUser`, quota → `Stopped`, disabled), it is
+                // stale — DROP it rather than dragging the agent back to work
+                // after the user paused it. (Mirrors the wait-wake `Watching`
+                // gate below; the pause paths — `hold_supervisor` etc. — don't
+                // all clear `pending_nudge` themselves.)
+                if !matches!(status, crate::supervisor::SupervisorStatus::Watching) {
+                    if let Some(st) = self.supervisor_states.get_mut(&id) {
+                        st.pending_nudge = None;
+                    }
+                    continue;
+                }
+                let quiet_enough = now_ms.saturating_sub(quiet_since_ms)
+                    >= (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000;
+                if idle_or_errored && quiet_enough {
+                    let pending = self
+                        .supervisor_states
+                        .get_mut(&id)
+                        .and_then(|s| s.pending_nudge.take());
+                    if let Some(content) = pending {
+                        self.deliver_nudge_now(id, content, cx).detach();
+                        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+                    }
+                }
+                continue;
+            }
+
+            // One-shot `wait`: a judge that decided "the agent is waiting on X,
+            // park until here" committed a single timeout the mechanism honors
+            // in full — no re-judging in between (re-deciding an unchanged wait
+            // is the poll we're eliminating). While the deadline is in the
+            // future, stay quiet. When it elapses, the mechanism itself wakes
+            // the agent (a deterministic "check the result" nudge, only if it's
+            // idle — if it already resumed we just drop the wait and let the
+            // normal cycle judge the new state). Gated on `Watching` so a stale
+            // deadline on a Held/WaitingUser session can't act.
+            if matches!(status, crate::supervisor::SupervisorStatus::Watching)
+                && let Some(wake_at) = self
+                    .supervisor_states
+                    .get(&id)
+                    .and_then(|s| s.wait_until_ms)
+            {
+                if now_ms < wake_at {
+                    continue;
+                }
+                if let Some(st) = self.supervisor_states.get_mut(&id) {
+                    st.wait_until_ms = None;
+                }
+                if idle_or_errored {
+                    self.deliver_nudge_now(
+                        id,
+                        "The task you were waiting on should be done by now — \
+                         check the result and continue."
+                            .to_string(),
+                        cx,
+                    )
+                    .detach();
+                }
+                self.persist_supervisor_state(id, cx);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+                continue;
+            }
+
+            if now_ms >= next_eligible_ms.unwrap_or(0)
+                && eligible_for_watch
+                && crate::supervisor::should_fire(
+                    enabled,
+                    &status,
+                    idle_or_errored,
+                    quiet_since_ms,
+                    now_ms,
+                    crate::supervisor::IDLE_THRESHOLD_SECS,
+                )
+            {
+                if let Some(st) = self.supervisor_states.get_mut(&id) {
+                    st.status = crate::supervisor::SupervisorStatus::Judging;
+                    // Fresh judge cycle: clear any stale supersede marker from a
+                    // prior reply whose judge never emitted, so this verdict
+                    // isn't pre-suppressed (bug #1).
+                    st.judge_superseded = false;
+                    st.last_fired_at = Some(now_ms);
+                    // One more supervisor firing — surfaced next to the status
+                    // icon. Reset on enable/disable toggle.
+                    st.trigger_count = st.trigger_count.saturating_add(1);
+                    // We've consumed the backoff window; clear the gate so a stale
+                    // value can't block a later eligible fire.
+                    st.next_eligible_ms = None;
+                }
+                self.backoff_timers.remove(&id);
+                self.persist_supervisor_state(id, cx);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+                self.spawn_judge(id, cx);
+            }
+        }
     }
 
 }
