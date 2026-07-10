@@ -223,7 +223,7 @@ fn shell_output_path_re() -> &'static Regex {
 pub fn parse_bash_bg_launch(announcement: &str) -> Option<(BackgroundShellId, PathBuf)> {
     let shell_id = shell_id_re().captures(announcement)?.get(1)?.as_str();
     let output_path = shell_output_path_re()
-        .captures(raw_output)?
+        .captures(announcement)?
         .get(1)?
         .as_str();
     Some((BackgroundShellId::new(shell_id), PathBuf::from(output_path)))
