@@ -492,7 +492,19 @@ impl BranchesPopup {
             .collect();
         entries.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
         let names: Vec<String> = entries.iter().map(|e| e.name.to_string()).collect();
-        let tree = tree::BranchTree::build(&names, self.expanded_groups.clone());
+        // An active search must not hide a match behind a collapsed folder
+        // (e.g. typing `mast` while the `origin` group is collapsed). Force
+        // every group open by seeding the expanded set with all group prefixes;
+        // when the query is empty, honor the user's persisted expand/collapse.
+        let expanded = if query_empty {
+            self.expanded_groups.clone()
+        } else {
+            names
+                .iter()
+                .filter_map(|n| n.rsplit_once('/').map(|(prefix, _)| prefix.to_string()))
+                .collect()
+        };
+        let tree = tree::BranchTree::build(&names, expanded);
         let by_name: std::collections::HashMap<&str, &BranchStatusEntry> =
             entries.iter().map(|e| (e.name.as_ref(), *e)).collect();
         if names.is_empty() {
@@ -1242,7 +1254,12 @@ impl Render for BranchesPopup {
             // opening it lands the user straight on "type to filter".
             .child(div().px_3().pt_2().pb_1().child(self.query.clone()))
             .child(div().h_px().bg(cx.theme().colors().border_variant))
-            .child(self.render_action_header(cx))
+            // The action header (New Branch / Checkout Tag or Revision…) is
+            // branch-management chrome, not a search result — hide it while a
+            // query is active so the popup shows only matching branches/tags.
+            .when(self.query.read(cx).text(cx).is_empty(), |this| {
+                this.child(self.render_action_header(cx))
+            })
             .child(
                 // Rows have heterogeneous heights (1-line section headers /
                 // empty / tags vs 2-line branch rows with a commit subtitle),
@@ -1660,6 +1677,78 @@ mod tests {
                 collapsed,
                 "recent section should collapse again after second toggle"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_branches_popup_search_force_expands_groups(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let popup = window_handle
+            .update(cx, |_mw, window, cx| {
+                cx.new(|cx| {
+                    BranchesPopup::new(WeakEntity::<Workspace>::new_invalid(), None, window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let remote = |name: &str| BranchStatusEntry {
+            name: SharedString::from(name.to_string()),
+            is_remote: true,
+            is_head: false,
+            upstream_track: None,
+            subject: None,
+            committer_date_relative: None,
+        };
+        let has_leaf = |rows: &[PopupRow], want: &str| {
+            rows.iter().any(
+                |r| matches!(r, PopupRow::Branch { entry, .. } if entry.name.as_ref() == want),
+            )
+        };
+
+        // Empty query, "remote" section expanded, `origin` group collapsed by
+        // default: the group header renders but its branches stay hidden.
+        window_handle
+            .update(cx, |_mw, _window, cx| {
+                popup.update(cx, |popup, cx| {
+                    popup.branches = vec![remote("origin/master"), remote("origin/master-1")];
+                    popup.toggle_section("remote", cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        popup.update(cx, |popup, _cx| {
+            assert!(
+                popup.rows.iter().any(
+                    |r| matches!(r, PopupRow::Group { path, .. } if path.as_ref() == "origin")
+                ),
+                "origin group header expected"
+            );
+            assert!(
+                !has_leaf(&popup.rows, "origin/master"),
+                "a collapsed group must hide its branches when not searching"
+            );
+        });
+
+        // Type a query → every group force-expands so matches aren't hidden.
+        window_handle
+            .update(cx, |_mw, window, cx| {
+                let query = popup.read(cx).query.clone();
+                query.update(cx, |editor, cx| editor.set_text("mast", window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        popup.update(cx, |popup, _cx| {
+            assert!(
+                has_leaf(&popup.rows, "origin/master"),
+                "search must force-expand the origin group so matches are visible"
+            );
+            assert!(has_leaf(&popup.rows, "origin/master-1"));
         });
     }
 
