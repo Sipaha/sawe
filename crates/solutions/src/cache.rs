@@ -126,6 +126,45 @@ mod tests {
     }
 
     #[test]
+    fn cached_member_clone_gets_every_branch() {
+        // The end-to-end contract behind the fix: ensure_cache + clone_local
+        // (exactly the add_member pipeline) must reproduce ALL remote branches
+        // in the member checkout, not just the default one.
+        use crate::git::test_support::run;
+        let dir = tempdir().expect("tempdir");
+        let origin = dir.path().join("origin.git");
+        let origin_str = origin.to_str().expect("path str").to_string();
+        let work = dir.path().join("work");
+        smol::block_on(async {
+            run(&["init", "--bare", "--quiet", &origin_str], None).await;
+            std::fs::create_dir(&work).expect("mkdir work");
+            crate::git::test_support::init_seed(&work).await;
+            run(&["branch", "feature-x"], Some(&work)).await;
+            run(&["branch", "feature-y"], Some(&work)).await;
+            run(&["remote", "add", "origin", &origin_str], Some(&work)).await;
+            run(&["push", "--quiet", "origin", "--all"], Some(&work)).await;
+        });
+
+        let cache_root = dir.path().join("cache");
+        let cache =
+            smol::block_on(ensure_cache(&cache_root, &origin_str, |_| {})).expect("ensure_cache");
+        let target = dir.path().join("member");
+        smol::block_on(crate::git::clone_local(&cache, &target, |_| {})).expect("clone_local");
+
+        let refs = std::process::Command::new("git")
+            .args(["-C", target.to_str().expect("str"), "branch", "-r"])
+            .output()
+            .expect("git branch -r");
+        let listing = String::from_utf8_lossy(&refs.stdout);
+        for branch in ["origin/feature-x", "origin/feature-y"] {
+            assert!(
+                listing.contains(branch),
+                "member checkout is missing {branch}; got:\n{listing}"
+            );
+        }
+    }
+
+    #[test]
     fn ensure_cache_rewipes_non_mirror_cache() {
         let dir = tempdir().expect("tempdir");
         let bare = smol::block_on(test_support::make_bare_with_one_commit(dir.path()));
