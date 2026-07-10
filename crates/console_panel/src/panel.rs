@@ -100,6 +100,14 @@ fn effective_active_index(in_scope: &[bool], active_index: Option<usize>) -> Opt
 pub enum ConsoleTab {
     Terminal {
         view: Entity<TerminalView>,
+        /// The directory the terminal was created in (the active member path
+        /// at spawn time). Used to scope the tab to its owning member project.
+        /// Fixed for the tab's life — unlike the terminal's *live* working
+        /// directory, which wanders with `cd` and becomes unreadable when the
+        /// foreground process is owned by another user (e.g. after `sudo su`,
+        /// `/proc/<pid>/cwd` is denied), which would otherwise make the tab
+        /// silently drop out of scope and vanish from the strip.
+        origin_cwd: Option<PathBuf>,
     },
     Chat {
         view: Entity<SolutionSessionView>,
@@ -378,11 +386,16 @@ impl ConsolePanel {
                         // `update` gives the closure `&mut TerminalProvider`,
                         // which sidesteps the `read(cx).method(cx)` borrow
                         // conflict on the outer `cx`.
-                        provider.update(cx, |provider, cx| provider.new_tab(cwd_path, window, cx))
+                        provider.update(cx, |provider, cx| {
+                            provider.new_tab(cwd_path.clone(), window, cx)
+                        })
                     });
                     match task {
                         Ok(task) => match task.await {
-                            Ok(view) => Some(ConsoleTab::Terminal { view }),
+                            Ok(view) => Some(ConsoleTab::Terminal {
+                                view,
+                                origin_cwd: cwd_path.clone(),
+                            }),
                             Err(err) => {
                                 log::warn!(
                                     "ConsolePanel restore: terminal tab #{tab_index} at cwd={cwd:?} \
@@ -528,12 +541,16 @@ impl ConsolePanel {
             .enumerate()
             .map(|(ix, tab)| {
                 let (kind, item_id, cwd) = match tab {
-                    ConsoleTab::Terminal { view } => {
-                        let cwd = view
-                            .read(cx)
-                            .terminal()
-                            .read(cx)
-                            .working_directory()
+                    ConsoleTab::Terminal { origin_cwd, .. } => {
+                        // Persist the immutable `origin_cwd` (the owning member
+                        // path), NOT the live working directory: the shell
+                        // process doesn't survive restart, and restore re-spawns
+                        // the terminal in this cwd — reopening it in its member
+                        // dir keeps the tab in scope (a live cwd captured under
+                        // `sudo su` would be empty/unreadable and drop the
+                        // restored tab out of scope).
+                        let cwd = origin_cwd
+                            .as_ref()
                             .map(|p| p.to_string_lossy().into_owned());
                         // For terminal rows the `item_id` is informational;
                         // restore only consults `cwd`. We use the cwd string
@@ -689,7 +706,7 @@ impl ConsolePanel {
                 continue;
             }
             let (icon, title): (IconName, SharedString) = match tab {
-                ConsoleTab::Terminal { view } => {
+                ConsoleTab::Terminal { view, .. } => {
                     (IconName::Terminal, view.read(cx).tab_content_text(0, cx))
                 }
                 ConsoleTab::Chat {
@@ -904,15 +921,16 @@ impl ConsolePanel {
     }
 
     /// Working directory a tab is anchored to, used to decide which member
-    /// project owns it. Chat tabs use the session's immutable `cwd` (set to
-    /// the active member path at creation, the same value `claude-acp` keys
-    /// its transcript bucket on); terminal tabs use their live working
-    /// directory.
+    /// project owns it. Both tab kinds use an *immutable* creation-time cwd:
+    /// chats use the session's `cwd` (set to the active member path at
+    /// creation, the same value `claude-acp` keys its transcript bucket on),
+    /// terminals use their `origin_cwd`. Deliberately NOT the terminal's live
+    /// working directory — that wanders with `cd` and goes unreadable under a
+    /// foreign-user foreground process (`sudo su`), which would drop the tab
+    /// out of scope and make it disappear from the strip.
     fn tab_cwd(&self, tab: &ConsoleTab, cx: &App) -> Option<PathBuf> {
         match tab {
-            ConsoleTab::Terminal { view } => {
-                view.read(cx).terminal().read(cx).working_directory()
-            }
+            ConsoleTab::Terminal { origin_cwd, .. } => origin_cwd.clone(),
             ConsoleTab::Chat { session_id, .. } => SolutionAgentStore::try_global(cx)
                 .and_then(|store| store.read(cx).session(*session_id))
                 .map(|session| session.read(cx).cwd.clone()),
@@ -934,7 +952,7 @@ impl ConsolePanel {
     /// across active-member switches.
     fn tab_key(tab: &ConsoleTab) -> ConsoleTabKey {
         match tab {
-            ConsoleTab::Terminal { view } => ConsoleTabKey::Terminal(view.entity_id()),
+            ConsoleTab::Terminal { view, .. } => ConsoleTabKey::Terminal(view.entity_id()),
             ConsoleTab::Chat { session_id, .. } => ConsoleTabKey::Chat(*session_id),
         }
     }
@@ -980,13 +998,14 @@ impl ConsolePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let origin_cwd = cwd.clone();
         let task = self
             .terminal_provider
             .update(cx, |provider, cx| provider.new_tab(cwd, window, cx));
         cx.spawn(async move |this, cx| {
             let view = task.await?;
             this.update(cx, |this, cx| {
-                this.tabs.push(ConsoleTab::Terminal { view });
+                this.tabs.push(ConsoleTab::Terminal { view, origin_cwd });
                 this.active_index = Some(this.tabs.len() - 1);
                 cx.notify();
                 this.persist(cx);
@@ -1048,6 +1067,7 @@ impl ConsolePanel {
     ) -> Task<Result<WeakEntity<Terminal>>> {
         let workspace = self.workspace.clone();
         self.pending_terminals_to_add += 1;
+        let origin_cwd = task.cwd.clone();
         cx.spawn_in(window, async move |this, cx| {
             let project = workspace.read_with(cx, |workspace, cx| {
                 if !workspace.project().read(cx).supports_terminal(cx) {
@@ -1084,6 +1104,7 @@ impl ConsolePanel {
             this.update(cx, |this, cx| {
                 this.tabs.push(ConsoleTab::Terminal {
                     view: terminal_view,
+                    origin_cwd,
                 });
                 this.active_index = Some(this.tabs.len() - 1);
                 this.pending_terminals_to_add = this.pending_terminals_to_add.saturating_sub(1);
@@ -1251,7 +1272,7 @@ impl ConsolePanel {
             .iter()
             .enumerate()
             .filter_map(|(index, tab)| match tab {
-                ConsoleTab::Terminal { view } => {
+                ConsoleTab::Terminal { view, .. } => {
                     let task_state = view.read(cx).terminal().read(cx).task()?;
                     if task_state.spawned_task.full_label == label {
                         Some((index, view.clone()))
@@ -1270,7 +1291,7 @@ impl ConsolePanel {
         self.tabs
             .iter()
             .filter_map(|tab| match tab {
-                ConsoleTab::Terminal { view } => view
+                ConsoleTab::Terminal { view, .. } => view
                     .read(cx)
                     .terminal()
                     .read(cx)
@@ -1287,7 +1308,7 @@ impl ConsolePanel {
     pub fn active_terminal_view(&self, _cx: &App) -> Option<Entity<TerminalView>> {
         let ix = self.active_index?;
         match self.tabs.get(ix)? {
-            ConsoleTab::Terminal { view } => Some(view.clone()),
+            ConsoleTab::Terminal { view, .. } => Some(view.clone()),
             _ => None,
         }
     }
@@ -1449,7 +1470,7 @@ impl ConsolePanel {
         };
         let weak = cx.weak_entity();
         let menu = match tab {
-            ConsoleTab::Terminal { view } => {
+            ConsoleTab::Terminal { view, .. } => {
                 let view = view.clone();
                 ContextMenu::build(window, cx, |menu, _, _| {
                     let weak_close = weak.clone();
@@ -1616,7 +1637,7 @@ impl ConsolePanel {
             return div().flex_1().min_h_0().into_any_element();
         };
         match &self.tabs[ix] {
-            ConsoleTab::Terminal { view } => div()
+            ConsoleTab::Terminal { view, .. } => div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
@@ -2027,6 +2048,44 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn terminal_tab_scopes_by_origin_cwd(cx: &mut TestAppContext) {
+        // A terminal must be scoped to the directory it was created in, not its
+        // live working directory — the latter wanders with `cd` and goes
+        // unreadable when the foreground process is another user's (`sudo su`),
+        // which would drop the tab out of scope and make it vanish. Here we
+        // assert the creation cwd is recorded and is what `tab_cwd` reports.
+        cx.executor().allow_parking();
+        let (window_handle, panel) = bootstrap_panel(cx).await;
+
+        let origin = std::env::temp_dir();
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |p, cx| {
+                    p.add_terminal_tab(Some(origin.clone()), window, cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        panel.read_with(cx, |p, cx| {
+            assert_eq!(p.tabs.len(), 1);
+            let ConsoleTab::Terminal { origin_cwd, .. } = &p.tabs[0] else {
+                panic!("expected a terminal tab");
+            };
+            assert_eq!(
+                origin_cwd.as_deref(),
+                Some(origin.as_path()),
+                "creation cwd must be recorded as origin_cwd"
+            );
+            assert_eq!(
+                p.tab_cwd(&p.tabs[0], cx).as_deref(),
+                Some(origin.as_path()),
+                "tab_cwd must report origin_cwd, not the live working directory"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn close_active_tab_moves_active_to_neighbor(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let (window_handle, panel) = bootstrap_panel(cx).await;
@@ -2084,7 +2143,7 @@ mod tests {
             p.tabs
                 .iter()
                 .map(|t| match t {
-                    ConsoleTab::Terminal { view } => view.entity_id(),
+                    ConsoleTab::Terminal { view, .. } => view.entity_id(),
                     ConsoleTab::Chat { view, .. } => view.entity_id(),
                 })
                 .collect()
