@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod message_generator;
 pub(crate) mod metrics_emitter;
 pub mod model;
+pub mod model_catalog;
 pub mod notifier;
 pub(crate) mod pool;
 pub mod rename_session_modal;

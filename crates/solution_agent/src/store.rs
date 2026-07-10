@@ -18,6 +18,7 @@ use util::ResultExt;
 use crate::adapter::AdapterRegistry;
 use crate::db::SolutionAgentDb;
 use crate::metrics_emitter::MetricsEmitter;
+use crate::model_catalog::ModelCatalog;
 use crate::model::{
     AgentServerId, SessionContextCount, SessionState, SolutionSession, SolutionSessionId,
     SolutionSessionMetadata,
@@ -195,12 +196,11 @@ pub struct SolutionAgentStore {
     /// table that production wiring will populate at app init and tests
     /// populate manually. Held in an `Rc` because `dyn AgentServer` is `!Sync`.
     server_registry: HashMap<AgentServerId, Rc<dyn agent_servers::AgentServer>>,
-    /// Last-known model list per agent, shared across that agent's sessions so
-    /// a fresh session (no turn yet → empty per-session list) still offers a
-    /// model picker. Filled on the first live capture and by a probe at create.
-    agent_models: HashMap<AgentServerId, Vec<claude_native::ModelInfo>>,
-    /// Agents with an in-flight `ensure_agent_models` probe (dedupe).
-    agent_models_probing: HashSet<AgentServerId>,
+    /// Global per-agent model/effort catalog: last-known model list per agent
+    /// (shared across that agent's sessions so a fresh session with no turn yet
+    /// still offers a model picker) plus the in-flight probe-dedup set. The
+    /// orchestration methods below route their catalog-state access through it.
+    model_catalog: ModelCatalog,
     /// Set by the navigator (Phase 6) so `mutate_state` can ask "is this
     /// session currently focused in the UI?" before deciding whether to
     /// fire an OS notification. Stored as `Fn(&App) -> bool` rather than
@@ -954,9 +954,10 @@ fn unique_session_title(
     SharedString::from(base.to_string())
 }
 
-/// The fixed effort options offered in the UI (no per-agent list — these are
-/// Claude Code's effort levels; `ultracode` = "xhigh + workflows").
-pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultracode"];
+/// Re-export so the historical `crate::store::EFFORT_LEVELS` path (used by
+/// `status_row` and the crate-root re-export) keeps resolving after the const
+/// moved into `model_catalog`.
+pub use crate::model_catalog::EFFORT_LEVELS;
 
 impl SolutionAgentStore {
     pub fn global(cx: &App) -> Entity<Self> {
@@ -1017,8 +1018,7 @@ impl SolutionAgentStore {
             persistence: None,
             adapters,
             server_registry: HashMap::new(),
-            agent_models: HashMap::new(),
-            agent_models_probing: HashSet::new(),
+            model_catalog: ModelCatalog::new(),
             focus_resolver: None,
             entry_update_throttles: HashMap::new(),
             entries_persist_chain: HashMap::new(),
@@ -4323,10 +4323,7 @@ impl SolutionAgentStore {
         if !session.cached_models.is_empty() {
             return session.cached_models.clone();
         }
-        self.agent_models
-            .get(&session.agent_id)
-            .cloned()
-            .unwrap_or_default()
+        self.model_catalog.models_for(&session.agent_id)
     }
 
     /// Currently-selected model `value`: explicit `desired_model`, else the
@@ -4374,7 +4371,7 @@ impl SolutionAgentStore {
             None => (Vec::new(), None),
         };
         if models.is_empty() {
-            models = self.agent_models.get(agent_id).cloned().unwrap_or_default();
+            models = self.model_catalog.models_for(agent_id);
         }
         (models, default)
     }
@@ -4420,22 +4417,16 @@ impl SolutionAgentStore {
         agent_id: AgentServerId,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .agent_models
-            .get(&agent_id)
-            .map_or(false, |m| !m.is_empty())
-            || self.agent_models_probing.contains(&agent_id)
-        {
+        if !self.model_catalog.begin_probe_if_needed(&agent_id) {
             return;
         }
-        self.agent_models_probing.insert(agent_id.clone());
         let task = self.probe_models_for_agent(&solution_id, &agent_id, cx);
         cx.spawn(async move |this, cx| {
             let models = task.await.log_err().unwrap_or_default();
             this.update(cx, |this, cx| {
-                this.agent_models_probing.remove(&agent_id);
+                this.model_catalog.end_probe(&agent_id);
                 if !models.is_empty() {
-                    this.agent_models.insert(agent_id.clone(), models);
+                    this.model_catalog.set_models(agent_id.clone(), models);
                     // Re-render every session of this agent so its status-row
                     // dropdown appears now that a list exists.
                     let ids: Vec<_> = this
@@ -4539,7 +4530,7 @@ impl SolutionAgentStore {
         if let Some(models) = live {
             if !models.is_empty() {
                 let agent_id = session.read(cx).agent_id.clone();
-                self.agent_models.insert(agent_id, models.clone());
+                self.model_catalog.set_models(agent_id, models.clone());
                 session.update(cx, |s, _| s.cached_models = models);
                 self.persist_session_row(session_id, cx);
                 cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
@@ -4576,7 +4567,7 @@ impl SolutionAgentStore {
                 return;
             }
             this.update(cx, |this, cx| {
-                this.agent_models.insert(agent_id, models.clone());
+                this.model_catalog.set_models(agent_id, models.clone());
                 if let Some(session) = this.session(session_id) {
                     session.update(cx, |s, _| s.cached_models = models);
                     this.persist_session_row(session_id, cx);
@@ -9180,7 +9171,7 @@ impl SolutionAgentStore {
                     if let Some(models) = live_models {
                         if !models.is_empty() {
                             let agent_id = s.read(cx).agent_id.clone();
-                            self.agent_models.insert(agent_id, models.clone());
+                            self.model_catalog.set_models(agent_id, models.clone());
                             if s.read(cx).cached_models != models {
                                 s.update(cx, |s, _| s.cached_models = models);
                                 self.persist_session_row(session_id, cx);

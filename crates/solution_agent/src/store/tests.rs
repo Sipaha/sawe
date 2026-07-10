@@ -9613,7 +9613,7 @@ fn session_models_falls_back_to_global_agent_cache(cx: &mut TestAppContext) {
         store.update(cx, |store, cx| {
             // Stand in for the first live capture: a sibling session of this
             // agent populated the global cache.
-            store.agent_models.insert(
+            store.model_catalog.set_models(
                 agent.clone(),
                 vec![
                     claude_native::ModelInfo {
