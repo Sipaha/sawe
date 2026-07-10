@@ -85,10 +85,15 @@ fn active_member_path(solution_id: &SolutionId, cx: &App) -> Option<PathBuf> {
 /// worktree filter (`abs_path().starts_with(active_member_path)`): a `None`
 /// member path means "no active-member filter" so every tab is shown;
 /// otherwise the tab is in scope iff its cwd lives inside the member root.
+///
+/// A `None` `tab_cwd` (an unscopeable tab — e.g. a terminal created via the
+/// bare `NewTerminal` keybinding with no cwd, or one restored with a NULL cwd)
+/// is treated as IN scope rather than hidden: a tab we can't place must never
+/// silently vanish from the strip (that would leave an un-closeable ghost tab).
 fn tab_cwd_in_scope(tab_cwd: Option<&std::path::Path>, active_member_path: Option<&std::path::Path>) -> bool {
     match active_member_path {
         None => true,
-        Some(member) => tab_cwd.is_some_and(|cwd| cwd.starts_with(member)),
+        Some(member) => tab_cwd.map_or(true, |cwd| cwd.starts_with(member)),
     }
 }
 
@@ -1968,10 +1973,11 @@ mod tests {
         assert!(!tab_cwd_in_scope(Some(member_b), Some(member_a)));
 
         // A tab whose cwd is the solution root (no member) is hidden while a
-        // member is active, and a tab with no recorded cwd never matches a
-        // concrete member.
+        // member is active.
         assert!(!tab_cwd_in_scope(Some(Path::new("/sol")), Some(member_a)));
-        assert!(!tab_cwd_in_scope(None, Some(member_a)));
+        // A tab with NO recorded cwd is unscopeable → shown (never a ghost tab),
+        // even while a concrete member is active.
+        assert!(tab_cwd_in_scope(None, Some(member_a)));
     }
 
     #[test]
