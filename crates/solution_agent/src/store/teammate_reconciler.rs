@@ -694,9 +694,13 @@ impl SolutionAgentStore {
                 .raw_output
                 .as_ref()
                 .and_then(|v| serde_json::to_string(v).ok());
-            // Only the terminal task-like branch reads the content (async-agent
-            // announcement fallback), so skip the string-building otherwise.
-            let content_text = if is_task_like && is_terminal {
+            // The content is read by the two terminal announcement parsers — the
+            // async-`Agent` one (task-like) and the background-`Bash` one — and
+            // BOTH need it: `claude_native::translate` only ever calls
+            // `.raw_input(..)`, never `.raw_output(..)`, so `call.raw_output` is
+            // always `None` and `raw_output_text` is always empty. Skip the
+            // string-building for every other tool.
+            let content_text = if is_terminal && (is_task_like || tool_name == "Bash") {
                 let mut text = String::new();
                 for content in &call.content {
                     if let acp_thread::ToolCallContent::ContentBlock(block) = content {
@@ -745,10 +749,25 @@ impl SolutionAgentStore {
                 .and_then(|v| v.as_bool())
                 == Some(true)
         {
-            let raw_output_text = snapshot.raw_output_text.clone().unwrap_or_default();
-            if let Some((shell_id, output_path)) =
-                crate::background_shell::parse_bash_bg_launch(&raw_output_text)
-            {
+            // The "Command running in background with ID: … Output is being
+            // written to: ….output" announcement lives in the tool_result body,
+            // which the native translator surfaces as the tool call's CONTENT —
+            // `raw_output` is never set (see the `content_text` comment above).
+            // Parse `raw_output` first for forward-compat with a dispatcher that
+            // stashes it there, then fall back to content. Without the content
+            // fallback the shell never registers and its strip pill never
+            // appears — exactly the gap the async-`Agent` path already patched.
+            let announcement = snapshot
+                .raw_output_text
+                .as_deref()
+                .and_then(crate::background_shell::parse_bash_bg_launch)
+                .or_else(|| {
+                    snapshot
+                        .content_text
+                        .as_deref()
+                        .and_then(crate::background_shell::parse_bash_bg_launch)
+                });
+            if let Some((shell_id, output_path)) = announcement {
                 let already = session_entity
                     .read(cx)
                     .background_shells

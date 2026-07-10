@@ -212,12 +212,16 @@ fn shell_output_path_re() -> &'static Regex {
     })
 }
 
-/// Best-effort parse of a `Bash(run_in_background=true)` tool_call's `raw_output`.
+/// Best-effort parse of a `Bash(run_in_background=true)` launch announcement.
 /// Returns `Some((shell_id, output_path))` when both the `ID:` token and the
 /// `written to: <…>.output` path are present; `None` otherwise (caller silently
 /// skips registration so a reshaped future announcement doesn't spam the log).
-pub fn parse_bash_bg_launch(raw_output: &str) -> Option<(BackgroundShellId, PathBuf)> {
-    let shell_id = shell_id_re().captures(raw_output)?.get(1)?.as_str();
+///
+/// The caller feeds this the tool call's CONTENT, not its `raw_output`:
+/// `claude_native::translate` only ever sets `raw_input`, so `raw_output` is
+/// always `None` and the announcement only ever lands in the tool_result body.
+pub fn parse_bash_bg_launch(announcement: &str) -> Option<(BackgroundShellId, PathBuf)> {
+    let shell_id = shell_id_re().captures(announcement)?.get(1)?.as_str();
     let output_path = shell_output_path_re()
         .captures(raw_output)?
         .get(1)?
