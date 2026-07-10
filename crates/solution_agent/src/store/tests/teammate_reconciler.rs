@@ -1629,6 +1629,76 @@ async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(
     });
 }
 
+/// Regression guard for the pill-leak: a DETACHED async agent (its pill exists
+/// ONLY because `rebuild_streams` folds `background_agents` in — no
+/// `subagent_id`-tagged parent-thread entries, so `demux` builds nothing) must
+/// still be closed by the reconcile when it goes stale, AND must NOT be
+/// resurrected by the fold on the next rebuild (the `closed_streams` guard).
+/// Without that guard the fold would re-add the just-reaped pill every rebuild
+/// and detached-agent pills would accumulate forever.
+#[gpui::test]
+async fn fold_does_not_resurrect_a_reaped_detached_agent_pill(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let toolu = "toolu_detached_stale";
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from(toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            // NO tagged entries: the detached agent never interleaves, so its
+            // stream can only come from the fold.
+            s.set_entries(vec![], cx);
+            let bg_id = crate::background_agent::BackgroundAgentId::new("bg_detached_stale");
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: "/nonexistent".into(),
+                    registered_at: chrono::Utc::now() - chrono::Duration::seconds(200),
+                    latest: None, // snapshot-less → ages from registered_at
+                    last_offset: 0,
+                    parent_tool_use_id: Some(SharedString::from(toolu)),
+                },
+            );
+            s.background_agent_order.push(bg_id);
+            s.rebuild_streams();
+            assert!(
+                s.streams.contains_key(&teammate),
+                "the fold gives a live detached agent a pill"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reconcile_finished_teammate_streams(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| {
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "the stale detached pill is closed by the reconcile"
+            );
+            // The crux: a rebuild must NOT bring the reaped pill back.
+            s.rebuild_streams();
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "the fold must respect closed_streams and not resurrect the reaped pill"
+            );
+        });
+    });
+}
+
 /// Rule 1: a teammate stream whose parent tool-call entry has vanished from the
 /// thread (and which is not a registered async agent) is orphaned → closed.
 #[gpui::test]
