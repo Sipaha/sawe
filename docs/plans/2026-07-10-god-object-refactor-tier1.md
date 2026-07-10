@@ -1,6 +1,6 @@
 # God-object refactor — Tier 1 (mechanical file splits)
 
-**Status:** in progress
+**Status:** complete
 **Date:** 2026-07-10
 **Owner:** supervisor session
 
@@ -179,16 +179,49 @@ re-export** every moved item so those paths keep resolving. Grep
 
 ## Acceptance criteria
 
-- [ ] All four files reduced to thin module roots; submodule trees created.
-- [ ] `cargo build -p solutions` and `cargo build -p solution_agent` clean (debug).
-- [ ] `cargo test -p solutions` and `cargo test -p solution_agent` all green
-      (same count as before, minus none).
-- [ ] No `const NAME` string changed; no behavior change; `git diff` is
-      relocation-only (verify with a rename-aware diff spot-check).
-- [ ] Externally-referenced `crate::<mod>::*` paths all still resolve
-      (the build proves this).
-- [ ] `docs/INDEX.md` plans table updated; this doc flipped to `complete`.
+- [x] All four files reduced to thin module roots; submodule trees created.
+- [x] `cargo build -p solutions` and `cargo build -p solution_agent` clean (debug);
+      whole-binary `cargo build --bin sawe` clean (EXIT 0) — no cross-crate breakage.
+- [x] `cargo test -p solutions` (146) and `cargo test -p solution_agent` (561+1+1)
+      all green — identical counts to before (mcp 71→71, db 30→30, render 38→38,
+      solutions mcp 64→64 test fns preserved).
+- [x] No `const NAME` string changed (byte-identical sorted-set diff, both crates);
+      no behavior change; diffs are relocation-only.
+- [x] Externally-referenced `crate::<mod>::*` paths all still resolve
+      (the whole-binary build — which compiles every caller — proves this).
+- [x] `docs/INDEX.md` plans table updated; this doc flipped to `complete`.
+
+## Results
+
+| File | Before | After (thin root) |
+|---|---|---|
+| `solutions/src/mcp.rs` | 5,766 | 28 (+ 6 submodules) |
+| `solution_agent/src/mcp.rs` | 8,483 | 52 (+ dto.rs + 8 submodules) |
+| `solution_agent/src/db.rs` | 2,896 | 485 (+ 5 submodules) |
+| `solution_agent/src/conversation_render.rs` | 2,246 | 719 (+ 3 submodules) |
+
+~19,400 monolith lines → thin roots + focused submodule trees; ~6,000 of
+that was inline test modules moved to sibling `tests.rs` files.
+
+**Deviations (all plan-sanctioned, mechanical):** a handful of private
+`fn`/const → `pub(crate)` visibility bumps where the split put a helper and
+its test/caller in different modules (`tool_call_arg_preview`,
+`find_window_for_solution`, `project_for_solution`, dto helpers, a few
+consts); registration regrouped into per-namespace `register_<ns>` fan-out
+(same tool set, same NAME strings, order not load-bearing); test-module `use`
+headers made explicit after the split. No logic changed.
 
 ## Commit log
 
-(to be filled as work lands)
+- `b18a9292f7` — item B: `solution_agent: Split mcp.rs into DTO layer + per-namespace submodules`
+- `aa9756f91e` — item C: `solution_agent: Split db.rs into per-table submodules`
+- `0fb74532bc` — item D: `solution_agent: Split conversation_render.rs into per-target submodules`
+- `ff9ae0c02d` — item A: `solutions: Split mcp.rs into per-namespace submodules` (cherry-picked from worktree)
+
+## Follow-ups (not done here — Tier 2/3)
+
+- Tier 2: `session_view.rs` satellite extraction; `store.rs` clean sub-objects
+  (ModelCatalog, PoolManager, ArchiveGc, TeammateWatchers).
+- Tier 3 (deferred): `store.rs` SupervisorEngine; `SolutionSession` struct
+  decomposition. See the survey verdicts — these need trait seams first / ripple
+  through 10k-line `store.rs`, so they are a separate dedicated effort.
