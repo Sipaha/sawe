@@ -2105,8 +2105,32 @@ impl AgentConnection for ClaudeNativeConnection {
             let Some(session) = sessions.get(session_id) else {
                 return;
             };
-            // No turn in flight → nothing to cancel.
+            // No turn in flight, yet the caller asked us to cancel — the store
+            // believes a turn is running while this connection holds no prompt
+            // oneshot (the classic desync: a reconnect/respawn replayed the
+            // transcript but the store's `Running` survived, or an orphan
+            // `result` already consumed `prompt_tx`). Returning silently here
+            // was the "no-prompt-tx race": nothing would ever emit `Stopped`,
+            // so the store sat in `Stopping` until its 40s safety-net
+            // force-flipped it to `Idle` — and because the queue flush is
+            // keyed on the `Stopped` event, an `interrupt_and_flush_pending`
+            // follow-up never got delivered at the interrupt (it limped in on
+            // a later idle-flush instead). Synthesize the terminal event the
+            // backend can no longer produce, exactly as the pump's
+            // orphan-result path does, so the store settles immediately and
+            // `flush_after_cancel` fires.
             if session.shared.prompt_tx.borrow().is_none() {
+                let thread = session.thread.clone();
+                log::warn!(
+                    "claude_native: cancel with no in-flight prompt (store/connection desync) \
+                     — synthesizing Stopped(Cancelled) on the AcpThread"
+                );
+                thread
+                    .update(cx, |thread, cx| {
+                        thread.flush_end_of_turn_tail(cx);
+                        cx.emit(AcpThreadEvent::Stopped(acp::StopReason::Cancelled));
+                    })
+                    .ok();
                 return;
             }
             // Idempotent: a Stop is already in flight for this session — keep the

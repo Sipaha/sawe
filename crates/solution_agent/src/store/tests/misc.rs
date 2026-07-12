@@ -336,6 +336,82 @@ async fn stopping_safety_net_force_flips_to_idle(cx: &mut TestAppContext) {
     );
 }
 
+/// Regression (the "⚡ переводит в Stopping, потом снова Running" report):
+/// `interrupt_and_flush_pending` arms `flush_after_cancel` and relies on the
+/// backend's `Stopped(Cancelled)` to deliver the queue. When the backend never
+/// emits it (the `cancel` no-prompt-tx race), the safety net force-flips to
+/// `Idle` — and must ITSELF consume the one-shot flag and deliver the queued
+/// follow-up. Otherwise the message limps in on a much later idle-flush and the
+/// stale flag survives to flush a queue a subsequent Stop meant to abandon.
+#[gpui::test]
+async fn stopping_safety_net_flushes_pending_when_flush_after_cancel(cx: &mut TestAppContext) {
+    let (session_id, _cancel_calls, _tmp) = create_session_with_cancel_counter(cx).await;
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session exists");
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+            });
+        });
+    });
+
+    // Send while Running → enqueued (not delivered).
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store
+                .send_message(session_id, "прерви и ответь".to_string(), cx)
+                .detach();
+        });
+    });
+    let queued = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .expect("session")
+            .read(cx)
+            .pending_messages
+            .len()
+    });
+    assert_eq!(queued, 1, "send while Running must enqueue");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.interrupt_and_flush_pending(session_id, cx)
+        })
+    })
+    .expect("interrupt_and_flush_pending");
+
+    // Backend never answers with `Stopped` — the net is the only thing that runs.
+    cx.executor()
+        .advance_clock(crate::store::queue::STOPPING_SAFETY_NET + std::time::Duration::from_secs(1));
+    cx.executor().run_until_parked();
+
+    let (pending, flush_flag) = cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .expect("session");
+        let s = session.read(cx);
+        (s.pending_messages.len(), s.flush_after_cancel)
+    });
+    assert_eq!(
+        pending, 0,
+        "safety net must DELIVER the queued follow-up, not leave it parked"
+    );
+    assert!(
+        !flush_flag,
+        "flush_after_cancel is one-shot — the net must consume it, else a later \
+         genuine Stop would flush an abandoned queue"
+    );
+}
+
 /// Sibling regression: when the natural `Stopped` chain DOES fire
 /// (the happy path), the safety net must NOT later overwrite a
 /// legitimate new state. The `mutate_state` cleanup hook drops the

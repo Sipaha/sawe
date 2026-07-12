@@ -362,6 +362,49 @@ impl SolutionAgentStore {
                     |state| *state = SessionState::Idle,
                     cx,
                 );
+                // The `Stopped` event never arrived, so the settle logic in
+                // `handle_acp_event` never ran — which means `flush_after_cancel`
+                // (a ONE-SHOT flag set by `interrupt_and_flush_pending`) is still
+                // armed and `pending_messages` is still queued. Leaving it that
+                // way has two failure modes we actually observed: the interrupted
+                // follow-up is not delivered at the interrupt (it limps in on a
+                // later idle-flush, the "Stopping → Running again a minute or two
+                // later" symptom), and the stale flag survives to flip a LATER,
+                // genuine Stop-button cancel into a flush of a queue the user
+                // meant to abandon. Consume the flag here and deliver what it
+                // promised — this is the same settle the `Stopped` branch does,
+                // minus the Cancelled-drop path (a flag-less force-flip keeps the
+                // queue for the normal idle-flush, exactly as before).
+                let flush_after_cancel = session.update(cx, |s, _| {
+                    let was = s.flush_after_cancel;
+                    s.flush_after_cancel = false;
+                    was
+                });
+                if !flush_after_cancel {
+                    return;
+                }
+                let main_blocks: Vec<agent_client_protocol::schema::ContentBlock> = session
+                    .update(cx, |s, _| {
+                        let mut main = Vec::new();
+                        for bundle in s.pending_messages.drain(..) {
+                            // A `Subagent`-targeted bundle belongs to a teammate of
+                            // the turn we just force-stopped; it has no live
+                            // addressee now, and routing it to the parent would
+                            // mis-deliver it (see the `Stopped` branch).
+                            if matches!(bundle.target, crate::model::QueueTarget::Main) {
+                                main.extend(bundle.blocks);
+                            }
+                        }
+                        main
+                    });
+                if main_blocks.is_empty() {
+                    return;
+                }
+                use gpui::TaskExt as _;
+                store.mark_queue_changed(session_id, cx);
+                store
+                    .send_message_blocks(session_id, main_blocks, cx)
+                    .detach_and_log_err(cx);
             });
         });
         session.update(cx, |s, _| s.stopping_safety_net = Some(task));
