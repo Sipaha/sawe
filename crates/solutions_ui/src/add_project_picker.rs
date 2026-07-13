@@ -147,10 +147,11 @@ impl Render for AddProjectPicker {
             .max_h(rems(18.))
             .overflow_y_scroll();
         for catalog_project in self.catalog_entries.iter() {
-            if !query.is_empty()
-                && !catalog_project.name.to_lowercase().contains(&query)
-                && !catalog_project.remote_url.to_lowercase().contains(&query)
-            {
+            // Name only. Matching the remote URL too made every query that
+            // happened to appear in a host or group path ("gitlab", "citeck")
+            // return the whole registry, which is exactly when the filter is
+            // needed most. The URL is still shown in the row's end slot.
+            if !query.is_empty() && !catalog_project.name.to_lowercase().contains(&query) {
                 continue;
             }
             let catalog_project = catalog_project.clone();

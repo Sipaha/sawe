@@ -14,6 +14,26 @@ impl SolutionStore {
         default_branch: Option<String>,
         cx: &mut gpui::Context<Self>,
     ) -> Result<CatalogId> {
+        // A catalog entry IS its remote: registering the same repository twice
+        // used to mint a second row with a `-2` slug, so the add-project picker
+        // listed the identical project (same name, same URL) two or three times
+        // and `refresh_cache` fetched the same mirror once per row. Adding a
+        // repo already in the registry is a no-op that hands back the existing
+        // id — the caller's intent ("I want this project available") is already
+        // satisfied.
+        if let Some(existing) = self
+            .config
+            .catalog
+            .iter()
+            .find(|c| same_remote(&c.remote_url, remote_url))
+        {
+            log::info!(
+                "solutions: catalog already holds {} for {remote_url} — reusing it instead of \
+                 registering a duplicate",
+                existing.id.0,
+            );
+            return Ok(existing.id.clone());
+        }
         let taken: Vec<String> = self.config.catalog.iter().map(|c| c.id.0.clone()).collect();
         let slug = unique_slug(name, &taken);
         let id = CatalogId(slug);
@@ -210,5 +230,44 @@ impl SolutionStore {
             return Ok(());
         };
         gpui::block_on(db.delete_catalog_project(id.0.clone()))
+    }
+}
+
+/// Do two remote URLs name the same repository? Compared on a normalized form
+/// (case-folded, trailing `/` and `.git` stripped) so `…/foo.git` and `…/foo`
+/// — the two shapes a user copies out of GitLab — don't register as separate
+/// catalog entries. Deliberately does NOT try to unify `git@host:path` with
+/// `https://host/path`: those are different credentials/transport and the user
+/// may genuinely want both.
+fn same_remote(a: &str, b: &str) -> bool {
+    fn normalize(url: &str) -> String {
+        url.trim()
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .to_lowercase()
+    }
+    !a.trim().is_empty() && normalize(a) == normalize(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_remote;
+
+    #[test]
+    fn same_remote_ignores_git_suffix_slash_and_case() {
+        assert!(same_remote(
+            "git@gitlab.citeck.ru:infrastructure/ci-cd/citeck-ci.git",
+            "git@gitlab.citeck.ru:infrastructure/ci-cd/citeck-ci",
+        ));
+        assert!(same_remote("https://x/Foo.git", "https://x/foo/"));
+    }
+
+    #[test]
+    fn same_remote_keeps_distinct_repos_and_transports_apart() {
+        assert!(!same_remote("git@x:foo.git", "git@x:other-foo.git"));
+        assert!(!same_remote("git@x:foo.git", "https://x/foo.git"));
+        // An empty remote (a local-only catalog row) must never collapse onto
+        // another empty one — every such project is its own thing.
+        assert!(!same_remote("", ""));
     }
 }
