@@ -2950,7 +2950,7 @@ git commit -m "Scope console tabs by member id instead of cwd prefix"
   - `editor_mcp::lifecycle::remove_stale_solution_socket_dirs(runtime: &Path) -> usize` (returns how many were removed)
   - `context_server::listener::McpServer::set_bound_solution(&self, id: i64)` — the injected `solution_id` argument is now a JSON number.
 
-- [ ] **Step 1: Write the failing sweep test**
+- [x] **Step 1: Write the failing sweep test**
 
 In `crates/editor_mcp/src/lifecycle.rs`, add (or extend) `mod tests`:
 
@@ -2987,12 +2987,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p editor_mcp --lib lifecycle::tests -- --nocapture`
 Expected: FAIL to compile — `error[E0425]: cannot find function 'remove_stale_solution_socket_dirs' in this scope`.
 
-- [ ] **Step 3: Implement the numeric socket path and the sweep**
+- [x] **Step 3: Implement the numeric socket path and the sweep**
 
 In `crates/editor_mcp/src/lifecycle.rs`:
 
@@ -3061,7 +3061,7 @@ Then delete the `&sol.id.0.to_string()` shims Task 1 introduced — `crates/solu
     });
 ```
 
-- [ ] **Step 4: Make the bound solution id numeric in the listener**
+- [x] **Step 4: Make the bound solution id numeric in the listener**
 
 In `crates/context_server/src/listener.rs`, change the field, the constructor local, the setter and the injection:
 
@@ -3095,12 +3095,12 @@ In `crates/context_server/src/listener.rs`, change the field, the constructor lo
                     }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p editor_mcp && cargo test -p context_server`
 Expected: PASS. `editor_mcp`'s `tests/*_e2e_test.rs` files that pass a string `solution_id` need the literal changed to a number — the compiler and the JSON schema will both point at them.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/editor_mcp/src crates/editor_mcp/tests crates/context_server/src

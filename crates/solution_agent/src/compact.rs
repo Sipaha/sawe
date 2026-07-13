@@ -253,7 +253,7 @@ pub(crate) fn render_compact_prompt_inner(
     // `editor_mcp` solution-socket lifecycle driven off
     // `SolutionStoreEvent::Opened/Closed`), so it is present regardless of
     // which Solution is the foreground one.
-    let solution_socket = editor_mcp::solution_socket_path(&solution_id.0.to_string())
+    let solution_socket = editor_mcp::solution_socket_path(solution_id.0)
         .to_string_lossy()
         .into_owned();
 

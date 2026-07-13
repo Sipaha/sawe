@@ -82,9 +82,9 @@ async fn solutions_flow_over_socket(cx: &mut TestAppContext) {
         .expect("structuredContent");
     let solution_id = data
         .get("solution_id")
-        .and_then(|v| v.as_str())
+        .and_then(|v| v.as_i64())
         .expect("solution_id");
-    assert_eq!(solution_id, "demo");
+    assert!(solution_id > 0, "ids are counters: {solution_id}");
 
     // 2. catalog.add_project
     let resp = call_tool(
@@ -102,9 +102,9 @@ async fn solutions_flow_over_socket(cx: &mut TestAppContext) {
         .expect("structuredContent");
     let catalog_id = data
         .get("catalog_id")
-        .and_then(|v| v.as_str())
+        .and_then(|v| v.as_i64())
         .expect("catalog_id");
-    assert_eq!(catalog_id, "demo-repo");
+    assert!(catalog_id > 0, "ids are counters: {catalog_id}");
 
     // 3. solutions.list
     let resp = call_tool(&mut stream, 3, "solutions.list", json!({})).await;
@@ -129,7 +129,7 @@ async fn solutions_flow_over_socket(cx: &mut TestAppContext) {
         &mut stream,
         5,
         "solutions.delete",
-        json!({"solution_id": "demo"}),
+        json!({"solution_id": solution_id}),
     )
     .await;
     let deleted = resp
@@ -191,13 +191,17 @@ async fn set_active_member_rejects_non_member(cx: &mut TestAppContext) {
     assert!(socket_path.exists(), "mcp.sock did not appear");
     let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
 
-    call_tool(&mut stream, 1, "solutions.create", json!({"name": "Demo"})).await;
-    // No members yet -> any catalog is a non-member -> tool must error.
+    let resp = call_tool(&mut stream, 1, "solutions.create", json!({"name": "Demo"})).await;
+    let solution_id = resp
+        .pointer("/result/structuredContent/solution_id")
+        .and_then(|v| v.as_i64())
+        .expect("solution_id");
+    // No members yet -> any member id is a non-member -> tool must error.
     let resp = call_tool(
         &mut stream,
         2,
         "solutions.set_active_member",
-        json!({"solution_id": "demo", "catalog_id": "not-a-member"}),
+        json!({"solution_id": solution_id, "member_id": 999_999}),
     )
     .await;
     let is_error = resp

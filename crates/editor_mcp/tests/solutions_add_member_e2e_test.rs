@@ -88,10 +88,9 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
     let resp = call_tool(&mut stream, 1, "solutions.create", json!({"name": "Demo"})).await;
     let solution_id = resp
         .pointer("/result/structuredContent/solution_id")
-        .and_then(|v| v.as_str())
-        .expect("solution_id")
-        .to_string();
-    assert!(!solution_id.is_empty());
+        .and_then(|v| v.as_i64())
+        .expect("solution_id");
+    assert!(solution_id > 0, "ids are counters: {solution_id}");
 
     // --- 2. Add catalog project pointing at our local bare repo ---
     let resp = call_tool(
@@ -103,9 +102,8 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
     .await;
     let catalog_id = resp
         .pointer("/result/structuredContent/catalog_id")
-        .and_then(|v| v.as_str())
-        .expect("catalog_id")
-        .to_string();
+        .and_then(|v| v.as_i64())
+        .expect("catalog_id");
 
     // --- 3. add_member starts an async op and returns operation_id ---
     let resp = call_tool(
@@ -172,9 +170,13 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
     assert_eq!(members.len(), 1, "expected one member, got {members:?}");
     let member = &members[0];
     assert_eq!(
-        member.get("catalog_id").and_then(|v| v.as_str()),
-        Some(catalog_id.as_str()),
+        member.get("origin_catalog_id").and_then(|v| v.as_i64()),
+        Some(catalog_id),
     );
+    let member_id = member
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .expect("member id");
     assert_eq!(
         member.get("status").and_then(|v| v.as_str()),
         Some("ok"),
@@ -208,8 +210,8 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
     .await;
     assert_eq!(
         resp.pointer("/result/structuredContent/match/solution_id")
-            .and_then(|v| v.as_str()),
-        Some(solution_id.as_str()),
+            .and_then(|v| v.as_i64()),
+        Some(solution_id),
         "find_for_path should match the solution that contains local_path: {resp}"
     );
     assert_eq!(
@@ -240,7 +242,7 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
         &mut stream,
         5,
         "solutions.remove_member",
-        json!({"solution_id": solution_id, "catalog_id": catalog_id}),
+        json!({"member_id": member_id}),
     )
     .await;
     assert!(resp.pointer("/result/structuredContent").is_some());

@@ -88,12 +88,11 @@ async fn add_empty_member_creates_git_member(cx: &mut gpui::TestAppContext) {
     .await;
     let solution_id = resp
         .pointer("/result/structuredContent/solution_id")
-        .and_then(|v| v.as_str())
-        .expect("solution_id")
-        .to_string();
-    assert!(!solution_id.is_empty());
+        .and_then(|v| v.as_i64())
+        .expect("solution_id");
+    assert!(solution_id > 0, "ids are counters: {solution_id}");
 
-    // --- 2. add_empty_member returns the new member's catalog_id synchronously ---
+    // --- 2. add_empty_member returns the new member's member_id synchronously ---
     let resp = call_tool(
         &mut stream,
         2,
@@ -101,15 +100,11 @@ async fn add_empty_member_creates_git_member(cx: &mut gpui::TestAppContext) {
         json!({"solution_id": solution_id, "name": "Scratchpad"}),
     )
     .await;
-    let catalog_id = resp
-        .pointer("/result/structuredContent/catalog_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("add_empty_member returned: {resp}"))
-        .to_string();
-    assert!(
-        !catalog_id.is_empty(),
-        "catalog_id should be a non-empty slug"
-    );
+    let member_id = resp
+        .pointer("/result/structuredContent/member_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| panic!("add_empty_member returned: {resp}"));
+    assert!(member_id > 0, "member ids are counters: {member_id}");
 
     // --- 3. solutions.get reports the member, on disk, git-init'ed ---
     let resp = call_tool(
@@ -126,9 +121,11 @@ async fn add_empty_member_creates_git_member(cx: &mut gpui::TestAppContext) {
         .unwrap_or_else(|| panic!("solutions.get returned: {resp}"));
     assert_eq!(members.len(), 1, "expected one member, got {members:?}");
     let member = &members[0];
+    assert_eq!(member.get("id").and_then(|v| v.as_i64()), Some(member_id));
     assert_eq!(
-        member.get("catalog_id").and_then(|v| v.as_str()),
-        Some(catalog_id.as_str()),
+        member.get("origin_catalog_id").and_then(|v| v.as_i64()),
+        None,
+        "an empty member has no catalog provenance: {member:?}"
     );
     assert_eq!(
         member.get("status").and_then(|v| v.as_str()),
@@ -146,7 +143,7 @@ async fn add_empty_member_creates_git_member(cx: &mut gpui::TestAppContext) {
         "empty member must be git-initialised (no remote): {local_path}",
     );
 
-    // --- 4. A second empty member with the same name gets a distinct slug ---
+    // --- 4. A second empty member with the same name gets its own id + folder ---
     let resp = call_tool(
         &mut stream,
         4,
@@ -154,14 +151,37 @@ async fn add_empty_member_creates_git_member(cx: &mut gpui::TestAppContext) {
         json!({"solution_id": solution_id, "name": "Scratchpad"}),
     )
     .await;
-    let catalog_id_2 = resp
-        .pointer("/result/structuredContent/catalog_id")
-        .and_then(|v| v.as_str())
-        .expect("second catalog_id")
-        .to_string();
+    let member_id_2 = resp
+        .pointer("/result/structuredContent/member_id")
+        .and_then(|v| v.as_i64())
+        .expect("second member_id");
     assert_ne!(
-        catalog_id, catalog_id_2,
-        "two empty members from the same name must get distinct slugs",
+        member_id, member_id_2,
+        "two empty members from the same name must get distinct ids",
+    );
+
+    let resp = call_tool(
+        &mut stream,
+        41,
+        "solutions.get",
+        json!({"solution_id": solution_id}),
+    )
+    .await;
+    let members = resp
+        .pointer("/result/structuredContent/solution/members")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_else(|| panic!("solutions.get returned: {resp}"));
+    let mut paths: Vec<&str> = members
+        .iter()
+        .filter_map(|m| m.get("local_path").and_then(|v| v.as_str()))
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    assert_eq!(
+        paths.len(),
+        2,
+        "same-named empty members must land in distinct folders: {members:?}"
     );
 
     // --- 5. Empty members never pollute the catalog ---

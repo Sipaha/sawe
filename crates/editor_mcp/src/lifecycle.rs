@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use util::ResultExt as _;
 
 /// Overrides the directory containing `mcp.lock` and `mcp.sock`. Set by
@@ -114,8 +114,8 @@ struct ActiveServer {
     /// Solution-scoped tools split off the global catalog at startup. Cloned
     /// into each per-solution server created by [`open_solution_socket`].
     scoped_template: Vec<ExportedTool>,
-    /// Live per-solution sockets, keyed by `SolutionId` string.
-    solution_sockets: Rc<RefCell<HashMap<String, SolutionSocket>>>,
+    /// Live per-solution sockets, keyed by the Solution's numeric id.
+    solution_sockets: Rc<RefCell<HashMap<i64, SolutionSocket>>>,
 }
 
 impl Global for ActiveServer {}
@@ -295,8 +295,59 @@ fn is_shared_tool(name: &str) -> bool {
 /// Deterministic path of a Solution's per-solution MCP socket. Pure — the
 /// socket only exists between [`open_solution_socket`] and
 /// [`close_solution_socket`].
-pub fn solution_socket_path(solution_id: &str) -> PathBuf {
-    runtime_dir().join("solutions").join(solution_id).join("mcp.sock")
+///
+/// The directory component is the Solution's numeric id: an id is stable across
+/// a rename, which is the whole point of the identity model.
+pub fn solution_socket_path(solution_id: i64) -> PathBuf {
+    runtime_dir()
+        .join("solutions")
+        .join(solution_id.to_string())
+        .join("mcp.sock")
+}
+
+/// Delete `<runtime>/solutions/<name>` entries whose name is not a numeric
+/// solution id. Those are leftovers from the pre-identity build, where the
+/// directory was the solution's slug; nothing will ever bind them again and a
+/// stale `mcp.sock` in one is an attractive nuisance for an agent that reads the
+/// directory listing instead of `solutions.get`. Returns the number removed.
+///
+/// Deliberately narrow: it only ever touches direct children of
+/// `<runtime>/solutions`, and it never recurses through a symlink — a symlinked
+/// child is unlinked, its target left alone.
+pub(crate) fn remove_stale_solution_socket_dirs(runtime: &Path) -> usize {
+    let solutions_dir = runtime.join("solutions");
+    let Ok(entries) = std::fs::read_dir(&solutions_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().parse::<i64>().is_ok() {
+            continue;
+        }
+        let path = entry.path();
+        // `file_type` here comes from the directory entry / `symlink_metadata`,
+        // so a symlink reports as a symlink and is unlinked rather than walked.
+        let outcome = match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(err) => Err(err),
+        };
+        match outcome {
+            Ok(()) => {
+                log::info!(
+                    "editor_mcp: removed stale slug-named socket dir {}",
+                    path.display()
+                );
+                removed += 1;
+            }
+            Err(err) => log::warn!(
+                "editor_mcp: could not remove stale socket dir {}: {err}",
+                path.display()
+            ),
+        }
+    }
+    removed
 }
 
 pub fn start_server(cx: &mut App) -> Result<()> {
@@ -317,6 +368,11 @@ pub fn start_server(cx: &mut App) -> Result<()> {
             return Ok(());
         }
     };
+
+    // We hold the single-instance lock, so no other editor process owns the
+    // per-solution sockets: any slug-named dir under `solutions/` is a leftover
+    // from the pre-identity build and safe to remove.
+    remove_stale_solution_socket_dirs(&runtime_dir());
 
     let sock = socket_path();
     if sock.exists() {
@@ -379,22 +435,21 @@ pub fn start_server(cx: &mut App) -> Result<()> {
 /// solution-scoped tool subset with `solution_id` force-injected. Idempotent:
 /// a repeat call for an already-open Solution is a no-op. No-op when the
 /// global server never started (tests / failed bind).
-pub fn open_solution_socket(cx: &mut App, solution_id: &str, root: PathBuf) {
+pub fn open_solution_socket(cx: &mut App, solution_id: i64, root: PathBuf) {
     let Some(active) = cx.try_global::<ActiveServer>() else {
         return;
     };
-    if active.solution_sockets.borrow().contains_key(solution_id) {
+    if active.solution_sockets.borrow().contains_key(&solution_id) {
         return;
     }
     let template = active.scoped_template.clone();
     let sockets = active.solution_sockets.clone();
     let socket = solution_socket_path(solution_id);
-    let solution_id: Arc<str> = Arc::from(solution_id);
 
     // Reserve the record synchronously so the deterministic path is
     // discoverable immediately; `server` is filled once the listener binds.
     sockets.borrow_mut().insert(
-        solution_id.to_string(),
+        solution_id,
         SolutionSocket {
             socket: socket.clone(),
             root,
@@ -407,7 +462,7 @@ pub fn open_solution_socket(cx: &mut App, solution_id: &str, root: PathBuf) {
     cx.spawn(async move |cx| {
         let server = server_task.await.context("creating per-solution MCP server")?;
         server.install_tools(template);
-        server.set_bound_solution(solution_id.clone());
+        server.set_bound_solution(solution_id);
 
         let actual_socket = server.socket_path().to_path_buf();
         if let Some(parent) = socket.parent() {
@@ -425,9 +480,7 @@ pub fn open_solution_socket(cx: &mut App, solution_id: &str, root: PathBuf) {
         cx.update(|cx| {
             let entity = cx.new(|_| server);
             if let Some(active) = cx.try_global::<ActiveServer>() {
-                if let Some(record) =
-                    active.solution_sockets.borrow_mut().get_mut(solution_id.as_ref())
-                {
+                if let Some(record) = active.solution_sockets.borrow_mut().get_mut(&solution_id) {
                     record.server = Some(entity);
                 } // else: closed before it finished binding — let the entity drop.
             }
@@ -440,11 +493,11 @@ pub fn open_solution_socket(cx: &mut App, solution_id: &str, root: PathBuf) {
 /// Tear down a Solution's per-solution socket. Dropping the stored server
 /// entity closes its listener; the symlink and the `solutions/<id>` dir are
 /// removed.
-pub fn close_solution_socket(cx: &mut App, solution_id: &str) {
+pub fn close_solution_socket(cx: &mut App, solution_id: i64) {
     let Some(active) = cx.try_global::<ActiveServer>() else {
         return;
     };
-    let removed = active.solution_sockets.borrow_mut().remove(solution_id);
+    let removed = active.solution_sockets.borrow_mut().remove(&solution_id);
     if let Some(record) = removed {
         std::fs::remove_file(&record.socket).log_err();
         if let Some(parent) = record.socket.parent() {
@@ -531,5 +584,76 @@ mod tests {
             let _lock = SingleInstanceLock::acquire(&lock_path).expect("first");
         }
         let _lock = SingleInstanceLock::acquire(&lock_path).expect("second");
+    }
+
+    #[test]
+    fn stale_slug_socket_dirs_are_removed_numeric_ones_kept() {
+        let dir = tempdir().expect("tempdir");
+        let solutions = dir.path().join("solutions");
+        for name in ["spk-solutions", "ecos-platform", "12", "7"] {
+            std::fs::create_dir_all(solutions.join(name)).expect("mkdir");
+            std::fs::write(solutions.join(name).join("mcp.sock"), b"").expect("touch sock");
+        }
+
+        let removed = remove_stale_solution_socket_dirs(dir.path());
+
+        assert_eq!(removed, 2, "both slug-named dirs must go");
+        assert!(!solutions.join("spk-solutions").exists());
+        assert!(!solutions.join("ecos-platform").exists());
+        assert!(
+            solutions.join("12").exists() && solutions.join("7").exists(),
+            "numeric dirs are live socket homes and must be left alone"
+        );
+    }
+
+    #[test]
+    fn sweep_is_a_no_op_when_the_solutions_dir_is_absent() {
+        let dir = tempdir().expect("tempdir");
+        assert_eq!(remove_stale_solution_socket_dirs(dir.path()), 0);
+    }
+
+    // The sweep deletes directories. Everything it can reach must live under
+    // `<runtime>/solutions/`: never a sibling of it, never a file, and never a
+    // symlink's target (removing the link itself is enough).
+    #[test]
+    fn sweep_touches_nothing_outside_the_solutions_dir() {
+        let dir = tempdir().expect("tempdir");
+        let sibling = dir.path().join("sibling-dir");
+        std::fs::create_dir_all(&sibling).expect("mkdir sibling");
+        std::fs::write(sibling.join("precious"), b"keep me").expect("write precious");
+        std::fs::write(dir.path().join("mcp.lock"), b"1").expect("write lock");
+
+        let solutions = dir.path().join("solutions");
+        std::fs::create_dir_all(solutions.join("slug")).expect("mkdir slug");
+        // A stray *file* (not a dir) with a non-numeric name.
+        std::fs::write(solutions.join("stray-file"), b"").expect("write stray");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sibling, solutions.join("link-out")).expect("symlink");
+
+        let removed = remove_stale_solution_socket_dirs(dir.path());
+
+        assert!(removed >= 1, "the slug dir must go");
+        assert!(!solutions.join("slug").exists());
+        assert!(!solutions.join("stray-file").exists());
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(solutions.join("link-out")).is_err(),
+            "the dangling-out symlink itself must be unlinked"
+        );
+        assert!(
+            sibling.join("precious").exists(),
+            "a symlinked-to directory outside solutions/ must survive"
+        );
+        assert!(dir.path().join("mcp.lock").exists());
+        assert!(solutions.exists(), "the solutions dir itself must survive");
+    }
+
+    #[test]
+    fn solution_socket_path_is_keyed_on_the_numeric_id() {
+        let path = solution_socket_path(42);
+        assert_eq!(
+            path.strip_prefix(runtime_dir()).expect("under runtime dir"),
+            Path::new("solutions").join("42").join("mcp.sock")
+        );
     }
 }

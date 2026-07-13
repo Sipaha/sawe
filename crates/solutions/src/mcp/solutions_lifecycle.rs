@@ -113,10 +113,8 @@ pub fn build_summary(sol: &Solution, cx: &App) -> SolutionSummary {
     let open = SolutionStore::try_global(cx)
         .map(|store| store.read(cx).is_open(sol.id))
         .unwrap_or(false);
-    // `editor_mcp`'s socket API still takes a &str id; the per-solution socket
-    // directory is the numeric id rendered as text. Task 5 flips it to i64.
     let mcp_socket = open.then(|| {
-        editor_mcp::solution_socket_path(&sol.id.0.to_string())
+        editor_mcp::solution_socket_path(sol.id.0)
             .to_string_lossy()
             .into_owned()
     });
@@ -272,7 +270,7 @@ impl McpServerTool for GetSolutionTool {
 
 fn build_detail(sol: &Solution, open: bool) -> SolutionDetail {
     let mcp_socket = open.then(|| {
-        editor_mcp::solution_socket_path(&sol.id.0.to_string())
+        editor_mcp::solution_socket_path(sol.id.0)
             .to_string_lossy()
             .into_owned()
     });

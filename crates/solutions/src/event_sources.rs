@@ -150,14 +150,11 @@ pub fn install(cx: &mut App) {
                             .find(|sol| &sol.id == id)
                             .map(|sol| sol.root.clone());
                         if let Some(root) = root {
-                            // `editor_mcp`'s socket API still takes a &str id;
-                            // the directory name is the numeric id rendered as
-                            // text. Task 5 flips the signature to i64.
-                            editor_mcp::open_solution_socket(cx, &id.0.to_string(), root);
+                            editor_mcp::open_solution_socket(cx, id.0, root);
                         }
                     }
                     SolutionStoreEvent::Closed { id } => {
-                        editor_mcp::close_solution_socket(cx, &id.0.to_string());
+                        editor_mcp::close_solution_socket(cx, id.0);
                     }
                 }),
             );

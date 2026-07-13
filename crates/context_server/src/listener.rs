@@ -19,7 +19,6 @@ use std::{
     cell::RefCell,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
 };
 use util::ResultExt;
 
@@ -42,7 +41,7 @@ pub struct McpServer {
     /// `tools/call` whose tool declares a `solution_id` input has that id
     /// force-injected (Sawe per-solution MCP sockets — see editor_mcp). The
     /// global server leaves this `None` and trusts the caller's `solution_id`.
-    bound_solution_id: Rc<RefCell<Option<Arc<str>>>>,
+    bound_solution_id: Rc<RefCell<Option<i64>>>,
     #[allow(dead_code)]
     next_connection_id: Rc<RefCell<u64>>,
     _server_task: Task<()>,
@@ -92,7 +91,7 @@ impl McpServer {
             let handlers = Rc::new(RefCell::new(HashMap::default()));
             let connections = Rc::new(RefCell::new(HashMap::default()));
             let next_connection_id = Rc::new(RefCell::new(0u64));
-            let bound_solution_id: Rc<RefCell<Option<Arc<str>>>> = Rc::new(RefCell::new(None));
+            let bound_solution_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
             let server_task = cx.spawn({
                 let tools = tools.clone();
                 let handlers = handlers.clone();
@@ -249,7 +248,7 @@ impl McpServer {
     /// whose tool declares a `solution_id` input has that field overwritten
     /// with `id`, so a connected subagent is physically scoped to one
     /// Solution and cannot reach another by passing a different id.
-    pub fn set_bound_solution(&self, id: Arc<str>) {
+    pub fn set_bound_solution(&self, id: i64) {
         *self.bound_solution_id.borrow_mut() = Some(id);
     }
 
@@ -304,7 +303,7 @@ impl McpServer {
         handlers: Rc<RefCell<HashMap<&'static str, RequestHandler>>>,
         connections: Rc<RefCell<HashMap<u64, UnboundedSender<String>>>>,
         next_connection_id: Rc<RefCell<u64>>,
-        bound_solution_id: Rc<RefCell<Option<Arc<str>>>>,
+        bound_solution_id: Rc<RefCell<Option<i64>>>,
         cx: &mut AsyncApp,
     ) {
         let (read, write) = stream.split();
@@ -468,7 +467,7 @@ impl McpServer {
         request_id: RequestId,
         params: Option<Box<RawValue>>,
         tools: &Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
-        bound_solution_id: &Rc<RefCell<Option<Arc<str>>>>,
+        bound_solution_id: &Rc<RefCell<Option<i64>>>,
         outgoing_tx: &UnboundedSender<String>,
         cx: &mut AsyncApp,
     ) {
@@ -487,7 +486,7 @@ impl McpServer {
                     // cannot target another Solution by passing a different id.
                     let mut arguments = params.arguments;
                     if tool.wants_solution_id
-                        && let Some(id) = bound_solution_id.borrow().as_ref()
+                        && let Some(id) = *bound_solution_id.borrow()
                     {
                         let obj = arguments.get_or_insert_with(|| {
                             serde_json::Value::Object(serde_json::Map::new())
@@ -495,7 +494,7 @@ impl McpServer {
                         if let Some(map) = obj.as_object_mut() {
                             map.insert(
                                 "solution_id".to_string(),
-                                serde_json::Value::String(id.to_string()),
+                                serde_json::Value::Number(serde_json::Number::from(id)),
                             );
                         }
                     }
