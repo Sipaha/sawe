@@ -1709,7 +1709,7 @@ coherent.
 
 **Steps**
 
-- [ ] Add a failing test to `crates/solutions/src/mcp/tests.rs`:
+- [x] Add a failing test to `crates/solutions/src/mcp/tests.rs`:
       ```rust
       #[test]
       fn every_project_tool_accepts_an_absent_solution_id() {
@@ -1730,15 +1730,15 @@ coherent.
       }
       ```
       (Use the real struct names / required sibling fields from each file.)
-- [ ] Run `cargo test -p solutions --lib every_project_tool_accepts` — expect a
+- [x] Run `cargo test -p solutions --lib every_project_tool_accepts` — expect a
       **type-mismatch failure** on the first `assert_eq!`.
-- [ ] Flip all twelve params structs + `Inner` shadows to `Option<String>` and
+- [x] Flip all twelve params structs + `Inner` shadows to `Option<String>` and
       route each handler through `crate::mcp::resolve_solution_id(input.solution_id)?`.
-- [ ] Run `cargo test -p solutions` — expect green.
-- [ ] Run `cargo check --workspace` — expect no errors (the params structs are
+- [x] Run `cargo test -p solutions` — expect green.
+- [x] Run `cargo check --workspace` — expect no errors (the params structs are
       also referenced from `remote_control`'s allow-list and from
       `crates/editor_mcp/tests/*`).
-- [ ] Commit: `Make solution_id optional in the project.* MCP tools`
+- [x] Commit: `Make solution_id optional in the project.* MCP tools`
 
 ## Task 3.5 — e2e: the scoped socket injects, and overrides a foreign id
 

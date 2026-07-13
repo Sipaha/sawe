@@ -499,7 +499,7 @@ use context_server::listener::McpServerTool;
             "max": 50
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.glob.as_deref(), Some("**/*.rs"));
         assert_eq!(p.scope.as_deref(), Some("first_worktree"));
         assert_eq!(p.max, Some(50));
@@ -508,7 +508,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn list_files_params_accepts_null() {
         let p: ListFilesParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.glob.is_none());
         assert!(p.scope.is_none());
         assert!(p.cursor.is_none());
@@ -557,14 +557,14 @@ use context_server::listener::McpServerTool;
             "path": "/abs/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path, "/abs/foo.rs");
     }
 
     #[test]
     fn read_buffer_params_accepts_null() {
         let p: ReadBufferParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
     }
 
@@ -588,7 +588,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn apply_edit_params_accepts_null() {
         let p: ApplyEditParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
         assert!(p.edits.is_empty());
     }
@@ -600,14 +600,14 @@ use context_server::listener::McpServerTool;
             "path": "/abs/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path, "/abs/foo.rs");
     }
 
     #[test]
     fn save_buffer_params_accepts_null() {
         let p: SaveBufferParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
     }
 
@@ -619,7 +619,7 @@ use context_server::listener::McpServerTool;
             "focus": false
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.focus, Some(false));
     }
@@ -627,7 +627,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn open_file_params_accepts_null() {
         let p: OpenFileParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
         assert!(p.focus.is_none());
     }
@@ -640,7 +640,7 @@ use context_server::listener::McpServerTool;
             "save": true
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.save, Some(true));
     }
@@ -648,7 +648,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn close_buffer_params_accepts_null() {
         let p: CloseBufferParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
         assert!(p.save.is_none());
     }
@@ -661,7 +661,7 @@ use context_server::listener::McpServerTool;
             "content": "hello"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.content.as_deref(), Some("hello"));
     }
@@ -669,7 +669,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn create_file_params_accepts_null() {
         let p: CreateFileParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
         assert!(p.content.is_none());
     }
@@ -681,14 +681,14 @@ use context_server::listener::McpServerTool;
             "path": "/abs/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path, "/abs/foo.rs");
     }
 
     #[test]
     fn delete_file_params_accepts_null() {
         let p: DeleteFileParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
     }
 
@@ -700,7 +700,7 @@ use context_server::listener::McpServerTool;
             "to": "/abs/new.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.from, "/abs/old.rs");
         assert_eq!(p.to, "/abs/new.rs");
     }
@@ -708,7 +708,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn rename_file_params_accepts_null() {
         let p: RenameFileParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.from.is_empty());
         assert!(p.to.is_empty());
     }
@@ -726,7 +726,7 @@ use context_server::listener::McpServerTool;
             "max": 50
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.query, "TODO");
         assert_eq!(p.case_sensitive, Some(true));
         assert_eq!(p.regex, Some(false));
@@ -739,7 +739,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn find_in_buffers_params_accepts_null() {
         let p: FindInBuffersParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.query.is_empty());
         assert!(p.case_sensitive.is_none());
         assert!(p.regex.is_none());
@@ -758,7 +758,7 @@ use context_server::listener::McpServerTool;
             "col": 4
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.line, 12);
         assert_eq!(p.col, 4);
@@ -768,7 +768,7 @@ use context_server::listener::McpServerTool;
     fn goto_definition_params_accepts_null() {
         let p: GotoDefinitionParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
         assert_eq!(p.line, 0);
         assert_eq!(p.col, 0);
@@ -784,7 +784,7 @@ use context_server::listener::McpServerTool;
             "include_declaration": true
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.line, 7);
         assert_eq!(p.col, 9);
@@ -795,7 +795,7 @@ use context_server::listener::McpServerTool;
     fn find_references_params_accepts_null() {
         let p: FindReferencesParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_empty());
         assert_eq!(p.line, 0);
         assert_eq!(p.col, 0);
@@ -916,4 +916,22 @@ use context_server::listener::McpServerTool;
         let params: DumpVisualStructureParams =
             serde_json::from_value(serde_json::json!({})).expect("deserialize");
         assert_eq!(params.solution_id, None);
+    }
+
+    #[test]
+    fn every_project_tool_accepts_an_absent_solution_id() {
+        // One representative per file — the edit is mechanical, the risk is
+        // forgetting a file.
+        let list: ListFilesParams =
+            serde_json::from_value(serde_json::json!({})).expect("fs_ops");
+        assert_eq!(list.solution_id, None);
+
+        let find: FindInBuffersParams =
+            serde_json::from_value(serde_json::json!({ "query": "x" })).expect("code_nav");
+        assert_eq!(find.solution_id, None);
+
+        let read: ReadBufferParams =
+            serde_json::from_value(serde_json::json!({ "path": "src/main.rs" }))
+                .expect("buffer_ops");
+        assert_eq!(read.solution_id, None);
     }

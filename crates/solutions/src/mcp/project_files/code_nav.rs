@@ -28,7 +28,11 @@ use super::{EditPoint, project_for_solution, resolve_project_path, validate_path
 /// (when the project owns extra worktrees) are filtered out post-hoc.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct FindInBuffersParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     /// Substring or regex pattern.
     pub query: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,7 +58,7 @@ impl<'de> Deserialize<'de> for FindInBuffersParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
             query: String,
             case_sensitive: Option<bool>,
             regex: Option<bool>,
@@ -113,10 +117,7 @@ impl McpServerTool for FindInBuffersTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
         anyhow::ensure!(!input.query.is_empty(), "invalid_params: query is required");
         let max = input.max.unwrap_or(100).clamp(1, 1000);
         let case_sensitive = input.case_sensitive.unwrap_or(false);
@@ -129,16 +130,16 @@ impl McpServerTool for FindInBuffersTool {
                     store.read_with(cx, |s, _| {
                         s.solutions()
                             .iter()
-                            .find(|sol| sol.id.0 == input.solution_id)
+                            .find(|sol| sol.id.0 == solution_id)
                             .map(|sol| sol.root.clone())
                     })
                 })
             })
-            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
+            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", solution_id))?;
 
         let project = cx
-            .update(|cx| project_for_solution(input.solution_id, cx))
-            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
+            .update(|cx| project_for_solution(solution_id, cx))
+            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", solution_id))?;
 
         // Build the SearchQuery. We pass the optional file_glob through
         // the project search engine's own include matcher so gitignore
@@ -312,7 +313,11 @@ impl McpServerTool for FindInBuffersTool {
 /// server provides definitions for the file (not an error).
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GotoDefinitionParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     /// Absolute path of the file. Must lie under one of the Solution's
     /// worktrees.
     pub path: String,
@@ -327,7 +332,7 @@ impl<'de> Deserialize<'de> for GotoDefinitionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
             path: String,
             line: u32,
             col: u32,
@@ -370,18 +375,15 @@ impl McpServerTool for GotoDefinitionTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(input.solution_id, cx))
-            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
+            .update(|cx| project_for_solution(solution_id, cx))
+            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
 
@@ -459,7 +461,11 @@ fn location_to_ref(location: &language::Location, cx: &App) -> LocationRef {
 /// provides references for the file (not an error).
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct FindReferencesParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     /// Absolute path of the file. Must lie under one of the Solution's
     /// worktrees.
     pub path: String,
@@ -477,7 +483,7 @@ impl<'de> Deserialize<'de> for FindReferencesParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
             path: String,
             line: u32,
             col: u32,
@@ -512,18 +518,15 @@ impl McpServerTool for FindReferencesTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(input.solution_id, cx))
-            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
+            .update(|cx| project_for_solution(solution_id, cx))
+            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
 
