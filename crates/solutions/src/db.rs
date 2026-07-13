@@ -92,6 +92,11 @@ impl SolutionsDb {
         }
     }
 
+    // Must be a real UPSERT, not INSERT OR REPLACE: `solutions` is the parent of
+    // `solution_members` and `active_member`, both ON DELETE CASCADE. REPLACE
+    // deletes the existing parent row before re-inserting it, so re-saving an
+    // existing solution (the rename path) would cascade-delete all of its
+    // members and its active member.
     query! {
         pub async fn save_solution(
             id: String,
@@ -99,8 +104,12 @@ impl SolutionsDb {
             root: String,
             last_opened_at: Option<i64>
         ) -> Result<()> {
-            INSERT OR REPLACE INTO solutions (id, name, root, last_opened_at)
+            INSERT INTO solutions (id, name, root, last_opened_at)
             VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                root = excluded.root,
+                last_opened_at = excluded.last_opened_at
         }
     }
 
@@ -285,6 +294,54 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "empty");
         assert!(rows[0].4.is_empty());
+    }
+
+    // `rename_solution` re-saves an existing solution row. If save_solution
+    // deleted the parent row first (INSERT OR REPLACE), the ON DELETE CASCADE
+    // on solution_members / active_member would silently wipe them.
+    #[gpui::test]
+    async fn resaving_solution_preserves_members_and_active_member() {
+        let db = SolutionsDb::open_test_db("solutions_db_resave_preserves_children").await;
+        db.save_solution(
+            "sol-1".into(),
+            "Alpha".into(),
+            "/tmp/sol-1".into(),
+            Some(1_700_000_000_000),
+        )
+        .await
+        .unwrap();
+        db.set_solution_member("sol-1".into(), "cat-a".into(), "/tmp/sol-1/cat-a".into(), 0)
+            .await
+            .unwrap();
+        db.set_solution_member("sol-1".into(), "cat-b".into(), "/tmp/sol-1/cat-b".into(), 1)
+            .await
+            .unwrap();
+        db.set_active_member("sol-1".into(), "cat-b".into())
+            .await
+            .unwrap();
+
+        db.save_solution(
+            "sol-1".into(),
+            "Renamed".into(),
+            "/tmp/sol-1".into(),
+            Some(1_700_000_000_000),
+        )
+        .await
+        .unwrap();
+
+        let rows = db.load_all_solutions_with_members().await.unwrap();
+        assert_eq!(rows.len(), 2, "members must survive a re-save: {rows:?}");
+        assert_eq!(rows[0].1, "Renamed");
+        assert_eq!(rows[0].3, Some(1_700_000_000_000));
+        let cat_ids: Vec<String> = rows.iter().map(|r| r.4.clone()).collect();
+        assert_eq!(cat_ids, vec!["cat-a", "cat-b"]);
+
+        let active = db.load_all_active_members().await.unwrap();
+        assert_eq!(
+            active,
+            vec![("sol-1".to_string(), "cat-b".to_string())],
+            "active member must survive a re-save"
+        );
     }
 
     #[gpui::test]
