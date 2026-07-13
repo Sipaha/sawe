@@ -3235,7 +3235,20 @@ git commit -m "Convert every solutions consumer to numeric ids"
 - Consumes: `SolutionsDb` (Task 1), `SolutionAgentDb::migrate_identity` (Task 2).
 - Produces: nothing consumed by later plans. This task is the acceptance gate for "no data was lost".
 
-- [ ] **Step 1: Write the rehearsal test**
+- [x] **Step 1: Write the rehearsal test**
+
+> **As shipped** (deviations from the sketch below):
+> - The real DBs live at `~/.spk/sawe/data/{db/0-stable/db.sqlite,solution_agent/solution_agent.db}`, and the test binary's `paths::data_dir()` does not resolve there — always pass `SAWE_SOLUTIONS_DB` / `SAWE_AGENT_DB`.
+> - The file carries **two** tests: the solutions-DB one below, plus
+>   `real_agent_db_migrates_without_losing_sessions`, which migrates a copy of the
+>   solutions DB first (that is where the slug → counter map comes from), then runs
+>   `SolutionAgentDb::migrate_identity` over a copy of the real agent DB and asserts
+>   sessions / entries / attachments are all conserved and that every slug left on a
+>   TEXT id is reported in `sessions_unmapped`.
+> - That required two small seams: `solutions` gained a **dev-dependency** on
+>   `solution_agent` (a cyclic dev-dep, which cargo permits), and `SolutionAgentDb`
+>   gained `open_at_path(executor, path)` — `open()` resolves the path itself and
+>   swaps to an in-memory DB under test cfgs, so it could not be pointed at a copy.
 
 The user's live DBs are at `~/.local/share/sawe/db/…/db.sqlite` (solutions, via `db::static_connection!`) and `~/.local/share/sawe/solution_agent/solution_agent.db`. The test is `#[ignore]`d by default (it needs the operator's real data and must never run in a normal `cargo test`), copies both files to a tempdir, migrates the copies, and asserts nothing was lost.
 
@@ -3336,12 +3349,31 @@ fn real_solutions_db_migrates_without_losing_rows() {
 }
 ```
 
-- [ ] **Step 2: Run the rehearsal against the real DB**
+- [x] **Step 2: Run the rehearsal against the real DB**
 
 Run: `cargo test -p solutions --test identity_migration_rehearsal -- --ignored --nocapture`
 Expected: PASS, and the printed line reports the operator's real numbers (16 solutions, ~40 members). If the migration drops an `active_member` row (a selection pointing at a member that no longer exists), the report assertion fails and names the table — delete the dangling row from the *real* DB and re-run before shipping.
 
-- [ ] **Step 3: Back up the real databases before the first launch of the new build**
+**Result (2026-07-13, both tests PASS):**
+
+```
+solutions db before: 16 solution(s), 43 member(s), 14 active, 47 catalog
+dangling active_member rows (would be dropped): []
+solutions db after:  16 solution(s), 43 member(s), 14 active, 47 catalog
+cross-db map: 16 slug(s), 43 member(s)
+agent db before: 176 session(s), 27792 entrie(s), 7 attachment(s)
+IdentityMigrationReport: IdentityMigrationReport { sessions_total: 176, sessions_remapped: 169,
+  sessions_unmapped: ["lena-bug-0606", "repo-6644c132", "launcher", "dashboard-problem"],
+  member_ids_backfilled: 70 }
+agent db after:  176 session(s), 27792 entrie(s), 7 attachment(s)
+```
+
+Nothing is lost: **zero** dangling `active_member` rows in the real DB, so the
+inner-JOIN drop the migration warns about does not occur here and no fix-forward
+delete is needed. The four unmapped slugs are sessions of solutions the operator
+deleted long ago; their rows keep their TEXT `solution_id` and stay inspectable.
+
+- [x] **Step 3: Back up the real databases before the first launch of the new build**
 
 ```bash
 cp -v ~/.local/share/sawe/db/0-stable/db.sqlite ~/.local/share/sawe/db/0-stable/db.sqlite.pre-identity.bak
@@ -3350,7 +3382,12 @@ cp -v ~/.local/share/sawe/solution_agent/solution_agent.db ~/.local/share/sawe/s
 
 (Adjust the paths if `paths::data_dir()` resolves elsewhere on this machine — `script/run-mcp --debug` prints the resolved runtime dir on launch.)
 
-- [ ] **Step 4: Commit**
+Done on 2026-07-13: the real data dir is `~/.spk/sawe/data/`, and the pre-identity
+backups are `/tmp/db.sqlite.pre-identity-1783948879` /
+`/tmp/solution_agent.db.pre-identity-1783948879`. Move them somewhere durable
+before the first launch of the new build — `/tmp` does not survive a reboot.
+
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/solutions/tests/identity_migration_rehearsal.rs

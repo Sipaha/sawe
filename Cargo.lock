@@ -18017,6 +18017,7 @@ dependencies = [
  "sha2",
  "shellexpand",
  "smol",
+ "solution_agent",
  "tempfile",
  "thiserror 2.0.17",
  "util",

@@ -87,6 +87,22 @@ impl SolutionAgentDb {
             Connection::open_file(&path.to_string_lossy())
         };
 
+        Self::open_connection(executor, connection)
+    }
+
+    /// Open the agent DB at an explicit file path, bypassing both the data-dir
+    /// lookup and the in-memory swap `open` performs under test cfgs. The
+    /// identity-migration rehearsal (`crates/solutions/tests`) uses this to run
+    /// the real schema setup + `migrate_identity` against a *copy* of the
+    /// operator's production database.
+    pub fn open_at_path(executor: BackgroundExecutor, path: &std::path::Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Self::open_connection(executor, Connection::open_file(&path.to_string_lossy()))
+    }
+
+    fn open_connection(executor: BackgroundExecutor, connection: Connection) -> Result<Self> {
         connection.exec(indoc! {"
             CREATE TABLE IF NOT EXISTS solution_sessions (
                 id                TEXT PRIMARY KEY,

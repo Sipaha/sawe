@@ -48,4 +48,8 @@ workspace.workspace = true
 db = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
+# Dev-only (cyclic: solution_agent depends on solutions). The identity-migration
+# rehearsal has to drive BOTH databases from one test — the solutions DB produces
+# the legacy slug → counter map that the agent DB's own migration consumes.
+solution_agent.workspace = true
 tempfile.workspace = true
