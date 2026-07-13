@@ -3797,6 +3797,20 @@ pub fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::
     servers
 }
 
+/// Sawe: the `(solution_id, solution_root)` of the Solution this project
+/// belongs to, when one is open. Mirrors the socket lookup inside
+/// [`mcp_servers_for_project`] so a session's MCP scope and its claude settings
+/// layer always resolve to the same Solution. `None` for a standalone project
+/// (no Solution) and in tests (no `ActiveServer`).
+pub fn solution_scope_for_project(
+    project: &Entity<Project>,
+    cx: &App,
+) -> Option<(i64, PathBuf)> {
+    let worktree = project.read(cx).visible_worktrees(cx).next()?;
+    let abs_path = worktree.read(cx).abs_path();
+    editor_mcp::solution_scope_for_path(cx, abs_path.as_ref())
+}
+
 /// Sawe fork: build an `McpServer::Stdio` entry that points at the
 /// embedded editor MCP socket via the editor binary's own `--nc` bridge.
 /// This is what makes `solution_agent.*` / `solutions.*` / `editor.*` /

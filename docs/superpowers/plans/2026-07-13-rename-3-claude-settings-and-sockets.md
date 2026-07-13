@@ -516,7 +516,7 @@ and docs.
 
 **Steps**
 
-- [ ] Add a failing test in `crates/editor_mcp/src/lifecycle.rs`'s test module:
+- [x] Add a failing test in `crates/editor_mcp/src/lifecycle.rs`'s test module:
       ```rust
       #[gpui::test]
       fn solution_scope_prefers_the_longest_matching_root(cx: &mut gpui::TestAppContext) {
@@ -533,9 +533,9 @@ and docs.
       end-to-end by the manual check in task 2.6. This test pins the
       no-Solution/no-server path, which is the one every unit test and every
       standalone window hits.)
-- [ ] Run `cargo test -p editor_mcp --lib solution_scope` — expect a **compile
+- [x] Run `cargo test -p editor_mcp --lib solution_scope` — expect a **compile
       error**: ``cannot find function `solution_scope_for_path` in this scope``.
-- [ ] Implement in `lifecycle.rs`, right below `solution_socket_for_path`:
+- [x] Implement in `lifecycle.rs`, right below `solution_socket_for_path`:
       ```rust
       /// The `(solution_id, solution_root)` of the open Solution that owns `path`.
       /// Longest matching root wins, exactly as in [`solution_socket_for_path`] —
@@ -555,9 +555,9 @@ and docs.
       ```
       and add `solution_scope_for_path` to the `pub use lifecycle::{…}` list in
       `crates/editor_mcp/src/editor_mcp.rs`.
-- [ ] Run `cargo test -p editor_mcp --lib solution_scope` — expect
+- [x] Run `cargo test -p editor_mcp --lib solution_scope` — expect
       `test solution_scope_prefers_the_longest_matching_root ... ok`.
-- [ ] Add to `crates/agent_servers/src/acp.rs`, directly after
+- [x] Add to `crates/agent_servers/src/acp.rs`, directly after
       `mcp_servers_for_project` (line ~3750):
       ```rust
       /// Sawe: the `(solution_id, solution_root)` of the Solution this project
@@ -576,8 +576,8 @@ and docs.
       ```
       and add `solution_scope_for_project` to the `pub use acp::{…}` list in
       `crates/agent_servers/src/agent_servers.rs` (line ~27).
-- [ ] Run `cargo check -p agent_servers` — expect no errors.
-- [ ] Commit: `Expose the Solution scope (id + root) that owns a project`
+- [x] Run `cargo check -p agent_servers` — expect no errors.
+- [x] Commit: `Expose the Solution scope (id + root) that owns a project`
 
 ## Task 2.2 — the worktree hook itself (`sawe --worktree-hook`)
 

@@ -606,6 +606,22 @@ pub fn solution_socket_for_path(cx: &App, path: &Path) -> Option<PathBuf> {
         .map(|record| record.socket.clone())
 }
 
+/// The `(solution_id, solution_root)` of the open Solution that owns `path`.
+/// Longest matching root wins, exactly as in [`solution_socket_for_path`] — the
+/// two lookups must agree, or a session could be MCP-scoped to one Solution
+/// while its claude settings point at another's `.agents/` dir.
+pub fn solution_scope_for_path(cx: &App, path: &Path) -> Option<(i64, PathBuf)> {
+    let active = cx.try_global::<ActiveServer>()?;
+    let scope = active
+        .solution_sockets
+        .borrow()
+        .iter()
+        .filter(|(_, record)| record.server.is_some() && path.starts_with(&record.root))
+        .max_by_key(|(_, record)| record.root.as_os_str().len())
+        .map(|(id, record)| (*id, record.root.clone()));
+    scope
+}
+
 pub fn server(cx: &App) -> Option<Entity<McpServer>> {
     cx.try_global::<ActiveServer>().map(|a| a.server.clone())
 }
@@ -815,5 +831,16 @@ mod tests {
             path.strip_prefix(runtime_dir()).expect("under runtime dir"),
             Path::new("solutions").join("42").join("mcp.sock")
         );
+    }
+
+    #[gpui::test]
+    fn solution_scope_prefers_the_longest_matching_root(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(
+                solution_scope_for_path(cx, Path::new("/tmp/nowhere")),
+                None,
+                "no ActiveServer global -> no scope"
+            );
+        });
     }
 }
