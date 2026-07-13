@@ -1151,7 +1151,7 @@ git commit -m "solutions: Move the member folder when a member is renamed"
 
 One `rename(2)` of the root moves every member with it, and one symlink at the old root covers every descendant path — so member `local_path`s are rewritten in memory/DB but **not** moved individually, and exactly one `pending_path_migrations` row is written.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the test module at the bottom of `crates/solutions/src/store/lifecycle.rs`:
 
@@ -1232,12 +1232,12 @@ Add to the test module at the bottom of `crates/solutions/src/store/lifecycle.rs
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p solutions rename_solution`
 Expected: FAIL — `rename_solution_moves_the_root_and_rewrites_member_paths` fails at `assert!(new_root.join("sawe/marker.txt").is_file())` (today's rename only rewrites the name), and `rename_solution_rejects_a_name_taken_by_another_solution` fails with `expect_err("collides")` panicking on an `Ok`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Replace `rename_solution` in `crates/solutions/src/store/lifecycle.rs` with:
 
@@ -1337,17 +1337,17 @@ Replace `rename_solution` in `crates/solutions/src/store/lifecycle.rs` with:
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p solutions rename_solution`
 Expected: PASS — both tests.
 
-- [ ] **Step 5: Check the crate still compiles for its callers**
+- [x] **Step 5: Check the crate still compiles for its callers**
 
 Run: `cargo check -p solutions`
 Expected: PASS. (`solutions_ui` and the MCP tool still pass `&SolutionId` — they are fixed in Tasks 9 and 10. If `cargo check -p solutions_ui` is run now it will fail; that is expected and fixed there.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/solutions/src/store/lifecycle.rs
@@ -1371,7 +1371,7 @@ git commit -m "solutions: Move the solution root when a solution is renamed"
 `rewrite_app_db` covers every path-bearing row in the shared `AppDatabase` file:
 `solutions.root`, `solution_members.local_path`, `workspaces.paths`/`paths_order`/`identity_paths`/`identity_paths_order` (with the `ix_workspaces_location` merge case), `console_panel_state.cwd`, `editors.path` and `editors.buffer_path` (BLOB), `terminals2.working_directory` (BLOB), `breakpoints.path`, `bookmarks.path`, `trusted_worktrees.absolute_path`, and **deletes** stale `toolchains` / `user_toolchains` rows (path is in the PK; the toolchain is re-detected).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/solutions/src/path_migrations.rs` with only the test module:
 
@@ -1567,12 +1567,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p solutions path_migrations`
 Expected: FAIL — `cannot find type 'PathRewrite' in this scope`, `cannot find function 'rewrite_app_db'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Prepend to `crates/solutions/src/path_migrations.rs`:
 
@@ -1892,12 +1892,12 @@ fn delete_stale_toolchains(connection: &Connection, rewrite: &PathRewrite) -> Re
 
 Register the module in `crates/solutions/src/solutions.rs`: add `pub mod path_migrations;` after `pub mod migrate;`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p solutions path_migrations`
 Expected: PASS — 4 tests (`apply_str_rewrites_the_path_and_its_descendants_only`, `rewrites_every_path_bearing_row`, `workspace_identity_row_is_preserved_and_the_squatter_is_merged_away`, `rewriting_twice_is_a_no_op`).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/solutions/src/path_migrations.rs crates/solutions/src/solutions.rs

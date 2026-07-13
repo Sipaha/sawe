@@ -12,6 +12,7 @@ pub mod git;
 pub mod mcp;
 pub mod migrate;
 mod model;
+pub mod path_migrations;
 mod persistence;
 pub mod rename;
 mod settings;
