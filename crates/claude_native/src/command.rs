@@ -46,6 +46,12 @@ pub struct ClaudeCommandSpec {
     /// its default. Used both for the initial spawn and every respawn so
     /// a chosen model survives kill+resume.
     pub model: Option<String>,
+    /// The editor-owned settings layer (`--settings <file>`): the
+    /// `WorktreeCreate`/`WorktreeRemove` hooks + `autoMemoryDirectory`. See
+    /// [`crate::claude_settings`]. `None` when the project isn't under an open
+    /// Solution (standalone window, tests) or when the layer is disabled via
+    /// `SAWE_CLAUDE_SETTINGS_DISABLED`.
+    pub settings_path: Option<PathBuf>,
 }
 
 impl ClaudeCommandSpec {
@@ -78,6 +84,13 @@ impl ClaudeCommandSpec {
         ]);
         cmd.args(["--mcp-config", &self.mcp_servers_json]);
         cmd.args(["--setting-sources", "user,project,local"]);
+        // `--settings` sits at the command-line precedence tier: it overrides the
+        // *same keys* in user/project/local settings but does not stop those
+        // sources from loading. `claude_settings` therefore re-emits the user's
+        // own `hooks` alongside ours, since `hooks` is one such key.
+        if let Some(settings) = &self.settings_path {
+            cmd.arg("--settings").arg(settings);
+        }
         cmd.args(["--permission-mode", "bypassPermissions"]);
         cmd.args([
             "--allow-dangerously-skip-permissions",
@@ -139,6 +152,7 @@ mod tests {
             append_system_prompt: Some("SYS".into()),
             extra_env: vec![("K".into(), "V".into())],
             model: None,
+            settings_path: None,
         };
         let cmd = spec.to_std_command();
         let args: Vec<String> = cmd
@@ -186,6 +200,7 @@ mod tests {
             append_system_prompt: None,
             extra_env: vec![],
             model: None,
+            settings_path: None,
         };
         let args: Vec<String> = spec
             .to_std_command()
@@ -210,6 +225,7 @@ mod tests {
             append_system_prompt: None,
             extra_env: vec![],
             model: Some("opus".into()),
+            settings_path: None,
         };
         let args: Vec<String> = spec.to_std_command().get_args()
             .map(|a| a.to_string_lossy().into_owned()).collect();
@@ -226,10 +242,58 @@ mod tests {
             append_system_prompt: None,
             extra_env: vec![],
             model: None,
+            settings_path: None,
         };
         let args: Vec<String> = spec.to_std_command().get_args()
             .map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(!args.iter().any(|a| a == "--model"));
+    }
+
+    #[test]
+    fn passes_the_editor_settings_file_without_dropping_the_user_sources() {
+        let spec = ClaudeCommandSpec {
+            binary: "claude".into(),
+            work_dir: "/w".into(),
+            session: SessionArg::New("uuid".into()),
+            mcp_servers_json: "{}".into(),
+            append_system_prompt: None,
+            extra_env: vec![],
+            model: None,
+            settings_path: Some("/state/solutions/7/claude-settings.json".into()),
+        };
+        let args: Vec<String> = spec
+            .to_std_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w[0] == "--settings"
+            && w[1] == "/state/solutions/7/claude-settings.json"));
+        // `--settings` is a command-line-tier OVERRIDE, not a replacement for the
+        // file sources: the user's own settings must keep loading.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--setting-sources" && w[1] == "user,project,local")
+        );
+    }
+
+    #[test]
+    fn omits_the_settings_flag_when_there_is_no_solution() {
+        let spec = ClaudeCommandSpec {
+            binary: "claude".into(),
+            work_dir: "/w".into(),
+            session: SessionArg::New("uuid".into()),
+            mcp_servers_json: "{}".into(),
+            append_system_prompt: None,
+            extra_env: vec![],
+            model: None,
+            settings_path: None,
+        };
+        let args: Vec<String> = spec
+            .to_std_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a == "--settings"));
     }
 
     #[test]

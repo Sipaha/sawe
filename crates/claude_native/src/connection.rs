@@ -169,6 +169,10 @@ impl ClaudeNativeAgentServer {
                 append_system_prompt: None,
                 extra_env,
                 model: None,
+                // A throwaway probe never runs a turn, so it needs no worktree
+                // hook and no auto-memory dir — and it has no project to resolve
+                // a Solution from anyway.
+                settings_path: None,
             };
             let mut process = cx.update(|cx| ClaudeProcess::spawn(spec, cx))?;
             let receiver = process.send_control(ControlRequestOut::Initialize {
@@ -305,6 +309,9 @@ struct RespawnBlueprint {
     work_dirs: PathList,
     append_system_prompt: Option<String>,
     model: Option<String>,
+    /// Carried across a respawn: a resumed session must keep the same worktree
+    /// base, or its `EnterWorktree` would half-land in `<member>/.claude/worktrees/`.
+    settings_path: Option<PathBuf>,
 }
 
 struct SessionState {
@@ -757,6 +764,31 @@ impl ClaudeNativeConnection {
             .map(|text| text.to_string())
     }
 
+    /// Materialize the editor-owned claude settings for this session's Solution
+    /// and return the file to hand to `--settings`. `None` when the project is
+    /// not under an open Solution (a standalone window, a test), when the editor
+    /// binary can't be resolved, or when the operator opted out.
+    fn editor_settings_path(
+        project: &Entity<Project>,
+        work_dir: &std::path::Path,
+        cx: &App,
+    ) -> Option<PathBuf> {
+        if std::env::var_os(crate::claude_settings::DISABLE_ENV_VAR).is_some() {
+            return None;
+        }
+        let (solution_id, solution_root) = agent_servers::solution_scope_for_project(project, cx)?;
+        let settings = crate::claude_settings::EditorClaudeSettings {
+            agents_dir: solution_root.join(".agents"),
+            // The *running* binary hooks itself: a dev build and a release build
+            // must not end up pointing at whichever `sawe` happens to be on PATH.
+            editor_exe: std::env::current_exe().log_err()?,
+            work_dir: work_dir.to_path_buf(),
+        };
+        let path = crate::claude_settings::settings_path(solution_id);
+        settings.write_to(&path).log_err()?;
+        Some(path)
+    }
+
     /// Extract the desired model from the ACP session meta the store passes.
     /// The store sets `meta["modelId"] = "<value>"` for a session whose user
     /// picked a model while it was cold.
@@ -822,11 +854,14 @@ impl ClaudeNativeConnection {
         let model = Self::model_from_meta(&extra_meta)
             .or_else(|| self.desired_models.borrow().get(&session_id).cloned());
 
+        let settings_path = Self::editor_settings_path(&project, &work_dir, cx);
+
         let blueprint = RespawnBlueprint {
             project: project.clone(),
             work_dirs: work_dirs.clone(),
             append_system_prompt: append_system_prompt.clone(),
             model: model.clone(),
+            settings_path: settings_path.clone(),
         };
 
         let spec = ClaudeCommandSpec {
@@ -837,6 +872,7 @@ impl ClaudeNativeConnection {
             append_system_prompt,
             extra_env: self.extra_env.clone(),
             model,
+            settings_path,
         };
 
         let mut process = match ClaudeProcess::spawn(spec, cx) {
@@ -1073,6 +1109,7 @@ impl ClaudeNativeConnection {
                 append_system_prompt: blueprint.append_system_prompt.clone(),
                 extra_env: self.extra_env.clone(),
                 model: blueprint.model.clone(),
+                settings_path: blueprint.settings_path.clone(),
             });
 
             let mut process = match cx.update(|cx| ClaudeProcess::spawn(spec, cx)) {

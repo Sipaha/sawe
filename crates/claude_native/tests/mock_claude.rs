@@ -43,6 +43,7 @@ fn spec_for(binary: PathBuf, capture: Option<PathBuf>) -> ClaudeCommandSpec {
         append_system_prompt: None,
         extra_env,
         model: None,
+        settings_path: None,
     }
 }
 

@@ -1308,7 +1308,7 @@ and docs.
 
 **Steps**
 
-- [ ] Add a failing test to `crates/claude_native/src/command.rs`'s test module:
+- [x] Add a failing test to `crates/claude_native/src/command.rs`'s test module:
       ```rust
       #[test]
       fn passes_the_editor_settings_file_without_dropping_the_user_sources() {
@@ -1359,10 +1359,10 @@ and docs.
           assert!(!args.iter().any(|a| a == "--settings"));
       }
       ```
-- [ ] Run `cargo test -p claude_native --lib command` — expect **compile errors**
+- [x] Run `cargo test -p claude_native --lib command` — expect **compile errors**
       in every existing test too: ``missing field `settings_path` in initializer
       of `ClaudeCommandSpec` `` (the four existing tests each build a spec).
-- [ ] Implement in `command.rs`: add the field to `ClaudeCommandSpec`
+- [x] Implement in `command.rs`: add the field to `ClaudeCommandSpec`
       ```rust
           /// The editor-owned settings layer (`--settings <file>`): the
           /// `WorktreeCreate`/`WorktreeRemove` hooks + `autoMemoryDirectory`. See
@@ -1385,9 +1385,9 @@ and docs.
       Add `settings_path: None` to the four existing tests in `command.rs`, to
       `probe_models` (`connection.rs:164`) and to `spec_for` in
       `crates/claude_native/tests/mock_claude.rs:38`.
-- [ ] Run `cargo test -p claude_native --lib command` — expect all six tests to
+- [x] Run `cargo test -p claude_native --lib command` — expect all six tests to
       pass.
-- [ ] Wire it into the real spawn. In `connection.rs`, add to
+- [x] Wire it into the real spawn. In `connection.rs`, add to
       `impl ClaudeNativeConnection` (near `append_system_prompt_from_meta`):
       ```rust
       /// Materialize the editor-owned claude settings for this session's Solution
@@ -1426,10 +1426,10 @@ and docs.
       at the respawn spec site (`connection.rs:1068`) — a respawned session must keep
       the same worktree base, or the resumed agent's `EnterWorktree` would half-land
       in `.claude/worktrees/`.
-- [ ] Run `cargo test -p claude_native` — expect the whole crate's tests to pass
+- [x] Run `cargo test -p claude_native` — expect the whole crate's tests to pass
       (including `tests/mock_claude.rs`).
-- [ ] Run `cargo check -p zed` — expect no errors.
-- [ ] Commit: `Hand the editor-owned settings layer to the claude subprocess`
+- [x] Run `cargo check -p zed` — expect no errors.
+- [x] Commit: `Hand the editor-owned settings layer to the claude subprocess`
 
 ## Task 2.6 — verify against a live editor + document
 
