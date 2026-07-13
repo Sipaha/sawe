@@ -314,6 +314,22 @@ impl SolutionStore {
         id
     }
 
+    /// Push a catalog row bypassing the uniqueness checks — the only way to
+    /// reproduce the duplicate rows that predate them (and that
+    /// `merge_catalog_project` exists to clean up).
+    #[cfg(test)]
+    pub fn test_force_add_catalog(&mut self, name: &str, remote_url: &str) -> CatalogId {
+        let taken: Vec<String> = self.config.catalog.iter().map(|c| c.id.0.clone()).collect();
+        let id = CatalogId(crate::slug::unique_slug(name, &taken));
+        self.config.catalog.push(CatalogProject {
+            id: id.clone(),
+            name: name.into(),
+            remote_url: remote_url.into(),
+            default_branch: None,
+        });
+        id
+    }
+
     #[cfg(test)]
     pub fn test_force_add_member(&mut self, sid: &SolutionId, cid: &CatalogId) {
         let sol = self
@@ -523,6 +539,110 @@ mod tests {
                 s.edit_catalog_project(&bar, Some("Bar".into()), None, None, cx)
             })
             .expect("self-rename must be allowed");
+    }
+
+    /// Duplicates that predate the uniqueness checks can't be deleted — each
+    /// half is referenced by different solutions, so `remove_catalog_project`
+    /// refuses. `merge_catalog_project` is the way out: repoint the members onto
+    /// the canonical entry (keeping their `local_path`, so no working tree is
+    /// touched) and drop the duplicate row.
+    #[gpui::test]
+    async fn merge_catalog_repoints_members_and_drops_the_duplicate(cx: &mut TestAppContext) {
+        let dir = tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("solutions.json");
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+
+        // The historical shape: two rows for the SAME repo (the second could only
+        // be created before the uniqueness check existed, so force it in).
+        let canonical = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project("Foo", "git@x:foo.git", None, cx)
+            })
+            .expect("add canonical");
+        let duplicate = store.update(cx, |s, _| s.test_force_add_catalog("Foo", "git@x:foo.git"));
+
+        let root = std::env::temp_dir().join("spke-test-solutions");
+        let sol = store
+            .update(cx, |s, cx| s.create_solution("Sol", root, cx))
+            .expect("create solution");
+        store.update(cx, |s, _| s.test_force_add_member(&sol, &duplicate));
+        let path_before = store.read_with(cx, |s, _| {
+            s.solutions()
+                .iter()
+                .find(|x| x.id == sol)
+                .and_then(|x| x.members.first().map(|m| m.local_path.clone()))
+        });
+
+        let repointed = store
+            .update(cx, |s, cx| s.merge_catalog_project(&duplicate, &canonical, cx))
+            .expect("merge");
+        assert_eq!(repointed, 1);
+
+        let (members, catalog_ids) = store.read_with(cx, |s, _| {
+            (
+                s.solutions()
+                    .iter()
+                    .find(|x| x.id == sol)
+                    .map(|x| x.members.clone())
+                    .unwrap_or_default(),
+                s.catalog().iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(
+            members.iter().map(|m| &m.catalog_id).collect::<Vec<_>>(),
+            vec![&canonical],
+            "the member must now point at the canonical entry"
+        );
+        assert_eq!(
+            members.first().map(|m| m.local_path.clone()),
+            path_before,
+            "the checked-out clone must not be moved or re-cloned"
+        );
+        assert!(!catalog_ids.contains(&duplicate), "duplicate row must be gone");
+        assert!(catalog_ids.contains(&canonical));
+    }
+
+    #[gpui::test]
+    async fn merge_catalog_refuses_unrelated_entries_and_shared_solutions(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("solutions.json");
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+
+        let foo = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project("Foo", "git@x:foo.git", None, cx)
+            })
+            .expect("add foo");
+        let bar = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project("Bar", "git@x:bar.git", None, cx)
+            })
+            .expect("add bar");
+
+        // Merge is deduplication, not a repoint tool.
+        let err = store
+            .update(cx, |s, cx| s.merge_catalog_project(&bar, &foo, cx))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not_duplicates"), "got {err}");
+
+        // A solution holding BOTH halves would lose a working tree on merge.
+        let dup = store.update(cx, |s, _| s.test_force_add_catalog("Foo", "git@x:foo.git"));
+        let root = std::env::temp_dir().join("spke-test-solutions");
+        let sol = store
+            .update(cx, |s, cx| s.create_solution("Sol", root, cx))
+            .expect("create solution");
+        store.update(cx, |s, _| {
+            s.test_force_add_member(&sol, &foo);
+            s.test_force_add_member(&sol, &dup);
+        });
+        let err = store
+            .update(cx, |s, cx| s.merge_catalog_project(&dup, &foo, cx))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("solution_holds_both"), "got {err}");
     }
 
     #[gpui::test]

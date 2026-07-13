@@ -207,7 +207,7 @@ impl SolutionStore {
         ))
     }
 
-    fn db_delete_member(&self, sol_id: &SolutionId, cat_id: &CatalogId) -> anyhow::Result<()> {
+    pub(crate) fn db_delete_member(&self, sol_id: &SolutionId, cat_id: &CatalogId) -> anyhow::Result<()> {
         let Some(db) = self.db.as_ref() else {
             return Ok(());
         };

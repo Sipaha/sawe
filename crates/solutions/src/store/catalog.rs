@@ -1,6 +1,6 @@
 use super::{SolutionStore, SolutionStoreEvent};
 use crate::git;
-use crate::model::{CatalogId, CatalogProject, SolutionId};
+use crate::model::{CatalogId, CatalogProject, SolutionId, SolutionMember};
 use crate::slug::unique_slug;
 use anyhow::{Context as _, Result, bail};
 use std::path::PathBuf;
@@ -197,6 +197,114 @@ impl SolutionStore {
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
         Ok(())
+    }
+
+    /// Fold the duplicate catalog entry `from` into the canonical `into`,
+    /// repointing every solution member that referenced `from`, then deleting
+    /// the `from` row. Returns how many members were repointed.
+    ///
+    /// This is the ONLY way to clean up duplicates that predate the uniqueness
+    /// checks in `add_catalog_project`: both halves of such a pair are typically
+    /// referenced by different solutions (the historical clones attached to
+    /// whichever row existed at the time), so `remove_catalog_project` rightly
+    /// refuses them and a raw delete would break those solutions.
+    ///
+    /// A member is `(catalog_id, local_path)`. Only `catalog_id` is rewritten —
+    /// `local_path` and the member's position are preserved, so the checked-out
+    /// working tree on disk is not touched, moved, or re-cloned.
+    ///
+    /// Refuses to merge entries that don't point at the same repository (this is
+    /// deduplication, not a repoint tool), and refuses when a single solution
+    /// holds BOTH entries — collapsing those two members into one would silently
+    /// drop one of the two working trees, which is the user's call, not ours.
+    pub fn merge_catalog_project(
+        &mut self,
+        from: &CatalogId,
+        into: &CatalogId,
+        cx: &mut gpui::Context<Self>,
+    ) -> Result<usize> {
+        if from == into {
+            bail!("merge_self: {} is both source and target", from.0);
+        }
+        let from_url = self
+            .config
+            .catalog
+            .iter()
+            .find(|c| c.id == *from)
+            .with_context(|| format!("catalog_not_found: {}", from.0))?
+            .remote_url
+            .clone();
+        let into_url = self
+            .config
+            .catalog
+            .iter()
+            .find(|c| c.id == *into)
+            .with_context(|| format!("catalog_not_found: {}", into.0))?
+            .remote_url
+            .clone();
+        if !same_remote(&from_url, &into_url) {
+            bail!(
+                "not_duplicates: {} points at {from_url}, {} at {into_url} — merge only folds two \
+                 entries for the SAME repository",
+                from.0,
+                into.0,
+            );
+        }
+        if let Some(both) = self.config.solutions.iter().find(|s| {
+            s.members.iter().any(|m| m.catalog_id == *from)
+                && s.members.iter().any(|m| m.catalog_id == *into)
+        }) {
+            bail!(
+                "solution_holds_both: solution \"{}\" has members for BOTH {} and {} — remove one \
+                 of them yourself first (merging would drop a working tree)",
+                both.name,
+                from.0,
+                into.0,
+            );
+        }
+
+        // Collect the writes first; `db_set_member` / `db_delete_member` take
+        // `&self`, so they can't run while `config.solutions` is borrowed mutably.
+        let mut repointed: Vec<(SolutionId, SolutionMember, i32)> = Vec::new();
+        for solution in self.config.solutions.iter_mut() {
+            for (position, member) in solution.members.iter_mut().enumerate() {
+                if member.catalog_id != *from {
+                    continue;
+                }
+                member.catalog_id = into.clone();
+                repointed.push((solution.id.clone(), member.clone(), position as i32));
+            }
+        }
+        for (solution_id, member, position) in &repointed {
+            // Order matters: the row is keyed by (solution_id, catalog_id), so
+            // drop the old key before writing the new one — otherwise the stale
+            // row survives and the member appears twice on next load.
+            self.db_delete_member(solution_id, from)?;
+            self.db_set_member(solution_id, member, *position)?;
+        }
+        // An active-member pointer at the dead id would leave the solution with
+        // no resolvable active project.
+        let stale_active: Vec<SolutionId> = self
+            .active_member
+            .iter()
+            .filter(|(_, catalog)| *catalog == from)
+            .map(|(solution, _)| solution.clone())
+            .collect();
+        for solution in stale_active {
+            self.set_active_member(solution, into.clone(), cx);
+        }
+
+        self.config.catalog.retain(|c| c.id != *from);
+        self.db_delete_catalog(from)?;
+        log::info!(
+            "solutions: merged catalog {} into {} ({} member(s) repointed)",
+            from.0,
+            into.0,
+            repointed.len(),
+        );
+        cx.emit(SolutionStoreEvent::Changed);
+        cx.notify();
+        Ok(repointed.len())
     }
 
     /// Snapshot of which solutions reference a given catalog entry. Used

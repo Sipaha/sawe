@@ -17,6 +17,9 @@ pub(crate) fn register_catalog(cx: &mut App) {
         server.add_tool(RemoveCatalogProjectTool);
     });
     editor_mcp::register_tool(cx, |server| {
+        server.add_tool(MergeCatalogProjectTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
         server.add_tool(EditCatalogProjectTool);
     });
     editor_mcp::register_tool(cx, |server| {
@@ -254,6 +257,82 @@ impl McpServerTool for RemoveCatalogProjectTool {
                 text: "removed".to_string(),
             }],
             structured_content: RemoveCatalogProjectResult { removed: true },
+        })
+    }
+}
+
+// =====================================================================
+// catalog.merge_project
+// =====================================================================
+
+/// Fold a duplicate catalog entry into the canonical one: every solution member
+/// referencing `from` is repointed at `into` (keeping its checked-out clone —
+/// only the `catalog_id` link is rewritten), then the `from` row is deleted.
+///
+/// This is the cleanup path for duplicates created before `add_project` started
+/// rejecting them. `remove_project` can't do it: both halves of such a pair are
+/// usually referenced by different solutions, so it refuses.
+///
+/// Both entries must point at the SAME repository, and no single solution may
+/// hold both (that would collapse two members into one and drop a working tree).
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct MergeCatalogProjectParams {
+    /// The duplicate to fold away — this row is deleted.
+    pub from: String,
+    /// The canonical entry to keep.
+    pub into: String,
+}
+
+impl<'de> Deserialize<'de> for MergeCatalogProjectParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            from: String,
+            into: String,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            from: inner.from,
+            into: inner.into,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct MergeCatalogProjectResult {
+    /// How many solution members were repointed onto `into`.
+    pub repointed_members: usize,
+}
+
+#[derive(Clone)]
+pub struct MergeCatalogProjectTool;
+
+impl McpServerTool for MergeCatalogProjectTool {
+    type Input = MergeCatalogProjectParams;
+    type Output = MergeCatalogProjectResult;
+    const NAME: &'static str = "catalog.merge_project";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(!input.from.is_empty(), "invalid_params: from is required");
+        anyhow::ensure!(!input.into.is_empty(), "invalid_params: into is required");
+        let repointed = cx.update(|cx| -> Result<usize> {
+            let store = SolutionStore::global(cx);
+            let from = crate::CatalogId(input.from);
+            let into = crate::CatalogId(input.into);
+            store.update(cx, |s, cx| s.merge_catalog_project(&from, &into, cx))
+        })?;
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: format!("merged; {repointed} member(s) repointed"),
+            }],
+            structured_content: MergeCatalogProjectResult {
+                repointed_members: repointed,
+            },
         })
     }
 }

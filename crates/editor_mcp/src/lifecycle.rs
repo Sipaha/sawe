@@ -167,6 +167,7 @@ const GLOBAL_TOOLS: &[&str] = &[
     "catalog.list",
     "catalog.add_project",
     "catalog.remove_project",
+    "catalog.merge_project",
     "catalog.edit_project",
     "catalog.refresh_cache",
     "catalog.clear_cache",
