@@ -1,10 +1,12 @@
 # Session handoff — 2026-07-13 (rename with folder move)
 
-**Status: the three-plan rename arc is IMPLEMENTED, verified end-to-end and
-pushed to `origin/main`.** The session started from a data-loss bug (renaming a
-Solution cascade-deleted its members), turned into a design + planning run for
-"renaming a Solution or a project also renames its folder", and then shipped all
-three plans. What remains is a short list of follow-ups, none of them blocking.
+**Status: the three-plan rename arc is IMPLEMENTED and verified end-to-end, and
+the entire follow-up pool has been CLEARED. All on `origin/main`.** The session
+started from a data-loss bug (renaming a Solution cascade-deleted its members),
+turned into a design + planning run for "renaming a Solution or a project also
+renames its folder", shipped all three plans, and then closed out every
+follow-up they surfaced — including several pre-existing red test suites left by
+the v1.7.2 refork. Every touched crate is green.
 
 Full write-up:
 [`2026-07-13-rename-with-folder-move-shipped.md`](2026-07-13-rename-with-folder-move-shipped.md).
@@ -20,6 +22,7 @@ Full write-up:
 | `a81166f241` `b22518b815` `f573212060` `9c3e0e9d1e` `0a1407c8a3` `defd92e20b` `a1917ea87c` `03ec37164d` | **plan 1 — identity model** |
 | `37763a1897` `5a3e92e403` `8012b06d8d` `107d47a40f` `27110814b5` `0a7843b2d4` `5a010d842d` `b60545b59b` `22e071d5ce` `eb3eb809f4` `5030f40efc` `5e2b6d661c` | **plan 2 — rename moves the folder** |
 | `47c38dbca7` `4573ee11b3` `307eea9bde` `710361bb66` `8a60552b22` `7ad284513f` `8b21dc3fdd` `69a83c8918` `16d9f9295d` `399eb2e471` `781b484308` `48a5b7b04c` `6ec94dbcb1` | **plan 3 — claude settings + sockets** |
+| `0473cabd97` `c8d20768bb` `0a3a666753` `c1a327602e` `df1ff88091` `86a6a1b616` `d52b8b67b9` `cb1e64b915` `b846537798` `4ba55c1e35` `c6dc8f33f9` `7b8734b94a` `5ec2f23d91` | **follow-up cleanup** (see below) |
 
 ## What shipped
 
@@ -69,26 +72,57 @@ Full write-up:
 binary**. Pre-migration backups: `/tmp/db.sqlite.pre-identity-1783948879` and
 `/tmp/solution_agent.db.pre-identity-1783948879`.
 
+## Follow-up cleanup (all CLOSED this session)
+
+Every item that was outstanding is now fixed, and the cleanup surfaced further
+real bugs that were fixed too:
+
+- **Cold reconcile completeness** (`0473cabd97`, `b846537798`). `file_folds` was
+  the reported gap; an audit of the whole app DB found **five more** missed
+  path-bearing tables (`vim_marks`, `vim_global_marks_paths`, `image_viewers`,
+  `git_graphs`, `undo_entries`) — all now rewritten. Four tables keyed by a
+  `DefaultHasher` digest of the repo path (`shelf_entries`, `branch_favorites`,
+  `branch_recent`, `pre_commit_configs`) are now re-keyed by recomputing the hash
+  for the moved repo (the hash fn is hoisted to `git::repo_hash`).
+- **`workspace.list_buffers` cross-solution leak** (`c8d20768bb`). Root cause:
+  two Solutions really share one window, and the tool read the window's *active*
+  workspace. Scoped to the socket's own Solution via `Solution::member_for_path`;
+  the same window-active bug in `diagnostics.get` and `project.open_file` (the
+  latter failed outright) was fixed in the same commit.
+- **Phantom-live background-agent tabs** (`df1ff88091`). On reconnect,
+  `set_acp_thread(None)` now marks background agents `killed` (not a completion,
+  not `Stopped`) — the strip paints them struck-through with a red X, and the
+  stuck-session watchdog stops being suppressed by a dead child holding
+  `background_alive`.
+- **Empty-solution chat guard** (`86a6a1b616`, `4ba55c1e35`). The UI guard now
+  tests `Solution::members` (`console_panel::workspace_has_project`); the MCP
+  `solution_agent.create_session` gained the matching member check it lacked.
+- **The colliding e2e tests** (`0a3a666753`). `set_runtime_dir_for_test` now
+  *panics* on a conflicting second call instead of silently dropping it;
+  `solutions_e2e_test.rs` was split one-server-per-binary; `run_config.*` was
+  correctly promoted to `GLOBAL_TOOLS`; the add-member clone cache is pinned to a
+  tempdir via `set_cache_root_for_test`.
+- **Pre-existing lints** (`c1a327602e`). All cleared; `git_store.rs`'s
+  `branches_future` was a merge-orphaned dead binding (branches are still fetched
+  by the inlined `try_join4`), removed.
+- **Long-red `cargo test -p zed`** (`cb1e64b915`, `d52b8b67b9`). 42
+  `open_listener` failures were the test harness not installing the fork-local
+  `SolutionStore`/`SolutionAgentStore` globals. Fixing it exposed two **real
+  production bugs**: `CommitDetails::short_sha` did `sha[..7]` (panicked the
+  render pass on a short sha), and the `--dev-container` flag was only consumed on
+  a late worktree event (stale-flag race) — both fixed.
+- **Long-red `cargo test -p workspace`** (`c6dc8f33f9`, `7b8734b94a`) and **3
+  `cargo test -p project` failures** (`5ec2f23d91`). Stale tests encoding upstream
+  defaults the fork changed (autosave-on-close; the `.zed/` → `.sawe/` per-project
+  config dir); expectations updated to the fork's reality. One
+  feature-unification `match` non-exhaustiveness fixed alongside.
+
 ## Outstanding pool
 
-- `file_folds` (editor fold persistence, keyed by path) is **not** in
-  `path_migrations::rewrite_app_db` — a folded region is orphaned by a rename.
-  Low impact, one row in the rewriter.
-- `crates/editor_mcp/tests/solutions_e2e_test.rs`'s two tests collide on the
-  process-global runtime-dir `OnceLock` + `SingleInstanceLock`: each passes
-  alone, the pair fails. Needs a per-`App` runtime dir or one test per binary.
-- `workspace.list_buffers` on a per-solution socket reports buffers from a
-  *different* Solution when both are open in the same window (buffer collection
-  is window-level).
-- After a reconnect, background-agent tabs from a killed subprocess still render
-  as live.
-- The empty-solution "can't create a chat" guard is ineffective
-  (`workspace_has_worktree` counts invisible worktrees).
-- Pre-existing, untouched: 42 `open_listener` test failures in the `zed` bin;
-  clippy lints at `crates/solutions/src/cache.rs:166`,
-  `crates/editor_mcp/src/tools/subscribe.rs:67`, `crates/zed/src/zed.rs:76`,
-  `crates/zed/src/main.rs:1733`/`:1744`; unused variable at
-  `crates/project/src/git_store.rs:10404`.
+Empty. The arc and its follow-ups are closed; every touched crate's tests and
+clippy are green. `cargo test -p project` still lists a couple of settings tests
+that only fail under cross-crate *parallel* port contention (pass standalone) —
+a test-harness nuisance, not a code defect, and not introduced here.
 
 ## Decisions, so they are not relitigated
 
@@ -112,8 +146,7 @@ form:
 
 ## Resume recipe
 
-The arc is closed; there is no in-flight phase to pick up. Take the next item
-from the outstanding pool per `docs/workflow/supervisor-mode.md` § 7 — the
-`file_folds` row and the `solutions_e2e_test.rs` test-isolation fix are both
-LIGHT and self-contained; the `list_buffers` cross-solution leak is the only one
-with real design surface.
+The arc and its follow-up pool are both closed; there is no in-flight phase and
+no outstanding pool to pick up. On the next resume, pick a fresh top-of-table
+item from `docs/INDEX.md` per `docs/workflow/supervisor-mode.md` § 7 rather than
+looking for leftovers here.
