@@ -57,6 +57,16 @@ pub struct SeedColdSessionParams {
     /// exercise a live shell stream without a real `Bash(run_in_background)`
     /// launch. Omitted = no shell. Debug/screenshot-only.
     pub live_shell: Option<String>,
+    /// When set, register ONE background (Managed) `Agent` on the seeded session,
+    /// keyed by this id, with a synthetic snapshot — so its derived
+    /// `StreamId::Teammate` tab paints without a real `Agent` dispatch. Combine
+    /// with `background_agent_killed` to screenshot the two render states of a
+    /// background agent whose parent subprocess died. Debug/screenshot-only.
+    pub background_agent: Option<String>,
+    /// Apply the SAME transition a reconnect applies (`mark_background_agents_killed`)
+    /// to the seeded `background_agent`: its teammate tab must then read as the
+    /// terminal `killed` state instead of claiming the agent is still running.
+    pub background_agent_killed: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -151,6 +161,9 @@ impl McpServerTool for SeedColdSessionTool {
                     entries,
                     input.live_teammates,
                     input.live_shell,
+                    input
+                        .background_agent
+                        .map(|id| (id, input.background_agent_killed)),
                     cx,
                 )
             })

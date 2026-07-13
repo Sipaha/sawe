@@ -139,19 +139,57 @@ pub struct BackgroundAgent {
     /// so a mtime-millis stamp (~1.7e12) here would collapse the stream's wire
     /// `seq` when demux takes over and strand the mobile delta cursor.
     pub latest_seq: u64,
+    /// The owning `claude` subprocess died / was replaced (watchdog reconnect,
+    /// manual reconnect, crash) while this agent was still running. A Managed
+    /// Agent is a CHILD of that subprocess, so it went down with it: it did not
+    /// reach a `stop_reason` and it never will — no further JSONL line can ever
+    /// arrive. This is a distinct terminal outcome from a genuine `stop_reason`
+    /// completion, and the UI must say so rather than keep painting a "running"
+    /// teammate tab for work that is gone (or, worse, silently drop the tab and
+    /// imply it finished).
+    pub killed: bool,
 }
+
+/// Close reason recorded on a killed agent's teammate stream. Deliberately not
+/// "done": the agent was reaped mid-flight.
+pub const KILLED_REASON: SharedString = SharedString::new_static("killed");
 
 impl BackgroundAgent {
     /// True while the managed agent is still running — no terminal
     /// `stop_reason` has been observed in its JSONL yet (or it has only
-    /// just registered, before any snapshot). Since phase 6d-tail this only
+    /// just registered, before any snapshot) AND its parent subprocess is
+    /// still the one that spawned it. Since phase 6d-tail this only
     /// feeds the supervisor's `has_live_background_work` gate (the compose row
     /// no longer branches on it — async agents render as view-only `Task`
-    /// teammate tabs).
+    /// teammate tabs). A `killed` agent is NOT live work: counting it there
+    /// would suppress the stuck-session watchdog forever after a reconnect.
     pub fn is_messageable(&self) -> bool {
-        self.latest
-            .as_ref()
-            .map_or(true, |snapshot| snapshot.stop_reason.is_none())
+        !self.killed
+            && self
+                .latest
+                .as_ref()
+                .map_or(true, |snapshot| snapshot.stop_reason.is_none())
+    }
+
+    /// Whether this agent still contributes a derived teammate stream to the
+    /// mirror. A running agent obviously does; a KILLED one keeps its tab (in
+    /// the terminal `Done { killed }` state) until the reaper ages it out, so
+    /// the user sees *why* the work stopped. An agent that reached a genuine
+    /// `stop_reason` is dropped straight away (`tick_background_agents` removes
+    /// it from the map on the next pass) — its transcript ended normally.
+    pub fn renders_stream(&self) -> bool {
+        self.killed || self.is_messageable()
+    }
+
+    /// Render state of this agent's derived teammate stream.
+    pub fn stream_state(&self) -> crate::stream::StreamState {
+        if self.killed {
+            crate::stream::StreamState::Done {
+                reason: KILLED_REASON,
+            }
+        } else {
+            crate::stream::StreamState::Live
+        }
     }
 
     /// Convert this agent's last-observed snapshot into the single
@@ -174,14 +212,28 @@ impl BackgroundAgent {
                 false,
             ),
         };
-        let state_label = if done { "done" } else { "running" };
+        let state_label = if self.killed {
+            "killed"
+        } else if done {
+            "done"
+        } else {
+            "running"
+        };
         let header = format!(
             "Agent {} · {} · {}",
             self.id.short(),
             state_label,
             observed
         );
-        let text = format!("{header}\n\n{activity}");
+        let body = if self.killed {
+            format!(
+                "{activity}\n\nKilled: the parent claude process was restarted \
+                 (reconnect). This background agent did NOT finish its work."
+            )
+        } else {
+            activity
+        };
+        let text = format!("{header}\n\n{body}");
         let created_ms = self
             .latest
             .as_ref()

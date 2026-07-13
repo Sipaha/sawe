@@ -819,6 +819,7 @@
                 // Distinctive change_seq-axis stamp — the fold entry's mod_seq
                 // (and thus stream.seq) must ride this, NOT the mtime.
                 latest_seq: 7,
+                killed: false,
             },
         );
         s.background_agent_order.push(id);

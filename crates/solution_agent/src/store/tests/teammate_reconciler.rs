@@ -1018,6 +1018,7 @@ async fn done_agent_removed_on_tick(cx: &mut TestAppContext) {
                     last_offset: 0,
                     parent_tool_use_id: None,
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1082,6 +1083,7 @@ async fn background_agent_terminal_transition_resets_silence_clock(cx: &mut Test
                     last_offset: 0,
                     parent_tool_use_id: None,
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1152,6 +1154,7 @@ async fn refresh_rebuilds_a_detached_agent_pill_so_it_is_not_frozen(cx: &mut Tes
                     last_offset: 0,
                     parent_tool_use_id: Some(parent_toolu.clone()),
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1254,6 +1257,7 @@ async fn background_agent_terminal_closes_teammate_stream(cx: &mut TestAppContex
                     last_offset: 0,
                     parent_tool_use_id: Some(parent_toolu.clone()),
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1334,6 +1338,7 @@ async fn background_agent_non_terminal_leaves_teammate_stream(cx: &mut TestAppCo
                     last_offset: 0,
                     parent_tool_use_id: Some(parent_toolu.clone()),
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1584,6 +1589,7 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
                         last_offset: 0,
                         parent_tool_use_id: Some(SharedString::from(parent.to_string())),
                         latest_seq: 0,
+                        killed: false,
                     },
                 );
                 s.background_agent_order.push(bg_id);
@@ -1699,6 +1705,7 @@ async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(
                         last_offset: 0,
                         parent_tool_use_id: Some(SharedString::from(parent.to_string())),
                         latest_seq: 0,
+                        killed: false,
                     },
                 );
                 s.background_agent_order.push(bg_id);
@@ -1778,6 +1785,7 @@ async fn fold_does_not_resurrect_a_reaped_detached_agent_pill(cx: &mut TestAppCo
                     last_offset: 0,
                     parent_tool_use_id: Some(SharedString::from(toolu)),
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id);
@@ -1885,6 +1893,7 @@ async fn stale_agent_lingers_briefly_then_removed(cx: &mut TestAppContext) {
                     last_offset: 0,
                     parent_tool_use_id: None,
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1933,6 +1942,7 @@ async fn silent_async_agent_with_live_parent_survives_below_cap(cx: &mut TestApp
                     last_offset: 0,
                     parent_tool_use_id: None,
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -1978,6 +1988,7 @@ async fn fresh_agent_survives_tick(cx: &mut TestAppContext) {
                     last_offset: 0,
                     parent_tool_use_id: None,
                     latest_seq: 0,
+                    killed: false,
                 },
             );
             s.background_agent_order.push(bg_id.clone());
@@ -2668,5 +2679,206 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
         });
         let session = store.read(cx).session(session_id).unwrap();
         assert_eq!(session.read(cx).background_shells.len(), 1);
+    });
+}
+
+/// Regression (phantom-live teammate tabs after a reconnect): a background
+/// (Managed) `Agent` is a CHILD of the `claude` subprocess. When the reconnect
+/// path cold-izes the session (`set_acp_thread(None)` — dropping the wedged
+/// thread so a fresh subprocess can be spawned) every still-running background
+/// agent died with that process. Before the fix nothing marked them, so their
+/// teammate tabs kept painting `Live` ("Agent … · running") for work that no
+/// longer existed, and `is_messageable()` kept reporting them as live background
+/// work (which suppresses the stuck-session watchdog, `turn_is_wedged`).
+///
+/// The terminal state is `killed`, NOT a `stop_reason` completion: the agent was
+/// reaped mid-flight and must never be reported as done.
+#[gpui::test]
+async fn dropping_the_thread_kills_background_agents(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let detached_toolu = "toolu_detached";
+    let demuxed_toolu = "toolu_demuxed";
+    let detached = crate::stream::StreamId::Teammate(SharedString::from(detached_toolu));
+    let demuxed = crate::stream::StreamId::Teammate(SharedString::from(demuxed_toolu));
+
+    // Two shapes of background agent: a DETACHED one (pill exists only because
+    // `rebuild_streams` folds `background_agents` in) and a DEMUXED one (also
+    // interleaves `subagent_id`-tagged entries into the parent thread, so its
+    // stream is built by `demux`). Both must go terminal.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![crate::session_entry::SessionEntry {
+                    created_ms: 1,
+                    mod_seq: 1,
+                    subagent_id: Some(SharedString::from(demuxed_toolu)),
+                    kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Message(
+                            "teammate output".into(),
+                        )],
+                    },
+                }],
+                cx,
+            );
+            for toolu in [detached_toolu, demuxed_toolu] {
+                let bg_id = crate::background_agent::BackgroundAgentId::new(format!("bg_{toolu}"));
+                s.background_agents.insert(
+                    bg_id.clone(),
+                    crate::background_agent::BackgroundAgent {
+                        id: bg_id.clone(),
+                        jsonl_path: "/nonexistent".into(),
+                        registered_at: Utc::now(),
+                        latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                            mtime: std::time::SystemTime::now(),
+                            activity_label: SharedString::from("Grep: foo"),
+                            stop_reason: None,
+                        }),
+                        last_offset: 0,
+                        parent_tool_use_id: Some(SharedString::from(toolu)),
+                        latest_seq: 0,
+                        killed: false,
+                    },
+                );
+                s.background_agent_order.push(bg_id);
+            }
+            s.rebuild_streams();
+            for id in [&detached, &demuxed] {
+                assert_eq!(
+                    s.streams.get(id).expect("live teammate stream").state,
+                    crate::stream::StreamState::Live,
+                    "a running background agent's tab is Live while its subprocess is up"
+                );
+            }
+            assert!(
+                s.background_agents.values().all(|a| a.is_messageable()),
+                "running agents count as live background work"
+            );
+        });
+    });
+
+    // The reconnect cold-ize: exactly what `reconnect_agent` does before handing
+    // off to `resume_session`.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| s.set_acp_thread(None, cx));
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let s = session.read(cx);
+        assert!(
+            s.background_agents.values().all(|a| a.killed),
+            "every background agent of a dropped subprocess is killed"
+        );
+        assert!(
+            s.background_agents.values().all(|a| !a.is_messageable()),
+            "a killed agent is NOT live background work — else the stuck-session \
+             watchdog stays suppressed forever after a reconnect"
+        );
+        assert!(
+            s.background_agents
+                .values()
+                .all(|a| a.latest.as_ref().is_none_or(|snap| snap.stop_reason.is_none())),
+            "killed is NOT a stop_reason completion — the agent never finished"
+        );
+        for id in [&detached, &demuxed] {
+            let stream = s.streams.get(id).expect("teammate tab survives the kill");
+            assert_eq!(
+                stream.state,
+                crate::stream::StreamState::Done {
+                    reason: crate::background_agent::KILLED_REASON
+                },
+                "the tab must go terminal-killed, not keep claiming the teammate runs"
+            );
+        }
+        // The demuxed teammate keeps its real entries; only its state changed.
+        assert_eq!(
+            s.streams.get(&demuxed).expect("demuxed").entries.len(),
+            1,
+            "re-stating a demuxed teammate must not clobber its transcript"
+        );
+        let body = match &s.streams.get(&detached).expect("detached").entries[0].kind {
+            crate::session_entry::SessionEntryKind::AssistantMessage { chunks } => match &chunks[0]
+            {
+                crate::session_entry::AssistantChunk::Message(text) => text.clone(),
+                other => panic!("unexpected chunk: {other:?}"),
+            },
+            other => panic!("unexpected entry kind: {other:?}"),
+        };
+        assert!(
+            body.contains("killed") && body.contains("did NOT finish"),
+            "the folded agent's body must say it was killed, not that it is running: {body}"
+        );
+    });
+}
+
+/// A killed agent must not be shielded by the LIVE-parent staleness cap once the
+/// reconnect has attached a NEW thread: the agent is a child of the OLD process,
+/// so no completion can ever arrive for it and the tight `STALE + DEAD_LINGER`
+/// reap applies. A still-running (not killed) agent of the same age IS shielded —
+/// silence is not death while its own parent is up (hardening #9).
+#[gpui::test]
+async fn killed_agent_is_reaped_despite_a_live_parent(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let killed_id = crate::background_agent::BackgroundAgentId::new("bg_killed");
+    let running_id = crate::background_agent::BackgroundAgentId::new("bg_running");
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| {
+            for (id, killed) in [(&killed_id, true), (&running_id, false)] {
+                s.background_agents.insert(
+                    id.clone(),
+                    crate::background_agent::BackgroundAgent {
+                        id: id.clone(),
+                        jsonl_path: "/nonexistent".into(),
+                        registered_at: Utc::now() - chrono::Duration::seconds(600),
+                        latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                            // Older than STALE+DEAD_LINGER (420s), well under the
+                            // live-parent cap (1h).
+                            mtime: std::time::SystemTime::now()
+                                - std::time::Duration::from_secs(500),
+                            activity_label: SharedString::from("Bash: cargo build"),
+                            stop_reason: None,
+                        }),
+                        last_offset: 0,
+                        parent_tool_use_id: Some(SharedString::from(format!("toolu_{id}"))),
+                        latest_seq: 0,
+                        killed,
+                    },
+                );
+                s.background_agent_order.push(id.clone());
+            }
+        });
+        // The session still has its live `AcpThread` (the reconnect finished and
+        // re-attached one) — the point of the test.
+        assert!(session.read(cx).acp_thread().is_some());
+        store.update(cx, |store, cx| store.tick_background_agents(cx));
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let s = session.read(cx);
+        assert!(
+            !s.background_agents.contains_key(&killed_id),
+            "a killed agent ages out on the tight window even with a new live thread"
+        );
+        assert!(
+            s.background_agents.contains_key(&running_id),
+            "a merely-silent RUNNING agent is still shielded by the live-parent cap"
+        );
+        assert_eq!(
+            s.closed_streams
+                .get(&crate::stream::StreamId::Teammate(SharedString::from(
+                    format!("toolu_{killed_id}")
+                )))
+                .cloned(),
+            Some(crate::background_agent::KILLED_REASON),
+            "the reaped stream closes as `killed`, never as `done`"
+        );
     });
 }

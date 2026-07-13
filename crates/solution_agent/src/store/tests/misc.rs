@@ -4804,6 +4804,7 @@ async fn idle_transition_gc_excludes_live_async_agent_teammate(cx: &mut TestAppC
                         last_offset: 0,
                         parent_tool_use_id: Some(SharedString::from("toolu_async_gc")),
                         latest_seq: 0,
+                        killed: false,
                     },
                 );
                 s.background_agent_order.push(bg_id);

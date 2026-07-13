@@ -686,6 +686,17 @@ impl SolutionSession {
     /// `SessionView::_thread_subscription` on the dead thread and
     /// silently halts conversation-list rendering for that session.
     pub fn set_acp_thread(&mut self, thread: Option<Entity<AcpThread>>, cx: &mut Context<Self>) {
+        // Dropping the live thread means the owning `claude` subprocess is gone
+        // (the reconnect cold-ize; a crash). Every Managed Agent it dispatched
+        // is a CHILD of that process, so it died with it — no `stop_reason` will
+        // ever arrive for it. Mark them here, at the single point where the
+        // thread is dropped, so no reconnect path can forget to: otherwise their
+        // teammate tabs keep painting "running" for work that no longer exists,
+        // AND `has_live_background_work` keeps counting them, which suppresses
+        // the stuck-session watchdog for the rest of the session's life.
+        if thread.is_none() && self.acp_thread.is_some() {
+            self.mark_background_agents_killed();
+        }
         self.live_base = if thread.is_some() {
             self.entries.len()
         } else {
@@ -694,6 +705,35 @@ impl SolutionSession {
         self.acp_thread = thread;
         cx.emit(SolutionSessionEvent::ThreadReplaced);
         cx.notify();
+    }
+
+    /// Flip every still-running background agent to `killed` (its owning
+    /// subprocess is gone) and rebuild the mirror so their teammate streams
+    /// re-state as `Done { killed }`. Returns whether anything changed, so the
+    /// store can decide whether to emit `SessionBackgroundAgentsChanged`.
+    /// Idempotent.
+    pub fn mark_background_agents_killed(&mut self) -> bool {
+        let to_kill: Vec<crate::background_agent::BackgroundAgentId> = self
+            .background_agents
+            .iter()
+            .filter(|(_, agent)| !agent.killed && agent.is_messageable())
+            .map(|(id, _)| id.clone())
+            .collect();
+        if to_kill.is_empty() {
+            return false;
+        }
+        for id in to_kill {
+            // A fresh `change_seq` stamp per killed agent: the folded pill's entry
+            // rides the same monotonic axis as demux entries, so the mobile delta
+            // cursor picks the terminal state up as a normal advance.
+            let seq = self.bump_change_seq();
+            if let Some(agent) = self.background_agents.get_mut(&id) {
+                agent.killed = true;
+                agent.latest_seq = seq;
+            }
+        }
+        self.rebuild_streams();
+        true
     }
 
     /// Store the given session entries and notify observers. Used by
@@ -773,29 +813,38 @@ impl SolutionSession {
         // entry + a `latest` snapshot but no stream and therefore no pill
         // (phase 6d-B removed the dedicated Background pill on the assumption
         // that every async agent rides a demux teammate stream, which detached
-        // ones do not). Mirrors the shell fold above: only agents still running
-        // (`is_messageable`) are folded — a terminal one is dropped by
-        // `tick_background_agents` — and an existing demux stream (the agent DID
-        // interleave) is never clobbered.
+        // ones do not). Mirrors the shell fold above: only agents that still have
+        // a stream (`renders_stream` — running, or KILLED and awaiting the reaper)
+        // are folded — an agent that finished on its own `stop_reason` is dropped
+        // by `tick_background_agents` — and an existing demux stream (the agent
+        // DID interleave) is never clobbered, only re-stated.
         let agent_now = chrono::Utc::now();
         for id in &self.background_agent_order {
             let Some(agent) = self.background_agents.get(id) else {
                 continue;
             };
-            if !agent.is_messageable() {
+            if !agent.renders_stream() {
                 continue;
             }
             let Some(parent_toolu) = agent.parent_tool_use_id.clone() else {
                 continue;
             };
             let key = crate::stream::StreamId::Teammate(parent_toolu.clone());
-            // Respect an existing demux stream (don't clobber real entries) AND
-            // the age-out: `reconcile_finished_teammate_streams` closes a stale /
-            // done agent's stream via `closed_streams` (removed at the top of
-            // this fn), and the agent lingers in `background_agents` for its
+            // Respect the age-out: `reconcile_finished_teammate_streams` closes a
+            // stale / done agent's stream via `closed_streams` (removed at the top
+            // of this fn), and the agent lingers in `background_agents` for its
             // dead-linger window — without this guard the fold would re-add the
             // just-closed pill every rebuild and the age-out could never win.
-            if streams.contains_key(&key) || self.closed_streams.contains_key(&key) {
+            if self.closed_streams.contains_key(&key) {
+                continue;
+            }
+            // An interleaving agent already HAS a demux stream built from its
+            // tagged entries — never clobber those. But its liveness is owned by
+            // the agent, so a killed one must be re-stated `Done { killed }` here
+            // or the tab keeps claiming the teammate is running after its
+            // subprocess died.
+            if let Some(existing) = streams.get_mut(&key) {
+                existing.state = agent.stream_state();
                 continue;
             }
             let stream = crate::stream::Stream {
@@ -807,7 +856,7 @@ impl SolutionSession {
                 label: parent_toolu,
                 entries: vec![agent.stream_entry(agent_now)],
                 seq: 0,
-                state: crate::stream::StreamState::Live,
+                state: agent.stream_state(),
                 source: crate::stream::StreamSource::FileTail(agent.jsonl_path.clone()),
             };
             streams.insert(key, stream);

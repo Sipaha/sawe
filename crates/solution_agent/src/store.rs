@@ -1976,7 +1976,11 @@ impl SolutionAgentStore {
         // hung subprocess can be reaped) and surface a transient "reconnecting…"
         // status. `set_acp_thread(None)` keeps `entries`, so `resume_session`
         // sees the cold-session shape and grafts in place.
-        session.update(cx, |s, cx| {
+        // `set_acp_thread(None)` flips every still-running background agent to
+        // `killed` (the subprocess they were children of is being replaced —
+        // they did not survive it). Report whether it did, so the change is
+        // broadcast to the MCP/mobile subscribers as well as the local views.
+        let background_agents_killed = session.update(cx, |s, cx| {
             s.state = SessionState::Errored(SharedString::from("reconnecting…"));
             s.set_acp_thread(None, cx);
             // Bump the activity clock so the SUPERVISOR tick doesn't treat the
@@ -1987,7 +1991,13 @@ impl SolutionAgentStore {
             // continuation prompt bumps it again on completion, so a normal
             // (sub-`IDLE_THRESHOLD`) reconnect is fully covered.
             s.last_activity_at = chrono::Utc::now();
+            !s.background_agents.is_empty()
         });
+        if background_agents_killed {
+            cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
+                session_id,
+            ));
+        }
         self.mark_state_changed(session_id, cx);
         // Retry material for a second attempt (see the spawn): `meta`/`project`
         // are moved into the first `resume_session`, so clone them first.
@@ -2730,22 +2740,23 @@ impl SolutionAgentStore {
         entries: Vec<crate::session_entry::SessionEntry>,
         live_teammates: bool,
         live_shell: Option<String>,
+        // `(agent id, killed)` — register one background (Managed) `Agent`, in
+        // the running or the reconnect-`killed` terminal state.
+        background_agent: Option<(String, bool)>,
         cx: &mut Context<Self>,
     ) -> SolutionSessionId {
         let session_id = SolutionSessionId::new();
-        // Use the first member's path as cwd (falling back to the solution
-        // root) so the ConsolePanel's active-member tab filter
-        // (`tab_cwd_in_scope`: cwd must `starts_with` the active member) shows
-        // the seeded session instead of scoping it out.
-        let root = SolutionStore::try_global(cx)
+        // Bind the seed to the first member (cwd AND `member_id`): a chat tab is
+        // scoped by its `member_id` (`ConsolePanel::tab_scope`), so a seed with
+        // none lands in `TabScope::Root` and is filtered out of the strip
+        // whenever a member project is active — i.e. it would never be visible.
+        let (root, member_id) = SolutionStore::try_global(cx)
             .and_then(|store| {
                 store.read_with(cx, |s, _| {
                     s.solutions().iter().find(|sol| sol.id == solution_id).map(
-                        |sol| {
-                            sol.members
-                                .first()
-                                .map(|m| m.local_path.clone())
-                                .unwrap_or_else(|| sol.root.clone())
+                        |sol| match sol.members.first() {
+                            Some(member) => (member.local_path.clone(), Some(member.id)),
+                            None => (sol.root.clone(), None),
                         },
                     )
                 })
@@ -2760,6 +2771,7 @@ impl SolutionAgentStore {
             );
             s.title = title;
             s.cwd = root;
+            s.member_id = member_id;
             s.set_entries(entries, cx);
             if live_teammates {
                 // Capture a friendly label for each distinct teammate id (from the
@@ -2809,6 +2821,41 @@ impl SolutionAgentStore {
                 );
                 s.background_shell_order.push(shell_id);
                 s.rebuild_streams();
+            }
+            if let Some((agent_id, killed)) = background_agent {
+                // Register ONE Managed Agent with a synthetic snapshot so
+                // `rebuild_streams` folds it into `session.streams` as its
+                // `StreamId::Teammate` tab (a detached async agent interleaves no
+                // tagged entries, so the fold is its only stream source).
+                let parent_toolu = SharedString::from(format!("toolu_{agent_id}"));
+                let bg_id = crate::background_agent::BackgroundAgentId::new(agent_id);
+                s.background_agents.insert(
+                    bg_id.clone(),
+                    crate::background_agent::BackgroundAgent {
+                        id: bg_id.clone(),
+                        jsonl_path: std::path::PathBuf::from("/tmp/sawe-seed-agent.jsonl"),
+                        registered_at: chrono::Utc::now(),
+                        latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                            mtime: std::time::SystemTime::now(),
+                            activity_label: SharedString::from("Grep: solution_agent"),
+                            stop_reason: None,
+                        }),
+                        last_offset: 0,
+                        parent_tool_use_id: Some(parent_toolu.clone()),
+                        latest_seq: 0,
+                        killed: false,
+                    },
+                );
+                s.background_agent_order.push(bg_id);
+                s.teammate_labels
+                    .insert(parent_toolu, SharedString::from("agent-research"));
+                s.rebuild_streams();
+                if killed {
+                    // The exact transition the reconnect path performs when it
+                    // drops the wedged thread — the state whose render we want to
+                    // verify, reached through the production routine.
+                    s.mark_background_agents_killed();
+                }
             }
             s
         });

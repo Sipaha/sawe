@@ -52,11 +52,22 @@ pub(super) fn render_task_subagent_strip(
     // rides `Stream.label` (enriched from `teammate_labels` in `rebuild_streams`,
     // phase 6d-tail-2), so the strip just reads `stream.label` — the single
     // source of truth for both desktop and the mobile wire.
-    let tabs: Vec<(SharedString, SharedString)> = session_ref
+    // A teammate stream can be `Done` while it still has a tab: a background
+    // agent whose parent `claude` subprocess was killed by a reconnect is
+    // terminal-but-not-finished, and its pill must SAY so (muted + a "killed"
+    // marker) instead of silently claiming the teammate is still working.
+    let tabs: Vec<(SharedString, SharedString, Option<SharedString>)> = session_ref
         .streams
         .iter()
         .filter_map(|(sid, stream)| match sid {
-            crate::stream::StreamId::Teammate(id) => Some((id.clone(), stream.label.clone())),
+            crate::stream::StreamId::Teammate(id) => Some((
+                id.clone(),
+                stream.label.clone(),
+                match &stream.state {
+                    crate::stream::StreamState::Live => None,
+                    crate::stream::StreamState::Done { reason } => Some(reason.clone()),
+                },
+            )),
             _ => None,
         })
         .collect();
@@ -105,10 +116,27 @@ pub(super) fn render_task_subagent_strip(
         .bg(cx.theme().colors().panel_background)
         .child(main_pill);
 
-    for (id, label) in tabs {
+    for (id, label, done_reason) in tabs {
         let is_active = matches!(&selected, StreamId::Teammate(sel) if sel == &id);
         let id_for_listener = id.clone();
         let pill_id = SharedString::from(format!("task-subagent-strip-{}", id));
+        if let Some(reason) = done_reason {
+            row = row.child(done_pill(
+                pill_id,
+                label,
+                reason,
+                is_active,
+                cx,
+                move |this, _, _, cx| {
+                    let next = StreamId::Teammate(id_for_listener.clone());
+                    if this.selected_stream != next {
+                        this.selected_stream = next;
+                        cx.notify();
+                    }
+                },
+            ));
+            continue;
+        }
         row = row.child(pill(
             pill_id,
             label,
@@ -192,6 +220,66 @@ where
             Label::new(label)
                 .size(label_size)
                 .color(label_color)
+                .truncate(),
+        )
+        .on_click(cx.listener(on_click))
+        .into_any_element()
+}
+
+/// A teammate pill for a stream that has reached a terminal state while its tab
+/// is still on screen — today only a background agent KILLED by a reconnect (its
+/// parent `claude` subprocess was replaced, so the agent went with it and will
+/// never report again). Rendered muted, with an X icon and the close reason in
+/// the label, so the strip can't be misread as "this teammate is still working".
+/// It stays clickable: the drill-in still shows the agent's last transcript
+/// snapshot until the reaper ages the tab out.
+fn done_pill<F>(
+    id: SharedString,
+    label: SharedString,
+    reason: SharedString,
+    is_active: bool,
+    cx: &mut Context<SolutionSessionView>,
+    on_click: F,
+) -> AnyElement
+where
+    F: Fn(
+            &mut SolutionSessionView,
+            &gpui::ClickEvent,
+            &mut Window,
+            &mut Context<SolutionSessionView>,
+        ) + 'static,
+{
+    let colors = cx.theme().colors();
+    let bg = if is_active {
+        colors.element_selected
+    } else {
+        colors.element_background
+    };
+    let tooltip_text = SharedString::from(format!(
+        "{label} — {reason} (the agent's process was restarted; it did not finish)"
+    ));
+    h_flex()
+        .id(id)
+        .flex_none()
+        .h(px(24.0))
+        .px_2()
+        .gap_1()
+        .items_center()
+        .rounded_md()
+        .bg(bg)
+        .cursor_pointer()
+        .hover(|s| s.bg(colors.element_hover))
+        .tooltip(Tooltip::text(tooltip_text))
+        .child(
+            Icon::new(IconName::XCircle)
+                .size(IconSize::XSmall)
+                .color(Color::Error),
+        )
+        .child(
+            Label::new(SharedString::from(format!("{label} · {reason}")))
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .strikethrough()
                 .truncate(),
         )
         .on_click(cx.listener(on_click))

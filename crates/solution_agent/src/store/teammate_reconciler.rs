@@ -1008,6 +1008,7 @@ impl SolutionAgentStore {
                                 last_offset: 0,
                                 parent_tool_use_id: Some(parent_toolu),
                                 latest_seq: 0,
+                                killed: false,
                             },
                         );
                         s.background_agent_order.push(id_for_insert);
@@ -1109,17 +1110,25 @@ impl SolutionAgentStore {
                     // for shells; the agent twin was left behind. With no thread
                     // (reconnect / crash / close) the terminal transition can never
                     // arrive, so the ordinary staleness timeout applies.
-                    let stale_threshold = if s.acp_thread().is_some() {
-                        live_parent_cap
-                    } else {
-                        expiry
-                    };
+                    let parent_alive = s.acp_thread().is_some();
                     let candidates: Vec<crate::background_agent::BackgroundAgentId> = s
                         .background_agent_order
                         .iter()
                         .filter(|id| {
                             let Some(ba) = s.background_agents.get(id) else {
                                 return false;
+                            };
+                            // A KILLED agent (its subprocess was replaced by a
+                            // reconnect) can never report anything again, even
+                            // though the session now has a NEW live thread — so
+                            // the generous live-parent cap must not apply to it.
+                            // It lingers on the ordinary stale+linger window, long
+                            // enough for the user to see the terminal tab, and is
+                            // then reaped like any dead agent.
+                            let stale_threshold = if parent_alive && !ba.killed {
+                                live_parent_cap
+                            } else {
+                                expiry
                             };
                             // Age from the snapshot's mtime when one exists, else
                             // from `registered_at` — mirroring the shell reaper.
@@ -1154,11 +1163,17 @@ impl SolutionAgentStore {
                         .filter_map(|id| {
                             let ba = s.background_agents.get(id)?;
                             let parent = ba.parent_tool_use_id.clone()?;
-                            let reason = ba
-                                .latest
-                                .as_ref()
-                                .and_then(|snap| snap.stop_reason.clone())
-                                .unwrap_or_else(|| gpui::SharedString::new_static("done"));
+                            // A killed agent closes as "killed", never "done" — it
+                            // was reaped mid-flight with its parent subprocess and
+                            // must not be reported as a completion.
+                            let reason = if ba.killed {
+                                crate::background_agent::KILLED_REASON
+                            } else {
+                                ba.latest
+                                    .as_ref()
+                                    .and_then(|snap| snap.stop_reason.clone())
+                                    .unwrap_or_else(|| gpui::SharedString::new_static("done"))
+                            };
                             Some((parent, reason))
                         })
                         .collect();
@@ -1267,11 +1282,9 @@ impl SolutionAgentStore {
             // `acp_thread` guarantees the terminal `stop_reason` will still be
             // observed, so only age out at the generous cap; with no thread the
             // terminal transition can never arrive and the tight timeout applies.
-            let stale = if s.acp_thread().is_some() {
-                std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS)
-            } else {
-                stale
-            };
+            let parent_alive = s.acp_thread().is_some();
+            let live_parent_stale =
+                std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
             let teammate_ids: Vec<SharedString> = s
                 .streams
                 .keys()
@@ -1293,6 +1306,16 @@ impl SolutionAgentStore {
                     .values()
                     .find(|ba| ba.parent_tool_use_id.as_ref() == Some(&toolu));
                 if let Some(ba) = async_agent {
+                    // A KILLED agent (subprocess replaced by a reconnect) can
+                    // never report again even though the session now holds a NEW
+                    // live thread, so the generous live-parent cap must not shield
+                    // it — it ages out on the tight staleness window like any
+                    // orphan, keeping its terminal tab visible only briefly.
+                    let stale = if parent_alive && !ba.killed {
+                        live_parent_stale
+                    } else {
+                        stale
+                    };
                     let terminal_stop = ba
                         .latest
                         .as_ref()
@@ -1311,11 +1334,16 @@ impl SolutionAgentStore {
                         now.duration_since(registered).unwrap_or_default() > stale
                     };
                     if terminal_stop || stale_mtime || stale_no_snapshot {
-                        let reason = ba
-                            .latest
-                            .as_ref()
-                            .and_then(|snap| snap.stop_reason.clone())
-                            .unwrap_or_else(|| gpui::SharedString::new_static("done"));
+                        // Never report a killed agent's stream as "done" — it was
+                        // reaped mid-flight with its parent subprocess.
+                        let reason = if ba.killed {
+                            crate::background_agent::KILLED_REASON
+                        } else {
+                            ba.latest
+                                .as_ref()
+                                .and_then(|snap| snap.stop_reason.clone())
+                                .unwrap_or_else(|| gpui::SharedString::new_static("done"))
+                        };
                         to_close.push((toolu, reason));
                     }
                     // else: fresh async teammate still streaming → keep.
