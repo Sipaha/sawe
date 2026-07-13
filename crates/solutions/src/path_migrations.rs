@@ -63,12 +63,11 @@ impl PathRewrite {
 /// `undo_entries`, `trusted_worktrees`) and drop the toolchain rows whose key is
 /// a stale path.
 ///
-/// Deliberately *not* rewritten: `shelf_entries`, `branch_favorites`,
-/// `branch_recent` and `pre_commit_configs` are keyed by `repo_hash` — a
-/// `DefaultHasher` digest of the repo's absolute path, not the path itself — so
-/// there is no prefix to rewrite; their rows are simply re-keyed (and orphaned)
-/// by a move. The `agent_ui` thread tables hold paths too, but that panel is
-/// disabled in this fork and never writes them.
+/// `shelf_entries`, `branch_favorites`, `branch_recent` and
+/// `pre_commit_configs` hold no path at all — they are keyed by `git::repo_hash`,
+/// a digest of the repo's absolute path — so they are not rewritten but *re-keyed*
+/// (`remap_repo_hashed_tables`). The `agent_ui` thread tables hold paths too, but
+/// that panel is disabled in this fork and never writes them.
 ///
 /// Tables are probed before they are touched: the domains that own them
 /// (`WorkspaceDb`, `EditorDb`, `TerminalDb`) migrate lazily, so the reconcile
@@ -105,6 +104,211 @@ pub fn rewrite_app_db(connection: &Connection, rewrite: &PathRewrite) -> Result<
         rewrite,
     )?;
     delete_stale_toolchains(connection, rewrite)?;
+    // Last: it reads the path columns above and expects them already rewritten.
+    remap_repo_hashed_tables(connection, rewrite)?;
+    Ok(())
+}
+
+/// The path columns from which a repository working directory can plausibly be
+/// recovered. Over-collecting is free — a candidate that is not a repo simply
+/// hashes to a key no table carries — while under-collecting silently orphans
+/// the user's data, so err towards more.
+const REPO_PATH_SOURCES: &[(&str, &str)] = &[
+    ("solutions", "root"),
+    ("solution_members", "local_path"),
+    ("git_graphs", "repo_working_path"),
+    ("undo_entries", "repo_path"),
+    ("trusted_worktrees", "absolute_path"),
+    ("terminals", "working_directory_path"),
+];
+
+/// Re-key the four tables that are keyed by `git::repo_hash` — a `DefaultHasher`
+/// digest of the repo's absolute working-directory path, *not* the path itself:
+/// `shelf_entries` (shelved changes), `branch_favorites`, `branch_recent` and
+/// `pre_commit_configs`. There is no prefix to rewrite in them, so without this
+/// a folder move silently orphans every one of those rows.
+///
+/// A digest cannot be inverted, so the old key is recovered by *recomputing* it:
+/// every repo-ish path the freshly-rewritten rows still know about that now
+/// lives under the new location is mapped back to where it used to live, and
+/// `repo_hash(old) → repo_hash(new)` is applied. The hashing goes through
+/// `git::repo_hash` itself — a second copy of that one-liner here would keep
+/// compiling and silently stop matching the day the production key changes.
+/// (`DefaultHasher`'s digest is only stable within a Rust release; that is
+/// already the contract those tables live under, and both sides of the mapping
+/// are computed in one process, so it does not affect this remap.)
+///
+/// Reading the candidates *after* the path columns were rewritten is what makes
+/// this idempotent: a second run finds the same new-path candidates, and the old
+/// key it derives no longer matches any row, so every statement is a no-op. It
+/// also makes a crash-resumed reconcile correct — the path rewrites run first
+/// and are themselves idempotent.
+///
+/// Not covered: a repo that lived under the moved directory but is unknown to
+/// every column in `REPO_PATH_SOURCES` (a nested repo never opened as a member,
+/// never graphed, never trusted). Its rows stay orphaned, exactly as they are
+/// today; there is nothing in the databases left to recover its old path from.
+fn remap_repo_hashed_tables(connection: &Connection, rewrite: &PathRewrite) -> Result<()> {
+    for repo in moved_repo_paths(connection, rewrite)? {
+        let old_key = git::repo_hash(&repo.old);
+        let new_key = git::repo_hash(&repo.new);
+        if old_key == new_key {
+            continue;
+        }
+        remap_shelf_entries(connection, &old_key, &new_key)?;
+        remap_pre_commit_configs(connection, &old_key, &new_key)?;
+        remap_branch_favorites(connection, &old_key, &new_key)?;
+        remap_branch_recent(connection, &old_key, &new_key)?;
+    }
+    Ok(())
+}
+
+/// Every repository that the move relocated, as `old path → new path`. Built
+/// from the *rewritten* rows, so the paths on hand are the new ones and the old
+/// one is reconstructed by re-basing onto `rewrite.old`.
+fn moved_repo_paths(connection: &Connection, rewrite: &PathRewrite) -> Result<Vec<PathRewrite>> {
+    // The moved directory itself: it can be a repo (a single-project solution
+    // whose root *is* the repo) even when no other row mentions it.
+    let mut new_paths: Vec<PathBuf> = vec![rewrite.new.clone()];
+    for (table, column) in REPO_PATH_SOURCES {
+        if !has_column(connection, table, column)? {
+            continue;
+        }
+        let rows: Vec<String> = connection
+            .select::<String>(&format!(
+                "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
+            ))
+            .with_context(|| format!("preparing repo-path select on {table}"))?()
+        .with_context(|| format!("selecting repo paths from {table}"))?;
+        new_paths.extend(rows.into_iter().map(PathBuf::from));
+    }
+
+    new_paths.retain(|path| path.starts_with(&rewrite.new));
+    new_paths.sort();
+    new_paths.dedup();
+
+    Ok(new_paths
+        .into_iter()
+        .filter_map(|new| {
+            let relative = new.strip_prefix(&rewrite.new).ok()?;
+            // `join("")` would append a separator, which would hash to a
+            // different key than the path the row was written under.
+            let old = if relative.as_os_str().is_empty() {
+                rewrite.old.clone()
+            } else {
+                rewrite.old.join(relative)
+            };
+            Some(PathRewrite { old, new })
+        })
+        .collect())
+}
+
+/// `PRIMARY KEY (repo_hash, name)`. A row can already sit at the destination
+/// key only if a *former* occupant of the new path shelved an entry of the same
+/// name and was itself renamed or deleted away without being reconciled — those
+/// rows are stale, while the migrating ones belong to the repo that is actually
+/// there now, so on a name collision the migrating entry wins. Destination rows
+/// whose name does *not* collide are left alone: they and the migrating entries
+/// simply coexist under the one key. Nothing is dropped that a live repo can
+/// still reach.
+fn remap_shelf_entries(connection: &Connection, old_key: &str, new_key: &str) -> Result<()> {
+    if !has_column(connection, "shelf_entries", "repo_hash")? {
+        return Ok(());
+    }
+    // No-op when the old key carries no rows: the `IN` sub-select is empty.
+    let mut drop_colliding = connection
+        .exec_bound::<(String, String)>(
+            "DELETE FROM shelf_entries
+             WHERE repo_hash = ?1
+               AND name IN (SELECT name FROM shelf_entries WHERE repo_hash = ?2)",
+        )
+        .context("preparing shelf_entries collision delete")?;
+    drop_colliding((new_key.to_string(), old_key.to_string()))
+        .context("dropping colliding shelf_entries")?;
+
+    let mut remap = connection
+        .exec_bound::<(String, String)>(
+            "UPDATE shelf_entries SET repo_hash = ?1 WHERE repo_hash = ?2",
+        )
+        .context("preparing shelf_entries remap")?;
+    remap((new_key.to_string(), old_key.to_string())).context("remapping shelf_entries")?;
+    Ok(())
+}
+
+/// `repo_hash` is the whole primary key (one config row per repo), so a
+/// destination row is a stale config of a former occupant of the path. Same rule
+/// as `remap_shelf_entries`: the migrating row wins, and only when there *is*
+/// one — the `EXISTS` guard is what keeps this from deleting a legitimate
+/// destination config when nothing is migrating onto it.
+fn remap_pre_commit_configs(connection: &Connection, old_key: &str, new_key: &str) -> Result<()> {
+    if !has_column(connection, "pre_commit_configs", "repo_hash")? {
+        return Ok(());
+    }
+    let mut drop_colliding = connection
+        .exec_bound::<(String, String)>(
+            "DELETE FROM pre_commit_configs
+             WHERE repo_hash = ?1
+               AND EXISTS (SELECT 1 FROM pre_commit_configs WHERE repo_hash = ?2)",
+        )
+        .context("preparing pre_commit_configs collision delete")?;
+    drop_colliding((new_key.to_string(), old_key.to_string()))
+        .context("dropping the colliding pre_commit_configs row")?;
+
+    let mut remap = connection
+        .exec_bound::<(String, String)>(
+            "UPDATE pre_commit_configs SET repo_hash = ?1 WHERE repo_hash = ?2",
+        )
+        .context("preparing pre_commit_configs remap")?;
+    remap((new_key.to_string(), old_key.to_string())).context("remapping pre_commit_configs")?;
+    Ok(())
+}
+
+/// A favorite is set membership — `PRIMARY KEY (repo_hash, branch_name)` with no
+/// payload — so the two sides are merged as a union rather than one overwriting
+/// the other. `UPDATE OR IGNORE` skips the rows whose branch is already favorited
+/// at the destination (they carry nothing to lose); the trailing DELETE then
+/// clears the ones it skipped, so the old key is empty either way.
+fn remap_branch_favorites(connection: &Connection, old_key: &str, new_key: &str) -> Result<()> {
+    if !has_column(connection, "branch_favorites", "repo_hash")? {
+        return Ok(());
+    }
+    let mut remap = connection
+        .exec_bound::<(String, String)>(
+            "UPDATE OR IGNORE branch_favorites SET repo_hash = ?1 WHERE repo_hash = ?2",
+        )
+        .context("preparing branch_favorites remap")?;
+    remap((new_key.to_string(), old_key.to_string())).context("remapping branch_favorites")?;
+
+    let mut drop_merged = connection
+        .exec_bound::<String>("DELETE FROM branch_favorites WHERE repo_hash = ?")
+        .context("preparing branch_favorites cleanup")?;
+    drop_merged(old_key.to_string()).context("clearing the migrated branch_favorites rows")?;
+    Ok(())
+}
+
+/// Union as well, but the row carries a timestamp, so a branch known to both
+/// keys keeps the *later* checkout — the two histories describe the same repo
+/// and the newest checkout is the true one.
+fn remap_branch_recent(connection: &Connection, old_key: &str, new_key: &str) -> Result<()> {
+    if !has_column(connection, "branch_recent", "last_checkout_unix")? {
+        return Ok(());
+    }
+    let mut merge = connection
+        .exec_bound::<(String, String)>(
+            "INSERT INTO branch_recent (repo_hash, branch_name, last_checkout_unix)
+             SELECT ?1, branch_name, last_checkout_unix
+             FROM branch_recent WHERE repo_hash = ?2
+             ON CONFLICT(repo_hash, branch_name) DO UPDATE
+                SET last_checkout_unix =
+                    max(last_checkout_unix, excluded.last_checkout_unix)",
+        )
+        .context("preparing branch_recent merge")?;
+    merge((new_key.to_string(), old_key.to_string())).context("merging branch_recent")?;
+
+    let mut drop_merged = connection
+        .exec_bound::<String>("DELETE FROM branch_recent WHERE repo_hash = ?")
+        .context("preparing branch_recent cleanup")?;
+    drop_merged(old_key.to_string()).context("clearing the migrated branch_recent rows")?;
     Ok(())
 }
 
@@ -1903,6 +2107,284 @@ mod tests {
         assert_eq!(
             text(&connection, "SELECT root FROM solutions"),
             vec!["/base/new"]
+        );
+    }
+
+    /// Shipped schema of the four `repo_hash`-keyed tables (`ShelfDb`,
+    /// `BranchFavoritesDb`, `PreCommitConfigDb`), which live in the same
+    /// `AppDatabase` file as everything else the reconcile rewrites.
+    fn seed_repo_hashed(connection: &Connection) {
+        connection
+            .exec(
+                "CREATE TABLE shelf_entries (repo_hash TEXT NOT NULL, name TEXT NOT NULL, stash_sha TEXT NOT NULL, created_at_unix INTEGER NOT NULL, source_branch TEXT, description TEXT, files_summary_json TEXT NOT NULL, PRIMARY KEY (repo_hash, name)) STRICT;
+                 CREATE TABLE branch_favorites (repo_hash TEXT NOT NULL, branch_name TEXT NOT NULL, PRIMARY KEY (repo_hash, branch_name)) STRICT;
+                 CREATE TABLE branch_recent (repo_hash TEXT NOT NULL, branch_name TEXT NOT NULL, last_checkout_unix INTEGER NOT NULL, PRIMARY KEY (repo_hash, branch_name)) STRICT;
+                 CREATE TABLE pre_commit_configs (repo_hash TEXT PRIMARY KEY, format INTEGER NOT NULL DEFAULT 0, organize_imports INTEGER NOT NULL DEFAULT 0, run_hook INTEGER NOT NULL DEFAULT 0, tasks_json TEXT NOT NULL) STRICT;",
+            )
+            .expect("prepare hashed schema")()
+        .expect("create hashed schema");
+    }
+
+    fn key(path: &str) -> String {
+        git::repo_hash(Path::new(path))
+    }
+
+    fn insert_shelf(connection: &Connection, repo: &str, name: &str, sha: &str) {
+        let mut insert = connection
+            .exec_bound::<(String, String, String, i64, String)>(
+                "INSERT INTO shelf_entries
+                     (repo_hash, name, stash_sha, created_at_unix, files_summary_json)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .expect("prepare shelf insert");
+        insert((
+            key(repo),
+            name.to_string(),
+            sha.to_string(),
+            1,
+            "{}".to_string(),
+        ))
+        .expect("insert shelf");
+    }
+
+    fn insert_favorite(connection: &Connection, repo: &str, branch: &str) {
+        let mut insert = connection
+            .exec_bound::<(String, String)>(
+                "INSERT INTO branch_favorites (repo_hash, branch_name) VALUES (?, ?)",
+            )
+            .expect("prepare favorite insert");
+        insert((key(repo), branch.to_string())).expect("insert favorite");
+    }
+
+    fn insert_recent(connection: &Connection, repo: &str, branch: &str, at: i64) {
+        let mut insert = connection
+            .exec_bound::<(String, String, i64)>(
+                "INSERT INTO branch_recent (repo_hash, branch_name, last_checkout_unix)
+                 VALUES (?, ?, ?)",
+            )
+            .expect("prepare recent insert");
+        insert((key(repo), branch.to_string(), at)).expect("insert recent");
+    }
+
+    fn insert_pre_commit(connection: &Connection, repo: &str, tasks_json: &str) {
+        let mut insert = connection
+            .exec_bound::<(String, String)>(
+                "INSERT INTO pre_commit_configs (repo_hash, tasks_json) VALUES (?, ?)",
+            )
+            .expect("prepare pre_commit insert");
+        insert((key(repo), tasks_json.to_string())).expect("insert pre_commit");
+    }
+
+    fn shelf_names(connection: &Connection, repo: &str) -> Vec<String> {
+        let mut select = connection
+            .select_bound::<String, String>(
+                "SELECT name FROM shelf_entries WHERE repo_hash = ? ORDER BY name",
+            )
+            .expect("prepare shelf select");
+        select(key(repo)).expect("select shelf")
+    }
+
+    fn favorites(connection: &Connection, repo: &str) -> Vec<String> {
+        let mut select = connection
+            .select_bound::<String, String>(
+                "SELECT branch_name FROM branch_favorites WHERE repo_hash = ? ORDER BY branch_name",
+            )
+            .expect("prepare favorites select");
+        select(key(repo)).expect("select favorites")
+    }
+
+    fn recents(connection: &Connection, repo: &str) -> Vec<(String, i64)> {
+        let mut select = connection
+            .select_bound::<String, (String, i64)>(
+                "SELECT branch_name, last_checkout_unix FROM branch_recent
+                 WHERE repo_hash = ? ORDER BY branch_name",
+            )
+            .expect("prepare recents select");
+        select(key(repo)).expect("select recents")
+    }
+
+    fn pre_commit_tasks(connection: &Connection, repo: &str) -> Vec<String> {
+        let mut select = connection
+            .select_bound::<String, String>(
+                "SELECT tasks_json FROM pre_commit_configs WHERE repo_hash = ?",
+            )
+            .expect("prepare pre_commit select");
+        select(key(repo)).expect("select pre_commit")
+    }
+
+    #[test]
+    fn repo_hash_keyed_rows_follow_the_moved_repo() {
+        let connection = Connection::open_memory(Some("repo_hash_keyed_rows_follow_the_move"));
+        seed(&connection);
+        seed_repo_hashed(&connection);
+
+        insert_shelf(&connection, "/base/old/member", "wip", "abc");
+        insert_favorite(&connection, "/base/old/member", "main");
+        insert_recent(&connection, "/base/old/member", "main", 100);
+        insert_pre_commit(&connection, "/base/old/member", "[\"check\"]");
+        // The solution root is a repo of its own in a single-repo solution.
+        insert_shelf(&connection, "/base/old", "root-wip", "def");
+
+        // Hostile neighbour: same *string* prefix, different directory.
+        insert_shelf(&connection, "/base/older/member", "sibling", "ghi");
+        insert_favorite(&connection, "/base/older/member", "sibling");
+        insert_recent(&connection, "/base/older/member", "sibling", 7);
+        insert_pre_commit(&connection, "/base/older/member", "[\"sibling\"]");
+
+        rewrite_app_db(&connection, &rewrite()).expect("rewrite");
+
+        assert_eq!(shelf_names(&connection, "/base/new/member"), vec!["wip"]);
+        assert_eq!(shelf_names(&connection, "/base/old/member"), Vec::<String>::new());
+        assert_eq!(shelf_names(&connection, "/base/new"), vec!["root-wip"]);
+        assert_eq!(favorites(&connection, "/base/new/member"), vec!["main"]);
+        assert_eq!(
+            recents(&connection, "/base/new/member"),
+            vec![("main".to_string(), 100)]
+        );
+        assert_eq!(
+            pre_commit_tasks(&connection, "/base/new/member"),
+            vec!["[\"check\"]"]
+        );
+
+        assert_eq!(
+            shelf_names(&connection, "/base/older/member"),
+            vec!["sibling"]
+        );
+        assert_eq!(
+            favorites(&connection, "/base/older/member"),
+            vec!["sibling"]
+        );
+        assert_eq!(
+            recents(&connection, "/base/older/member"),
+            vec![("sibling".to_string(), 7)]
+        );
+        assert_eq!(
+            pre_commit_tasks(&connection, "/base/older/member"),
+            vec!["[\"sibling\"]"]
+        );
+    }
+
+    #[test]
+    fn repo_hash_remap_merges_into_an_occupied_destination_key() {
+        let connection = Connection::open_memory(Some("repo_hash_remap_merges"));
+        seed(&connection);
+        seed_repo_hashed(&connection);
+
+        // What the moved repo carries.
+        insert_shelf(&connection, "/base/old/member", "wip", "incoming");
+        insert_favorite(&connection, "/base/old/member", "main");
+        insert_recent(&connection, "/base/old/member", "main", 100);
+        insert_recent(&connection, "/base/old/member", "topic", 90);
+        insert_pre_commit(&connection, "/base/old/member", "[\"incoming\"]");
+
+        // Stale rows a former occupant of the destination path left behind.
+        insert_shelf(&connection, "/base/new/member", "wip", "stale");
+        insert_shelf(&connection, "/base/new/member", "keep", "no-collision");
+        insert_favorite(&connection, "/base/new/member", "main");
+        insert_favorite(&connection, "/base/new/member", "dev");
+        insert_recent(&connection, "/base/new/member", "main", 50);
+        insert_recent(&connection, "/base/new/member", "dev", 5);
+        insert_pre_commit(&connection, "/base/new/member", "[\"stale\"]");
+
+        rewrite_app_db(&connection, &rewrite()).expect("rewrite");
+
+        // Shelf: the migrating entry wins the name collision, the destination's
+        // non-colliding entry survives.
+        assert_eq!(
+            shelf_names(&connection, "/base/new/member"),
+            vec!["keep", "wip"]
+        );
+        let mut select_sha = connection
+            .select_bound::<(String, String), String>(
+                "SELECT stash_sha FROM shelf_entries WHERE repo_hash = ? AND name = ?",
+            )
+            .expect("prepare sha select");
+        assert_eq!(
+            select_sha((key("/base/new/member"), "wip".to_string())).expect("select sha"),
+            vec!["incoming"]
+        );
+
+        // Favorites / recents: union, newest checkout wins.
+        assert_eq!(
+            favorites(&connection, "/base/new/member"),
+            vec!["dev", "main"]
+        );
+        assert_eq!(
+            recents(&connection, "/base/new/member"),
+            vec![
+                ("dev".to_string(), 5),
+                ("main".to_string(), 100),
+                ("topic".to_string(), 90),
+            ]
+        );
+
+        // Pre-commit: single-row key, the migrating config wins.
+        assert_eq!(
+            pre_commit_tasks(&connection, "/base/new/member"),
+            vec!["[\"incoming\"]"]
+        );
+
+        assert_eq!(
+            counts(
+                &connection,
+                "SELECT COUNT(*) FROM shelf_entries WHERE stash_sha = 'stale'"
+            ),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn repo_hash_remap_is_idempotent() {
+        let connection = Connection::open_memory(Some("repo_hash_remap_is_idempotent"));
+        seed(&connection);
+        seed_repo_hashed(&connection);
+
+        insert_shelf(&connection, "/base/old/member", "wip", "abc");
+        insert_favorite(&connection, "/base/old/member", "main");
+        insert_recent(&connection, "/base/old/member", "main", 100);
+        insert_pre_commit(&connection, "/base/old/member", "[\"check\"]");
+
+        rewrite_app_db(&connection, &rewrite()).expect("first");
+        // A row that was written *after* the move, under the new key, must
+        // survive a re-run — the second pass must not treat it as migrating.
+        insert_shelf(&connection, "/base/new/member", "post-move", "xyz");
+        rewrite_app_db(&connection, &rewrite()).expect("second");
+
+        assert_eq!(
+            shelf_names(&connection, "/base/new/member"),
+            vec!["post-move", "wip"]
+        );
+        assert_eq!(favorites(&connection, "/base/new/member"), vec!["main"]);
+        assert_eq!(
+            recents(&connection, "/base/new/member"),
+            vec![("main".to_string(), 100)]
+        );
+        assert_eq!(
+            pre_commit_tasks(&connection, "/base/new/member"),
+            vec!["[\"check\"]"]
+        );
+        assert_eq!(
+            counts(&connection, "SELECT COUNT(*) FROM shelf_entries"),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn repo_hash_remap_skips_missing_tables() {
+        // The `ShelfDb` / `BranchFavoritesDb` / `PreCommitConfigDb` domains
+        // migrate lazily, so the reconcile can legitimately run before any of
+        // their tables exist.
+        let connection = Connection::open_memory(Some("repo_hash_remap_skips_missing_tables"));
+        seed(&connection);
+
+        rewrite_app_db(&connection, &rewrite()).expect("rewrite");
+
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT local_path FROM solution_members WHERE id = 1"
+            ),
+            vec!["/base/new/member"]
         );
     }
 }

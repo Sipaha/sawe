@@ -25,6 +25,7 @@ db.workspace = true
 dirs.workspace = true
 editor_mcp.workspace = true
 fs.workspace = true
+git.workspace = true
 globset.workspace = true
 gpui.workspace = true
 image.workspace = true

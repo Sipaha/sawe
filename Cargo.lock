@@ -18004,6 +18004,7 @@ dependencies = [
  "dirs",
  "editor_mcp",
  "fs",
+ "git",
  "globset",
  "gpui",
  "image",

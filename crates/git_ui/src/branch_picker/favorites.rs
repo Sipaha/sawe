@@ -12,8 +12,6 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 pub use self::persistence::BranchFavoritesDb;
@@ -26,14 +24,12 @@ pub fn init(cx: &gpui::App) {
 
 const RECENT_CAP: usize = 50;
 
-/// Stable identifier for a repository, derived from the absolute path of
-/// its working directory. Returned as a hex-encoded `u64` so it survives
-/// any text format without serialization quirks.
-pub fn repo_hash(work_dir: &Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    work_dir.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+/// Stable identifier for a repository, derived from the absolute path of its
+/// working directory. Re-exported rather than redefined: `branch_favorites` /
+/// `branch_recent` are keyed by it and the folder-move reconcile in
+/// `solutions::path_migrations` re-derives it to follow a renamed repo, so both
+/// sides must hash through the same function.
+pub use git::repo_hash;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecentEntry {

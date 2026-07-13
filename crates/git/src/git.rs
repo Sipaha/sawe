@@ -18,6 +18,8 @@ pub use repository::RemoteCommandOutput;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Write as _};
+use std::hash::{Hash as _, Hasher as _};
+use std::path::Path;
 use std::str::FromStr;
 
 pub const DOT_GIT: &str = ".git";
@@ -27,6 +29,28 @@ pub const LFS_DIR: &str = "lfs";
 pub const COMMIT_MESSAGE: &str = "COMMIT_EDITMSG";
 pub const INDEX_LOCK: &str = "index.lock";
 pub const REPO_EXCLUDE: &str = "info/exclude";
+
+/// Stable identifier for a repository, derived from the absolute path of its
+/// working directory. Hex-encoded `u64` so it round-trips through any text
+/// format without serialization quirks.
+///
+/// This is the persistence key of `shelf_entries`, `branch_favorites`,
+/// `branch_recent` and `pre_commit_configs`, and the cold folder-move reconcile
+/// (`solutions::path_migrations`) re-derives it to follow a renamed repo. Every
+/// one of those call sites must hash through **this** function: a second,
+/// textually identical copy elsewhere would silently stop matching the day this
+/// one changes.
+///
+/// `DefaultHasher`'s digest is only guaranteed stable within a Rust release, so
+/// a toolchain upgrade can in principle re-key every row. That is already the
+/// contract these tables live under (the key is recomputed from the path on
+/// every read), and the reconcile recomputes both sides of the mapping in the
+/// same process — so it is unaffected either way.
+pub fn repo_hash(work_dir: &Path) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    work_dir.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 
 actions!(
     git,

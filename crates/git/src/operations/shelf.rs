@@ -15,8 +15,6 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -175,13 +173,11 @@ impl ShelfStore {
     }
 }
 
-/// Stable identifier for a repository, hashed from the absolute path of
-/// its working directory. Hex-encoded so it survives any text format.
-pub fn repo_hash(work_dir: &Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    work_dir.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+/// Stable identifier for a repository, hashed from the absolute path of its
+/// working directory. Re-exported rather than redefined: the folder-move
+/// reconcile in `solutions::path_migrations` re-derives this key to follow a
+/// renamed repo, and it must be the *same* function.
+pub use crate::repo_hash;
 
 /// Test scaffolding kept under the original `test_override` name so existing
 /// callers keep compiling. `set` / `clear` are no-ops; the SQLite-backed

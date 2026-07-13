@@ -728,9 +728,15 @@ display name with **no transliteration** (Unicode is fine on every supported
 filesystem) and a collision is a hard error, not a silent suffix. When you add a
 new table that stores an absolute path, add it to `rewrite_app_db` /
 `rewrite_agent_db` in `crates/solutions/src/path_migrations.rs` — a table that
-is not listed there is silently orphaned by the next rename (`file_folds` is
-currently in exactly that state; see
-`docs/findings/2026-07-13-rename-with-folder-move-shipped.md`).
+is not listed there is silently orphaned by the next rename (see
+`docs/findings/2026-07-13-rename-with-folder-move-shipped.md`). A table keyed by
+a **hash of the repo path** rather than the path itself (`shelf_entries`,
+`branch_favorites`, `branch_recent`, `pre_commit_configs`) cannot be rewritten
+by prefix — it must be *re-keyed* instead: `remap_repo_hashed_tables` recomputes
+`git::repo_hash(old) → git::repo_hash(new)` for every repo the move relocated.
+`repo_hash` lives in one place (`crates/git/src/git.rs`) precisely so the reconcile
+and the production writers hash identically; a second textual copy of that
+`DefaultHasher` one-liner would compile and silently stop matching.
 
 ## Where specs and plans live
 

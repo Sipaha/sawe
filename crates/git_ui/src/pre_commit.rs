@@ -23,8 +23,6 @@ use lsp::CodeActionKind;
 use project::Project;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -42,13 +40,11 @@ pub fn init(cx: &gpui::App) {
 }
 
 /// Stable identifier for a repository, derived from the absolute path of its
-/// working directory. Hex-encoded `u64` so it round-trips through any
-/// text format without serialization quirks.
-pub fn repo_hash(work_dir: &Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    work_dir.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+/// working directory. Re-exported rather than redefined: `pre_commit_configs`
+/// is keyed by it and the folder-move reconcile in
+/// `solutions::path_migrations` re-derives it to follow a renamed repo, so both
+/// sides must hash through the same function.
+pub use git::repo_hash;
 
 /// User-facing config for the per-repo "before commit" panel section. All
 /// fields default to `false` — a pristine repo runs no checks until the
