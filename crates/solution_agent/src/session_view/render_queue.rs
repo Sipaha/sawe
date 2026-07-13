@@ -92,6 +92,30 @@ impl SolutionSessionView {
                             .border_color(border_color)
                             .rounded_md()
                             .child(body)
+                            // The queue is NOT a dead letter: it is pulled into the
+                            // running turn at the agent's next hook boundary
+                            // (`PostToolUse`, or `Stop` at turn end). Users read a
+                            // silent "Queued" badge as "my message was swallowed" —
+                            // especially while the agent sits inside a 40-minute
+                            // build, where the next boundary is that build's end.
+                            // Say when it lands, and that ⚡ is the way to not wait.
+                            .when(is_running, |this| {
+                                let hint = match crate::status_row::in_progress_tool(
+                                    self.session.read(cx),
+                                ) {
+                                    Some((tool, _)) => format!(
+                                        "Delivered when {tool} finishes — or ⚡ to interrupt now"
+                                    ),
+                                    None => "Delivered at the agent's next step — or ⚡ to \
+                                             interrupt now"
+                                        .to_string(),
+                                };
+                                this.child(
+                                    Label::new(SharedString::from(hint))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                            })
                             // Send-now bolt floats in the bubble's bottom-right
                             // corner (anchored absolutely on the `relative`
                             // bubble) rather than in a separate strip beneath

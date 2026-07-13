@@ -1565,6 +1565,18 @@ impl SolutionAgentStore {
         // addressee's hook (or get dropped at turn end if that addressee is
         // already gone — see the `Stopped` idle-flush).
         let session = self.session(session_id)?;
+        // The hook pull is the ONLY path that delivers a queued follow-up into a
+        // RUNNING turn, and it was entirely silent: when a message sat in the
+        // queue for an hour there was no way to tell whether the hook never
+        // fired, fired with a subagent's `agent_id` (which must not drain a
+        // Main-targeted bundle), or fired and found nothing. Log every firing
+        // with what it saw — this is the "where did my message go?" ledger, the
+        // same reason the enqueue side logs.
+        let queue_len = session.read(cx).pending_messages.len();
+        log::info!(
+            target: "solution_agent::queue",
+            "session={session_id} hook pull (agent_id={agent_id:?}, end_of_turn={is_end_of_turn}, queue_len={queue_len})",
+        );
         let combined: Vec<acp::ContentBlock> = session.update(cx, |s, _| {
             let mut taken: Vec<acp::ContentBlock> = Vec::new();
             let mut kept: std::collections::VecDeque<crate::model::PendingBundle> =
@@ -1592,6 +1604,18 @@ impl SolutionAgentStore {
             taken
         });
         if combined.is_empty() {
+            if queue_len > 0 {
+                // The queue is non-empty yet this hook drained nothing: every
+                // bundle is addressed to somebody else (a teammate's hook, or the
+                // main agent while a teammate's hook is firing), or an image
+                // bundle is being deferred to the end-of-turn re-send. Worth a
+                // line — from the user's seat this is indistinguishable from "my
+                // message was swallowed".
+                log::info!(
+                    target: "solution_agent::queue",
+                    "session={session_id} hook pull drained NOTHING despite queue_len={queue_len}                      (agent_id={agent_id:?}, end_of_turn={is_end_of_turn}) — bundles are targeted                      elsewhere or image-deferred",
+                );
+            }
             return None;
         }
 

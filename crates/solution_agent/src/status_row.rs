@@ -193,11 +193,34 @@ pub(crate) fn render_status_row(
                 Some(msg.clone()),
             ),
             SessionState::Running { started_at, .. } => {
-                let elapsed = started_at.elapsed().as_secs();
-                let label = if elapsed >= 1 {
-                    format!("Thinking… {}", format_elapsed(elapsed))
-                } else {
-                    "Thinking…".to_string()
+                // "Thinking…" is a lie while the agent is BLOCKED on a tool call:
+                // a 40-minute `mvn verify` rendered as "Thinking… 1h18m", which
+                // reads as a hung model rather than a build the user is waiting
+                // for, and gives no clue that a typed follow-up will be delivered
+                // at the next tool boundary (the hook pull), not swallowed. Name
+                // the tool and count ITS elapsed instead; fall back to the turn
+                // clock when the agent really is between tools.
+                let label = match in_progress_tool(s) {
+                    Some((tool, since_ms)) => {
+                        let secs = since_ms
+                            .map(|ms| {
+                                (chrono::Utc::now().timestamp_millis() - ms).max(0) / 1000
+                            })
+                            .unwrap_or(0) as u64;
+                        if secs >= 1 {
+                            format!("Running {tool} · {}", format_elapsed(secs))
+                        } else {
+                            format!("Running {tool}")
+                        }
+                    }
+                    None => {
+                        let elapsed = started_at.elapsed().as_secs();
+                        if elapsed >= 1 {
+                            format!("Thinking… {}", format_elapsed(elapsed))
+                        } else {
+                            "Thinking…".to_string()
+                        }
+                    }
                 };
                 (SharedString::from(label), None)
             }
@@ -1225,6 +1248,44 @@ pub(crate) fn smooth_used_tokens(raw_used: u64, peak: u64) -> u64 {
     }
 }
 
+/// The tool call the agent is currently BLOCKED on, as `(display name, unix-ms
+/// when it went InProgress)`. The last in-progress call wins: a nested Agent
+/// Teams call is more specific than its parent's. `None` when the agent is
+/// between tools — genuinely thinking.
+pub(crate) fn in_progress_tool(s: &crate::model::SolutionSession) -> Option<(String, Option<i64>)> {
+    s.entries.iter().rev().find_map(|entry| match &entry.kind {
+        crate::session_entry::SessionEntryKind::ToolCall {
+            status: crate::session_entry::ToolStatus::InProgress,
+            tool_name,
+            label_md,
+            status_started_at,
+            ..
+        } => {
+            let name = tool_name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| first_line_of(label_md));
+            Some((name, *status_started_at))
+        }
+        _ => None,
+    })
+}
+
+/// First non-empty line of a tool's markdown label, clamped — the label can be a
+/// whole command line and the status row has one row of space.
+fn first_line_of(label_md: &str) -> String {
+    let line = label_md
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("tool");
+    let mut clamped: String = line.chars().take(28).collect();
+    if line.chars().count() > 28 {
+        clamped.push('…');
+    }
+    clamped
+}
+
 /// "Thinking… 7s" / "Thinking… 1m32s" / "Thinking… 1h05m" — granularity
 /// shifts up as the turn drags on so a 40-minute thought doesn't render
 /// as "Thinking… 2412s" (mentally divide-by-60 every render). Hours +
@@ -1446,5 +1507,24 @@ mod tests {
         let label = local_date_label(older, now);
         assert_eq!(label.len(), 10); // YYYY-MM-DD
         assert_eq!(label.as_bytes()[4], b'-');
+    }
+}
+
+#[cfg(test)]
+mod status_row_tests {
+    use super::first_line_of;
+
+    #[test]
+    fn first_line_of_takes_the_first_non_empty_line_and_clamps() {
+        assert_eq!(first_line_of("\n\n  Bash  \n more"), "Bash");
+        let long = "mvn -o -pl forge-core clean verify -DskipITs";
+        let out = first_line_of(long);
+        assert!(out.ends_with('…'), "a long command must be clamped: {out}");
+        assert!(out.chars().count() <= 29);
+    }
+
+    #[test]
+    fn first_line_of_falls_back_when_empty() {
+        assert_eq!(first_line_of("   \n  "), "tool");
     }
 }
