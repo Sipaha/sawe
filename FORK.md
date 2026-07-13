@@ -626,6 +626,30 @@ The god-object refactor (2026-07-10) reduced `SolutionAgentStore` (`store.rs`). 
 
 How to apply: to get orchestration-heavy code out of `store.rs`, **relocate the method bodies into a child `mod` of `store` (partial-class)** — do NOT try to make a sub-object *own* the orchestration. A GPUI `Entity`'s methods that spawn/emit/read-siblings cannot be lifted onto a plain sub-struct without an unresolvable borrow + async-target problem. True dependency inversion here would have to be driven by a *feature* need (e.g. multiple supervisor strategies), not god-object hygiene, and would cost making the sub-object an Entity. Full analysis: `docs/plans/2026-07-10-god-object-refactor-tier3.md`.
 
+### 50. Solution / member / catalog ids are surrogate counters, not slugs
+
+*Why:* the id used to be a slug of the display name **and** doubled as a path
+component (`root = <settings.root>/<slug>`, `local_path = root/<catalog_id>`,
+per-solution MCP socket at `<runtime>/solutions/<id>/mcp.sock`), so "rename"
+literally meant "change the primary key". That is why rename silently degraded
+to a label-only change and the on-disk folder drifted away from the name
+forever. `SolutionId` / `MemberId` / `CatalogId` are now `pub struct X(pub i64)`
+(`Copy`) backed by SQLite `INTEGER PRIMARY KEY` rowids; `name` and
+`local_path` / `root` are ordinary mutable columns.
+
+*How to apply:* address solutions and members by `SolutionId(i64)` /
+`MemberId(i64)` everywhere — MCP tool params and wire DTOs included (they carry
+raw `i64`, not strings). A member owns its own `name`; `origin_catalog_id` is
+provenance only, so a tab/chip label is `member.name` and never a catalog
+lookup with a slug fallback. A session's project is `solution_sessions
+.member_id`, never an inference from its cwd. Never `INSERT OR REPLACE` into a
+table that is an FK parent with `ON DELETE CASCADE` (see
+`docs/findings/2026-07-13-rename-solution-cascade-data-loss.md`). Note the one
+resolution loss this brings: `Solution::last_opened_at` is now epoch **millis**
+(`Option<i64>`), so two touches inside the same millisecond tie under a stable
+sort — order-sensitive tests must advance the real wall clock, not a GPUI
+virtual timer.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

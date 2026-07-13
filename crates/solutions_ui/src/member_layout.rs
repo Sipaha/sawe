@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{Context, Task, Window};
-use solutions::{CatalogId, SolutionId, SolutionStoreEvent};
+use solutions::{MemberId, SolutionId, SolutionStoreEvent};
 use workspace::{DockStructure, OpenOptions, OpenVisible, SaveIntent, Workspace};
 
-type MemberKey = (SolutionId, CatalogId);
+type MemberKey = (SolutionId, MemberId);
 
 #[derive(Clone, Default)]
 struct MemberLayout {
@@ -51,14 +51,14 @@ fn plan_item_reconcile(current: &[PathBuf], target: &[PathBuf]) -> ItemReconcile
 }
 
 /// Snapshot the outgoing active member's layout and apply the incoming
-/// member's, if it has one. `catalog == None` means the solution lost its
+/// member's, if it has one. `member == None` means the solution lost its
 /// last member: clear tracking without applying. First visit to a member
 /// (no stored snapshot) leaves the current layout intact.
 pub(crate) fn apply_active_member_change(
     state: &Rc<RefCell<MemberLayoutState>>,
     workspace: &mut Workspace,
     solution: SolutionId,
-    catalog: Option<CatalogId>,
+    member: Option<MemberId>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -71,7 +71,7 @@ pub(crate) fn apply_active_member_change(
     // 1. Snapshot the outgoing member from the live workspace.
     {
         let mut st = state.borrow_mut();
-        if let Some(prev) = st.current.clone() {
+        if let Some(prev) = st.current {
             // Only snapshot when the solution itself hasn't changed. An
             // in-place solution switch (switch::switch_active_solution_in_place)
             // swaps worktrees and replays the new solution's tabs on this
@@ -96,13 +96,13 @@ pub(crate) fn apply_active_member_change(
     }
 
     // 2. Resolve the incoming key. No member => stop tracking, no apply.
-    let Some(catalog) = catalog else {
+    let Some(member) = member else {
         let mut st = state.borrow_mut();
         st.current = None;
         st.apply_task = None;
         return;
     };
-    let key = (solution, catalog);
+    let key = (solution, member);
 
     // 3. Apply the incoming member's snapshot (first visit => skip).
     let to_apply = {
@@ -236,15 +236,8 @@ pub(crate) fn register_member_layout_controller(
     };
     let state = Rc::new(RefCell::new(MemberLayoutState::default()));
     cx.subscribe_in(&store, window, move |workspace, _store, event, window, cx| {
-        if let SolutionStoreEvent::ActiveMemberChanged { solution, catalog } = event {
-            apply_active_member_change(
-                &state,
-                workspace,
-                solution.clone(),
-                catalog.clone(),
-                window,
-                cx,
-            );
+        if let SolutionStoreEvent::ActiveMemberChanged { solution, member } = event {
+            apply_active_member_change(&state, workspace, *solution, *member, window, cx);
         }
     })
     .detach();
@@ -257,7 +250,7 @@ mod tests {
     use gpui::{AppContext as _, TestAppContext};
     use project::Project;
     use serde_json::json;
-    use solutions::{CatalogId, SolutionId};
+    use solutions::{MemberId, SolutionId};
     use settings::{Settings as _, SettingsStore};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -292,12 +285,12 @@ mod tests {
         state: &Rc<RefCell<MemberLayoutState>>,
         workspace: &gpui::Entity<Workspace>,
         cx: &mut gpui::VisualTestContext,
-        s: &str,
-        c: Option<&str>,
+        solution: i64,
+        member: Option<i64>,
     ) {
-        let (state, catalog) = (state.clone(), c.map(|c| CatalogId(c.into())));
+        let (state, member) = (state.clone(), member.map(MemberId));
         workspace.update_in(cx, |ws, window, cx| {
-            apply_active_member_change(&state, ws, SolutionId(s.into()), catalog, window, cx);
+            apply_active_member_change(&state, ws, SolutionId(solution), member, window, cx);
         });
         cx.run_until_parked();
     }
@@ -365,11 +358,11 @@ mod tests {
         let state = Rc::new(RefCell::new(MemberLayoutState::default()));
 
         // First visit to member A: no apply (inherit current empty view).
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
         open(&workspace, cx, path!("/sol/a.txt")).await;
 
         // Switch to B (first visit): snapshots A={a.txt}, inherits a.txt open.
-        switch(&state, &workspace, cx, "sol", Some("B"));
+        switch(&state, &workspace, cx, 1, Some(20));
         // Establish B's own view: close a.txt, open b.txt.
         let a_id = workspace.update(cx, |ws, cx| {
             ws.items(cx).next().map(|i| i.item_id())
@@ -386,13 +379,13 @@ mod tests {
         open(&workspace, cx, path!("/sol/b.txt")).await;
 
         // Back to A: apply A={a.txt} → center shows only a.txt.
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
         let paths = open_paths(&workspace, cx);
         assert_eq!(paths.len(), 1, "A restores exactly its own tab: {paths:?}");
         assert!(paths[0].ends_with("a.txt"), "A restores a.txt: {paths:?}");
 
         // Back to B: apply B={b.txt}.
-        switch(&state, &workspace, cx, "sol", Some("B"));
+        switch(&state, &workspace, cx, 1, Some(20));
         let paths = open_paths(&workspace, cx);
         assert_eq!(paths.len(), 1, "B restores exactly its own tab: {paths:?}");
         assert!(paths[0].ends_with("b.txt"), "B restores b.txt: {paths:?}");
@@ -451,13 +444,13 @@ mod tests {
 
         // Member A, first visit: open x.txt then z.txt in the single pane, so
         // z.txt is the active item.
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
         open(&workspace, cx, path!("/sol/x.txt")).await;
         open(&workspace, cx, path!("/sol/z.txt")).await;
         let first_pane = workspace.update(cx, |ws, _| ws.active_pane().clone());
 
         // Switch to B: snapshots A workspace-wide = {x.txt, z.txt}, active=z.txt.
-        switch(&state, &workspace, cx, "sol", Some("B"));
+        switch(&state, &workspace, cx, 1, Some(20));
 
         // Build B's split layout:
         //   non-active pane  = {x.txt}
@@ -510,7 +503,7 @@ mod tests {
         // OPEN x.txt into the active pane (it lives only in the non-active pane)
         // and CLOSE y.txt there. A workspace-wide `current` would see x.txt as
         // "already open" and never open it — leaving the active pane without it.
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
 
         let active_paths = sorted(pane_abs_paths(
             &workspace.update(cx, |ws, _| ws.active_pane().clone()),
@@ -545,12 +538,12 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let state = Rc::new(RefCell::new(MemberLayoutState::default()));
 
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
         open(&workspace, cx, path!("/sol/a.txt")).await;
-        switch(&state, &workspace, cx, "sol", Some("B"));
+        switch(&state, &workspace, cx, 1, Some(20));
         open(&workspace, cx, path!("/sol/b.txt")).await;
         // Back to A: a real close+reopen swap runs.
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
 
         let suppressed = workspace.update(cx, |ws, _| ws.active_entry_reveal_suppressed());
         assert!(
@@ -569,10 +562,10 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let state = Rc::new(RefCell::new(MemberLayoutState::default()));
 
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
         open(&workspace, cx, path!("/sol/a.txt")).await;
         // First visit to B must NOT blank the editor (inherit A's view).
-        switch(&state, &workspace, cx, "sol", Some("B"));
+        switch(&state, &workspace, cx, 1, Some(20));
         let paths = open_paths(&workspace, cx);
         assert_eq!(paths.len(), 1, "first visit inherits current tabs: {paths:?}");
         assert!(paths[0].ends_with("a.txt"));
@@ -588,9 +581,9 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let state = Rc::new(RefCell::new(MemberLayoutState::default()));
 
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
         open(&workspace, cx, path!("/sol/a.txt")).await;
-        switch(&state, &workspace, cx, "sol", None); // member removed
+        switch(&state, &workspace, cx, 1, None); // member removed
         assert!(state.borrow().current.is_none(), "current cleared on None catalog");
         // The just-open file is left as-is (no forced blank).
         let paths = open_paths(&workspace, cx);
@@ -616,7 +609,7 @@ mod tests {
         });
         let state = Rc::new(RefCell::new(MemberLayoutState::default()));
 
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
         // A: open the left dock.
         workspace.update_in(cx, |ws, window, cx| {
             ws.left_dock().update(cx, |d, cx| d.set_open(true, window, cx));
@@ -625,18 +618,18 @@ mod tests {
         assert!(left_dock_open(&workspace, cx), "A has left dock open");
 
         // B (first visit): inherits open; then close it for B.
-        switch(&state, &workspace, cx, "sol", Some("B"));
+        switch(&state, &workspace, cx, 1, Some(20));
         workspace.update_in(cx, |ws, window, cx| {
             ws.left_dock().update(cx, |d, cx| d.set_open(false, window, cx));
         });
         cx.run_until_parked();
 
         // Back to A: left dock re-opens.
-        switch(&state, &workspace, cx, "sol", Some("A"));
+        switch(&state, &workspace, cx, 1, Some(10));
         assert!(left_dock_open(&workspace, cx), "A restores left dock open");
 
         // Back to B: left dock closed.
-        switch(&state, &workspace, cx, "sol", Some("B"));
+        switch(&state, &workspace, cx, 1, Some(20));
         assert!(!left_dock_open(&workspace, cx), "B restores left dock closed");
     }
 
@@ -655,12 +648,12 @@ mod tests {
         let state = Rc::new(RefCell::new(MemberLayoutState::default()));
 
         // 1. Switch to solution A, member X; open a.txt.
-        switch(&state, &workspace, cx, "A", Some("X"));
+        switch(&state, &workspace, cx, 1, Some(100));
         open(&workspace, cx, path!("/sol/a.txt")).await;
 
         // 2. Switch to A, member X2 (first visit): snapshots (A,X)={a.txt};
         //    current=(A,X2); no apply, workspace still shows a.txt.
-        switch(&state, &workspace, cx, "A", Some("X2"));
+        switch(&state, &workspace, cx, 1, Some(102));
         let paths = open_paths(&workspace, cx);
         assert_eq!(paths.len(), 1, "X2 first visit inherits current tabs: {paths:?}");
         assert!(paths[0].ends_with("a.txt"));
@@ -684,10 +677,10 @@ mod tests {
         // 4. Switch to solution B, member Y. `state.current` still says
         //    (A, X2), which is stale relative to the workspace's real
         //    content (B's tabs) — the snapshot step must not fire.
-        switch(&state, &workspace, cx, "B", Some("Y"));
+        switch(&state, &workspace, cx, 2, Some(200));
 
         // 5. (A, X2) must not have been corrupted with B's file.
-        let key_x2 = (SolutionId("A".into()), CatalogId("X2".into()));
+        let key_x2 = (SolutionId(1), MemberId(102));
         let st = state.borrow();
         if let Some(layout) = st.layouts.get(&key_x2) {
             assert!(
@@ -700,7 +693,7 @@ mod tests {
             );
         }
         // (A, X) must still hold its original snapshot of a.txt.
-        let key_x = (SolutionId("A".into()), CatalogId("X".into()));
+        let key_x = (SolutionId(1), MemberId(100));
         let layout_x = st.layouts.get(&key_x).expect("(A, X) snapshot must still exist");
         assert_eq!(layout_x.open_paths.len(), 1, "{:?}", layout_x.open_paths);
         assert!(layout_x.open_paths[0].to_string_lossy().ends_with("a.txt"));

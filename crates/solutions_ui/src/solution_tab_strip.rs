@@ -100,7 +100,7 @@ fn solution_id_for_workspace(
     project.read(cx).worktrees(cx).find_map(|tree| {
         store
             .solution_for_path(&tree.read(cx).abs_path())
-            .map(|sol| sol.id.clone())
+            .map(|sol| sol.id)
     })
 }
 
@@ -148,7 +148,7 @@ impl Render for SolutionTabStrip {
                 .map(|s| s.read(cx).visible_session_count(&sol_id))
                 .unwrap_or(0);
             tabs.push((
-                sol_id.clone(),
+                sol_id,
                 SharedString::from(sol.name.clone()),
                 is_active,
                 ai_count,
@@ -164,7 +164,7 @@ impl Render for SolutionTabStrip {
         let any_closed = store_read
             .solutions()
             .iter()
-            .any(|s| !seen_ids.contains(&s.id) && !is_solution_open_anywhere(&s.id, cx));
+            .any(|s| !seen_ids.contains(&s.id) && !is_solution_open_anywhere(s.id, cx));
 
         let weak_workspace = self.workspace.clone();
         let weak_multi_workspace = self.multi_workspace.clone();

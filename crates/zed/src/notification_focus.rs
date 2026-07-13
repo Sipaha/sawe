@@ -73,7 +73,7 @@ pub fn focus_session(session_id: SolutionSessionId, cx: &mut App) {
     let Some(session) = store.read(cx).session(session_id) else {
         return;
     };
-    let solution_id = session.read(cx).solution_id.clone();
+    let solution_id = session.read(cx).solution_id;
 
     // Each editor window's root is a `MultiWorkspace`; find the one holding the
     // session's Solution and drive the focus sequence inside it.
@@ -85,7 +85,7 @@ pub fn focus_session(session_id: SolutionSessionId, cx: &mut App) {
     for handle in windows {
         let focused = handle
             .update(cx, |multi_workspace, window, cx| {
-                let Some(target) = workspace_for_solution(multi_workspace, &solution_id, cx) else {
+                let Some(target) = workspace_for_solution(multi_workspace, solution_id, cx) else {
                     return false;
                 };
                 // 1. raise the OS window, 2. activate the Solution's tab.
@@ -112,7 +112,7 @@ pub fn focus_session(session_id: SolutionSessionId, cx: &mut App) {
 /// worktree→solution resolution.
 fn workspace_for_solution(
     multi_workspace: &MultiWorkspace,
-    solution_id: &solutions::SolutionId,
+    solution_id: solutions::SolutionId,
     cx: &App,
 ) -> Option<gpui::Entity<Workspace>> {
     let store = SolutionStore::global(cx);
@@ -124,7 +124,7 @@ fn workspace_for_solution(
             project.read(cx).worktrees(cx).any(|tree| {
                 store
                     .solution_for_path(&tree.read(cx).abs_path())
-                    .is_some_and(|solution| &solution.id == solution_id)
+                    .is_some_and(|solution| solution.id == solution_id)
             })
         })
         .cloned()

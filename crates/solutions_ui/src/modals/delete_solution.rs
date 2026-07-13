@@ -27,7 +27,7 @@ impl DeleteSolutionModal {
         // block the UI thread. Failures are logged but not surfaced: by
         // this point the metadata entry is gone, so the user has
         // effectively forgotten the solution either way.
-        crate::delete_solution_with_cleanup(self.id.clone(), self.root.clone(), cx);
+        crate::delete_solution_with_cleanup(self.id, self.root.clone(), cx);
         cx.emit(DismissEvent);
     }
 

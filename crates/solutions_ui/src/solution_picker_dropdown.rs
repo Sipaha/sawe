@@ -119,7 +119,7 @@ impl SolutionPickerDropdown {
                             .find_map(|tree| {
                                 store
                                     .solution_for_path(&tree.read(cx).abs_path())
-                                    .map(|sol| sol.id.clone())
+                                    .map(|sol| sol.id)
                             })
                     })
                     .collect()
@@ -127,26 +127,24 @@ impl SolutionPickerDropdown {
             .unwrap_or_default();
 
         let store = SolutionStore::global(cx);
-        let mut rows: Vec<(Option<chrono::DateTime<chrono::Utc>>, ClosedSolutionRow)> = store
-            .read_with(cx, |s, _| {
-                s.solutions()
-                    .iter()
-                    .filter(|sol: &&Solution| {
-                        !is_solution_open_anywhere(&sol.id, cx)
-                            && !open_in_this_window.contains(&sol.id)
-                    })
-                    .map(|sol| {
-                        (
-                            sol.last_opened_at,
-                            ClosedSolutionRow {
-                                id: sol.id.clone(),
-                                name: SharedString::from(sol.name.clone()),
-                                root: sol.root.clone(),
-                            },
-                        )
-                    })
-                    .collect()
-            });
+        let mut rows: Vec<(Option<i64>, ClosedSolutionRow)> = store.read_with(cx, |s, _| {
+            s.solutions()
+                .iter()
+                .filter(|sol: &&Solution| {
+                    !is_solution_open_anywhere(sol.id, cx) && !open_in_this_window.contains(&sol.id)
+                })
+                .map(|sol| {
+                    (
+                        sol.last_opened_at,
+                        ClosedSolutionRow {
+                            id: sol.id,
+                            name: SharedString::from(sol.name.clone()),
+                            root: sol.root.clone(),
+                        },
+                    )
+                })
+                .collect()
+        });
         // Most-recently-opened first; never-opened solutions go last in
         // their natural store order. Mirrors `welcome::all_solutions`
         // so the dropdown's row order matches what the user already
@@ -268,12 +266,10 @@ impl Render for SolutionPickerDropdown {
         let row_elements: Vec<gpui::AnyElement> = rows
             .into_iter()
             .map(|row| {
-                let row_id = SharedString::from(format!("solution-picker-row-{}", row.id.as_str()));
-                let group_id =
-                    SharedString::from(format!("solution-picker-group-{}", row.id.as_str()));
-                let trash_id =
-                    SharedString::from(format!("solution-picker-delete-{}", row.id.as_str()));
-                let id_for_open = row.id.clone();
+                let row_id = SharedString::from(format!("solution-picker-row-{}", row.id.0));
+                let group_id = SharedString::from(format!("solution-picker-group-{}", row.id.0));
+                let trash_id = SharedString::from(format!("solution-picker-delete-{}", row.id.0));
+                let id_for_open = row.id;
                 let label = row.name.clone();
                 h_flex()
                     .id(row_id)
@@ -286,7 +282,7 @@ impl Render for SolutionPickerDropdown {
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().colors().element_hover))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_row(id_for_open.clone(), window, cx);
+                        this.open_row(id_for_open, window, cx);
                     }))
                     .child(div().flex_1().min_w_0().child(Label::new(label).truncate()))
                     .child(
@@ -483,17 +479,17 @@ mod tests {
     fn filter_matches_substring_case_insensitive() {
         let rows = [
             ClosedSolutionRow {
-                id: SolutionId("1".into()),
+                id: SolutionId(1),
                 name: "Citeck Core".into(),
                 root: PathBuf::from("/x/1"),
             },
             ClosedSolutionRow {
-                id: SolutionId("2".into()),
+                id: SolutionId(2),
                 name: "ECOS Records".into(),
                 root: PathBuf::from("/x/2"),
             },
             ClosedSolutionRow {
-                id: SolutionId("3".into()),
+                id: SolutionId(3),
                 name: "sawe".into(),
                 root: PathBuf::from("/x/3"),
             },

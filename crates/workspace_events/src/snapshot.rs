@@ -38,7 +38,7 @@ pub(crate) fn build_snapshot(cx: &App) -> WorkspaceSnapshot {
             if !summary.open {
                 continue;
             }
-            let sol_id = sol.id.clone();
+            let sol_id = sol.id;
             let sessions = if let Some(agent_store_ref) = agent_store.as_ref() {
                 agent_store_ref.read_with(cx, |agent, cx| {
                     agent

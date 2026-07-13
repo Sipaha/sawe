@@ -120,11 +120,8 @@ impl ProjectToolbar {
             .read(cx)
             .worktrees(cx)
             .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))?;
-        let catalog = store.active_member(&solution.id)?;
-        let member = solution
-            .members
-            .iter()
-            .find(|member| &member.catalog_id == catalog)?;
+        let member_id = store.active_member(solution.id)?;
+        let member = solution.member(member_id)?;
         project
             .read(cx)
             .repositories(cx)

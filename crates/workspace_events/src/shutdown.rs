@@ -21,12 +21,12 @@ use solutions::SolutionId;
 /// Sessions (tab_order + conversation entries) are preserved on disk.
 /// Only in-process runtime state (AcpThread processes, terminal ptys) is
 /// terminated.
-pub fn shutdown_solution_runtime(id: &SolutionId, cx: &mut App) {
+pub fn shutdown_solution_runtime(id: SolutionId, cx: &mut App) {
     shutdown_agent_threads(id, cx);
     shutdown_terminals(id, cx);
 }
 
-fn shutdown_agent_threads(id: &SolutionId, cx: &mut App) {
+fn shutdown_agent_threads(id: SolutionId, cx: &mut App) {
     let Some(agent_store) = solution_agent::store::SolutionAgentStore::try_global(cx) else {
         return;
     };
@@ -37,7 +37,7 @@ fn shutdown_agent_threads(id: &SolutionId, cx: &mut App) {
     let threads_to_cancel: Vec<gpui::Entity<acp_thread::AcpThread>> =
         agent_store.read_with(cx, |store, cx| {
             store
-                .sessions_for(id)
+                .sessions_for(&id)
                 .into_iter()
                 .filter_map(|entity| entity.read(cx).acp_thread().cloned())
                 .collect()
@@ -54,7 +54,7 @@ fn shutdown_agent_threads(id: &SolutionId, cx: &mut App) {
     }
 }
 
-fn shutdown_terminals(_id: &SolutionId, _cx: &mut App) {
+fn shutdown_terminals(_id: SolutionId, _cx: &mut App) {
     // Gap: terminals are owned by TerminalPanel which is attached to a
     // Workspace window entity. There is no global terminal registry keyed
     // by SolutionId or working directory that we can reach from App without

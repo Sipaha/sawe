@@ -189,8 +189,8 @@ impl SolutionStatusDashboard {
             .iter()
             .map(|m| {
                 MemberRow::skeleton(
-                    SharedString::from(m.catalog_id.0.clone()),
-                    SharedString::from(m.catalog_id.0.clone()),
+                    SharedString::from(m.name.clone()),
+                    SharedString::from(m.name.clone()),
                     m.local_path.clone(),
                 )
             })
@@ -662,7 +662,7 @@ fn resolve_targets(cx: &App, filter: Option<&[String]>) -> Result<Vec<(SharedStr
         .filter(|m| {
             allowed
                 .as_ref()
-                .map(|set| set.contains(m.catalog_id.0.as_str()))
+                .map(|set| set.contains(m.name.as_str()))
                 .unwrap_or(true)
         })
         // Drop non-git members so `batch_fetch` / `batch_pull` /
@@ -670,12 +670,7 @@ fn resolve_targets(cx: &App, filter: Option<&[String]>) -> Result<Vec<(SharedStr
         // for paths that aren't repos to begin with. Mirrors
         // `aggregator::plan_session` and `commit::build_plan`.
         .filter(|m| m.local_path.join(".git").exists())
-        .map(|m| {
-            (
-                SharedString::from(m.catalog_id.0.clone()),
-                m.local_path.clone(),
-            )
-        })
+        .map(|m| (SharedString::from(m.name.clone()), m.local_path.clone()))
         .collect();
     if pairs.is_empty() {
         return Err(anyhow!("no members match the requested filter"));
@@ -687,7 +682,7 @@ fn resolve_targets(cx: &App, filter: Option<&[String]>) -> Result<Vec<(SharedStr
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatusDashboardInput {
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
 }
 
 /// Output of the status dashboard tool.
@@ -755,7 +750,7 @@ impl McpServerTool for StatusDashboardTool {
 #[serde(default, deny_unknown_fields)]
 pub struct BatchOpInput {
     pub members: Option<Vec<String>>,
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
     /// Only meaningful for `batch_pull` — when `true`, dirty trees are
     /// reported as `skipped` and not pulled. Default: `true`.
     pub skip_dirty: Option<bool>,
@@ -880,7 +875,7 @@ impl McpServerTool for BatchPullTool {
 pub struct CheckoutPatternInput {
     pub pattern: String,
     pub members: Option<Vec<String>>,
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
 }
 
 /// Output of the checkout pattern tool.

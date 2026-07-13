@@ -3830,12 +3830,8 @@ impl GitPanel {
         let solution = self.active_solution(cx)?;
         let store = solutions::SolutionStore::try_global(cx)?;
         let store = store.read(cx);
-        let catalog = store.active_member(&solution.id)?;
-        solution
-            .members
-            .iter()
-            .find(|member| &member.catalog_id == catalog)
-            .cloned()
+        let member_id = store.active_member(solution.id)?;
+        solution.member(member_id).cloned()
     }
 
     /// If the panel's solution has an active member, override `active_repository`

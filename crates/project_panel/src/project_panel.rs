@@ -4056,12 +4056,7 @@ impl ProjectPanel {
         let solution = self.active_solution(cx)?;
         let store = solutions::SolutionStore::try_global(cx)?;
         let store = store.read(cx);
-        let catalog = store.active_member(&solution.id)?;
-        solution
-            .members
-            .iter()
-            .find(|member| &member.catalog_id == catalog)
-            .map(|member| member.local_path.clone())
+        store.active_member_path(solution.id)
     }
 
     fn update_visible_entries(

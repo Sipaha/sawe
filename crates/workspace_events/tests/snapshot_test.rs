@@ -198,7 +198,7 @@ async fn list_solutions_with_open_true_returns_only_open(cx: &mut TestAppContext
 
     let result = cx.update(|cx| workspace_events::list_solutions_for_test(cx, Some(true)));
     assert_eq!(result.solutions.len(), 1, "expected 1 open solution");
-    assert_eq!(result.solutions[0].id, open_id.as_str());
+    assert_eq!(result.solutions[0].id, open_id.0);
 }
 
 #[gpui::test]
@@ -227,7 +227,7 @@ async fn list_solutions_with_open_false_returns_only_closed(cx: &mut TestAppCont
 
     let result = cx.update(|cx| workspace_events::list_solutions_for_test(cx, Some(false)));
     assert_eq!(result.solutions.len(), 1, "expected 1 closed solution");
-    assert_eq!(result.solutions[0].id, closed_id.as_str());
+    assert_eq!(result.solutions[0].id, closed_id.0);
 }
 
 #[gpui::test]
@@ -395,7 +395,7 @@ async fn open_solution_for_closed_marks_open_and_advances_seq(cx: &mut TestAppCo
     let is_open = cx.update(|cx| {
         solutions::SolutionStore::global(cx)
             .read(cx)
-            .is_open(&sol_id)
+            .is_open(sol_id)
     });
     assert!(is_open, "solution must be marked open after open_solution");
 }
@@ -418,7 +418,7 @@ async fn close_solution_marks_closed_and_advances_seq(cx: &mut TestAppContext) {
     let is_open = cx.update(|cx| {
         solutions::SolutionStore::global(cx)
             .read(cx)
-            .is_open(&sol_id)
+            .is_open(sol_id)
     });
     assert!(
         !is_open,
@@ -552,18 +552,22 @@ async fn close_solution_cancels_open_agent_threads(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = solutions::SolutionStore::global(cx);
         assert!(
-            !store.read(cx).is_open(&sol_id),
+            !store.read(cx).is_open(sol_id),
             "solution must be marked closed after close_solution"
         );
     });
 
-    // Session record is preserved on the agent store (transcripts on disk).
+    // Closing a solution is a COLD close: `SolutionAgentStore::cold_close_solution`
+    // evicts the solution's sessions from memory (and drops the pooled subprocess)
+    // without setting `closed_at`. The transcript + `tab_order` stay in the DB, so
+    // reopening the solution re-hydrates every tab. So the in-memory entity is
+    // expected to be gone here — a live entity would mean the eviction (and with
+    // it the subprocess teardown) silently stopped running.
     cx.update(|cx| {
         let agent = solution_agent::store::SolutionAgentStore::global(cx);
-        let session = agent.read(cx).session(sess_id);
         assert!(
-            session.is_some(),
-            "session entity must still exist after close_solution (transcripts preserved)"
+            agent.read(cx).session(sess_id).is_none(),
+            "close_solution must cold-evict the session from memory"
         );
     });
 }

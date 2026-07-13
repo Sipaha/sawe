@@ -235,7 +235,7 @@ impl SolutionPushDialog {
             .iter()
             .map(|m| {
                 MemberPushSection::skeleton(
-                    SharedString::from(m.catalog_id.0.clone()),
+                    SharedString::from(m.name.clone()),
                     m.local_path.clone(),
                 )
             })
@@ -1179,7 +1179,7 @@ pub mod mcp {
         pub per_member_options: Option<HashMap<String, PerMemberPushOptions>>,
         /// Default: true.
         pub parallel: Option<bool>,
-        pub solution_id: Option<String>,
+        pub solution_id: Option<i64>,
         /// Required when any resolved per-member force mode is `force`.
         pub confirmed: Option<bool>,
     }
@@ -1226,7 +1226,7 @@ pub mod mcp {
 
         let mut plans = Vec::new();
         for member in &solution.members {
-            let id_str = member.catalog_id.0.as_str();
+            let id_str = member.name.as_str();
             if let Some(allowed) = &allowed
                 && !allowed.contains(id_str)
             {

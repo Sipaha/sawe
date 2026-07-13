@@ -64,7 +64,7 @@ impl EmptySolutionPage {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let id = self.solution_id.clone();
+        let id = self.solution_id;
         workspace.update(cx, |workspace, cx| {
             AddMemberPicker::open(workspace, id, window, cx);
         });

@@ -49,11 +49,9 @@ impl RepositorySelector {
                     .read(cx)
                     .worktrees(cx)
                     .find_map(|wt| store.solution_for_path(&wt.read(cx).abs_path()))?;
-                let catalog_id = store.active_member(&solution.id)?;
+                let member_id = store.active_member(solution.id)?;
                 solution
-                    .members
-                    .iter()
-                    .find(|member| &member.catalog_id == catalog_id)
+                    .member(member_id)
                     .map(|member| member.local_path.clone())
             });
 

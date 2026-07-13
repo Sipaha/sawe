@@ -187,7 +187,7 @@ pub(crate) async fn analyze_solution_with(
     //    doesn't sink the whole analysis with "fatal: not a git repo".
     let mut members: Vec<MemberCommits> = Vec::with_capacity(solution.members.len());
     for member in &solution.members {
-        let member_id = SharedString::from(member.catalog_id.0.clone());
+        let member_id = SharedString::from(member.name.clone());
         let work_dir = member.local_path.clone();
         if !work_dir.join(".git").exists() {
             continue;
@@ -664,22 +664,26 @@ mod test_override {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solutions::{CatalogId, SolutionId, SolutionMember};
+    use solutions::{MemberId, SolutionId, SolutionMember};
     use tempfile::tempdir;
 
     fn make_solution() -> Solution {
         Solution {
-            id: SolutionId("test-sol".into()),
+            id: SolutionId(1),
             name: "Test".into(),
             root: PathBuf::from("/tmp/test-sol"),
             members: vec![
                 SolutionMember {
-                    catalog_id: CatalogId("alpha".into()),
+                    id: MemberId(1),
+                    name: "alpha".into(),
                     local_path: PathBuf::from("/tmp/alpha"),
+                    origin_catalog_id: None,
                 },
                 SolutionMember {
-                    catalog_id: CatalogId("beta".into()),
+                    id: MemberId(2),
+                    name: "beta".into(),
                     local_path: PathBuf::from("/tmp/beta"),
+                    origin_catalog_id: None,
                 },
             ],
             last_opened_at: None,

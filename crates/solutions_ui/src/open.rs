@@ -44,14 +44,14 @@ pub fn open_solution(
     // user explicitly asked for a new window via middle-click.
     let source_window_id = source_window.as_ref().map(|w| w.window_id());
     if intent == OpenIntent::SameWindow
-        && let Some(existing) = find_window_for_solution(&sol_id, source_window_id, cx)
+        && let Some(existing) = find_window_for_solution(sol_id, source_window_id, cx)
     {
         existing
             .update(cx, |_, window, _| window.activate_window())
             .log_err();
         if let Some(store) = SolutionStore::try_global(cx) {
             store
-                .update(cx, |s, cx| s.touch_last_opened(&sol_id, cx))
+                .update(cx, |s, cx| s.touch_last_opened(sol_id, cx))
                 .log_err();
         }
         // If the click came from a different window (e.g. the welcome
@@ -90,7 +90,7 @@ pub fn open_solution(
                 .read_with(cx, |multi_workspace, cx| {
                     multi_workspace
                         .workspaces()
-                        .find(|ws| workspace_has_solution(ws, &target, cx))
+                        .find(|ws| workspace_has_solution(ws, target, cx))
                         .cloned()
                 })
                 .ok()
@@ -98,7 +98,7 @@ pub fn open_solution(
             if let Some(target_workspace) = already_open_here {
                 if let Some(store) = SolutionStore::try_global(cx) {
                     store
-                        .update(cx, |s, cx| s.touch_last_opened(&target, cx))
+                        .update(cx, |s, cx| s.touch_last_opened(target, cx))
                         .log_err();
                 }
                 src.update(cx, |multi_workspace, window, cx| {
@@ -141,13 +141,13 @@ fn open_solution_as_new_workspace(
             .solutions()
             .iter()
             .find(|sol| sol.id == sol_id)
-            .ok_or_else(|| anyhow!("solution not found: {}", sol_id.as_str()))?;
+            .ok_or_else(|| anyhow!("solution not found: {sol_id}"))?;
         let is_empty = solution.members.is_empty();
         let name = solution.name.clone();
         let paths = if is_empty {
             vec![solution.root.clone()]
         } else {
-            s.paths_for_open(&sol_id)?
+            s.paths_for_open(sol_id)?
         };
         Ok(OpenInfo {
             paths,
@@ -157,16 +157,13 @@ fn open_solution_as_new_workspace(
     }) {
         Ok(info) => info,
         Err(err) => {
-            log::error!(
-                "solutions_ui: resolving paths for {} failed: {err}",
-                sol_id.as_str()
-            );
+            log::error!("solutions_ui: resolving paths for {sol_id} failed: {err}");
             return;
         }
     };
 
     store
-        .update(cx, |s, cx| s.touch_last_opened(&sol_id, cx))
+        .update(cx, |s, cx| s.touch_last_opened(sol_id, cx))
         .log_err();
 
     let app_state = AppState::global(cx);
@@ -201,7 +198,7 @@ fn open_solution_as_new_workspace(
     // the new workspace window appears.
     let welcome_window = workspace::welcome::find_existing(cx);
 
-    let sol_id_for_page = sol_id.clone();
+    let sol_id_for_page = sol_id;
     let sol_id_for_lookup = sol_id;
     cx.spawn(async move |cx| {
         let Some(opened) = task.await.log_err() else {
@@ -209,7 +206,7 @@ fn open_solution_as_new_workspace(
         };
         if add_to_existing {
             let new_workspace = opened.workspace.clone();
-            let target_sol_id = sol_id_for_lookup.clone();
+            let target_sol_id = sol_id_for_lookup;
             cx.update(|cx| {
                 opened
                     .window
@@ -218,7 +215,7 @@ fn open_solution_as_new_workspace(
                             .workspaces()
                             .find(|ws| {
                                 ws != &&new_workspace
-                                    && workspace_has_solution(ws, &target_sol_id, cx)
+                                    && workspace_has_solution(ws, target_sol_id, cx)
                             })
                             .cloned();
                         multi_workspace.retain_active_workspace(cx);
@@ -238,11 +235,11 @@ fn open_solution_as_new_workspace(
         // observe_new still races us and the second insert no-ops.
         cx.update(|cx| {
             if let Some(store) = SolutionStore::try_global(cx) {
-                store.update(cx, |s, cx| s.mark_open(sol_id_for_lookup.clone(), cx));
+                store.update(cx, |s, cx| s.mark_open(sol_id_for_lookup, cx));
             }
         });
         if info.is_empty {
-            let sol_id_for_page = sol_id_for_page.clone();
+            let sol_id_for_page = sol_id_for_page;
             let name_for_page = info.name.clone();
             cx.update(|cx| {
                 opened
@@ -278,7 +275,7 @@ fn open_solution_as_new_workspace(
 
 pub(crate) fn workspace_has_solution(
     workspace: &gpui::Entity<workspace::Workspace>,
-    sol_id: &SolutionId,
+    sol_id: SolutionId,
     cx: &App,
 ) -> bool {
     let project = workspace.read(cx).project().clone();
@@ -289,12 +286,12 @@ pub(crate) fn workspace_has_solution(
     project.read(cx).worktrees(cx).any(|tree| {
         store_read
             .solution_for_path(&tree.read(cx).abs_path())
-            .is_some_and(|sol| &sol.id == sol_id)
+            .is_some_and(|sol| sol.id == sol_id)
     })
 }
 
 fn find_window_for_solution(
-    sol_id: &SolutionId,
+    sol_id: SolutionId,
     skip_extra: Option<gpui::WindowId>,
     cx: &App,
 ) -> Option<WindowHandle<MultiWorkspace>> {

@@ -104,7 +104,7 @@ impl AddCatalogProjectModal {
         } else {
             Some(branch)
         };
-        let solution_id = self.solution_id.clone();
+        let solution_id = self.solution_id;
         let store = SolutionStore::global(cx);
         let catalog_id = match store.update(cx, |s, cx| {
             s.add_catalog_project(&name, &url, default_branch, cx)

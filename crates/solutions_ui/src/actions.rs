@@ -29,7 +29,7 @@ actions!(
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct DeleteSolution {
-    pub id: String,
+    pub id: i64,
 }
 
 /// Close a Solution from the title-bar tab strip — stops AI sessions and
@@ -38,7 +38,7 @@ pub struct DeleteSolution {
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct CloseSolutionFromTabBar {
-    pub id: String,
+    pub id: i64,
 }
 
 /// Open the destructive-action confirmation modal for the given Solution
@@ -48,7 +48,7 @@ pub struct CloseSolutionFromTabBar {
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct DeleteSolutionFromTabBar {
-    pub id: String,
+    pub id: i64,
 }
 
 /// Reveal the on-disk root folder of a Solution in the OS file manager.
@@ -56,7 +56,7 @@ pub struct DeleteSolutionFromTabBar {
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct RevealSolutionFolder {
-    pub id: String,
+    pub id: i64,
 }
 
 /// Open the rename modal for a Solution by id. Triggered from the title-bar
@@ -64,7 +64,7 @@ pub struct RevealSolutionFolder {
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct RenameSolution {
-    pub id: String,
+    pub id: i64,
 }
 
 /// Open the edit modal for a catalog project (Name / Remote URL / default
@@ -74,7 +74,7 @@ pub struct RenameSolution {
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct EditCatalogProject {
-    pub id: String,
+    pub id: i64,
 }
 
 /// Open the delete-confirmation modal for a catalog project. Triggered
@@ -84,7 +84,7 @@ pub struct EditCatalogProject {
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct DeleteCatalogProject {
-    pub id: String,
+    pub id: i64,
 }
 
 /// Open the modal that creates a new empty member inside the named
@@ -92,7 +92,7 @@ pub struct DeleteCatalogProject {
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct CreateNewProjectInSolution {
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 /// Open the modal to add a new git project to the catalog. When dispatched
@@ -104,18 +104,19 @@ pub struct CreateNewProjectInSolution {
 #[action(namespace = solutions)]
 #[serde(default)]
 pub struct AddCatalogProject {
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
 }
 
 /// Open the destructive-action confirmation modal for removing a member
 /// from a solution. Dispatched from the trash icon on a member-picker
 /// row. The modal lists the registry entry + on-disk folder; on confirm
-/// it calls `SolutionStore::remove_member` and rm-rfs the folder.
+/// it calls `SolutionStore::remove_member` and rm-rfs the folder. The
+/// member id alone identifies the target — the owning solution is
+/// recovered via `SolutionStore::member_of`.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct RemoveMember {
-    pub solution_id: String,
-    pub catalog_id: String,
+    pub member_id: i64,
 }
 
 /// Cycle the solution-wide active project forward (next member) within

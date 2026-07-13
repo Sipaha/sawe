@@ -3123,7 +3123,7 @@ git commit -m "Key per-solution MCP sockets on the numeric id and sweep stale sl
 - Consumes: everything produced by Tasks 1-5.
 - Produces: a compiling workspace. No new API.
 
-- [ ] **Step 1: Sweep `solutions_ui`**
+- [x] **Step 1: Sweep `solutions_ui`**
 
 The compiler drives this. The recurring substitutions:
 
@@ -3152,7 +3152,7 @@ The project tab strip (`project_tab.rs`, `project_tab_strip.rs`) currently label
 Run: `cargo check -p solutions_ui --all-targets`
 Expected: clean.
 
-- [ ] **Step 2: Sweep the panels and git crates**
+- [x] **Step 2: Sweep the panels and git crates**
 
 `project_panel`, `git_ui`, `git_graph`, `solution_git` only *read* the active member and its path. Point them at the new store accessor:
 
@@ -3170,7 +3170,7 @@ Expected: clean.
 Run: `cargo check -p project_panel -p git_ui -p git_graph -p solution_git --all-targets`
 Expected: clean.
 
-- [ ] **Step 3: Sweep `workspace_events` and `zed`**
+- [x] **Step 3: Sweep `workspace_events` and `zed`**
 
 `workspace_events/src/dto.rs` serialises solution ids onto the mobile wire. Change the DTO field to `i64`:
 
@@ -3188,7 +3188,7 @@ and the session DTO gains `member_id: Option<i64>` so the mobile client can rend
 Run: `cargo check -p workspace_events -p zed --all-targets`
 Expected: clean.
 
-- [ ] **Step 4: Green the whole workspace**
+- [x] **Step 4: Green the whole workspace**
 
 Run: `cargo check --workspace --all-targets`
 Expected: clean (warnings are acceptable; `error` lines are not).
@@ -3198,7 +3198,7 @@ Then run the affected suites:
 Run: `cargo test -p solutions -p solution_agent -p console_panel -p editor_mcp -p workspace_events`
 Expected: PASS.
 
-- [ ] **Step 5: Record the decision in `FORK.md`**
+- [x] **Step 5: Record the decision in `FORK.md`**
 
 Add one numbered entry under "Key architectural decisions":
 
@@ -3217,7 +3217,7 @@ N. **Solution / member / catalog ids are surrogate counters, not slugs.**
    `docs/findings/2026-07-13-rename-solution-cascade-data-loss.md`).
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates FORK.md

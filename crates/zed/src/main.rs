@@ -1683,11 +1683,13 @@ async fn open_solution_by_name_or_id(
         let Some(store) = SolutionStore::try_global(cx) else {
             return Ok(None);
         };
+        // `--solution` accepts either the numeric id or the display name.
+        let by_id = name_or_id.parse::<i64>().ok().map(SolutionId);
         store.read_with(cx, |s, _| {
             let Some(sol) = s
                 .solutions()
                 .iter()
-                .find(|sol| sol.id.0 == name_or_id || sol.name == name_or_id)
+                .find(|sol| Some(sol.id) == by_id || sol.name == name_or_id)
             else {
                 return Ok::<_, anyhow::Error>(None);
             };
@@ -1695,10 +1697,10 @@ async fn open_solution_by_name_or_id(
             let paths = if is_empty {
                 vec![sol.root.clone()]
             } else {
-                s.paths_for_open(&sol.id)?
+                s.paths_for_open(sol.id)?
             };
             Ok(Some(Resolved {
-                id: sol.id.clone(),
+                id: sol.id,
                 paths,
                 name: sol.name.clone(),
                 is_empty,
@@ -1716,7 +1718,7 @@ async fn open_solution_by_name_or_id(
     cx.update(|cx| {
         if let Some(store) = SolutionStore::try_global(cx) {
             store
-                .update(cx, |s, cx| s.touch_last_opened(&resolved.id, cx))
+                .update(cx, |s, cx| s.touch_last_opened(resolved.id, cx))
                 .log_err();
         }
     });

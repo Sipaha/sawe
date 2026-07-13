@@ -2182,7 +2182,7 @@ mod tests {
     struct TwoMemberSolution {
         project: Entity<Project>,
         sid: solutions::SolutionId,
-        catalog_b: solutions::CatalogId,
+        member_b: solutions::MemberId,
         member_a_root: std::path::PathBuf,
         member_b_root: std::path::PathBuf,
     }
@@ -2195,7 +2195,7 @@ mod tests {
 
         // Build the solution + two members first so we know the root the FakeFs tree
         // must live under (solution_for_path matches worktrees by root prefix).
-        let (sid, catalog_b, root) = cx.update(|cx| {
+        let (sid, member_b, root) = cx.update(|cx| {
             let store = solutions::SolutionStore::for_test(std::path::PathBuf::new(), cx);
             let out = store.update(cx, |store, cx| {
                 let sid = store.create_for_test_minimal("diff-active-member", cx);
@@ -2205,12 +2205,10 @@ mod tests {
                     .expect("solution just created")
                     .root
                     .clone();
-                let catalog_a = solutions::CatalogId("member-a".into());
-                let catalog_b = solutions::CatalogId("member-b".into());
-                store.test_add_member_with_path(&sid, &catalog_a, root.join("memberA"));
-                store.test_add_member_with_path(&sid, &catalog_b, root.join("memberB"));
-                store.set_active_member(sid.clone(), catalog_a.clone(), cx);
-                (sid, catalog_b, root)
+                let member_a = store.test_add_member_with_path(sid, "member-a", root.join("memberA"));
+                let member_b = store.test_add_member_with_path(sid, "member-b", root.join("memberB"));
+                store.set_active_member(sid, member_a, cx);
+                (sid, member_b, root)
             });
             solutions::install_global_for_test(store, cx);
             out
@@ -2251,7 +2249,7 @@ mod tests {
         TwoMemberSolution {
             project,
             sid,
-            catalog_b,
+            member_b,
             member_a_root,
             member_b_root,
         }
@@ -2269,7 +2267,7 @@ mod tests {
         let TwoMemberSolution {
             project,
             sid,
-            catalog_b,
+            member_b,
             member_a_root,
             member_b_root,
         } = setup_two_member_solution(cx).await;
@@ -2291,7 +2289,7 @@ mod tests {
         // Flip the active member; the resolver must now point at memberB's repo.
         cx.update(|cx| {
             solutions::SolutionStore::global(cx).update(cx, |store, cx| {
-                store.set_active_member(sid.clone(), catalog_b.clone(), cx);
+                store.set_active_member(sid, member_b, cx);
             });
         });
         cx.run_until_parked();
@@ -2316,7 +2314,7 @@ mod tests {
         let TwoMemberSolution {
             project,
             sid,
-            catalog_b,
+            member_b,
             member_b_root,
             ..
         } = setup_two_member_solution(cx).await;
@@ -2325,7 +2323,7 @@ mod tests {
         // memberA (first worktree), so active member and default now diverge.
         cx.update(|cx| {
             solutions::SolutionStore::global(cx).update(cx, |store, cx| {
-                store.set_active_member(sid.clone(), catalog_b.clone(), cx);
+                store.set_active_member(sid, member_b, cx);
             });
         });
         cx.run_until_parked();

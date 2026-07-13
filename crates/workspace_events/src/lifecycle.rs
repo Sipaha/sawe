@@ -12,7 +12,7 @@ use solutions::{SolutionId, SolutionStore};
 use crate::coordinator::WorkspaceEventCoordinator;
 use crate::dto::{SeqAck, SessionIdParam, SolutionIdParam};
 
-pub(crate) fn open_solution_impl(cx: &mut App, id: &SolutionId) -> Result<u64> {
+pub(crate) fn open_solution_impl(cx: &mut App, id: SolutionId) -> Result<u64> {
     let store =
         SolutionStore::try_global(cx).ok_or_else(|| anyhow!("SolutionStore not initialised"))?;
     let coord = WorkspaceEventCoordinator::global(cx);
@@ -49,7 +49,7 @@ pub(crate) fn open_solution_impl(cx: &mut App, id: &SolutionId) -> Result<u64> {
     // Hydrate restored sessions for this solution (idempotent if already hydrated).
     // Done before mark_open so any sessions in memory are captured by the snapshot.
     if let Some(agent) = solution_agent::store::SolutionAgentStore::try_global(cx) {
-        let _ = agent.update(cx, |a, cx| a.hydrate_all_for_solution(id.clone(), cx));
+        let _ = agent.update(cx, |a, cx| a.hydrate_all_for_solution(id, cx));
         // The hydration is a Task<_> — we don't await here; the notification
         // reflects whatever state is in memory. The mobile client re-syncs on
         // reconnect via workspace.snapshot anyway.
@@ -63,13 +63,13 @@ pub(crate) fn open_solution_impl(cx: &mut App, id: &SolutionId) -> Result<u64> {
     // both stores. That keeps the walk consistent across every `mark_open`
     // call site (wire RPC here, desktop UI button, event-source bootstrap
     // observers) without each one re-implementing the same walk.
-    store.update(cx, |s, cx| s.mark_open(id.clone(), cx));
+    store.update(cx, |s, cx| s.mark_open(id, cx));
 
     // Return the seq just reserved by mark_open's emit_sequenced call.
     Ok(WorkspaceEventCoordinator::global(cx).current_seq())
 }
 
-pub(crate) fn close_solution_impl(cx: &mut App, id: &SolutionId) -> Result<u64> {
+pub(crate) fn close_solution_impl(cx: &mut App, id: SolutionId) -> Result<u64> {
     let store =
         SolutionStore::try_global(cx).ok_or_else(|| anyhow!("SolutionStore not initialised"))?;
     let coord = WorkspaceEventCoordinator::global(cx);
@@ -104,7 +104,7 @@ impl McpServerTool for OpenSolutionTool {
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
         let id = SolutionId(input.solution_id);
-        let seq = cx.update(|cx| open_solution_impl(cx, &id))?;
+        let seq = cx.update(|cx| open_solution_impl(cx, id))?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: format!("seq={seq}"),
@@ -128,7 +128,7 @@ impl McpServerTool for CloseSolutionTool {
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
         let id = SolutionId(input.solution_id);
-        let seq = cx.update(|cx| close_solution_impl(cx, &id))?;
+        let seq = cx.update(|cx| close_solution_impl(cx, id))?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: format!("seq={seq}"),
@@ -176,7 +176,7 @@ pub(crate) fn close_session_impl(cx: &mut App, session_id_str: &str) -> Result<u
             .session(session_id)
             .ok_or_else(|| anyhow!("session not found"))?;
         let s = entity.read(cx);
-        Ok::<_, anyhow::Error>((s.solution_id.clone(), s.tab_order.is_some()))
+        Ok::<_, anyhow::Error>((s.solution_id, s.tab_order.is_some()))
     })?;
     if !was_in_strip {
         return Ok(WorkspaceEventCoordinator::global(cx).current_seq());
@@ -204,7 +204,7 @@ pub(crate) fn close_session_impl(cx: &mut App, session_id_str: &str) -> Result<u
     // via WorkspaceEventCoordinator::emit_sequenced (F5). No manual
     // emit here — doing so would double-fire the notification.
     agent.update(cx, |a, cx| {
-        a.persist_tab_order(solution_id.clone(), new_order, cx)
+        a.persist_tab_order(solution_id, new_order, cx)
     });
 
     // Return the seq that persist_tab_order just reserved.

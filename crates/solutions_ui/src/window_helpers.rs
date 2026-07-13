@@ -24,7 +24,7 @@ use crate::open::workspace_has_solution;
 /// `sol_id` is open in their own window must determine that locally
 /// (e.g. by inspecting their own `MultiWorkspace::workspaces()`).
 pub fn find_window_for_solution(
-    sol_id: &SolutionId,
+    sol_id: SolutionId,
     cx: &App,
 ) -> Option<WindowHandle<MultiWorkspace>> {
     cx.windows().into_iter().find_map(|handle| {
@@ -36,7 +36,7 @@ pub fn find_window_for_solution(
     })
 }
 
-pub fn is_solution_open_anywhere(sol_id: &SolutionId, cx: &App) -> bool {
+pub fn is_solution_open_anywhere(sol_id: SolutionId, cx: &App) -> bool {
     find_window_for_solution(sol_id, cx).is_some()
 }
 
@@ -70,7 +70,7 @@ where
 {
     for path in paths {
         if let Some(sol) = store.solution_for_path(path.as_ref()) {
-            return Some(sol.id.clone());
+            return Some(sol.id);
         }
     }
     None

@@ -137,7 +137,7 @@ struct Session {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct SessionKey {
-    solution_id: String,
+    solution_id: i64,
     git_args: Vec<String>,
     paths: Vec<String>,
     members: Vec<String>,
@@ -230,7 +230,7 @@ impl SolutionGitAggregator {
             .filter(|m| {
                 allowed
                     .as_ref()
-                    .map(|set| set.contains(&m.catalog_id.0))
+                    .map(|set| set.contains(&m.name))
                     .unwrap_or(true)
             })
             // Skip members that aren't git repos. Without this, a single
@@ -239,12 +239,7 @@ impl SolutionGitAggregator {
             // same way via `fetch_status(...).log_err()`. `.git` covers
             // both real directories and gitfile redirects (worktrees).
             .filter(|m| m.local_path.join(".git").exists())
-            .map(|m| {
-                (
-                    SharedString::from(m.catalog_id.0.clone()),
-                    m.local_path.clone(),
-                )
-            })
+            .map(|m| (SharedString::from(m.name.clone()), m.local_path.clone()))
             .collect();
 
         if eligible.is_empty() {
@@ -839,7 +834,7 @@ mod tests {
     fn cap_stops_pagination() {
         let mut session = Session {
             key: SessionKey {
-                solution_id: "s".into(),
+                solution_id: 1,
                 git_args: Vec::new(),
                 paths: Vec::new(),
                 members: vec!["a".into()],

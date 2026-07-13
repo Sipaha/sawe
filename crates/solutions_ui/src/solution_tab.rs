@@ -103,9 +103,9 @@ impl SolutionTab {
 
 impl RenderOnce for SolutionTab {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let dot = dot_color(&self.id);
-        let id_for_click = self.id.clone();
-        let id_for_menu = self.id.clone();
+        let dot = dot_color(self.id);
+        let id_for_click = self.id;
+        let id_for_menu = self.id;
         let active_bg = if self.is_active {
             Some(cx.theme().colors().tab_active_background)
         } else {
@@ -113,8 +113,8 @@ impl RenderOnce for SolutionTab {
         };
         let active_border = cx.theme().colors().border_focused;
         let inactive_border = cx.theme().colors().border_transparent;
-        let row_id = SharedString::from(format!("solution-tab-{}", self.id.as_str()));
-        let menu_id = SharedString::from(format!("solution-tab-menu-{}", self.id.as_str()));
+        let row_id = SharedString::from(format!("solution-tab-{}", self.id.0));
+        let menu_id = SharedString::from(format!("solution-tab-menu-{}", self.id.0));
 
         let row = h_flex()
             .id(row_id)
@@ -162,9 +162,8 @@ impl RenderOnce for SolutionTab {
             })
             .on_click({
                 move |_event: &ClickEvent, window, cx| {
-                    let id = id_for_click.clone();
                     let source = window.window_handle().downcast();
-                    open_solution(id, source, OpenIntent::SameWindow, cx);
+                    open_solution(id_for_click, source, OpenIntent::SameWindow, cx);
                 }
             })
             // Drag-and-drop reorder. `on_drag` only fires once the pointer
@@ -209,22 +208,16 @@ impl RenderOnce for SolutionTab {
                     .unwrap_or_else(|| div().into_any_element())
             })
             .menu(move |window, cx| {
-                let id_str = id_for_menu.0.clone();
+                let raw_id = id_for_menu.0;
                 ContextMenu::build(window, cx, move |menu, _, _| {
-                    menu.action(
-                        "Close",
-                        Box::new(CloseSolutionFromTabBar { id: id_str.clone() }),
-                    )
-                    .action(
-                        "Delete…",
-                        Box::new(DeleteSolutionFromTabBar { id: id_str.clone() }),
-                    )
-                    .separator()
-                    .action(
-                        "Reveal Solution Folder",
-                        Box::new(RevealSolutionFolder { id: id_str.clone() }),
-                    )
-                    .action("Rename…", Box::new(RenameSolution { id: id_str }))
+                    menu.action("Close", Box::new(CloseSolutionFromTabBar { id: raw_id }))
+                        .action("Delete…", Box::new(DeleteSolutionFromTabBar { id: raw_id }))
+                        .separator()
+                        .action(
+                            "Reveal Solution Folder",
+                            Box::new(RevealSolutionFolder { id: raw_id }),
+                        )
+                        .action("Rename…", Box::new(RenameSolution { id: raw_id }))
                 })
             })
             .into_any_element()
@@ -232,18 +225,24 @@ impl RenderOnce for SolutionTab {
 }
 
 /// Deterministic hue derived from the solution's id. Stable across
-/// restarts — keeps a tab visually identifiable even when its name
-/// changes — and reasonably spread across the colour wheel for short
-/// id strings (the persistence layer uses uuid-shaped ids).
-fn dot_color(id: &SolutionId) -> Hsla {
-    dot_color_for_str(id.as_str())
+/// restarts *and across renames* — the id is a surrogate counter, so a
+/// tab keeps its colour when the user renames the solution.
+fn dot_color(id: SolutionId) -> Hsla {
+    dot_color_for_id(id.0)
+}
+
+/// Hue for a surrogate counter id. Hashing the decimal rendering (rather
+/// than the raw integer) keeps small, adjacent ids well spread across the
+/// colour wheel — FNV-1a over `"1"` / `"2"` diverges immediately, while
+/// hashing the ints themselves would give near-identical hues.
+pub(crate) fn dot_color_for_id(id: i64) -> Hsla {
+    dot_color_for_str(&id.to_string())
 }
 
 /// FNV-1a 32-bit hue derivation shared by the solution tabs and the
-/// per-project tabs (which hash a `CatalogId` instead of a `SolutionId`).
-/// Stable across Rust toolchain upgrades unlike `DefaultHasher` (whose
-/// algorithm is explicitly unstable). The 360-mod means we don't care
-/// about higher-quality hashing.
+/// per-project tabs. Stable across Rust toolchain upgrades unlike
+/// `DefaultHasher` (whose algorithm is explicitly unstable). The 360-mod
+/// means we don't care about higher-quality hashing.
 pub(crate) fn dot_color_for_str(s: &str) -> Hsla {
     let mut h: u32 = 2166136261;
     for byte in s.bytes() {
@@ -260,14 +259,12 @@ mod tests {
 
     #[test]
     fn dot_color_is_stable_for_same_id() {
-        let id = SolutionId("abc-123".to_string());
-        assert_eq!(dot_color(&id), dot_color(&id));
+        let id = SolutionId(123);
+        assert_eq!(dot_color(id), dot_color(id));
     }
 
     #[test]
     fn dot_color_differs_across_ids() {
-        let a = dot_color(&SolutionId("a".to_string()));
-        let b = dot_color(&SolutionId("b".to_string()));
-        assert_ne!(a, b);
+        assert_ne!(dot_color(SolutionId(1)), dot_color(SolutionId(2)));
     }
 }

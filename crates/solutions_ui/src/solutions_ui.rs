@@ -66,7 +66,7 @@ pub fn init(cx: &mut App) {
 pub fn delete_solution_with_cleanup(id: SolutionId, root: PathBuf, cx: &mut App) {
     let store = SolutionStore::global(cx);
     store
-        .update(cx, |s, cx| s.delete_solution(&id, cx))
+        .update(cx, |s, cx| s.delete_solution(id, cx))
         .log_err();
     cx.background_spawn(async move {
         let result: std::io::Result<()> =
@@ -115,10 +115,10 @@ fn register_member_sync_observer(
         let hosted = project.read(cx).worktrees(cx).find_map(|tree| {
             store_read
                 .solution_for_path(&tree.read(cx).abs_path())
-                .map(|sol| sol.id.clone())
+                .map(|sol| sol.id)
         });
         let Some(sol_id) = hosted else { return };
-        let paths = match store_read.paths_for_open(&sol_id) {
+        let paths = match store_read.paths_for_open(sol_id) {
             Ok(paths) => paths,
             Err(err) => {
                 log::error!("solutions_ui: paths_for_open({:?}): {err}", sol_id);
@@ -218,11 +218,11 @@ fn register_solution_close_observer(
         let Some(mw_weak) = workspace.multi_workspace().cloned() else {
             return;
         };
-        let id = id.clone();
+        let id = *id;
         cx.spawn_in(window, async move |_, cx| {
             if let Some(mw) = cx.update(|_, _| mw_weak.upgrade()).ok().flatten() {
                 mw.update_in(cx, |mw, window, cx| {
-                    close_solution_workspaces_in(mw, &id, window, cx);
+                    close_solution_workspaces_in(mw, id, window, cx);
                 })
                 .log_err();
             }
@@ -294,11 +294,10 @@ fn register_tab_actions(
     _: &mut gpui::Context<Workspace>,
 ) {
     workspace.register_action(|workspace, action: &CloseSolutionFromTabBar, window, cx| {
-        let id = SolutionId(action.id.clone());
-        close_solution(workspace, id, window, cx);
+        close_solution(workspace, SolutionId(action.id), window, cx);
     });
     workspace.register_action(|workspace, action: &DeleteSolutionFromTabBar, window, cx| {
-        let id = SolutionId(action.id.clone());
+        let id = SolutionId(action.id);
         let store = SolutionStore::global(cx);
         let Some((name, root)) = store.read_with(cx, |s, _| {
             s.solutions()
@@ -332,7 +331,7 @@ fn register_tab_actions(
         );
     });
     workspace.register_action(|_workspace, action: &RevealSolutionFolder, _window, cx| {
-        let id = SolutionId(action.id.clone());
+        let id = SolutionId(action.id);
         let store = SolutionStore::global(cx);
         let Some(root) = store.read_with(cx, |s, _| {
             s.solutions()
@@ -345,8 +344,7 @@ fn register_tab_actions(
         cx.reveal_path(&root);
     });
     workspace.register_action(|workspace, action: &RenameSolution, window, cx| {
-        let id = SolutionId(action.id.clone());
-        crate::modals::open_rename_solution(workspace, id, window, cx);
+        crate::modals::open_rename_solution(workspace, SolutionId(action.id), window, cx);
     });
     workspace.register_action(|_workspace, _: &SwitchToNextSolution, window, cx| {
         crate::switch::cycle_solution(1, window, cx);
@@ -366,19 +364,13 @@ fn register_tab_actions(
     workspace.register_action(|workspace, action: &RemoveMember, window, cx| {
         use util::ResultExt as _;
 
-        let sol_id = SolutionId(action.solution_id.clone());
-        let cat_id = solutions::CatalogId(action.catalog_id.clone());
+        let member_id = solutions::MemberId(action.member_id);
         let store = SolutionStore::global(cx);
         let Some((sol_name, member_path, member_label)) = store.read_with(cx, |s, _| {
-            let sol = s.solutions().iter().find(|sol| sol.id == sol_id)?;
-            let m = sol.members.iter().find(|m| m.catalog_id == cat_id)?;
-            let label = m
-                .local_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| m.catalog_id.0.clone());
-            Some((sol.name.clone(), m.local_path.clone(), label))
+            let sol_id = s.member_of(member_id)?;
+            let sol = s.find_solution(sol_id).ok()?;
+            let m = sol.member(member_id)?;
+            Some((sol.name.clone(), m.local_path.clone(), m.name.clone()))
         }) else {
             return;
         };
@@ -411,7 +403,7 @@ fn register_tab_actions(
             move |_window, cx| {
                 let store = SolutionStore::global(cx);
                 store
-                    .update(cx, |s, cx| s.remove_member(&sol_id, &cat_id, cx))
+                    .update(cx, |s, cx| s.remove_member(member_id, cx))
                     .log_err();
                 // Detach the removed member's worktree(s) from the project so
                 // the Project Panel stops rendering its tree. Done before the
@@ -485,14 +477,12 @@ fn close_solution(
     // released.
     let mw_weak = workspace.multi_workspace().cloned();
     let skip_window_id = window.window_handle().window_id();
-    let sol_id_for_defer = sol_id.clone();
     cx.spawn_in(window, async move |_, cx| {
         if let Some(mw_weak) = mw_weak
             && let Some(mw) = cx.update(|_, _| mw_weak.upgrade()).ok().flatten()
         {
-            let sol_id = sol_id_for_defer.clone();
             mw.update_in(cx, |mw, window, cx| {
-                close_solution_workspaces_in(mw, &sol_id, window, cx);
+                close_solution_workspaces_in(mw, sol_id, window, cx);
             })
             .log_err();
         }
@@ -506,10 +496,9 @@ fn close_solution(
             })
             .unwrap_or_default();
         for handle in other_windows {
-            let sol_id = sol_id_for_defer.clone();
             handle
                 .update(cx, move |mw, window, cx| {
-                    close_solution_workspaces_in(mw, &sol_id, window, cx);
+                    close_solution_workspaces_in(mw, sol_id, window, cx);
                 })
                 .log_err();
         }
@@ -525,7 +514,7 @@ fn close_solution(
         // on the eventual window drop is a safe no-op.
         cx.update(|_, cx| {
             if let Some(store) = solutions::SolutionStore::try_global(cx) {
-                store.update(cx, |s, cx| s.mark_closed(&sol_id_for_defer, cx));
+                store.update(cx, |s, cx| s.mark_closed(sol_id, cx));
             }
         })
         .log_err();
@@ -545,28 +534,24 @@ fn cycle_project_in_panel(workspace: &Workspace, _panel_kind: &str, dir: isize, 
     };
     let store = SolutionStore::global(cx);
     let Some((members, current)) = store.read_with(cx, |s, _| {
-        let sol = s.solutions().iter().find(|sol| sol.id == sol_id)?;
-        let members: Vec<solutions::CatalogId> =
-            sol.members.iter().map(|m| m.catalog_id.clone()).collect();
-        if members.is_empty() {
-            return None;
-        }
-        let current = s
-            .active_member(&sol.id)
-            .cloned()
-            .unwrap_or_else(|| members[0].clone());
+        let sol = s.find_solution(sol_id).ok()?;
+        let members: Vec<solutions::MemberId> = sol.members.iter().map(|m| m.id).collect();
+        let first = *members.first()?;
+        let current = s.active_member(sol.id).unwrap_or(first);
         Some((members, current))
     }) else {
         return;
     };
     let new_idx = cycle_index(
-        members.iter().position(|c| *c == current).unwrap_or(0),
+        members.iter().position(|m| *m == current).unwrap_or(0),
         members.len(),
         dir,
     );
-    let new_catalog = members[new_idx].clone();
+    let Some(next_member) = members.get(new_idx).copied() else {
+        return;
+    };
     store.update(cx, |s, cx| {
-        s.set_active_member(sol_id, new_catalog, cx);
+        s.set_active_member(sol_id, next_member, cx);
     });
 }
 
@@ -577,16 +562,17 @@ fn refresh_cache_for_active_solution(workspace: &Workspace, cx: &mut gpui::App) 
     };
     let store = SolutionStore::global(cx);
     let targets: Vec<(solutions::CatalogId, String)> = store.read_with(cx, |s, _| {
-        let Some(sol) = s.solutions().iter().find(|sol| sol.id == sol_id) else {
+        let Ok(sol) = s.find_solution(sol_id) else {
             return Vec::new();
         };
         sol.members
             .iter()
             .filter_map(|m| {
+                let origin = m.origin_catalog_id?;
                 s.catalog()
                     .iter()
-                    .find(|c| c.id == m.catalog_id)
-                    .map(|c| (c.id.clone(), c.remote_url.clone()))
+                    .find(|c| c.id == origin)
+                    .map(|c| (c.id, c.remote_url.clone()))
             })
             .collect()
     });
@@ -653,7 +639,7 @@ mod tests {
 
 fn close_solution_workspaces_in(
     mw: &mut workspace::MultiWorkspace,
-    sol_id: &SolutionId,
+    sol_id: SolutionId,
     window: &mut Window,
     cx: &mut gpui::Context<workspace::MultiWorkspace>,
 ) {

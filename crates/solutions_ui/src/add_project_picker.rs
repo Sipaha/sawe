@@ -27,10 +27,8 @@ impl AddProjectPicker {
         let store = SolutionStore::global(cx);
         let catalog_entries = store.read_with(cx, |s, _| {
             let already_member: collections::HashSet<CatalogId> = s
-                .solutions()
-                .iter()
-                .find(|sol| sol.id == solution_id)
-                .map(|sol| sol.members.iter().map(|m| m.catalog_id.clone()).collect())
+                .find_solution(solution_id)
+                .map(|sol| sol.members.iter().filter_map(|m| m.origin_catalog_id).collect())
                 .unwrap_or_default();
             s.catalog()
                 .iter()
@@ -65,7 +63,7 @@ impl AddProjectPicker {
     }
 
     pub fn create_empty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let solution_id = self.solution_id.clone();
+        let solution_id = self.solution_id;
         cx.emit(DismissEvent);
         window.dispatch_action(
             Box::new(crate::actions::CreateNewProjectInSolution {
@@ -76,7 +74,7 @@ impl AddProjectPicker {
     }
 
     pub fn add_from_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let solution_id = self.solution_id.0.clone();
+        let solution_id = self.solution_id.0;
         cx.emit(DismissEvent);
         window.dispatch_action(
             Box::new(crate::actions::AddCatalogProject {
@@ -93,7 +91,7 @@ impl AddProjectPicker {
         cx: &mut Context<Self>,
     ) {
         let cache_root = default_cache_root();
-        let solution_id = self.solution_id.clone();
+        let solution_id = self.solution_id;
         let store = SolutionStore::global(cx);
         let task = store.update(cx, |s, cx| {
             s.add_member(solution_id, catalog_project.id, cache_root, cx)
@@ -158,7 +156,7 @@ impl Render for AddProjectPicker {
             let label: SharedString = catalog_project.name.clone().into();
             let url: SharedString = catalog_project.remote_url.clone().into();
             list = list.child(
-                ListItem::new(SharedString::from(catalog_project.id.0.clone()))
+                ListItem::new(SharedString::from(catalog_project.id.to_string()))
                     .inset(true)
                     .spacing(ListItemSpacing::Sparse)
                     .child(Label::new(label))

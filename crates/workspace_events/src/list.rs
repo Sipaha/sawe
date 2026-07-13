@@ -24,7 +24,7 @@ pub(crate) fn build_list(cx: &App, open: Option<bool>) -> ListSolutionsResult {
             .iter()
             .filter(|sol| match open {
                 None => true,
-                Some(want) => store.is_open(&sol.id) == want,
+                Some(want) => store.is_open(sol.id) == want,
             })
             .map(|sol| solutions::mcp::build_summary(sol, cx))
             .collect()

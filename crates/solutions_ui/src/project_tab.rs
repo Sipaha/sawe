@@ -5,9 +5,9 @@
 //! [`crate::solution_tab::SolutionTab`] but moves the member within
 //! `solution.members` through [`SolutionStore::reorder_members`].
 //!
-//! Visuals: deterministic colour dot derived from the `CatalogId`
-//! (shared FNV-1a helper with the solution tabs), the catalog project
-//! name (truncated), and an active-tab highlight. The clone-progress
+//! Visuals: deterministic colour dot derived from the `MemberId`
+//! (shared FNV-1a helper with the solution tabs), the member's name
+//! (truncated), and an active-tab highlight. The clone-progress
 //! spinner for an in-flight `add_member` renders here too, as a
 //! non-interactive [`PendingProjectTab`] ghost — the project being
 //! cloned is exactly the member-scoped surface it belongs on (it used
@@ -17,35 +17,35 @@ use gpui::{
     App, ClickEvent, Context, ElementId, Hsla, IntoElement, Render, RenderOnce, SharedString,
     Window, div, px,
 };
-use solutions::{CatalogId, SolutionId, SolutionStore};
+use solutions::{CatalogId, MemberId, SolutionId, SolutionStore};
 use std::cell::RefCell;
 use ui::{ContextMenu, Indicator, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 
 use crate::actions::RemoveMember;
-use crate::solution_tab::dot_color_for_str;
+use crate::solution_tab::dot_color_for_id;
 
 #[derive(IntoElement)]
 pub struct ProjectTab {
     solution_id: SolutionId,
-    catalog_id: CatalogId,
+    member_id: MemberId,
     name: SharedString,
     is_active: bool,
-    /// Full member order (catalog ids) at render time. The drop handler
+    /// Full member order (member ids) at render time. The drop handler
     /// rebuilds this list with the dragged member moved to the drop
     /// target's slot and hands the result to
     /// [`SolutionStore::reorder_members`], which takes the whole new
     /// order rather than a (from, to) pair.
-    order: Vec<CatalogId>,
+    order: Vec<MemberId>,
 }
 
 /// Drag payload for reordering project tabs. Carries the dragged
-/// member's `CatalogId` (the drop target uses it to recompute the
+/// member's `MemberId` (the drop target uses it to recompute the
 /// member order) plus the colour-dot + name so the drag preview looks
 /// like the tab being dragged.
 #[derive(Clone)]
 pub struct DraggedProjectTab {
-    pub(crate) catalog_id: CatalogId,
+    pub(crate) member_id: MemberId,
     name: SharedString,
     dot: Hsla,
 }
@@ -68,14 +68,14 @@ impl Render for DraggedProjectTab {
 impl ProjectTab {
     pub fn new(
         solution_id: SolutionId,
-        catalog_id: CatalogId,
+        member_id: MemberId,
         name: SharedString,
         is_active: bool,
-        order: Vec<CatalogId>,
+        order: Vec<MemberId>,
     ) -> Self {
         Self {
             solution_id,
-            catalog_id,
+            member_id,
             name,
             is_active,
             order,
@@ -85,13 +85,13 @@ impl ProjectTab {
 
 impl RenderOnce for ProjectTab {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let dot = dot_color_for_str(self.catalog_id.0.as_str());
-        // Per-item ElementId derived from the catalog id so clicks/drags
+        let dot = dot_color_for_id(self.member_id.0);
+        // Per-item ElementId derived from the member id so clicks/drags
         // route to the right tab (a constant literal reused per list item
         // would misroute).
         let row_id = ElementId::from(SharedString::from(format!(
             "project-tab-{}",
-            self.catalog_id.0
+            self.member_id.0
         )));
         let active_bg = if self.is_active {
             Some(cx.theme().colors().tab_active_background)
@@ -101,15 +101,14 @@ impl RenderOnce for ProjectTab {
         let active_border = cx.theme().colors().border_focused;
         let inactive_border = cx.theme().colors().border_transparent;
 
-        let solution_for_click = self.solution_id.clone();
-        let catalog_for_click = self.catalog_id.clone();
+        let solution_for_click = self.solution_id;
+        let member_for_click = self.member_id;
         // Captured up front (the chain below partially moves `self.order`).
         let menu_id = ElementId::from(SharedString::from(format!(
             "project-tab-menu-{}",
-            self.catalog_id.0
+            self.member_id.0
         )));
-        let solution_for_menu = self.solution_id.0.clone();
-        let catalog_for_menu = self.catalog_id.0.clone();
+        let member_for_menu = self.member_id.0;
 
         let row = h_flex()
             .id(row_id)
@@ -139,10 +138,8 @@ impl RenderOnce for ProjectTab {
             )
             .on_click({
                 move |_event: &ClickEvent, _window, cx| {
-                    let solution = solution_for_click.clone();
-                    let catalog = catalog_for_click.clone();
                     SolutionStore::global(cx).update(cx, |store, cx| {
-                        store.set_active_member(solution, catalog, cx);
+                        store.set_active_member(solution_for_click, member_for_click, cx);
                     });
                 }
             })
@@ -151,7 +148,7 @@ impl RenderOnce for ProjectTab {
             // reaches `on_click` above and switches the active member.
             .on_drag(
                 DraggedProjectTab {
-                    catalog_id: self.catalog_id.clone(),
+                    member_id: self.member_id,
                     name: self.name.clone(),
                     dot,
                 },
@@ -161,14 +158,14 @@ impl RenderOnce for ProjectTab {
                 style.bg(cx.theme().colors().drop_target_background)
             })
             .on_drop({
-                let solution_id = self.solution_id.clone();
-                let target = self.catalog_id.clone();
+                let solution_id = self.solution_id;
+                let target = self.member_id;
                 let order = self.order;
                 move |dragged: &DraggedProjectTab, _window, cx| {
-                    let new_order = reorder_to(&order, &dragged.catalog_id, &target);
+                    let new_order = reorder_to(&order, dragged.member_id, target);
                     SolutionStore::global(cx)
                         .update(cx, |store, cx| {
-                            store.reorder_members(&solution_id, new_order, cx)
+                            store.reorder_members(solution_id, new_order, cx)
                         })
                         .log_err();
                 }
@@ -190,14 +187,11 @@ impl RenderOnce for ProjectTab {
                     .unwrap_or_else(|| div().into_any_element())
             })
             .menu(move |window, cx| {
-                let solution_id = solution_for_menu.clone();
-                let catalog_id = catalog_for_menu.clone();
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     menu.action(
                         "Remove from Solution…",
                         Box::new(RemoveMember {
-                            solution_id: solution_id.clone(),
-                            catalog_id: catalog_id.clone(),
+                            member_id: member_for_menu,
                         }),
                     )
                 })
@@ -246,7 +240,7 @@ impl PendingProjectTab {
 
 impl RenderOnce for PendingProjectTab {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let dot = dot_color_for_str(self.catalog_id.0.as_str());
+        let dot = dot_color_for_id(self.catalog_id.0);
         let row_id = ElementId::from(SharedString::from(format!(
             "project-tab-pending-{}",
             self.catalog_id.0
@@ -282,7 +276,7 @@ impl RenderOnce for PendingProjectTab {
                     .border_b_2()
                     .border_color(cx.theme().colors().border_transparent)
                     .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(dot))
-                    .child(Label::new(self.name.clone()).truncate().color(Color::Muted))
+                    .child(Label::new(self.name).truncate().color(Color::Muted))
                     .child(trailing),
             )
             .tooltip(Tooltip::text(tooltip_text))
@@ -294,28 +288,28 @@ impl RenderOnce for PendingProjectTab {
 /// strip so a tab can be dropped past the last tab to become last — a
 /// position no per-tab drop target can express (each tab inserts *before*
 /// itself). Returns the original order unchanged when `from` is missing.
-pub(crate) fn move_to_end(order: &[CatalogId], from: &CatalogId) -> Vec<CatalogId> {
-    if !order.contains(from) {
+pub(crate) fn move_to_end(order: &[MemberId], from: MemberId) -> Vec<MemberId> {
+    if !order.contains(&from) {
         return order.to_vec();
     }
-    let mut remaining: Vec<CatalogId> = order.iter().filter(|c| *c != from).cloned().collect();
-    remaining.push(from.clone());
+    let mut remaining: Vec<MemberId> = order.iter().copied().filter(|m| *m != from).collect();
+    remaining.push(from);
     remaining
 }
 
 /// Move `from` so it lands at the slot currently occupied by `target`,
 /// preserving the order of the remaining members. Returns the original
 /// order unchanged when either id is missing.
-fn reorder_to(order: &[CatalogId], from: &CatalogId, target: &CatalogId) -> Vec<CatalogId> {
-    if from == target || !order.contains(from) || !order.contains(target) {
+fn reorder_to(order: &[MemberId], from: MemberId, target: MemberId) -> Vec<MemberId> {
+    if from == target || !order.contains(&from) || !order.contains(&target) {
         return order.to_vec();
     }
-    let mut remaining: Vec<CatalogId> = order.iter().filter(|c| *c != from).cloned().collect();
+    let mut remaining: Vec<MemberId> = order.iter().copied().filter(|m| *m != from).collect();
     let insert_at = remaining
         .iter()
-        .position(|c| c == target)
+        .position(|m| *m == target)
         .unwrap_or(remaining.len());
-    remaining.insert(insert_at, from.clone());
+    remaining.insert(insert_at, from);
     remaining
 }
 
@@ -324,8 +318,8 @@ mod tests {
     use super::*;
     use crate::solution_tab::dot_color_for_str;
 
-    fn id(s: &str) -> CatalogId {
-        CatalogId(s.to_string())
+    fn id(n: i64) -> MemberId {
+        MemberId(n)
     }
 
     #[test]
@@ -335,40 +329,28 @@ mod tests {
 
     #[test]
     fn reorder_moves_member_to_target_slot() {
-        let order = vec![id("a"), id("b"), id("c")];
-        assert_eq!(
-            reorder_to(&order, &id("c"), &id("a")),
-            vec![id("c"), id("a"), id("b")]
-        );
-        assert_eq!(
-            reorder_to(&order, &id("a"), &id("c")),
-            vec![id("b"), id("a"), id("c")]
-        );
+        let order = vec![id(1), id(2), id(3)];
+        assert_eq!(reorder_to(&order, id(3), id(1)), vec![id(3), id(1), id(2)]);
+        assert_eq!(reorder_to(&order, id(1), id(3)), vec![id(2), id(1), id(3)]);
     }
 
     #[test]
     fn reorder_is_noop_for_unknown_or_same_ids() {
-        let order = vec![id("a"), id("b")];
-        assert_eq!(reorder_to(&order, &id("a"), &id("a")), order);
-        assert_eq!(reorder_to(&order, &id("z"), &id("a")), order);
+        let order = vec![id(1), id(2)];
+        assert_eq!(reorder_to(&order, id(1), id(1)), order);
+        assert_eq!(reorder_to(&order, id(99), id(1)), order);
     }
 
     #[test]
     fn move_to_end_appends_dragged_member() {
-        let order = vec![id("a"), id("b"), id("c")];
+        let order = vec![id(1), id(2), id(3)];
         // Front tab to the end.
-        assert_eq!(
-            move_to_end(&order, &id("a")),
-            vec![id("b"), id("c"), id("a")]
-        );
+        assert_eq!(move_to_end(&order, id(1)), vec![id(2), id(3), id(1)]);
         // Middle tab to the end.
-        assert_eq!(
-            move_to_end(&order, &id("b")),
-            vec![id("a"), id("c"), id("b")]
-        );
+        assert_eq!(move_to_end(&order, id(2)), vec![id(1), id(3), id(2)]);
         // Last tab to the end is a no-op (order unchanged).
-        assert_eq!(move_to_end(&order, &id("c")), order);
+        assert_eq!(move_to_end(&order, id(3)), order);
         // Unknown id is a no-op.
-        assert_eq!(move_to_end(&order, &id("z")), order);
+        assert_eq!(move_to_end(&order, id(99)), order);
     }
 }

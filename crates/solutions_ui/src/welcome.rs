@@ -131,7 +131,7 @@ fn finish_edit(commit: bool, window: &mut Window, cx: &mut App) {
                 }
                 WelcomeEditMode::Renaming(id) => {
                     store
-                        .update(cx, |s, cx| s.rename_solution(&id, &name, cx))
+                        .update(cx, |s, cx| s.rename_solution(id, &name, cx))
                         .log_err();
                 }
                 WelcomeEditMode::Idle | WelcomeEditMode::ConfirmingDelete(_) => {}
@@ -327,9 +327,9 @@ fn render_card(
     confirming_delete: bool,
     cx: &App,
 ) -> impl IntoElement {
-    let entry_id = entry.id.clone();
-    let entry_id_for_delete = entry.id.clone();
-    let entry_id_for_rename = entry.id.clone();
+    let entry_id = entry.id;
+    let entry_id_for_delete = entry.id;
+    let entry_id_for_rename = entry.id;
     let original_name = entry.label.clone();
 
     let avatar_color = avatar_color_for(&entry.label, cx);
@@ -373,7 +373,7 @@ fn render_card(
                     } else {
                         OpenIntent::SameWindow
                     };
-                    open_solution(entry_id.clone(), source, intent, cx);
+                    open_solution(entry_id, source, intent, cx);
                 })
                 .child(
                     ui::h_flex()
@@ -478,7 +478,7 @@ fn render_card(
                         .tooltip(ui::Tooltip::text("Rename solution"))
                         .on_click(move |_, window, cx| {
                             enter_mode(
-                                WelcomeEditMode::Renaming(entry_id_for_rename.clone()),
+                                WelcomeEditMode::Renaming(entry_id_for_rename),
                                 &original_name,
                                 window,
                                 cx,
@@ -492,7 +492,7 @@ fn render_card(
                         .icon_color(Color::Muted)
                         .tooltip(ui::Tooltip::text("Delete solution"))
                         .on_click(move |_, _window, cx| {
-                            enter_confirm_delete(entry_id_for_delete.clone(), cx);
+                            enter_confirm_delete(entry_id_for_delete, cx);
                         }),
                 )
             }
@@ -532,11 +532,15 @@ fn all_solutions(cx: &App) -> Vec<RecentSolution> {
         s.solutions()
             .iter()
             .map(|sol: &Solution| RecentSolution {
-                id: sol.id.clone(),
+                id: sol.id,
                 label: sol.name.clone(),
                 root: sol.root.clone(),
                 is_empty: sol.members.is_empty(),
-                last_opened_at: sol.last_opened_at,
+                // The store keeps epoch millis; the launcher renders a
+                // relative-time label, so convert at this edge.
+                last_opened_at: sol
+                    .last_opened_at
+                    .and_then(DateTime::<Utc>::from_timestamp_millis),
             })
             .collect()
     });
@@ -675,8 +679,17 @@ mod tests {
                         s.create_solution(&format!("Open{i}"), dir.path().join(format!("o{i}")), cx)
                     })
                     .expect("create");
+                // `touch_last_opened` stamps `chrono::Utc::now().timestamp_millis()`,
+                // and the sort is stable — two touches inside the same millisecond
+                // tie and fall back to store order, which is the opposite of what
+                // this test asserts. Sleep past the clock's resolution so the two
+                // stamps genuinely differ. Must be a real (blocking) sleep: the GPUI
+                // test executor's virtual timers don't move the wall clock.
+                if i > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
                 store
-                    .update(cx, |s, cx| s.touch_last_opened(&sol_id, cx))
+                    .update(cx, |s, cx| s.touch_last_opened(sol_id, cx))
                     .expect("touch");
             }
             solutions::install_global_for_test(store, cx);

@@ -94,17 +94,15 @@ impl AddMemberDelegate {
         let store = SolutionStore::global(cx);
         let mut candidates: Vec<PickerEntry> = store.read_with(cx, |s, _| {
             let already_in_solution: std::collections::HashSet<CatalogId> = s
-                .solutions()
-                .iter()
-                .find(|sol| sol.id == solution_id)
-                .map(|sol| sol.members.iter().map(|m| m.catalog_id.clone()).collect())
+                .find_solution(solution_id)
+                .map(|sol| sol.members.iter().filter_map(|m| m.origin_catalog_id).collect())
                 .unwrap_or_default();
             s.catalog()
                 .iter()
                 .filter(|c| !already_in_solution.contains(&c.id))
                 .map(|c| {
                     PickerEntry::Catalog(CatalogEntry {
-                        id: c.id.clone(),
+                        id: c.id,
                         name: c.name.clone(),
                         remote_url: c.remote_url.clone(),
                     })
@@ -189,8 +187,8 @@ impl PickerDelegate for AddMemberDelegate {
         };
         match entry {
             PickerEntry::Catalog(catalog) => {
-                let cat_id = catalog.id.clone();
-                let sol_id = self.solution_id.clone();
+                let cat_id = catalog.id;
+                let sol_id = self.solution_id;
                 let cache_root = default_cache_root();
                 let solutions_root = SolutionsSettings::get_global(cx).root.clone();
                 let _ = solutions_root;
@@ -204,7 +202,7 @@ impl PickerDelegate for AddMemberDelegate {
                 // Hand off to the AddCatalogProject modal, carrying this
                 // solution so the new project is added to it (cloning in the
                 // background) as soon as it's in the catalog.
-                let solution_id = self.solution_id.0.clone();
+                let solution_id = self.solution_id.0;
                 self.dismissed(window, cx);
                 let Some(workspace) = self.workspace.upgrade() else {
                     return;

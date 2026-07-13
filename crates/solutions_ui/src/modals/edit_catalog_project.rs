@@ -68,14 +68,14 @@ impl EditCatalogProjectModal {
             return;
         }
         let store = SolutionStore::global(cx);
-        let id = self.catalog_id.clone();
+        let id = self.catalog_id;
         let new_branch = if branch.is_empty() {
             None
         } else {
             Some(branch)
         };
         if let Err(error) = store.update(cx, |s, cx| {
-            s.edit_catalog_project(&id, Some(name), new_branch, Some(url), cx)
+            s.edit_catalog_project(id, Some(name), new_branch, Some(url), cx)
         }) {
             // Name / remote uniqueness is enforced in the store. Keep the modal
             // open with the reason instead of dismissing as if it had worked.

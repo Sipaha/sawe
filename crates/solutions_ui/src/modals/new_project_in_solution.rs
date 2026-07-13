@@ -33,9 +33,9 @@ impl NewProjectInSolutionModal {
             return;
         }
         let store = SolutionStore::global(cx);
-        let id = self.solution_id.clone();
+        let id = self.solution_id;
         store
-            .update(cx, |s, cx| s.add_empty_member(&id, &name, cx))
+            .update(cx, |s, cx| s.add_empty_member(id, &name, cx))
             .log_err();
         cx.emit(DismissEvent);
     }
@@ -123,7 +123,7 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
         let _modal = cx.add_window(|window, cx| {
-            NewProjectInSolutionModal::new(SolutionId("sol-1".into()), window, cx)
+            NewProjectInSolutionModal::new(SolutionId(1), window, cx)
         });
     }
 }

@@ -71,13 +71,13 @@ impl OpenSolutionDelegate {
             s.solutions()
                 .iter()
                 .map(|sol| SolutionEntry {
-                    id: sol.id.clone(),
+                    id: sol.id,
                     name: sol.name.clone(),
                     member_count: sol.members.len(),
                 })
                 .collect()
         });
-        all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        all.sort_by_key(|a| a.name.to_lowercase());
         let matches = (0..all.len()).collect();
         Self {
             modal,
@@ -142,7 +142,7 @@ impl PickerDelegate for OpenSolutionDelegate {
         let Some(entry) = self.all.get(idx) else {
             return;
         };
-        let sol_id = entry.id.clone();
+        let sol_id = entry.id;
         let source = window.window_handle().downcast();
         open_solution(sol_id, source, OpenIntent::SameWindow, cx);
         self.dismissed(window, cx);

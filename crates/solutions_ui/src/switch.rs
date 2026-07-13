@@ -61,7 +61,7 @@ pub fn switch_active_solution_in_place(
 
         // Step 1: snapshot current.
         let prev_id = previous_solution_id(&workspace, cx)?;
-        if let Some(prev_id) = prev_id.clone() {
+        if let Some(prev_id) = prev_id {
             // `Entity::update` on `AsyncWindowContext` returns `R`
             // directly (not `Result<R>`); the entity-released case
             // surfaces only when calling through `update_in`. Plain
@@ -84,7 +84,7 @@ pub fn switch_active_solution_in_place(
             cx.update(|_, cx| {
                 if let Some(store) = SolutionStore::try_global(cx) {
                     store.update(cx, |store, cx| {
-                        store.store_tab_snapshot(prev_id.clone(), snapshot, cx);
+                        store.store_tab_snapshot(prev_id, snapshot, cx);
                     });
                 }
             })
@@ -95,7 +95,7 @@ pub fn switch_active_solution_in_place(
         cx.update(|_, cx| {
             if let Some(store) = SolutionStore::try_global(cx) {
                 store
-                    .update(cx, |s, cx| s.touch_last_opened(&target_id, cx))
+                    .update(cx, |s, cx| s.touch_last_opened(target_id, cx))
                     .log_err();
             }
         })
@@ -106,7 +106,7 @@ pub fn switch_active_solution_in_place(
             .update(|_, cx| {
                 SolutionStore::try_global(cx)
                     .and_then(|store| {
-                        store.read_with(cx, |s, _| s.paths_for_open(&target_id).log_err())
+                        store.read_with(cx, |s, _| s.paths_for_open(target_id).log_err())
                     })
                     .unwrap_or_default()
             })
@@ -140,7 +140,7 @@ pub fn switch_active_solution_in_place(
         let snapshot = cx
             .update(|_, cx| {
                 SolutionStore::try_global(cx).and_then(|store| {
-                    store.read_with(cx, |s, _| s.tab_snapshot(&target_id).cloned())
+                    store.read_with(cx, |s, _| s.tab_snapshot(target_id).cloned())
                 })
             })
             .ok()
@@ -184,7 +184,7 @@ fn previous_solution_id(
             .read(cx)
             .visible_worktrees(cx)
             .find_map(|wt| store_read.solution_for_path(&wt.read(cx).abs_path()))
-            .map(|sol| sol.id.clone())
+            .map(|sol| sol.id)
     })
 }
 
@@ -212,13 +212,13 @@ fn previous_solution_id(
 #[serde(default, deny_unknown_fields)]
 pub struct SwitchSolutionParams {
     pub window_id: String,
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct SwitchSolutionResult {
     pub window_id: String,
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 #[derive(Clone)]
@@ -238,11 +238,7 @@ impl McpServerTool for SwitchSolutionTool {
             !input.window_id.is_empty(),
             "invalid_params: window_id is required"
         );
-        anyhow::ensure!(
-            !input.solution_id.is_empty(),
-            "invalid_params: solution_id is required"
-        );
-        let target_id = SolutionId(input.solution_id.clone());
+        let target_id = SolutionId(input.solution_id);
         let window_id_str = input.window_id.clone();
 
         // Resolve the window + active workspace, then schedule the
@@ -269,7 +265,7 @@ impl McpServerTool for SwitchSolutionTool {
                     .with_context(|| format!("window_not_multi_workspace: {window_id_str}"))?;
                 multi.update(cx, |multi_workspace, window, cx| {
                     let workspace = multi_workspace.workspace().clone().downgrade();
-                    switch_active_solution_in_place(workspace, target_id.clone(), window, cx)
+                    switch_active_solution_in_place(workspace, target_id, window, cx)
                 })
             })?;
         task.await?;
@@ -375,7 +371,7 @@ fn active_solution_id_in(mw: &MultiWorkspace, cx: &App) -> Option<SolutionId> {
     project.read(cx).worktrees(cx).find_map(|tree| {
         store_read
             .solution_for_path(&tree.read(cx).abs_path())
-            .map(|sol| sol.id.clone())
+            .map(|sol| sol.id)
     })
 }
 
@@ -393,7 +389,7 @@ fn solution_workspace_pairs(mw: &MultiWorkspace, cx: &App) -> Vec<(SolutionId, E
         if let Some(sol_id) = project.read(cx).worktrees(cx).find_map(|tree| {
             store_read
                 .solution_for_path(&tree.read(cx).abs_path())
-                .map(|sol| sol.id.clone())
+                .map(|sol| sol.id)
         }) {
             if !pairs.iter().any(|(existing, _)| existing == &sol_id) {
                 pairs.push((sol_id, ws.clone()));

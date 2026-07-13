@@ -40,7 +40,7 @@ impl RenameSolutionModal {
         let new_name = self.name_editor.read(cx).text(cx).trim().to_string();
         if !new_name.is_empty() {
             SolutionStore::global(cx)
-                .update(cx, |s, cx| s.rename_solution(&self.id, &new_name, cx))
+                .update(cx, |s, cx| s.rename_solution(self.id, &new_name, cx))
                 .log_err();
         }
         cx.emit(DismissEvent);

@@ -104,7 +104,7 @@ fn member_work_dir(solution: &Solution, member_id: &str) -> Result<PathBuf> {
     let member = solution
         .members
         .iter()
-        .find(|m| m.catalog_id.0 == member_id)
+        .find(|m| m.name == member_id)
         .ok_or_else(|| {
             anyhow!(
                 "`{member_id}` is not a member of solution `{}`",
@@ -737,7 +737,7 @@ impl CrossCherryPickModal {
         let target_options: Vec<SharedString> = solution
             .members
             .iter()
-            .map(|m| SharedString::from(m.catalog_id.0.clone()))
+            .map(|m| SharedString::from(m.name.clone()))
             .filter(|id| id != &source_member)
             .collect();
         let target_member = target_options.first().cloned().unwrap_or_default();
@@ -766,7 +766,7 @@ impl CrossCherryPickModal {
             .solution
             .members
             .iter()
-            .find(|m| m.catalog_id.0 == self.source_member.as_ref())
+            .find(|m| m.name == self.source_member.as_ref())
         else {
             return;
         };
@@ -1129,7 +1129,7 @@ pub mod mcp {
         pub target_member: String,
         pub path_mapping: Option<Vec<PathMappingPair>>,
         pub no_commit: Option<bool>,
-        pub solution_id: Option<String>,
+        pub solution_id: Option<i64>,
     }
 
     /// Output of the cherry pick to member tool.
@@ -1149,17 +1149,15 @@ pub mod mcp {
         }
     }
 
-    fn resolve_solution(solution_id: Option<&str>, cx: &App) -> Result<Solution> {
+    fn resolve_solution(solution_id: Option<i64>, cx: &App) -> Result<Solution> {
         let store = SolutionStore::try_global(cx)
             .ok_or_else(|| anyhow!("no SolutionStore global — `solution_git::init` must run"))?;
         let store_ref = store.read(cx);
         if let Some(id) = solution_id {
             return store_ref
-                .solutions()
-                .iter()
-                .find(|s| s.id.0 == id)
+                .find_solution(solutions::SolutionId(id))
                 .cloned()
-                .ok_or_else(|| anyhow!("no solution with id `{id}`"));
+                .map_err(|_| anyhow!("no solution with id `{id}`"));
         }
         let mut best: Option<&Solution> = None;
         for sol in store_ref.solutions() {
@@ -1197,8 +1195,7 @@ pub mod mcp {
             if input.source_sha.trim().is_empty() {
                 return Err(anyhow!("`source_sha` is required"));
             }
-            let solution_id = input.solution_id.clone();
-            let solution = cx.update(|cx| resolve_solution(solution_id.as_deref(), cx))?;
+            let solution = cx.update(|cx| resolve_solution(input.solution_id, cx))?;
             let request = CrossCherryPickRequest {
                 source_member: SharedString::from(input.source_member),
                 source_sha: input.source_sha,
@@ -1418,17 +1415,21 @@ mod tests {
     /// Build a Solution with two members rooted at the given temp dirs.
     fn solution(a: &Path, b: &Path) -> Solution {
         Solution {
-            id: SolutionId("test".into()),
+            id: SolutionId(1),
             name: "Test".into(),
             root: PathBuf::from("/tmp/cross-cp"),
             members: vec![
                 SolutionMember {
-                    catalog_id: CatalogId("a".into()),
+                    id: solutions::MemberId(1),
+                    name: "a".into(),
                     local_path: a.to_path_buf(),
+                    origin_catalog_id: None,
                 },
                 SolutionMember {
-                    catalog_id: CatalogId("b".into()),
+                    id: solutions::MemberId(2),
+                    name: "b".into(),
                     local_path: b.to_path_buf(),
+                    origin_catalog_id: None,
                 },
             ],
             last_opened_at: None,

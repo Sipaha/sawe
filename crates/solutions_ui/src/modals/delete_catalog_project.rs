@@ -32,14 +32,14 @@ impl DeleteCatalogProjectModal {
 
     fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
         let store = SolutionStore::global(cx);
-        let id = self.catalog_id.clone();
+        let id = self.catalog_id;
         // The store's cascade returns the list of clone directories
         // that need to be wiped from disk. Spawning the rm-rf here
         // (instead of inside the store) mirrors `DeleteSolutionModal`'s
         // pattern and keeps `SolutionStore` blocking-thread-free for
         // the GPUI test scheduler.
         let clone_paths = store
-            .update(cx, |s, cx| s.remove_catalog_project_cascade(&id, cx))
+            .update(cx, |s, cx| s.remove_catalog_project_cascade(id, cx))
             .log_err()
             .unwrap_or_default();
         if !clone_paths.is_empty() {

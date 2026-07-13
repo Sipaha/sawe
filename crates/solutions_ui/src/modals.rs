@@ -34,13 +34,13 @@ pub fn register(workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Conte
     });
     workspace.register_action(|workspace, action: &AddCatalogProject, window, cx| {
         let weak = cx.weak_entity();
-        let solution_id = action.solution_id.clone().map(SolutionId);
+        let solution_id = action.solution_id.map(SolutionId);
         workspace.toggle_modal(window, cx, move |window, cx| {
             AddCatalogProjectModal::new(weak, solution_id, window, cx)
         });
     });
     workspace.register_action(|workspace, action: &EditCatalogProject, window, cx| {
-        let id = CatalogId(action.id.clone());
+        let id = CatalogId(action.id);
         let store = SolutionStore::global(cx);
         let Some(prefill) = store.read_with(cx, |s, _| {
             s.catalog()
@@ -60,11 +60,11 @@ pub fn register(workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Conte
         });
     });
     workspace.register_action(|workspace, action: &DeleteCatalogProject, window, cx| {
-        let id = CatalogId(action.id.clone());
+        let id = CatalogId(action.id);
         let store = SolutionStore::global(cx);
         let Some((name, references)) = store.read_with(cx, |s, _| {
             let project = s.catalog().iter().find(|p| p.id == id)?;
-            Some((project.name.clone(), s.solutions_referencing(&id)))
+            Some((project.name.clone(), s.solutions_referencing(id)))
         }) else {
             return;
         };
@@ -73,7 +73,7 @@ pub fn register(workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Conte
         });
     });
     workspace.register_action(|workspace, action: &DeleteSolution, window, cx| {
-        let id = SolutionId(action.id.clone());
+        let id = SolutionId(action.id);
         let store = SolutionStore::global(cx);
         // Look up the solution's display name + root for the modal copy.
         // If the id is unknown (stale action / already-deleted), do nothing.
@@ -91,7 +91,7 @@ pub fn register(workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Conte
     });
     workspace.register_action(
         |workspace, action: &CreateNewProjectInSolution, window, cx| {
-            let id = SolutionId(action.solution_id.clone());
+            let id = SolutionId(action.solution_id);
             open_new_project_in_solution(workspace, id, window, cx);
         },
     );

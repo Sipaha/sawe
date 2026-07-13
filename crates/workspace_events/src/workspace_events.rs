@@ -61,7 +61,7 @@ fn install_solution_open_observer(cx: &mut App) {
             let SolutionStoreEvent::Opened { id } = event else {
                 return;
             };
-            let id = id.clone();
+            let id = *id;
             let Some(agent) = solution_agent::store::SolutionAgentStore::try_global(cx) else {
                 return;
             };
@@ -93,7 +93,7 @@ fn install_solution_open_observer(cx: &mut App) {
                     cx,
                     "workspace.session_opened",
                     serde_json::json!({
-                        "solution_id": id.as_str(),
+                        "solution_id": id.0,
                         "session": summary,
                     }),
                 );
@@ -125,14 +125,14 @@ pub fn list_solutions_for_test(cx: &App, open: Option<bool>) -> dto::ListSolutio
 /// Test-only direct invocation of `workspace.open_solution`.
 /// Call from tests as: `cx.update(|cx| workspace_events::open_solution_for_test(cx, &id))`.
 pub fn open_solution_for_test(cx: &mut App, id: &solutions::SolutionId) -> dto::SeqAck {
-    let seq = lifecycle::open_solution_impl(cx, id).expect("open_solution");
+    let seq = lifecycle::open_solution_impl(cx, *id).expect("open_solution");
     dto::SeqAck { seq }
 }
 
 /// Test-only direct invocation of `workspace.close_solution`.
 /// Call from tests as: `cx.update(|cx| workspace_events::close_solution_for_test(cx, &id))`.
 pub fn close_solution_for_test(cx: &mut App, id: &solutions::SolutionId) -> dto::SeqAck {
-    let seq = lifecycle::close_solution_impl(cx, id).expect("close_solution");
+    let seq = lifecycle::close_solution_impl(cx, *id).expect("close_solution");
     dto::SeqAck { seq }
 }
 
