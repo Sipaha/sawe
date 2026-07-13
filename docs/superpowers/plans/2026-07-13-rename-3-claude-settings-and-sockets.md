@@ -240,7 +240,7 @@ and docs.
 
 **Steps**
 
-- [ ] Add a failing test at the bottom of `crates/editor_mcp/src/lifecycle.rs`
+- [x] Add a failing test at the bottom of `crates/editor_mcp/src/lifecycle.rs`
       (inside a new `#[cfg(test)] mod tests`, or the existing one if present):
       ```rust
       #[cfg(test)]
@@ -263,9 +263,9 @@ and docs.
           }
       }
       ```
-- [ ] Run `cargo test -p editor_mcp --lib runtime_dir` — expect a **compile
+- [x] Run `cargo test -p editor_mcp --lib runtime_dir` — expect a **compile
       error**: ``cannot find function `default_runtime_dir` in this scope``.
-- [ ] Implement, replacing `runtime_dir` (`lifecycle.rs:34-38`):
+- [x] Implement, replacing `runtime_dir` (`lifecycle.rs:34-38`):
       ```rust
       /// The socket, its lock file, the per-solution socket dirs and the upload
       /// spool are *runtime state*, not configuration — they must not live in
@@ -283,13 +283,13 @@ and docs.
               .unwrap_or_else(default_runtime_dir)
       }
       ```
-- [ ] Run `cargo test -p editor_mcp --lib runtime_dir` — expect
+- [x] Run `cargo test -p editor_mcp --lib runtime_dir` — expect
       `test runtime_dir_tests::default_runtime_dir_is_state_not_config ... ok`.
-- [ ] Run `cargo check -p editor_mcp -p solution_agent` — expect no errors
+- [x] Run `cargo check -p editor_mcp -p solution_agent` — expect no errors
       (`solution_agent::init` already derives its upload spool from
       `editor_mcp::runtime_dir()`, `solution_agent.rs:112`, so it follows for
       free).
-- [ ] Commit: `Move the MCP socket, lock and upload spool from config/ to state/`
+- [x] Commit: `Move the MCP socket, lock and upload spool from config/ to state/`
 
 ## Task 1.2 — remove the leftovers under `config/`
 

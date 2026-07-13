@@ -31,11 +31,20 @@ pub fn set_runtime_dir_for_test(dir: PathBuf) {
     let _ = RUNTIME_DIR_OVERRIDE.set(dir);
 }
 
+/// The socket, its lock file, the per-solution socket dirs and the upload
+/// spool are *runtime state*, not configuration — they must not live in
+/// `config/` next to `settings.json` (a `rm -r ~/.spk/sawe/config` to reset
+/// settings would otherwise take the lock with it, and conversely a config
+/// sync would ship a dead socket).
+fn default_runtime_dir() -> PathBuf {
+    paths::state_dir().clone()
+}
+
 pub fn runtime_dir() -> PathBuf {
     RUNTIME_DIR_OVERRIDE
         .get()
         .cloned()
-        .unwrap_or_else(|| paths::config_dir().clone())
+        .unwrap_or_else(default_runtime_dir)
 }
 
 #[derive(Debug)]
@@ -647,6 +656,21 @@ mod tests {
         );
         assert!(dir.path().join("mcp.lock").exists());
         assert!(solutions.exists(), "the solutions dir itself must survive");
+    }
+
+    #[test]
+    fn default_runtime_dir_is_state_not_config() {
+        let dir = default_runtime_dir();
+        assert!(
+            dir.ends_with("state"),
+            "the mcp socket + lock are runtime state, not configuration: {}",
+            dir.display()
+        );
+        assert_ne!(
+            dir,
+            *paths::config_dir(),
+            "runtime_dir must no longer alias config_dir"
+        );
     }
 
     #[test]
