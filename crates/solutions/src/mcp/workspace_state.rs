@@ -1,4 +1,3 @@
-use crate::SolutionStore;
 use anyhow::{Context as _, Result};
 use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;
@@ -25,12 +24,14 @@ pub(crate) fn register_workspace_state(cx: &mut App) {
 // workspace.list_buffers
 // =====================================================================
 
-/// List open buffers in the editor window for a Solution. Each entry
-/// reports the project-relative `path`, dirty/focused flags, and (when
-/// available) the language name. Buffers from every pane in the window
-/// are returned; a single buffer open in multiple panes appears once
-/// per pane (matching the editor UI). Returns an empty list when no
-/// window is currently open for the Solution.
+/// List open buffers of a Solution. Scoped to the Solution's own workspaces —
+/// a window can host several Solutions at once, and a sibling Solution's tabs
+/// are never reported here. Each entry reports the project-relative `path`,
+/// dirty/focused flags, and (when available) the language name. Buffers from
+/// every pane of the Solution are returned; a single buffer open in multiple
+/// panes appears once per pane (matching the editor UI). `focused` is only
+/// ever true when the window is currently presenting this Solution's
+/// workspace. Returns an empty list when the Solution isn't open.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ListBuffersParams {
     /// Absent on a per-solution socket: the server injects the socket's bound
@@ -93,87 +94,67 @@ impl McpServerTool for ListBuffersTool {
     }
 }
 
-fn collect_buffers(solution_id: i64, cx: &mut App) -> Vec<BufferInfo> {
-    let Some(store) = SolutionStore::try_global(cx) else {
-        return Vec::new();
-    };
-    let Some(root) = store.read_with(cx, |s, _| {
-        s.solutions()
-            .iter()
-            .find(|sol| sol.id.0 == solution_id)
-            .map(|sol| sol.root.clone())
-    }) else {
-        return Vec::new();
-    };
-
-    for handle in cx.windows() {
-        let Some(window_handle) = handle.downcast::<workspace::MultiWorkspace>() else {
-            continue;
-        };
-        let collected = window_handle
-            .update(cx, |multi, _window, cx| {
-                let workspace = multi.workspace().read(cx);
-                let project = workspace.project().read(cx);
-                let matches_solution = project
-                    .visible_worktrees(cx)
-                    .any(|tree| tree.read(cx).abs_path().starts_with(&root))
-                    || multi.workspaces().any(|ws| {
-                        ws.read(cx)
-                            .project()
-                            .read(cx)
-                            .visible_worktrees(cx)
-                            .any(|tree| tree.read(cx).abs_path().starts_with(&root))
-                    });
-                if !matches_solution {
-                    return None;
-                }
-
-                // The active item resolves through the active pane; capture its
-                // project_path so we can flag exactly the entry the user is
-                // currently looking at, even if the same buffer is open in
-                // another pane.
-                let active_project_path = workspace
-                    .active_item(cx)
-                    .and_then(|item| item.project_path(cx));
-                let active_pane_id = workspace.active_pane().entity_id();
-
-                let mut buffers = Vec::new();
-                for pane_entity in workspace.panes() {
-                    let pane = pane_entity.read(cx);
-                    let pane_is_active = pane_entity.entity_id() == active_pane_id;
-                    let pane_active_item_id = pane.active_item().map(|item| item.item_id());
-                    for item in pane.items() {
-                        let Some(project_path) = item.project_path(cx) else {
-                            continue;
-                        };
-                        let is_active_in_pane = pane_active_item_id == Some(item.item_id());
-                        let focused = pane_is_active
-                            && is_active_in_pane
-                            && active_project_path
-                                .as_ref()
-                                .map(|p| p == &project_path)
-                                .unwrap_or(true);
-                        buffers.push(BufferInfo {
-                            path: project_path.path.as_unix_str().to_string(),
-                            dirty: item.is_dirty(cx),
-                            // Language detection requires `Buffer` access via
-                            // `act_as::<Editor>` and is left for a follow-up;
-                            // the field is reserved in the schema so clients
-                            // can rely on the shape today.
-                            language: None,
-                            focused,
-                        });
-                    }
-                }
-                Some(buffers)
+fn collect_buffers(solution_id: i64, cx: &App) -> Vec<BufferInfo> {
+    let mut buffers = Vec::new();
+    // Only the Solution's own workspaces — a window can host several Solutions
+    // at once (see `workspaces_for_solution`), and reading the window's active
+    // workspace would leak a sibling Solution's tabs into this list.
+    for (handle, workspace_entity) in
+        crate::mcp::project_files::workspaces_for_solution(solution_id, cx)
+    {
+        // A buffer can only be focused if its workspace is the one the window
+        // is actually presenting.
+        let workspace_is_presented = handle
+            .downcast::<workspace::MultiWorkspace>()
+            .and_then(|window_handle| {
+                window_handle
+                    .read_with(cx, |multi, _cx| {
+                        multi.workspace().entity_id() == workspace_entity.entity_id()
+                    })
+                    .ok()
             })
-            .ok()
-            .flatten();
-        if let Some(buffers) = collected {
-            return buffers;
+            .unwrap_or(false);
+
+        let workspace = workspace_entity.read(cx);
+        // The active item resolves through the active pane; capture its
+        // project_path so we can flag exactly the entry the user is
+        // currently looking at, even if the same buffer is open in
+        // another pane.
+        let active_project_path = workspace
+            .active_item(cx)
+            .and_then(|item| item.project_path(cx));
+        let active_pane_id = workspace.active_pane().entity_id();
+
+        for pane_entity in workspace.panes() {
+            let pane = pane_entity.read(cx);
+            let pane_is_active = pane_entity.entity_id() == active_pane_id;
+            let pane_active_item_id = pane.active_item().map(|item| item.item_id());
+            for item in pane.items() {
+                let Some(project_path) = item.project_path(cx) else {
+                    continue;
+                };
+                let is_active_in_pane = pane_active_item_id == Some(item.item_id());
+                let focused = workspace_is_presented
+                    && pane_is_active
+                    && is_active_in_pane
+                    && active_project_path
+                        .as_ref()
+                        .map(|p| p == &project_path)
+                        .unwrap_or(true);
+                buffers.push(BufferInfo {
+                    path: project_path.path.as_unix_str().to_string(),
+                    dirty: item.is_dirty(cx),
+                    // Language detection requires `Buffer` access via
+                    // `act_as::<Editor>` and is left for a follow-up;
+                    // the field is reserved in the schema so clients
+                    // can rely on the shape today.
+                    language: None,
+                    focused,
+                });
+            }
         }
     }
-    Vec::new()
+    buffers
 }
 
 // =====================================================================
@@ -344,38 +325,15 @@ impl McpServerTool for DispatchActionTool {
     }
 }
 
-pub(crate) fn find_window_for_solution(
-    solution_id: i64,
-    cx: &mut App,
-) -> Option<gpui::AnyWindowHandle> {
-    let store = SolutionStore::try_global(cx)?;
-    let root = store.read_with(cx, |s, _| {
-        s.solutions()
-            .iter()
-            .find(|sol| sol.id.0 == solution_id)
-            .map(|sol| sol.root.clone())
-    })?;
-    for handle in cx.windows() {
-        let Some(window_handle) = handle.downcast::<workspace::MultiWorkspace>() else {
-            continue;
-        };
-        let matches_solution = window_handle
-            .read_with(cx, |multi, cx| {
-                multi.workspaces().any(|ws| {
-                    ws.read(cx)
-                        .project()
-                        .read(cx)
-                        .visible_worktrees(cx)
-                        .any(|tree| tree.read(cx).abs_path().starts_with(&root))
-                })
-            })
-            .ok()
-            .unwrap_or(false);
-        if matches_solution {
-            return Some(handle);
-        }
-    }
-    None
+/// The window *hosting* the Solution. Note that the window may host other
+/// Solutions too, and its active workspace may well be one of theirs — use
+/// `project_files::workspaces_for_solution` whenever you need the Solution's
+/// own `Workspace`, and reserve this for genuinely window-level operations
+/// (screenshot, action dispatch, visual dump).
+pub(crate) fn find_window_for_solution(solution_id: i64, cx: &App) -> Option<gpui::AnyWindowHandle> {
+    crate::mcp::project_files::workspaces_for_solution(solution_id, cx)
+        .first()
+        .map(|(handle, _)| *handle)
 }
 
 // =====================================================================

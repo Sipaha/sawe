@@ -375,22 +375,26 @@ impl McpServerTool for OpenFileTool {
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let focus = input.focus.unwrap_or(true);
-        let window_handle = cx
-            .update(|cx| find_window_for_solution(solution_id, cx))
+        // Open into the Solution's OWN workspace. The hosting window's active
+        // workspace may belong to a sibling Solution, whose project doesn't
+        // know this worktree at all — `open_path` would fail there.
+        let (window_handle, workspace_entity) = cx
+            .update(|cx| {
+                super::workspaces_for_solution(solution_id, cx)
+                    .into_iter()
+                    .next()
+            })
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", solution_id))?;
         let typed_window = window_handle
             .downcast::<workspace::MultiWorkspace>()
             .ok_or_else(|| anyhow::anyhow!("window_not_multi_workspace"))?;
 
-        let project = cx
-            .update(|cx| project_for_solution(solution_id, cx))
-            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", solution_id))?;
+        let project = cx.update(|cx| workspace_entity.read(cx).project().clone());
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
 
         let task = typed_window
-            .update(cx, |multi, window, cx| {
-                let workspace_entity = multi.workspace().clone();
+            .update(cx, |_multi, window, cx| {
                 workspace_entity.update(cx, |workspace, cx| {
                     workspace.open_path(project_path, None, focus, window, cx)
                 })

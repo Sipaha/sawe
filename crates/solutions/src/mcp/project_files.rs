@@ -144,48 +144,72 @@ pub struct EditPoint {
     pub col: u32,
 }
 
-// Locate the `Project` whose worktrees back the named Solution. We walk
-// every open `MultiWorkspace` window and return the first project whose
-// visible worktrees include the Solution's root (or a member directory
-// underneath it).
-pub(crate) fn project_for_solution(
+// A window may host several Solutions at once: `solutions.open` uses
+// `OpenMode::Activate`, which adds the new Solution's `Workspace` to the
+// already-open `MultiWorkspace` window instead of spawning a new one. So
+// "the window that hosts Solution X" is NOT the same as "Solution X's
+// workspace" — the window's *active* workspace can belong to a sibling
+// Solution. Anything that reports or mutates per-Solution state must go
+// through the workspaces resolved here, never through `multi.workspace()`.
+pub(crate) fn workspaces_for_solution(
     solution_id: i64,
-    cx: &mut App,
-) -> Option<gpui::Entity<project::Project>> {
-    let store = SolutionStore::try_global(cx)?;
-    let root = store.read_with(cx, |s, _| {
+    cx: &App,
+) -> Vec<(gpui::AnyWindowHandle, gpui::Entity<workspace::Workspace>)> {
+    let Some(store) = SolutionStore::try_global(cx) else {
+        return Vec::new();
+    };
+    let Some(solution) = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
             .find(|sol| sol.id.0 == solution_id)
-            .map(|sol| sol.root.clone())
-    })?;
+            .cloned()
+    }) else {
+        return Vec::new();
+    };
 
+    let mut found = Vec::new();
     for handle in cx.windows() {
         let Some(window_handle) = handle.downcast::<workspace::MultiWorkspace>() else {
             continue;
         };
-        let result = window_handle
-            .update(cx, |multi, _window, cx| {
-                for workspace_entity in multi.workspaces() {
-                    let workspace = workspace_entity.read(cx);
-                    let project = workspace.project();
-                    let matches = project
+        let Ok(workspaces) = window_handle.read_with(cx, |multi, cx| {
+            multi
+                .workspaces()
+                .filter(|workspace_entity| {
+                    workspace_entity
+                        .read(cx)
+                        .project()
                         .read(cx)
                         .visible_worktrees(cx)
-                        .any(|tree| tree.read(cx).abs_path().starts_with(&root));
-                    if matches {
-                        return Some(project.clone());
-                    }
-                }
-                None
-            })
-            .ok()
-            .flatten();
-        if let Some(project) = result {
-            return Some(project);
-        }
+                        .any(|tree| {
+                            solution_owns_path(&solution, tree.read(cx).abs_path().as_ref())
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        }) else {
+            continue;
+        };
+        found.extend(workspaces.into_iter().map(|workspace| (handle, workspace)));
     }
-    None
+    found
+}
+
+/// A path belongs to a Solution when it sits under the Solution root or under
+/// one of its members (`member_for_path` — a member may be relocated outside
+/// the root, so the root check alone is not sufficient).
+pub(crate) fn solution_owns_path(solution: &crate::Solution, path: &std::path::Path) -> bool {
+    path.starts_with(&solution.root) || solution.member_for_path(path).is_some()
+}
+
+// Locate the `Project` whose worktrees back the named Solution.
+pub(crate) fn project_for_solution(
+    solution_id: i64,
+    cx: &App,
+) -> Option<gpui::Entity<project::Project>> {
+    workspaces_for_solution(solution_id, cx)
+        .first()
+        .map(|(_, workspace)| workspace.read(cx).project().clone())
 }
 
 // Map an absolute path to a `ProjectPath` within one of the project's

@@ -18025,6 +18025,8 @@ dependencies = [
  "smol",
  "solution_agent",
  "tempfile",
+ "theme",
+ "theme_settings",
  "thiserror 2.0.17",
  "unicode-normalization",
  "util",

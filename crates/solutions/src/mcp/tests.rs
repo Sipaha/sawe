@@ -379,6 +379,135 @@ use context_server::listener::McpServerTool;
         assert_eq!(p.solution_id, None);
     }
 
+    /// Two Solutions can live in one window (`solutions.open` uses
+    /// `OpenMode::Activate`), and the window's *active* workspace may belong to
+    /// the sibling. `workspace.list_buffers` must report only the buffers of
+    /// the Solution it was asked about — including files opened from a member
+    /// subdirectory — and never the sibling's tabs.
+    #[gpui::test]
+    async fn list_buffers_reports_only_the_owning_solutions_buffers(cx: &mut TestAppContext) {
+        use fs::FakeFs;
+        use gpui::AppContext as _;
+        use project::Project;
+        use workspace::MultiWorkspace;
+        use workspace::item::test::{TestItem, TestProjectItem};
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let dir = tempdir().expect("tempdir");
+        let roots = dir.path().to_path_buf();
+        let alpha_member = roots.join("alpha/proj");
+        let beta_member = roots.join("beta/na");
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            &alpha_member,
+            serde_json::json!({
+                "only_in_alpha.txt": "a",
+                "sub": { "nested_alpha.txt": "b" },
+            }),
+        )
+        .await;
+        fs.insert_tree(&beta_member, serde_json::json!({ "demo.txt": "c" }))
+            .await;
+
+        let store = cx.update(|cx| SolutionStore::for_test(roots.join("c.json"), cx));
+        cx.update(|cx| crate::store::install_global_for_test(store.clone(), cx));
+        let (alpha, beta) = store.update(cx, |s, cx| {
+            let alpha = s
+                .create_solution("alpha", roots.clone(), cx)
+                .expect("create alpha");
+            let beta = s
+                .create_solution("beta", roots.clone(), cx)
+                .expect("create beta");
+            s.test_add_member_with_path(alpha, "proj", alpha_member.clone());
+            s.test_add_member_with_path(beta, "na", beta_member.clone());
+            (alpha, beta)
+        });
+
+        let alpha_project = Project::test(fs.clone(), [alpha_member.as_path()], cx).await;
+        let beta_project = Project::test(fs.clone(), [beta_member.as_path()], cx).await;
+        cx.run_until_parked();
+
+        let worktree_id_of = |project: &gpui::Entity<Project>, cx: &mut TestAppContext| {
+            project.read_with(cx, |project, cx| {
+                project
+                    .visible_worktrees(cx)
+                    .next()
+                    .expect("worktree")
+                    .read(cx)
+                    .id()
+            })
+        };
+        let alpha_worktree = worktree_id_of(&alpha_project, cx);
+        let beta_worktree = worktree_id_of(&beta_project, cx);
+
+        // One window hosting both Solutions; beta's workspace ends up active.
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(alpha_project.clone(), window, cx));
+        window
+            .update(cx, |multi, window, cx| {
+                let alpha_workspace = multi.workspace().clone();
+                for (entry_id, path) in [(1, "only_in_alpha.txt"), (2, "sub/nested_alpha.txt")] {
+                    let item = cx.new(|cx| {
+                        let project_item =
+                            TestProjectItem::new_in_worktree(entry_id, path, alpha_worktree, cx);
+                        TestItem::new(cx).with_project_items(&[project_item])
+                    });
+                    alpha_workspace.update(cx, |workspace, cx| {
+                        workspace.add_item_to_active_pane(Box::new(item), None, false, window, cx);
+                    });
+                }
+
+                let beta_workspace = multi.test_add_workspace(beta_project.clone(), window, cx);
+                let item = cx.new(|cx| {
+                    let project_item =
+                        TestProjectItem::new_in_worktree(3, "demo.txt", beta_worktree, cx);
+                    TestItem::new(cx).with_project_items(&[project_item])
+                });
+                beta_workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(Box::new(item), None, false, window, cx);
+                });
+            })
+            .expect("populate window");
+        cx.run_until_parked();
+
+        let list_buffers = async |id: crate::SolutionId, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let tool = ListBuffersTool;
+                cx.spawn(async move |cx| {
+                    tool.run(
+                        ListBuffersParams {
+                            solution_id: Some(id.0),
+                        },
+                        cx,
+                    )
+                    .await
+                })
+            })
+            .await
+            .expect("run list_buffers")
+            .structured_content
+            .buffers
+        };
+
+        let alpha_buffers = list_buffers(alpha, cx).await;
+        let alpha_paths: Vec<&str> = alpha_buffers.iter().map(|b| b.path.as_str()).collect();
+        assert_eq!(
+            alpha_paths,
+            vec!["only_in_alpha.txt", "sub/nested_alpha.txt"],
+            "alpha must list all of its own buffers (incl. the subdirectory one) and none of beta's"
+        );
+
+        let beta_buffers = list_buffers(beta, cx).await;
+        let beta_paths: Vec<&str> = beta_buffers.iter().map(|b| b.path.as_str()).collect();
+        assert_eq!(beta_paths, vec!["demo.txt"]);
+    }
+
     #[test]
     fn get_effective_settings_params_round_trip() {
         let p: GetEffectiveSettingsParams = serde_json::from_value(serde_json::json!({

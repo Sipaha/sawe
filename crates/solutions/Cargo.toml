@@ -56,6 +56,8 @@ project = { workspace = true, features = ["test-support"] }
 release_channel.workspace = true
 semver.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+theme.workspace = true
+theme_settings.workspace = true
 # `project/test-support` turns on `remote/test-support`, which adds the
 # `RemoteConnectionIdentity::Mock` variant. The `workspace` crate only matches
 # that variant when *its own* test-support is on, so the two must be enabled

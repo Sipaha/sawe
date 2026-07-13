@@ -1,4 +1,3 @@
-use crate::SolutionStore;
 use anyhow::Result;
 use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;
@@ -120,77 +119,41 @@ impl McpServerTool for GetDiagnosticsTool {
 fn collect_diagnostic_summaries(
     solution_id: i64,
     input: &GetDiagnosticsParams,
-    cx: &mut App,
+    cx: &App,
 ) -> Vec<DiagnosticPathSummary> {
-    let Some(store) = SolutionStore::try_global(cx) else {
+    // The Solution's own project, not the hosting window's active one — the
+    // window may be presenting a sibling Solution (see `workspaces_for_solution`).
+    let Some(project) = project_for_solution(solution_id, cx) else {
         return Vec::new();
     };
-    let Some(root) = store.read_with(cx, |s, _| {
-        s.solutions()
-            .iter()
-            .find(|sol| sol.id.0 == solution_id)
-            .map(|sol| sol.root.clone())
-    }) else {
-        return Vec::new();
-    };
+    let project = project.read(cx);
 
-    for handle in cx.windows() {
-        let Some(window_handle) = handle.downcast::<workspace::MultiWorkspace>() else {
+    // A path may have multiple language servers reporting on it (e.g.
+    // rust-analyzer + clippy). Aggregate counts across all servers for a single
+    // per-path summary, matching the rollup shown in the editor's diagnostics
+    // panel.
+    let mut by_path: std::collections::BTreeMap<String, DiagnosticPathSummary> =
+        std::collections::BTreeMap::new();
+
+    for (project_path, _server_id, summary) in project.diagnostic_summaries(false, cx) {
+        let path_str = project_path.path.as_unix_str().to_string();
+        if let Some(filter) = input.buffer_path.as_deref()
+            && path_str != filter
+        {
             continue;
-        };
-        let collected = window_handle
-            .update(cx, |multi, _window, cx| {
-                let workspace = multi.workspace().read(cx);
-                let project = workspace.project().read(cx);
-                let matches_solution = project
-                    .visible_worktrees(cx)
-                    .any(|tree| tree.read(cx).abs_path().starts_with(&root))
-                    || multi.workspaces().any(|ws| {
-                        ws.read(cx)
-                            .project()
-                            .read(cx)
-                            .visible_worktrees(cx)
-                            .any(|tree| tree.read(cx).abs_path().starts_with(&root))
-                    });
-                if !matches_solution {
-                    return None;
-                }
-
-                // A path may have multiple language servers reporting on it
-                // (e.g. rust-analyzer + clippy). Aggregate counts across all
-                // servers for a single per-path summary, matching the rollup
-                // shown in the editor's diagnostics panel.
-                let mut by_path: std::collections::BTreeMap<String, DiagnosticPathSummary> =
-                    std::collections::BTreeMap::new();
-
-                for (project_path, _server_id, summary) in project.diagnostic_summaries(false, cx) {
-                    let path_str = project_path.path.as_unix_str().to_string();
-                    if let Some(filter) = input.buffer_path.as_deref() {
-                        if path_str != filter {
-                            continue;
-                        }
-                    }
-                    let entry = by_path
-                        .entry(path_str.clone())
-                        .or_insert(DiagnosticPathSummary {
-                            path: path_str,
-                            error_count: 0,
-                            warning_count: 0,
-                        });
-                    entry.error_count += summary.error_count;
-                    entry.warning_count += summary.warning_count;
-                }
-
-                Some(by_path.into_values().collect::<Vec<_>>())
-            })
-            .ok()
-            .flatten();
-
-        if let Some(diagnostics) = collected {
-            return diagnostics;
         }
+        let entry = by_path
+            .entry(path_str.clone())
+            .or_insert(DiagnosticPathSummary {
+                path: path_str,
+                error_count: 0,
+                warning_count: 0,
+            });
+        entry.error_count += summary.error_count;
+        entry.warning_count += summary.warning_count;
     }
-    Vec::new()
+
+    by_path.into_values().collect()
 }
 
 async fn collect_diagnostic_items(
