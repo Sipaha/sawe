@@ -7884,6 +7884,7 @@ mod tests {
     #[gpui::test]
     async fn test_close_all_items(cx: &mut TestAppContext) {
         init_test(cx);
+        disable_autosave(cx);
         let fs = FakeFs::new(cx.executor());
 
         let project = Project::test(fs, None, cx).await;
@@ -8091,6 +8092,7 @@ mod tests {
     #[gpui::test]
     async fn test_dont_save_single_file_reloads_from_disk(cx: &mut TestAppContext) {
         init_test(cx);
+        disable_autosave(cx);
         let fs = FakeFs::new(cx.executor());
 
         let project = Project::test(fs, None, cx).await;
@@ -8265,6 +8267,7 @@ mod tests {
     #[gpui::test]
     async fn test_close_multibuffer_items(cx: &mut TestAppContext) {
         init_test(cx);
+        disable_autosave(cx);
         let fs = FakeFs::new(cx.executor());
 
         let project = Project::test(fs, None, cx).await;
@@ -8913,6 +8916,19 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(LoadThemes::JustBase, cx);
+        });
+    }
+
+    /// Sawe defaults `autosave` to `on_focus_change` (IDEA convention, see
+    /// `assets/settings/default.json`), so a dirty item is saved on close (and
+    /// on focus change) instead of prompting. Tests that exercise the
+    /// save-prompt / dirty-on-close path have to opt back into upstream's
+    /// manual-save default.
+    fn disable_autosave(cx: &mut TestAppContext) {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.autosave = Some(AutosaveSetting::Off);
+            });
         });
     }
 

@@ -12229,6 +12229,7 @@ mod tests {
     #[gpui::test]
     async fn test_prompting_to_save_only_on_last_item_for_entry(cx: &mut TestAppContext) {
         init_test(cx);
+        disable_autosave(cx);
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
@@ -14485,6 +14486,7 @@ mod tests {
     #[gpui::test]
     async fn test_no_save_prompt_when_multi_buffer_dirty_items_closed(cx: &mut TestAppContext) {
         init_test(cx);
+        disable_autosave(cx);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         let project = Project::test(fs, [], cx).await;
@@ -14630,6 +14632,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
+        disable_autosave(cx);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         let project = Project::test(fs, [], cx).await;
@@ -15044,6 +15047,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
+        disable_autosave(cx);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         let project = Project::test(fs, [], cx).await;
@@ -16158,6 +16162,18 @@ mod tests {
             cx.set_global(settings_store);
             cx.set_global(db::AppDatabase::test_new());
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+    }
+
+    /// Sawe defaults `autosave` to `on_focus_change` (IDEA convention, see
+    /// `assets/settings/default.json`), so a dirty item is saved on close (and
+    /// on focus change) instead of prompting. Tests that exercise the
+    /// save-prompt path have to opt back into upstream's manual-save default.
+    fn disable_autosave(cx: &mut TestAppContext) {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.autosave = Some(AutosaveSetting::Off);
+            });
         });
     }
 
