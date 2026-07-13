@@ -131,6 +131,36 @@ impl McpServerTool for CreateSessionTool {
             None => None,
         };
 
+        // Mirror of the UI guard (`console_panel::workspace_has_project`): a
+        // Solution with no members has no project for the agent to work in, so
+        // the subprocess would be rooted at the solution root — which is not a
+        // repo — and the chat renders as a cwd-less `ROOT` session. The UI
+        // refuses to create one; the tool has to refuse too, or an agent driving
+        // MCP walks straight into the state the UI is guarded against. There is
+        // no legitimate member-less session: `cwd` must resolve to one of the
+        // solution's members, and a sub-agent inherits its parent's member — a
+        // member-less solution can host neither.
+        //
+        // A solution the store does not know (no `SolutionStore` global at all,
+        // or an id that was never registered) is *not* reported as empty: that
+        // case is already covered, more precisely, by the
+        // `no_active_workspace_for_solution` error just below.
+        let solution_has_no_members = cx.update(|cx| {
+            SolutionStore::try_global(cx).is_some_and(|store| {
+                store.read_with(cx, |store, _| {
+                    store
+                        .find_solution(solution_id)
+                        .is_ok_and(|solution| solution.members.is_empty())
+                })
+            })
+        });
+        anyhow::ensure!(
+            !solution_has_no_members,
+            "solution_has_no_members: Solution {} has no projects — add one with \
+             solutions.add_member before creating a session",
+            input.solution_id
+        );
+
         let project = cx
             .update(|cx| project_for_solution(solution_id, cx))
             .ok_or_else(|| {
