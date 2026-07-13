@@ -31,11 +31,11 @@ fn cancel_operation_params_round_trip() {
 fn subscribe_params_round_trip() {
     let p: SubscribeParams = serde_json::from_value(serde_json::json!({
         "kinds": ["operation_progress", "buffer_saved"],
-        "solution_id": "sol-1"
+        "solution_id": 1
     }))
     .expect("parse");
     assert_eq!(p.kinds, vec!["operation_progress", "buffer_saved"]);
-    assert_eq!(p.solution_id.as_deref(), Some("sol-1"));
+    assert_eq!(p.solution_id, Some(1));
 }
 
 #[test]

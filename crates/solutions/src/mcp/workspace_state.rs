@@ -33,7 +33,7 @@ pub(crate) fn register_workspace_state(cx: &mut App) {
 /// window is currently open for the Solution.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ListBuffersParams {
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 impl<'de> Deserialize<'de> for ListBuffersParams {
@@ -41,7 +41,7 @@ impl<'de> Deserialize<'de> for ListBuffersParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
         }
         Ok(Self {
             solution_id: Option::<Inner>::deserialize(de)?
@@ -79,10 +79,10 @@ impl McpServerTool for ListBuffersTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
-        let buffers = cx.update(|cx| collect_buffers(&input.solution_id, cx));
+        let buffers = cx.update(|cx| collect_buffers(input.solution_id, cx));
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: format!("{} buffer(s)", buffers.len()),
@@ -92,14 +92,14 @@ impl McpServerTool for ListBuffersTool {
     }
 }
 
-fn collect_buffers(solution_id: &str, cx: &mut App) -> Vec<BufferInfo> {
+fn collect_buffers(solution_id: i64, cx: &mut App) -> Vec<BufferInfo> {
     let Some(store) = SolutionStore::try_global(cx) else {
         return Vec::new();
     };
     let Some(root) = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.0.to_string() == solution_id)
+            .find(|sol| sol.id.0 == solution_id)
             .map(|sol| sol.root.clone())
     }) else {
         return Vec::new();
@@ -187,7 +187,7 @@ fn collect_buffers(solution_id: &str, cx: &mut App) -> Vec<BufferInfo> {
 /// but does not change the response.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GetEffectiveSettingsParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }
@@ -197,7 +197,7 @@ impl<'de> Deserialize<'de> for GetEffectiveSettingsParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: Option<String>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -227,7 +227,7 @@ impl McpServerTool for GetEffectiveSettingsTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         let settings = cx.update(|cx| -> serde_json::Value {
@@ -263,7 +263,7 @@ impl McpServerTool for GetEffectiveSettingsTool {
 /// when no window is currently open for the Solution.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct DispatchActionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     pub action_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
@@ -274,7 +274,7 @@ impl<'de> Deserialize<'de> for DispatchActionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             action_name: String,
             args: Option<serde_json::Value>,
         }
@@ -306,7 +306,7 @@ impl McpServerTool for DispatchActionTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(
@@ -315,7 +315,7 @@ impl McpServerTool for DispatchActionTool {
         );
         let action_name = input.action_name.clone();
         let dispatched = cx.update(|cx| -> Result<bool> {
-            let Some(handle) = find_window_for_solution(&input.solution_id, cx) else {
+            let Some(handle) = find_window_for_solution(input.solution_id, cx) else {
                 return Ok(false);
             };
             // Build the action up-front so a deserialization error surfaces
@@ -341,12 +341,15 @@ impl McpServerTool for DispatchActionTool {
     }
 }
 
-pub(crate) fn find_window_for_solution(solution_id: &str, cx: &mut App) -> Option<gpui::AnyWindowHandle> {
+pub(crate) fn find_window_for_solution(
+    solution_id: i64,
+    cx: &mut App,
+) -> Option<gpui::AnyWindowHandle> {
     let store = SolutionStore::try_global(cx)?;
     let root = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.0.to_string() == solution_id)
+            .find(|sol| sol.id.0 == solution_id)
             .map(|sol| sol.root.clone())
     })?;
     for handle in cx.windows() {
@@ -385,7 +388,7 @@ pub(crate) fn find_window_for_solution(solution_id: &str, cx: &mut App) -> Optio
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ScreenshotParams {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
     /// A `window:N` id from `windows.list`. Use this to screenshot a window
     /// that isn't a Solution workspace (e.g. the Welcome launcher).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,7 +410,7 @@ impl<'de> Deserialize<'de> for ScreenshotParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: Option<String>,
+            solution_id: Option<i64>,
             window_id: Option<String>,
             format: Option<String>,
             quality: Option<u8>,
@@ -446,7 +449,7 @@ impl McpServerTool for ScreenshotTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        let solution_id = input.solution_id.clone().filter(|s| !s.is_empty());
+        let solution_id = input.solution_id.filter(|id| *id > 0);
         let window_id = input.window_id.clone().filter(|s| !s.is_empty());
         anyhow::ensure!(
             solution_id.is_some() != window_id.is_some(),
@@ -460,7 +463,7 @@ impl McpServerTool for ScreenshotTool {
         let quality = input.quality.unwrap_or(80).clamp(1, 100);
 
         let rgba = cx.update(|cx| -> anyhow::Result<image::RgbaImage> {
-            let handle = if let Some(solution_id) = solution_id.as_deref() {
+            let handle = if let Some(solution_id) = solution_id {
                 find_window_for_solution(solution_id, cx)
                     .ok_or_else(|| anyhow::anyhow!("solution_not_open: {solution_id}"))?
             } else {

@@ -82,7 +82,7 @@ impl std::error::Error for PathValidationError {}
 /// escaping into arbitrary filesystem via `apply_edit("/etc/passwd", ...)`.
 #[allow(dead_code)]
 pub fn validate_path_in_solution(
-    solution_id: &str,
+    solution_id: i64,
     path: &str,
     cx: &App,
 ) -> Result<std::path::PathBuf, PathValidationError> {
@@ -101,7 +101,7 @@ pub fn validate_path_in_solution(
     let valid = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.0.to_string() == solution_id)
+            .find(|sol| sol.id.0 == solution_id)
             .map(|sol| {
                 sol.members.iter().any(|m| {
                     let canon_member = m
@@ -148,12 +148,15 @@ pub struct EditPoint {
 // every open `MultiWorkspace` window and return the first project whose
 // visible worktrees include the Solution's root (or a member directory
 // underneath it).
-pub(crate) fn project_for_solution(solution_id: &str, cx: &mut App) -> Option<gpui::Entity<project::Project>> {
+pub(crate) fn project_for_solution(
+    solution_id: i64,
+    cx: &mut App,
+) -> Option<gpui::Entity<project::Project>> {
     let store = SolutionStore::try_global(cx)?;
     let root = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.0.to_string() == solution_id)
+            .find(|sol| sol.id.0 == solution_id)
             .map(|sol| sol.root.clone())
     })?;
 

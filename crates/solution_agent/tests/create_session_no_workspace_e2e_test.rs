@@ -72,7 +72,7 @@ async fn create_session_without_workspace_errors(cx: &mut TestAppContext) {
         1,
         "solution_agent.create_session",
         json!({
-            "solution_id": "nonexistent",
+            "solution_id": 999_999,
             "agent_id": "claude-acp",
         }),
     )

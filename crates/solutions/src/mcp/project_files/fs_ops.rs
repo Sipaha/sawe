@@ -21,7 +21,7 @@ use super::{project_for_solution, resolve_project_path, validate_path_in_solutio
 /// order.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ListFilesParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Optional glob pattern (e.g. `**/*.rs`). When omitted, all files
     /// are returned.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,7 +42,7 @@ impl<'de> Deserialize<'de> for ListFilesParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             glob: Option<String>,
             scope: Option<String>,
             cursor: Option<String>,
@@ -91,7 +91,7 @@ impl McpServerTool for ListFilesTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         let max = input.max.unwrap_or(200).clamp(1, 5000);
@@ -113,7 +113,7 @@ impl McpServerTool for ListFilesTool {
 
         let (files, next_cursor) = cx.update(|cx| {
             collect_files(
-                &input.solution_id,
+                input.solution_id,
                 scope_first_only,
                 glob_matcher.as_ref(),
                 &start_after,
@@ -136,7 +136,7 @@ fn cursor_for(file: &FileEntry) -> String {
 }
 
 fn collect_files(
-    solution_id: &str,
+    solution_id: i64,
     first_only: bool,
     glob: Option<&globset::GlobMatcher>,
     start_after: &str,
@@ -149,7 +149,7 @@ fn collect_files(
     let Some(root) = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.0.to_string() == solution_id)
+            .find(|sol| sol.id.0 == solution_id)
             .map(|sol| sol.root.clone())
     }) else {
         return (Vec::new(), None);
@@ -251,7 +251,7 @@ fn collect_files(
 /// needed. Errors if the path already exists.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct CreateFileParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file to create. Must lie under one of the
     /// Solution's worktrees.
     pub path: String,
@@ -265,7 +265,7 @@ impl<'de> Deserialize<'de> for CreateFileParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
             content: Option<String>,
         }
@@ -297,12 +297,12 @@ impl McpServerTool for CreateFileTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let abs_path = std::path::PathBuf::from(&input.path);
@@ -311,7 +311,7 @@ impl McpServerTool for CreateFileTool {
         }
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let fs: std::sync::Arc<dyn fs::Fs> = cx.update(|cx| project.read(cx).fs().clone());
@@ -336,7 +336,7 @@ impl McpServerTool for CreateFileTool {
 /// the path is not currently tracked by a worktree.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct DeleteFileParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file to delete. Must lie under one of the
     /// Solution's worktrees.
     pub path: String,
@@ -347,7 +347,7 @@ impl<'de> Deserialize<'de> for DeleteFileParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -377,16 +377,16 @@ impl McpServerTool for DeleteFileTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
@@ -424,7 +424,7 @@ impl McpServerTool for DeleteFileTool {
 /// also notifies the LSP layer.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RenameFileParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute source path. Must lie under one of the Solution's
     /// worktrees.
     pub from: String,
@@ -438,7 +438,7 @@ impl<'de> Deserialize<'de> for RenameFileParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             from: String,
             to: String,
         }
@@ -470,19 +470,19 @@ impl McpServerTool for RenameFileTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.from.is_empty(), "invalid_params: from is required");
         anyhow::ensure!(!input.to.is_empty(), "invalid_params: to is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.from, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.from, cx))
             .map_err(|err| anyhow::anyhow!("from: {err}"))?;
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.to, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.to, cx))
             .map_err(|err| anyhow::anyhow!("to: {err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let from_project_path = cx.update(|cx| resolve_project_path(&project, &input.from, cx))?;

@@ -30,7 +30,7 @@ pub(crate) fn register_visual_structure(cx: &mut App) {
 /// pane is focused"), NOT the full GPUI element tree.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct DumpVisualStructureParams {
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 impl<'de> Deserialize<'de> for DumpVisualStructureParams {
@@ -38,7 +38,7 @@ impl<'de> Deserialize<'de> for DumpVisualStructureParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -83,11 +83,11 @@ impl McpServerTool for DumpVisualStructureTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         let (tree, clickables) = cx
-            .update(|cx| build_visual_tree(&input.solution_id, cx))
+            .update(|cx| build_visual_tree(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
@@ -172,7 +172,7 @@ impl McpServerTool for DumpWindowStructureTool {
 }
 
 fn build_visual_tree(
-    solution_id: &str,
+    solution_id: i64,
     cx: &mut App,
 ) -> Option<(VisualNode, Vec<workspace::mcp::clickables::Clickable>)> {
     let handle = find_window_for_solution(solution_id, cx)?;

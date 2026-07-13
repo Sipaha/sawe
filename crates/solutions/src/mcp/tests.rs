@@ -367,26 +367,26 @@ use context_server::listener::McpServerTool;
     #[test]
     fn list_buffers_params_round_trip() {
         let p: ListBuffersParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo"
+            "solution_id": 7
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
     }
 
     #[test]
     fn list_buffers_params_accepts_null() {
         let p: ListBuffersParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
     }
 
     #[test]
     fn get_effective_settings_params_round_trip() {
         let p: GetEffectiveSettingsParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "src/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path.as_deref(), Some("src/foo.rs"));
     }
 
@@ -394,19 +394,19 @@ use context_server::listener::McpServerTool;
     fn get_effective_settings_params_accepts_null() {
         let p: GetEffectiveSettingsParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_none());
     }
 
     #[test]
     fn dispatch_action_params_with_args() {
         let p: DispatchActionParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "action_name": "workspace::ToggleLeftDock",
             "args": null
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.action_name, "workspace::ToggleLeftDock");
     }
 
@@ -414,20 +414,20 @@ use context_server::listener::McpServerTool;
     fn dispatch_action_params_accepts_null() {
         let p: DispatchActionParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.action_name.is_empty());
     }
 
     #[test]
     fn screenshot_params_round_trip() {
         let p: ScreenshotParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "format": "jpeg",
             "quality": 75,
             "max_dimension": 1280
         }))
         .expect("parse");
-        assert_eq!(p.solution_id.as_deref(), Some("demo"));
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.format.as_deref(), Some("jpeg"));
         assert_eq!(p.quality, Some(75));
         assert_eq!(p.max_dimension, Some(1280));
@@ -458,27 +458,27 @@ use context_server::listener::McpServerTool;
     #[test]
     fn dump_visual_params_round_trip() {
         let p: DumpVisualStructureParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo"
+            "solution_id": 7
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
     }
 
     #[test]
     fn dump_visual_params_accepts_null() {
         let p: DumpVisualStructureParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
     }
 
     #[test]
     fn diagnostics_params_round_trip() {
         let p: GetDiagnosticsParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "buffer_path": "src/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.buffer_path.as_deref(), Some("src/foo.rs"));
     }
 
@@ -486,20 +486,20 @@ use context_server::listener::McpServerTool;
     fn diagnostics_params_accepts_null() {
         let p: GetDiagnosticsParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.buffer_path.is_none());
     }
 
     #[test]
     fn list_files_params_round_trip() {
         let p: ListFilesParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "glob": "**/*.rs",
             "scope": "first_worktree",
             "max": 50
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.glob.as_deref(), Some("**/*.rs"));
         assert_eq!(p.scope.as_deref(), Some("first_worktree"));
         assert_eq!(p.max, Some(50));
@@ -508,7 +508,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn list_files_params_accepts_null() {
         let p: ListFilesParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.glob.is_none());
         assert!(p.scope.is_none());
         assert!(p.cursor.is_none());
@@ -520,7 +520,7 @@ use context_server::listener::McpServerTool;
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("c.json"), cx));
         cx.update(|cx| crate::store::install_global_for_test(store, cx));
-        let result = cx.update(|cx| validate_path_in_solution("any", "relative/path.rs", cx));
+        let result = cx.update(|cx| validate_path_in_solution(1, "relative/path.rs", cx));
         assert!(matches!(result, Err(PathValidationError::InvalidPath)));
     }
 
@@ -529,7 +529,7 @@ use context_server::listener::McpServerTool;
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("c.json"), cx));
         cx.update(|cx| crate::store::install_global_for_test(store, cx));
-        let result = cx.update(|cx| validate_path_in_solution("nonexistent", "/tmp/foo", cx));
+        let result = cx.update(|cx| validate_path_in_solution(999_999, "/tmp/foo", cx));
         assert!(matches!(result, Err(PathValidationError::SolutionNotFound)));
     }
 
@@ -543,10 +543,7 @@ use context_server::listener::McpServerTool;
                 s.create_solution("Sol", dir.path().to_path_buf(), cx)
             })
             .expect("create");
-        // `project.*` tools still take the solution id as a string on the wire;
-        // it is now the numeric id rendered as text.
-        let sol_id = sol_id.0.to_string();
-        let result = cx.update(|cx| validate_path_in_solution(&sol_id, "/etc/passwd", cx));
+        let result = cx.update(|cx| validate_path_in_solution(sol_id.0, "/etc/passwd", cx));
         assert!(matches!(
             result,
             Err(PathValidationError::PathOutsideSolution)
@@ -556,25 +553,25 @@ use context_server::listener::McpServerTool;
     #[test]
     fn read_buffer_params_round_trip() {
         let p: ReadBufferParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path, "/abs/foo.rs");
     }
 
     #[test]
     fn read_buffer_params_accepts_null() {
         let p: ReadBufferParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
     }
 
     #[test]
     fn apply_edit_params_round_trip() {
         let p: ApplyEditParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs",
             "edits": [{
                 "range": {"start": {"line": 0, "col": 0}, "end": {"line": 0, "col": 5}},
@@ -591,7 +588,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn apply_edit_params_accepts_null() {
         let p: ApplyEditParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
         assert!(p.edits.is_empty());
     }
@@ -599,30 +596,30 @@ use context_server::listener::McpServerTool;
     #[test]
     fn save_buffer_params_round_trip() {
         let p: SaveBufferParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path, "/abs/foo.rs");
     }
 
     #[test]
     fn save_buffer_params_accepts_null() {
         let p: SaveBufferParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
     }
 
     #[test]
     fn open_file_params_round_trip() {
         let p: OpenFileParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs",
             "focus": false
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.focus, Some(false));
     }
@@ -630,7 +627,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn open_file_params_accepts_null() {
         let p: OpenFileParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
         assert!(p.focus.is_none());
     }
@@ -638,12 +635,12 @@ use context_server::listener::McpServerTool;
     #[test]
     fn close_buffer_params_round_trip() {
         let p: CloseBufferParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs",
             "save": true
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.save, Some(true));
     }
@@ -651,7 +648,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn close_buffer_params_accepts_null() {
         let p: CloseBufferParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
         assert!(p.save.is_none());
     }
@@ -659,12 +656,12 @@ use context_server::listener::McpServerTool;
     #[test]
     fn create_file_params_round_trip() {
         let p: CreateFileParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs",
             "content": "hello"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.content.as_deref(), Some("hello"));
     }
@@ -672,7 +669,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn create_file_params_accepts_null() {
         let p: CreateFileParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
         assert!(p.content.is_none());
     }
@@ -680,30 +677,30 @@ use context_server::listener::McpServerTool;
     #[test]
     fn delete_file_params_round_trip() {
         let p: DeleteFileParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path, "/abs/foo.rs");
     }
 
     #[test]
     fn delete_file_params_accepts_null() {
         let p: DeleteFileParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
     }
 
     #[test]
     fn rename_file_params_round_trip() {
         let p: RenameFileParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "from": "/abs/old.rs",
             "to": "/abs/new.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.from, "/abs/old.rs");
         assert_eq!(p.to, "/abs/new.rs");
     }
@@ -711,7 +708,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn rename_file_params_accepts_null() {
         let p: RenameFileParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.from.is_empty());
         assert!(p.to.is_empty());
     }
@@ -719,7 +716,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn find_in_buffers_params_round_trip() {
         let p: FindInBuffersParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "query": "TODO",
             "case_sensitive": true,
             "regex": false,
@@ -729,7 +726,7 @@ use context_server::listener::McpServerTool;
             "max": 50
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.query, "TODO");
         assert_eq!(p.case_sensitive, Some(true));
         assert_eq!(p.regex, Some(false));
@@ -742,7 +739,7 @@ use context_server::listener::McpServerTool;
     #[test]
     fn find_in_buffers_params_accepts_null() {
         let p: FindInBuffersParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.query.is_empty());
         assert!(p.case_sensitive.is_none());
         assert!(p.regex.is_none());
@@ -755,13 +752,13 @@ use context_server::listener::McpServerTool;
     #[test]
     fn goto_definition_params_round_trip() {
         let p: GotoDefinitionParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs",
             "line": 12,
             "col": 4
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.line, 12);
         assert_eq!(p.col, 4);
@@ -771,7 +768,7 @@ use context_server::listener::McpServerTool;
     fn goto_definition_params_accepts_null() {
         let p: GotoDefinitionParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
         assert_eq!(p.line, 0);
         assert_eq!(p.col, 0);
@@ -780,14 +777,14 @@ use context_server::listener::McpServerTool;
     #[test]
     fn find_references_params_round_trip() {
         let p: FindReferencesParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 7,
             "path": "/abs/foo.rs",
             "line": 7,
             "col": 9,
             "include_declaration": true
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
         assert_eq!(p.path, "/abs/foo.rs");
         assert_eq!(p.line, 7);
         assert_eq!(p.col, 9);
@@ -798,7 +795,7 @@ use context_server::listener::McpServerTool;
     fn find_references_params_accepts_null() {
         let p: FindReferencesParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
         assert!(p.path.is_empty());
         assert_eq!(p.line, 0);
         assert_eq!(p.col, 0);

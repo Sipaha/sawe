@@ -19,7 +19,7 @@ use std::cell::RefCell;
 pub struct Subscription {
     pub id: String,
     pub kinds: Vec<String>,
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
     pub filter: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
@@ -40,7 +40,7 @@ pub fn init(cx: &mut App) {
 
 pub fn create(
     kinds: Vec<String>,
-    solution_id: Option<String>,
+    solution_id: Option<i64>,
     filter: Option<serde_json::Value>,
     cx: &mut App,
 ) -> String {
@@ -89,7 +89,7 @@ mod tests {
     async fn create_list_delete(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let id1 = create(vec!["op_progress".into()], None, None, cx);
-            let id2 = create(vec!["buffer_saved".into()], Some("sol-1".into()), None, cx);
+            let id2 = create(vec!["buffer_saved".into()], Some(1), None, cx);
             let listed = list(cx);
             assert_eq!(listed.len(), 2);
             assert!(delete(&id1, cx));

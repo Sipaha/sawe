@@ -30,7 +30,7 @@ pub(crate) fn register_diagnostics(cx: &mut App) {
 /// detail (`"info"`, `"hint"`).
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GetDiagnosticsParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_path: Option<String>,
 }
@@ -40,7 +40,7 @@ impl<'de> Deserialize<'de> for GetDiagnosticsParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             buffer_path: Option<String>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -98,7 +98,7 @@ impl McpServerTool for GetDiagnosticsTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         let summaries = cx.update(|cx| collect_diagnostic_summaries(&input, cx));
@@ -126,7 +126,7 @@ fn collect_diagnostic_summaries(
     let Some(root) = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.0.to_string() == input.solution_id)
+            .find(|sol| sol.id.0 == input.solution_id)
             .map(|sol| sol.root.clone())
     }) else {
         return Vec::new();
@@ -195,7 +195,7 @@ async fn collect_diagnostic_items(
     input: &GetDiagnosticsParams,
     cx: &mut AsyncApp,
 ) -> Vec<DiagnosticItem> {
-    let Some(project) = cx.update(|cx| project_for_solution(&input.solution_id, cx)) else {
+    let Some(project) = cx.update(|cx| project_for_solution(input.solution_id, cx)) else {
         return Vec::new();
     };
 

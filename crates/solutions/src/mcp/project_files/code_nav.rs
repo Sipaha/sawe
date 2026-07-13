@@ -28,7 +28,7 @@ use super::{EditPoint, project_for_solution, resolve_project_path, validate_path
 /// (when the project owns extra worktrees) are filtered out post-hoc.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct FindInBuffersParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Substring or regex pattern.
     pub query: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,7 +54,7 @@ impl<'de> Deserialize<'de> for FindInBuffersParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             query: String,
             case_sensitive: Option<bool>,
             regex: Option<bool>,
@@ -114,7 +114,7 @@ impl McpServerTool for FindInBuffersTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.query.is_empty(), "invalid_params: query is required");
@@ -129,7 +129,7 @@ impl McpServerTool for FindInBuffersTool {
                     store.read_with(cx, |s, _| {
                         s.solutions()
                             .iter()
-                            .find(|sol| sol.id.0.to_string() == input.solution_id)
+                            .find(|sol| sol.id.0 == input.solution_id)
                             .map(|sol| sol.root.clone())
                     })
                 })
@@ -137,7 +137,7 @@ impl McpServerTool for FindInBuffersTool {
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         // Build the SearchQuery. We pass the optional file_glob through
@@ -312,7 +312,7 @@ impl McpServerTool for FindInBuffersTool {
 /// server provides definitions for the file (not an error).
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GotoDefinitionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file. Must lie under one of the Solution's
     /// worktrees.
     pub path: String,
@@ -327,7 +327,7 @@ impl<'de> Deserialize<'de> for GotoDefinitionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
             line: u32,
             col: u32,
@@ -371,16 +371,16 @@ impl McpServerTool for GotoDefinitionTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
@@ -459,7 +459,7 @@ fn location_to_ref(location: &language::Location, cx: &App) -> LocationRef {
 /// provides references for the file (not an error).
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct FindReferencesParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file. Must lie under one of the Solution's
     /// worktrees.
     pub path: String,
@@ -477,7 +477,7 @@ impl<'de> Deserialize<'de> for FindReferencesParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
             line: u32,
             col: u32,
@@ -513,16 +513,16 @@ impl McpServerTool for FindReferencesTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;

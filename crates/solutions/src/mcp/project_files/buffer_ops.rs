@@ -18,7 +18,7 @@ use crate::mcp::workspace_state::find_window_for_solution;
 /// without creating a tab; calling again is idempotent.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ReadBufferParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file to read. Must lie under one of the
     /// Solution's worktrees.
     pub path: String,
@@ -29,7 +29,7 @@ impl<'de> Deserialize<'de> for ReadBufferParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -63,16 +63,16 @@ impl McpServerTool for ReadBufferTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
@@ -114,7 +114,7 @@ impl McpServerTool for ReadBufferTool {
 /// not performed automatically.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ApplyEditParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file to edit. Must lie under one of the
     /// Solution's worktrees.
     pub path: String,
@@ -127,7 +127,7 @@ impl<'de> Deserialize<'de> for ApplyEditParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
             #[serde(default)]
             edits: Vec<EditSpec>,
@@ -167,7 +167,7 @@ impl McpServerTool for ApplyEditTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
@@ -176,11 +176,11 @@ impl McpServerTool for ApplyEditTool {
             "invalid_params: at least one edit is required"
         );
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
@@ -229,7 +229,7 @@ impl McpServerTool for ApplyEditTool {
 /// hooks; calling on a clean buffer is a no-op.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct SaveBufferParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file to save. Must lie under one of the
     /// Solution's worktrees.
     pub path: String,
@@ -240,7 +240,7 @@ impl<'de> Deserialize<'de> for SaveBufferParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -271,16 +271,16 @@ impl McpServerTool for SaveBufferTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
@@ -315,7 +315,7 @@ impl McpServerTool for SaveBufferTool {
 /// adds it to the active pane.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct OpenFileParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file to open. Must lie under one of the
     /// Solution's worktrees.
     pub path: String,
@@ -329,7 +329,7 @@ impl<'de> Deserialize<'de> for OpenFileParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
             focus: Option<bool>,
         }
@@ -362,24 +362,24 @@ impl McpServerTool for OpenFileTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let focus = input.focus.unwrap_or(true);
         let window_handle = cx
-            .update(|cx| find_window_for_solution(&input.solution_id, cx))
+            .update(|cx| find_window_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
         let typed_window = window_handle
             .downcast::<workspace::MultiWorkspace>()
             .ok_or_else(|| anyhow::anyhow!("window_not_multi_workspace"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;
@@ -417,7 +417,7 @@ impl McpServerTool for OpenFileTool {
 /// uses `SaveIntent::Skip` to avoid prompting the user.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct CloseBufferParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Absolute path of the file whose tab should be closed. Must lie
     /// under one of the Solution's worktrees.
     pub path: String,
@@ -431,7 +431,7 @@ impl<'de> Deserialize<'de> for CloseBufferParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             path: String,
             save: Option<bool>,
         }
@@ -464,25 +464,25 @@ impl McpServerTool for CloseBufferTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(!input.path.is_empty(), "invalid_params: path is required");
 
-        cx.update(|cx| validate_path_in_solution(&input.solution_id, &input.path, cx))
+        cx.update(|cx| validate_path_in_solution(input.solution_id, &input.path, cx))
             .map_err(|err| anyhow::anyhow!("{err}"))?;
 
         let save = input.save.unwrap_or(false);
 
         let window_handle = cx
-            .update(|cx| find_window_for_solution(&input.solution_id, cx))
+            .update(|cx| find_window_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
         let typed_window = window_handle
             .downcast::<workspace::MultiWorkspace>()
             .ok_or_else(|| anyhow::anyhow!("window_not_multi_workspace"))?;
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(input.solution_id, cx))
             .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
 
         let project_path = cx.update(|cx| resolve_project_path(&project, &input.path, cx))?;

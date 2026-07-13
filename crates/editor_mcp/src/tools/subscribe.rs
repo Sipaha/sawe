@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct SubscribeParams {
     /// Optional Solution scope. Omit for global subscription.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
     /// List of event kinds to subscribe to (e.g., `operation_progress`).
     pub kinds: Vec<String>,
     /// Optional filter object (kind-specific).
@@ -26,7 +26,7 @@ impl<'de> Deserialize<'de> for SubscribeParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: Option<String>,
+            solution_id: Option<i64>,
             kinds: Vec<String>,
             filter: Option<serde_json::Value>,
         }
@@ -151,7 +151,7 @@ pub struct SubscriptionInfo {
     pub id: String,
     pub kinds: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<serde_json::Value>,
     pub created_at: String,
