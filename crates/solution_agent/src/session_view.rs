@@ -1719,8 +1719,15 @@ impl Render for SolutionSessionView {
                 h_flex()
                     .id("compose-row-disabled")
                     .w_full()
+                    .flex_none()
+                    // Match the compose row's exact height (see the `else` arm:
+                    // `compose_height + 3px` for its resize handle). A
+                    // content-sized row here made the whole conversation jump
+                    // vertically every time the user flipped between the Main
+                    // pill and a shell pill — the strip and transcript above it
+                    // shift by the height delta on each switch.
+                    .h(self.compose_height + px(3.0))
                     .px_3()
-                    .py_2()
                     .bg(cx.theme().colors().panel_background)
                     .border_t_1()
                     .border_color(cx.theme().colors().border_variant)
