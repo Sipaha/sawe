@@ -2818,7 +2818,10 @@ mod tests {
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
                     assert_eq!(workspace.worktrees(cx).count(), 2);
-                    assert!(workspace.right_dock().read(cx).is_open());
+                    // Opening paths into an existing window reveals the
+                    // project panel's dock. Sawe docks the project panel
+                    // LEFT (upstream: right) — see `assets/settings/default.json`.
+                    assert!(workspace.left_dock().read(cx).is_open());
                     assert!(
                         workspace
                             .active_pane()
@@ -3040,6 +3043,7 @@ mod tests {
     async fn test_window_edit_state_restoring_disabled(cx: &mut TestAppContext) {
         let executor = cx.executor();
         let app_state = init_test(cx);
+        disable_autosave(cx);
 
         cx.update(|cx| {
             SettingsStore::update_global(cx, |store, cx| {
@@ -4270,6 +4274,7 @@ mod tests {
     #[gpui::test]
     async fn test_pane_actions(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
+        disable_autosave(cx);
         app_state
             .fs
             .as_fake()
@@ -4376,7 +4381,10 @@ mod tests {
             .unwrap();
         let cx = &mut VisualTestContext::from_window(*window, cx);
 
-        let mouse_position = point(px(250.), px(250.));
+        // Must land inside the editor. Sawe docks the project panel LEFT
+        // (upstream: right), so the upstream x=250 now falls inside the
+        // project panel and the scroll never reaches the editor.
+        let mouse_position = point(px(600.), px(300.));
 
         let event_modifiers = {
             #[cfg(target_os = "macos")]
@@ -5335,6 +5343,8 @@ mod tests {
                 "collab_panel",
                 "command_palette",
                 "console",
+                // Sawe: fork-local panel (terminals + solution_agent chats).
+                "console_panel",
                 "context_server",
                 "copilot",
                 "csv",
@@ -5361,7 +5371,6 @@ mod tests {
                 "keymap_editor",
                 "keystroke_input",
                 "language_selector",
-                "welcome",
                 "line_ending_selector",
                 "lsp_tool",
                 "markdown",
@@ -5382,11 +5391,18 @@ mod tests {
                 "recent_projects",
                 "remote_debug",
                 "repl",
+                // Sawe: fork-local run configurations.
+                "run_config",
                 "search",
                 "settings_editor",
                 "settings_profile_selector",
                 "skill_creator",
                 "snippets",
+                // Sawe: fork-local Solutions / solution-scoped AI surfaces.
+                "solution_agent",
+                "solution_git",
+                "solutions",
+                "solutions_ui",
                 "stash_picker",
                 "svg",
                 "syntax_tree_view",
@@ -5561,6 +5577,35 @@ mod tests {
         init_test_with_state(cx, cx.update(AppState::test))
     }
 
+    /// Sawe defaults `autosave` to `on_focus_change` (IDEA convention, see
+    /// `assets/settings/default.json`), and an autosaving buffer is saved on
+    /// close instead of prompting. Tests that exercise the save-prompt path
+    /// have to opt back into upstream's manual-save default.
+    fn disable_autosave(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.autosave = Some(settings::AutosaveSetting::Off);
+                });
+            });
+        });
+    }
+
+    /// Sawe defaults `restore_on_startup` to `launchpad` (always land on the
+    /// Welcome/Solutions page — see `assets/settings/default.json` and FORK.md
+    /// §10), which makes `restore_or_create_workspace` restore nothing. Tests
+    /// that exercise session restore have to ask for it explicitly.
+    fn restore_last_session_on_startup(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.restore_on_startup =
+                        Some(settings::RestoreOnStartupBehavior::LastSession);
+                });
+            });
+        });
+    }
+
     fn init_test_with_state(
         cx: &mut TestAppContext,
         mut app_state: Arc<AppState>,
@@ -5573,8 +5618,32 @@ mod tests {
             app_state.languages.add(markdown_lang());
 
             gpui_tokio::init(cx);
+            // Without a per-App database, `AppDatabase::global` falls back to a
+            // process-wide in-memory DB shared by every test in this binary.
+            // Tests then see each other's rows — and because window ids restart
+            // at 1 in every test App, the window-keyed multi-workspace state of
+            // one test gets restored into another's window. Give each test its
+            // own connection.
+            cx.set_global(db::AppDatabase::test_new());
             AppState::set_global(app_state.clone(), cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            // `initialize_workspace` installs fork-local status items
+            // (`SolutionsStatusItem`) that read the `SolutionStore` global.
+            // Production installs it in `solutions::init` long before the
+            // first window opens; the real `init` needs an on-disk DB, so
+            // tests get the in-memory equivalent instead.
+            solutions::SolutionsSettings::register(cx);
+            let solution_store =
+                solutions::SolutionStore::for_test(paths::config_dir().join("solutions.json"), cx);
+            solutions::install_global_for_test(solution_store, cx);
+            // Same story for the `SolutionAgentStore` global that
+            // `ConsolePanel::load` reads. Persistence is opt-in
+            // (`set_persistence`), so a store built here touches no DB.
+            solution_agent::agent_settings::SolutionAgentSettings::register(cx);
+            solution_agent::store::SolutionAgentStore::init_global(
+                cx,
+                Arc::new(solution_agent::adapter::AdapterRegistry::new()),
+            );
             audio::init(cx);
             channel::init(&app_state.client, app_state.user_store.clone(), cx);
             call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
@@ -6090,6 +6159,7 @@ mod tests {
     #[gpui::test]
     async fn test_quit_checks_all_workspaces_for_dirty_items(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
+        disable_autosave(cx);
         cx.update(init);
 
         app_state
@@ -6378,6 +6448,7 @@ mod tests {
         use workspace::{OpenMode, ProjectGroupKey, Workspace, WorkspaceId};
 
         let app_state = init_test(cx);
+        restore_last_session_on_startup(cx);
 
         let dir1 = path!("/dir1");
         let dir2 = path!("/dir2");
@@ -6594,6 +6665,7 @@ mod tests {
         use workspace::{OpenMode, Workspace};
 
         let app_state = init_test(cx);
+        restore_last_session_on_startup(cx);
         cx.update(init);
 
         let dir1 = path!("/dir1");
@@ -6734,6 +6806,7 @@ mod tests {
         use workspace::{OpenMode, ProjectGroupKey};
 
         let app_state = init_test(cx);
+        restore_last_session_on_startup(cx);
 
         let fs = app_state.fs.clone();
         let fake_fs = fs.as_fake();
