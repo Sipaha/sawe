@@ -1664,7 +1664,7 @@ and docs.
 
 **Steps**
 
-- [ ] Add a failing test to `crates/solutions/src/mcp/tests.rs`:
+- [x] Add a failing test to `crates/solutions/src/mcp/tests.rs`:
       ```rust
       #[test]
       fn workspace_list_buffers_accepts_an_absent_solution_id() {
@@ -1675,15 +1675,15 @@ and docs.
       ```
       (Adjust the struct name to whatever `workspace_state.rs:36` actually
       declares.)
-- [ ] Run `cargo test -p solutions --lib workspace_list_buffers_accepts` — expect
+- [x] Run `cargo test -p solutions --lib workspace_list_buffers_accepts` — expect
       a **failure**: ``missing field `solution_id` `` or a type mismatch on
       `assert_eq!(params.solution_id, None)`.
-- [ ] Flip the four params structs + their `Inner` shadows to `Option<String>` and
+- [x] Flip the four params structs + their `Inner` shadows to `Option<String>` and
       route every handler through `crate::mcp::resolve_solution_id(input.solution_id)?`,
       exactly as in task 3.2.
-- [ ] Run `cargo test -p solutions --lib` — expect the new test to pass and no
+- [x] Run `cargo test -p solutions --lib` — expect the new test to pass and no
       regressions.
-- [ ] Commit: `Make solution_id optional in the workspace.* MCP tools`
+- [x] Commit: `Make solution_id optional in the workspace.* MCP tools`
 
 ## Task 3.4 — flip `project.*`
 

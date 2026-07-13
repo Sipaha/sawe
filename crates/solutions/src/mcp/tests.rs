@@ -370,13 +370,13 @@ use context_server::listener::McpServerTool;
             "solution_id": 7
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
     }
 
     #[test]
     fn list_buffers_params_accepts_null() {
         let p: ListBuffersParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
     }
 
     #[test]
@@ -386,7 +386,7 @@ use context_server::listener::McpServerTool;
             "path": "src/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.path.as_deref(), Some("src/foo.rs"));
     }
 
@@ -394,7 +394,7 @@ use context_server::listener::McpServerTool;
     fn get_effective_settings_params_accepts_null() {
         let p: GetEffectiveSettingsParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.path.is_none());
     }
 
@@ -406,7 +406,7 @@ use context_server::listener::McpServerTool;
             "args": null
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.action_name, "workspace::ToggleLeftDock");
     }
 
@@ -414,7 +414,7 @@ use context_server::listener::McpServerTool;
     fn dispatch_action_params_accepts_null() {
         let p: DispatchActionParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.action_name.is_empty());
     }
 
@@ -461,14 +461,14 @@ use context_server::listener::McpServerTool;
             "solution_id": 7
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
     }
 
     #[test]
     fn dump_visual_params_accepts_null() {
         let p: DumpVisualStructureParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
     }
 
     #[test]
@@ -902,4 +902,18 @@ use context_server::listener::McpServerTool;
             .map(|values| values.iter().any(|value| value == "solution_id"))
             .unwrap_or(false);
         assert!(!required, "solution_id must no longer be required");
+    }
+
+    #[test]
+    fn workspace_list_buffers_accepts_an_absent_solution_id() {
+        let params: ListBuffersParams =
+            serde_json::from_value(serde_json::json!({})).expect("deserialize");
+        assert_eq!(params.solution_id, None);
+    }
+
+    #[test]
+    fn workspace_dump_visual_structure_accepts_an_absent_solution_id() {
+        let params: DumpVisualStructureParams =
+            serde_json::from_value(serde_json::json!({})).expect("deserialize");
+        assert_eq!(params.solution_id, None);
     }

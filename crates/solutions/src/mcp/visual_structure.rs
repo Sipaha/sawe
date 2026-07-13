@@ -30,7 +30,11 @@ pub(crate) fn register_visual_structure(cx: &mut App) {
 /// pane is focused"), NOT the full GPUI element tree.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct DumpVisualStructureParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
 }
 
 impl<'de> Deserialize<'de> for DumpVisualStructureParams {
@@ -38,7 +42,7 @@ impl<'de> Deserialize<'de> for DumpVisualStructureParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -82,18 +86,15 @@ impl McpServerTool for DumpVisualStructureTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
         let (tree, clickables) = cx
-            .update(|cx| build_visual_tree(input.solution_id, cx))
-            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", input.solution_id))?;
+            .update(|cx| build_visual_tree(solution_id, cx))
+            .ok_or_else(|| anyhow::anyhow!("solution_not_open: {}", solution_id))?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: format!(
                     "structure for {} ({} clickables)",
-                    input.solution_id,
+                    solution_id,
                     clickables.len()
                 ),
             }],

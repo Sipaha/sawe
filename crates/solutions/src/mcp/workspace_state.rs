@@ -33,7 +33,11 @@ pub(crate) fn register_workspace_state(cx: &mut App) {
 /// window is currently open for the Solution.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ListBuffersParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
 }
 
 impl<'de> Deserialize<'de> for ListBuffersParams {
@@ -41,7 +45,7 @@ impl<'de> Deserialize<'de> for ListBuffersParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
         }
         Ok(Self {
             solution_id: Option::<Inner>::deserialize(de)?
@@ -78,11 +82,8 @@ impl McpServerTool for ListBuffersTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
-        let buffers = cx.update(|cx| collect_buffers(input.solution_id, cx));
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
+        let buffers = cx.update(|cx| collect_buffers(solution_id, cx));
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: format!("{} buffer(s)", buffers.len()),
@@ -187,7 +188,11 @@ fn collect_buffers(solution_id: i64, cx: &mut App) -> Vec<BufferInfo> {
 /// but does not change the response.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GetEffectiveSettingsParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }
@@ -197,7 +202,7 @@ impl<'de> Deserialize<'de> for GetEffectiveSettingsParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
             path: Option<String>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -226,10 +231,7 @@ impl McpServerTool for GetEffectiveSettingsTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
+        crate::mcp::resolve_solution_id(input.solution_id)?;
         let settings = cx.update(|cx| -> serde_json::Value {
             // `merged_settings` returns the default+user+profile-resolved view.
             // Path-scoped resolution requires `SettingsLocation`, which we
@@ -263,7 +265,11 @@ impl McpServerTool for GetEffectiveSettingsTool {
 /// when no window is currently open for the Solution.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct DispatchActionParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     pub action_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
@@ -274,7 +280,7 @@ impl<'de> Deserialize<'de> for DispatchActionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
             action_name: String,
             args: Option<serde_json::Value>,
         }
@@ -305,17 +311,14 @@ impl McpServerTool for DispatchActionTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
         anyhow::ensure!(
             !input.action_name.is_empty(),
             "invalid_params: action_name is required"
         );
         let action_name = input.action_name.clone();
         let dispatched = cx.update(|cx| -> Result<bool> {
-            let Some(handle) = find_window_for_solution(input.solution_id, cx) else {
+            let Some(handle) = find_window_for_solution(solution_id, cx) else {
                 return Ok(false);
             };
             // Build the action up-front so a deserialization error surfaces
