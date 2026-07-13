@@ -54,14 +54,43 @@ pub fn active_solution_id_for_workspace(workspace: &Workspace, cx: &App) -> Opti
     None
 }
 
-/// Whether the workspace has any project directory to run a terminal in. An
-/// empty Solution has 0 member projects → 0 worktrees, so a terminal has
-/// nowhere to run and is refused. A Solution with members (or a plain folder)
-/// has ≥1 worktree and is allowed. Takes `&Workspace` directly so it is safe
-/// to call from action handlers that already hold the `Workspace` leased
-/// (reading the entity via `cx` there would double-lease-panic).
-pub fn workspace_has_worktree(workspace: &Workspace, cx: &App) -> bool {
-    workspace.project().read(cx).worktrees(cx).next().is_some()
+/// Whether this workspace has a project to run a terminal / AI chat in — the
+/// gate on both console tab kinds ("+" menu state, `NewTerminal`, `NewChat`,
+/// reopen-session).
+///
+/// For a **Solution** workspace the authoritative answer is its member list, not
+/// its worktrees: `solutions_ui::open` opens an EMPTY solution with the solution
+/// root as an *invisible* worktree (`OpenVisible::None`), and the old
+/// `project.worktrees()` check counted invisible worktrees — so the guard passed
+/// for exactly the case it existed to block, and a chat created there fell back
+/// to `solution.root` and rendered as `ROOT`. `Solution::members` is the single
+/// source of truth for "which projects are in this solution" (plan 1's numeric
+/// `MemberId`s), so ask it directly.
+///
+/// A plain folder workspace (not a Solution) has no member list; there the
+/// question really is "is a project directory open", which means a VISIBLE
+/// worktree — an invisible one is a stray single file, not a project.
+///
+/// Takes `&Workspace` directly so it is safe to call from action handlers that
+/// already hold the `Workspace` leased (reading the entity via `cx` there would
+/// double-lease-panic).
+pub fn workspace_has_project(workspace: &Workspace, cx: &App) -> bool {
+    if let Some(solution_id) = active_solution_id_for_workspace(workspace, cx)
+        && let Some(store) = SolutionStore::try_global(cx)
+    {
+        return store
+            .read(cx)
+            .solutions()
+            .iter()
+            .find(|solution| solution.id == solution_id)
+            .is_some_and(|solution| !solution.members.is_empty());
+    }
+    workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .is_some()
 }
 
 /// Folder of the solution's *active* project — the one selected in the
@@ -827,13 +856,13 @@ impl ConsolePanel {
         // after the chat is created, before the first message is sent.
         let active_path = active_solution_id.and_then(|id| active_member_path(id, cx));
         // A terminal needs a project directory to run in. An empty solution has
-        // 0 worktrees, so grey out "New Terminal" (the action handlers enforce
-        // the same rule for the keyboard path). A non-empty solution or a plain
-        // folder has a worktree and is allowed.
+        // no member project, so grey out "New Terminal" (the action handlers
+        // enforce the same rule for the keyboard path). A non-empty solution, or a
+        // plain folder with a visible worktree, is allowed.
         let has_project = self
             .workspace
             .upgrade()
-            .is_some_and(|ws| workspace_has_worktree(ws.read(cx), cx));
+            .is_some_and(|ws| workspace_has_project(ws.read(cx), cx));
         // Read the project handle here, in render context, where nothing is
         // leased — `add_chat_tab_with_cwd` no longer reads it from the
         // Workspace entity (see its doc comment: the action path holds the
@@ -1103,9 +1132,9 @@ impl ConsolePanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        // No project directory to run in (an empty solution has 0 worktrees) →
-        // refuse both the center-pane and the console-panel spawn below.
-        if !workspace_has_worktree(workspace, cx) {
+        // No project directory to run in (an empty solution has no member
+        // project) → refuse both the center-pane and the console-panel spawn.
+        if !workspace_has_project(workspace, cx) {
             return;
         }
         let center_pane = workspace.active_pane();
@@ -1698,11 +1727,11 @@ impl ConsolePanel {
             return;
         };
         // Defense in depth, mirroring the `NewChat` action: the menu entry is
-        // disabled without a worktree, but the handler must refuse too — a
+        // disabled without a project, but the handler must refuse too — a
         // reopened session resumes an agent, and an empty solution gives it
         // nowhere to run. An EMPTY solution still resolves an `active_solution_id`
         // (it IS the active solution), so the guard above does not cover this.
-        if !workspace_has_worktree(workspace.read(cx), cx) {
+        if !workspace_has_project(workspace.read(cx), cx) {
             return;
         }
         // Closed sessions live only on disk (close_session evicts them from
@@ -2156,8 +2185,91 @@ mod tests {
         });
     }
 
+    /// Regression: the empty-solution guard used to ask
+    /// `project.worktrees()`, which COUNTS INVISIBLE worktrees — and
+    /// `solutions_ui::open` opens an empty solution with its root as an
+    /// *invisible* worktree (`OpenVisible::None`). So the guard passed for
+    /// exactly the case it existed to block: "New AI Chat" / "New Terminal"
+    /// stayed enabled in a solution with no projects, and the chat it created
+    /// fell back to `solution.root` and rendered as `ROOT`.
+    ///
+    /// The guard now asks the authoritative thing — the Solution's member list.
     #[gpui::test]
-    async fn workspace_has_worktree_gates_on_project_dirs(cx: &mut TestAppContext) {
+    async fn empty_solution_with_an_invisible_root_worktree_has_no_project(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (solution_id, solution_root) = cx.update(|cx| {
+            let store = SolutionStore::for_test(std::path::PathBuf::from("/cfg.json"), cx);
+            let out = store.update(cx, |store, cx| {
+                let id = store.create_for_test_minimal("Empty", cx);
+                let root = store
+                    .solutions()
+                    .iter()
+                    .find(|sol| sol.id == id)
+                    .map(|sol| sol.root.clone())
+                    .expect("just-created solution");
+                (id, root)
+            });
+            solutions::install_global_for_test(store, cx);
+            out
+        });
+        let member_path = solution_root.join("proj");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(&solution_root, serde_json::json!({"proj": {}}))
+            .await;
+
+        // A Project with NO visible worktree, plus the solution root as an
+        // INVISIBLE one — precisely the shape `solutions_ui::open` builds for an
+        // empty solution.
+        let project = Project::test(fs, [] as [&std::path::Path; 0], cx).await;
+        // Keep the handle alive: `WorktreeStore` holds worktrees weakly.
+        let _invisible_worktree = project
+            .update(cx, |project, cx| {
+                project.create_worktree(&solution_root, false, cx)
+            })
+            .await
+            .expect("invisible worktree");
+        cx.run_until_parked();
+        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+
+        window
+            .update(cx, |workspace, _window, cx| {
+                assert!(
+                    workspace.project().read(cx).worktrees(cx).next().is_some(),
+                    "precondition: the invisible root worktree is there — it is what the \
+                     old `worktrees()` check tripped over"
+                );
+                assert!(
+                    !workspace_has_project(workspace, cx),
+                    "a Solution with zero members has no project to run a chat/terminal in, \
+                     however many invisible worktrees its workspace carries"
+                );
+            })
+            .unwrap();
+
+        // Give the Solution a member: the same workspace now hosts a project.
+        cx.update(|cx| {
+            let store = SolutionStore::global(cx);
+            store.update(cx, |store, _| {
+                store.test_add_member_with_path(solution_id, "proj", member_path.clone());
+            });
+        });
+        window
+            .update(cx, |workspace, _window, cx| {
+                assert!(
+                    workspace_has_project(workspace, cx),
+                    "a Solution with a member project must allow a chat/terminal"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn workspace_has_project_gates_on_project_dirs(cx: &mut TestAppContext) {
         // The signal the terminal entry points (keyboard `NewTerminal`,
         // `handle_new_terminal`, and the "+" menu's disabled state) use to
         // block a terminal in an empty solution: no worktree => no project
@@ -2168,7 +2280,7 @@ mod tests {
         empty_window
             .update(cx, |workspace, _window, cx| {
                 assert!(
-                    !workspace_has_worktree(workspace, cx),
+                    !workspace_has_project(workspace, cx),
                     "an empty solution (no worktrees) must report no project"
                 );
             })
@@ -2178,7 +2290,7 @@ mod tests {
         window
             .update(cx, |workspace, _window, cx| {
                 assert!(
-                    workspace_has_worktree(workspace, cx),
+                    workspace_has_project(workspace, cx),
                     "a solution with a project worktree must report a project"
                 );
             })

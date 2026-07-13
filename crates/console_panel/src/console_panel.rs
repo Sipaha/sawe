@@ -18,10 +18,10 @@ pub fn init(cx: &mut gpui::App) {
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
-            // No project directory to run in (an empty solution has 0
-            // worktrees) → refuse. A non-empty solution or a plain folder has a
-            // worktree and is allowed.
-            if !panel::workspace_has_worktree(workspace, cx) {
+            // No project directory to run in (an empty solution has 0 member
+            // projects) → refuse. A non-empty solution or a plain folder with a
+            // visible worktree is allowed.
+            if !panel::workspace_has_project(workspace, cx) {
                 return;
             }
             if let Some(panel) = workspace.panel::<ConsolePanel>(cx) {
@@ -29,10 +29,11 @@ pub fn init(cx: &mut gpui::App) {
             }
         });
         workspace.register_action(|workspace, _: &NewChat, window, cx| {
-            // Same gate as `NewTerminal`: an empty solution has 0 worktrees, so
-            // there is no directory for the agent to work in. Without this the
-            // keybinding walked straight past the menu entry's disabled state.
-            if !panel::workspace_has_worktree(workspace, cx) {
+            // Same gate as `NewTerminal`: an empty solution has no member
+            // project, so there is no directory for the agent to work in. Without
+            // this the keybinding walked straight past the menu entry's disabled
+            // state.
+            if !panel::workspace_has_project(workspace, cx) {
                 return;
             }
             let Some(solution_id) = panel::active_solution_id_for_workspace(workspace, cx) else {
