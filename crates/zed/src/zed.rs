@@ -73,7 +73,6 @@ use settings::{
     VIM_KEYMAP_PATH, initial_local_debug_tasks_content, initial_project_settings_content,
     initial_tasks_content, update_settings_file,
 };
-use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 

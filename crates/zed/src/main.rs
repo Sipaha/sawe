@@ -1752,7 +1752,7 @@ async fn open_solution_by_name_or_id(
     let opened = task.await?;
 
     if resolved.is_empty {
-        let sol_id = resolved.id.clone();
+        let sol_id = resolved.id;
         let name = resolved.name.clone();
         cx.update(|cx| {
             opened
@@ -1763,7 +1763,7 @@ async fn open_solution_by_name_or_id(
                     workspace.update(cx, |ws, cx| {
                         let page = cx.new(|cx| {
                             solutions_ui::EmptySolutionPage::new(
-                                sol_id.clone(),
+                                sol_id,
                                 name.clone(),
                                 weak_workspace,
                                 cx,

@@ -10401,10 +10401,6 @@ async fn compute_snapshot(
         )
     });
 
-    let branches_future = {
-        let backend = backend.clone();
-        async move { backend.branches().await.log_err().unwrap_or_default() }
-    };
     let head_commit_future = {
         let backend = backend.clone();
         async move {

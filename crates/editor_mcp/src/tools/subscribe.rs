@@ -64,7 +64,7 @@ impl McpServerTool for SubscribeTool {
         let id = cx.update(|cx| {
             crate::sub_create(
                 input.kinds.clone(),
-                input.solution_id.clone(),
+                input.solution_id,
                 input.filter.clone(),
                 cx,
             )
