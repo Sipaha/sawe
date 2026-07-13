@@ -58,8 +58,17 @@ impl PathRewrite {
 
 /// Rewrite every path-bearing row of the shared `AppDatabase` file
 /// (`solutions`, `solution_members`, `workspaces`, `console_panel_state`,
-/// `editors`, `terminals`, `breakpoints`, `bookmarks`, `trusted_worktrees`)
-/// and drop the toolchain rows whose key is a stale path.
+/// `editors`, `terminals`, `breakpoints`, `bookmarks`, `file_folds`,
+/// `vim_marks`, `vim_global_marks_paths`, `image_viewers`, `git_graphs`,
+/// `undo_entries`, `trusted_worktrees`) and drop the toolchain rows whose key is
+/// a stale path.
+///
+/// Deliberately *not* rewritten: `shelf_entries`, `branch_favorites`,
+/// `branch_recent` and `pre_commit_configs` are keyed by `repo_hash` — a
+/// `DefaultHasher` digest of the repo's absolute path, not the path itself — so
+/// there is no prefix to rewrite; their rows are simply re-keyed (and orphaned)
+/// by a move. The `agent_ui` thread tables hold paths too, but that panel is
+/// disabled in this fork and never writes them.
 ///
 /// Tables are probed before they are touched: the domains that own them
 /// (`WorkspaceDb`, `EditorDb`, `TerminalDb`) migrate lazily, so the reconcile
@@ -79,6 +88,15 @@ pub fn rewrite_app_db(connection: &Connection, rewrite: &PathRewrite) -> Result<
     rewrite_text_column(connection, "terminals", "working_directory_path", rewrite)?;
     rewrite_text_column(connection, "breakpoints", "path", rewrite)?;
     rewrite_text_column(connection, "bookmarks", "path", rewrite)?;
+    // Fold persistence is keyed by the *file* path (`PRIMARY KEY (workspace_id,
+    // path, start)`), independently of the `editors` row — so a folder move
+    // orphans it unless the path is rewritten here too.
+    rewrite_text_column(connection, "file_folds", "path", rewrite)?;
+    rewrite_blob_column(connection, "vim_marks", "path", rewrite)?;
+    rewrite_blob_column(connection, "vim_global_marks_paths", "path", rewrite)?;
+    rewrite_blob_column(connection, "image_viewers", "image_path", rewrite)?;
+    rewrite_text_column(connection, "git_graphs", "repo_working_path", rewrite)?;
+    rewrite_text_column(connection, "undo_entries", "repo_path", rewrite)?;
     rewrite_keyed_text_column(
         connection,
         "trusted_worktrees",
@@ -147,11 +165,17 @@ fn rewrite_keyed_text_column(
     Ok(())
 }
 
-/// `breakpoints`, `bookmarks`, `editors.buffer_path` and
+/// `breakpoints`, `bookmarks`, `file_folds`, `editors.buffer_path` and
 /// `terminals.working_directory_path` have no single-column key to address a
 /// row by, so match on the old value itself. Safe because the value is an
 /// absolute path that the rewrite has already made unreachable, and because
 /// `apply_str` returns `None` for an already-rewritten value (idempotence).
+///
+/// `OR REPLACE`, because in some of these tables the path is part of a unique
+/// key (`file_folds` is `PRIMARY KEY (workspace_id, path, start)`) and a row may
+/// already sit at the rewritten path — the user had that same file open under
+/// the target directory before. Aborting the whole reconcile over a stale fold
+/// row would be far worse than dropping it; the migrating row wins.
 fn rewrite_text_column(
     connection: &Connection,
     table: &str,
@@ -170,7 +194,7 @@ fn rewrite_text_column(
 
     let mut update = connection
         .exec_bound::<(String, String)>(&format!(
-            "UPDATE {table} SET {path_column} = ?1 WHERE {path_column} = ?2"
+            "UPDATE OR REPLACE {table} SET {path_column} = ?1 WHERE {path_column} = ?2"
         ))
         .with_context(|| format!("preparing update on {table}"))?;
     for value in rows {
@@ -181,6 +205,10 @@ fn rewrite_text_column(
     Ok(())
 }
 
+/// Same shape as `rewrite_text_column`, for the columns that hold raw OS-string
+/// bytes (`editors.path`, `terminals.working_directory`, `vim_marks.path`,
+/// `image_viewers.image_path`). `OR REPLACE` for the same reason: `vim_marks`
+/// carries `UNIQUE (workspace_id, mark_name, path)`.
 fn rewrite_blob_column(
     connection: &Connection,
     table: &str,
@@ -199,7 +227,7 @@ fn rewrite_blob_column(
 
     let mut update = connection
         .exec_bound::<(Vec<u8>, Vec<u8>)>(&format!(
-            "UPDATE {table} SET {path_column} = ?1 WHERE {path_column} = ?2"
+            "UPDATE OR REPLACE {table} SET {path_column} = ?1 WHERE {path_column} = ?2"
         ))
         .with_context(|| format!("preparing update on {table}"))?;
     for value in rows {
@@ -881,14 +909,20 @@ mod tests {
                  CREATE TABLE bookmarks (workspace_id INTEGER, path TEXT, row INTEGER);
                  CREATE TABLE trusted_worktrees (trust_id INTEGER PRIMARY KEY, absolute_path TEXT, user_name TEXT, host_name TEXT);
                  CREATE TABLE toolchains (workspace_id INTEGER, worktree_root_path TEXT, language_name TEXT, name TEXT, path TEXT, raw_json TEXT, relative_worktree_path TEXT);
-                 CREATE TABLE user_toolchains (remote_connection_id INTEGER, workspace_id INTEGER, worktree_root_path TEXT, relative_worktree_path TEXT, language_name TEXT, name TEXT, path TEXT, raw_json TEXT);",
+                 CREATE TABLE user_toolchains (remote_connection_id INTEGER, workspace_id INTEGER, worktree_root_path TEXT, relative_worktree_path TEXT, language_name TEXT, name TEXT, path TEXT, raw_json TEXT);
+                 CREATE TABLE file_folds (workspace_id INTEGER NOT NULL, path TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL, start_fingerprint TEXT, end_fingerprint TEXT, PRIMARY KEY(workspace_id, path, start));
+                 CREATE TABLE vim_marks (workspace_id INTEGER, mark_name TEXT, path BLOB, value TEXT);
+                 CREATE TABLE vim_global_marks_paths (workspace_id INTEGER, mark_name TEXT, path BLOB);
+                 CREATE TABLE image_viewers (workspace_id INTEGER, item_id INTEGER, image_path BLOB);
+                 CREATE TABLE git_graphs (workspace_id INTEGER, item_id INTEGER, repo_working_path TEXT);
+                 CREATE TABLE undo_entries (id INTEGER PRIMARY KEY, repo_path TEXT NOT NULL, op TEXT NOT NULL);",
             )
             .expect("prepare schema")()
         .expect("create schema");
 
         // A statement that depends on a table created by an earlier statement
         // cannot be prepared in the same batch (sqlez prepares them all up
-        // front), so the index goes in its own call.
+        // front), so the indexes go in their own call.
         connection
             .exec(
                 "CREATE UNIQUE INDEX ix_workspaces_location
@@ -896,6 +930,10 @@ mod tests {
             )
             .expect("prepare index")()
         .expect("create index");
+        connection
+            .exec("CREATE UNIQUE INDEX idx_vim_marks ON vim_marks (workspace_id, mark_name, path);")
+            .expect("prepare vim index")()
+        .expect("create vim index");
 
         connection
             .exec(
@@ -907,7 +945,10 @@ mod tests {
                  INSERT INTO bookmarks VALUES (7, '/base/old/member/src/main.rs', 9);
                  INSERT INTO trusted_worktrees VALUES (1, '/base/old/member', NULL, NULL);
                  INSERT INTO toolchains VALUES (7, '/base/old/member', 'Rust', 'stable', '/usr/bin/cargo', '{}', '');
-                 INSERT INTO user_toolchains VALUES (NULL, 7, '/base/old/member', '', 'Rust', 'stable', '/usr/bin/cargo', '{}');",
+                 INSERT INTO user_toolchains VALUES (NULL, 7, '/base/old/member', '', 'Rust', 'stable', '/usr/bin/cargo', '{}');
+                 INSERT INTO file_folds VALUES (7, '/base/old/member/src/main.rs', 10, 20, NULL, NULL);
+                 INSERT INTO git_graphs VALUES (7, 1, '/base/old/member');
+                 INSERT INTO undo_entries VALUES (1, '/base/old/member', 'commit');",
             )
             .expect("prepare seed")()
         .expect("seed rows");
@@ -924,7 +965,10 @@ mod tests {
                  INSERT INTO bookmarks VALUES (8, '/base/older/member/src/main.rs', 9);
                  INSERT INTO trusted_worktrees VALUES (2, '/base/older/member', NULL, NULL);
                  INSERT INTO toolchains VALUES (8, '/base/older/member', 'Rust', 'stable', '/usr/bin/cargo', '{}', '');
-                 INSERT INTO user_toolchains VALUES (NULL, 8, '/base/older/member', '', 'Rust', 'stable', '/usr/bin/cargo', '{}');",
+                 INSERT INTO user_toolchains VALUES (NULL, 8, '/base/older/member', '', 'Rust', 'stable', '/usr/bin/cargo', '{}');
+                 INSERT INTO file_folds VALUES (8, '/base/older/member/src/main.rs', 10, 20, NULL, NULL);
+                 INSERT INTO git_graphs VALUES (8, 1, '/base/older/member');
+                 INSERT INTO undo_entries VALUES (2, '/base/older/member', 'commit');",
             )
             .expect("prepare hostile seed")()
         .expect("seed hostile rows");
@@ -969,6 +1013,49 @@ mod tests {
             "/base/older/member".to_string(),
         ))
         .expect("insert hostile terminal");
+
+        let mut insert_mark = connection
+            .exec_bound::<(i64, String, Vec<u8>, String)>(
+                "INSERT INTO vim_marks (workspace_id, mark_name, path, value) VALUES (?, ?, ?, ?)",
+            )
+            .expect("prepare vim_marks");
+        insert_mark((
+            7,
+            "a".to_string(),
+            b"/base/old/member/src/main.rs".to_vec(),
+            "1,1".to_string(),
+        ))
+        .expect("insert mark");
+        insert_mark((
+            8,
+            "a".to_string(),
+            b"/base/older/member/src/main.rs".to_vec(),
+            "1,1".to_string(),
+        ))
+        .expect("insert hostile mark");
+
+        let mut insert_global_mark = connection
+            .exec_bound::<(i64, String, Vec<u8>)>(
+                "INSERT INTO vim_global_marks_paths (workspace_id, mark_name, path) VALUES (?, ?, ?)",
+            )
+            .expect("prepare vim_global_marks_paths");
+        insert_global_mark((7, "A".to_string(), b"/base/old/member/src/main.rs".to_vec()))
+            .expect("insert global mark");
+        insert_global_mark((
+            8,
+            "A".to_string(),
+            b"/base/older/member/src/main.rs".to_vec(),
+        ))
+        .expect("insert hostile global mark");
+
+        let mut insert_image = connection
+            .exec_bound::<(i64, i64, Vec<u8>)>(
+                "INSERT INTO image_viewers (workspace_id, item_id, image_path) VALUES (?, ?, ?)",
+            )
+            .expect("prepare image_viewers");
+        insert_image((7, 1, b"/base/old/member/logo.png".to_vec())).expect("insert image");
+        insert_image((8, 1, b"/base/older/member/logo.png".to_vec()))
+            .expect("insert hostile image");
     }
 
     fn rewrite() -> PathRewrite {
@@ -1108,6 +1195,49 @@ mod tests {
         );
 
         assert_eq!(
+            text(
+                &connection,
+                "SELECT path FROM file_folds WHERE workspace_id = 7"
+            ),
+            vec!["/base/new/member/src/main.rs"]
+        );
+        assert_eq!(
+            blobs(
+                &connection,
+                "SELECT path FROM vim_marks WHERE workspace_id = 7"
+            ),
+            vec![b"/base/new/member/src/main.rs".to_vec()]
+        );
+        assert_eq!(
+            blobs(
+                &connection,
+                "SELECT path FROM vim_global_marks_paths WHERE workspace_id = 7"
+            ),
+            vec![b"/base/new/member/src/main.rs".to_vec()]
+        );
+        assert_eq!(
+            blobs(
+                &connection,
+                "SELECT image_path FROM image_viewers WHERE workspace_id = 7"
+            ),
+            vec![b"/base/new/member/logo.png".to_vec()]
+        );
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT repo_working_path FROM git_graphs WHERE workspace_id = 7"
+            ),
+            vec!["/base/new/member"]
+        );
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT repo_path FROM undo_entries WHERE id = 1"
+            ),
+            vec!["/base/new/member"]
+        );
+
+        assert_eq!(
             counts(
                 &connection,
                 "SELECT COUNT(*) FROM toolchains WHERE workspace_id = 7"
@@ -1196,6 +1326,48 @@ mod tests {
             vec![b"/base/older/member".to_vec()]
         );
         assert_eq!(
+            text(
+                &connection,
+                "SELECT path FROM file_folds WHERE workspace_id = 8"
+            ),
+            vec!["/base/older/member/src/main.rs"]
+        );
+        assert_eq!(
+            blobs(
+                &connection,
+                "SELECT path FROM vim_marks WHERE workspace_id = 8"
+            ),
+            vec![b"/base/older/member/src/main.rs".to_vec()]
+        );
+        assert_eq!(
+            blobs(
+                &connection,
+                "SELECT path FROM vim_global_marks_paths WHERE workspace_id = 8"
+            ),
+            vec![b"/base/older/member/src/main.rs".to_vec()]
+        );
+        assert_eq!(
+            blobs(
+                &connection,
+                "SELECT image_path FROM image_viewers WHERE workspace_id = 8"
+            ),
+            vec![b"/base/older/member/logo.png".to_vec()]
+        );
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT repo_working_path FROM git_graphs WHERE workspace_id = 8"
+            ),
+            vec!["/base/older/member"]
+        );
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT repo_path FROM undo_entries WHERE id = 2"
+            ),
+            vec!["/base/older/member"]
+        );
+        assert_eq!(
             counts(
                 &connection,
                 "SELECT COUNT(*) FROM toolchains WHERE workspace_id = 8"
@@ -1269,6 +1441,45 @@ mod tests {
             "a second pass must not duplicate or drop rows"
         );
         assert_eq!(counts(&connection, "SELECT COUNT(*) FROM editors"), vec![2]);
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT path FROM file_folds WHERE workspace_id = 7"
+            ),
+            vec!["/base/new/member/src/main.rs"]
+        );
+        assert_eq!(
+            counts(&connection, "SELECT COUNT(*) FROM file_folds"),
+            vec![2],
+            "a second pass over an already-migrated fold row is a no-op"
+        );
+    }
+
+    #[test]
+    fn a_fold_row_already_at_the_target_path_does_not_abort_the_rewrite() {
+        let connection = Connection::open_memory(Some("a_fold_row_already_at_the_target_path"));
+        seed(&connection);
+        // The user had the same file open under the *target* directory before,
+        // so a row already occupies `(workspace_id, path, start)` — a plain
+        // UPDATE would trip the primary key and fail the whole reconcile.
+        connection
+            .exec(
+                "INSERT INTO file_folds VALUES (7, '/base/new/member/src/main.rs', 10, 99, NULL, NULL);",
+            )
+            .expect("prepare")()
+        .expect("insert squatting fold");
+
+        rewrite_app_db(&connection, &rewrite()).expect("rewrite");
+
+        assert_eq!(
+            counts(
+                &connection,
+                "SELECT end FROM file_folds
+                 WHERE workspace_id = 7 AND path = '/base/new/member/src/main.rs'"
+            ),
+            vec![20],
+            "the migrating row wins over the stale row already at the target path"
+        );
     }
 
     fn seed_agent_db(connection: &Connection) {
