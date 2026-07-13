@@ -1711,6 +1711,16 @@ impl WorkspaceDb {
                 host = Some(format!("mock-{}", id));
                 user = Some(format!("mock-user-{}", id));
             }
+            // `remote`'s `test-support` feature (which is what adds the `Mock`
+            // variant) can be turned on via cargo feature unification even when
+            // this crate is compiled without it: `--all-targets` pulls
+            // `remote/test-support` through our dev-dependencies, so the lib
+            // target links against a `remote` that has `Mock` while this arm's
+            // `cfg` is off. Cover that leaked variant to keep the match
+            // exhaustive; it is genuinely unreachable in a normal build.
+            #[cfg(not(any(test, feature = "test-support")))]
+            #[allow(unreachable_patterns)]
+            _ => anyhow::bail!("mock remote identity is only available in test builds"),
         }
 
         if let RemoteConnectionOptions::Docker(options) = options {
