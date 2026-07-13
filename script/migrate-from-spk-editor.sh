@@ -102,7 +102,11 @@ if schema_ready; then
     echo "[4/6] sawe schema already present — skipping boot."
 else
     echo "[4/6] booting sawe once to create its schema..."
-    rm -f "$DST/config/mcp.sock" "$DST/config/mcp.lock"
+    # Runtime state lives in state/ (an old build put it in config/ — the
+    # editor sweeps that itself at startup, but a stale lock there would still
+    # be gone by the time this boot happens, so clear both).
+    rm -f "$DST/state/mcp.sock" "$DST/state/mcp.lock" \
+          "$DST/config/mcp.sock" "$DST/config/mcp.lock"
     "$SAWE_BIN" --headless >/dev/null 2>&1 &
     boot_pid=$!
     for _ in $(seq 1 60); do schema_ready && break; sleep 1; done

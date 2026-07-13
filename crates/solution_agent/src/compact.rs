@@ -246,7 +246,7 @@ pub(crate) fn render_compact_prompt_inner(
 
     // The per-solution MCP socket — `solution_agent.compact_session` is a
     // solution-scoped tool, so it lives ONLY on this socket, never on the
-    // editor-global `~/.spk/sawe/config/mcp.sock`. The template hands the
+    // editor-global `~/.spk/sawe/state/mcp.sock`. The template hands the
     // agent the literal path so it can `nc -U` it directly instead of
     // guessing (or hitting "Tool not found" on the global socket). The
     // per-solution socket is bound for every OPEN Solution (see

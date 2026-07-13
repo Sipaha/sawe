@@ -160,7 +160,7 @@ Existing inputs that constrain the decision:
 
 ### Option D — Stay on the existing `editor_mcp` Unix socket via SSH tunnel
 
-- Don't add a TCP listener at all. Instruct the user to `ssh -L 7777:$HOME/.spk/sawe/config/mcp.sock` from their phone (Termux + ssh on Android).
+- Don't add a TCP listener at all. Instruct the user to `ssh -L 7777:$HOME/.spk/sawe/state/mcp.sock` from their phone (Termux + ssh on Android).
 - **Pros:** Zero new code. Reuses the existing 60-tool surface as-is.
 - **Cons:**
   - **Termux SSH is not a remote-control UX.** The Android product needs
@@ -168,7 +168,7 @@ Existing inputs that constrain the decision:
     a private key, configure ssh-agent, and tunnel a Unix socket is a
     different product (developer ssh-into-laptop, not phone-as-pager).
   - **No client identity model.** The local MCP socket has no auth: any
-    process with FS access to `~/.spk/sawe/config/` can drive the
+    process with FS access to `~/.spk/sawe/state/` can drive the
     editor. Punching that through ssh exposes the same trust model to
     every device on the other side of the tunnel; one phone with the
     private key = full editor control with no per-client revoke.

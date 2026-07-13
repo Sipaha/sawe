@@ -425,7 +425,7 @@ script/run-mcp --debug --display &    # when a screenshot is required
 # Both auto-build if missing, set SAWE_HOME, and strip stale
 # socket/lock state up front (so a failing precheck doesn't leave a
 # half-ready state behind).
-until [ -S "$HOME/.spk/sawe-dev/config/mcp.sock" ]; do sleep 0.5; done
+until [ -S "$HOME/.spk/sawe-dev/state/mcp.sock" ]; do sleep 0.5; done
 
 # 3. Drive via a small Python (or socat) client over the JSON-RPC newline-delimited socket.
 #    Always start with `editor.capabilities`. Then exercise the scenario from

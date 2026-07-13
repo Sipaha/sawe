@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch sawe with the MCP socket exposed for autonomous agent driving.
-# The MCP socket lives at $XDG_CONFIG_HOME/sawe/mcp.sock by default;
+# The MCP socket lives at ~/.spk/sawe[-dev]/state/mcp.sock by default;
 # pass --runtime-dir <path> to override.
 #
 # Usage:
@@ -97,19 +97,21 @@ if [[ -n "$runtime_dir" ]]; then
     # Full isolation: editor's config / data / cache all land under
     # $runtime_dir. The editor uses its standard XDG-derived paths, which
     # means a fresh state — no user settings, themes, keymaps, db, etc.
-    # The MCP socket lands at $runtime_dir/sawe/mcp.sock.
+    # The MCP socket lands at $runtime_dir/sawe/state/mcp.sock.
     mkdir -p "$runtime_dir"
     export XDG_CONFIG_HOME="$runtime_dir"
     export XDG_DATA_HOME="$runtime_dir"
     export XDG_CACHE_HOME="$runtime_dir"
-    socket_dir="$runtime_dir/sawe"
+    socket_dir="$runtime_dir/sawe/state"
 else
-    # Sawe uses ~/.spk/sawe[-dev]/config/ (see crates/paths) —
-    # NOT XDG_CONFIG_HOME. The dev binary suffixes with `-dev`.
+    # Sawe uses ~/.spk/sawe[-dev]/state/ for runtime state — the socket and
+    # its lock are NOT configuration and no longer live under config/ (see
+    # crates/editor_mcp/src/lifecycle.rs::default_runtime_dir). The dev binary
+    # suffixes with `-dev`.
     if [[ "$profile" == "dev" ]]; then
-        socket_dir="$HOME/.spk/sawe-dev/config"
+        socket_dir="$HOME/.spk/sawe-dev/state"
     else
-        socket_dir="$HOME/.spk/sawe/config"
+        socket_dir="$HOME/.spk/sawe/state"
     fi
     # Pin the editor's home-dir resolution to the real $HOME. A binary built
     # with `--features test-support` (needed for the workspace.screenshot MCP

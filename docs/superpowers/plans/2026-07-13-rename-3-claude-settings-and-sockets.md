@@ -432,7 +432,7 @@ and docs.
 
 **Steps**
 
-- [ ] `script/run-mcp` — replace the socket-dir resolution block (lines ~96-119):
+- [x] `script/run-mcp` — replace the socket-dir resolution block (lines ~96-119):
       ```bash
       if [[ -n "$runtime_dir" ]]; then
           # Full isolation: editor's config / data / cache all land under
@@ -462,8 +462,8 @@ and docs.
       ```
       and fix the header comment on line 3 to
       `# The MCP socket lives at ~/.spk/sawe[-dev]/state/mcp.sock by default;`.
-- [ ] Run `bash -n script/run-mcp` — expect no output (syntax OK).
-- [ ] Update the docs. In **both** `.rules` and `CLAUDE.md`:
+- [x] Run `bash -n script/run-mcp` — expect no output (syntax OK).
+- [x] Update the docs. In **both** `.rules` and `CLAUDE.md`:
       - line ~133: `~/.spk/sawe/config/mcp.sock` → `~/.spk/sawe/state/mcp.sock`
       - line ~147 (**Socket:**): `~/.spk/sawe-dev/config/mcp.sock` →
         `~/.spk/sawe-dev/state/mcp.sock`, `~/.spk/sawe/config/mcp.sock` →
@@ -475,17 +475,17 @@ and docs.
         `…/state/solutions/<solution_id>/mcp.sock`
       - line ~163: `socat - UNIX-CONNECT:$HOME/.spk/sawe-dev/config/mcp.sock` →
         `.../state/mcp.sock`
-- [ ] `docs/architecture/decisions/0003-remote-control-protocol.md:163`:
+- [x] `docs/architecture/decisions/0003-remote-control-protocol.md:163`:
       `ssh -L 7777:$HOME/.spk/sawe/config/mcp.sock` → `.../state/mcp.sock`.
-- [ ] `grep -rn "config/mcp.sock\|config/solutions\|config/mcp.lock" . --exclude-dir=target --exclude-dir=.git`
+- [x] `grep -rn "config/mcp.sock\|config/solutions\|config/mcp.lock" . --exclude-dir=target --exclude-dir=.git`
       — expect **no hits** outside `docs/superpowers/` (historical plans/specs are
       allowed to keep the old path) and outside the migration code in
       `lifecycle.rs`.
-- [ ] `crates/solution_agent/src/compact.rs:249-256` — fix the stale comment:
+- [x] `crates/solution_agent/src/compact.rs:249-256` — fix the stale comment:
       replace `` the editor-global `~/.spk/sawe/config/mcp.sock` `` with
       `` the editor-global `~/.spk/sawe/state/mcp.sock` ``.
-- [ ] Run `cargo check -p solution_agent` — expect no errors.
-- [ ] Commit: `Point run-mcp and the docs at the state/ socket path`
+- [x] Run `cargo check -p solution_agent` — expect no errors.
+- [x] Commit: `Point run-mcp and the docs at the state/ socket path`
 
 ---
 
