@@ -2442,8 +2442,8 @@ impl AcpThread {
         }
     }
 
-    /// Flush the streaming-reveal backlog into the last entry's markdown AND,
-    /// when the flush actually moved bytes, emit `EntryUpdated(last)` so a mirror
+    /// Flush the streaming-reveal backlog into the buffered entry's markdown AND,
+    /// when the flush actually moved bytes, emit `EntryUpdated(target_entry)` so a mirror
     /// that re-projects a given entry only on `EntryUpdated` (the fork's
     /// `session.entries`) picks up the flushed tail instead of dropping it (the
     /// "message truncated mid-paragraph" bug). The MID-TURN twin of
@@ -4120,6 +4120,75 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    /// Companion to the torn-message fix: once a chunk can coalesce into a
+    /// NON-last entry, every `EntryUpdated` on the streaming path must carry that
+    /// entry's index. Emitting `entries.len() - 1` re-synced the teammate's entry
+    /// and left the parent's stale in the persisted / MCP mirror — the message
+    /// looked truncated on Main and on mobile even though the text had arrived.
+    #[gpui::test]
+    async fn streaming_signals_the_coalesced_entry_not_the_last_one(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Parent opens a message (entry 0), a teammate starts streaming (entry 1).
+        thread.update(cx, |t, cx| {
+            for update in [
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("parent ".into())),
+                acp::SessionUpdate::AgentMessageChunk(chunk_with_subagent("teammate", "T1")),
+            ] {
+                t.handle_session_update(update, cx).unwrap();
+            }
+        });
+        cx.executor().run_until_parked();
+
+        let updated = Rc::new(std::cell::RefCell::new(Vec::<usize>::new()));
+        let _sub = cx.update(|cx| {
+            let updated = updated.clone();
+            cx.subscribe(&thread, move |_t, ev, _cx| {
+                if let AcpThreadEvent::EntryUpdated(i) = ev {
+                    updated.borrow_mut().push(*i);
+                }
+            })
+        });
+
+        // The parent resumes: the chunk coalesces back into entry 0, which is NO
+        // LONGER the last entry.
+        thread.update(cx, |t, cx| {
+            t.handle_session_update(
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("continues".into())),
+                cx,
+            )
+            .unwrap();
+        });
+        cx.executor().run_until_parked();
+        thread.update(cx, |t, cx| t.flush_end_of_turn_tail(cx));
+        cx.executor().run_until_parked();
+
+        let signalled = updated.borrow().clone();
+        assert!(
+            !signalled.is_empty(),
+            "the coalesced append must signal SOMETHING"
+        );
+        assert!(
+            signalled.iter().all(|i| *i == 0),
+            "every signal must point at the parent's entry (0), never at the \
+             teammate's tail entry; got {signalled:?}"
+        );
     }
 
     #[gpui::test]

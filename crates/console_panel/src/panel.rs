@@ -1652,6 +1652,14 @@ impl ConsolePanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+        // Defense in depth, mirroring the `NewChat` action: the menu entry is
+        // disabled without a worktree, but the handler must refuse too — a
+        // reopened session resumes an agent, and an empty solution gives it
+        // nowhere to run. An EMPTY solution still resolves an `active_solution_id`
+        // (it IS the active solution), so the guard above does not cover this.
+        if !workspace_has_worktree(workspace.read(cx), cx) {
+            return;
+        }
         // Closed sessions live only on disk (close_session evicts them from
         // memory), so the picker reads them straight from the DB. The query
         // already returns top-level closed rows ordered most-recently-active
