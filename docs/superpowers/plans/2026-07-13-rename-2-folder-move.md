@@ -1918,7 +1918,7 @@ git commit -m "solutions: Rewrite every path-bearing app-db row on a cold reconc
   - `pub fn rewrite_agent_db(connection: &Connection, rewrite: &PathRewrite) -> Result<()>` — `solution_sessions.cwd`, `solution_session_background_agent.jsonl_path`, `solution_session_attachment.path` (path is in the PK → delete + reinsert).
   - `pub fn encode_claude_bucket(path: &Path) -> String` — claude's own encoding: every `/` and `.` becomes `-` (mirrors `crates/solution_agent/src/store/teammate_reconciler.rs:22-39`).
   - `pub fn move_transcript_bucket(claude_projects_dir: &Path, rewrite: &PathRewrite) -> Result<()>` — moves `<enc(old)>` → `<enc(new)>`, merging file-by-file when the target bucket exists; never renames over an existing bucket.
-  - `pub fn repair_git_worktrees(member_roots: &[PathBuf]) -> Result<()>` — runs `git worktree repair` in any member that still has `.claude/worktrees/*`.
+  - `pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)]) -> Result<()>` — `(member_root, solution_root)` pairs. Runs `git -C <member_root> worktree repair <tree paths…>` for every claude agent worktree of that member, in **both** locations: the legacy `<member_root>/.claude/worktrees/*` and the relocated `<solution_root>/.agents/worktrees/<member-dir>/*` (plan 3's `WorktreeCreate` hook puts them there). The tree paths are passed as **arguments** — see the doc comment in the code for why a bare `git worktree repair` is not enough.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2167,35 +2167,72 @@ fn merge_dir(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Legacy claude Agent-Teams / background-agent worktrees live at
-/// `<member>/.claude/worktrees/<name>` and hold **absolute** `gitdir`
-/// pointers that a move invalidates. `git worktree repair` rewrites them.
-/// (New worktrees are relocated out of the member by the `WorktreeCreate`
-/// hook — phase 6 — so this is a one-release compatibility step.)
-pub fn repair_git_worktrees(member_roots: &[PathBuf]) -> Result<()> {
-    for root in member_roots {
-        if !root.join(".claude/worktrees").is_dir() {
+/// A claude agent worktree is a *linked* git worktree: the tree lives in one
+/// place, but its **admin directory always lives inside the member repo** at
+/// `<member>/.git/worktrees/<name>/`, and the two point at each other with
+/// **absolute** paths. So a rename breaks it in one of two directions:
+///
+///   * a **member** rename moves the repo (and with it the admin dir) — the
+///     tree's `.git` file still names the old admin dir;
+///   * a **solution** rename moves the *trees* — the admin dir's `gitdir` file
+///     still names the old tree location. (Plan 3's `WorktreeCreate` hook
+///     relocates new trees to `<solution_root>/.agents/worktrees/<member-dir>/<name>`;
+///     legacy trees are still at `<member>/.claude/worktrees/<name>`. Both are
+///     scanned here.)
+///
+/// `git -C <member> worktree repair <tree paths…>` fixes **both** directions —
+/// but only when the moved tree paths are passed as **arguments**. A bare
+/// `git worktree repair` can only repair trees it can still reach through the
+/// (possibly stale) admin entries, so it silently misses the trees whose
+/// location changed.
+pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)]) -> Result<()> {
+    for (member_root, solution_root) in members {
+        let mut trees = Vec::new();
+        collect_worktree_dirs(&member_root.join(".claude").join("worktrees"), &mut trees);
+        if let Some(member_dir) = member_root.file_name() {
+            collect_worktree_dirs(
+                &solution_root
+                    .join(".agents")
+                    .join("worktrees")
+                    .join(member_dir),
+                &mut trees,
+            );
+        }
+        if trees.is_empty() {
             continue;
         }
         let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(member_root)
             .arg("worktree")
             .arg("repair")
-            .current_dir(root)
+            .args(&trees)
             .output();
         match output {
             Ok(output) if !output.status.success() => log::warn!(
                 "path_migrations: `git worktree repair` in {} failed: {}",
-                root.display(),
+                member_root.display(),
                 String::from_utf8_lossy(&output.stderr).trim(),
             ),
             Err(err) => log::warn!(
                 "path_migrations: running `git worktree repair` in {} failed: {err}",
-                root.display(),
+                member_root.display(),
             ),
             Ok(_) => {}
         }
     }
     Ok(())
+}
+
+fn collect_worktree_dirs(parent: &Path, trees: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            trees.push(entry.path());
+        }
+    }
 }
 ```
 
@@ -2359,15 +2396,23 @@ pub(crate) fn apply_one_with_connections(
         move_transcript_bucket(projects, rewrite)?;
     }
 
-    let member_roots: Vec<PathBuf> = app_db
-        .select::<String>("SELECT local_path FROM solution_members")
+    // `(member_root, solution_root)` for every member that now lives under the
+    // moved path. The solution root is needed because the relocated agent
+    // worktrees sit at `<solution_root>/.agents/worktrees/<member-dir>/*`,
+    // outside the member itself.
+    let members: Vec<(PathBuf, PathBuf)> = app_db
+        .select::<(String, String)>(
+            "SELECT solution_members.local_path, solutions.root
+             FROM solution_members
+             JOIN solutions ON solutions.id = solution_members.solution_id",
+        )
         .context("preparing member select")?()
     .context("selecting members")?
     .into_iter()
-    .map(PathBuf::from)
-    .filter(|path| path.starts_with(&rewrite.new))
+    .map(|(member, solution)| (PathBuf::from(member), PathBuf::from(solution)))
+    .filter(|(member, _)| member.starts_with(&rewrite.new))
     .collect();
-    repair_git_worktrees(&member_roots)?;
+    repair_git_worktrees(&members)?;
 
     remove_compat_link(&rewrite.old)?;
     Ok(())
