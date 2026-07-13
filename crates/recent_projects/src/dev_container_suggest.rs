@@ -30,21 +30,64 @@ fn project_devcontainer_key(project_path: &str) -> String {
     format!("{}_{}", DEV_CONTAINER_SUGGEST_KEY, project_path)
 }
 
-pub fn suggest_on_worktree_updated(
+/// Consume the `--dev-container` CLI flag that `open_local_workspace` stamped
+/// onto the freshly-created workspace: once every worktree has finished
+/// scanning, either open the dev-container modal or report that the project has
+/// no configuration.
+///
+/// This used to be a branch inside [`suggest_on_worktree_updated`], i.e. it
+/// only ran if a `WorktreeUpdatedEntries` event happened to be delivered after
+/// the workspace had subscribed to the project. A worktree that finished (or
+/// never needed) its scan before the workspace existed emits no such event, so
+/// the flag was never consumed: no modal, no warning, and a stale
+/// `open_in_dev_container = true` left on the workspace that would hijack the
+/// next unrelated file change into a dev-container action. Keying off workspace
+/// creation instead makes the CLI flag's fate independent of scan timing.
+pub fn consume_cli_dev_container_flag(
     workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if !workspace.open_in_dev_container() {
+        return;
+    }
+    workspace.set_open_in_dev_container(false);
+
+    let task = cx.spawn_in(window, async move |workspace, cx| {
+        let scans_complete =
+            workspace.update(cx, |workspace, cx| workspace.worktree_scans_complete(cx))?;
+        scans_complete.await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let has_configs = workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .any(|wt| !find_configs_in_snapshot(wt.read(cx)).is_empty());
+            if has_configs {
+                cx.on_next_frame(window, move |_workspace, window, cx| {
+                    window.dispatch_action(Box::new(zed_actions::OpenDevContainer), cx);
+                });
+            } else {
+                log::warn!("--dev-container: no devcontainer configuration found in project");
+            }
+        })
+    });
+    workspace.set_dev_container_task(task);
+}
+
+pub fn suggest_on_worktree_updated(
     worktree_id: WorktreeId,
     updated_entries: &UpdatedEntriesSet,
     project: &gpui::Entity<Project>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let cli_auto_open = workspace.open_in_dev_container();
-
     let devcontainer_updated = updated_entries.iter().any(|(path, _, _)| {
         path.as_ref() == devcontainer_dir_path() || path.as_ref() == devcontainer_json_path()
     });
 
-    if !devcontainer_updated && !cli_auto_open {
+    if !devcontainer_updated {
         return;
     }
 
@@ -58,35 +101,7 @@ pub fn suggest_on_worktree_updated(
         return;
     }
 
-    let has_configs = !find_configs_in_snapshot(worktree).is_empty();
-
-    if cli_auto_open {
-        workspace.set_open_in_dev_container(false);
-        let task = cx.spawn_in(window, async move |workspace, cx| {
-            let scans_complete =
-                workspace.update(cx, |workspace, cx| workspace.worktree_scans_complete(cx))?;
-            scans_complete.await;
-
-            workspace.update_in(cx, |workspace, window, cx| {
-                let has_configs = workspace
-                    .project()
-                    .read(cx)
-                    .worktrees(cx)
-                    .any(|wt| !find_configs_in_snapshot(wt.read(cx)).is_empty());
-                if has_configs {
-                    cx.on_next_frame(window, move |_workspace, window, cx| {
-                        window.dispatch_action(Box::new(zed_actions::OpenDevContainer), cx);
-                    });
-                } else {
-                    log::warn!("--dev-container: no devcontainer configuration found in project");
-                }
-            })
-        });
-        workspace.set_dev_container_task(task);
-        return;
-    }
-
-    if !has_configs {
+    if find_configs_in_snapshot(worktree).is_empty() {
         return;
     }
 

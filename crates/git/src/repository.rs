@@ -560,7 +560,13 @@ impl CommitFile {
 
 impl CommitDetails {
     pub fn short_sha(&self) -> SharedString {
-        self.sha[..SHORT_SHA_LENGTH].to_string().into()
+        // Slicing blind panics on any sha shorter than SHORT_SHA_LENGTH.
+        // Real git object ids are always 40 hex chars, but this type is also
+        // fed by fakes/tests and by whatever a `git log` format string
+        // produced, and the title bar renders it on every repaint — a
+        // truncated sha must degrade, not crash the window.
+        let sha: &str = &self.sha;
+        sha.get(..SHORT_SHA_LENGTH).unwrap_or(sha).to_string().into()
     }
 }
 

@@ -546,15 +546,20 @@ pub fn init(cx: &mut App) {
             let Some(window) = window else {
                 return;
             };
+            // The `--dev-container` CLI flag is stamped on the workspace by the
+            // `init` callback that runs inside `cx.new(|cx| Workspace::new(..))`,
+            // i.e. strictly before this `observe_new` fires — so it is already
+            // visible here, and consuming it does not depend on any worktree
+            // event being delivered.
+            dev_container_suggest::consume_cli_dev_container_flag(workspace, window, cx);
             cx.subscribe_in(
                 workspace.project(),
                 window,
-                move |workspace, project, event, window, cx| {
+                move |_workspace, project, event, window, cx| {
                     if let project::Event::WorktreeUpdatedEntries(worktree_id, updated_entries) =
                         event
                     {
                         dev_container_suggest::suggest_on_worktree_updated(
-                            workspace,
                             *worktree_id,
                             updated_entries,
                             project,
