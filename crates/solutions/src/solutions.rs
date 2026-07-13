@@ -7,6 +7,7 @@ pub mod branch_protection;
 mod cache;
 pub mod db;
 mod event_sources;
+pub mod folder_name;
 pub mod git;
 pub mod mcp;
 pub mod migrate;
@@ -20,6 +21,8 @@ mod tabs_snapshot;
 pub use add_member::{AddProgressCallback, PendingAddView};
 pub use cache::{default_cache_root, refresh_cache};
 pub use event_sources::install as install_event_sources_for_test;
+pub use folder_name::FolderNameError;
+pub use folder_name::derive as derive_folder_name;
 pub use model::{CatalogId, CatalogProject, MemberId, Solution, SolutionId, SolutionMember};
 pub use settings::{BranchProtectionMember, BranchProtectionSettings, SolutionsSettings};
 pub use store::{

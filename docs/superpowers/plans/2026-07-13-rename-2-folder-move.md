@@ -69,7 +69,7 @@
 
 `unicode-normalization` **0.1.24 is already in `Cargo.lock`** (transitively, via `idna`) but is **not** in `[workspace.dependencies]` — add it there; no lockfile churn results.
 
-- [ ] **Step 1: Add the dependency**
+- [x] **Step 1: Add the dependency**
 
 In `Cargo.toml`, inside `[workspace.dependencies]` (keep the list alphabetical — it sits between `unicase` and `unindent` if present, otherwise place it alphabetically):
 
@@ -83,7 +83,7 @@ In `crates/solutions/Cargo.toml`, under `[dependencies]`, after `thiserror.works
 unicode-normalization.workspace = true
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `crates/solutions/src/folder_name.rs` containing **only** the test module:
 
@@ -228,12 +228,12 @@ pub use folder_name::derive as derive_folder_name;
 
 (Keep `pub mod folder_name;` so the contract path `solutions::folder_name::derive` also resolves.)
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p solutions folder_name`
 Expected: FAIL — `error[E0425]: cannot find function 'derive' in this scope` (and `cannot find type 'FolderNameError'`).
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 Prepend to `crates/solutions/src/folder_name.rs` (above the test module):
 
@@ -360,12 +360,12 @@ fn is_reserved(folder: &str) -> bool {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p solutions folder_name`
 Expected: PASS — 8 tests (`derives_folder_names`, `normalizes_to_nfc`, `rejects_empty_derivations`, `rejects_reserved_windows_names`, `truncates_to_255_bytes_on_a_char_boundary`, `truncation_never_leaves_a_trailing_dot`, `never_changes_case`, `error_messages_match_the_spec`).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml crates/solutions/Cargo.toml crates/solutions/src/folder_name.rs crates/solutions/src/solutions.rs

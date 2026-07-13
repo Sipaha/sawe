@@ -18020,6 +18020,7 @@ dependencies = [
  "solution_agent",
  "tempfile",
  "thiserror 2.0.17",
+ "unicode-normalization",
  "util",
  "workspace",
 ]
