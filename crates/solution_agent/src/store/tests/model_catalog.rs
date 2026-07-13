@@ -58,7 +58,7 @@ fn select_model_on_cold_session_records_desired(cx: &mut TestAppContext) {
             let id = SolutionSessionId::new();
             let session = insert_cold_session(
                 id,
-                SolutionId("sol-a".into()),
+                SolutionId(1),
                 SharedString::from("claude-acp"),
                 None,
                 None,
@@ -111,7 +111,7 @@ fn new_chat_model_options_from_latest_session(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
 
-    let sol = SolutionId("sol-a".into());
+    let sol = SolutionId(1);
     let agent: AgentServerId = SharedString::from("claude-acp");
 
     cx.update(|cx| {
@@ -124,7 +124,7 @@ fn new_chat_model_options_from_latest_session(cx: &mut TestAppContext) {
 
             let id = SolutionSessionId::new();
             let session =
-                insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
             session.update(cx, |s, _| {
                 s.cached_models = vec![
                     claude_native::ModelInfo {
@@ -159,7 +159,7 @@ fn session_models_falls_back_to_global_agent_cache(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
 
-    let sol = SolutionId("sol-a".into());
+    let sol = SolutionId(1);
     let agent: AgentServerId = SharedString::from("claude-acp");
 
     cx.update(|cx| {
@@ -186,7 +186,7 @@ fn session_models_falls_back_to_global_agent_cache(cx: &mut TestAppContext) {
             // A brand-new session with an empty per-session list.
             let fresh_id = SolutionSessionId::new();
             let fresh =
-                insert_cold_session(fresh_id, sol.clone(), agent.clone(), None, None, store, cx);
+                insert_cold_session(fresh_id, sol, agent.clone(), None, None, store, cx);
             assert!(
                 fresh.read(cx).cached_models.is_empty(),
                 "precondition: fresh session has no per-session model list"

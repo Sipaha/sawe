@@ -549,19 +549,21 @@ pub(crate) fn project_name_for_cwd(
     }
     let member = solution.members.iter().find(|m| m.local_path == cwd)?;
     let store = SolutionStore::try_global(cx)?;
-    // Prefer the catalog display name; fall back to the member's slug
-    // (catalog id) for empty members that have no catalog entry, matching
+    // Prefer the origin catalog project's display name; fall back to the
+    // member's own name for empty members that have no catalog entry, matching
     // how the project tab strip labels the same member. The member matched
     // a real project folder, so it must get a project name — never fall
     // through to the solution name here.
-    let catalog_name = store.read_with(cx, |s, _| {
-        s.catalog()
-            .iter()
-            .find(|c| c.id == member.catalog_id)
-            .map(|c| c.name.clone())
+    let catalog_name = member.origin_catalog_id.and_then(|catalog_id| {
+        store.read_with(cx, |s, _| {
+            s.catalog()
+                .iter()
+                .find(|c| c.id == catalog_id)
+                .map(|c| c.name.clone())
+        })
     });
     Some(SharedString::from(
-        catalog_name.unwrap_or_else(|| member.catalog_id.0.clone()),
+        catalog_name.unwrap_or_else(|| member.name.clone()),
     ))
 }
 
@@ -815,7 +817,7 @@ impl SolutionAgentStore {
         ephemeral: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<SolutionSessionId>> {
-        let pair = (solution_id.clone(), agent_id.clone());
+        let pair = (solution_id, agent_id.clone());
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             // 1. Resolve the solution. Cloned out so we don't hold the store
@@ -916,7 +918,7 @@ impl SolutionAgentStore {
                 let entity = cx.new(|cx| {
                     let mut s = SolutionSession::new_idle(
                         session_id,
-                        solution_id.clone(),
+                        solution_id,
                         agent_id.clone(),
                         acp_session_id,
                     );
@@ -935,7 +937,7 @@ impl SolutionAgentStore {
                     s
                 });
                 store.sessions.insert(session_id, entity);
-                let by_sol = store.by_solution.entry(solution_id.clone()).or_default();
+                let by_sol = store.by_solution.entry(solution_id).or_default();
                 if !by_sol.contains(&session_id) {
                     by_sol.push(session_id);
                 }
@@ -950,7 +952,7 @@ impl SolutionAgentStore {
                 // new-chat picker has a model list before its first turn lands
                 // the live `initialize` response. Deduped per agent, so this is
                 // a no-op once any session of this agent has captured a list.
-                store.ensure_agent_models(solution_id.clone(), agent_id.clone(), cx);
+                store.ensure_agent_models(solution_id, agent_id.clone(), cx);
                 // Hidden supervisor judge/auditor sessions are excluded from
                 // the wire `agent_session_created` churn (a connected mobile
                 // client would otherwise see a create+close pair every idle
@@ -1125,7 +1127,7 @@ impl SolutionAgentStore {
             .unwrap_or((None, None));
         let meta = SolutionSessionMetadata {
             id: session_id,
-            solution_id: s.solution_id.clone(),
+            solution_id: s.solution_id,
             agent_id: s.agent_id.clone(),
             acp_session_id: s.acp_session_id.clone(),
             title: s.title.clone(),
@@ -1146,6 +1148,7 @@ impl SolutionAgentStore {
             // `update_tab_orders`; this is the live in-memory value (usually
             // None at create time, before the strip pin lands).
             tab_order: s.tab_order,
+            member_id: None,
         };
         db.save_metadata(meta).detach_and_log_err(cx);
     }
@@ -1520,7 +1523,7 @@ impl SolutionAgentStore {
     /// `SolutionStore` or the solution isn't registered (headless / test).
     fn session_inbox_dir(&self, session_id: SolutionSessionId, cx: &App) -> std::path::PathBuf {
         let solution_root = self.sessions.get(&session_id).and_then(|s| {
-            let solution_id = s.read(cx).solution_id.clone();
+            let solution_id = s.read(cx).solution_id;
             SolutionStore::try_global(cx)?
                 .read(cx)
                 .solutions()
@@ -1715,7 +1718,7 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) -> SolutionSessionId {
         let id = session.id;
-        let solution_id = session.solution_id.clone();
+        let solution_id = session.solution_id;
         let parent_session_id = session.parent_session_id;
         let entity = cx.new(|_| session);
         self.sessions.insert(id, entity);
@@ -1742,7 +1745,7 @@ impl SolutionAgentStore {
         let id = SolutionSessionId::new();
         let mut session = SolutionSession::new_idle(
             id,
-            solution_id.clone(),
+            *solution_id,
             SharedString::from("mock-agent"),
             acp::SessionId::new(format!("acp-{}", id.as_str())),
         );
@@ -1814,7 +1817,7 @@ impl SolutionAgentStore {
                 Some(s.cwd.clone())
             };
             (
-                s.solution_id.clone(),
+                s.solution_id,
                 s.agent_id.clone(),
                 project,
                 cwd_override,
@@ -1822,7 +1825,7 @@ impl SolutionAgentStore {
                 s.desired_effort.clone(),
             )
         };
-        let pair = (solution_id.clone(), agent_id.clone());
+        let pair = (solution_id, agent_id.clone());
         {
             let mut pool = self.pool.lock();
             pool.remove(&pair);
@@ -1916,7 +1919,7 @@ impl SolutionAgentStore {
                 .unwrap_or((None, None));
             SolutionSessionMetadata {
                 id: session_id,
-                solution_id: s.solution_id.clone(),
+                solution_id: s.solution_id,
                 agent_id: s.agent_id.clone(),
                 acp_session_id: s.acp_session_id.clone(),
                 title: s.title.clone(),
@@ -1931,9 +1934,10 @@ impl SolutionAgentStore {
                 desired_effort: s.desired_effort.clone(),
                 cached_models: s.cached_models.clone(),
                 tab_order: s.tab_order,
+                member_id: None,
             }
         };
-        let pair = (meta.solution_id.clone(), meta.agent_id.clone());
+        let pair = (meta.solution_id, meta.agent_id.clone());
         // Drop the pooled connection so `resume_session`'s
         // `get_or_spawn_connection` forces a fresh subprocess — the current one
         // is wedged. Live co-tenant sessions of the same (solution, agent) keep
@@ -2212,14 +2216,14 @@ impl SolutionAgentStore {
                 }
             };
             (
-                s.solution_id.clone(),
+                s.solution_id,
                 s.agent_id.clone(),
                 project,
                 s.context_count,
                 s.cwd.clone(),
             )
         };
-        let pair = (solution_id.clone(), agent_id);
+        let pair = (solution_id, agent_id);
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             // Resolve the live Solution so `connection.new_session`
@@ -2385,13 +2389,13 @@ impl SolutionAgentStore {
         let (solution_id, agent_id, cached_project, session_cwd) = {
             let s = session_entity.read(cx);
             (
-                s.solution_id.clone(),
+                s.solution_id,
                 s.agent_id.clone(),
                 s.project.clone(),
                 s.cwd.clone(),
             )
         };
-        let pair = (solution_id.clone(), agent_id);
+        let pair = (solution_id, agent_id);
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let solution = cx.update(|cx| {
@@ -2602,7 +2606,7 @@ impl SolutionAgentStore {
                         cx,
                         "workspace.session_opened",
                         serde_json::json!({
-                            "solution_id": solution_id.as_str(),
+                            "solution_id": solution_id.0,
                             "session": summary,
                         }),
                     );
@@ -2613,7 +2617,7 @@ impl SolutionAgentStore {
                     cx,
                     "workspace.session_closed",
                     serde_json::json!({
-                        "solution_id": solution_id.as_str(),
+                        "solution_id": solution_id.0,
                         "session_id": closed_id.to_string(),
                     }),
                 );
@@ -2628,7 +2632,7 @@ impl SolutionAgentStore {
         // future consumers may want to react to that too; current
         // `ConsolePanel` subscriber filters out the empty case.
         cx.emit(SolutionAgentStoreEvent::TabsChanged {
-            solution_id: solution_id.clone(),
+            solution_id: solution_id,
             opened: opened_ids,
             closed: closed_ids,
         });
@@ -2663,7 +2667,7 @@ impl SolutionAgentStore {
         };
         let (solution_id, already_pinned) = {
             let s = entity.read(cx);
-            (s.solution_id.clone(), s.tab_order.is_some())
+            (s.solution_id, s.tab_order.is_some())
         };
         if already_pinned {
             return;
@@ -2725,7 +2729,7 @@ impl SolutionAgentStore {
         let entity = cx.new(|cx| {
             let mut s = SolutionSession::new_idle(
                 session_id,
-                solution_id.clone(),
+                solution_id,
                 SharedString::from("claude-acp"),
                 acp::SessionId::new("seed-cold"),
             );
@@ -3315,7 +3319,7 @@ impl SolutionAgentStore {
                 // never-hydrated sessions. Idempotent against the earlier
                 // `Changed`-driven purge (by_solution is already empty → just the
                 // DB sweep + `.agents` removal).
-                self.purge_solution_fully(id.clone(), Some(root.clone()), cx);
+                self.purge_solution_fully(*id, Some(root.clone()), cx);
             }
             SolutionStoreEvent::Closed { id } => self.cold_close_solution(id, cx),
             SolutionStoreEvent::Opened { id } => {
@@ -3325,10 +3329,10 @@ impl SolutionAgentStore {
                 // an orphan already in the DB before this feature would never be
                 // loaded — and so never purged — until it was touched some other
                 // way.
-                let id = id.clone();
+                let id = *id;
                 cx.spawn(async move |this, cx| {
                     let hydrate = this
-                        .update(cx, |this, cx| this.hydrate_all_for_solution(id.clone(), cx))
+                        .update(cx, |this, cx| this.hydrate_all_for_solution(id, cx))
                         .log_err();
                     if let Some(task) = hydrate {
                         task.await.log_err();

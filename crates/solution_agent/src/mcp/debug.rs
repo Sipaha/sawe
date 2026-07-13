@@ -41,7 +41,7 @@ pub struct SeedColdSessionEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SeedColdSessionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     /// Tab title (default `"Seed"`).
     pub title: Option<String>,
     pub entries: Vec<SeedColdSessionEntry>,
@@ -80,10 +80,6 @@ impl McpServerTool for SeedColdSessionTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            !input.solution_id.is_empty(),
-            "invalid_params: solution_id is required"
-        );
         let solution_id = SolutionId(input.solution_id);
         let title = SharedString::from(input.title.unwrap_or_else(|| "Seed".to_string()));
         // Give entries increasing timestamps so date separators render (Main

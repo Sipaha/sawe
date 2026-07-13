@@ -336,7 +336,7 @@ async fn render_sizes_list_state_to_selected_stream_not_flat_entries(
         store.update(cx, |store, cx| {
             let session = crate::store::tests::insert_cold_session(
                 session_id,
-                solution_id.clone(),
+                solution_id,
                 agent_id.clone(),
                 Some(120_000),
                 Some(project.clone()),

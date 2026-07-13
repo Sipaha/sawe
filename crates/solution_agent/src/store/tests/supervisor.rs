@@ -19,7 +19,7 @@ fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let sol = SolutionId("sol-a".into());
+            let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
 
             // Two ordinary user sessions + one judge child session.
@@ -27,7 +27,7 @@ fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
             let other = SolutionSessionId::new();
             let judge = SolutionSessionId::new();
             for id in [supervised, other, judge] {
-                insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
             }
 
             // Before the judge is registered, all three count.
@@ -82,10 +82,10 @@ fn user_reply_supersedes_in_flight_judge(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let sol = SolutionId("sol-a".into());
+            let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
             let id = SolutionSessionId::new();
-            insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+            insert_cold_session(id, sol, agent, None, None, store, cx);
 
             // Supervisor is mid-Judging with a live judge handle (judge_id None
             // so finish_judge has no child session to close).
@@ -151,10 +151,10 @@ fn verdict_applies_while_judge_in_flight(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let sol = SolutionId("sol-a".into());
+            let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
             let id = SolutionSessionId::new();
-            insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+            insert_cold_session(id, sol, agent, None, None, store, cx);
 
             let mut st = SupervisorState::new(id);
             st.enabled = true;
@@ -372,7 +372,7 @@ async fn error_arm_unsupervised_wall_surfaces_text_without_resume(cx: &mut TestA
                 other => panic!("expected Errored(wall), got {other:?}"),
             }
             assert!(
-                store.supervisor_states.get(&session_id).is_none(),
+                !store.supervisor_states.contains_key(&session_id),
                 "no supervisor row may be fabricated for an unsupervised session",
             );
         });
@@ -513,7 +513,7 @@ async fn acted_verdict_records_judge_tokens(cx: &mut TestAppContext) {
             let (solution_id, agent_id) = {
                 let s = store.session(supervised_id).unwrap();
                 let s = s.read(cx);
-                (s.solution_id.clone(), s.agent_id.clone())
+                (s.solution_id, s.agent_id.clone())
             };
             // A judge session carrying a known token figure.
             let judge_id = crate::model::SolutionSessionId::new();
@@ -591,7 +591,7 @@ async fn judge_past_timeout_but_streaming_is_not_killed(cx: &mut TestAppContext)
             let (solution_id, agent_id) = {
                 let s = store.session(supervised_id).unwrap();
                 let s = s.read(cx);
-                (s.solution_id.clone(), s.agent_id.clone())
+                (s.solution_id, s.agent_id.clone())
             };
             // A judge session that streamed just now → still alive.
             let judge_id = crate::model::SolutionSessionId::new();
@@ -644,7 +644,7 @@ async fn judge_past_timeout_and_silent_is_killed(cx: &mut TestAppContext) {
             let (solution_id, agent_id) = {
                 let s = store.session(supervised_id).unwrap();
                 let s = s.read(cx);
-                (s.solution_id.clone(), s.agent_id.clone())
+                (s.solution_id, s.agent_id.clone())
             };
             // A judge session silent well past the liveness window → dead.
             let judge_id = crate::model::SolutionSessionId::new();
@@ -2236,7 +2236,7 @@ fn visible_session_count_excludes_live_auditors(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let sol = SolutionId("sol-a".into());
+            let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
 
             // Two ordinary user sessions + one auditor child session.
@@ -2244,7 +2244,7 @@ fn visible_session_count_excludes_live_auditors(cx: &mut TestAppContext) {
             let other = SolutionSessionId::new();
             let auditor = SolutionSessionId::new();
             for id in [supervised, other, auditor] {
-                insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
             }
 
             assert_eq!(store.visible_session_count(&sol), 3);

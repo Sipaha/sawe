@@ -21,7 +21,7 @@ use super::*;
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ListSessionsParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub solution_id: Option<String>,
+    pub solution_id: Option<i64>,
     /// F: filter by parent session id. When set, returns only sessions
     /// whose `parent_session_id` matches — i.e. the immediate children
     /// of the named session. Stacks with `solution_id`.
@@ -43,7 +43,7 @@ impl<'de> Deserialize<'de> for ListSessionsParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Helper {
-            solution_id: Option<String>,
+            solution_id: Option<i64>,
             parent_session_id: Option<String>,
             before_last_activity_at_ms: Option<i64>,
             count: Option<usize>,
@@ -97,8 +97,8 @@ impl McpServerTool for ListSessionsTool {
         // same sessions 1-to-1 (#4). `hydrate_all_for_solution` is a no-op for
         // already-hydrated sessions, so a repeat list_sessions costs just one
         // cheap DB metadata query.
-        if let Some(s) = input.solution_id.as_ref() {
-            let sol_id = SolutionId(s.clone());
+        if let Some(s) = input.solution_id {
+            let sol_id = SolutionId(s);
             let task = cx.update(|cx| {
                 let store = SolutionAgentStore::global(cx);
                 store.update(cx, |s, cx| s.hydrate_all_for_solution(sol_id, cx))
@@ -108,7 +108,7 @@ impl McpServerTool for ListSessionsTool {
         let (sessions, total_count) = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.read_with(cx, |store, cx| {
-                let want_solution = input.solution_id.as_ref().map(|s| SolutionId(s.clone()));
+                let want_solution = input.solution_id.map(SolutionId);
                 let mut matching: Vec<SessionSummary> = store
                     .all_sessions()
                     .filter_map(|entity| {
@@ -147,7 +147,7 @@ impl McpServerTool for ListSessionsTool {
                 // the most-recent N sessions. `total_count` is the count
                 // BEFORE before_last_activity_at_ms / count filtering, so
                 // the client knows if a "load older" page exists.
-                matching.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+                matching.sort_by_key(|s| std::cmp::Reverse(s.last_activity_at));
                 let total = matching.len();
                 if let Some(before) = input.before_last_activity_at_ms {
                     matching.retain(|s| s.last_activity_at < before);
@@ -250,7 +250,7 @@ impl McpServerTool for GetSessionChildrenTool {
                         }
                     })
                     .collect();
-                children.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                children.sort_by_key(|a| a.created_at);
                 Ok(children)
             })
         })?;
@@ -445,7 +445,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GetSessionResult {
     pub id: String,
-    pub solution_id: String,
+    pub solution_id: i64,
     pub agent_id: String,
     pub title: String,
     pub state: SessionStateDto,

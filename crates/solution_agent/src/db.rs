@@ -166,6 +166,14 @@ impl SolutionAgentDb {
         apply_idempotent_add_column(&connection, "desired_model TEXT");
         apply_idempotent_add_column(&connection, "desired_effort TEXT");
         apply_idempotent_add_column(&connection, "cached_models TEXT");
+        // Phase 1 (rename/identity): the session's project, as a fact rather
+        // than an inference. NULL = the session runs at the solution root (the
+        // "ROOT" label). Previously the project was derived by comparing `cwd`
+        // to each member's `local_path` with exact equality, so any path drift
+        // silently degraded the label to ROOT. No FK: `solution_agent.db` is a
+        // different file from the solutions DB, so a dangling member_id degrades
+        // to "unknown project" instead of corrupting the row.
+        apply_idempotent_add_column(&connection, "member_id INTEGER");
 
         connection.exec(indoc! {"
             CREATE TABLE IF NOT EXISTS solution_session_background_agent (
@@ -327,9 +335,126 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            delete_by_solution(&connection, &solution_id)
+            delete_by_solution(&connection, solution_id)
         })
     }
+
+    /// Rewrite `solution_sessions.solution_id` / `solution_session_attachment
+    /// .solution_id` from the pre-identity TEXT slug to the numeric counter id
+    /// the solutions DB now uses, and bind each session to the member whose
+    /// `local_path` equals its `cwd`.
+    ///
+    /// Idempotent: rows whose `solution_id` already parses as an integer are
+    /// skipped, and `member_id` is only written where it is still NULL.
+    ///
+    /// `legacy_solution_ids` is `(old_slug, new_id)` from
+    /// `SolutionsDb::load_solution_legacy_ids`; `members` is
+    /// `(member_id, solution_id, local_path)`.
+    pub fn migrate_identity(
+        &self,
+        legacy_solution_ids: Vec<(String, i64)>,
+        members: Vec<(i64, i64, String)>,
+    ) -> Task<Result<IdentityMigrationReport>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            migrate_identity_fn(&connection, &legacy_solution_ids, &members)
+        })
+    }
+
+    pub fn set_session_member(
+        &self,
+        id: SolutionSessionId,
+        member_id: Option<solutions::MemberId>,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut update = connection.exec_bound::<(Option<i64>, String)>(indoc! {"
+                UPDATE solution_sessions SET member_id = ?1 WHERE id = ?2
+            "})?;
+            update((member_id.map(|m| m.0), id.to_string()))?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityMigrationReport {
+    pub sessions_total: i64,
+    pub sessions_remapped: i64,
+    /// Slugs that had no entry in the solutions DB's legacy map — their rows are
+    /// left untouched so the operator can inspect them. Non-empty means a
+    /// solution was deleted from `solutions.db` while its sessions survived.
+    pub sessions_unmapped: Vec<String>,
+    pub member_ids_backfilled: i64,
+}
+
+fn migrate_identity_fn(
+    connection: &Connection,
+    legacy_solution_ids: &[(String, i64)],
+    members: &[(i64, i64, String)],
+) -> Result<IdentityMigrationReport> {
+    let sessions = connection.select::<(String, String, Option<String>, Option<i64>)>(indoc! {"
+        SELECT id, solution_id, cwd, member_id FROM solution_sessions
+    "})?()?;
+
+    let mut report = IdentityMigrationReport {
+        sessions_total: sessions.len() as i64,
+        ..Default::default()
+    };
+
+    let mut remap = connection.exec_bound::<(String, String)>(indoc! {"
+        UPDATE solution_sessions SET solution_id = ?1 WHERE id = ?2
+    "})?;
+    let mut remap_attachments = connection.exec_bound::<(String, String)>(indoc! {"
+        UPDATE solution_session_attachment SET solution_id = ?1 WHERE solution_id = ?2
+    "})?;
+    let mut bind_member = connection.exec_bound::<(i64, String)>(indoc! {"
+        UPDATE solution_sessions SET member_id = ?1 WHERE id = ?2
+    "})?;
+
+    let mut unmapped: Vec<String> = Vec::new();
+    for (session_id, solution_id, cwd, member_id) in &sessions {
+        // Already-numeric rows were migrated by an earlier run.
+        let numeric_solution: i64 = match solution_id.parse::<i64>() {
+            Ok(numeric) => numeric,
+            Err(_) => {
+                let Some((_, new_id)) =
+                    legacy_solution_ids.iter().find(|(old, _)| old == solution_id)
+                else {
+                    if !unmapped.contains(solution_id) {
+                        unmapped.push(solution_id.clone());
+                    }
+                    continue;
+                };
+                remap((new_id.to_string(), session_id.clone()))?;
+                remap_attachments((new_id.to_string(), solution_id.clone()))?;
+                report.sessions_remapped += 1;
+                *new_id
+            }
+        };
+
+        if member_id.is_some() {
+            continue;
+        }
+        let Some(cwd) = cwd.as_deref().filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        // Exact match only: `cwd` is the member root at spawn time. A cwd that is
+        // the solution root (or anything else) stays NULL — that IS the ROOT label.
+        let Some((matched_member, _, _)) = members
+            .iter()
+            .find(|(_, solution, path)| *solution == numeric_solution && path == cwd)
+        else {
+            continue;
+        };
+        bind_member((*matched_member, session_id.clone()))?;
+        report.member_ids_backfilled += 1;
+    }
+
+    report.sessions_unmapped = unmapped;
+    Ok(report)
 }
 
 /// Apply `ALTER TABLE solution_sessions ADD COLUMN <column_def>` and
@@ -440,8 +565,12 @@ fn purge_session_fn(connection: &Connection, id: SolutionSessionId) -> Result<()
     tx.map_err(|e| anyhow!("purge_session failed: {e}"))
 }
 
-fn delete_by_solution(connection: &Connection, solution_id: &SolutionId) -> Result<()> {
-    let solution_id = solution_id.0.clone();
+fn delete_by_solution(connection: &Connection, solution_id: SolutionId) -> Result<()> {
+    // The `solution_id` column is TEXT (it held slugs before the identity
+    // migration); the migration rewrites it to the *decimal text* of the numeric
+    // id rather than retyping the column, so every read/write of it binds the
+    // stringified counter.
+    let solution_id = solution_id.0.to_string();
     // One savepoint so the solution can't be left half-purged. Only
     // `solution_sessions` and `solution_session_attachment` carry a
     // `solution_id` column; the per-session child tables (entries + the two

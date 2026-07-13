@@ -84,7 +84,7 @@
     fn build_session() -> SolutionSession {
         SolutionSession {
             id: SolutionSessionId::new(),
-            solution_id: SolutionId("sol".into()),
+            solution_id: SolutionId(10),
             agent_id: SharedString::from("claude-acp"),
             acp_session_id: acp::SessionId::new("acp-mock"),
             acp_thread: None,

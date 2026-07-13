@@ -6,17 +6,17 @@
     use super::*;
     use crate::store::tests::create_session_with_thread;
     use agent_client_protocol::schema as acp;
-    use anyhow::{Context as _, Result, anyhow};
-    use context_server::listener::{McpServerTool, ToolResponse};
+    
+    use context_server::listener::McpServerTool;
     use context_server::types::ToolResponseContent;
-    use gpui::{AsyncApp, Entity};
-    use schemars::JsonSchema;
-    use serde::{Deserialize, Deserializer, Serialize};
-    use std::collections::HashMap;
-    use crate::model::{SolutionSession, SolutionSessionId};
-    use crate::store::{PersistedSession, SolutionAgentStore};
+    
+    
+    
+    
+    use crate::model::SolutionSessionId;
+    use crate::store::SolutionAgentStore;
     use gpui::SharedString;
-    use solutions::{SolutionId, SolutionStore};
+    
 
     #[test]
     fn entry_role_and_status_dto_serialize_snake_case() {
@@ -688,7 +688,7 @@
                 let id = crate::model::SolutionSessionId::new();
                 let mut session = crate::model::SolutionSession::new_idle(
                     id,
-                    solution_id.clone(),
+                    solution_id,
                     SharedString::from("mock-agent"),
                     acp::SessionId::new(format!("acp-{}", id.as_str())),
                 );
@@ -996,7 +996,7 @@
                 .expect("first session exists");
             let session_ref = session.read(cx);
             (
-                session_ref.solution_id.clone(),
+                session_ref.solution_id,
                 session_ref.agent_id.clone(),
                 session_ref
                     .project
@@ -1009,7 +1009,7 @@
             .update(|cx| {
                 let store = SolutionAgentStore::global(cx);
                 store.update(cx, |store, cx| {
-                    store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                    store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
                 })
             })
             .await
@@ -1019,7 +1019,7 @@
             .update(|cx| {
                 let store = SolutionAgentStore::global(cx);
                 store.update(cx, |store, cx| {
-                    store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                    store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
                 })
             })
             .await
@@ -1048,7 +1048,7 @@
         let result = ListSessionsTool
             .run(
                 ListSessionsParams {
-                    solution_id: Some(solution_id.0.clone()),
+                    solution_id: Some(solution_id.0),
                     parent_session_id: None,
                     count: Some(1),
                     before_last_activity_at_ms: None,
@@ -1094,7 +1094,7 @@
                 .expect("parent session exists");
             let session_ref = session.read(cx);
             (
-                session_ref.solution_id.clone(),
+                session_ref.solution_id,
                 session_ref.agent_id.clone(),
                 session_ref.project.clone().expect("parent has project"),
             )
@@ -1177,7 +1177,6 @@
                 .expect("session")
                 .read(cx)
                 .solution_id
-                .clone()
         });
         // A short id that's well-formed (`[a-z0-9]{8}`) but not in the
         // store. `parse` will accept it; the store lookup will reject.
@@ -1185,7 +1184,7 @@
         let err = CreateSessionTool
             .run(
                 CreateSessionParams {
-                    solution_id: solution_id.0.clone(),
+                    solution_id: solution_id.0,
                     agent_id: "mock-agent".into(),
                     initial_message: None,
                     parent_session_id: Some(unknown_parent.to_string()),
@@ -1216,11 +1215,11 @@
         // belongs to solution-A; we pass solution-B. Validation fires
         // before workspace lookup so we don't need solution-B to have
         // an open window.
-        let other_solution = "sol-OTHER-not-the-parents";
+        let other_solution: i64 = 999;
         let err = CreateSessionTool
             .run(
                 CreateSessionParams {
-                    solution_id: other_solution.into(),
+                    solution_id: other_solution,
                     agent_id: "mock-agent".into(),
                     initial_message: None,
                     parent_session_id: Some(parent_id.to_string()),
@@ -1365,14 +1364,13 @@
                 .expect("parent")
                 .read(cx)
                 .solution_id
-                .clone()
         });
 
         // parent_session_id=parent → both children come back, parent itself excluded.
         let filtered = ListSessionsTool
             .run(
                 ListSessionsParams {
-                    solution_id: Some(solution_id.0.clone()),
+                    solution_id: Some(solution_id.0),
                     parent_session_id: Some(parent_id.to_string()),
                     before_last_activity_at_ms: None,
                     count: None,
@@ -1416,7 +1414,6 @@
                 .expect("tabbed")
                 .read(cx)
                 .solution_id
-                .clone()
         });
 
         let untabbed_id = cx.update(|cx| {
@@ -1434,7 +1431,7 @@
                 let id = SolutionSessionId::new();
                 crate::store::tests::insert_cold_session(
                     id,
-                    solution_id.clone(),
+                    solution_id,
                     "mock-agent".into(),
                     None,
                     None,
@@ -1448,7 +1445,7 @@
         let result = ListSessionsTool
             .run(
                 ListSessionsParams {
-                    solution_id: Some(solution_id.0.clone()),
+                    solution_id: Some(solution_id.0),
                     ..Default::default()
                 },
                 &mut cx.to_async(),
@@ -2469,7 +2466,7 @@
         let now = chrono::Utc::now();
         let meta = crate::model::SolutionSessionMetadata {
             id: session_id,
-            solution_id: solution_id.clone(),
+            solution_id: solution_id,
             agent_id: SharedString::from("mock-agent"),
             acp_session_id: acp::SessionId::new(format!("acp-{}", session_id.as_str())),
             title: SharedString::from("closed row-native session"),
@@ -2484,6 +2481,7 @@
             desired_effort: None,
             cached_models: vec![],
             tab_order: None,
+            member_id: None,
         };
         db.save_metadata(meta).await.expect("save metadata");
 
@@ -2603,7 +2601,7 @@
                 let id = crate::model::SolutionSessionId::new();
                 let mut session = crate::model::SolutionSession::new_idle(
                     id,
-                    solution_id.clone(),
+                    solution_id,
                     SharedString::from("mock-agent"),
                     acp::SessionId::new(format!("acp-{}", id.as_str())),
                 );

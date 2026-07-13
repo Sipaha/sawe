@@ -75,7 +75,7 @@ impl SolutionAgentStore {
     /// test), or the solution isn't registered.
     pub(super) fn solution_root_for(&self, id: SolutionSessionId, cx: &App) -> Option<PathBuf> {
         let session = self.session(id)?;
-        let solution_id = session.read(cx).solution_id.clone();
+        let solution_id = session.read(cx).solution_id;
         SolutionStore::try_global(cx).and_then(|store| {
             store.read_with(cx, |s, _| {
                 s.solutions()
@@ -280,7 +280,7 @@ impl SolutionAgentStore {
                 }
             };
             (
-                s.solution_id.clone(),
+                s.solution_id,
                 s.agent_id.clone(),
                 project,
                 context_usage,

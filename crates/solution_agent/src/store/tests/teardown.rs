@@ -23,7 +23,7 @@ fn close_session_removes_from_indices(cx: &mut TestAppContext) {
             let entity = cx.new(|_| {
                 let mut s = SolutionSession::new_idle(
                     id,
-                    SolutionId("sol-a".into()),
+                    SolutionId(1),
                     SharedString::from("claude-acp"),
                     agent_client_protocol::schema::SessionId::new("acp-1"),
                 );
@@ -33,13 +33,13 @@ fn close_session_removes_from_indices(cx: &mut TestAppContext) {
             store.sessions.insert(id, entity);
             store
                 .by_solution
-                .entry(SolutionId("sol-a".into()))
+                .entry(SolutionId(1))
                 .or_default()
                 .push(id);
 
-            assert_eq!(store.sessions_for(&SolutionId("sol-a".into())).len(), 1);
+            assert_eq!(store.sessions_for(&SolutionId(1)).len(), 1);
             store.close_session(id, cx).expect("close_session");
-            assert_eq!(store.sessions_for(&SolutionId("sol-a".into())).len(), 0);
+            assert_eq!(store.sessions_for(&SolutionId(1)).len(), 0);
             assert!(store.session(id).is_none());
         });
     });
@@ -60,10 +60,10 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let sol = SolutionId("sol-a".into());
+            let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
             let id = SolutionSessionId::new();
-            insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+            insert_cold_session(id, sol, agent, None, None, store, cx);
 
             // Populate every per-session runtime map for `id`.
             store
@@ -207,7 +207,7 @@ async fn close_session_purges_inbox_attachments(cx: &mut gpui::TestAppContext) {
 async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
     let (archive_dir, db, sol) = store.update(cx, |store, cx| {
-        let sol = store.session(id).unwrap().read(cx).solution_id.clone();
+        let sol = store.session(id).unwrap().read(cx).solution_id;
         let root = store.solution_root_for_app(id, cx).expect("solution root");
         (
             root.join(".agents").join(id.to_string()),
@@ -225,7 +225,7 @@ async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::Tes
     // Persist a metadata row + an entry so we can prove the HARD delete.
     db.save_metadata(crate::model::SolutionSessionMetadata {
         id,
-        solution_id: sol.clone(),
+        solution_id: sol,
         agent_id: SharedString::from("claude-acp"),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-cold"),
         title: SharedString::from("Cold"),
@@ -240,6 +240,7 @@ async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::Tes
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     })
     .await
     .unwrap();
@@ -263,7 +264,7 @@ async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::Tes
     });
     assert!(!archive_dir.exists(), ".agents/<sid> tree must be deleted");
     assert!(
-        db.list_for_solution(sol.clone())
+        db.list_for_solution(sol)
             .await
             .unwrap()
             .iter()
@@ -285,7 +286,7 @@ async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::Tes
 async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
     let (root, agents_dir, archive_dir, db, sol) = store.update(cx, |store, cx| {
-        let sol = store.session(id).unwrap().read(cx).solution_id.clone();
+        let sol = store.session(id).unwrap().read(cx).solution_id;
         let root = store.solution_root_for_app(id, cx).expect("solution root");
         let agents = root.join(".agents");
         (
@@ -308,7 +309,7 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
     // Persist the hydrated session's metadata + an entry, plus a supervisor row.
     db.save_metadata(crate::model::SolutionSessionMetadata {
         id,
-        solution_id: sol.clone(),
+        solution_id: sol,
         agent_id: SharedString::from("claude-acp"),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-cold"),
         title: SharedString::from("Cold"),
@@ -323,6 +324,7 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     })
     .await
     .unwrap();
@@ -334,7 +336,7 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
         .unwrap();
 
     store.update(cx, |store, cx| {
-        store.purge_solution_fully(sol.clone(), Some(root.clone()), cx)
+        store.purge_solution_fully(sol, Some(root.clone()), cx)
     });
     cx.run_until_parked();
 
@@ -350,7 +352,7 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
         ".agents tree must be wholesale-removed"
     );
     assert!(
-        db.list_for_solution(sol.clone()).await.unwrap().is_empty(),
+        db.list_for_solution(sol).await.unwrap().is_empty(),
         "session rows must be hard-deleted"
     );
     assert!(
@@ -374,7 +376,7 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
 async fn close_session_is_soft_keeps_archive_dir_and_supervisor_row(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
     let (archive_dir, db, sol) = store.update(cx, |store, cx| {
-        let sol = store.session(id).unwrap().read(cx).solution_id.clone();
+        let sol = store.session(id).unwrap().read(cx).solution_id;
         let root = store.solution_root_for_app(id, cx).expect("solution root");
         (
             root.join(".agents").join(id.to_string()),
@@ -389,7 +391,7 @@ async fn close_session_is_soft_keeps_archive_dir_and_supervisor_row(cx: &mut gpu
     // so the row must exist before the soft close for the stamp to land.
     db.save_metadata(crate::model::SolutionSessionMetadata {
         id,
-        solution_id: sol.clone(),
+        solution_id: sol,
         agent_id: SharedString::from("claude-acp"),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-cold"),
         title: SharedString::from("Cold"),
@@ -404,6 +406,7 @@ async fn close_session_is_soft_keeps_archive_dir_and_supervisor_row(cx: &mut gpu
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     })
     .await
     .unwrap();
@@ -458,7 +461,7 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
         let root = solution_store.read(cx).solutions()[0].root.clone();
         let member_path = root.join("kept-member");
         solution_store.update(cx, |s, _| {
-            s.test_add_member_with_path(&sol, &CatalogId("kept".into()), member_path.clone());
+            s.test_add_member_with_path(sol, "kept", member_path.clone());
         });
         (sol, root, member_path)
     });
@@ -478,7 +481,7 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
             (orphan, root.join("removed-member")),
         ] {
             let session =
-                insert_cold_session(sid, sol.clone(), agent.clone(), None, None, store, cx);
+                insert_cold_session(sid, sol, agent.clone(), None, None, store, cx);
             session.update(cx, |s, _| s.cwd = cwd);
         }
         store.gc_orphan_members(cx);
@@ -509,7 +512,6 @@ async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppConte
             .expect("seeded")
             .read(cx)
             .solution_id
-            .clone()
     });
     let db = store
         .read_with(cx, |s, _| s.persistence())
@@ -523,7 +525,7 @@ async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppConte
         for id in [old, recent] {
             insert_cold_session(
                 id,
-                sol.clone(),
+                sol,
                 SharedString::from("claude-acp"),
                 None,
                 None,
@@ -548,7 +550,7 @@ async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppConte
     .unwrap();
 
     store.update(cx, |store, cx| {
-        store.reap_stale_closed_sessions(sol.clone(), cx)
+        store.reap_stale_closed_sessions(sol, cx)
     });
     cx.run_until_parked();
 
@@ -574,10 +576,10 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let sol = SolutionId("sol-a".into());
+            let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
             let id = SolutionSessionId::new();
-            insert_cold_session(id, sol.clone(), agent.clone(), None, None, store, cx);
+            insert_cold_session(id, sol, agent, None, None, store, cx);
 
             store
                 .supervisor_states
@@ -669,7 +671,7 @@ fn stale_archive_dirs_gates_on_count_then_age() {
     let root = std::path::Path::new("/sol/root");
     let make = |n: usize, days_ago: i64| crate::model::SolutionSessionMetadata {
         id: crate::model::SolutionSessionId::new(),
-        solution_id: SolutionId("sol".into()),
+        solution_id: SolutionId(10),
         agent_id: SharedString::from("claude-acp"),
         acp_session_id: agent_client_protocol::schema::SessionId::new(format!("acp-{n}")),
         title: SharedString::from("s"),
@@ -684,6 +686,7 @@ fn stale_archive_dirs_gates_on_count_then_age() {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
 
     // <= the min-session gate: keep everything, even ancient archives.

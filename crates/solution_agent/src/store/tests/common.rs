@@ -25,7 +25,7 @@ pub(crate) fn insert_cold_session(
     let session = cx.new(|_| {
         let mut s = crate::model::SolutionSession::new_idle(
             session_id,
-            solution_id.clone(),
+            solution_id,
             agent_id,
             agent_client_protocol::schema::SessionId::new("acp-cold"),
         );
@@ -117,7 +117,7 @@ pub(crate) async fn create_session_with_thread(
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
             })
         })
         .await

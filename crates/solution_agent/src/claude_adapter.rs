@@ -55,15 +55,15 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
             "\nThis solution's id is `{id}`. You can manage its member projects with \
              these MCP tools (provided by the `sawe` server):\n\
              - `catalog.list` — list every available registry (catalog) project.\n\
-             - `solutions.add_member {{\"solution_id\": \"{id}\", \"catalog_id\": \
-             \"<id from catalog.list>\"}}` — clone an existing registry project into \
+             - `solutions.add_member {{\"solution_id\": {id}, \"catalog_id\": \
+             <id from catalog.list>}}` — clone an existing registry project into \
              THIS solution (runs asynchronously).\n\
-             - `solutions.add_empty_member {{\"solution_id\": \"{id}\", \"name\": \
+             - `solutions.add_empty_member {{\"solution_id\": {id}, \"name\": \
              \"<project name>\"}}` — create a new empty, git-initialised (no remote) \
              project in THIS solution.\n\
              Use these whenever the user asks to add an existing project or create a \
              new one in this solution.\n",
-            id = solution.id.as_str(),
+            id = solution.id.0,
         ));
         buf.push_str(
             "Stay inside the solution. All file edits, git operations, and shell \
@@ -116,22 +116,25 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use solutions::{CatalogId, Solution, SolutionId, SolutionMember};
+    use solutions::{MemberId, Solution, SolutionId, SolutionMember};
     use std::path::PathBuf;
 
     fn solution(members: Vec<&str>) -> Solution {
         Solution {
-            id: SolutionId("sol-x".into()),
+            id: SolutionId(14),
             name: "test".into(),
             root: PathBuf::from("/tmp/sol-x"),
             members: members
                 .into_iter()
-                .map(|m| SolutionMember {
-                    catalog_id: CatalogId(format!("cat-{m}")),
+                .enumerate()
+                .map(|(i, m)| SolutionMember {
+                    id: MemberId(i as i64 + 1),
+                    name: m.to_string(),
                     local_path: PathBuf::from(format!("/tmp/sol-x/{m}")),
+                    origin_catalog_id: None,
                 })
                 .collect(),
-            last_opened_at: Some(Utc::now()),
+            last_opened_at: Some(Utc::now().timestamp_millis()),
         }
     }
 
@@ -147,11 +150,11 @@ mod tests {
         assert!(prompt.contains("per-action go-ahead"));
         // Catalog / project-management awareness: the agent must know the
         // solution id and the tools to list + add projects to it.
-        assert!(prompt.contains("solution's id is `sol-x`"));
+        assert!(prompt.contains("solution's id is `14`"));
         assert!(prompt.contains("catalog.list"));
         assert!(prompt.contains("solutions.add_member"));
         assert!(prompt.contains("solutions.add_empty_member"));
-        assert!(prompt.contains("\"solution_id\": \"sol-x\""));
+        assert!(prompt.contains("\"solution_id\": 14"));
     }
 
     #[test]

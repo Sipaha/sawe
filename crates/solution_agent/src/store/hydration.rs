@@ -274,7 +274,7 @@ impl SolutionAgentStore {
             return Task::ready(Ok(existing));
         }
 
-        let pair = (meta.solution_id.clone(), meta.agent_id.clone());
+        let pair = (meta.solution_id, meta.agent_id.clone());
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let solution = cx.update(|cx| {
@@ -687,7 +687,7 @@ impl SolutionAgentStore {
                     let entity = cx.new(|cx| {
                         let mut s = SolutionSession::new_idle(
                             session_id,
-                            meta.solution_id.clone(),
+                            meta.solution_id,
                             meta.agent_id.clone(),
                             new_thread_session_id,
                         );
@@ -737,7 +737,7 @@ impl SolutionAgentStore {
                 }
                 let by_sol = store
                     .by_solution
-                    .entry(meta.solution_id.clone())
+                    .entry(meta.solution_id)
                     .or_default();
                 if !by_sol.contains(&session_id) {
                     by_sol.push(session_id);
@@ -815,14 +815,14 @@ impl SolutionAgentStore {
         let already_open: std::collections::HashSet<SolutionSessionId> =
             self.sessions.keys().copied().collect();
         cx.spawn(async move |this, cx| {
-            let ordered_ids = db.list_open_tabs(solution_id.clone()).await?;
+            let ordered_ids = db.list_open_tabs(solution_id).await?;
             if ordered_ids.is_empty() {
                 return Ok(Vec::new());
             }
             // Pull metadata for the whole solution once (single query) and
             // index by id. Cheaper than N round-trips when the user had
             // five-plus tabs open.
-            let metas = db.list_for_solution(solution_id.clone()).await?;
+            let metas = db.list_for_solution(solution_id).await?;
             let by_id: std::collections::HashMap<SolutionSessionId, SolutionSessionMetadata> =
                 metas.into_iter().map(|m| (m.id, m)).collect();
             // Phase 4: prefer per-entry rows. Load rows + epoch for every id
@@ -945,7 +945,7 @@ impl SolutionAgentStore {
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
-                            meta.solution_id.clone(),
+                            meta.solution_id,
                             meta.agent_id.clone(),
                             meta.acp_session_id.clone(),
                         );
@@ -993,7 +993,7 @@ impl SolutionAgentStore {
                         this.persist_session_row(meta.id, cx);
                     }
                     this.by_solution
-                        .entry(solution_id.clone())
+                        .entry(solution_id)
                         .or_default()
                         .push(meta.id);
                     cx.emit(SolutionAgentStoreEvent::SessionCreated {
@@ -1115,8 +1115,8 @@ impl SolutionAgentStore {
         // Opening a solution is a natural, infrequent point to garbage-collect
         // stale on-disk session archives under `.agents/`, and to hard-purge
         // sessions that have sat soft-closed past their TTL.
-        self.reap_stale_session_archives(solution_id.clone(), cx);
-        self.reap_stale_closed_sessions(solution_id.clone(), cx);
+        self.reap_stale_session_archives(solution_id, cx);
+        self.reap_stale_closed_sessions(solution_id, cx);
         let Some(db) = self.persistence.clone() else {
             return Task::ready(Ok(Vec::new()));
         };
@@ -1130,7 +1130,7 @@ impl SolutionAgentStore {
             // session back into self.sessions, undoing the close from
             // the phone's perspective on the very next list_sessions.
             let open_ids: std::collections::HashSet<SolutionSessionId> = db
-                .list_open_session_ids(solution_id.clone())
+                .list_open_session_ids(solution_id)
                 .await?
                 .into_iter()
                 .collect();
@@ -1138,7 +1138,7 @@ impl SolutionAgentStore {
             // `tab_order` on freshly-hydrated sessions. Sessions not
             // in this list get `tab_order = None` (closed/hidden tab).
             let tabbed_ids: Vec<SolutionSessionId> = db
-                .list_open_tabs(solution_id.clone())
+                .list_open_tabs(solution_id)
                 .await
                 .unwrap_or_default();
             let tab_order_map: std::collections::HashMap<SolutionSessionId, i64> = tabbed_ids
@@ -1149,7 +1149,7 @@ impl SolutionAgentStore {
             if open_ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let metas = db.list_for_solution(solution_id.clone()).await?;
+            let metas = db.list_for_solution(solution_id).await?;
             if metas.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1245,7 +1245,7 @@ impl SolutionAgentStore {
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
-                            meta.solution_id.clone(),
+                            meta.solution_id,
                             meta.agent_id.clone(),
                             meta.acp_session_id.clone(),
                         );
@@ -1365,7 +1365,7 @@ impl SolutionAgentStore {
                             cx,
                             "workspace.session_opened",
                             serde_json::json!({
-                                "solution_id": solution_id.as_str(),
+                                "solution_id": solution_id.0,
                                 "session": summary,
                             }),
                         );
@@ -1407,7 +1407,7 @@ impl SolutionAgentStore {
         priority: Option<SolutionSessionId>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<SolutionSessionId>>> {
-        self.reap_stale_session_archives(solution_id.clone(), cx);
+        self.reap_stale_session_archives(solution_id, cx);
         let Some(db) = self.persistence.clone() else {
             return Task::ready(Ok(Vec::new()));
         };
@@ -1417,7 +1417,7 @@ impl SolutionAgentStore {
             // Metadata-only queries — deliberately NO blob loads here so the
             // placeholder pass below can return fast.
             let open_ids: std::collections::HashSet<SolutionSessionId> = db
-                .list_open_session_ids(solution_id.clone())
+                .list_open_session_ids(solution_id)
                 .await?
                 .into_iter()
                 .collect();
@@ -1425,7 +1425,7 @@ impl SolutionAgentStore {
                 return Ok(Vec::new());
             }
             let tabbed_ids: Vec<SolutionSessionId> = db
-                .list_open_tabs(solution_id.clone())
+                .list_open_tabs(solution_id)
                 .await
                 .unwrap_or_default();
             let tab_order_map: std::collections::HashMap<SolutionSessionId, i64> = tabbed_ids
@@ -1433,7 +1433,7 @@ impl SolutionAgentStore {
                 .enumerate()
                 .map(|(i, id)| (*id, i as i64))
                 .collect();
-            let metas = db.list_for_solution(solution_id.clone()).await?;
+            let metas = db.list_for_solution(solution_id).await?;
             if metas.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1455,7 +1455,7 @@ impl SolutionAgentStore {
                     let entity = cx.new(|_| {
                         let mut s = SolutionSession::new_idle(
                             meta.id,
-                            meta.solution_id.clone(),
+                            meta.solution_id,
                             meta.agent_id.clone(),
                             meta.acp_session_id.clone(),
                         );
@@ -1504,7 +1504,7 @@ impl SolutionAgentStore {
                             cx,
                             "workspace.session_opened",
                             serde_json::json!({
-                                "solution_id": solution_id.as_str(),
+                                "solution_id": solution_id.0,
                                 "session": summary,
                             }),
                         );
@@ -1656,7 +1656,7 @@ impl SolutionAgentStore {
         };
         cx.background_spawn(async move {
             let closed: HashSet<SolutionSessionId> = db
-                .list_closed_session_ids(solution_id.clone())
+                .list_closed_session_ids(solution_id)
                 .await?
                 .into_iter()
                 .collect();
@@ -1693,7 +1693,7 @@ impl SolutionAgentStore {
         cx.spawn(async move |this, cx| {
             db.reopen_session(id).await?;
             let hydrate = this.update(cx, |this, cx| {
-                this.hydrate_all_for_solution(solution_id.clone(), cx)
+                this.hydrate_all_for_solution(solution_id, cx)
             })?;
             hydrate.await?;
             this.update(cx, |this, cx| this.open_session_in_strip(id, cx))?;

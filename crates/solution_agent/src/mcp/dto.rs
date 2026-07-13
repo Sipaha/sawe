@@ -61,7 +61,7 @@ impl SessionStateDto {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SessionSummary {
     pub id: String,
-    pub solution_id: String,
+    pub solution_id: i64,
     pub agent_id: String,
     pub title: String,
     pub state: SessionStateDto,
@@ -266,7 +266,7 @@ pub fn session_summary(session: &SolutionSession, cx: &App) -> SessionSummary {
     };
     SessionSummary {
         id: session.id.to_string(),
-        solution_id: session.solution_id.0.clone(),
+        solution_id: session.solution_id.0,
         agent_id: session.agent_id.to_string(),
         title: session.title.to_string(),
         state: SessionStateDto::from_state(

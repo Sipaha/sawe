@@ -16,7 +16,7 @@ async fn pool_release_arms_60s_shutdown_then_drops(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
 
-    let key = (SolutionId("sol-a".into()), SharedString::from("mock-agent"));
+    let key = (SolutionId(1), SharedString::from("mock-agent"));
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -54,7 +54,7 @@ async fn pool_release_arms_60s_shutdown_then_drops(cx: &mut TestAppContext) {
 async fn shutdown_cancels_when_session_re_added(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
-    let key = (SolutionId("sol-a".into()), SharedString::from("mock-agent"));
+    let key = (SolutionId(1), SharedString::from("mock-agent"));
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -106,7 +106,7 @@ async fn create_session_spawns_subprocess_once_per_pair(cx: &mut TestAppContext)
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
             })
         })
         .await
@@ -147,13 +147,13 @@ async fn parallel_create_session_for_same_pair_spawns_only_once(cx: &mut TestApp
     let task1 = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+            store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
         })
     });
     let task2 = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+            store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
         })
     });
 
@@ -208,7 +208,7 @@ async fn create_session_with_cancel_counter(
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
             })
         })
         .await
@@ -856,7 +856,7 @@ async fn send_message_starts_running_state_immediately(cx: &mut TestAppContext) 
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
             })
         })
         .await
@@ -1533,7 +1533,7 @@ async fn late_send_error_is_dropped_when_session_was_reset(cx: &mut TestAppConte
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
             })
         })
         .await
@@ -2286,21 +2286,23 @@ async fn reset_context_preserves_session_cwd(cx: &mut TestAppContext) {
 #[gpui::test]
 fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
     use crate::claude_adapter::{CLAUDE_ACP_AGENT_ID, ClaudeAcpAdapter};
-    use solutions::{CatalogId, Solution, SolutionMember};
+    use solutions::{MemberId, Solution, SolutionMember};
 
     let mut registry = AdapterRegistry::new();
     registry.register(Arc::new(ClaudeAcpAdapter));
     cx.update(|cx| SolutionAgentStore::init_global(cx, Arc::new(registry)));
 
     let solution = Solution {
-        id: SolutionId("sol-meta".into()),
+        id: SolutionId(6),
         name: "test-meta".into(),
         root: PathBuf::from("/tmp/sol-meta"),
         members: vec![SolutionMember {
-            catalog_id: CatalogId("cat-foo".into()),
+            id: MemberId(1),
+            name: "foo".into(),
             local_path: PathBuf::from("/tmp/sol-meta/foo"),
+            origin_catalog_id: None,
         }],
-        last_opened_at: Some(Utc::now()),
+        last_opened_at: Some(Utc::now().timestamp_millis()),
     };
 
     cx.update(|cx| {
@@ -2410,7 +2412,7 @@ async fn cold_send_unknown_solution_returns_structured_error(cx: &mut TestAppCon
         SolutionAgentStore::init_global(cx, registry);
     });
 
-    let orphan_solution_id = SolutionId("orphan-sol".into());
+    let orphan_solution_id = SolutionId(15);
     let session_id = SolutionSessionId::new();
     let agent_id = SharedString::from("mock-agent");
 
@@ -2419,7 +2421,7 @@ async fn cold_send_unknown_solution_returns_structured_error(cx: &mut TestAppCon
         store.update(cx, |store, cx| {
             insert_cold_session(
                 session_id,
-                orphan_solution_id.clone(),
+                orphan_solution_id,
                 agent_id.clone(),
                 None,
                 None,
@@ -3596,7 +3598,7 @@ async fn send_during_running_on_native_connection_routes_to_queue(cx: &mut TestA
         let session = cx.new(|_| {
             let mut s = crate::model::SolutionSession::new_idle(
                 session_id,
-                solution_id.clone(),
+                solution_id,
                 agent_id.clone(),
                 acp_session_id.clone(),
             );
@@ -3616,7 +3618,7 @@ async fn send_during_running_on_native_connection_routes_to_queue(cx: &mut TestA
             store.sessions.insert(session_id, session);
             store
                 .by_solution
-                .entry(solution_id.clone())
+                .entry(solution_id)
                 .or_default()
                 .push(session_id);
         });
@@ -3744,7 +3746,7 @@ async fn registered_store_pull_drains_queue_and_returns_followup_text(cx: &mut T
         let session = cx.new(|_| {
             let mut s = crate::model::SolutionSession::new_idle(
                 session_id,
-                solution_id.clone(),
+                solution_id,
                 agent_id.clone(),
                 acp_session_id.clone(),
             );
@@ -3764,7 +3766,7 @@ async fn registered_store_pull_drains_queue_and_returns_followup_text(cx: &mut T
             store.sessions.insert(session_id, session.clone());
             store
                 .by_solution
-                .entry(solution_id.clone())
+                .entry(solution_id)
                 .or_default()
                 .push(session_id);
             let sub = store.subscribe_to_session(session_id, acp_thread.clone(), cx);
@@ -3942,7 +3944,7 @@ async fn create_session_appends_subsequent_sessions_in_order(cx: &mut TestAppCon
         let session = store.read(cx).session(first).expect("first session");
         let s = session.read(cx);
         (
-            s.solution_id.clone(),
+            s.solution_id,
             s.agent_id.clone(),
             s.project.clone().expect("first session has project"),
         )
@@ -3973,7 +3975,7 @@ async fn create_child_session_is_not_pinned(cx: &mut TestAppContext) {
         let session = store.read(cx).session(parent).expect("parent session");
         let s = session.read(cx);
         (
-            s.solution_id.clone(),
+            s.solution_id,
             s.agent_id.clone(),
             s.project.clone().expect("parent has project"),
         )
@@ -5756,7 +5758,7 @@ async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
             })
         })
         .await
@@ -5769,7 +5771,7 @@ async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
                 store.create_ephemeral_session(
-                    solution_id.clone(),
+                    solution_id,
                     agent_id.clone(),
                     project.clone(),
                     cx,

@@ -25,7 +25,7 @@ use solutions::{SolutionId, SolutionStore};
 /// first via `solutions.open`.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct CreateSessionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_message: Option<String>,
@@ -56,7 +56,7 @@ impl<'de> Deserialize<'de> for CreateSessionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             agent_id: String,
             initial_message: Option<String>,
             parent_session_id: Option<String>,
@@ -94,14 +94,10 @@ impl McpServerTool for CreateSessionTool {
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
-            "invalid_params: solution_id is required"
-        );
-        anyhow::ensure!(
             !input.agent_id.is_empty(),
             "invalid_params: agent_id is required"
         );
-        let solution_id = SolutionId(input.solution_id.clone());
+        let solution_id = SolutionId(input.solution_id);
         let agent_id: crate::model::AgentServerId = input.agent_id.clone().into();
 
         // F: parent validation. Parse the id, then look it up in the
@@ -118,7 +114,7 @@ impl McpServerTool for CreateSessionTool {
                     store.read_with(cx, |store, cx| {
                         store
                             .session(parsed)
-                            .map(|entity| entity.read(cx).solution_id.clone())
+                            .map(|entity| entity.read(cx).solution_id)
                     })
                 });
                 let parent_solution =
@@ -136,7 +132,7 @@ impl McpServerTool for CreateSessionTool {
         };
 
         let project = cx
-            .update(|cx| project_for_solution(&input.solution_id, cx))
+            .update(|cx| project_for_solution(solution_id, cx))
             .ok_or_else(|| {
                 anyhow!(
                     "no_active_workspace_for_solution: open Solution {} via solutions.open before \
@@ -206,12 +202,12 @@ impl McpServerTool for CreateSessionTool {
 // the helper of the same name in `solutions::mcp` (kept private there);
 // duplicated here to avoid widening the `solutions` crate's public API
 // just for this MCP tool.
-fn project_for_solution(solution_id: &str, cx: &mut App) -> Option<Entity<project::Project>> {
+fn project_for_solution(solution_id: SolutionId, cx: &mut App) -> Option<Entity<project::Project>> {
     let store = SolutionStore::try_global(cx)?;
     let root = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.as_str() == solution_id)
+            .find(|sol| sol.id == solution_id)
             .map(|sol| sol.root.clone())
     })?;
 

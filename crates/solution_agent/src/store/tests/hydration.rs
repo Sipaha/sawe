@@ -32,7 +32,7 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
 
     let meta_a = crate::model::SolutionSessionMetadata {
         id: id_a,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: agent_id.clone(),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
@@ -47,6 +47,7 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
     let meta_b = crate::model::SolutionSessionMetadata {
         id: id_b,
@@ -73,14 +74,14 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
     .unwrap();
     db.save_blob(id_a, blob_a).await.expect("blob a");
 
-    db.update_tab_orders(solution_id.clone(), vec![id_b, id_a])
+    db.update_tab_orders(solution_id, vec![id_b, id_a])
         .await
         .expect("tab order");
 
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -163,7 +164,7 @@ async fn create_session_persists_tab_order_for_restart(cx: &mut TestAppContext) 
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.create_session(solution_id.clone(), agent_id.clone(), project.clone(), cx)
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
             })
         })
         .await
@@ -176,7 +177,7 @@ async fn create_session_persists_tab_order_for_restart(cx: &mut TestAppContext) 
     // be durable, so a restart's `restore_open_tabs` (which queries
     // `list_open_tabs`) re-hydrates it instead of raising "unknown session".
     let open_tabs = db
-        .list_open_tabs(solution_id.clone())
+        .list_open_tabs(solution_id)
         .await
         .expect("list_open_tabs");
     assert_eq!(
@@ -190,7 +191,7 @@ async fn create_session_persists_tab_order_for_restart(cx: &mut TestAppContext) 
     // this proves the create flow re-persists the row AFTER pinning, so the
     // value is durable regardless of which detached write won the race.
     let metas = db
-        .list_for_solution(solution_id.clone())
+        .list_for_solution(solution_id)
         .await
         .expect("list_for_solution");
     let row = metas
@@ -320,7 +321,7 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
 
     let meta_a = crate::model::SolutionSessionMetadata {
         id: id_a,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: agent_id.clone(),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
@@ -335,6 +336,7 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -359,14 +361,14 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
     })
     .unwrap();
     db.save_blob(id_a, blob_a).await.expect("blob a");
-    db.update_tab_orders(solution_id.clone(), vec![id_a])
+    db.update_tab_orders(solution_id, vec![id_a])
         .await
         .expect("tab order");
 
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -512,7 +514,7 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
     let now = Utc::now();
     let meta_a = crate::model::SolutionSessionMetadata {
         id: id_a,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: agent_id.clone(),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
@@ -527,6 +529,7 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -562,14 +565,14 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
     .await
     .expect("row 1");
     db.save_epoch(id_a, 7).await.expect("epoch");
-    db.update_tab_orders(solution_id.clone(), vec![id_a])
+    db.update_tab_orders(solution_id, vec![id_a])
         .await
         .expect("tab order");
 
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -628,7 +631,7 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
     let now = Utc::now();
     let meta_a = crate::model::SolutionSessionMetadata {
         id: id_a,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: agent_id.clone(),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
@@ -643,6 +646,7 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -683,14 +687,14 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
     db.save_change_seq(id_a, PERSISTED_CHANGE_SEQ)
         .await
         .expect("change_seq");
-    db.update_tab_orders(solution_id.clone(), vec![id_a])
+    db.update_tab_orders(solution_id, vec![id_a])
         .await
         .expect("tab order");
 
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -765,7 +769,7 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
     let now = Utc::now();
     let meta_a = crate::model::SolutionSessionMetadata {
         id: id_a,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: agent_id.clone(),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-legacy"),
         title: SharedString::from("legacy session"),
@@ -780,6 +784,7 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -814,13 +819,13 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
     .await
     .expect("row 1");
     // Intentionally do NOT call save_change_seq → column stays NULL.
-    db.update_tab_orders(solution_id.clone(), vec![id_a])
+    db.update_tab_orders(solution_id, vec![id_a])
         .await
         .expect("tab order");
 
     cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.restore_open_tabs(solution_id.clone(), cx)
+            store.restore_open_tabs(solution_id, cx)
         })
     })
     .await
@@ -873,7 +878,7 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     let now = Utc::now();
     let meta_a = crate::model::SolutionSessionMetadata {
         id: id_a,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: agent_id.clone(),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
@@ -888,6 +893,7 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -917,14 +923,14 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         db.load_entries(id_a).await.expect("load rows").is_empty(),
         "precondition: no rows before migration"
     );
-    db.update_tab_orders(solution_id.clone(), vec![id_a])
+    db.update_tab_orders(solution_id, vec![id_a])
         .await
         .expect("tab order");
 
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -969,7 +975,7 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     let ordered2 = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -1027,7 +1033,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     let now = chrono::Utc::now();
     let meta_a = crate::model::SolutionSessionMetadata {
         id: id_a,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: agent_id.clone(),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
         title: SharedString::from("model session"),
@@ -1043,6 +1049,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -1067,7 +1074,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         db.load_entries(id_a).await.expect("load rows").is_empty(),
         "precondition: no rows before first restore"
     );
-    db.update_tab_orders(solution_id.clone(), vec![id_a])
+    db.update_tab_orders(solution_id, vec![id_a])
         .await
         .expect("tab order");
 
@@ -1075,7 +1082,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -1105,7 +1112,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         .expect("load rows after migrate");
     assert_eq!(rows.len(), 1, "migration must have written 1 row");
     let metas = db
-        .list_for_solution(solution_id.clone())
+        .list_for_solution(solution_id)
         .await
         .expect("list metas");
     let db_meta = metas.iter().find(|m| m.id == id_a).expect("meta in db");
@@ -1127,7 +1134,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     let ordered2 = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -1172,7 +1179,7 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
     let now = Utc::now();
     let meta_a = crate::model::SolutionSessionMetadata {
         id: id_a,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: agent_id.clone(),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
         title: SharedString::from("legacy session"),
@@ -1187,6 +1194,7 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -1206,14 +1214,14 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
     })
     .unwrap();
     db.save_blob(id_a, blob_a).await.expect("blob a");
-    db.update_tab_orders(solution_id.clone(), vec![id_a])
+    db.update_tab_orders(solution_id, vec![id_a])
         .await
         .expect("tab order");
 
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id.clone(), cx)
+                store.restore_open_tabs(solution_id, cx)
             })
         })
         .await
@@ -1589,12 +1597,12 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
 
     let session_id = crate::model::SolutionSessionId::new();
-    let solution_id = SolutionId("sol-model-test".into());
+    let solution_id = SolutionId(7);
     let now = Utc::now();
 
     let meta = crate::model::SolutionSessionMetadata {
         id: session_id,
-        solution_id: solution_id.clone(),
+        solution_id: solution_id,
         agent_id: SharedString::from("mock-agent"),
         acp_session_id: agent_client_protocol::schema::SessionId::new("acp-model-test"),
         title: SharedString::from("model-test session"),
@@ -1609,6 +1617,7 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
         desired_effort: Some("high".to_string()),
         cached_models: vec![],
         tab_order: None,
+        member_id: None,
     };
 
     // Build the entity exactly as the fixed fresh-entity branch does.
@@ -1618,7 +1627,7 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
             cx.new(|_| {
                 let mut s = SolutionSession::new_idle(
                     meta.id,
-                    meta.solution_id.clone(),
+                    meta.solution_id,
                     meta.agent_id.clone(),
                     meta.acp_session_id.clone(),
                 );

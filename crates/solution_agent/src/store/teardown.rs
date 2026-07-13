@@ -136,7 +136,6 @@ impl SolutionAgentStore {
         // while their paths are still queryable.
         if let Some(db) = &self.persistence {
             let db = db.clone();
-            let solution_id = solution_id.clone();
             cx.background_spawn(async move {
                 if let Ok(paths) = db
                     .attachment_paths_for_solution(solution_id.0.to_string())
@@ -188,7 +187,7 @@ impl SolutionAgentStore {
                 .iter()
                 .map(|sol| {
                     let members = sol.members.iter().map(|m| m.local_path.clone()).collect();
-                    (sol.id.clone(), (sol.root.clone(), members))
+                    (sol.id, (sol.root.clone(), members))
                 })
                 .collect()
         });
@@ -287,7 +286,7 @@ impl SolutionAgentStore {
             .read(cx)
             .solutions()
             .iter()
-            .map(|s| s.id.clone())
+            .map(|s| s.id)
             .collect();
         let orphan_ids: Vec<SolutionId> = self
             .by_solution
@@ -383,7 +382,7 @@ impl SolutionAgentStore {
                 previews.join(" | "),
             );
         }
-        let solution_id = session_read.solution_id.clone();
+        let solution_id = session_read.solution_id;
         // Captured while the entity is still live (the flag is dropped with the
         // entity below). Hidden supervisor judge/auditor sessions suppress all
         // close notifications, mirroring the create-side suppression so a
@@ -399,7 +398,6 @@ impl SolutionAgentStore {
             let thread = thread.read(cx);
             (thread.connection().clone(), thread.session_id().clone())
         });
-        drop(session_read);
         if let Some(list) = self.by_solution.get_mut(&solution_id) {
             list.retain(|sid| *sid != id);
             if list.is_empty() {
@@ -447,7 +445,7 @@ impl SolutionAgentStore {
                     cx,
                     "workspace.session_deleted",
                     serde_json::json!({
-                        "solution_id": teardown.solution_id.as_str(),
+                        "solution_id": teardown.solution_id.0,
                         "session_id": id.to_string(),
                     }),
                 );

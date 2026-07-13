@@ -177,7 +177,7 @@ fn collect_snapshots(
             SessionSnapshot {
                 id: s.id,
                 parent_session_id: s.parent_session_id,
-                solution_id: s.solution_id.clone(),
+                solution_id: s.solution_id,
                 title: s.title.clone(),
                 state_label: state_label(&s.state),
                 state_color: state_color(&s.state),
@@ -339,7 +339,7 @@ pub(super) fn render_subagent_strip(
 ) -> Option<AnyElement> {
     let (current_id, solution_id) = {
         let s = session.read(cx);
-        (s.id, s.solution_id.clone())
+        (s.id, s.solution_id)
     };
     let snapshots = collect_snapshots(store, &solution_id, cx);
     let rows = compute_strip_rows(current_id, &solution_id, &snapshots)?;
@@ -477,7 +477,7 @@ mod tests {
         SessionSnapshot {
             id,
             parent_session_id: parent,
-            solution_id: SolutionId("sol-a".into()),
+            solution_id: SolutionId(1),
             title: SharedString::from(title.to_string()),
             state_label: "idle",
             state_color: StripStateColor::Success,
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn top_level_with_no_children_returns_none() {
         let parent = snap("a", None, "alpha", 1);
-        let rows = compute_strip_rows(parent.id, &SolutionId("sol-a".into()), &[parent]);
+        let rows = compute_strip_rows(parent.id, &SolutionId(1), &[parent]);
         assert!(
             rows.is_none(),
             "strip should hide for a lone top-level session"
@@ -514,7 +514,7 @@ mod tests {
         let parent = snap("a", None, "alpha", 1);
         let child = snap("b", Some("a"), "beta", 2);
         let child_id = child.id;
-        let rows = compute_strip_rows(child_id, &SolutionId("sol-a".into()), &[parent, child])
+        let rows = compute_strip_rows(child_id, &SolutionId(1), &[parent, child])
             .expect("strip rows present");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].indent_level, 0);
@@ -545,7 +545,7 @@ mod tests {
         let grandchild = snap("d", Some("b"), "delta", 4);
         let parent_id = parent.id;
         let snaps = vec![parent, child2, child1, grandchild];
-        let rows = compute_strip_rows(parent_id, &SolutionId("sol-a".into()), &snaps)
+        let rows = compute_strip_rows(parent_id, &SolutionId(1), &snaps)
             .expect("strip rows present");
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
         assert_eq!(labels, vec!["alpha", "beta", "delta", "gamma"]);
@@ -564,7 +564,7 @@ mod tests {
             let cid = format!("c{i:02}");
             snaps.push(snap(&cid, Some("a"), &format!("kid{i}"), 10 + i as i64));
         }
-        let rows = compute_strip_rows(parent_id, &SolutionId("sol-a".into()), &snaps)
+        let rows = compute_strip_rows(parent_id, &SolutionId(1), &snaps)
             .expect("strip rows present");
         assert_eq!(rows.len(), MAX_STRIP_ROWS);
         let last = rows.last().expect("last row");
@@ -584,11 +584,11 @@ mod tests {
         let parent = snap("a", None, "alpha", 1);
         let child = snap("b", Some("a"), "beta", 2);
         let mut other = snap("c", Some("a"), "outsider", 3);
-        other.solution_id = SolutionId("sol-other".into());
+        other.solution_id = SolutionId(8);
         let child_id = child.id;
         let rows = compute_strip_rows(
             child_id,
-            &SolutionId("sol-a".into()),
+            &SolutionId(1),
             &[parent, child, other],
         )
         .expect("strip rows present");
@@ -617,7 +617,7 @@ mod tests {
         // The judge is parent-linked to the supervised session but is
         // excluded by collect_snapshots before compute_strip_rows runs.
         // We simulate this by simply not including it in the snapshot slice.
-        let rows = compute_strip_rows(supervised.id, &SolutionId("sol-a".into()), &[supervised]);
+        let rows = compute_strip_rows(supervised.id, &SolutionId(1), &[supervised]);
         assert!(
             rows.is_none(),
             "strip should hide when judge is excluded and only the supervised session remains"
@@ -635,7 +635,7 @@ mod tests {
         let judge = snap("bb", Some("aa"), "Judge", 2);
         let rows = compute_strip_rows(
             supervised.id,
-            &SolutionId("sol-a".into()),
+            &SolutionId(1),
             &[supervised, judge],
         );
         assert!(

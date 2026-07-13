@@ -832,7 +832,7 @@ impl SolutionSessionView {
         let session = self.session.read(cx);
         let meta = crate::model::SolutionSessionMetadata {
             id: session.id,
-            solution_id: session.solution_id.clone(),
+            solution_id: session.solution_id,
             agent_id: session.agent_id.clone(),
             acp_session_id: session.acp_session_id.clone(),
             title: session.title.clone(),
@@ -847,6 +847,7 @@ impl SolutionSessionView {
             desired_effort: session.desired_effort.clone(),
             cached_models: session.cached_models.clone(),
             tab_order: session.tab_order,
+            member_id: None,
         };
         let store = SolutionAgentStore::global(cx);
         let task = store.update(cx, |store, cx| store.resume_session(meta, project, cx));

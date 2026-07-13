@@ -2149,7 +2149,7 @@ git commit -m "Give solutions, members and catalog projects numeric identities"
   - `SolutionSessionMetadata.member_id: Option<MemberId>`
   - `SolutionAgentDb::set_session_member(&self, id: SolutionSessionId, member_id: Option<MemberId>) -> Task<Result<()>>`
 
-- [ ] **Step 1: Write the failing migration test**
+- [x] **Step 1: Write the failing migration test**
 
 Append to `crates/solution_agent/src/db/tests.rs`:
 
@@ -2259,12 +2259,12 @@ Append to `crates/solution_agent/src/db/tests.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p solution_agent --lib db::tests::migrate_identity -- --nocapture`
 Expected: FAIL to compile — `error[E0599]: no method named 'migrate_identity' found for struct 'SolutionAgentDb'`.
 
-- [ ] **Step 3: Add the `member_id` column**
+- [x] **Step 3: Add the `member_id` column**
 
 In `crates/solution_agent/src/db.rs`, after the `cached_models` ALTER (line ~168):
 
@@ -2279,7 +2279,7 @@ In `crates/solution_agent/src/db.rs`, after the `cached_models` ALTER (line ~168
         apply_idempotent_add_column(&connection, "member_id INTEGER");
 ```
 
-- [ ] **Step 4: Implement `migrate_identity`**
+- [x] **Step 4: Implement `migrate_identity`**
 
 In `crates/solution_agent/src/db.rs`, add next to `delete_for_solution`:
 
@@ -2411,12 +2411,12 @@ fn migrate_identity_fn(
 pub use db::{IdentityMigrationReport, SolutionAgentDb};
 ```
 
-- [ ] **Step 5: Run the migration tests to verify they pass**
+- [x] **Step 5: Run the migration tests to verify they pass**
 
 Run: `cargo test -p solution_agent --lib db::tests::migrate_identity -- --nocapture`
 Expected: FAIL to compile still — `solutions::SolutionId` is now `i64` and `db/sessions.rs` binds it as a `String`. Fix that next; the two new tests are the target of Step 8.
 
-- [ ] **Step 6: Carry numeric ids and `member_id` through the metadata read/write**
+- [x] **Step 6: Carry numeric ids and `member_id` through the metadata read/write**
 
 In `crates/solution_agent/src/model.rs`, add to `SolutionSessionMetadata` (after `cwd`):
 
@@ -2508,7 +2508,7 @@ and the bind site:
 
 `select_metadata_for_solution` mirrors it: `select_bound::<i64, (…)>`, `SELECT … , tab_order, member_id`, bind `solution_id.0`, and construct `member_id: member_id.map(solutions::MemberId)`, `solution_id: SolutionId(solution_id)`. Every other fn in this file that binds a `SolutionId` (`select_sessions_closed_before`, `select_closed_session_ids`, `delete_by_solution`) binds `solution_id.0` as `i64`.
 
-- [ ] **Step 7: Run the identity migration at startup**
+- [x] **Step 7: Run the identity migration at startup**
 
 In `crates/solution_agent/src/solution_agent.rs`'s `init`, where `SolutionAgentDb::connect(cx)` is awaited and wired into the store, run the migration before the store hydrates. `solutions::init` (which builds `SolutionStore` and runs the solutions-side migration) is called at `crates/zed/src/main.rs:792`, before `solution_agent::init` at `:794`, so the legacy map and the member list are both available:
 
@@ -2579,14 +2579,14 @@ In `crates/solution_agent/src/solution_agent.rs`'s `init`, where `SolutionAgentD
 
 Keep whatever the existing spawn already does after the DB resolves — the migration is inserted *before* that work, in the same task, so hydration never reads un-remapped rows.
 
-- [ ] **Step 8: Sweep the rest of the crate and run the suite**
+- [x] **Step 8: Sweep the rest of the crate and run the suite**
 
 `SolutionId` is `Copy` and numeric now, so the compiler will point at every `&solution_id` / `.0.clone()` / `SolutionId(string)` site in `store.rs`, `store/hydration.rs`, `store/teardown.rs`, `store/connection_pool.rs`, `pool.rs`, `mcp/{read,lifecycle,debug}.rs`, `session_view/subagent_strip.rs`, `message_generator.rs`, `reopen_session_modal.rs` and the test modules. The substitutions are mechanical: drop the `&`, drop the `.clone()`, and in the MCP tool params change `solution_id: String` to `solution_id: i64` (`solutions.*` and `solution_agent.*` both address by number now). `SolutionSessionMetadata` literals gain `member_id: None`.
 
 Run: `cargo test -p solution_agent`
 Expected: PASS (including `migrate_identity_remaps_slugs_and_backfills_member_ids` and `migrate_identity_is_idempotent`).
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/solution_agent/src

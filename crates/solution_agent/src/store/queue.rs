@@ -837,7 +837,7 @@ impl SolutionAgentStore {
         let (meta, cached_project) = session_entity.read_with(cx, |s, _| {
             let meta = SolutionSessionMetadata {
                 id: s.id,
-                solution_id: s.solution_id.clone(),
+                solution_id: s.solution_id,
                 agent_id: s.agent_id.clone(),
                 acp_session_id: s.acp_session_id.clone(),
                 title: s.title.clone(),
@@ -852,11 +852,12 @@ impl SolutionAgentStore {
                 desired_effort: s.desired_effort.clone(),
                 cached_models: s.cached_models.clone(),
                 tab_order: s.tab_order,
+                member_id: None,
             };
             (meta, s.project.clone())
         });
 
-        let solution_id = meta.solution_id.clone();
+        let solution_id = meta.solution_id;
         let solution = solutions::SolutionStore::try_global(cx).and_then(|store| {
             store
                 .read(cx)

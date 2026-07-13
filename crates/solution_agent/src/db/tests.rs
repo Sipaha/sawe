@@ -66,10 +66,10 @@
         assert!(got.enabled);
     }
 
-    fn make_meta(seq: u32, sol: &str) -> SolutionSessionMetadata {
+    fn make_meta(seq: u32, sol: i64) -> SolutionSessionMetadata {
         SolutionSessionMetadata {
             id: SolutionSessionId::new(),
-            solution_id: SolutionId(sol.into()),
+            solution_id: SolutionId(sol),
             agent_id: SharedString::from("claude-acp"),
             acp_session_id: acp::SessionId::new(format!("acp-{seq}")),
             title: SharedString::from(format!("session {seq}")),
@@ -88,6 +88,7 @@
             desired_effort: None,
             cached_models: vec![],
             tab_order: None,
+            member_id: None,
         }
     }
 
@@ -96,22 +97,22 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        db.save_metadata(make_meta(1, "sol-a")).await.unwrap();
-        db.save_metadata(make_meta(2, "sol-a")).await.unwrap();
-        db.save_metadata(make_meta(3, "sol-b")).await.unwrap();
+        db.save_metadata(make_meta(1, 1)).await.unwrap();
+        db.save_metadata(make_meta(2, 1)).await.unwrap();
+        db.save_metadata(make_meta(3, 2)).await.unwrap();
 
         let in_a = db
-            .list_for_solution(SolutionId("sol-a".into()))
+            .list_for_solution(SolutionId(1))
             .await
             .unwrap();
         assert_eq!(in_a.len(), 2);
         let in_b = db
-            .list_for_solution(SolutionId("sol-b".into()))
+            .list_for_solution(SolutionId(2))
             .await
             .unwrap();
         assert_eq!(in_b.len(), 1);
         let in_c = db
-            .list_for_solution(SolutionId("sol-c".into()))
+            .list_for_solution(SolutionId(3))
             .await
             .unwrap();
         assert_eq!(in_c.len(), 0);
@@ -122,15 +123,15 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        let mut with_cwd = make_meta(1, "sol-a");
+        let mut with_cwd = make_meta(1, 1);
         with_cwd.cwd = std::path::PathBuf::from("/tmp/sol-a/member-x");
-        let without_cwd = make_meta(2, "sol-a"); // empty PathBuf — legacy row
+        let without_cwd = make_meta(2, 1); // empty PathBuf — legacy row
 
         db.save_metadata(with_cwd.clone()).await.unwrap();
         db.save_metadata(without_cwd.clone()).await.unwrap();
 
         let listed = db
-            .list_for_solution(SolutionId("sol-a".into()))
+            .list_for_solution(SolutionId(1))
             .await
             .unwrap();
         let by_id = |id| listed.iter().find(|m| m.id == id).expect("row present");
@@ -143,7 +144,7 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        let meta = make_meta(1, "sol-a");
+        let meta = make_meta(1, 1);
         db.save_metadata(meta.clone()).await.unwrap();
         let blob = b"\x01\x02\x03 example payload".to_vec();
         db.save_blob(meta.id, blob.clone()).await.unwrap();
@@ -156,13 +157,13 @@
     async fn delete_removes_row(cx: &mut gpui::TestAppContext) {
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
-        let meta = make_meta(1, "sol-a");
+        let meta = make_meta(1, 1);
         db.save_metadata(meta.clone()).await.unwrap();
 
         db.delete(meta.id).await.unwrap();
 
         let listing = db
-            .list_for_solution(meta.solution_id.clone())
+            .list_for_solution(meta.solution_id)
             .await
             .unwrap();
         assert!(listing.is_empty());
@@ -173,24 +174,24 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        let m1 = make_meta(1, "sol-a");
-        let m2 = make_meta(2, "sol-a");
-        let m3 = make_meta(3, "sol-a");
-        let other = make_meta(4, "sol-b");
+        let m1 = make_meta(1, 1);
+        let m2 = make_meta(2, 1);
+        let m3 = make_meta(3, 1);
+        let other = make_meta(4, 2);
         for m in [&m1, &m2, &m3, &other] {
             db.save_metadata(m.clone()).await.unwrap();
         }
 
-        db.update_tab_orders(SolutionId("sol-a".into()), vec![m2.id, m3.id, m1.id])
+        db.update_tab_orders(SolutionId(1), vec![m2.id, m3.id, m1.id])
             .await
             .unwrap();
-        db.update_tab_orders(SolutionId("sol-b".into()), vec![other.id])
+        db.update_tab_orders(SolutionId(2), vec![other.id])
             .await
             .unwrap();
 
-        let in_a = db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap();
+        let in_a = db.list_open_tabs(SolutionId(1)).await.unwrap();
         assert_eq!(in_a, vec![m2.id, m3.id, m1.id]);
-        let in_b = db.list_open_tabs(SolutionId("sol-b".into())).await.unwrap();
+        let in_b = db.list_open_tabs(SolutionId(2)).await.unwrap();
         assert_eq!(in_b, vec![other.id]);
     }
 
@@ -199,26 +200,26 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        let m1 = make_meta(1, "sol-a");
-        let m2 = make_meta(2, "sol-a");
-        let m3 = make_meta(3, "sol-a");
+        let m1 = make_meta(1, 1);
+        let m2 = make_meta(2, 1);
+        let m3 = make_meta(3, 1);
         for m in [&m1, &m2, &m3] {
             db.save_metadata(m.clone()).await.unwrap();
         }
 
-        db.update_tab_orders(SolutionId("sol-a".into()), vec![m1.id, m2.id, m3.id])
+        db.update_tab_orders(SolutionId(1), vec![m1.id, m2.id, m3.id])
             .await
             .unwrap();
         assert_eq!(
-            db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
+            db.list_open_tabs(SolutionId(1)).await.unwrap(),
             vec![m1.id, m2.id, m3.id]
         );
 
-        db.update_tab_orders(SolutionId("sol-a".into()), vec![m2.id])
+        db.update_tab_orders(SolutionId(1), vec![m2.id])
             .await
             .unwrap();
         assert_eq!(
-            db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
+            db.list_open_tabs(SolutionId(1)).await.unwrap(),
             vec![m2.id]
         );
     }
@@ -241,11 +242,11 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        let mut m = make_meta(1, "sol-a");
+        let mut m = make_meta(1, 1);
 
         // UPDATE first against a non-existent row: a genuine no-op, mirroring
         // the metadata-INSERT-loses-the-race ordering.
-        db.update_tab_orders(SolutionId("sol-a".into()), vec![m.id])
+        db.update_tab_orders(SolutionId(1), vec![m.id])
             .await
             .unwrap();
         // INSERT second, carrying the real tab_order the store stamped in
@@ -255,7 +256,7 @@
         db.save_metadata(m.clone()).await.unwrap();
 
         assert_eq!(
-            db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
+            db.list_open_tabs(SolutionId(1)).await.unwrap(),
             vec![m.id],
             "a metadata INSERT carrying tab_order must persist it even when a \
              prior UPDATE found no row"
@@ -268,14 +269,14 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        let m = make_meta(1, "sol-a");
+        let m = make_meta(1, 1);
         db.save_metadata(m.clone()).await.unwrap();
-        db.update_tab_orders(SolutionId("sol-a".into()), vec![m.id])
+        db.update_tab_orders(SolutionId(1), vec![m.id])
             .await
             .unwrap();
 
         assert_eq!(
-            db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
+            db.list_open_tabs(SolutionId(1)).await.unwrap(),
             vec![m.id]
         );
     }
@@ -292,9 +293,9 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        let m = make_meta(1, "sol-a");
+        let m = make_meta(1, 1);
         db.save_metadata(m.clone()).await.unwrap();
-        db.update_tab_orders(SolutionId("sol-a".into()), vec![m.id])
+        db.update_tab_orders(SolutionId(1), vec![m.id])
             .await
             .unwrap();
         // Re-save metadata (tab_order None) as the live store would on a later
@@ -302,7 +303,7 @@
         db.save_metadata(m.clone()).await.unwrap();
 
         assert_eq!(
-            db.list_open_tabs(SolutionId("sol-a".into())).await.unwrap(),
+            db.list_open_tabs(SolutionId(1)).await.unwrap(),
             vec![m.id],
             "a follow-up save_metadata(None) must not clear an existing tab_order"
         );
@@ -313,13 +314,13 @@
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
 
-        let m = make_meta(1, "sol-a");
+        let m = make_meta(1, 1);
         db.save_metadata(m.clone()).await.unwrap();
 
         // Pin the session into the strip, then close it. `close_session` marks
         // `closed_at` but deliberately leaves `tab_order` set, so a closed row
         // keeps a dangling strip slot — reproduced here directly.
-        db.update_tab_orders(SolutionId("sol-a".into()), vec![m.id])
+        db.update_tab_orders(SolutionId(1), vec![m.id])
             .await
             .unwrap();
         let closed_at = Utc.timestamp_millis_opt(1_700_000_500_000).unwrap();
@@ -328,7 +329,7 @@
         // While closed it is excluded from the open-tab strip (the closed_at
         // filter), even though its tab_order is still set.
         assert!(
-            db.list_open_tabs(SolutionId("sol-a".into()))
+            db.list_open_tabs(SolutionId(1))
                 .await
                 .unwrap()
                 .is_empty()
@@ -345,7 +346,7 @@
 
         // Live again:
         assert_eq!(
-            db.list_open_session_ids(SolutionId("sol-a".into()))
+            db.list_open_session_ids(SolutionId(1))
                 .await
                 .unwrap(),
             vec![m.id]
@@ -353,7 +354,7 @@
         // …but NOT pinned: the strip set is empty, so the reopen path re-pins
         // it fresh via `open_session_in_strip` and emits `TabsChanged`.
         assert!(
-            db.list_open_tabs(SolutionId("sol-a".into()))
+            db.list_open_tabs(SolutionId(1))
                 .await
                 .unwrap()
                 .is_empty(),
@@ -502,16 +503,16 @@
     #[gpui::test]
     async fn attachments_round_trip_and_cascade(cx: &mut gpui::TestAppContext) {
         let db = SolutionAgentDb::open(cx.executor()).unwrap();
-        db.record_attachment("ses-1".into(), "sol-a".into(), "/inbox/a.png".into(), 1)
+        db.record_attachment("ses-1".into(), "1".into(), "/inbox/a.png".into(), 1)
             .await
             .unwrap();
-        db.record_attachment("ses-1".into(), "sol-a".into(), "/inbox/b.png".into(), 2)
+        db.record_attachment("ses-1".into(), "1".into(), "/inbox/b.png".into(), 2)
             .await
             .unwrap();
-        db.record_attachment("ses-2".into(), "sol-a".into(), "/inbox/c.png".into(), 3)
+        db.record_attachment("ses-2".into(), "1".into(), "/inbox/c.png".into(), 3)
             .await
             .unwrap();
-        db.record_attachment("ses-3".into(), "sol-b".into(), "/inbox/d.png".into(), 4)
+        db.record_attachment("ses-3".into(), "2".into(), "/inbox/d.png".into(), 4)
             .await
             .unwrap();
 
@@ -523,7 +524,7 @@
         assert_eq!(by_ses1, vec!["/inbox/a.png", "/inbox/b.png"]);
 
         let by_sol_a = db
-            .attachment_paths_for_solution("sol-a".into())
+            .attachment_paths_for_solution("1".into())
             .await
             .unwrap();
         assert_eq!(by_sol_a.len(), 3);
@@ -547,17 +548,17 @@
         );
 
         // delete_for_solution cascades to attachment rows for that solution only.
-        db.delete_for_solution(SolutionId("sol-a".into()))
+        db.delete_for_solution(SolutionId(1))
             .await
             .unwrap();
         assert!(
-            db.attachment_paths_for_solution("sol-a".into())
+            db.attachment_paths_for_solution("1".into())
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            db.attachment_paths_for_solution("sol-b".into())
+            db.attachment_paths_for_solution("2".into())
                 .await
                 .unwrap()
                 .len(),
@@ -606,22 +607,22 @@
     async fn delete_for_solution_cascades(cx: &mut gpui::TestAppContext) {
         let executor = cx.executor();
         let db = SolutionAgentDb::open(executor).unwrap();
-        db.save_metadata(make_meta(1, "sol-a")).await.unwrap();
-        db.save_metadata(make_meta(2, "sol-a")).await.unwrap();
-        db.save_metadata(make_meta(3, "sol-b")).await.unwrap();
+        db.save_metadata(make_meta(1, 1)).await.unwrap();
+        db.save_metadata(make_meta(2, 1)).await.unwrap();
+        db.save_metadata(make_meta(3, 2)).await.unwrap();
 
-        db.delete_for_solution(SolutionId("sol-a".into()))
+        db.delete_for_solution(SolutionId(1))
             .await
             .unwrap();
 
         assert!(
-            db.list_for_solution(SolutionId("sol-a".into()))
+            db.list_for_solution(SolutionId(1))
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            db.list_for_solution(SolutionId("sol-b".into()))
+            db.list_for_solution(SolutionId(2))
                 .await
                 .unwrap()
                 .len(),
@@ -643,14 +644,14 @@
         let db = SolutionAgentDb::open(executor).unwrap();
 
         // One session in the doomed solution, one in a survivor solution.
-        let doomed_meta = make_meta(1, "sol-doomed");
+        let doomed_meta = make_meta(1, 4);
         let doomed = doomed_meta.id;
         db.save_metadata(doomed_meta).await.unwrap();
-        let keep_meta = make_meta(2, "sol-keep");
+        let keep_meta = make_meta(2, 5);
         let keep = keep_meta.id;
         db.save_metadata(keep_meta).await.unwrap();
 
-        for (id, sol, tag) in [(doomed, "sol-doomed", "x"), (keep, "sol-keep", "y")] {
+        for (id, sol, tag) in [(doomed, "4", "x"), (keep, "5", "y")] {
             db.upsert_entry(id, 0, 0, 0, None, tag.as_bytes().to_vec())
                 .await
                 .unwrap();
@@ -685,7 +686,7 @@
                 .unwrap();
         }
 
-        db.delete_for_solution(SolutionId("sol-doomed".into()))
+        db.delete_for_solution(SolutionId(4))
             .await
             .unwrap();
 
@@ -717,7 +718,7 @@
                 .all(|s| s.session_id != doomed)
         );
         assert!(
-            db.list_for_solution(SolutionId("sol-doomed".into()))
+            db.list_for_solution(SolutionId(4))
                 .await
                 .unwrap()
                 .is_empty()
@@ -754,7 +755,7 @@
                 .any(|s| s.session_id == keep)
         );
         assert_eq!(
-            db.list_for_solution(SolutionId("sol-keep".into()))
+            db.list_for_solution(SolutionId(5))
                 .await
                 .unwrap()
                 .len(),
@@ -846,7 +847,7 @@
         let db = SolutionAgentDb::open(executor).unwrap();
 
         // epoch lives on solution_sessions, so the row must exist first.
-        let meta = make_meta(1, "sol-epoch");
+        let meta = make_meta(1, 16);
         db.save_metadata(meta.clone()).await.unwrap();
 
         // Before setting it, load_epoch returns None.
@@ -869,7 +870,7 @@
         let db = SolutionAgentDb::open(executor).unwrap();
 
         // change_seq lives on solution_sessions, so the row must exist first.
-        let meta = make_meta(1, "sol-change-seq");
+        let meta = make_meta(1, 17);
         db.save_metadata(meta.clone()).await.unwrap();
 
         // Before setting it, load_change_seq returns None (legacy/unset).
@@ -930,11 +931,11 @@
         let db = SolutionAgentDb::open(executor).unwrap();
 
         // The session to purge, plus a sibling whose rows must survive.
-        let meta = make_meta(1, "sol-purge");
+        let meta = make_meta(1, 9);
         let target = meta.id;
         db.save_metadata(meta).await.unwrap();
 
-        let sibling_meta = make_meta(2, "sol-purge");
+        let sibling_meta = make_meta(2, 9);
         let sibling = sibling_meta.id;
         db.save_metadata(sibling_meta).await.unwrap();
 
@@ -1009,7 +1010,7 @@
                 .all(|s| s.session_id != target)
         );
         let listed = db
-            .list_for_solution(SolutionId("sol-purge".into()))
+            .list_for_solution(SolutionId(9))
             .await
             .unwrap();
         assert!(listed.iter().all(|m| m.id != target));
@@ -1069,7 +1070,7 @@
         let db = SolutionAgentDb::open(executor).unwrap();
 
         // (a) round-trip
-        let mut meta = make_meta(1, "sol-settings");
+        let mut meta = make_meta(1, 13);
         meta.desired_model = Some("claude-opus-4-5".into());
         meta.desired_effort = Some("high".into());
         meta.cached_models = vec![
@@ -1079,7 +1080,7 @@
         db.save_metadata(meta.clone()).await.unwrap();
 
         let listed = db
-            .list_for_solution(SolutionId("sol-settings".into()))
+            .list_for_solution(SolutionId(13))
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
@@ -1089,7 +1090,7 @@
         assert_eq!(loaded.cached_models, meta.cached_models);
 
         // (b) COALESCE: second write with None/empty must not clobber
-        let mut meta_nones = make_meta(1, "sol-settings");
+        let mut meta_nones = make_meta(1, 13);
         // Override id to match the existing row so ON CONFLICT fires.
         meta_nones.id = meta.id;
         meta_nones.desired_model = None;
@@ -1098,7 +1099,7 @@
         db.save_metadata(meta_nones).await.unwrap();
 
         let listed2 = db
-            .list_for_solution(SolutionId("sol-settings".into()))
+            .list_for_solution(SolutionId(13))
             .await
             .unwrap();
         assert_eq!(listed2.len(), 1);
@@ -1121,12 +1122,12 @@
 
         // (c) cached_models JSON round-trip: a write with ≥1 model and then a
         // read must preserve all fields of ModelInfo.
-        let mut meta2 = make_meta(2, "sol-settings");
+        let mut meta2 = make_meta(2, 13);
         meta2.cached_models = vec![make_model_info("model-x")];
         db.save_metadata(meta2.clone()).await.unwrap();
 
         let listed3 = db
-            .list_for_solution(SolutionId("sol-settings".into()))
+            .list_for_solution(SolutionId(13))
             .await
             .unwrap();
         let loaded3 = listed3
@@ -1145,9 +1146,9 @@
         let day = 86_400_000i64;
         let now = 1_800_000_000_000i64;
 
-        let old = make_meta(1, "sol-reap");
-        let recent = make_meta(2, "sol-reap");
-        let open = make_meta(3, "sol-reap");
+        let old = make_meta(1, 11);
+        let recent = make_meta(2, 11);
+        let open = make_meta(3, 11);
         let (old_id, recent_id, open_id) = (old.id, recent.id, open.id);
         for m in [old, recent, open] {
             db.save_metadata(m).await.unwrap();
@@ -1170,7 +1171,7 @@
 
         let cutoff = now - 30 * day;
         let ids = db
-            .list_sessions_closed_before(SolutionId("sol-reap".into()), cutoff)
+            .list_sessions_closed_before(SolutionId(11), cutoff)
             .await
             .unwrap();
         assert_eq!(
@@ -1183,7 +1184,7 @@
         // eligible even though it was once closed long ago.
         db.reopen_session(old_id).await.unwrap();
         let ids = db
-            .list_sessions_closed_before(SolutionId("sol-reap".into()), cutoff)
+            .list_sessions_closed_before(SolutionId(11), cutoff)
             .await
             .unwrap();
         assert!(
@@ -1191,4 +1192,106 @@
             "a reopened session is excluded (closed_at cleared)"
         );
         let _ = (recent_id, open_id);
+    }
+
+    /// Seed a DB whose `solution_sessions` rows still carry TEXT slug
+    /// `solution_id`s (what every existing user has) and no `member_id`.
+    fn seed_legacy_sessions(db: &SolutionAgentDb) {
+        let connection = db.connection.lock();
+        connection
+            .exec(
+                "INSERT INTO solution_sessions
+                    (id, solution_id, agent_id, acp_session_id, title, created_at,
+                     last_activity_at, context_count, cwd)
+                 VALUES
+                    ('11111111-1111-4111-8111-111111111111', 'spk-solutions', 'claude-acp', 'acp-1',
+                     'One', 1, 1, 1, '/home/u/sol/spk-solutions/sawe'),
+                    ('22222222-2222-4222-8222-222222222222', 'spk-solutions', 'claude-acp', 'acp-2',
+                     'Two', 2, 2, 1, '/home/u/sol/spk-solutions'),
+                    ('33333333-3333-4333-8333-333333333333', 'ghost', 'claude-acp', 'acp-3',
+                     'Three', 3, 3, 1, '/home/u/sol/ghost')",
+            )
+            .expect("prepare legacy session insert")()
+        .expect("legacy session insert");
+    }
+
+    #[gpui::test]
+    async fn migrate_identity_remaps_slugs_and_backfills_member_ids(cx: &mut gpui::TestAppContext) {
+        let db = SolutionAgentDb::open(cx.executor()).expect("open db");
+        seed_legacy_sessions(&db);
+
+        let report = db
+            .migrate_identity(
+                vec![("spk-solutions".to_string(), 7)],
+                vec![(42, 7, "/home/u/sol/spk-solutions/sawe".to_string())],
+            )
+            .await
+            .expect("migrate identity");
+
+        assert_eq!(report.sessions_total, 3);
+        assert_eq!(report.sessions_remapped, 2);
+        assert_eq!(
+            report.sessions_unmapped,
+            vec!["ghost".to_string()],
+            "a session whose solution no longer exists must be reported, not silently dropped"
+        );
+        assert_eq!(report.member_ids_backfilled, 1);
+
+        let rows = {
+            let connection = db.connection.lock();
+            connection
+                .select::<(String, String, Option<i64>)>(
+                    "SELECT id, solution_id, member_id FROM solution_sessions ORDER BY id",
+                )
+                .expect("prepare select sessions")()
+            .expect("select sessions")
+        };
+        assert_eq!(rows[0].1, "7", "the slug is replaced by the numeric id");
+        assert_eq!(
+            rows[0].2,
+            Some(42),
+            "cwd == member.local_path binds member_id"
+        );
+        assert_eq!(rows[1].1, "7");
+        assert_eq!(
+            rows[1].2, None,
+            "a session at the solution root keeps a NULL member_id (the ROOT label)"
+        );
+        assert_eq!(
+            rows[2].1, "ghost",
+            "an unmapped session's id is left alone so the row is still inspectable"
+        );
+    }
+
+    #[gpui::test]
+    async fn migrate_identity_is_idempotent(cx: &mut gpui::TestAppContext) {
+        let db = SolutionAgentDb::open(cx.executor()).expect("open db");
+        seed_legacy_sessions(&db);
+        let mapping = vec![("spk-solutions".to_string(), 7)];
+        let members = vec![(42, 7, "/home/u/sol/spk-solutions/sawe".to_string())];
+
+        db.migrate_identity(mapping.clone(), members.clone())
+            .await
+            .expect("first run");
+        let second = db
+            .migrate_identity(mapping, members)
+            .await
+            .expect("second run");
+
+        assert_eq!(
+            second.sessions_remapped, 0,
+            "already-numeric rows must not be touched again"
+        );
+        assert_eq!(
+            second.member_ids_backfilled, 0,
+            "already-bound sessions must not be rewritten"
+        );
+        let count = {
+            let connection = db.connection.lock();
+            connection
+                .select::<i64>("SELECT COUNT(*) FROM solution_sessions")
+                .expect("prepare count")()
+            .expect("count")
+        };
+        assert_eq!(count, vec![3], "no rows created or destroyed");
     }

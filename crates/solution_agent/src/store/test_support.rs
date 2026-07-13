@@ -84,7 +84,6 @@ pub(crate) fn session_solution_root(
             .expect("session not found in store")
             .read(cx)
             .solution_id
-            .clone()
     });
     solution_root_for(&solution_id, cx)
 }

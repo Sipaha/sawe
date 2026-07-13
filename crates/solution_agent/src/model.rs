@@ -1055,6 +1055,10 @@ pub struct SolutionSessionMetadata {
     /// lost-update race at create time that left idle never-touched sessions
     /// with `tab_order = NULL`, so `restore_open_tabs` never re-hydrated them).
     pub tab_order: Option<i64>,
+    /// The member this session belongs to. `None` = the solution root (the
+    /// "ROOT" label). Source of truth for the project label and console-tab
+    /// scoping — replaces the old cwd-equality inference.
+    pub member_id: Option<solutions::MemberId>,
 }
 
 #[cfg(test)]

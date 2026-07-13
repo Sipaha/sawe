@@ -188,7 +188,7 @@ pub(crate) fn render_compact_prompt_inner(
             .or(s.cached_max_tokens)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         (
-            s.solution_id.clone(),
+            s.solution_id,
             s.agent_id.clone(),
             s.created_at,
             context_count,
@@ -253,7 +253,7 @@ pub(crate) fn render_compact_prompt_inner(
     // `editor_mcp` solution-socket lifecycle driven off
     // `SolutionStoreEvent::Opened/Closed`), so it is present regardless of
     // which Solution is the foreground one.
-    let solution_socket = editor_mcp::solution_socket_path(solution_id.0.as_str())
+    let solution_socket = editor_mcp::solution_socket_path(&solution_id.0.to_string())
         .to_string_lossy()
         .into_owned();
 
@@ -261,7 +261,7 @@ pub(crate) fn render_compact_prompt_inner(
         .replace("{{session_id}}", &session_id.to_string())
         .replace("{{compact_dir}}", &compact_dir_str)
         .replace("{{solution_socket}}", &solution_socket)
-        .replace("{{solution_id}}", solution_id.0.as_str())
+        .replace("{{solution_id}}", &solution_id.0.to_string())
         .replace("{{agent_id}}", agent_id.as_ref())
         .replace("{{started_at_iso}}", &started_at.to_rfc3339())
         .replace("{{tokens_used}}", &used.to_string())
@@ -527,7 +527,7 @@ mod tests {
             let session = store.update(cx, |store, cx| {
                 crate::store::tests::insert_cold_session(
                     session_id,
-                    solution_id.clone(),
+                    solution_id,
                     agent_id.clone(),
                     Some(120_000),
                     Some(project.clone()),
@@ -608,7 +608,7 @@ mod tests {
             store.update(cx, |store, cx| {
                 crate::store::tests::insert_cold_session(
                     session_id,
-                    solution_id.clone(),
+                    solution_id,
                     agent_id.clone(),
                     // 50% of the 1.0M default window → comfortably above the
                     // 10% COMPACT_BUTTON_MIN_PCT gate, with ample headroom.

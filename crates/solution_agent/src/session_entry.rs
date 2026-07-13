@@ -7,7 +7,7 @@
 
 use acp_thread::{AgentThreadEntry, AssistantMessageChunk, UserMessageId};
 use agent_client_protocol::schema as acp;
-use gpui::{App, AppContext as _, SharedString};
+use gpui::{App, SharedString};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

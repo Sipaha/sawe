@@ -28,7 +28,7 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            select_metadata_for_solution(&connection, &solution_id)
+            select_metadata_for_solution(&connection, solution_id)
         })
     }
 
@@ -164,7 +164,7 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            apply_tab_orders(&connection, &solution_id, &ordered_ids)
+            apply_tab_orders(&connection, solution_id, &ordered_ids)
         })
     }
 
@@ -175,7 +175,7 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            select_open_tabs(&connection, &solution_id)
+            select_open_tabs(&connection, solution_id)
         })
     }
 
@@ -192,7 +192,7 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            select_open_session_ids(&connection, &solution_id)
+            select_open_session_ids(&connection, solution_id)
         })
     }
 
@@ -208,7 +208,7 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            select_sessions_closed_before(&connection, &solution_id, cutoff_ms)
+            select_sessions_closed_before(&connection, solution_id, cutoff_ms)
         })
     }
 
@@ -224,7 +224,7 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            select_closed_session_ids(&connection, &solution_id)
+            select_closed_session_ids(&connection, solution_id)
         })
     }
 }
@@ -250,9 +250,9 @@ pub(crate) fn insert_or_update_metadata(
     // SQLite resolves the conflict-target row rather than the bare name.
     //
     // Nested tuple shape because `sqlez::Bind` only implements tuples up to
-    // size 10; we have 16 columns now (5 + 7 + 4).
+    // size 10; we have 17 columns now (5 + 7 + 5).
     let mut insert = connection.exec_bound::<(
-        (String, String, String, Arc<str>, String),
+        (String, i64, String, Arc<str>, String),
         (
             i64,
             i64,
@@ -262,15 +262,21 @@ pub(crate) fn insert_or_update_metadata(
             Option<String>,
             Option<String>,
         ),
-        (Option<String>, Option<String>, Option<String>, Option<i64>),
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ),
     )>(indoc! {"
         INSERT INTO solution_sessions (
             id, solution_id, agent_id, acp_session_id, title,
             created_at, last_activity_at, preview, total_tokens,
             context_count, cwd, parent_session_id,
-            desired_model, desired_effort, cached_models, tab_order
+            desired_model, desired_effort, cached_models, tab_order, member_id
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         ON CONFLICT(id) DO UPDATE SET
             solution_id        = excluded.solution_id,
             agent_id           = excluded.agent_id,
@@ -286,7 +292,8 @@ pub(crate) fn insert_or_update_metadata(
             desired_model      = COALESCE(excluded.desired_model, desired_model),
             desired_effort     = COALESCE(excluded.desired_effort, desired_effort),
             cached_models      = COALESCE(excluded.cached_models, cached_models),
-            tab_order          = COALESCE(excluded.tab_order, solution_sessions.tab_order)
+            tab_order          = COALESCE(excluded.tab_order, solution_sessions.tab_order),
+            member_id          = COALESCE(excluded.member_id, solution_sessions.member_id)
     "})?;
 
     let cwd_str = if meta.cwd.as_os_str().is_empty() {
@@ -304,7 +311,7 @@ pub(crate) fn insert_or_update_metadata(
     insert((
         (
             meta.id.to_string(),
-            meta.solution_id.0.clone(),
+            meta.solution_id.0,
             meta.agent_id.to_string(),
             meta.acp_session_id.0.clone(),
             meta.title.to_string(),
@@ -323,6 +330,7 @@ pub(crate) fn insert_or_update_metadata(
             meta.desired_effort.clone(),
             cached_models_json,
             meta.tab_order,
+            meta.member_id.map(|m| m.0),
         ),
     ))?;
 
@@ -430,7 +438,7 @@ pub(crate) fn select_change_seq(connection: &Connection, session_id: &str) -> Re
 
 pub(crate) fn apply_tab_orders(
     connection: &Connection,
-    solution_id: &SolutionId,
+    solution_id: SolutionId,
     ordered_ids: &[SolutionSessionId],
 ) -> Result<()> {
     // Single transaction: clear all tab_order for the solution, then
@@ -438,15 +446,15 @@ pub(crate) fn apply_tab_orders(
     // `CASE WHEN id IN (…) THEN …`) so the SQL stays trivial and we
     // don't have to bind a variable-length IN list with sqlez.
     let tx = connection.with_savepoint("apply_tab_orders", || {
-        let mut clear = connection.exec_bound::<String>(
+        let mut clear = connection.exec_bound::<i64>(
             "UPDATE solution_sessions SET tab_order = NULL WHERE solution_id = ?",
         )?;
-        clear(solution_id.0.clone())?;
-        let mut set = connection.exec_bound::<(i64, String, String)>(
+        clear(solution_id.0)?;
+        let mut set = connection.exec_bound::<(i64, String, i64)>(
             "UPDATE solution_sessions SET tab_order = ?1 WHERE id = ?2 AND solution_id = ?3",
         )?;
         for (idx, id) in ordered_ids.iter().enumerate() {
-            set((idx as i64, id.to_string(), solution_id.0.clone()))?;
+            set((idx as i64, id.to_string(), solution_id.0))?;
         }
         Ok(())
     });
@@ -455,19 +463,19 @@ pub(crate) fn apply_tab_orders(
 
 pub(crate) fn select_open_tabs(
     connection: &Connection,
-    solution_id: &SolutionId,
+    solution_id: SolutionId,
 ) -> Result<Vec<SolutionSessionId>> {
     // `closed_at IS NULL` filters out soft-closed sessions: when the
     // user closes a tab via `close_session`, we keep the row (and its
     // `tab_order`) so the persisted transcript stays readable, but the
     // restore-on-open path must not re-hydrate it as a live tab — the
     // user closed it, they expect it to stay closed across restarts.
-    let mut select = connection.select_bound::<String, String>(indoc! {"
+    let mut select = connection.select_bound::<i64, String>(indoc! {"
         SELECT id FROM solution_sessions
         WHERE solution_id = ? AND tab_order IS NOT NULL AND closed_at IS NULL
         ORDER BY tab_order ASC
     "})?;
-    let rows = select(solution_id.0.clone())?;
+    let rows = select(solution_id.0)?;
     let mut out = Vec::with_capacity(rows.len());
     for id in rows {
         let parsed = SolutionSessionId::parse(&id)
@@ -485,13 +493,13 @@ pub(crate) fn select_open_tabs(
 /// just dismissed).
 pub(crate) fn select_open_session_ids(
     connection: &Connection,
-    solution_id: &SolutionId,
+    solution_id: SolutionId,
 ) -> Result<Vec<SolutionSessionId>> {
-    let mut select = connection.select_bound::<String, String>(indoc! {"
+    let mut select = connection.select_bound::<i64, String>(indoc! {"
         SELECT id FROM solution_sessions
         WHERE solution_id = ? AND closed_at IS NULL
     "})?;
-    let rows = select(solution_id.0.clone())?;
+    let rows = select(solution_id.0)?;
     let mut out = Vec::with_capacity(rows.len());
     for id in rows {
         let parsed = SolutionSessionId::parse(&id)
@@ -505,13 +513,13 @@ pub(crate) fn select_open_session_ids(
 /// explicitly-closed sessions (`closed_at IS NOT NULL`).
 pub(crate) fn select_closed_session_ids(
     connection: &Connection,
-    solution_id: &SolutionId,
+    solution_id: SolutionId,
 ) -> Result<Vec<SolutionSessionId>> {
-    let mut select = connection.select_bound::<String, String>(indoc! {"
+    let mut select = connection.select_bound::<i64, String>(indoc! {"
         SELECT id FROM solution_sessions
         WHERE solution_id = ? AND closed_at IS NOT NULL
     "})?;
-    let rows = select(solution_id.0.clone())?;
+    let rows = select(solution_id.0)?;
     let mut out = Vec::with_capacity(rows.len());
     for id in rows {
         let parsed = SolutionSessionId::parse(&id)
@@ -523,14 +531,14 @@ pub(crate) fn select_closed_session_ids(
 
 pub(crate) fn select_sessions_closed_before(
     connection: &Connection,
-    solution_id: &SolutionId,
+    solution_id: SolutionId,
     cutoff_ms: i64,
 ) -> Result<Vec<SolutionSessionId>> {
-    let mut select = connection.select_bound::<(String, i64), String>(indoc! {"
+    let mut select = connection.select_bound::<(i64, i64), String>(indoc! {"
         SELECT id FROM solution_sessions
         WHERE solution_id = ? AND closed_at IS NOT NULL AND closed_at < ?
     "})?;
-    let rows = select((solution_id.0.clone(), cutoff_ms))?;
+    let rows = select((solution_id.0, cutoff_ms))?;
     let mut out = Vec::with_capacity(rows.len());
     for id in rows {
         out.push(
@@ -543,12 +551,12 @@ pub(crate) fn select_sessions_closed_before(
 
 pub(crate) fn select_metadata_for_solution(
     connection: &Connection,
-    solution_id: &SolutionId,
+    solution_id: SolutionId,
 ) -> Result<Vec<SolutionSessionMetadata>> {
     // Same nested-tuple shape as the INSERT side — `sqlez::Column` only
-    // implements tuples up to size 10; we have 16 columns now (5 + 7 + 4).
-    let mut select = connection.select_bound::<String, (
-        (String, String, String, Arc<str>, String),
+    // implements tuples up to size 10; we have 17 columns now (5 + 7 + 5).
+    let mut select = connection.select_bound::<i64, (
+        (String, i64, String, Arc<str>, String),
         (
             i64,
             i64,
@@ -558,18 +566,24 @@ pub(crate) fn select_metadata_for_solution(
             Option<String>,
             Option<String>,
         ),
-        (Option<String>, Option<String>, Option<String>, Option<i64>),
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ),
     )>(indoc! {"
         SELECT id, solution_id, agent_id, acp_session_id, title,
                created_at, last_activity_at, preview, total_tokens,
                context_count, cwd, parent_session_id,
-               desired_model, desired_effort, cached_models, tab_order
+               desired_model, desired_effort, cached_models, tab_order, member_id
         FROM solution_sessions
         WHERE solution_id = ?
         ORDER BY last_activity_at DESC
     "})?;
 
-    let rows = select(solution_id.0.clone())?;
+    let rows = select(solution_id.0)?;
     let mut out = Vec::with_capacity(rows.len());
     for (
         (id, solution_id, agent_id, acp_session_id, title),
@@ -582,7 +596,7 @@ pub(crate) fn select_metadata_for_solution(
             cwd,
             parent_session_id,
         ),
-        (desired_model, desired_effort, cached_models_json, tab_order),
+        (desired_model, desired_effort, cached_models_json, tab_order, member_id),
     ) in rows
     {
         let id = SolutionSessionId::parse(&id)
@@ -630,6 +644,7 @@ pub(crate) fn select_metadata_for_solution(
             desired_effort,
             cached_models,
             tab_order,
+            member_id: member_id.map(solutions::MemberId),
         });
     }
     Ok(out)

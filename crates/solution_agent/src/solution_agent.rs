@@ -44,6 +44,7 @@ pub use metrics_emitter::MetricsEmitter;
 pub mod test_support;
 
 pub use background_agent::{BackgroundAgent, BackgroundAgentId, BackgroundAgentSnapshot};
+pub use db::{IdentityMigrationReport, SolutionAgentDb};
 pub use background_shell::{
     BackgroundShell, BackgroundShellId, BackgroundShellSnapshot, ShellRuntimeState,
 };
@@ -88,16 +89,26 @@ pub fn init(cx: &mut App) {
     // once it's ready. Failure to open the DB is logged but non-fatal — the
     // store falls back to in-memory state.
     let db_task = db::SolutionAgentDb::connect(cx);
-    cx.spawn(async move |cx: &mut AsyncApp| match db_task.await {
-        Ok(db) => {
-            cx.update(|cx| {
-                let store = store::SolutionAgentStore::global(cx);
-                store.update(cx, |store, cx| store.set_persistence(db, cx));
-            });
-        }
-        Err(err) => {
-            log::error!("solution_agent: failed to open persistence DB: {err}");
-        }
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let db = match db_task.await {
+            Ok(db) => db,
+            Err(err) => {
+                log::error!("solution_agent: failed to open persistence DB: {err}");
+                return;
+            }
+        };
+
+        // The identity migration MUST run before the store hydrates, otherwise
+        // hydration reads rows whose `solution_id` is still a pre-identity slug.
+        // `solutions::init` (which applies the solutions-side migration that
+        // writes `solution_legacy_ids`) runs before `solution_agent::init`, so
+        // both the legacy map and the member list are already available here.
+        run_identity_migration(&db, cx).await;
+
+        cx.update(|cx| {
+            let store = store::SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| store.set_persistence(db, cx));
+        });
     })
     .detach();
 
@@ -145,6 +156,58 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// Remap `solution_sessions.solution_id` from the pre-identity slug to the
+/// numeric counter the solutions DB now uses, and backfill `member_id` from each
+/// session's cwd. Never fatal: a failure here leaves the rows untouched and is
+/// logged, so a busted map degrades to "sessions don't show up" instead of
+/// destroying them.
+async fn run_identity_migration(db: &db::SolutionAgentDb, cx: &mut AsyncApp) {
+    let (solutions_db, members) = cx.update(|cx| {
+        let solutions_db = solutions::db::SolutionsDb::global(cx);
+        let members: Vec<(i64, i64, String)> = solutions::SolutionStore::global(cx)
+            .read(cx)
+            .solutions()
+            .iter()
+            .flat_map(|solution| {
+                solution.members.iter().map(|member| {
+                    (
+                        member.id.0,
+                        solution.id.0,
+                        member.local_path.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        (solutions_db, members)
+    });
+    let legacy = match solutions_db.load_solution_legacy_ids().await {
+        Ok(legacy) => legacy,
+        Err(err) => {
+            log::error!("solution_agent: cannot read the solutions legacy id map: {err}");
+            return;
+        }
+    };
+    match db.migrate_identity(legacy, members).await {
+        Ok(report) => {
+            if !report.sessions_unmapped.is_empty() {
+                log::error!(
+                    "solution_agent: session(s) reference solution slug(s) {:?} that no longer \
+                     exist — their rows were left untouched",
+                    report.sessions_unmapped
+                );
+            }
+            log::info!(
+                "solution_agent: identity migration — {} of {} session(s) remapped, {} member \
+                 binding(s) backfilled",
+                report.sessions_remapped,
+                report.sessions_total,
+                report.member_ids_backfilled
+            );
+        }
+        Err(err) => log::error!("solution_agent: identity migration failed: {err}"),
+    }
 }
 
 /// Drain queued chunk-ack events from the `UploadManager` and broadcast each

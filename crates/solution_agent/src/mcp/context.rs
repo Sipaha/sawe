@@ -162,7 +162,7 @@ impl McpServerTool for CompactSessionTool {
                 store.read_with(cx, |store, cx| {
                     store.session(old_session_id).map(|entity| {
                         let s = entity.read(cx);
-                        (s.solution_id.clone(), s.agent_id.clone())
+                        (s.solution_id, s.agent_id.clone())
                     })
                 })
             })

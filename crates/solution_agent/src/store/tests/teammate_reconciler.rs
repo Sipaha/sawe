@@ -1070,7 +1070,7 @@ async fn background_agent_terminal_transition_resets_silence_clock(cx: &mut Test
                 bg_id.clone(),
                 crate::background_agent::BackgroundAgent {
                     id: bg_id.clone(),
-                    jsonl_path: jsonl.clone().into(),
+                    jsonl_path: jsonl.clone(),
                     registered_at: chrono::Utc::now(),
                     // Currently NON-terminal — the refresh below observes the
                     // transition INTO terminal.
@@ -1142,7 +1142,7 @@ async fn refresh_rebuilds_a_detached_agent_pill_so_it_is_not_frozen(cx: &mut Tes
                 bg_id.clone(),
                 crate::background_agent::BackgroundAgent {
                     id: bg_id.clone(),
-                    jsonl_path: jsonl.clone().into(),
+                    jsonl_path: jsonl.clone(),
                     registered_at: chrono::Utc::now(),
                     latest: Some(crate::background_agent::BackgroundAgentSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
@@ -1243,7 +1243,7 @@ async fn background_agent_terminal_closes_teammate_stream(cx: &mut TestAppContex
                 bg_id.clone(),
                 crate::background_agent::BackgroundAgent {
                     id: bg_id.clone(),
-                    jsonl_path: jsonl.clone().into(),
+                    jsonl_path: jsonl.clone(),
                     registered_at: chrono::Utc::now(),
                     // Currently NON-terminal so the refresh observes the edge.
                     latest: Some(crate::background_agent::BackgroundAgentSnapshot {
@@ -1328,7 +1328,7 @@ async fn background_agent_non_terminal_leaves_teammate_stream(cx: &mut TestAppCo
                 bg_id.clone(),
                 crate::background_agent::BackgroundAgent {
                     id: bg_id.clone(),
-                    jsonl_path: jsonl.clone().into(),
+                    jsonl_path: jsonl.clone(),
                     registered_at: chrono::Utc::now(),
                     latest: None,
                     last_offset: 0,
@@ -2241,7 +2241,7 @@ fn stale_running_shell_reaped_when_parent_gone(cx: &mut TestAppContext) {
             let id = SolutionSessionId::new();
             insert_cold_session(
                 id,
-                SolutionId("sol-a".into()),
+                SolutionId(1),
                 SharedString::from("claude-acp"),
                 None,
                 None,
@@ -2553,7 +2553,7 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
             let entity = cx.new(|_| {
                 let mut s = SolutionSession::new_idle(
                     session_id,
-                    SolutionId("sol-scan".into()),
+                    SolutionId(12),
                     SharedString::from("claude-acp"),
                     agent_client_protocol::schema::SessionId::new(acp_id),
                 );
@@ -2577,7 +2577,7 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
             store.sessions.insert(session_id, entity);
             store
                 .by_solution
-                .entry(SolutionId("sol-scan".into()))
+                .entry(SolutionId(12))
                 .or_default()
                 .push(session_id);
             // First scan: lazy-inits the offset to current EOF, flips nothing.

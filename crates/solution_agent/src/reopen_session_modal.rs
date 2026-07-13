@@ -41,7 +41,7 @@ impl ReopenableSession {
     pub fn from_metadata(meta: &SolutionSessionMetadata) -> Self {
         Self {
             id: meta.id,
-            solution_id: meta.solution_id.clone(),
+            solution_id: meta.solution_id,
             title: meta.title.clone(),
             total_tokens: meta.total_tokens,
             last_activity_at: meta.last_activity_at,
@@ -128,7 +128,7 @@ impl Render for ReopenSessionModal {
         let now = chrono::Utc::now();
         for session in self.sessions.clone() {
             let id = session.id;
-            let solution_id = session.solution_id.clone();
+            let solution_id = session.solution_id;
             // Secondary line: "128.4k ctx · 3h ago" (token half omitted when
             // the session never reported a usage). Lets the user pick a heavy
             // or recently-touched session without opening each one.
@@ -158,7 +158,7 @@ impl Render for ReopenSessionModal {
                             ),
                     )
                     .on_click(
-                        cx.listener(move |this, _, _, cx| this.reopen(id, solution_id.clone(), cx)),
+                        cx.listener(move |this, _, _, cx| this.reopen(id, solution_id, cx)),
                     ),
             );
         }
