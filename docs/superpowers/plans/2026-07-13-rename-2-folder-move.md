@@ -2870,7 +2870,7 @@ git commit -m "solutions_ui: Add a member rename modal and surface rename failur
   - `solutions.rename_member` — `{ member_id: i64, new_name: String }` → `{ member_id: i64, local_path: String }`.
   - `RenameMemberTool`, `RenameMemberParams`, `RenameMemberResult` (exported from `mcp::solutions_lifecycle`, re-exported by `mcp.rs`'s `pub use solutions_lifecycle::*;`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/solutions/src/mcp/tests.rs`:
 
@@ -2912,12 +2912,12 @@ async fn rename_member_tool_moves_the_folder(cx: &mut gpui::TestAppContext) {
 
 If `install_global_for_test` + `create_solution` do not let the test seed a member directly, seed the store with `crate::store::for_test_with_solution` (Task 4's fixture) and install it as the global instead — the assertion (the tool returns the **new** `local_path` and the folder moved) is what matters.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p solutions mcp::tests::rename_member_tool`
 Expected: FAIL — `cannot find struct 'RenameMemberTool' in this scope`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `crates/solutions/src/mcp/solutions_lifecycle.rs`, replace the `solutions.rename` doc comment and result type, and add the new tool below it:
 
@@ -3095,17 +3095,17 @@ Add `"solutions.rename_member",` to `GLOBAL_TOOLS` in `crates/editor_mcp/src/lif
 
 In `CLAUDE.md`, bump the catalog count (`**Tool catalog** (87 tools` → `88 tools`) and add `rename_member` to the `solutions.{…}` list.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p solutions mcp::tests::rename_member_tool`
 Expected: PASS.
 
-- [ ] **Step 5: Verify the workspace still builds**
+- [x] **Step 5: Verify the workspace still builds**
 
 Run: `cargo check -p solutions -p solutions_ui -p editor_mcp`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/solutions/src/mcp/solutions_lifecycle.rs crates/solutions/src/mcp/tests.rs crates/editor_mcp/src/lifecycle.rs CLAUDE.md

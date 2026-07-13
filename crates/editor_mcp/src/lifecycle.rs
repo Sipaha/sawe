@@ -152,6 +152,7 @@ const GLOBAL_TOOLS: &[&str] = &[
     "solutions.open",
     "solutions.close",
     "solutions.rename",
+    "solutions.rename_member",
     "solutions.reorder_members",
     "solutions.set_active_member",
     "solutions.find_for_path",

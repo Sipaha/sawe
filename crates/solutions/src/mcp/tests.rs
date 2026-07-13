@@ -801,3 +801,56 @@ use context_server::listener::McpServerTool;
         assert_eq!(p.col, 0);
         assert!(p.include_declaration.is_none());
     }
+
+    #[gpui::test]
+    async fn rename_member_tool_moves_the_folder(cx: &mut TestAppContext) {
+        let base = tempdir().expect("tempdir");
+        let solution_root = base.path().join("sol");
+        let member_path = solution_root.join("old-project");
+        std::fs::create_dir_all(&member_path).expect("mkdir");
+
+        let store =
+            cx.update(|cx| crate::store::for_test_with_solution(cx, &solution_root, &member_path));
+        let member_id = store.read_with(cx, |store, _| store.solutions()[0].members[0].id);
+        cx.update(|cx| crate::store::install_global_for_test(store, cx));
+
+        let response = cx
+            .update(|cx| {
+                let tool = RenameMemberTool;
+                cx.spawn(async move |cx| {
+                    tool.run(
+                        RenameMemberParams {
+                            member_id: member_id.0,
+                            new_name: "New Project".into(),
+                        },
+                        cx,
+                    )
+                    .await
+                })
+            })
+            .await
+            .expect("rename");
+
+        let new_path = solution_root.join("New-Project");
+        assert_eq!(
+            response.structured_content.local_path,
+            new_path.to_string_lossy()
+        );
+        assert_eq!(response.structured_content.member_id, member_id.0);
+        assert!(new_path.is_dir(), "folder moved");
+        assert!(
+            std::fs::symlink_metadata(&member_path)
+                .expect("stat old path")
+                .file_type()
+                .is_symlink(),
+            "compat symlink left behind"
+        );
+    }
+
+    #[gpui::test]
+    async fn rename_member_params_accepts_null() {
+        let p: RenameMemberParams =
+            serde_json::from_value(serde_json::Value::Null).expect("null");
+        assert_eq!(p.member_id, 0);
+        assert!(p.new_name.is_empty());
+    }

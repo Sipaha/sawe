@@ -21,6 +21,9 @@ pub(crate) fn register_solutions_lifecycle(cx: &mut App) {
         server.add_tool(RenameSolutionTool);
     });
     editor_mcp::register_tool(cx, |server| {
+        server.add_tool(RenameMemberTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
         server.add_tool(DeleteSolutionTool);
     });
     editor_mcp::register_tool(cx, |server| {
@@ -425,8 +428,9 @@ impl McpServerTool for CreateSolutionTool {
 // solutions.rename
 // =====================================================================
 
-/// Rename an existing Solution. Mutates `name` only; `id` and on-disk paths
-/// are unchanged.
+/// Rename a Solution. Also renames its directory on disk (the folder name is
+/// derived from the display name) and records a pending path migration that
+/// the next cold start reconciles. `solution_id` is stable across a rename.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RenameSolutionParams {
     pub solution_id: i64,
@@ -452,6 +456,8 @@ impl<'de> Deserialize<'de> for RenameSolutionParams {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RenameSolutionResult {
     pub solution_id: i64,
+    /// The solution's root **after** the rename.
+    pub root: String,
 }
 
 #[derive(Clone)]
@@ -476,17 +482,103 @@ impl McpServerTool for RenameSolutionTool {
             "invalid_params: new_name is required"
         );
         let solution_id = input.solution_id;
-        cx.update(|cx| -> Result<()> {
+        let id = crate::SolutionId(solution_id);
+        let root = cx.update(|cx| -> Result<String> {
             let store = SolutionStore::global(cx);
-            let id = crate::SolutionId(input.solution_id);
-            store.update(cx, |s, cx| s.rename_solution(id, &input.new_name, cx))?;
-            Ok(())
+            store.update(cx, |store, cx| store.rename_solution(id, &input.new_name, cx))?;
+            let root = store
+                .read(cx)
+                .find_solution(id)
+                .context("solution vanished during rename")?
+                .root
+                .to_string_lossy()
+                .into_owned();
+            Ok(root)
         })?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
-                text: format!("renamed: {solution_id}"),
+                text: format!("renamed: {solution_id} → {root}"),
             }],
-            structured_content: RenameSolutionResult { solution_id },
+            structured_content: RenameSolutionResult { solution_id, root },
+        })
+    }
+}
+
+// =====================================================================
+// solutions.rename_member
+// =====================================================================
+
+/// Rename a member project. Also renames its directory on disk. `member_id`
+/// is stable across a rename.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct RenameMemberParams {
+    pub member_id: i64,
+    pub new_name: String,
+}
+
+impl<'de> Deserialize<'de> for RenameMemberParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            member_id: i64,
+            new_name: String,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            member_id: inner.member_id,
+            new_name: inner.new_name,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RenameMemberResult {
+    pub member_id: i64,
+    /// The member's path **after** the rename.
+    pub local_path: String,
+}
+
+#[derive(Clone)]
+pub struct RenameMemberTool;
+
+impl McpServerTool for RenameMemberTool {
+    type Input = RenameMemberParams;
+    type Output = RenameMemberResult;
+    const NAME: &'static str = "solutions.rename_member";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(input.member_id > 0, "invalid_params: member_id is required");
+        anyhow::ensure!(
+            !input.new_name.trim().is_empty(),
+            "invalid_params: new_name is required"
+        );
+        let member_id = input.member_id;
+        let id = crate::MemberId(member_id);
+        let local_path = cx.update(|cx| -> Result<String> {
+            let store = SolutionStore::global(cx);
+            store.update(cx, |store, cx| store.rename_member(id, &input.new_name, cx))?;
+            let path = store
+                .read(cx)
+                .find_member(id)
+                .context("member vanished during rename")?
+                .local_path
+                .to_string_lossy()
+                .into_owned();
+            Ok(path)
+        })?;
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: format!("renamed: {member_id} → {local_path}"),
+            }],
+            structured_content: RenameMemberResult {
+                member_id,
+                local_path,
+            },
         })
     }
 }
