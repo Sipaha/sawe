@@ -1918,7 +1918,7 @@ git commit -m "solutions: Rewrite every path-bearing app-db row on a cold reconc
   - `pub fn rewrite_agent_db(connection: &Connection, rewrite: &PathRewrite) -> Result<()>` — `solution_sessions.cwd`, `solution_session_background_agent.jsonl_path`, `solution_session_attachment.path` (path is in the PK → delete + reinsert).
   - `pub fn encode_claude_bucket(path: &Path) -> String` — claude's own encoding: every `/` and `.` becomes `-` (mirrors `crates/solution_agent/src/store/teammate_reconciler.rs:22-39`).
   - `pub fn move_transcript_bucket(claude_projects_dir: &Path, rewrite: &PathRewrite) -> Result<()>` — moves `<enc(old)>` → `<enc(new)>`, merging file-by-file when the target bucket exists; never renames over an existing bucket.
-  - `pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)]) -> Result<()>` — `(member_root, solution_root)` pairs. Runs `git -C <member_root> worktree repair <tree paths…>` for every claude agent worktree of that member, in **both** locations: the legacy `<member_root>/.claude/worktrees/*` and the relocated `<solution_root>/.agents/worktrees/<member-dir>/*` (plan 3's `WorktreeCreate` hook puts them there). The tree paths are passed as **arguments** — see the doc comment in the code for why a bare `git worktree repair` is not enough.
+  - `pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)], rewrite: &PathRewrite) -> Result<()>` — `(member_root, solution_root)` pairs. Runs `git -C <member_root> worktree repair <tree paths…>` for every claude agent worktree owned by that member, in **both** locations: the legacy `<member_root>/.claude/worktrees/*` and the relocated `<solution_root>/.agents/worktrees/<member-dir>/*` (plan 3's `WorktreeCreate` hook puts them there). The tree paths are passed as **arguments** — see the doc comment in the code for why a bare `git worktree repair` is not enough, and why ownership is decided from the tree's `.git` pointer rather than from the `<member-dir>` folder name.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2185,19 +2185,25 @@ fn merge_dir(source: &Path, target: &Path) -> Result<()> {
 /// `git worktree repair` can only repair trees it can still reach through the
 /// (possibly stale) admin entries, so it silently misses the trees whose
 /// location changed.
-pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)]) -> Result<()> {
+pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)], rewrite: &PathRewrite) -> Result<()> {
     for (member_root, solution_root) in members {
-        let mut trees = Vec::new();
-        collect_worktree_dirs(&member_root.join(".claude").join("worktrees"), &mut trees);
-        if let Some(member_dir) = member_root.file_name() {
-            collect_worktree_dirs(
-                &solution_root
-                    .join(".agents")
-                    .join("worktrees")
-                    .join(member_dir),
-                &mut trees,
-            );
+        // Candidate trees, both locations. The `<member-dir>` level under
+        // `.agents/worktrees` is itself named after the member's *old* folder
+        // after a member rename, so do NOT filter by that name — collect every
+        // tree and decide ownership from the tree's own `.git` pointer.
+        let mut candidates = Vec::new();
+        collect_dirs(&member_root.join(".claude").join("worktrees"), &mut candidates);
+        let relocated = solution_root.join(".agents").join("worktrees");
+        let mut member_dirs = Vec::new();
+        collect_dirs(&relocated, &mut member_dirs);
+        for member_dir in &member_dirs {
+            collect_dirs(member_dir, &mut candidates);
         }
+
+        let trees: Vec<PathBuf> = candidates
+            .into_iter()
+            .filter(|tree| owning_repo(tree, rewrite).as_deref() == Some(member_root.as_path()))
+            .collect();
         if trees.is_empty() {
             continue;
         }
@@ -2224,15 +2230,32 @@ pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)]) -> Result<()> {
     Ok(())
 }
 
-fn collect_worktree_dirs(parent: &Path, trees: &mut Vec<PathBuf>) {
+fn collect_dirs(parent: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
     for entry in entries.flatten() {
         if entry.path().is_dir() {
-            trees.push(entry.path());
+            out.push(entry.path());
         }
     }
+}
+
+/// A linked worktree's `.git` is a file reading
+/// `gitdir: <repo>/.git/worktrees/<name>` — an **absolute** path that may still
+/// name the pre-rename location, hence the rewrite before matching. Returns the
+/// repo (member) the tree belongs to.
+fn owning_repo(tree: &Path, rewrite: &PathRewrite) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(tree.join(".git")).ok()?;
+    let pointer = contents.trim().strip_prefix("gitdir:")?.trim();
+    let pointer = rewrite
+        .apply_str(pointer)
+        .unwrap_or_else(|| pointer.to_string());
+    // <repo>/.git/worktrees/<name> → <repo>
+    Path::new(&pointer)
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
 }
 ```
 
@@ -2412,7 +2435,7 @@ pub(crate) fn apply_one_with_connections(
     .map(|(member, solution)| (PathBuf::from(member), PathBuf::from(solution)))
     .filter(|(member, _)| member.starts_with(&rewrite.new))
     .collect();
-    repair_git_worktrees(&members)?;
+    repair_git_worktrees(&members, rewrite)?;
 
     remove_compat_link(&rewrite.old)?;
     Ok(())
@@ -3393,6 +3416,122 @@ fn cold_reconcile_rewrites_all_three_databases_and_merges_the_bucket() {
     assert!(!old_bucket.exists(), "the source bucket is drained");
     assert!(!old_root.exists(), "the compat symlink is removed");
 }
+
+/// A **member** rename moves the repo — and with it the worktree admin dirs at
+/// `<member>/.git/worktrees/<name>/` — while the relocated agent worktree
+/// itself stays at `<solution_root>/.agents/worktrees/<member-dir>/<name>` and
+/// keeps pointing at the *old* admin path. Without a targeted
+/// `git worktree repair <tree>` the tree shows up as missing/prunable.
+#[test]
+fn cold_reconcile_repairs_relocated_agent_worktrees() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let solution_root = base.path().join("sol");
+    let old_member = solution_root.join("old-project");
+    let new_member = solution_root.join("New-Project");
+    std::fs::create_dir_all(&old_member).expect("mkdir member");
+
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    git(&["init", "-q"], &old_member);
+    git(&["config", "user.email", "t@example.com"], &old_member);
+    git(&["config", "user.name", "Test"], &old_member);
+    std::fs::write(old_member.join("README.md"), b"hi").expect("write");
+    git(&["add", "README.md"], &old_member);
+    git(&["commit", "-qm", "init"], &old_member);
+
+    // The relocated agent worktree, exactly where plan 3's `WorktreeCreate`
+    // hook puts it.
+    let tree = solution_root
+        .join(".agents")
+        .join("worktrees")
+        .join("old-project")
+        .join("wt-1");
+    git(
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt-1",
+            &tree.to_string_lossy(),
+        ],
+        &old_member,
+    );
+
+    // The hot rename: move the member, leave the compat symlink.
+    std::fs::rename(&old_member, &new_member).expect("rename member");
+    std::os::unix::fs::symlink(&new_member, &old_member).expect("compat symlink");
+
+    let app = Connection::open_memory(Some("cold_reconcile_worktrees"));
+    app.exec(
+        "CREATE TABLE solutions (id INTEGER PRIMARY KEY, name TEXT, root TEXT, last_opened_at INTEGER);
+         CREATE TABLE solution_members (id INTEGER PRIMARY KEY, solution_id INTEGER, name TEXT, local_path TEXT, position INTEGER, origin_catalog_id INTEGER);
+         CREATE TABLE workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT, paths_order TEXT, identity_paths TEXT, identity_paths_order TEXT, remote_connection_id INTEGER);
+         CREATE UNIQUE INDEX ix_workspaces_location ON workspaces(remote_connection_id, paths);
+         CREATE TABLE console_panel_state (workspace_id INTEGER, tab_index INTEGER, cwd TEXT);
+         CREATE TABLE editors (item_id INTEGER, workspace_id INTEGER, path BLOB, buffer_path BLOB);
+         CREATE TABLE terminals2 (workspace_id INTEGER, item_id INTEGER, working_directory BLOB);
+         CREATE TABLE breakpoints (workspace_id INTEGER, path TEXT, breakpoint_location INTEGER);
+         CREATE TABLE bookmarks (workspace_id INTEGER, path TEXT, row INTEGER);
+         CREATE TABLE trusted_worktrees (trust_id INTEGER PRIMARY KEY, absolute_path TEXT);
+         CREATE TABLE toolchains (workspace_id INTEGER, worktree_root_path TEXT, language_name TEXT, name TEXT, path TEXT, raw_json TEXT, relative_worktree_path TEXT);
+         CREATE TABLE user_toolchains (remote_connection_id INTEGER, workspace_id INTEGER, worktree_root_path TEXT, relative_worktree_path TEXT, language_name TEXT, name TEXT, path TEXT, raw_json TEXT);",
+    )
+    .expect("prepare app schema")()
+    .expect("create app schema");
+    app.exec_bound::<String>("INSERT INTO solutions VALUES (1, 'Sol', ?, NULL)")
+        .expect("prepare solutions insert")(solution_root.to_string_lossy().into_owned())
+    .expect("insert solution");
+    app.exec_bound::<String>(
+        "INSERT INTO solution_members VALUES (1, 1, 'New Project', ?, 0, NULL)",
+    )
+    .expect("prepare members insert")(new_member.to_string_lossy().into_owned())
+    .expect("insert member");
+
+    apply_one_with_connections(
+        &app,
+        None,
+        None,
+        &PathRewrite {
+            old: old_member.clone(),
+            new: new_member.clone(),
+        },
+    )
+    .expect("reconcile");
+
+    let listed = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&new_member)
+        .output()
+        .expect("git worktree list");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains(&format!("worktree {}", tree.display())),
+        "the relocated worktree must resolve at its path: {listed}"
+    );
+    assert!(
+        !listed.contains("prunable"),
+        "the worktree must not be prunable after the repair: {listed}"
+    );
+    // The tree's own `.git` pointer now names the *moved* admin dir.
+    let pointer = std::fs::read_to_string(tree.join(".git")).expect("read .git");
+    assert!(
+        pointer.contains(&new_member.join(".git/worktrees/wt-1").to_string_lossy().to_string()),
+        "{pointer}"
+    );
+}
 ```
 
 Register it: `mod cold_reconcile;` inside `mod tests` in `crates/solutions/src/solutions.rs`.
@@ -3400,7 +3539,7 @@ Register it: `mod cold_reconcile;` inside `mod tests` in `crates/solutions/src/s
 - [ ] **Step 2: Run it to verify it fails, then passes**
 
 Run: `cargo test -p solutions cold_reconcile`
-Expected on the first run: FAIL to compile (`apply_one_with_connections` is `pub(crate)` — it is, so this compiles; if the seed statements need adjusting to sqlez's one-statement-per-prepare rule, fix the *test*). Once compiling, it must PASS with the Task 6–8 implementation. If any assertion fails, fix the implementation, not the assertion.
+Expected: both `cold_reconcile_rewrites_all_three_databases_and_merges_the_bucket` and `cold_reconcile_repairs_relocated_agent_worktrees` PASS with the Task 6–8 implementation. (If the seed statements need adjusting to sqlez's one-statement-per-`exec_bound` rule, fix the *test*.) If an assertion fails, fix the implementation, not the assertion — in particular a "prunable" entry in `git worktree list` means `repair_git_worktrees` did not pass the moved tree path as an argument.
 
 - [ ] **Step 3: Write the MCP e2e test**
 
