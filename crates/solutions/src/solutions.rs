@@ -21,6 +21,8 @@ mod store;
 mod tabs_snapshot;
 
 pub use add_member::{AddProgressCallback, PendingAddView};
+#[cfg(any(test, feature = "test-support"))]
+pub use cache::set_cache_root_for_test;
 pub use cache::{default_cache_root, refresh_cache};
 pub use event_sources::install as install_event_sources_for_test;
 pub use folder_name::FolderNameError;

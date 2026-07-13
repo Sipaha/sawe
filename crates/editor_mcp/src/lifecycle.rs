@@ -25,10 +25,30 @@ use util::ResultExt as _;
 static RUNTIME_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Pin the lock + socket paths to a test-owned directory. Must be called
-/// before [`start_server`]. Idempotent only with the same value — a second
-/// call with a different path is silently ignored (`OnceLock`).
+/// before [`start_server`].
+///
+/// The override is process-global on purpose: so is the thing it overrides. The
+/// socket path is read from contexts that have no `App` at all — the pre-`App`
+/// CLI handoff (`handoff.rs`), the tokio-side mobile proxy
+/// (`remote_control::proxy::connect`), `claude_native`'s settings writer — so it
+/// cannot become a GPUI global without inventing a second source of truth. One
+/// process holds one runtime dir, guarded by one flock.
+///
+/// The consequence for tests: **only one runtime dir per test binary**. A test
+/// that starts a server must therefore be the only such test in its
+/// `tests/*.rs` file. A conflicting second call panics here rather than being
+/// silently dropped — the silent version presented as a 10-second
+/// "mcp.sock did not appear" timeout in whichever test happened to run second,
+/// which cost real debugging time twice.
 pub fn set_runtime_dir_for_test(dir: PathBuf) {
-    let _ = RUNTIME_DIR_OVERRIDE.set(dir);
+    if RUNTIME_DIR_OVERRIDE.set(dir.clone()).is_err() && RUNTIME_DIR_OVERRIDE.get() != Some(&dir) {
+        panic!(
+            "editor_mcp runtime dir already pinned to {:?} in this process; a test \
+             that starts the MCP server must be the only such test in its test binary \
+             (split it into its own tests/*.rs file)",
+            RUNTIME_DIR_OVERRIDE.get()
+        );
+    }
 }
 
 /// The socket, its lock file, the per-solution socket dirs and the upload
@@ -181,6 +201,19 @@ const GLOBAL_TOOLS: &[&str] = &[
     "catalog.edit_project",
     "catalog.refresh_cache",
     "catalog.clear_cache",
+    // Run configurations. `RunConfigStore` is a single app-global entity keyed
+    // off the project it watches, and no `run_config.*` tool takes (or could
+    // take) a `solution_id`. Solution-scoping a tool with no `solution_id` to
+    // inject buys exactly zero isolation — the tool reaches the same app-global
+    // store no matter which socket the call arrived on — while making it
+    // unreachable from the global socket. So: global, like `catalog.*`, and
+    // ALSO in SHARED_TOOLS so scoped subagents keep it.
+    "run_config.list",
+    "run_config.create",
+    "run_config.delete",
+    "run_config.select",
+    "run_config.run",
+    "run_config.stop",
     // Windows are orthogonal to Solutions — one window hosts many Solutions,
     // so a window has no single owner and window ops can't be solution-scoped.
     // The whole `windows.*` surface is cross-solution (operator-level), kept
@@ -261,6 +294,13 @@ const SHARED_TOOLS: &[&str] = &[
     "solutions.add_member",
     "solutions.add_empty_member",
     "solutions.remove_member",
+    // App-global store, no `solution_id` to inject (see GLOBAL_TOOLS).
+    "run_config.list",
+    "run_config.create",
+    "run_config.delete",
+    "run_config.select",
+    "run_config.run",
+    "run_config.stop",
     // Remote Control tools (see GLOBAL_TOOLS): kept on the global socket for
     // the mobile proxy AND cloned into each per-solution socket so scoped
     // subagents retain them. `solution_id` is force-injected only into the
@@ -649,6 +689,25 @@ mod tests {
             "solutions.open",
         ] {
             assert!(is_global_tool(name), "{name} must be a global-socket tool");
+        }
+    }
+
+    // `run_config.*` acts on an app-global store and carries no `solution_id`,
+    // so a per-solution socket cannot scope it — it must stay reachable from the
+    // global socket, and it must also be shared onto per-solution sockets so a
+    // scoped subagent keeps it.
+    #[test]
+    fn run_config_tools_are_global_and_shared() {
+        for name in [
+            "run_config.list",
+            "run_config.create",
+            "run_config.delete",
+            "run_config.select",
+            "run_config.run",
+            "run_config.stop",
+        ] {
+            assert!(is_global_tool(name), "{name} must be a global-socket tool");
+            assert!(is_shared_tool(name), "{name} must also reach scoped agents");
         }
     }
 

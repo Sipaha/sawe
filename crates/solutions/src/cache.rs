@@ -72,7 +72,40 @@ pub async fn refresh_cache(
     Ok(path)
 }
 
+/// Test-only override for [`default_cache_root`]. `paths::temp_dir()` derives
+/// from `util::paths::home_dir()`, which a `test-support` build hard-codes to
+/// `/home/zed` (deterministic snapshots) — a directory that does not exist. Any
+/// test that drives the real clone pipeline through the MCP tools (which resolve
+/// the cache root themselves via `default_cache_root`, rather than taking it as
+/// a parameter the way `SolutionStore::add_member` does) would otherwise die in
+/// `git clone --bare … could not create leading directories of '/home/zed/…'`.
+///
+/// Process-global, like [`editor_mcp::set_runtime_dir_for_test`]: only ONE
+/// value per test binary, so a test that needs it must be the only test in its
+/// `tests/*.rs` file (or share the same tempdir).
+#[cfg(any(test, feature = "test-support"))]
+static CACHE_ROOT_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Pin the catalog clone cache to a test-owned directory. See
+/// [`CACHE_ROOT_OVERRIDE`]. Panics on a conflicting second call rather than
+/// silently keeping the first value — the failure mode of the silent version is
+/// a mystifying clone error in an unrelated test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_cache_root_for_test(dir: PathBuf) {
+    if CACHE_ROOT_OVERRIDE.set(dir.clone()).is_err() && CACHE_ROOT_OVERRIDE.get() != Some(&dir) {
+        panic!(
+            "solutions cache root already pinned to {:?} in this process; a test \
+             that pins it must be the only test in its test binary",
+            CACHE_ROOT_OVERRIDE.get()
+        );
+    }
+}
+
 pub fn default_cache_root() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(dir) = CACHE_ROOT_OVERRIDE.get() {
+        return dir.clone();
+    }
     paths::temp_dir().join("catalog")
 }
 

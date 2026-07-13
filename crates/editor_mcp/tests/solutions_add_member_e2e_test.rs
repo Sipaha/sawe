@@ -35,6 +35,13 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
     std::fs::create_dir_all(&solutions_root).expect("mkdir sol-root");
     std::fs::create_dir_all(&cache_root).expect("mkdir cache");
 
+    // `solutions.add_member` / `catalog.*` resolve the clone cache themselves via
+    // `solutions::default_cache_root()` — there is no `solutions.cache_root`
+    // setting — and under `test-support` that lands in the hard-coded
+    // `/home/zed/…`, which does not exist (`git clone --bare` then exits 128).
+    // Pin it to our tempdir instead.
+    solutions::set_cache_root_for_test(cache_root.clone());
+
     // Seed a local bare git repo to act as the catalog project's remote.
     // Uses solutions::git::test_support helpers (gated behind the
     // `test-support` feature in solutions/Cargo.toml).
@@ -50,13 +57,10 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
         solutions::mcp::register(cx);
     });
 
-    // Override solutions.root and solutions.cache_root so the test does not
-    // touch the real ~/sawe/solutions/ or ~/.cache/sawe/.
+    // Override solutions.root so the test does not touch the real
+    // ~/sawe/solutions/. (The cache root is pinned above — it is not a setting.)
     let user_settings = json!({
-        "solutions": {
-            "root": solutions_root.to_string_lossy(),
-            "cache_root": cache_root.to_string_lossy(),
-        }
+        "solutions": { "root": solutions_root.to_string_lossy() }
     })
     .to_string();
     cx.update(|cx| {
