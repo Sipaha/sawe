@@ -59,13 +59,13 @@ use context_server::listener::McpServerTool;
             "solution_id": 7
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
     }
 
     #[test]
     fn get_params_accepts_null() {
         let p: GetSolutionParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
     }
 
     #[test]
@@ -294,7 +294,7 @@ use context_server::listener::McpServerTool;
             "catalog_id": 2
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 1);
+        assert_eq!(p.solution_id, Some(1));
         assert_eq!(p.catalog_id, 2);
     }
 
@@ -478,7 +478,7 @@ use context_server::listener::McpServerTool;
             "buffer_path": "src/foo.rs"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, 7);
+        assert_eq!(p.solution_id, Some(7));
         assert_eq!(p.buffer_path.as_deref(), Some("src/foo.rs"));
     }
 
@@ -486,7 +486,7 @@ use context_server::listener::McpServerTool;
     fn diagnostics_params_accepts_null() {
         let p: GetDiagnosticsParams =
             serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert_eq!(p.solution_id, 0);
+        assert_eq!(p.solution_id, None);
         assert!(p.buffer_path.is_none());
     }
 
@@ -853,4 +853,53 @@ use context_server::listener::McpServerTool;
             serde_json::from_value(serde_json::Value::Null).expect("null");
         assert_eq!(p.member_id, 0);
         assert!(p.new_name.is_empty());
+    }
+
+    #[test]
+    fn resolve_solution_id_parses_the_injected_id() {
+        let id = crate::mcp::resolve_solution_id(Some(7)).expect("resolve");
+        assert_eq!(id, crate::SolutionId(7));
+    }
+
+    #[test]
+    fn resolve_solution_id_explains_the_global_socket_case() {
+        let err = crate::mcp::resolve_solution_id(None).expect_err("must fail");
+        assert!(
+            err.to_string().contains("per-solution socket"),
+            "the error must tell the caller where the id comes from: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_solution_id_rejects_a_non_positive_id() {
+        let err = crate::mcp::resolve_solution_id(Some(0)).expect_err("must fail");
+        assert!(err.to_string().contains("positive numeric id"), "got: {err}");
+    }
+    /// `context_server::listener` decides whether to force-inject the socket's
+    /// bound `solution_id` by checking that the tool's input schema HAS a
+    /// `solution_id` property. Making the field optional must drop it from
+    /// `required`, never from `properties`.
+    #[test]
+    fn optional_solution_id_stays_a_schema_property() {
+        let mut settings = schemars::generate::SchemaSettings::draft07();
+        settings.inline_subschemas = true;
+        let schema = settings
+            .into_generator()
+            .root_schema_for::<crate::mcp::GetDiagnosticsParams>();
+
+        let properties = schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("properties");
+        assert!(
+            properties.contains_key("solution_id"),
+            "dropping the property would silently disable the per-socket injection"
+        );
+
+        let required = schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .map(|values| values.iter().any(|value| value == "solution_id"))
+            .unwrap_or(false);
+        assert!(!required, "solution_id must no longer be required");
     }

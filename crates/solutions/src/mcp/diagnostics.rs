@@ -30,7 +30,11 @@ pub(crate) fn register_diagnostics(cx: &mut App) {
 /// detail (`"info"`, `"hint"`).
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GetDiagnosticsParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_path: Option<String>,
 }
@@ -40,7 +44,7 @@ impl<'de> Deserialize<'de> for GetDiagnosticsParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
             buffer_path: Option<String>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -97,12 +101,9 @@ impl McpServerTool for GetDiagnosticsTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
-        let summaries = cx.update(|cx| collect_diagnostic_summaries(&input, cx));
-        let items = collect_diagnostic_items(&input, cx).await;
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
+        let summaries = cx.update(|cx| collect_diagnostic_summaries(solution_id, &input, cx));
+        let items = collect_diagnostic_items(solution_id, &input, cx).await;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: format!(
@@ -117,6 +118,7 @@ impl McpServerTool for GetDiagnosticsTool {
 }
 
 fn collect_diagnostic_summaries(
+    solution_id: i64,
     input: &GetDiagnosticsParams,
     cx: &mut App,
 ) -> Vec<DiagnosticPathSummary> {
@@ -126,7 +128,7 @@ fn collect_diagnostic_summaries(
     let Some(root) = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.0 == input.solution_id)
+            .find(|sol| sol.id.0 == solution_id)
             .map(|sol| sol.root.clone())
     }) else {
         return Vec::new();
@@ -192,10 +194,11 @@ fn collect_diagnostic_summaries(
 }
 
 async fn collect_diagnostic_items(
+    solution_id: i64,
     input: &GetDiagnosticsParams,
     cx: &mut AsyncApp,
 ) -> Vec<DiagnosticItem> {
-    let Some(project) = cx.update(|cx| project_for_solution(input.solution_id, cx)) else {
+    let Some(project) = cx.update(|cx| project_for_solution(solution_id, cx)) else {
         return Vec::new();
     };
 

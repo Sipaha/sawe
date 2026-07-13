@@ -1497,7 +1497,7 @@ and docs.
 
 **Steps**
 
-- [ ] Add failing tests to `crates/solutions/src/mcp/tests.rs`:
+- [x] Add failing tests to `crates/solutions/src/mcp/tests.rs`:
       ```rust
       #[test]
       fn resolve_solution_id_parses_the_injected_id() {
@@ -1521,9 +1521,9 @@ and docs.
           assert!(err.to_string().contains("numeric id"), "got: {err}");
       }
       ```
-- [ ] Run `cargo test -p solutions --lib resolve_solution_id` — expect a **compile
+- [x] Run `cargo test -p solutions --lib resolve_solution_id` — expect a **compile
       error**: ``cannot find function `resolve_solution_id` in module `super` ``.
-- [ ] Implement in `crates/solutions/src/mcp.rs`:
+- [x] Implement in `crates/solutions/src/mcp.rs`:
       ```rust
       use anyhow::{Context as _, Result, anyhow};
 
@@ -1552,9 +1552,9 @@ and docs.
       **Pre-plan-1 variant** (if this lands before `SolutionId` becomes `i64`):
       drop the `parse` and return `Ok(crate::SolutionId(raw))`; the
       `rejects_a_non_numeric_id` test then does not apply and is added with plan 1.
-- [ ] Run `cargo test -p solutions --lib resolve_solution_id` — expect three
+- [x] Run `cargo test -p solutions --lib resolve_solution_id` — expect three
       passing tests.
-- [ ] Add the schema guard to `crates/solutions/src/mcp/tests.rs` (this is the test
+- [x] Add the schema guard to `crates/solutions/src/mcp/tests.rs` (this is the test
       that keeps the injection working — the listener's `wants_solution_id` is
       `input_schema.properties.solution_id.is_some()`, `listener.rs:145-149`):
       ```rust
@@ -1587,11 +1587,11 @@ and docs.
           assert!(!required, "solution_id must no longer be required");
       }
       ```
-- [ ] Run `cargo test -p solutions --lib optional_solution_id_stays_a_schema_property`
+- [x] Run `cargo test -p solutions --lib optional_solution_id_stays_a_schema_property`
       — expect a **failure**: `assertion failed: !required` (the field is still
       `String`, hence still required). This is the red test that tasks 3.2-3.4
       turn green.
-- [ ] Commit: `Add resolve_solution_id for solution-scoped MCP tools`
+- [x] Commit: `Add resolve_solution_id for solution-scoped MCP tools`
 
 ## Task 3.2 — flip `solutions.*` and `diagnostics.get`
 
@@ -1613,7 +1613,7 @@ and docs.
 
 **Steps**
 
-- [ ] Flip the five params. Each is the same two-line edit, e.g. in
+- [x] Flip the five params. Each is the same two-line edit, e.g. in
       `diagnostics.rs:33`:
       ```rust
       pub struct GetDiagnosticsParams {
@@ -1632,7 +1632,7 @@ and docs.
                   buffer_path: Option<String>,
               }
       ```
-- [ ] Update each handler's id construction. `crate::SolutionId(input.solution_id)`
+- [x] Update each handler's id construction. `crate::SolutionId(input.solution_id)`
       / `crate::SolutionId(input.solution_id.clone())` becomes
       `crate::mcp::resolve_solution_id(input.solution_id)?` — the five call sites
       are `member_mgmt.rs:86`, `member_mgmt.rs:205`, `member_mgmt.rs:279`,
@@ -1641,11 +1641,11 @@ and docs.
       `Task<Result<…>>`, `?` already works; where it is a plain `fn` returning
       `Result`, likewise. If a site is inside a closure that must not fail early,
       hoist the `resolve_solution_id` call above it.
-- [ ] Run `cargo test -p solutions --lib` — expect
+- [x] Run `cargo test -p solutions --lib` — expect
       `optional_solution_id_stays_a_schema_property ... ok` (it keys off
       `GetDiagnosticsParams`) and no regressions.
-- [ ] Run `cargo check -p solutions` — expect no errors.
-- [ ] Commit: `Make solution_id optional in solutions.* and diagnostics.get`
+- [x] Run `cargo check -p solutions` — expect no errors.
+- [x] Commit: `Make solution_id optional in solutions.* and diagnostics.get`
 
 ## Task 3.3 — flip `workspace.*`
 

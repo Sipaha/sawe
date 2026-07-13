@@ -36,7 +36,11 @@ pub(crate) fn register_member_mgmt(cx: &mut App) {
 /// **Slow**: cloning can take seconds-to-minutes for large repos.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct AddMemberParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     pub catalog_id: i64,
 }
 
@@ -45,7 +49,7 @@ impl<'de> Deserialize<'de> for AddMemberParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
             catalog_id: i64,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -74,20 +78,17 @@ impl McpServerTool for AddMemberTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
         anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
 
-        let sol_id = crate::SolutionId(input.solution_id);
+        let sol_id = crate::SolutionId(solution_id);
         let cat_id = crate::CatalogId(input.catalog_id);
         let cache_root = crate::default_cache_root();
 
         let operation_id = cx.update(|cx| editor_mcp::op_start("solutions.add_member", cx));
 
         let op_id_for_task = operation_id.clone();
-        let solution_id_for_log = input.solution_id;
+        let solution_id_for_log = solution_id;
         let catalog_id_for_log = input.catalog_id;
 
         cx.spawn(async move |cx| {
@@ -131,7 +132,7 @@ impl McpServerTool for AddMemberTool {
             content: vec![ToolResponseContent::Text {
                 text: format!(
                     "queued add_member: {}/{}",
-                    input.solution_id, input.catalog_id
+                    solution_id, input.catalog_id
                 ),
             }],
             structured_content: AddMemberResult { operation_id },
@@ -152,7 +153,11 @@ impl McpServerTool for AddMemberTool {
 /// `member_id` synchronously.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct AddEmptyMemberParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     pub name: String,
 }
 
@@ -161,7 +166,7 @@ impl<'de> Deserialize<'de> for AddEmptyMemberParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
             name: String,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -190,16 +195,13 @@ impl McpServerTool for AddEmptyMemberTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.solution_id > 0,
-            "invalid_params: solution_id is required"
-        );
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
         anyhow::ensure!(
             !input.name.trim().is_empty(),
             "invalid_params: name is required"
         );
 
-        let sol_id = crate::SolutionId(input.solution_id);
+        let sol_id = crate::SolutionId(solution_id);
         let member_id = cx.update(|cx| -> Result<crate::MemberId> {
             let store = SolutionStore::global(cx);
             store.update(cx, |s, cx| s.add_empty_member(sol_id, &input.name, cx))

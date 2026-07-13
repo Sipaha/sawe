@@ -170,7 +170,11 @@ fn find_window_id_for_solution(solution_root: &std::path::Path, cx: &App) -> Opt
 /// Get full details of a Solution by id, including any active window info.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GetSolutionParams {
-    pub solution_id: i64,
+    /// Absent on a per-solution socket: the server injects the socket's bound
+    /// Solution and overrides any value sent here. Required only on the
+    /// editor-global socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
 }
 
 impl<'de> Deserialize<'de> for GetSolutionParams {
@@ -178,7 +182,7 @@ impl<'de> Deserialize<'de> for GetSolutionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: i64,
+            solution_id: Option<i64>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -246,14 +250,15 @@ impl McpServerTool for GetSolutionTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
         let (detail, root) = cx.update(|cx| -> Result<(SolutionDetail, std::path::PathBuf)> {
             let store = SolutionStore::global(cx);
             store.read_with(cx, |s, _| {
                 s.solutions()
                     .iter()
-                    .find(|sol| sol.id.0 == input.solution_id)
+                    .find(|sol| sol.id.0 == solution_id)
                     .map(|sol| (build_detail(sol, s.is_open(sol.id)), sol.root.clone()))
-                    .with_context(|| format!("solution_not_found: {}", input.solution_id))
+                    .with_context(|| format!("solution_not_found: {}", solution_id))
             })
         })?;
 
