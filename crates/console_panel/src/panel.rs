@@ -15,7 +15,7 @@ use solution_agent::rename_session_modal::RenameSessionModal;
 use solution_agent::reopen_session_modal::{ReopenSessionModal, ReopenableSession};
 use solution_agent::session_view::SolutionSessionView;
 use solution_agent::store::SolutionAgentStore;
-use solutions::{SolutionId, SolutionStore};
+use solutions::{MemberId, SolutionId, SolutionStore};
 use std::path::PathBuf;
 use task::{RevealStrategy, RevealTarget, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
@@ -48,7 +48,7 @@ pub fn active_solution_id_for_workspace(workspace: &Workspace, cx: &App) -> Opti
     for worktree in project.worktrees(cx) {
         let abs_path = worktree.read(cx).abs_path();
         if let Some(sol) = store.solution_for_path(abs_path.as_ref()) {
-            return Some(sol.id.clone());
+            return Some(sol.id);
         }
     }
     None
@@ -68,32 +68,36 @@ pub fn workspace_has_worktree(workspace: &Workspace, cx: &App) -> bool {
 /// project tab strip — falling back to the solution root when there is no
 /// active member. Used as the `cwd` for new terminals / AI chats started
 /// from the "+" menu (one project per solution drives both surfaces).
-fn active_member_path(solution_id: &SolutionId, cx: &App) -> Option<PathBuf> {
+fn active_member_path(solution_id: SolutionId, cx: &App) -> Option<PathBuf> {
     let store = SolutionStore::try_global(cx)?;
     let store = store.read(cx);
-    let solution = store.solutions().iter().find(|s| &s.id == solution_id)?;
-    if let Some(catalog) = store.active_member(solution_id)
-        && let Some(member) = solution.members.iter().find(|m| &m.catalog_id == catalog)
-    {
-        return Some(member.local_path.clone());
-    }
-    Some(solution.root.clone())
+    store.active_member_path(solution_id)
 }
 
-/// Whether a tab whose working directory is `tab_cwd` belongs to the
-/// project rooted at `active_member_path`. Mirrors `project_panel`'s
-/// worktree filter (`abs_path().starts_with(active_member_path)`): a `None`
-/// member path means "no active-member filter" so every tab is shown;
-/// otherwise the tab is in scope iff its cwd lives inside the member root.
-///
-/// A `None` `tab_cwd` (an unscopeable tab — e.g. a terminal created via the
-/// bare `NewTerminal` keybinding with no cwd, or one restored with a NULL cwd)
-/// is treated as IN scope rather than hidden: a tab we can't place must never
-/// silently vanish from the strip (that would leave an un-closeable ghost tab).
-fn tab_cwd_in_scope(tab_cwd: Option<&std::path::Path>, active_member_path: Option<&std::path::Path>) -> bool {
-    match active_member_path {
-        None => true,
-        Some(member) => tab_cwd.map_or(true, |cwd| cwd.starts_with(member)),
+/// Which project a console tab belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabScope {
+    /// The tab is bound to a member — either as a fact (a chat carries the
+    /// session's `member_id`) or by placement (a terminal's cwd lives inside
+    /// the member's folder).
+    Member(MemberId),
+    /// The tab sits at the solution root and belongs to no project.
+    Root,
+    /// The tab cannot be placed at all (a terminal opened by the bare
+    /// `NewTerminal` keybinding with no cwd, or one restored with a NULL cwd).
+    Unscoped,
+}
+
+/// Whether a tab is visible under the current active-member selection. A `None`
+/// active member means "no filter". An `Unscoped` tab is always shown: a tab we
+/// can't place must never silently vanish (that would leave an un-closeable
+/// ghost tab in the strip).
+pub(crate) fn tab_in_scope(scope: TabScope, active_member: Option<MemberId>) -> bool {
+    match (scope, active_member) {
+        (_, None) => true,
+        (TabScope::Unscoped, _) => true,
+        (TabScope::Member(member), Some(active)) => member == active,
+        (TabScope::Root, Some(_)) => false,
     }
 }
 
@@ -226,7 +230,7 @@ impl ConsolePanel {
                     opened,
                     closed,
                 } => this.apply_external_tab_changes(
-                    solution_id.clone(),
+                    *solution_id,
                     opened.clone(),
                     closed.clone(),
                     window,
@@ -636,7 +640,7 @@ impl ConsolePanel {
                 let Some(entity) = store_ref.session(*session_id) else {
                     continue;
                 };
-                let solution_id = entity.read(cx).solution_id.clone();
+                let solution_id = entity.read(cx).solution_id;
                 per_solution
                     .entry(solution_id)
                     .or_default()
@@ -821,9 +825,7 @@ impl ConsolePanel {
         // folder (the project selected in the project tab strip). Model and
         // effort are no longer chosen here — they're picked in the status bar
         // after the chat is created, before the first message is sent.
-        let active_path = active_solution_id
-            .as_ref()
-            .and_then(|id| active_member_path(id, cx));
+        let active_path = active_solution_id.and_then(|id| active_member_path(id, cx));
         // A terminal needs a project directory to run in. An empty solution has
         // 0 worktrees, so grey out "New Terminal" (the action handlers enforce
         // the same rule for the keyboard path). A non-empty solution or a plain
@@ -859,7 +861,6 @@ impl ConsolePanel {
                 )
                 .anchor(Anchor::TopLeft)
                 .menu(move |window, cx| {
-                    let active_solution_id = active_solution_id.clone();
                     let active_path = active_path.clone();
                     let project = project.clone();
                     let weak_self = weak_self.clone();
@@ -895,7 +896,7 @@ impl ConsolePanel {
                         // worktree for the agent to work in, while the terminal
                         // next to it was correctly disabled.
                         let menu = if let (true, Some(solution_id), Some(project)) =
-                            (has_project, active_solution_id.clone(), project.clone())
+                            (has_project, active_solution_id, project.clone())
                         {
                             let weak_self = weak_self.clone();
                             let cwd = active_path.clone();
@@ -903,7 +904,7 @@ impl ConsolePanel {
                                 if let Some(panel) = weak_self.upgrade() {
                                     panel.update(cx, |panel, cx| {
                                         panel.add_chat_tab_with_cwd(
-                                            solution_id.clone(),
+                                            solution_id,
                                             project.clone(),
                                             cwd.clone(),
                                             window,
@@ -957,7 +958,7 @@ impl ConsolePanel {
     /// `project_panel::ProjectPanel::active_member_path`.
     fn active_member_path(&self, cx: &App) -> Option<PathBuf> {
         let solution_id = self.active_solution_id(cx)?;
-        active_member_path(&solution_id, cx)
+        active_member_path(solution_id, cx)
     }
 
     /// Working directory a tab is anchored to, used to decide which member
@@ -977,14 +978,52 @@ impl ConsolePanel {
         }
     }
 
+    /// A chat tab's scope is a stored fact — the session's `member_id`. A
+    /// terminal has no member binding, so it is placed by its cwd (longest
+    /// matching member wins; anything under the root but in no member is `Root`).
+    fn tab_scope(&self, tab: &ConsoleTab, cx: &App) -> TabScope {
+        if let ConsoleTab::Chat { session_id, .. } = tab
+            && let Some(session) = SolutionAgentStore::try_global(cx)
+                .and_then(|store| store.read(cx).session(*session_id))
+        {
+            return match session.read(cx).member_id {
+                Some(member_id) => TabScope::Member(member_id),
+                None => TabScope::Root,
+            };
+        }
+        let Some(cwd) = self.tab_cwd(tab, cx) else {
+            return TabScope::Unscoped;
+        };
+        let Some(solution_id) = self.active_solution_id(cx) else {
+            return TabScope::Unscoped;
+        };
+        let Some(store) = SolutionStore::try_global(cx) else {
+            return TabScope::Unscoped;
+        };
+        let store = store.read(cx);
+        let Ok(solution) = store.find_solution(solution_id) else {
+            return TabScope::Unscoped;
+        };
+        match solution.member_for_path(&cwd) {
+            Some(member) => TabScope::Member(member.id),
+            None if cwd.starts_with(&solution.root) => TabScope::Root,
+            None => TabScope::Unscoped,
+        }
+    }
+
+    /// The solution-wide active member the tab strip is currently filtered by.
+    fn active_member(&self, cx: &App) -> Option<MemberId> {
+        let solution_id = self.active_solution_id(cx)?;
+        let store = SolutionStore::try_global(cx)?;
+        store.read(cx).active_member(solution_id)
+    }
+
     /// Per-tab in-scope flags for the currently active member, in tab order.
     fn tab_scope_flags(&self, cx: &App) -> Vec<bool> {
-        let member_path = self.active_member_path(cx);
+        let active_member = self.active_member(cx);
         self.tabs
             .iter()
-            .map(|tab| {
-                tab_cwd_in_scope(self.tab_cwd(tab, cx).as_deref(), member_path.as_deref())
-            })
+            .map(|tab| tab_in_scope(self.tab_scope(tab, cx), active_member))
             .collect()
     }
 
@@ -1385,7 +1424,7 @@ impl ConsolePanel {
         // the session cwd to the solution root, so the keyboard `NewChat`
         // action (and any other caller of this convenience wrapper) would land
         // the agent in "ROOT" instead of the selected project.
-        let cwd = active_member_path(&solution_id, cx);
+        let cwd = active_member_path(solution_id, cx);
         self.add_chat_tab_with_cwd(solution_id, project, cwd, window, cx);
     }
 
@@ -1414,6 +1453,11 @@ impl ConsolePanel {
         // Model and effort are chosen in the status bar after the chat is
         // created (and applied before the first message starts the session),
         // so the create call no longer carries them.
+        // Bind the new session to the active project up-front. The session's
+        // `member_id` is what scopes its tab from now on — inferring the member
+        // from the cwd would break the moment the member's folder is renamed.
+        let member_id = SolutionStore::try_global(cx)
+            .and_then(|store| store.read(cx).active_member(solution_id));
         let store = SolutionAgentStore::global(cx);
         let task = store.update(cx, |store, cx| {
             store.create_session_with_cwd(
@@ -1421,6 +1465,7 @@ impl ConsolePanel {
                 SharedString::from(CLAUDE_ACP_AGENT_ID),
                 project,
                 cwd,
+                member_id,
                 None,
                 None,
                 cx,
@@ -1667,7 +1712,7 @@ impl ConsolePanel {
         // display.
         let store = SolutionAgentStore::global(cx);
         let closed = store.update(cx, |store, cx| {
-            store.list_closed_sessions(solution_id.clone(), cx)
+            store.list_closed_sessions(solution_id, cx)
         });
         cx.spawn_in(window, async move |_this, cx| {
             let metas = closed.await.log_err().unwrap_or_default();
@@ -1963,34 +2008,31 @@ mod tests {
     use project::{FakeFs, Project};
     use settings::SettingsStore;
     use solution_agent::store::SolutionAgentStore;
-    use std::path::Path;
     use workspace::Workspace;
 
     #[test]
-    fn tab_cwd_in_scope_filters_by_active_member() {
-        let member_a = Path::new("/sol/member-a");
-        let member_b = Path::new("/sol/member-b");
+    fn tab_in_scope_filters_by_active_member() {
+        let a = MemberId(1);
+        let b = MemberId(2);
 
-        // No active member → every tab is in scope (mirrors project_panel,
-        // which shows all worktrees when no member is selected).
-        assert!(tab_cwd_in_scope(Some(Path::new("/sol/member-a/sub")), None));
-        assert!(tab_cwd_in_scope(None, None));
+        // No active member → the panel shows everything.
+        assert!(tab_in_scope(TabScope::Member(a), None));
+        assert!(tab_in_scope(TabScope::Root, None));
+        assert!(tab_in_scope(TabScope::Unscoped, None));
 
-        // With an active member, a tab is in scope iff its cwd lives under
-        // that member's root.
-        assert!(tab_cwd_in_scope(Some(member_a), Some(member_a)));
-        assert!(tab_cwd_in_scope(
-            Some(Path::new("/sol/member-a/nested/dir")),
-            Some(member_a)
-        ));
-        assert!(!tab_cwd_in_scope(Some(member_b), Some(member_a)));
+        // A tab bound to the active member is in scope; one bound to a sibling
+        // is not — even though both live under the same solution root, and even
+        // if one of the folders was renamed out from under the tab's cwd.
+        assert!(tab_in_scope(TabScope::Member(a), Some(a)));
+        assert!(!tab_in_scope(TabScope::Member(b), Some(a)));
 
-        // A tab whose cwd is the solution root (no member) is hidden while a
-        // member is active.
-        assert!(!tab_cwd_in_scope(Some(Path::new("/sol")), Some(member_a)));
-        // A tab with NO recorded cwd is unscopeable → shown (never a ghost tab),
-        // even while a concrete member is active.
-        assert!(tab_cwd_in_scope(None, Some(member_a)));
+        // A solution-root tab is hidden while a member is selected (it is not
+        // part of that project), matching the pre-existing prefix behaviour.
+        assert!(!tab_in_scope(TabScope::Root, Some(a)));
+
+        // A tab we cannot place must never silently vanish — hiding it would
+        // leave an un-closeable ghost in the strip.
+        assert!(tab_in_scope(TabScope::Unscoped, Some(a)));
     }
 
     #[test]

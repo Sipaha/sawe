@@ -68,7 +68,7 @@ impl ChatProvider {
                         return;
                     }
                     cx.emit(ChatProviderEvent::TabsChanged {
-                        solution_id: solution_id.clone(),
+                        solution_id: *solution_id,
                         opened: opened.clone(),
                         closed: closed.clone(),
                     });
@@ -107,9 +107,25 @@ impl ChatProvider {
                     .map(|ws| ws.read(cx).project().clone())
             })??;
 
+            // The session's member binding is a stored fact, not a cwd guess —
+            // see `ConsolePanel::tab_scope`.
+            let member_id = cx.update(|_window, cx| {
+                solutions::SolutionStore::try_global(cx)
+                    .and_then(|store| store.read(cx).active_member(solution_id))
+            })?;
+
             let session_id = store
                 .update(cx, |s, cx| {
-                    s.create_session_with_cwd(solution_id, agent_id, project, cwd, None, None, cx)
+                    s.create_session_with_cwd(
+                        solution_id,
+                        agent_id,
+                        project,
+                        cwd,
+                        member_id,
+                        None,
+                        None,
+                        cx,
+                    )
                 })
                 .await?;
 

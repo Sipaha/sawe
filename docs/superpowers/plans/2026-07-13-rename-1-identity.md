@@ -2776,7 +2776,7 @@ git commit -m "Label AI sessions from their bound member instead of their cwd"
   - `console_panel::panel::TabScope` — `enum TabScope { Member(MemberId), Root, Unscoped }`
   - `console_panel::panel::tab_in_scope(scope: TabScope, active_member: Option<MemberId>) -> bool`
 
-- [ ] **Step 1: Write the failing scoping test**
+- [x] **Step 1: Write the failing scoping test**
 
 Replace `tab_cwd_in_scope_filters_by_active_member` in `crates/console_panel/src/panel.rs`'s `mod tests` with:
 
@@ -2807,12 +2807,12 @@ Replace `tab_cwd_in_scope_filters_by_active_member` in `crates/console_panel/src
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p console_panel --lib panel::tests::tab_in_scope_filters_by_active_member -- --nocapture`
 Expected: FAIL to compile — `error[E0433]: failed to resolve: use of undeclared type 'TabScope'`.
 
-- [ ] **Step 3: Implement `TabScope` / `tab_in_scope`**
+- [x] **Step 3: Implement `TabScope` / `tab_in_scope`**
 
 Replace `tab_cwd_in_scope` (and rewrite `active_member_path`) in `crates/console_panel/src/panel.rs`:
 
@@ -2906,7 +2906,7 @@ to
 
 where `active_member` is `self.solution_id(cx).and_then(|id| SolutionStore::try_global(cx).and_then(|s| s.read(cx).active_member(id)))`. `active_member_path` is still used for *creating* tabs (`:672`, `:1388`) — keep those.
 
-- [ ] **Step 4: Pass the member id when starting a chat**
+- [x] **Step 4: Pass the member id when starting a chat**
 
 In `crates/console_panel/src/chat_provider.rs`, where the panel calls `create_session_with_cwd`, pass the active member so the new session is bound rather than inferred:
 
@@ -2918,12 +2918,12 @@ In `crates/console_panel/src/chat_provider.rs`, where the panel calls `create_se
         })
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p console_panel`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/console_panel/src
