@@ -22,6 +22,7 @@ agent_servers.workspace = true
 agent-client-protocol.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+editor_mcp.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true

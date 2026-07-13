@@ -1019,7 +1019,7 @@ and docs.
 
 **Steps**
 
-- [ ] Create `crates/claude_native/src/claude_settings.rs` with **only** the test
+- [x] Create `crates/claude_native/src/claude_settings.rs` with **only** the test
       module:
       ```rust
       #[cfg(test)]
@@ -1111,12 +1111,12 @@ and docs.
           }
       }
       ```
-- [ ] Register the module (`pub mod claude_settings;` in
+- [x] Register the module (`pub mod claude_settings;` in
       `crates/claude_native/src/claude_native.rs`) and add `paths.workspace = true`
       to `[dependencies]` in `crates/claude_native/Cargo.toml`.
-- [ ] Run `cargo test -p claude_native --lib claude_settings` — expect **compile
+- [x] Run `cargo test -p claude_native --lib claude_settings` — expect **compile
       errors**: ``cannot find struct `EditorClaudeSettings` in this scope``.
-- [ ] Implement above the tests:
+- [x] Implement above the tests:
       ```rust
       //! The editor-owned claude settings layer, handed to the subprocess as
       //! `--settings <file>`.
@@ -1282,11 +1282,11 @@ and docs.
           format!("\"{}\"", value.replace('"', ""))
       }
       ```
-- [ ] Run `cargo test -p claude_native --lib claude_settings` — expect all four
+- [x] Run `cargo test -p claude_native --lib claude_settings` — expect all four
       tests to pass. (`keeps_the_users_own_hooks` reads only the *project* file;
       the user file is whatever the dev box has and the assertions don't depend on
       it being absent.)
-- [ ] Commit: `Build the editor-owned claude settings JSON`
+- [x] Commit: `Build the editor-owned claude settings JSON`
 
 ## Task 2.5 — pass `--settings` to the subprocess
 

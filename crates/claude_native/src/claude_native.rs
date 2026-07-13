@@ -3,6 +3,7 @@
 //! since the `@agentclientprotocol/claude-agent-acp` node wrapper path was
 //! retired (revert via git history if it ever needs to come back).
 
+pub mod claude_settings;
 pub mod command;
 mod connection;
 pub mod process;
