@@ -48,8 +48,19 @@ workspace.workspace = true
 
 [dev-dependencies]
 db = { workspace = true, features = ["test-support"] }
+fs.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
+project = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
+semver.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+# `project/test-support` turns on `remote/test-support`, which adds the
+# `RemoteConnectionIdentity::Mock` variant. The `workspace` crate only matches
+# that variant when *its own* test-support is on, so the two must be enabled
+# together or `workspace` fails to compile in this crate's test build.
+workspace = { workspace = true, features = ["test-support"] }
 # Dev-only (cyclic: solution_agent depends on solutions). The identity-migration
 # rehearsal has to drive BOTH databases from one test — the solutions DB produces
 # the legacy slug → counter map that the agent DB's own migration consumes.

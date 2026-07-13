@@ -161,6 +161,10 @@ mod tests {
         let target = dir.path().join("member");
         smol::block_on(crate::git::clone_local(&cache, &target, |_| {})).expect("clone_local");
 
+        // A synchronous one-shot `git branch -r` in a test, not in a task that
+        // could block the executor — the `disallowed_methods` lint's concern
+        // does not apply here.
+        #[allow(clippy::disallowed_methods)]
         let refs = std::process::Command::new("git")
             .args(["-C", target.to_str().expect("str"), "branch", "-r"])
             .output()

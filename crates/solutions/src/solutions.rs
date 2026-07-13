@@ -85,4 +85,5 @@ pub fn init(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     mod persistence_e2e;
+    mod rename_hot_worktree;
 }

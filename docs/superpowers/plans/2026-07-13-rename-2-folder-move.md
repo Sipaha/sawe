@@ -3127,7 +3127,7 @@ git commit -m "solutions: Expose solutions.rename_member over MCP and move folde
 
 Proves the three claims the design rests on: the worktree's `abs_path` follows the move (via `ScanState::RootUpdated` → `update_abs_path_and_refresh`, `crates/worktree/src/worktree.rs:4356-4381` → `2050-2066`), open buffers survive, and the old path still resolves through the compat symlink.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/solutions/src/tests/rename_hot_worktree.rs`:
 
@@ -3242,12 +3242,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p solutions renaming_a_solution_moves_the_folder_under_a_live_worktree`
 Expected: FAIL — first a compile error (`use of undeclared crate 'project'`) until the dev-dependencies are added; after adding them the test must run and pass (the implementation from Task 5 is already in place). If it fails on the worktree assertion, that is a **real** bug in the rename path, not a test artifact — do not paper over it by removing the assertion.
 
-- [ ] **Step 3: Add the dev-dependencies**
+- [x] **Step 3: Add the dev-dependencies**
 
 In `crates/solutions/Cargo.toml`, under `[dev-dependencies]`:
 
@@ -3258,12 +3258,12 @@ project = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p solutions renaming_a_solution_moves_the_folder_under_a_live_worktree`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/solutions/Cargo.toml crates/solutions/src/solutions.rs crates/solutions/src/tests/rename_hot_worktree.rs
