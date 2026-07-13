@@ -19,6 +19,7 @@ pub(crate) use new_solution::NewSolutionModal;
 pub(crate) use rename_solution::open_rename_solution;
 
 use add_catalog_project::AddCatalogProjectModal;
+use add_catalog_project::humanize_catalog_error;
 use delete_catalog_project::DeleteCatalogProjectModal;
 use delete_solution::DeleteSolutionModal;
 use edit_catalog_project::{EditCatalogPrefill, EditCatalogProjectModal};

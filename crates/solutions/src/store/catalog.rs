@@ -14,25 +14,38 @@ impl SolutionStore {
         default_branch: Option<String>,
         cx: &mut gpui::Context<Self>,
     ) -> Result<CatalogId> {
-        // A catalog entry IS its remote: registering the same repository twice
-        // used to mint a second row with a `-2` slug, so the add-project picker
-        // listed the identical project (same name, same URL) two or three times
-        // and `refresh_cache` fetched the same mirror once per row. Adding a
-        // repo already in the registry is a no-op that hands back the existing
-        // id — the caller's intent ("I want this project available") is already
-        // satisfied.
-        if let Some(existing) = self
+        // Both the name and the remote are unique keys, and a clash on either is
+        // an ERROR, never a silent fixup. Registering a repo that was already in
+        // the catalog used to mint a second row with a `-2` slug: the picker then
+        // showed the identical project (same label, same URL) two or three times,
+        // and `refresh_cache` fetched the same mirror once per row. Reusing the
+        // existing entry instead would be just as bad in the other direction —
+        // the caller asks to add a project and gets back someone else's id, with
+        // its own name and default branch, which is exactly the hidden magic that
+        // makes a registry untrustworthy. Say no and let the user decide.
+        if let Some(clash) = self
             .config
             .catalog
             .iter()
             .find(|c| same_remote(&c.remote_url, remote_url))
         {
-            log::info!(
-                "solutions: catalog already holds {} for {remote_url} — reusing it instead of \
-                 registering a duplicate",
-                existing.id.0,
+            bail!(
+                "duplicate_remote: catalog already has \"{}\" pointing at {} — remove or edit \
+                 that entry instead of registering the same repository twice",
+                clash.name,
+                clash.remote_url,
             );
-            return Ok(existing.id.clone());
+        }
+        // The picker shows the NAME as the row's primary label, so two rows
+        // reading `citeck-ci` are indistinguishable at a glance no matter how
+        // their URLs differ.
+        if let Some(clash) = self.config.catalog.iter().find(|c| same_name(&c.name, name)) {
+            bail!(
+                "duplicate_name: catalog already has a project named \"{}\" ({}) — pick a \
+                 different name",
+                clash.name,
+                clash.remote_url,
+            );
         }
         let taken: Vec<String> = self.config.catalog.iter().map(|c| c.id.0.clone()).collect();
         let slug = unique_slug(name, &taken);
@@ -57,6 +70,37 @@ impl SolutionStore {
         new_remote_url: Option<String>,
         cx: &mut gpui::Context<Self>,
     ) -> Result<()> {
+        // Same uniqueness contract as `add_catalog_project` — otherwise Edit is
+        // a back door that recreates exactly the duplicates the add path now
+        // refuses. Checked against every OTHER entry (a no-op self-rename must
+        // still be allowed) and BEFORE any field is written, so a rejected edit
+        // leaves the entry untouched.
+        if let Some(name) = new_name.as_deref()
+            && let Some(clash) = self
+                .config
+                .catalog
+                .iter()
+                .find(|c| c.id != *id && same_name(&c.name, name))
+        {
+            bail!(
+                "duplicate_name: catalog already has a project named \"{}\" ({})",
+                clash.name,
+                clash.remote_url,
+            );
+        }
+        if let Some(url) = new_remote_url.as_deref()
+            && let Some(clash) = self
+                .config
+                .catalog
+                .iter()
+                .find(|c| c.id != *id && same_remote(&c.remote_url, url))
+        {
+            bail!(
+                "duplicate_remote: catalog already has \"{}\" pointing at {}",
+                clash.name,
+                clash.remote_url,
+            );
+        }
         let proj = self
             .config
             .catalog
@@ -249,9 +293,16 @@ fn same_remote(a: &str, b: &str) -> bool {
     !a.trim().is_empty() && normalize(a) == normalize(b)
 }
 
+/// Do two catalog names collide? Case- and surrounding-whitespace-insensitive:
+/// `citeck-ci` and `Citeck-CI ` read as the same row in the picker, so they must
+/// not both be registrable.
+fn same_name(a: &str, b: &str) -> bool {
+    !a.trim().is_empty() && a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::same_remote;
+    use super::{same_name, same_remote};
 
     #[test]
     fn same_remote_ignores_git_suffix_slash_and_case() {
@@ -269,5 +320,12 @@ mod tests {
         // An empty remote (a local-only catalog row) must never collapse onto
         // another empty one — every such project is its own thing.
         assert!(!same_remote("", ""));
+    }
+
+    #[test]
+    fn same_name_folds_case_and_padding_but_not_empties() {
+        assert!(same_name("citeck-ci", " Citeck-CI "));
+        assert!(!same_name("citeck-ci", "citeck-ci-2"));
+        assert!(!same_name("", ""));
     }
 }

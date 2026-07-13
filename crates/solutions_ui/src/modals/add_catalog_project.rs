@@ -5,7 +5,6 @@ use gpui::{
 };
 use solutions::{SolutionId, SolutionStore};
 use ui::prelude::*;
-use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 pub struct AddCatalogProjectModal {
@@ -16,6 +15,11 @@ pub struct AddCatalogProjectModal {
     /// added to it as a member (cloning in the background, shown as a pending
     /// row with a spinner) once it's in the catalog. `None` = catalog-only.
     solution_id: Option<SolutionId>,
+    /// Rejection from the last Confirm (duplicate name / duplicate remote).
+    /// Rendered inline above the buttons and the modal STAYS open — the store
+    /// enforces both as hard errors, and silently dismissing on a rejected add
+    /// would look exactly like a successful one.
+    error: Option<SharedString>,
     _workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     _url_subscription: Subscription,
@@ -81,6 +85,7 @@ impl AddCatalogProjectModal {
             url_editor,
             branch_editor,
             solution_id,
+            error: None,
             _workspace: workspace,
             focus_handle,
             _url_subscription: url_subscription,
@@ -101,11 +106,16 @@ impl AddCatalogProjectModal {
         };
         let solution_id = self.solution_id.clone();
         let store = SolutionStore::global(cx);
-        let catalog_id = store
-            .update(cx, |s, cx| {
-                s.add_catalog_project(&name, &url, default_branch, cx)
-            })
-            .log_err();
+        let catalog_id = match store.update(cx, |s, cx| {
+            s.add_catalog_project(&name, &url, default_branch, cx)
+        }) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                self.error = Some(humanize_catalog_error(&error).into());
+                cx.notify();
+                return;
+            }
+        };
         // If opened from a Solution's `+`, immediately add the new project as a
         // member of that Solution. The clone runs in the background; the project
         // strip shows it as a pending row with a spinner until it completes.
@@ -134,6 +144,19 @@ fn derive_project_name_from_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     let last = trimmed.rsplit(['/', ':']).next().unwrap_or("");
     last.trim_end_matches(".git").to_string()
+}
+
+/// Turn the store's machine-tagged rejection into a sentence for the modal.
+/// The `duplicate_name:` / `duplicate_remote:` prefixes exist so MCP callers can
+/// branch on them; a human just wants to be told what to change.
+pub(super) fn humanize_catalog_error(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    match text.split_once(": ") {
+        Some((tag, rest)) if tag == "duplicate_name" || tag == "duplicate_remote" => {
+            rest.to_string()
+        }
+        _ => text,
+    }
 }
 
 impl EventEmitter<DismissEvent> for AddCatalogProjectModal {}
@@ -192,6 +215,9 @@ impl Render for AddCatalogProjectModal {
                     .color(Color::Muted),
             )
             .child(self.branch_editor.clone())
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
             .child(
                 h_flex()
                     .justify_end()

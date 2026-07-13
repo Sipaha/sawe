@@ -4,7 +4,6 @@ use gpui::{
 };
 use solutions::{CatalogId, SolutionStore};
 use ui::prelude::*;
-use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 /// Initial values handed to [`EditCatalogProjectModal::new`]. Snapshotted
@@ -21,6 +20,9 @@ pub struct EditCatalogProjectModal {
     name_editor: Entity<Editor>,
     url_editor: Entity<Editor>,
     branch_editor: Entity<Editor>,
+    /// Rejection from the last Confirm (duplicate name / duplicate remote),
+    /// shown inline so a refused edit can't look like a successful one.
+    error: Option<SharedString>,
     _workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
 }
@@ -52,6 +54,7 @@ impl EditCatalogProjectModal {
             name_editor,
             url_editor,
             branch_editor,
+            error: None,
             _workspace: workspace,
             focus_handle,
         }
@@ -71,11 +74,15 @@ impl EditCatalogProjectModal {
         } else {
             Some(branch)
         };
-        store
-            .update(cx, |s, cx| {
-                s.edit_catalog_project(&id, Some(name), new_branch, Some(url), cx)
-            })
-            .log_err();
+        if let Err(error) = store.update(cx, |s, cx| {
+            s.edit_catalog_project(&id, Some(name), new_branch, Some(url), cx)
+        }) {
+            // Name / remote uniqueness is enforced in the store. Keep the modal
+            // open with the reason instead of dismissing as if it had worked.
+            self.error = Some(super::humanize_catalog_error(&error).into());
+            cx.notify();
+            return;
+        }
         cx.emit(DismissEvent);
     }
 
@@ -135,6 +142,9 @@ impl Render for EditCatalogProjectModal {
                     .color(Color::Muted),
             )
             .child(self.branch_editor.clone())
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
             .child(
                 h_flex()
                     .justify_end()

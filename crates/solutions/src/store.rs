@@ -438,8 +438,13 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
+    /// Name and remote are both unique keys. A clash on either is an error —
+    /// NOT a silent `-2` slug (which produced two picker rows with the identical
+    /// label and URL) and NOT a silent reuse of the existing entry (which would
+    /// hand the caller back someone else's project). Both are the "hidden magic"
+    /// the registry must not do.
     #[gpui::test]
-    async fn add_catalog_project_dedupes_slug(cx: &mut TestAppContext) {
+    async fn add_catalog_project_rejects_duplicate_name_and_remote(cx: &mut TestAppContext) {
         let dir = tempdir().expect("tempdir");
         let cfg_path = dir.path().join("solutions.json");
         let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
@@ -449,13 +454,75 @@ mod tests {
                 s.add_catalog_project("Foo", "git@x:foo.git", None, cx)
             })
             .expect("first add");
-        let id2 = store
-            .update(cx, |s, cx| {
-                s.add_catalog_project("Foo", "git@x:other-foo.git", None, cx)
-            })
-            .expect("second add");
         assert_eq!(id1.as_str(), "foo");
-        assert_eq!(id2.as_str(), "foo-2");
+
+        let same_name = store.update(cx, |s, cx| {
+            s.add_catalog_project("Foo", "git@x:other-foo.git", None, cx)
+        });
+        assert!(
+            same_name
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate_name"),
+            "a second project under an existing name must be refused"
+        );
+
+        // Same repo, different label, and the `.git` suffix dropped — still the
+        // same remote.
+        let same_remote = store.update(cx, |s, cx| {
+            s.add_catalog_project("Foo Clone", "git@x:foo", None, cx)
+        });
+        assert!(
+            same_remote
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate_remote"),
+            "re-registering a repository already in the catalog must be refused"
+        );
+
+        let count = store.read_with(cx, |s, _| s.catalog().len());
+        assert_eq!(count, 1, "no rejected add may have landed a row");
+    }
+
+    #[gpui::test]
+    async fn edit_catalog_project_rejects_duplicate_name(cx: &mut TestAppContext) {
+        let dir = tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("solutions.json");
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+
+        store
+            .update(cx, |s, cx| {
+                s.add_catalog_project("Foo", "git@x:foo.git", None, cx)
+            })
+            .expect("add foo");
+        let bar = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project("Bar", "git@x:bar.git", None, cx)
+            })
+            .expect("add bar");
+
+        let clash = store.update(cx, |s, cx| {
+            s.edit_catalog_project(&bar, Some("foo".into()), None, None, cx)
+        });
+        assert!(
+            clash.unwrap_err().to_string().contains("duplicate_name"),
+            "Edit must not be a back door for the duplicates Add refuses"
+        );
+        // The rejected edit must not have half-written the new name.
+        let still_bar = store.read_with(cx, |s, _| {
+            s.catalog()
+                .iter()
+                .find(|c| c.id == bar)
+                .map(|c| c.name.clone())
+        });
+        assert_eq!(still_bar.as_deref(), Some("Bar"));
+
+        // A no-op self-rename is still allowed.
+        store
+            .update(cx, |s, cx| {
+                s.edit_catalog_project(&bar, Some("Bar".into()), None, None, cx)
+            })
+            .expect("self-rename must be allowed");
     }
 
     #[gpui::test]
