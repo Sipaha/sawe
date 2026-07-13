@@ -2,7 +2,6 @@ use editor::Editor;
 use gpui::{AppContext as _, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable};
 use solutions::{SolutionId, SolutionStore};
 use ui::prelude::*;
-use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 /// Single-field modal for renaming a solution. Used by the title-bar tab
@@ -14,6 +13,7 @@ pub struct RenameSolutionModal {
     id: SolutionId,
     name_editor: Entity<Editor>,
     focus_handle: FocusHandle,
+    error: Option<SharedString>,
 }
 
 impl RenameSolutionModal {
@@ -33,17 +33,31 @@ impl RenameSolutionModal {
             id,
             name_editor,
             focus_handle,
+            error: None,
         }
     }
 
     fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
         let new_name = self.name_editor.read(cx).text(cx).trim().to_string();
-        if !new_name.is_empty() {
-            SolutionStore::global(cx)
-                .update(cx, |s, cx| s.rename_solution(self.id, &new_name, cx))
-                .log_err();
+        if new_name.is_empty() {
+            return;
         }
-        cx.emit(DismissEvent);
+        let id = self.id;
+        let result = SolutionStore::global(cx)
+            .update(cx, |store, cx| store.rename_solution(id, &new_name, cx));
+        match result {
+            Ok(()) => {
+                self.error = None;
+                cx.emit(DismissEvent);
+            }
+            // A rename now moves the folder, so it can fail (bad name,
+            // collision, cross-device move) — show it and keep the modal open
+            // instead of dismissing on a rename that never happened.
+            Err(error) => {
+                self.error = Some(error.to_string().into());
+                cx.notify();
+            }
+        }
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
@@ -81,6 +95,9 @@ impl Render for RenameSolutionModal {
             .rounded_md()
             .child(Label::new("Rename Solution").size(LabelSize::Large))
             .child(self.name_editor.clone())
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
             .child(
                 h_flex()
                     .justify_end()
@@ -112,11 +129,11 @@ pub fn open_rename_solution(
     cx: &mut Context<Workspace>,
 ) {
     let store = SolutionStore::global(cx);
-    let Some(current_name) = store.read_with(cx, |s, _| {
-        s.solutions()
-            .iter()
-            .find(|sol| sol.id == id)
-            .map(|sol| sol.name.clone())
+    let Some(current_name) = store.read_with(cx, |store, _| {
+        store
+            .find_solution(id)
+            .ok()
+            .map(|solution| solution.name.clone())
     }) else {
         return;
     };

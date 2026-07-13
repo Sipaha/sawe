@@ -38,7 +38,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::actions::{
-    CloseSolutionFromTabBar, DeleteSolutionFromTabBar, RemoveMember, RenameSolution,
+    CloseSolutionFromTabBar, DeleteSolutionFromTabBar, RemoveMember, RenameMember, RenameSolution,
     RevealSolutionFolder, SwitchToNextProjectInPanel, SwitchToNextSolution,
     SwitchToPrevProjectInPanel, SwitchToPrevSolution,
 };
@@ -360,6 +360,14 @@ fn register_tab_actions(
     });
     workspace.register_action(|workspace, _: &RefreshCacheForCurrent, _, cx| {
         refresh_cache_for_active_solution(workspace, cx);
+    });
+    workspace.register_action(|workspace, action: &RenameMember, window, cx| {
+        crate::modals::open_rename_member(
+            workspace,
+            solutions::MemberId(action.member_id),
+            window,
+            cx,
+        );
     });
     workspace.register_action(|workspace, action: &RemoveMember, window, cx| {
         use util::ResultExt as _;

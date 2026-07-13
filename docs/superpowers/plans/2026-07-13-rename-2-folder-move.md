@@ -2558,7 +2558,7 @@ git commit -m "solutions: Drain pending path migrations at startup before any wi
 
 A rename can now fail (bad name, collision, cross-device), so the modal must **show** the error and stay open instead of `log_err()`-ing it away.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the bottom of `crates/solutions_ui/src/modals/rename_member.rs` (create the file with only this test):
 
@@ -2586,12 +2586,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p solutions_ui rename_member`
 Expected: FAIL — `cannot find type 'RenameMemberModal' in this scope`.
 
-- [ ] **Step 3: Write the modal**
+- [x] **Step 3: Write the modal**
 
 Prepend to `crates/solutions_ui/src/modals/rename_member.rs`:
 
@@ -2741,12 +2741,12 @@ pub fn open_rename_member(
 
 In `crates/solutions_ui/src/modals.rs`, add `mod rename_member;` to the module list and `pub(crate) use rename_member::open_rename_member;` to the re-exports.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p solutions_ui rename_member`
 Expected: PASS — `confirm_reports_a_collision_and_keeps_the_modal_open`.
 
-- [ ] **Step 5: Add the action and the context-menu entry**
+- [x] **Step 5: Add the action and the context-menu entry**
 
 In `crates/solutions_ui/src/actions.rs`, after `RemoveMember`:
 
@@ -2797,7 +2797,7 @@ In `crates/solutions_ui/src/solutions_ui.rs`, next to the `RemoveMember` handler
 
 …and add `RenameMember` to the `use crate::actions::{…}` import list at `:41`.
 
-- [ ] **Step 6: Surface rename errors in the solution modal too**
+- [x] **Step 6: Surface rename errors in the solution modal too**
 
 In `crates/solutions_ui/src/modals/rename_solution.rs`: add an `error: Option<SharedString>` field (initialised to `None` in `new`), replace `confirm` with:
 
@@ -2841,12 +2841,12 @@ Also update `open_rename_solution` to look the solution up through the contract 
     };
 ```
 
-- [ ] **Step 7: Build and run the crate's tests**
+- [x] **Step 7: Build and run the crate's tests**
 
 Run: `cargo test -p solutions_ui`
 Expected: PASS (existing tests plus the new one). `cargo check -p solutions_ui` must be clean — this is where the `rename_solution(id, …)`-by-value signature change from Task 5 lands.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/solutions_ui/src/modals.rs crates/solutions_ui/src/modals/rename_member.rs crates/solutions_ui/src/modals/rename_solution.rs crates/solutions_ui/src/actions.rs crates/solutions_ui/src/project_tab.rs crates/solutions_ui/src/solutions_ui.rs

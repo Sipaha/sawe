@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use ui::{ContextMenu, Indicator, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 
-use crate::actions::RemoveMember;
+use crate::actions::{RemoveMember, RenameMember};
 use crate::solution_tab::dot_color_for_id;
 
 #[derive(IntoElement)]
@@ -189,6 +189,13 @@ impl RenderOnce for ProjectTab {
             .menu(move |window, cx| {
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     menu.action(
+                        "Rename…",
+                        Box::new(RenameMember {
+                            member_id: member_for_menu,
+                        }),
+                    )
+                    .separator()
+                    .action(
                         "Remove from Solution…",
                         Box::new(RemoveMember {
                             member_id: member_for_menu,

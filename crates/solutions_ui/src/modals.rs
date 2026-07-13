@@ -13,9 +13,11 @@ mod delete_solution;
 mod edit_catalog_project;
 mod new_project_in_solution;
 mod new_solution;
+mod rename_member;
 mod rename_solution;
 
 pub(crate) use new_solution::NewSolutionModal;
+pub(crate) use rename_member::open_rename_member;
 pub(crate) use rename_solution::open_rename_solution;
 
 use add_catalog_project::AddCatalogProjectModal;

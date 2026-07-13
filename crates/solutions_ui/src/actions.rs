@@ -119,6 +119,14 @@ pub struct RemoveMember {
     pub member_id: i64,
 }
 
+/// Open the rename modal for a member project. Dispatched from the project
+/// tab's right-click menu. Renaming also renames the member's folder on disk.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
+#[action(namespace = solutions)]
+pub struct RenameMember {
+    pub member_id: i64,
+}
+
 /// Cycle the solution-wide active project forward (next member) within
 /// the active solution. The `panel_kind` field is retained for keymap
 /// stability but is now ignored (selection is solution-wide, not
