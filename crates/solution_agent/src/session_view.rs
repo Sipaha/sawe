@@ -584,8 +584,16 @@ impl SolutionSessionView {
     /// addressees and it is the single source of truth for "which bundles
     /// belong to this tab".
     pub(super) fn visible_pending_bundles(&self, cx: &App) -> Vec<crate::model::PendingBundle> {
-        // Every tab routes to Main — teammate/shell tabs are view-only since
-        // the per-source-streams fold.
+        // Every queued bundle is `Main`-targeted (teammate/shell tabs don't own
+        // a queue of their own since the per-source-streams fold), so filtering
+        // by target ALONE surfaced the Main ghost bubble — and its Up-arrow
+        // recall — on every pill the user flipped to. The queue belongs to the
+        // Main transcript: a follow-up typed for the agent has no business
+        // hovering under a background shell's output. Gate on the selected
+        // stream, not just the bundle target.
+        if !pending_visible_for(&self.selected_stream) {
+            return Vec::new();
+        }
         let target = crate::model::QueueTarget::Main;
         self.session
             .read(cx)
@@ -969,6 +977,13 @@ impl SolutionSessionView {
 /// `tests.rs` can exercise it without spinning up a full GPUI view.
 pub(crate) fn compose_disabled_for(view: &crate::stream::StreamId) -> bool {
     matches!(view, crate::stream::StreamId::Shell(_))
+}
+
+/// Pure predicate: `true` when the queued-follow-up ghost bubble (and its
+/// Up-arrow recall) belongs on the given `selected_stream`. The queue is
+/// Main-only, so it must not follow the user onto a teammate or shell pill.
+pub(crate) fn pending_visible_for(view: &crate::stream::StreamId) -> bool {
+    matches!(view, crate::stream::StreamId::Main)
 }
 
 #[cfg(test)]

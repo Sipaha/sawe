@@ -238,6 +238,19 @@ fn compose_disabled_predicate_returns_true_for_shell() {
     assert!(super::compose_disabled_for(&StreamId::Shell(id)));
 }
 
+/// The queue is Main-only. Rendering its ghost bubble off the bundle target
+/// alone painted the pending message on EVERY pill the user flipped to (the
+/// "я писал только в main, а Pending рендерится во всех вкладках" report).
+#[test]
+fn pending_ghost_is_visible_on_main_only() {
+    assert!(super::pending_visible_for(&StreamId::Main));
+    assert!(!super::pending_visible_for(&StreamId::Teammate(
+        SharedString::from("toolu_a")
+    )));
+    let id = crate::background_shell::BackgroundShellId::new("x");
+    assert!(!super::pending_visible_for(&StreamId::Shell(id)));
+}
+
 #[test]
 fn unpack_recalled_bundle_handles_more_images_than_placeholders() {
     // Defensive: if the text somehow lost its `[image #N]` placeholders
