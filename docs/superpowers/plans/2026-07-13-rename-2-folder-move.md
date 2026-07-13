@@ -3283,7 +3283,7 @@ git commit -m "solutions: Cover the hot rename with a live-worktree integration 
 - Consumes: everything from Tasks 1–10.
 - Produces: nothing.
 
-- [ ] **Step 1: Write the failing cold-reconcile test**
+- [x] **Step 1: Write the failing cold-reconcile test**
 
 Create `crates/solutions/src/tests/cold_reconcile.rs`:
 
@@ -3536,12 +3536,12 @@ fn cold_reconcile_repairs_relocated_agent_worktrees() {
 
 Register it: `mod cold_reconcile;` inside `mod tests` in `crates/solutions/src/solutions.rs`.
 
-- [ ] **Step 2: Run it to verify it fails, then passes**
+- [x] **Step 2: Run it to verify it fails, then passes**
 
 Run: `cargo test -p solutions cold_reconcile`
 Expected: both `cold_reconcile_rewrites_all_three_databases_and_merges_the_bucket` and `cold_reconcile_repairs_relocated_agent_worktrees` PASS with the Task 6–8 implementation. (If the seed statements need adjusting to sqlez's one-statement-per-`exec_bound` rule, fix the *test*.) If an assertion fails, fix the implementation, not the assertion — in particular a "prunable" entry in `git worktree list` means `repair_git_worktrees` did not pass the moved tree path as an argument.
 
-- [ ] **Step 3: Write the MCP e2e test**
+- [x] **Step 3: Write the MCP e2e test**
 
 Create `crates/editor_mcp/tests/rename_folder_move_e2e_test.rs`:
 
@@ -3693,17 +3693,17 @@ async fn rename_solution_and_member_over_mcp_survives_a_restart(cx: &mut TestApp
 
 Copy the settings/`solutions::init`/`start_server` setup block verbatim from `crates/editor_mcp/tests/solutions_add_member_e2e_test.rs:24-70` — it already does exactly what this test needs (a `SettingsStore`, `solutions::init`, `editor_mcp::start_server`), and the field names there are the source of truth for `settings.root`.
 
-- [ ] **Step 4: Run the e2e test**
+- [x] **Step 4: Run the e2e test**
 
 Run: `cargo test -p editor_mcp --test rename_folder_move_e2e_test`
 Expected: PASS. If `solutions.add_empty_member`'s result field is not `member_id` (plan 1 may name it differently), read the actual field name off the tool's `…Result` struct and fix the test.
 
-- [ ] **Step 5: Full check**
+- [x] **Step 5: Full check**
 
 Run: `cargo test -p solutions && cargo test -p solutions_ui && cargo test -p editor_mcp`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/solutions/src/solutions.rs crates/solutions/src/tests/cold_reconcile.rs crates/editor_mcp/tests/rename_folder_move_e2e_test.rs

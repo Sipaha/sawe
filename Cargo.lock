@@ -5984,6 +5984,7 @@ dependencies = [
  "chrono",
  "collections",
  "context_server",
+ "db",
  "fs2",
  "gpui",
  "log",

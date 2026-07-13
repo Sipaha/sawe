@@ -700,9 +700,6 @@ pub(crate) fn apply_one_with_connections(
     if let Some(agent_db) = agent_db {
         rewrite_agent_db(agent_db, rewrite)?;
     }
-    if let Some(projects) = claude_projects_dir {
-        move_transcript_bucket(projects, rewrite)?;
-    }
 
     // `(member_root, solution_root)` for every member that now lives under the
     // moved path. The solution root is needed because the relocated agent
@@ -720,10 +717,75 @@ pub(crate) fn apply_one_with_connections(
     .map(|(member, solution)| (PathBuf::from(member), PathBuf::from(solution)))
     .filter(|(member, _)| member.starts_with(&rewrite.new))
     .collect();
-    repair_git_worktrees(&members, rewrite)?;
 
+    if let Some(projects) = claude_projects_dir {
+        // A bucket is keyed by a *session's* cwd, so a solution rename has to
+        // move the bucket of every cwd that lived under the moved root — the
+        // members and the agent worktrees — not just the root's own bucket.
+        for moved in moved_session_dirs(app_db, agent_db, &members, rewrite)? {
+            move_transcript_bucket(projects, &moved)?;
+        }
+    }
+
+    // Before the repair, not after: while the compat link still stands, the
+    // `gitdir:` pointer inside a moved worktree keeps resolving, so git sees
+    // nothing to fix and `worktree repair` leaves the stale absolute path in
+    // place.
     remove_compat_link(&rewrite.old)?;
+
+    repair_git_worktrees(&members, rewrite)?;
     Ok(())
+}
+
+/// Every directory whose transcript bucket the move invalidated: the moved path
+/// itself, plus each member and each recorded session cwd that now lives under
+/// it. Derived from the databases rather than by prefix-scanning the bucket
+/// directory, because claude's encoding maps both `/` and `.` to `-` — so
+/// `<old>.bak`'s bucket is indistinguishable from a bucket *under* `<old>` by
+/// name alone, and prefix-scanning would move an unrelated project's transcripts.
+fn moved_session_dirs(
+    app_db: &Connection,
+    agent_db: Option<&Connection>,
+    members: &[(PathBuf, PathBuf)],
+    rewrite: &PathRewrite,
+) -> Result<Vec<PathRewrite>> {
+    let mut new_paths: Vec<PathBuf> = vec![rewrite.new.clone()];
+    new_paths.extend(members.iter().map(|(member, _)| member.clone()));
+
+    if let Some(agent_db) = agent_db
+        && has_column(agent_db, "solution_sessions", "cwd")?
+    {
+        let cwds: Vec<String> = agent_db
+            .select::<String>("SELECT DISTINCT cwd FROM solution_sessions WHERE cwd IS NOT NULL")
+            .context("preparing session cwd select")?()
+        .context("selecting session cwds")?;
+        new_paths.extend(cwds.into_iter().map(PathBuf::from));
+    }
+    // The solution roots the app DB knows about can also be session cwds.
+    let roots: Vec<String> = app_db
+        .select::<String>("SELECT root FROM solutions WHERE root IS NOT NULL")
+        .context("preparing solution root select")?()
+    .context("selecting solution roots")?;
+    new_paths.extend(roots.into_iter().map(PathBuf::from));
+
+    new_paths.retain(|path| path.starts_with(&rewrite.new));
+    new_paths.sort();
+    new_paths.dedup();
+
+    Ok(new_paths
+        .into_iter()
+        .filter_map(|new| {
+            let relative = new.strip_prefix(&rewrite.new).ok()?;
+            // `join("")` would append a separator, and the bucket name encodes
+            // every separator — so the moved path itself must be used verbatim.
+            let old = if relative.as_os_str().is_empty() {
+                rewrite.old.clone()
+            } else {
+                rewrite.old.join(relative)
+            };
+            Some(PathRewrite { old, new })
+        })
+        .collect())
 }
 
 /// Only ever removes a *symlink*. If the user re-created a real directory at the

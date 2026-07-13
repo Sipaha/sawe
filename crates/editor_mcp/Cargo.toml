@@ -29,7 +29,9 @@ smol.workspace = true
 util.workspace = true
 
 [dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+paths.workspace = true
 pretty_assertions.workspace = true
 run_config.workspace = true
 settings = { workspace = true, features = ["test-support"] }

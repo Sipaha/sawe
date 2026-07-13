@@ -84,6 +84,7 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    mod cold_reconcile;
     mod persistence_e2e;
     mod rename_hot_worktree;
 }
