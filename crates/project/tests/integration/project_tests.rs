@@ -1086,7 +1086,7 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
     let topmost_local_task_source_kind = TaskSourceKind::Worktree {
         id: worktree_id,
         directory_in_worktree: rel_path(".sawe").into(),
-        id_base: "local worktree tasks from directory \".zed\"".into(),
+        id_base: "local worktree tasks from directory \".sawe\"".into(),
     };
 
     let buffer_a = project
@@ -1129,8 +1129,8 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
             (
                 TaskSourceKind::Worktree {
                     id: worktree_id,
-                    directory_in_worktree: rel_path("b/.zed").into(),
-                    id_base: "local worktree tasks from directory \"b/.zed\"".into()
+                    directory_in_worktree: rel_path("b/.sawe").into(),
+                    id_base: "local worktree tasks from directory \"b/.sawe\"".into()
                 },
                 "cargo check".to_string(),
                 vec!["check".to_string()],
@@ -1210,8 +1210,8 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
             (
                 TaskSourceKind::Worktree {
                     id: worktree_id,
-                    directory_in_worktree: rel_path("b/.zed").into(),
-                    id_base: "local worktree tasks from directory \"b/.zed\"".into()
+                    directory_in_worktree: rel_path("b/.sawe").into(),
+                    id_base: "local worktree tasks from directory \"b/.sawe\"".into()
                 },
                 "cargo check".to_string(),
                 vec!["check".to_string()],
@@ -1380,7 +1380,7 @@ async fn test_fallback_to_single_worktree_tasks(cx: &mut gpui::TestAppContext) {
             TaskSourceKind::Worktree {
                 id: worktree_id,
                 directory_in_worktree: rel_path(".sawe").into(),
-                id_base: "local worktree tasks from directory \".zed\"".into(),
+                id_base: "local worktree tasks from directory \".sawe\"".into(),
             },
             "echo /dir".to_string(),
         )]
