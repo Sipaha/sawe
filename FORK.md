@@ -77,9 +77,11 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/remote_connection/src/remote_connection.rs` | Added `RemoteConnectionOptions::Mock` fallback for non-test builds (cfg-gated `unreachable!()`); pre-existing upstream pattern issue blocking our test runs. | upstream-fix |
 | `crates/acp_thread/src/connection.rs` | Adds `AgentConnection::new_session_with_meta` extension point (default impl drops the meta + falls back to `new_session`) so adapters can act on protocol-level `_meta` keys (e.g. `claude-agent-acp` reads `_meta.systemPrompt` to seed the session prompt). | `solution_agent` |
 | `crates/acp_thread/src/acp_thread.rs` | (1) `ToolCall::status_started_at: Option<chrono::DateTime<Utc>>` — stamped on the first transition into `InProgress` (both `from_acp` and `update_fields`), preserved across the transition to a terminal status. Lets fork-owned renderers (`solution_agent::conversation_render`, the MCP wire) display a live "ran for Xs" badge without inventing a parallel start-time table. (2) `SPK_CLIENT_SEND_ID_META_KEY` constant + `client_send_id_from_user_message(&UserMessage) -> Option<i64>` helper — read-only scan over a UserMessage's `chunks` for a client-stamped `_meta.spk_client_send_id`. Lets the mobile client round-trip-match its in-flight optimistic bubble to the server-echoed entry by id instead of fragile content-equality on truncated previews. Zero changes to `AcpThread::send` or `UserMessage` struct — the id rides on the existing `acp::ContentBlock._meta` field. | `solution_agent` |
-| `crates/agent_servers/src/acp.rs` | (1) `mcp_servers_for_project` prepends a fork-local `acp::McpServer::Stdio` entry pointing at `<current_exe> --nc <editor_mcp.socket_path>` so spawned ACP subagents see the editor's embedded MCP tools (helper: `sawe_mcp_bridge_server`) — see decision 14. (2) `AcpConnection::new_session_with_meta` impl splices `extra_meta` into `NewSessionRequest::meta`. | `editor_mcp` / `solution_agent` |
+| `crates/agent_servers/src/acp.rs` | (1) `mcp_servers_for_project` prepends a fork-local `acp::McpServer::Stdio` entry pointing at `<current_exe> --nc <editor_mcp.socket_path>` so spawned ACP subagents see the editor's embedded MCP tools (helper: `sawe_mcp_bridge_server`) — see decision 14. (2) `AcpConnection::new_session_with_meta` impl splices `extra_meta` into `NewSessionRequest::meta`. (3) **(decision #51)** `solution_scope_for_project(project, cx) -> Option<SolutionScope>` — resolves the `(SolutionId, root)` that owns a project's worktrees, so the claude adapter can write/point at that Solution's `claude-settings.json`. | `editor_mcp` / `solution_agent` |
 | `crates/agent_servers/Cargo.toml` | New dep on `editor_mcp` for the socket path. | `editor_mcp` / `solution_agent` |
-| `crates/context_server/src/listener.rs` | (1) `broadcast_notification` for fork event push. (2) Per-solution sockets (decision 17): tool handlers became `Rc` (shareable across sockets); `RegisteredTool.wants_solution_id` computed from input schema in `add_tool`; `McpServer.bound_solution_id` + `set_bound_solution`; `split_off_tools` / `export_tools` / `install_tools` to partition the catalog; `handle_call_tool` injects the bound `solution_id`. | `editor_mcp` |
+| `crates/agent_servers/src/agent_servers.rs` | Re-exports `acp::solution_scope_for_project` alongside `mcp_servers_for_project` (decision #51). | `solution_agent` |
+| `crates/git_ui/src/git_ui.rs`, `crates/git_ui/src/project_diff.rs`, `crates/git_ui/src/branch_picker.rs` | `ProjectDiff` / branch picker follow the **active solution member's** repo (`active_solution` + `SolutionStore::active_member`, subscribed to `ActiveMemberChanged`). Since decision #50 the lookup is `store.active_member(solution.id) -> MemberId` + `solution.member(id)`, not a catalog-slug scan. | `solutions_ui` / `solutions` |
+| `crates/context_server/src/listener.rs` | (1) `broadcast_notification` for fork event push. (2) Per-solution sockets (decision 17): tool handlers became `Rc` (shareable across sockets); `RegisteredTool.wants_solution_id` computed from input schema in `add_tool`; `McpServer.bound_solution_id` + `set_bound_solution`; `split_off_tools` / `export_tools` / `install_tools` to partition the catalog; `handle_call_tool` injects the bound `solution_id` — as a JSON **number** since decision #50, and it **overrides** any id the caller supplied (a per-solution socket can never be talked into acting on another Solution). | `editor_mcp` |
 | `crates/gpui/src/elements/list.rs` | `ListState::measure_last(N)` chunked tail prefetch (plus `MEASURE_LAST_DEFAULT_BATCH` / `LOOKAHEAD` / `EAGER_THRESHOLD` knobs) so virtualized lists can pre-warm their most-recent items on the first layout pass without paying the full-list measurement cost. Used by `solution_agent`'s conversation list to keep scroll-up off long resumed conversations from triggering a height-discovery cascade. | `solution_agent` |
 | `crates/gpui/src/window.rs` | `Window::render_to_image` ungated (was `#[cfg(any(test, feature = "test-support"))]`) so `workspace.screenshot` works in normal builds. Adds `Window::iter_hitboxes()` — a public accessor over the most-recently rendered frame's hitboxes, used by `workspace::mcp::clickables` to surface clickable regions to the autonomous-testing MCP surface. | `solutions` (screenshot tool) / `workspace` (clickable tree) |
 | `crates/gpui/src/platform.rs` | `PlatformWindow::render_to_image` default + the `use image::RgbaImage` import ungated (were `#[cfg(test|test-support)]`). Non-implementing backends still return the "not implemented for this platform" error. | `solutions` (screenshot tool) |
@@ -683,6 +685,52 @@ turns the whole layer off. Verified live: the subagent worktree landed at
 `<solution_root>/.agents/worktrees/proj/agent-…` and auto memory in
 `<solution_root>/.agents/memory/` — the settings doc's workspace-trust gate on
 `autoMemoryDirectory` applies to project/local settings only, not to ours.
+
+### 52. Renaming a Solution / member moves its folder in two halves: a hot `rename(2)` + symlink, and a cold reconcile at the next startup
+
+*Why:* the on-disk folder is referenced from three places that cannot all be
+fixed at the same instant. (a) **Live processes** — a `claude` subprocess, a
+shell, an LSP server — hold the directory as an *inode* via their cwd, so a
+same-filesystem `rename(2)` does not break them; they keep working in the moved
+directory without noticing. That is what makes a hot move legal at all. A
+cross-device move would have to copy + delete and would break them, so
+`rename(2)` failing with `EXDEV` is a **hard error**, never a copy fallback.
+(b) Those same processes also hold the old path as a *string* (transcript-bucket
+names, `gitdir` pointers, absolute paths already in an agent's context). Nothing
+can rewrite a string inside a running process, so the hot half drops a **compat
+symlink** old → new; every stale string keeps resolving until the process dies.
+(c) **Databases** — `workspaces`, `editors`, `terminals`, `breakpoints`,
+`bookmarks`, `trusted_worktrees`, `toolchains`, `console_panel_state` in the app
+DB, plus `solution_sessions` / background-agent JSONL paths in the agent DB —
+are owned by subsystems (`WorkspaceDb`, `EditorDb`, `TerminalDb`) that hold
+their rows in memory and write them back on shutdown, so rewriting them under a
+live window would just be clobbered. So the DB rewrite is deferred: the hot half
+queues a `pending_path_migrations` row, and `path_migrations::drain_and_apply`
+runs in `SolutionStore::init_with_db` — **before any window opens** — rewriting
+every path-bearing row, moving/merging the claude transcript bucket, repairing
+git worktrees, removing the compat symlink, and deleting the row. It is
+idempotent and crash-safe: a crash mid-drain leaves the row, and the next start
+re-runs it.
+
+The load-bearing subtlety inside the cold half: **`workspaces.paths` is the
+workspace's identity key**, so it is rewritten **in place** (`UPDATE workspaces
+SET paths = …, paths_order = … WHERE workspace_id = ?`). Delete-and-reinsert
+would mint a new `workspace_id` and silently orphan every pane, tab, dock and
+editor row that references the old one — the window would come back empty after
+a rename, which is exactly the class of bug that started this work.
+
+*How to apply:* never "fix up" a rename by re-inserting rows keyed on a path —
+find the row by its integer key and `UPDATE` the path column (`toolchains` is
+the exception: its key *is* the path, so stale rows are deleted, not rewritten).
+The worktree self-heals (`ScanState::RootUpdated` → `update_abs_path_and_refresh`),
+so a rename must NOT remove and recreate it. Folder names are derived from the
+display name with **no transliteration** (Unicode is fine on every supported
+filesystem) and a collision is a hard error, not a silent suffix. When you add a
+new table that stores an absolute path, add it to `rewrite_app_db` /
+`rewrite_agent_db` in `crates/solutions/src/path_migrations.rs` — a table that
+is not listed there is silently orphaned by the next rename (`file_folds` is
+currently in exactly that state; see
+`docs/findings/2026-07-13-rename-with-folder-move-shipped.md`).
 
 ## Where specs and plans live
 

@@ -1,83 +1,119 @@
 # Session handoff — 2026-07-13 (rename with folder move)
 
-**Context for a fresh agent:** the operator renamed the Solution `spk-solutions`
-to "Sawe" and it came back empty after a restart. That bug is fixed and the data
-is restored; the session then turned into a design + planning run for "renaming a
-Solution or a project also renames its folder". The plans are written and pushed;
-**implementation has not started**.
+**Status: the three-plan rename arc is IMPLEMENTED, verified end-to-end and
+pushed to `origin/main`.** The session started from a data-loss bug (renaming a
+Solution cascade-deleted its members), turned into a design + planning run for
+"renaming a Solution or a project also renames its folder", and then shipped all
+three plans. What remains is a short list of follow-ups, none of them blocking.
+
+Full write-up:
+[`2026-07-13-rename-with-folder-move-shipped.md`](2026-07-13-rename-with-folder-move-shipped.md).
 
 ## Commit chain (all on `origin/main`)
 
-| Commit | What |
+| Commits | What |
 |---|---|
 | `132e89f5a7` | `solutions`: `save_solution` is a real UPSERT — rename no longer cascade-deletes members |
-| `f96c85defe` | finding: `docs/findings/2026-07-13-rename-solution-cascade-data-loss.md` |
-| `d61e2c41b0` | plan 1 — identity model |
-| `ccda012864` + `d8f84951dd` | plan 2 — folder move (+ worktree-repair refinement) |
-| `2854fa4c9a` | plan 3 — claude settings + sockets |
+| `f96c85defe` | finding: `2026-07-13-rename-solution-cascade-data-loss.md` |
 | `31f4f1fde2` | `solution_agent`: stuck-session watchdog no longer kills a parent waiting on background agents |
+| `d61e2c41b0` `ccda012864` `d8f84951dd` `2854fa4c9a` | the three plan docs |
+| `a81166f241` `b22518b815` `f573212060` `9c3e0e9d1e` `0a1407c8a3` `defd92e20b` `a1917ea87c` `03ec37164d` | **plan 1 — identity model** |
+| `37763a1897` `5a3e92e403` `8012b06d8d` `107d47a40f` `27110814b5` `0a7843b2d4` `5a010d842d` `b60545b59b` `22e071d5ce` `eb3eb809f4` `5030f40efc` `5e2b6d661c` | **plan 2 — rename moves the folder** |
+| `47c38dbca7` `4573ee11b3` `307eea9bde` `710361bb66` `8a60552b22` `7ad284513f` `8b21dc3fdd` `69a83c8918` `16d9f9295d` `399eb2e471` `781b484308` `48a5b7b04c` `6ec94dbcb1` | **plan 3 — claude settings + sockets** |
 
 ## What shipped
 
 1. **Data-loss fix.** `save_solution` used `INSERT OR REPLACE` on `solutions`,
-   whose children (`solution_members`, `active_member`) are
-   `ON DELETE CASCADE` with `PRAGMA foreign_keys=TRUE` — the REPLACE deleted the
-   parent row and cascaded the members away. `rename_solution` was the only caller
-   that re-saved an existing id, so renaming wiped the member list; the loss was
-   invisible until the next app start. Regression test:
-   `db::tests::resaving_solution_preserves_members_and_active_member`.
-   The operator's live DB was repaired by hand (members `sawe`, `spk-editor-mobile`
-   + `active_member`); backup at `/tmp/db.sqlite.bak-1783929090`.
+   whose children (`solution_members`, `active_member`) are `ON DELETE CASCADE`
+   with `PRAGMA foreign_keys=TRUE` — the REPLACE deleted the parent row and
+   cascaded the members away, invisible until the next app start. Now an
+   `ON CONFLICT(id) DO UPDATE`.
 
 2. **Watchdog false positive.** `tick_stuck_sessions` treated "Running, silent
-   300s, no in-progress tool" as a hang. A parent awaiting background agents has
-   exactly that shape (the spawning `Agent` call returns immediately), so it killed
-   two live agent chains. `turn_is_wedged` now takes `background_alive`, computed
-   from live background shells + background agents whose JSONL grew within
-   `TOOL_OUTPUT_SILENCE_SECS`. A hung *foreground* tool is still recovered.
+   300s, no in-progress tool" as a hang, which is exactly the shape of a parent
+   awaiting background agents. `turn_is_wedged` now takes `background_alive`. A
+   hung *foreground* tool is still recovered.
 
-## The plan pool (nothing started)
+3. **Plan 1 — identity model.** `SolutionId(i64)` / `MemberId(i64)` /
+   `CatalogId(i64)` surrogate counters replace slug ids; catalog entries became
+   templates; `solution_sessions.member_id` replaces cwd-inference; per-solution
+   MCP socket dirs are keyed by the numeric id. Cross-DB migration
+   (`solution_legacy_ids`) remaps `solution_agent.db`'s slugs, rehearsed against
+   the operator's real databases (16 solutions / 43 members / 14 active / 47
+   catalog in → same out; 176 sessions preserved, 169 remapped, 70 `member_id`s
+   backfilled, 4 slugs of long-deleted solutions left unmapped, 0 dangling
+   `active_member` rows).
 
-Spec: `docs/superpowers/specs/2026-07-13-rename-with-folder-move-design.md`
-(local only — `docs/superpowers/specs/` is gitignored; plans are tracked).
+4. **Plan 2 — rename moves the folder.** Hot half: Unicode folder-name
+   derivation, collision + same-filesystem check (cross-device = hard error),
+   `rename(2)`, compat symlink, `pending_path_migrations` row. Cold half
+   (`path_migrations::drain_and_apply`, before any window opens): rewrite every
+   path-bearing row in the app + agent DBs, move/merge the claude transcript
+   bucket, repair git worktrees, remove the symlink, delete the row —
+   idempotent and crash-safe. `workspaces.paths` is rewritten **in place**, so
+   the window keeps its `workspace_id` and its panes/tabs/docks. Verified live:
+   `btest` → `Проект Тест` moved the directory and drained cleanly on restart.
+   New `solutions.rename_member` MCP tool + rename-member modal.
 
-- `docs/superpowers/plans/2026-07-13-rename-1-identity.md` — 7 tasks. Counter ids
-  for solutions/members/catalog, catalog becomes templates (`origin_catalog_id` is
-  provenance only), `solution_sessions.member_id` replaces cwd-inference for the
-  project label and console-tab scoping, cross-DB migration off slug ids.
-- `docs/superpowers/plans/2026-07-13-rename-2-folder-move.md` — 12 tasks. Unicode
-  folder-name derivation (no transliteration, hard error on collision), hot rename
-  = `mv` + compat symlink + `pending_path_migrations`, cold reconcile at startup
-  rewrites every path-bearing row in three DBs and moves the claude transcript
-  bucket.
-- `docs/superpowers/plans/2026-07-13-rename-3-claude-settings-and-sockets.md` —
-  14 tasks. Sockets `config/` → `state_dir()`, an editor-owned claude settings file
-  (`WorktreeCreate`/`WorktreeRemove` hooks → `<root>/.agents/worktrees`,
-  `autoMemoryDirectory` → `<root>/.agents/memory`), optional `solution_id` in
-  scoped MCP tools.
+5. **Plan 3 — claude settings + sockets.** Sockets / lock / upload spool moved
+   `config/` → `state_dir()` (`~/.spk/sawe[-dev]/state/`) with a one-time sweep
+   of the old location. The editor owns a claude settings layer
+   (`--settings <file>`) whose `WorktreeCreate` / `WorktreeRemove` hooks are the
+   running binary itself, so agent worktrees land in
+   `<solution_root>/.agents/worktrees/` and auto memory in
+   `<solution_root>/.agents/memory` (verified with a real claude subagent).
+   `solution_id` is optional in solution-scoped MCP tools — injected and
+   overridden by the per-solution socket, a clear error on the global socket.
 
-Order: 1 → 2 → 3 (2 depends on 1's types; 3 is independent of 2).
+**Operator action:** the real databases migrate **on the next launch of the new
+binary**. Pre-migration backups: `/tmp/db.sqlite.pre-identity-1783948879` and
+`/tmp/solution_agent.db.pre-identity-1783948879`.
 
-## Key decisions, so they are not relitigated
+## Outstanding pool
 
-- Ids are surrogate counters, never derived from names. This is what makes rename
-  cheap: the per-solution MCP socket dir and every FK survive it.
-- A live process's cwd is an inode, so `mv` on the same filesystem does not break a
-  running `claude` or shell. The compat symlink exists only to keep the *strings*
-  they hold valid (transcript bucket, gitdir pointers, absolute paths in context)
-  until the next cold start. Cross-filesystem rename is a hard error.
-- The worktree self-heals (`ScanState::RootUpdated` → `update_abs_path_and_refresh`),
-  so a rename must NOT remove/recreate it.
-- Sessions keep cwd = the member path. Pinning every session to the solution root
-  was considered and rejected: claude only loads a subdirectory's `CLAUDE.md`
-  lazily, so a root-rooted session starts a task without the project's conventions.
-
-## Open, not scheduled
-
-- After a reconnect, background-agent tabs from the killed subprocess still render
-  as live — no terminal state is set for them.
+- `file_folds` (editor fold persistence, keyed by path) is **not** in
+  `path_migrations::rewrite_app_db` — a folded region is orphaned by a rename.
+  Low impact, one row in the rewriter.
+- `crates/editor_mcp/tests/solutions_e2e_test.rs`'s two tests collide on the
+  process-global runtime-dir `OnceLock` + `SingleInstanceLock`: each passes
+  alone, the pair fails. Needs a per-`App` runtime dir or one test per binary.
+- `workspace.list_buffers` on a per-solution socket reports buffers from a
+  *different* Solution when both are open in the same window (buffer collection
+  is window-level).
+- After a reconnect, background-agent tabs from a killed subprocess still render
+  as live.
 - The empty-solution "can't create a chat" guard is ineffective
-  (`workspace_has_worktree` counts invisible worktrees) — see the data-loss finding.
-- `./script/clippy` is red on pre-existing lints: `crates/git/src/backup.rs:114`
-  (`unnecessary_sort_by`), `crates/solutions/src/add_member.rs:701`,
-  `crates/solutions/src/cache.rs:166`.
+  (`workspace_has_worktree` counts invisible worktrees).
+- Pre-existing, untouched: 42 `open_listener` test failures in the `zed` bin;
+  clippy lints at `crates/solutions/src/cache.rs:166`,
+  `crates/editor_mcp/src/tools/subscribe.rs:67`, `crates/zed/src/zed.rs:76`,
+  `crates/zed/src/main.rs:1733`/`:1744`; unused variable at
+  `crates/project/src/git_store.rs:10404`.
+
+## Decisions, so they are not relitigated
+
+Now recorded as FORK.md **#50** (surrogate counter ids), **#51** (editor-owned
+claude settings + worktree hook) and **#52** (the hot/cold rename split). Short
+form:
+
+- Ids are surrogate counters, never derived from names. That is what makes
+  rename cheap: the per-solution MCP socket dir and every FK survive it.
+- A live process's cwd is an inode, so a same-filesystem `mv` does not break a
+  running `claude` or shell. The compat symlink exists only to keep the
+  *strings* they hold valid until the next cold start. Cross-filesystem rename
+  is a hard error, never a copy fallback.
+- `workspaces.paths` is the workspace identity key — rewrite it in place, never
+  delete-and-reinsert, or the window comes back empty.
+- The worktree self-heals (`ScanState::RootUpdated` →
+  `update_abs_path_and_refresh`), so a rename must NOT remove/recreate it.
+- Sessions keep cwd = the member path. Pinning every session to the solution
+  root was rejected: claude only loads a subdirectory's `CLAUDE.md` lazily, so a
+  root-rooted session starts a task without the project's conventions.
+
+## Resume recipe
+
+The arc is closed; there is no in-flight phase to pick up. Take the next item
+from the outstanding pool per `docs/workflow/supervisor-mode.md` § 7 — the
+`file_folds` row and the `solutions_e2e_test.rs` test-isolation fix are both
+LIGHT and self-contained; the `list_buffers` cross-solution leak is the only one
+with real design surface.
