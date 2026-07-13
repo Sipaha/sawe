@@ -106,18 +106,32 @@ const TOOL_OUTPUT_SILENCE_SECS: u64 = 15 * 60;
 
 /// Decide whether a silent-for-[`STUCK_TURN_SECS`] `Running` turn is wedged,
 /// given its newest in-progress tool call as `(tool_secs, shows_liveness)` —
-/// how long that tool has been running and whether it's still making progress.
-/// `None` means no tool is executing (claude hung between steps → wedged). A
-/// running tool is wedged only once it has exceeded [`TOOL_STUCK_SECS`] AND is
-/// no longer showing liveness (hardening #7 — a live long build isn't killed).
+/// how long that tool has been running and whether it's still making progress —
+/// and whether the session has live background work (see
+/// [`background_work_shows_liveness`]).
+/// `None` means no tool is executing: claude hung between steps → wedged, UNLESS
+/// background work is running, because a parent awaiting its background agents
+/// has exactly this shape (the spawning `Agent` call completes immediately) and
+/// is not hung at all. A running tool is wedged only once it has exceeded
+/// [`TOOL_STUCK_SECS`] AND is no longer showing liveness (hardening #7 — a live
+/// long build isn't killed); background work does not excuse a hung foreground
+/// tool, since claude is genuinely stuck inside it.
 /// Pure so the decision is unit-testable without a live thread.
-fn turn_is_wedged(active_tool: Option<(i64, bool)>) -> bool {
+fn turn_is_wedged(active_tool: Option<(i64, bool)>, background_alive: bool) -> bool {
     match active_tool {
         Some((tool_secs, shows_liveness)) => {
             tool_secs >= TOOL_STUCK_SECS as i64 && !shows_liveness
         }
-        None => true,
+        None => !background_alive,
     }
+}
+
+/// Whether a background agent still vouches for its silent parent, given how long
+/// its JSONL has been quiet. A teammate counts as liveness only while it is itself
+/// making progress: past [`TOOL_OUTPUT_SILENCE_SECS`] of silence it stops
+/// suppressing the watchdog, so a hung parent+teammate pair is still recovered.
+fn background_work_shows_liveness(quiet_secs: i64) -> bool {
+    quiet_secs < TOOL_OUTPUT_SILENCE_SECS as i64
 }
 
 /// Per-attempt timeout for a reconnect's `resume_session` (subprocess respawn +

@@ -1100,19 +1100,45 @@ async fn observer_nudge_held_while_typing_then_flushed(cx: &mut gpui::TestAppCon
 /// never wedged, so it isn't reconnected out from under itself.
 #[test]
 fn turn_wedged_decision_gates_on_tool_liveness() {
-    // No in-progress tool: claude hung between steps → wedged.
-    assert!(turn_is_wedged(None));
+    // No in-progress tool and no background work: claude hung between steps → wedged.
+    assert!(turn_is_wedged(None, false));
     // A young tool (under the backstop) is never wedged, live or not.
-    assert!(!turn_is_wedged(Some((60, false))));
-    assert!(!turn_is_wedged(Some((60, true))));
+    assert!(!turn_is_wedged(Some((60, false)), false));
+    assert!(!turn_is_wedged(Some((60, true)), false));
     // Past the backstop but STILL streaming output (live build) → NOT wedged.
-    assert!(!turn_is_wedged(Some((TOOL_STUCK_SECS as i64 + 1, true))));
+    assert!(!turn_is_wedged(Some((TOOL_STUCK_SECS as i64 + 1, true)), false));
     // Past the backstop AND no liveness (truly hung command) → wedged.
-    assert!(turn_is_wedged(Some((TOOL_STUCK_SECS as i64 + 1, false))));
+    assert!(turn_is_wedged(Some((TOOL_STUCK_SECS as i64 + 1, false)), false));
     // Exactly at the backstop with no liveness → wedged (the bound is `>=`).
-    assert!(turn_is_wedged(Some((TOOL_STUCK_SECS as i64, false))));
+    assert!(turn_is_wedged(Some((TOOL_STUCK_SECS as i64, false)), false));
     // At the backstop but live → not wedged.
-    assert!(!turn_is_wedged(Some((TOOL_STUCK_SECS as i64, true))));
+    assert!(!turn_is_wedged(Some((TOOL_STUCK_SECS as i64, true)), false));
+}
+
+/// A parent that dispatched background agents legitimately goes quiet while they
+/// work: the spawning `Agent` tool call returns immediately, so the watchdog sees
+/// `Running` + no in-progress tool — the exact shape it treats as a hang. Two live
+/// plan-writing chains were killed this way. Live background work is liveness.
+#[test]
+fn live_background_work_spares_a_quiet_parent() {
+    assert!(!turn_is_wedged(None, true));
+    assert!(turn_is_wedged(None, false));
+    // Background work excuses only the "no live tool" shape. A foreground tool that
+    // is itself hung past the backstop still gets recovered, teammates or not.
+    assert!(turn_is_wedged(
+        Some((TOOL_STUCK_SECS as i64 + 1, false)),
+        true
+    ));
+    // A teammate vouches for the parent only while its own JSONL keeps growing;
+    // once it has been silent past the output window it stops counting, so a hung
+    // parent+teammate pair is still recovered.
+    assert!(background_work_shows_liveness(0));
+    assert!(background_work_shows_liveness(
+        TOOL_OUTPUT_SILENCE_SECS as i64 - 1
+    ));
+    assert!(!background_work_shows_liveness(
+        TOOL_OUTPUT_SILENCE_SECS as i64
+    ));
 }
 
 /// Verdict authentication (#6): a `supervisor_verdict` call is honoured only
