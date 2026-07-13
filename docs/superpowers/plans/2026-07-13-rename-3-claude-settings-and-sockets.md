@@ -1754,7 +1754,7 @@ coherent.
 
 **Steps**
 
-- [ ] Write the failing test:
+- [x] Write the failing test:
       ```rust
       //! A scoped socket call with NO `solution_id` must succeed (the listener
       //! injects the bound id), and a call carrying a FOREIGN `solution_id` must be
@@ -1795,17 +1795,17 @@ coherent.
           assert_eq!(response["isError"], json!(false));
       }
       ```
-- [ ] Run `cargo test -p editor_mcp --test solution_id_injection_e2e_test` — before
+- [x] Run `cargo test -p editor_mcp --test solution_id_injection_e2e_test` — before
       tasks 3.2-3.4 this would fail on case 1 with a deserialize error; run it now
       and expect **pass** (the flip already landed). If case 1 fails with
       ``missing field `solution_id` ``, a params struct was missed — find it and
       flip it.
-- [ ] Bump the tool-catalog note in `.rules` / `CLAUDE.md`: the two-tier-socket
+- [x] Bump the tool-catalog note in `.rules` / `CLAUDE.md`: the two-tier-socket
       paragraph gains *"`solution_id` is optional on a per-solution socket (the
       server injects the bound id and overrides any value the caller sends); it is
       required only on the editor-global socket."*
-- [ ] Run `cargo test -p editor_mcp` — expect the full e2e suite green.
-- [ ] Commit: `Assert the per-solution socket injects and overrides solution_id`
+- [x] Run `cargo test -p editor_mcp` — expect the full e2e suite green.
+- [x] Commit: `Assert the per-solution socket injects and overrides solution_id`
 
 ---
 
