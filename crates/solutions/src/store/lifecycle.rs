@@ -49,16 +49,88 @@ impl SolutionStore {
         Ok(id)
     }
 
+    /// Rename a solution **and move its directory**. One `rename(2)` of the
+    /// root carries every member with it, and one compat symlink at the old
+    /// root keeps every descendant path string resolving (live `claude`
+    /// subprocesses, terminals, git `gitdir` pointers) until the cold
+    /// reconcile removes it. Live sessions and terminals are not touched.
     pub fn rename_solution(
         &mut self,
         id: SolutionId,
         new_name: &str,
         cx: &mut gpui::Context<Self>,
     ) -> Result<()> {
-        let sol = self.find_solution_mut(id)?;
-        sol.name = new_name.into();
-        let updated = sol.clone();
-        self.db_save_solution(&updated)?;
+        let folder = crate::folder_name::derive(new_name)?;
+
+        let index = self
+            .config
+            .solutions
+            .iter()
+            .position(|solution| solution.id == id)
+            .with_context(|| format!("solution not found: {id}"))?;
+
+        let old_root = self.config.solutions[index].root.clone();
+        let parent = old_root
+            .parent()
+            .context("solution root has no parent")?
+            .to_path_buf();
+
+        let taken: Vec<crate::rename::TakenFolder> = self
+            .config
+            .solutions
+            .iter()
+            .filter(|solution| solution.id != id)
+            .filter_map(|solution| {
+                Some(crate::rename::TakenFolder {
+                    folder: solution.root.file_name()?.to_string_lossy().into_owned(),
+                    owner: solution.name.clone(),
+                })
+            })
+            .collect();
+
+        let new_root =
+            crate::rename::ensure_folder_available(&parent, &folder, Some(&old_root), &taken)?;
+
+        if old_root == new_root {
+            // Display-name-only change (the folder already has this name).
+            let solution = &mut self.config.solutions[index];
+            solution.name = new_name.to_string();
+            let solution = solution.clone();
+            self.db_update_solution(&solution)?;
+            cx.emit(SolutionStoreEvent::Changed);
+            cx.notify();
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            crate::rename::same_filesystem(&old_root, &parent)?,
+            "{} and {} are on different filesystems — a cross-device move would orphan every running process in this solution",
+            old_root.display(),
+            parent.display(),
+        );
+
+        crate::rename::move_dir_with_compat_link(&old_root, &new_root)?;
+
+        // The one `rename(2)` above already moved every member on disk, so the
+        // member paths are only *rewritten*, never moved individually — and a
+        // single `pending_path_migrations` row (the root) covers all of them,
+        // since the cold reconcile rewrites by path prefix.
+        let solution = &mut self.config.solutions[index];
+        solution.name = new_name.to_string();
+        solution.root = new_root.clone();
+        for member in solution.members.iter_mut() {
+            if let Ok(relative) = member.local_path.strip_prefix(&old_root) {
+                member.local_path = new_root.join(relative);
+            }
+        }
+        let solution = solution.clone();
+
+        self.db_update_solution(&solution)?;
+        for member in &solution.members {
+            self.db_update_member(member)?;
+        }
+        self.db_insert_pending_path_migration(&old_root, &new_root)?;
+
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
         Ok(())
@@ -244,15 +316,19 @@ impl SolutionStore {
         max_solution.max(max_member).max(max_catalog) + 1
     }
 
-    fn db_save_solution(&self, s: &Solution) -> anyhow::Result<()> {
+    /// Plain UPDATE of the name/root columns. `save_solution` is an
+    /// `INSERT OR REPLACE`, which *deletes* the conflicting parent row first
+    /// and cascades that delete into `solution_members` / `active_member` —
+    /// exactly how a rename wiped every member the last time it shipped
+    /// (docs/findings/2026-07-13-rename-solution-cascade-data-loss.md).
+    pub(crate) fn db_update_solution(&self, s: &Solution) -> anyhow::Result<()> {
         let Some(db) = self.db.as_ref() else {
             return Ok(());
         };
-        gpui::block_on(db.save_solution(
+        gpui::block_on(db.update_solution_row(
             s.id.0,
             s.name.clone(),
             s.root.to_string_lossy().into_owned(),
-            s.last_opened_at,
         ))
     }
 
@@ -268,5 +344,92 @@ impl SolutionStore {
             return Ok(());
         };
         gpui::block_on(db.update_last_opened(id.0, ts_ms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[gpui::test]
+    async fn rename_solution_moves_the_root_and_rewrites_member_paths(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let base = tempfile::tempdir().expect("tempdir");
+        let old_root = base.path().join("spk-solutions");
+        let member_path = old_root.join("sawe");
+        std::fs::create_dir_all(&member_path).expect("mkdir member");
+        std::fs::write(member_path.join("marker.txt"), b"m").expect("write marker");
+
+        let store =
+            cx.update(|cx| crate::store::for_test_with_solution(cx, &old_root, &member_path));
+        let solution_id = store.read_with(cx, |store, _| store.solutions()[0].id);
+
+        store
+            .update(cx, |store, cx| {
+                store.rename_solution(solution_id, "Sawe", cx)
+            })
+            .expect("rename");
+
+        let new_root = base.path().join("Sawe");
+        assert!(new_root.join("sawe/marker.txt").is_file(), "root moved");
+        assert!(
+            std::fs::symlink_metadata(&old_root)
+                .expect("stat old root")
+                .file_type()
+                .is_symlink(),
+            "compat symlink left at the old root"
+        );
+        // The single link at the root covers every descendant path.
+        assert_eq!(
+            std::fs::read(old_root.join("sawe/marker.txt")).expect("read through link"),
+            b"m"
+        );
+
+        store.read_with(cx, |store, _| {
+            let solution = store.find_solution(solution_id).expect("solution");
+            assert_eq!(solution.name, "Sawe");
+            assert_eq!(solution.root, new_root);
+            assert_eq!(solution.members.len(), 1, "members survive the rename");
+            assert_eq!(solution.members[0].local_path, new_root.join("sawe"));
+        });
+    }
+
+    #[gpui::test]
+    async fn rename_solution_rejects_a_name_taken_by_another_solution(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let base = tempfile::tempdir().expect("tempdir");
+        let old_root = base.path().join("spk-solutions");
+        let member_path = old_root.join("sawe");
+        std::fs::create_dir_all(&member_path).expect("mkdir member");
+
+        let store =
+            cx.update(|cx| crate::store::for_test_with_solution(cx, &old_root, &member_path));
+        store.update(cx, |store, _| {
+            store.config.solutions.push(crate::model::Solution {
+                id: crate::model::SolutionId(2),
+                name: "Citeck Forge".into(),
+                root: base.path().join("Citeck-Forge"),
+                members: vec![],
+                last_opened_at: None,
+            });
+        });
+        let solution_id = store.read_with(cx, |store, _| store.solutions()[0].id);
+
+        let err = store
+            .update(cx, |store, cx| {
+                store.rename_solution(solution_id, "citeck forge", cx)
+            })
+            .expect_err("collides");
+        assert_eq!(
+            err.to_string(),
+            "Directory 'citeck-forge' is already taken by solution 'Citeck Forge'"
+        );
+        // Nothing moved.
+        assert!(member_path.is_dir());
+        store.read_with(cx, |store, _| {
+            let solution = store.find_solution(solution_id).expect("solution");
+            assert_eq!(solution.name, "My Solution");
+            assert_eq!(solution.root, old_root);
+        });
     }
 }
