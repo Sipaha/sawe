@@ -650,6 +650,40 @@ resolution loss this brings: `Solution::last_opened_at` is now epoch **millis**
 sort — order-sensitive tests must advance the real wall clock, not a GPUI
 virtual timer.
 
+### 51. The editor owns a claude settings layer (`--settings <file>`), and the editor binary is its own worktree hook
+
+*Why:* two claude defaults are keyed to the **git repo root** — i.e. the
+*member*, not the Solution: agent worktrees land in `<member>/.claude/worktrees/`
+(a member rename then breaks their absolute `gitdir` pointers, and the trees get
+swept along by the member's `mv`), and auto memory is bucketed per repo. Both
+belong to the Solution. `--setting-sources` can't express this (it accepts only
+`user|project|local` — there is no way to name a directory of our own), so the
+editor writes its own settings JSON and passes it as `--settings <file>`, which
+sits at the *command-line* precedence tier: above local/project/user, and
+**additive** to them (`--setting-sources user,project,local` stays). The file is
+`<runtime>/solutions/<id>/claude-settings.json`, beside that Solution's MCP
+socket. It carries a `WorktreeCreate`/`WorktreeRemove` hook pair pointing
+worktrees at `<solution_root>/.agents/worktrees/<member>/<name>` and
+`autoMemoryDirectory` → `<solution_root>/.agents/memory`. The hook command is
+the **running editor binary itself** (`sawe --worktree-hook create|remove
+--worktree-base <dir>`, an early-return in `main()` before GPUI init), mirroring
+the `--nc` MCP bridge: no `jq` dependency, no shipped shell script that can
+drift from the JSON we generate, and a dev build hooks the dev build.
+
+*How to apply:* `--settings` overrides same-named keys **wholesale** ("keys you
+omit keep their file-based values" — but `hooks` is one key), so
+`claude_native::claude_settings` reads the `hooks` object out of the three
+enabled sources (user / project / local) and re-emits them alongside ours;
+never emit a bare `{"hooks": {ours}}` or you silently disable the user's hooks.
+Resolve the exe with `std::env::current_exe()`, never a bare `sawe` on `$PATH`.
+The remove hook refuses any path that doesn't canonicalize inside its base
+(symlinks included), so legacy `<member>/.claude/worktrees/*` trees are left to
+the rename reconcile's `git worktree repair`. `SAWE_CLAUDE_SETTINGS_DISABLED=1`
+turns the whole layer off. Verified live: the subagent worktree landed at
+`<solution_root>/.agents/worktrees/proj/agent-…` and auto memory in
+`<solution_root>/.agents/memory/` — the settings doc's workspace-trust gate on
+`autoMemoryDirectory` applies to project/local settings only, not to ours.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

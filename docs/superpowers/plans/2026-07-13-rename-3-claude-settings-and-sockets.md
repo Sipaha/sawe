@@ -1441,10 +1441,10 @@ and docs.
 
 **Steps**
 
-- [ ] `cargo build --bin sawe` (debug), then `script/run-mcp --debug --headless`.
+- [x] `cargo build --bin sawe` (debug), then `script/run-mcp --debug --headless`.
       Open a Solution with at least one member, create an AI session, and ask the
       agent to run a subagent with `isolation: worktree` (or `EnterWorktree`).
-- [ ] Assert, on disk:
+- [x] Assert, on disk:
       - `<solution_root>/.agents/worktrees/<member>/<name>/` exists and
         `git -C <member> worktree list` lists it;
       - nothing new appeared under `<member>/.claude/worktrees/`;
@@ -1456,7 +1456,7 @@ and docs.
       to *project/local* settings; ours is command-line tier, so it should not),
       record it in `docs/findings/` and fall back to setting `CLAUDE_CONFIG_DIR`
       per solution — do **not** silently ship a dead setting.
-- [ ] Add to `FORK.md` under "Key architectural decisions" a new numbered entry:
+- [x] Add to `FORK.md` under "Key architectural decisions" a new numbered entry:
       *"Editor-owned claude settings layer (`--settings <file>`, not a
       `--setting-sources` entry — that flag only takes `user|project|local`).
       Carries a `WorktreeCreate`/`WorktreeRemove` hook pair pointing agent
@@ -1469,13 +1469,13 @@ and docs.
       `--settings` overrides same-named keys wholesale, `claude_settings` re-emits
       the user's own `hooks` alongside ours; `SAWE_CLAUDE_SETTINGS_DISABLED=1`
       turns the layer off."*
-- [ ] Add one line to the MCP section of `.rules` **and** `CLAUDE.md`: *"Agent
+- [x] Add one line to the MCP section of `.rules` **and** `CLAUDE.md`: *"Agent
       worktrees (Agent Teams / background agents / `isolation: worktree`) land
       under `<solution_root>/.agents/worktrees/<member>/<name>` via an editor-owned
       `WorktreeCreate` hook, not `<member>/.claude/worktrees/`. The hook is the
       `sawe` binary itself (`--worktree-hook`); the settings file lives at
       `<state>/solutions/<id>/claude-settings.json`."*
-- [ ] Commit: `Document the editor-owned claude settings layer`
+- [x] Commit: `Document the editor-owned claude settings layer`
 
 ---
 

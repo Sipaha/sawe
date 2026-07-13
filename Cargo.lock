@@ -3187,6 +3187,7 @@ dependencies = [
  "agent_servers",
  "anyhow",
  "chrono",
+ "editor_mcp",
  "futures 0.3.32",
  "gpui",
  "log",
