@@ -1523,9 +1523,25 @@ async fn reconcile_keeps_live_inline_task_teammate(cx: &mut TestAppContext) {
 /// survives while a stale-mtime one — AND one with a terminal stop_reason — are
 /// reconciled closed. A terminal async Agent's spawn tool-call being terminal is
 /// spawn-ack and is NOT what closes it; the background_agent snapshot is.
+/// Detach the session's `AcpThread`, modelling an ORPHANED background agent /
+/// shell: its owning subprocess is gone (reconnect / crash / close), so no
+/// terminal transition can ever arrive for it and the tight `STALE + DEAD_LINGER`
+/// reap applies. With a LIVE parent, silence is not death and the reapers only
+/// age a quiet agent out at `BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS` (hardening
+/// #9, extended to async agents) — so a test asserting a stale-reap must first
+/// orphan the session or it is asserting the wrong contract.
+fn orphan_session(cx: &mut TestAppContext, session_id: SolutionSessionId) {
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        session.update(cx, |s, cx| s.set_acp_thread(None, cx));
+    });
+}
+
 #[gpui::test]
 async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    orphan_session(cx, session_id);
     let live_toolu = "toolu_async_live";
     let stale_toolu = "toolu_async_stale";
     let stop_toolu = "toolu_async_stop";
@@ -1646,6 +1662,7 @@ async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(
     cx: &mut TestAppContext,
 ) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    orphan_session(cx, session_id);
     let stale_toolu = "toolu_async_nosnap_stale";
     let fresh_toolu = "toolu_async_nosnap_fresh";
     let stale = crate::stream::StreamId::Teammate(SharedString::from(stale_toolu));
@@ -1735,6 +1752,7 @@ async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(
 #[gpui::test]
 async fn fold_does_not_resurrect_a_reaped_detached_agent_pill(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    orphan_session(cx, session_id);
     let toolu = "toolu_detached_stale";
     let teammate = crate::stream::StreamId::Teammate(SharedString::from(toolu));
 
@@ -1847,6 +1865,7 @@ async fn reconcile_closes_teammate_whose_toolcall_vanished(cx: &mut TestAppConte
 #[gpui::test]
 async fn stale_agent_lingers_briefly_then_removed(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    orphan_session(cx, session_id);
     let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc");
     cx.update(|cx| {
         let s = SolutionAgentStore::global(cx);
@@ -1881,6 +1900,55 @@ async fn stale_agent_lingers_briefly_then_removed(cx: &mut TestAppContext) {
         assert!(
             session.read(cx).background_agents.is_empty(),
             "stale-beyond-linger agent must be removed on tick"
+        );
+    });
+}
+
+/// #9 twin for ASYNC AGENTS (the asymmetry the shell reaper already fixed): a
+/// detached agent grinding through a long tool call writes nothing to its JSONL
+/// for minutes. While its parent subprocess is LIVE its terminal `stop_reason`
+/// will still be observed, so silence is not death — reaping it at the ~7min
+/// mark would drop a running agent's pill AND lie to the supervisor's
+/// `has_live_background_work`.
+#[gpui::test]
+async fn silent_async_agent_with_live_parent_survives_below_cap(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc");
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| {
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: "/nonexistent".into(),
+                    registered_at: chrono::Utc::now(),
+                    latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                        // 600s: past STALE+DEAD_LINGER (420s), far under the 60min cap.
+                        mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+                        activity_label: SharedString::from("Bash: long build"),
+                        stop_reason: None,
+                    }),
+                    last_offset: 0,
+                    parent_tool_use_id: None,
+                    latest_seq: 0,
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+        });
+    });
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| s.tick_background_agents(cx));
+    });
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        assert!(
+            session.read(cx).background_agents.contains_key(&bg_id),
+            "a silent async agent with a live parent must survive past the ~7min \
+             stale mark — its completion still arrives via the JSONL scan"
         );
     });
 }

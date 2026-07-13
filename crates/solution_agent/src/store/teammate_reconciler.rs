@@ -1082,6 +1082,8 @@ impl SolutionAgentStore {
         let expiry = std::time::Duration::from_secs(
             MANAGED_AGENT_STALE_TIMEOUT_SECS + MANAGED_AGENT_DEAD_LINGER_SECS,
         );
+        let live_parent_cap =
+            std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();
@@ -1096,6 +1098,22 @@ impl SolutionAgentStore {
             }
             let to_remove: Vec<crate::background_agent::BackgroundAgentId> =
                 session.update(cx, |s, _| {
+                    // Same liveness gate as the shell reaper (hardening #9). A
+                    // live `acp_thread` means the owning subprocess is still up,
+                    // so a finished agent's terminal `stop_reason` will still be
+                    // observed — an agent that is merely SILENT (a long research
+                    // pass writing nothing to its JSONL) is presumed alive and is
+                    // only aged out at the generous cap. Reaping it at the flat
+                    // ~7min mark dropped its pill AND lied to the supervisor's
+                    // `has_live_background_work`, which is exactly the bug #9 fixed
+                    // for shells; the agent twin was left behind. With no thread
+                    // (reconnect / crash / close) the terminal transition can never
+                    // arrive, so the ordinary staleness timeout applies.
+                    let stale_threshold = if s.acp_thread().is_some() {
+                        live_parent_cap
+                    } else {
+                        expiry
+                    };
                     let candidates: Vec<crate::background_agent::BackgroundAgentId> = s
                         .background_agent_order
                         .iter()
@@ -1121,7 +1139,7 @@ impl SolutionAgentStore {
                                     now.duration_since(registered).unwrap_or_default()
                                 }
                             };
-                            age > expiry
+                            age > stale_threshold
                         })
                         .cloned()
                         .collect();
@@ -1241,6 +1259,19 @@ impl SolutionAgentStore {
         let now = std::time::SystemTime::now();
         let stale = std::time::Duration::from_secs(MANAGED_AGENT_STALE_TIMEOUT_SECS);
         let closed_any = session.update(cx, |s, _| {
+            // Silence is not death while the owning subprocess is up (hardening
+            // #9, applied here to the ASYNC-AGENT arm as well as the shell one):
+            // a detached agent grinding through a long tool call writes nothing
+            // to its JSONL for minutes, and closing its pill at the 120s stale
+            // mark made a running agent's tab vanish with no backstop. A live
+            // `acp_thread` guarantees the terminal `stop_reason` will still be
+            // observed, so only age out at the generous cap; with no thread the
+            // terminal transition can never arrive and the tight timeout applies.
+            let stale = if s.acp_thread().is_some() {
+                std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS)
+            } else {
+                stale
+            };
             let teammate_ids: Vec<SharedString> = s
                 .streams
                 .keys()

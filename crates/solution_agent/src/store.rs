@@ -271,7 +271,7 @@ pub struct SolutionAgentStore {
     /// notifications do NOT trigger resync on the client.
     metrics_emitter: MetricsEmitter,
     _solution_subscription: Option<Subscription>,
-    /// 1 Hz healthcheck loop that drives `tick_background_agents`.
+    /// 0.2 Hz (every 5s) healthcheck loop that drives `tick_background_agents`.
     /// Held so the timer cancels when the store is dropped.
     _bg_agents_tick: Option<Task<()>>,
     /// Per-session supervisor control state (enabled flag, counters, status).

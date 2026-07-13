@@ -263,25 +263,53 @@ impl SolutionStore {
             );
         }
 
-        // Collect the writes first; `db_set_member` / `db_delete_member` take
-        // `&self`, so they can't run while `config.solutions` is borrowed mutably.
-        let mut repointed: Vec<(SolutionId, SolutionMember, i32)> = Vec::new();
-        for solution in self.config.solutions.iter_mut() {
-            for (position, member) in solution.members.iter_mut().enumerate() {
-                if member.catalog_id != *from {
-                    continue;
-                }
-                member.catalog_id = into.clone();
-                repointed.push((solution.id.clone(), member.clone(), position as i32));
-            }
-        }
-        for (solution_id, member, position) in &repointed {
+        // Plan the writes WITHOUT touching `config` — the DB goes first. A
+        // half-applied merge (in-memory rewritten, then a `?` on the third DB
+        // write) would leave RAM and SQLite disagreeing about which catalog a
+        // member belongs to, and the disagreement only surfaces on the next
+        // restart. Persist everything first; mutate memory only once every write
+        // has landed, so a failure aborts with both sides still consistent.
+        let planned: Vec<(SolutionId, SolutionMember, i32)> = self
+            .config
+            .solutions
+            .iter()
+            .flat_map(|solution| {
+                solution
+                    .members
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, member)| member.catalog_id == *from)
+                    .map(|(position, member)| {
+                        (
+                            solution.id.clone(),
+                            SolutionMember {
+                                catalog_id: into.clone(),
+                                local_path: member.local_path.clone(),
+                            },
+                            position as i32,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (solution_id, member, position) in &planned {
             // Order matters: the row is keyed by (solution_id, catalog_id), so
             // drop the old key before writing the new one — otherwise the stale
             // row survives and the member appears twice on next load.
             self.db_delete_member(solution_id, from)?;
             self.db_set_member(solution_id, member, *position)?;
         }
+        self.db_delete_catalog(from)?;
+
+        // Every write landed — now make memory match.
+        for solution in self.config.solutions.iter_mut() {
+            for member in solution.members.iter_mut() {
+                if member.catalog_id == *from {
+                    member.catalog_id = into.clone();
+                }
+            }
+        }
+        let repointed = planned;
         // An active-member pointer at the dead id would leave the solution with
         // no resolvable active project.
         let stale_active: Vec<SolutionId> = self
@@ -295,7 +323,6 @@ impl SolutionStore {
         }
 
         self.config.catalog.retain(|c| c.id != *from);
-        self.db_delete_catalog(from)?;
         log::info!(
             "solutions: merged catalog {} into {} ({} member(s) repointed)",
             from.0,

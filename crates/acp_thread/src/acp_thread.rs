@@ -1607,6 +1607,13 @@ struct StreamingTextBuffer {
     bytes_to_reveal_per_tick: usize,
     /// The Markdown entity being streamed into.
     target: Entity<Markdown>,
+    /// Index of the entry that owns `target`. NOT derivable as `entries.len()-1`:
+    /// with Agent Teams a chunk coalesces into the open message of ITS stream
+    /// (`open_assistant_message_index`), which a concurrently-streaming teammate
+    /// can push away from the tail. Emitting `EntryUpdated(last)` then re-synced
+    /// somebody else's entry and left the one actually being appended to stale in
+    /// the persisted / MCP mirror.
+    target_entry: usize,
     /// Timer task that periodically moves text from `pending` into `source`.
     _reveal_task: Task<()>,
 }
@@ -2241,7 +2248,7 @@ impl AcpThread {
                 self.streaming_markdown_target(is_thought, indented, &subagent_id)
             {
                 cx.emit(AcpThreadEvent::EntryUpdated(idx));
-                self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
+                self.buffer_streaming_text(&markdown, idx, text_content.text.clone(), cx);
                 return;
             }
         }
@@ -2364,6 +2371,7 @@ impl AcpThread {
     fn buffer_streaming_text(
         &mut self,
         markdown: &Entity<Markdown>,
+        target_entry: usize,
         text: String,
         cx: &mut Context<Self>,
     ) {
@@ -2390,6 +2398,7 @@ impl AcpThread {
             pending: text,
             bytes_to_reveal_per_tick: bytes_to_reveal,
             target,
+            target_entry,
             _reveal_task,
         });
     }
@@ -2419,9 +2428,17 @@ impl AcpThread {
     /// run-turn completion calls it; so must any code that synthesizes a
     /// terminal event out-of-band (e.g. `claude_native`'s orphan-result path).
     pub fn flush_end_of_turn_tail(&mut self, cx: &mut Context<Self>) {
+        let target = self.streaming_text_buffer.as_ref().map(|b| b.target_entry);
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
-        if !self.entries.is_empty() {
-            cx.emit(AcpThreadEvent::EntryUpdated(self.entries.len() - 1));
+        // Signal the entry the buffer targeted; with no buffer (the reveal task
+        // already drained it, or the turn never streamed text) fall back to the
+        // last entry. The emit is UNCONDITIONAL by design: it is what re-syncs
+        // the turn's final tail into the persisted / MCP transcript.
+        let idx = target
+            .filter(|idx| *idx < self.entries.len())
+            .or_else(|| self.entries.len().checked_sub(1));
+        if let Some(idx) = idx {
+            cx.emit(AcpThreadEvent::EntryUpdated(idx));
         }
     }
 
@@ -2436,13 +2453,14 @@ impl AcpThread {
     /// `rewind` deliberately does NOT use this — it flushes then truncates the
     /// flushed entry away (`EntriesRemoved`), so re-syncing its tail is moot.
     fn flush_streaming_text_and_signal(&mut self, cx: &mut Context<Self>) {
-        let had_pending = self
+        let target = self
             .streaming_text_buffer
             .as_ref()
-            .is_some_and(|b| !b.pending.is_empty());
+            .filter(|b| !b.pending.is_empty())
+            .map(|b| b.target_entry);
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
-        if had_pending && !self.entries.is_empty() {
-            cx.emit(AcpThreadEvent::EntryUpdated(self.entries.len() - 1));
+        if let Some(idx) = target.filter(|idx| *idx < self.entries.len()) {
+            cx.emit(AcpThreadEvent::EntryUpdated(idx));
         }
     }
 
@@ -2483,11 +2501,13 @@ impl AcpThread {
                         // persisted/MCP model (`session.entries`) re-syncs an entry
                         // only on `EntryUpdated`, so without this every gradually
                         // revealed tail (incl. the final bytes of a turn) is frozen
-                        // out of the stored entry — the truncated-reply bug. Emit
-                        // for the last entry (a new entry always flushes the buffer
-                        // first, so the streaming target is the tail entry).
-                        let last = this.entries.len().saturating_sub(1);
-                        cx.emit(AcpThreadEvent::EntryUpdated(last));
+                        // out of the stored entry — the truncated-reply bug. Signal
+                        // the entry the buffer actually targets: it is NOT always
+                        // the tail (a teammate streaming concurrently can push the
+                        // parent's open message away from the end).
+                        if buffer.target_entry < this.entries.len() {
+                            cx.emit(AcpThreadEvent::EntryUpdated(buffer.target_entry));
+                        }
 
                         true
                     })

@@ -887,12 +887,15 @@ impl ConsolePanel {
                                     }),
                             )
                         };
-                        // New AI Chat in the active project's folder. Enabled
-                        // only when there's an active project (an empty / absent
-                        // solution can't resolve one, so `active_solution_id` is
-                        // `None` and this falls to the disabled branch).
-                        let menu = if let (Some(solution_id), Some(project)) =
-                            (active_solution_id.clone(), project.clone())
+                        // New AI Chat in the active project's folder. Gated on
+                        // `has_project` exactly like New Terminal above: an EMPTY
+                        // solution still resolves an `active_solution_id` (it is
+                        // the active solution — it just has no members), so the
+                        // `if let` alone let the chat entry stay enabled with no
+                        // worktree for the agent to work in, while the terminal
+                        // next to it was correctly disabled.
+                        let menu = if let (true, Some(solution_id), Some(project)) =
+                            (has_project, active_solution_id.clone(), project.clone())
                         {
                             let weak_self = weak_self.clone();
                             let cwd = active_path.clone();
@@ -916,13 +919,15 @@ impl ConsolePanel {
                                 NewChat.boxed_clone(),
                             )
                         };
-                        // Reopen a chat that was closed but still lives on
-                        // disk. Disabled when there's no active solution.
+                        // Reopen a chat that was closed but still lives on disk.
+                        // Needs a worktree for the same reason New AI Chat does —
+                        // the reopened session resumes an agent that has to run
+                        // somewhere.
                         let menu = {
                             let weak_self = weak_self.clone();
                             menu.item(
                                 ui::ContextMenuEntry::new("Reopen Closed Chat…")
-                                    .disabled(!has_active_solution)
+                                    .disabled(!has_active_solution || !has_project)
                                     .handler(move |window, cx| {
                                         if let Some(panel) = weak_self.upgrade() {
                                             panel.update(cx, |panel, cx| {

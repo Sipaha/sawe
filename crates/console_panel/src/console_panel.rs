@@ -29,6 +29,12 @@ pub fn init(cx: &mut gpui::App) {
             }
         });
         workspace.register_action(|workspace, _: &NewChat, window, cx| {
+            // Same gate as `NewTerminal`: an empty solution has 0 worktrees, so
+            // there is no directory for the agent to work in. Without this the
+            // keybinding walked straight past the menu entry's disabled state.
+            if !panel::workspace_has_worktree(workspace, cx) {
+                return;
+            }
             let Some(solution_id) = panel::active_solution_id_for_workspace(workspace, cx) else {
                 return;
             };
