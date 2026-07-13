@@ -360,6 +360,79 @@ pub(crate) fn remove_stale_solution_socket_dirs(runtime: &Path) -> usize {
     removed
 }
 
+/// One-time migration: before this build the socket, its lock, the
+/// per-solution socket dirs and the upload spool lived under `config/`.
+/// A stale `config/mcp.lock` left behind by an old build would make a new
+/// build's `SingleInstanceLock` believe another instance is running, so we
+/// sweep the old location at startup. Best-effort and idempotent; skipped
+/// under a test override (a test's runtime dir was never the config dir).
+pub fn cleanup_legacy_runtime_dir() {
+    if RUNTIME_DIR_OVERRIDE.get().is_some() {
+        return;
+    }
+    cleanup_legacy_runtime_dir_in(paths::config_dir());
+}
+
+/// Only the runtime artefacts named here are ever removed, and only as direct
+/// children of `legacy` — real configuration (`settings.json`, `themes/`, the
+/// remote-control keys) sits in the same directory and must survive.
+fn cleanup_legacy_runtime_dir_in(legacy: &Path) {
+    // `mcp.sock` is a *symlink* to a short `/tmp/zed-mcp*/mcp.sock` (the
+    // 108-byte `sun_path` limit), and a dangling symlink reports
+    // `exists() == false` — so probe with `symlink_metadata`.
+    for name in ["mcp.sock", "mcp.lock"] {
+        let path = legacy.join(name);
+        if std::fs::symlink_metadata(&path).is_ok() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing legacy {}", path.display()))
+                .log_err();
+        }
+    }
+
+    let solutions = legacy.join("solutions");
+    if let Ok(entries) = std::fs::read_dir(&solutions) {
+        for entry in entries.flatten() {
+            let socket = entry.path().join("mcp.sock");
+            if std::fs::symlink_metadata(&socket).is_ok() {
+                std::fs::remove_file(&socket)
+                    .with_context(|| format!("removing legacy {}", socket.display()))
+                    .log_err();
+            }
+            // Only ever remove the dir we just emptied — never recurse, so a
+            // future non-socket file under `config/solutions/` survives and
+            // shows up in the log instead of being deleted.
+            if is_empty_dir(&entry.path()) {
+                std::fs::remove_dir(entry.path())
+                    .with_context(|| format!("removing legacy {}", entry.path().display()))
+                    .log_err();
+            }
+        }
+        if is_empty_dir(&solutions) {
+            std::fs::remove_dir(&solutions)
+                .with_context(|| format!("removing legacy {}", solutions.display()))
+                .log_err();
+        }
+    }
+
+    // `symlink_metadata`, not `is_dir()`: if `uploads` were ever a symlink we
+    // unlink the link and leave whatever it points at alone.
+    let uploads = legacy.join("uploads");
+    if let Ok(metadata) = std::fs::symlink_metadata(&uploads) {
+        let outcome = if metadata.is_dir() {
+            std::fs::remove_dir_all(&uploads)
+        } else {
+            std::fs::remove_file(&uploads)
+        };
+        outcome
+            .with_context(|| format!("removing legacy {}", uploads.display()))
+            .log_err();
+    }
+}
+
+fn is_empty_dir(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+}
+
 pub fn start_server(cx: &mut App) -> Result<()> {
     // S-BAK: derive process-global caller capabilities from the
     // `SAWE_MCP_BRIDGE_CAPS` env var on first server start. The bridge
@@ -370,6 +443,8 @@ pub fn start_server(cx: &mut App) -> Result<()> {
     let caps_value = std::env::var(crate::tier::BRIDGE_CAPS_ENV_VAR).unwrap_or_default();
     let caps = crate::tier::CallerCapabilities::from_bridge_env_value(&caps_value);
     crate::tier_guard::set_process_caps(caps);
+
+    cleanup_legacy_runtime_dir();
 
     let lock = match SingleInstanceLock::acquire(&lock_path()) {
         Ok(lock) => lock,
@@ -656,6 +731,66 @@ mod tests {
         );
         assert!(dir.path().join("mcp.lock").exists());
         assert!(solutions.exists(), "the solutions dir itself must survive");
+    }
+
+    #[test]
+    fn cleanup_legacy_removes_socket_lock_and_solution_dirs() {
+        let legacy = tempdir().expect("tempdir");
+        let root = legacy.path();
+        std::fs::write(root.join("mcp.lock"), b"1234").expect("lock");
+        std::fs::write(root.join("mcp.sock"), b"").expect("sock");
+        std::fs::write(root.join("settings.json"), b"{}").expect("settings");
+        std::fs::create_dir_all(root.join("themes")).expect("themes");
+        std::fs::create_dir_all(root.join("solutions/7")).expect("sol dir");
+        std::fs::write(root.join("solutions/7/mcp.sock"), b"").expect("sol sock");
+        std::fs::create_dir_all(root.join("uploads")).expect("uploads");
+        std::fs::write(root.join("uploads/1.bin"), b"x").expect("upload");
+
+        cleanup_legacy_runtime_dir_in(root);
+
+        assert!(!root.join("mcp.lock").exists());
+        assert!(!root.join("mcp.sock").exists());
+        assert!(!root.join("solutions").exists());
+        assert!(!root.join("uploads").exists());
+        assert!(
+            root.join("settings.json").exists() && root.join("themes").is_dir(),
+            "cleanup must never touch real configuration"
+        );
+
+        // Idempotent: a second pass on an already-clean dir is a no-op.
+        cleanup_legacy_runtime_dir_in(root);
+        assert!(root.join("settings.json").exists());
+    }
+
+    // The live socket is a symlink into /tmp, so it is usually *dangling* by
+    // the time we sweep — `exists()` reports false on it and would leave it
+    // behind.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_legacy_removes_a_dangling_socket_symlink() {
+        let legacy = tempdir().expect("tempdir");
+        let root = legacy.path();
+        std::os::unix::fs::symlink("/tmp/zed-mcp-gone/mcp.sock", root.join("mcp.sock"))
+            .expect("symlink");
+        assert!(!root.join("mcp.sock").exists(), "precondition: dangling");
+
+        cleanup_legacy_runtime_dir_in(root);
+
+        assert!(std::fs::symlink_metadata(root.join("mcp.sock")).is_err());
+    }
+
+    // A non-socket file under `config/solutions/<id>/` means someone put
+    // something there we don't understand: keep the dir rather than recurse.
+    #[test]
+    fn cleanup_legacy_keeps_a_solution_dir_holding_an_unknown_file() {
+        let legacy = tempdir().expect("tempdir");
+        let root = legacy.path();
+        std::fs::create_dir_all(root.join("solutions/7")).expect("sol dir");
+        std::fs::write(root.join("solutions/7/mystery.json"), b"{}").expect("mystery");
+
+        cleanup_legacy_runtime_dir_in(root);
+
+        assert!(root.join("solutions/7/mystery.json").exists());
     }
 
     #[test]

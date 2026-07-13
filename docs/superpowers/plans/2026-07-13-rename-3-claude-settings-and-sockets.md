@@ -305,7 +305,7 @@ and docs.
 
 **Steps**
 
-- [ ] Add a failing test in `crates/editor_mcp/src/lifecycle.rs`:
+- [x] Add a failing test in `crates/editor_mcp/src/lifecycle.rs`:
       ```rust
       #[test]
       fn cleanup_legacy_removes_socket_lock_and_solution_dirs() {
@@ -335,9 +335,9 @@ and docs.
           assert!(root.join("settings.json").exists());
       }
       ```
-- [ ] Run `cargo test -p editor_mcp --lib cleanup_legacy` — expect a **compile
+- [x] Run `cargo test -p editor_mcp --lib cleanup_legacy` — expect a **compile
       error**: ``cannot find function `cleanup_legacy_runtime_dir_in` in this scope``.
-- [ ] Implement in `lifecycle.rs`:
+- [x] Implement in `lifecycle.rs`:
       ```rust
       /// One-time migration: before this build the socket, its lock, the
       /// per-solution socket dirs and the upload spool lived under `config/`.
@@ -404,17 +404,17 @@ and docs.
       (`anyhow::Context as _` and `util::ResultExt as _` are already imported at
       the top of the file; add `tempfile` to `[dev-dependencies]` of
       `crates/editor_mcp/Cargo.toml` if it is not there.)
-- [ ] Run `cargo test -p editor_mcp --lib cleanup_legacy` — expect
+- [x] Run `cargo test -p editor_mcp --lib cleanup_legacy` — expect
       `test cleanup_legacy_removes_socket_lock_and_solution_dirs ... ok`.
-- [ ] Call it from `start_server` (`lifecycle.rs`, immediately before
+- [x] Call it from `start_server` (`lifecycle.rs`, immediately before
       `let lock = match SingleInstanceLock::acquire(&lock_path())`):
       ```rust
       cleanup_legacy_runtime_dir();
       ```
       and re-export from `crates/editor_mcp/src/editor_mcp.rs`, extending the
       existing `pub use lifecycle::{...}` list with `cleanup_legacy_runtime_dir`.
-- [ ] Run `cargo check -p editor_mcp` — expect no errors.
-- [ ] Commit: `Sweep the legacy config/ socket, lock and upload leftovers at startup`
+- [x] Run `cargo check -p editor_mcp` — expect no errors.
+- [x] Commit: `Sweep the legacy config/ socket, lock and upload leftovers at startup`
 
 ## Task 1.3 — `script/run-mcp` and the docs
 

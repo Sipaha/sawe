@@ -19,9 +19,9 @@ pub mod workspace_seq;
 
 pub use handoff::{HandoffOutcome, try_handoff_to_existing_instance};
 pub use lifecycle::{
-    close_solution_socket, is_global_tool, open_solution_socket, runtime_dir,
-    set_runtime_dir_for_test, socket_path, solution_socket_for_path, solution_socket_path,
-    start_server,
+    cleanup_legacy_runtime_dir, close_solution_socket, is_global_tool, open_solution_socket,
+    runtime_dir, set_runtime_dir_for_test, socket_path, solution_socket_for_path,
+    solution_socket_path, start_server,
 };
 pub use notifications::emit as emit_notification;
 pub use registry::{
