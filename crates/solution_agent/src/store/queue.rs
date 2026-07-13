@@ -852,7 +852,7 @@ impl SolutionAgentStore {
                 desired_effort: s.desired_effort.clone(),
                 cached_models: s.cached_models.clone(),
                 tab_order: s.tab_order,
-                member_id: None,
+                member_id: s.member_id,
             };
             (meta, s.project.clone())
         });

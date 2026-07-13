@@ -847,7 +847,7 @@ impl SolutionSessionView {
             desired_effort: session.desired_effort.clone(),
             cached_models: session.cached_models.clone(),
             tab_order: session.tab_order,
-            member_id: None,
+            member_id: session.member_id,
         };
         let store = SolutionAgentStore::global(cx);
         let task = store.update(cx, |store, cx| store.resume_session(meta, project, cx));

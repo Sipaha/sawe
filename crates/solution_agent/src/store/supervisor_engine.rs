@@ -403,6 +403,9 @@ impl SolutionAgentStore {
             agent_id,
             project,
             Some(solution_root),
+            // Judge/auditor sessions run at the solution root, so they are bound
+            // to no member.
+            None,
             Some(id),
             None,
             None,

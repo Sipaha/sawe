@@ -143,6 +143,23 @@ impl McpServerTool for CreateSessionTool {
 
         let cwd: Option<std::path::PathBuf> = input.cwd.as_ref().map(std::path::PathBuf::from);
 
+        // The wire tool takes a path, not a member id, so bind the session to
+        // the member that owns that path (longest match); with no cwd the
+        // session lands wherever `create_session` would put it — the solution's
+        // active member.
+        let member_id = cx.update(|cx| {
+            let store = solutions::SolutionStore::try_global(cx)?;
+            let store = store.read(cx);
+            match cwd.as_deref() {
+                Some(cwd) => store
+                    .find_solution(solution_id)
+                    .ok()?
+                    .member_for_path(cwd)
+                    .map(|member| member.id),
+                None => store.active_member(solution_id),
+            }
+        });
+
         let create_task = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
@@ -151,6 +168,7 @@ impl McpServerTool for CreateSessionTool {
                     agent_id,
                     project,
                     cwd,
+                    member_id,
                     parent_session_id,
                     None,
                     None,

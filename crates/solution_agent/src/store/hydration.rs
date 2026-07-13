@@ -644,6 +644,7 @@ impl SolutionAgentStore {
                         session.pending_messages.clear();
                         session.flush_after_cancel = false;
                         session.cwd = resume_cwd.clone();
+                        session.member_id = meta.member_id;
                         // KEEP `cold_entries`: claude --resume does NOT re-emit
                         // the transcript through stream-json, so clearing them
                         // wipes the chat history from the UI — old code assumed
@@ -699,6 +700,7 @@ impl SolutionAgentStore {
                         // next restart finds the row aligned with the
                         // agent state.
                         s.cwd = resume_cwd.clone();
+                        s.member_id = meta.member_id;
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
                         s.desired_model = meta.desired_model.clone();
@@ -954,6 +956,7 @@ impl SolutionAgentStore {
                         s.last_activity_at = meta.last_activity_at;
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
+                        s.member_id = meta.member_id;
                         s.entries = entries;
                         // Rebuild the per-source `streams` mirror (phase 2c) —
                         // the desktop render reads it, and this cold-load path
@@ -1254,6 +1257,7 @@ impl SolutionAgentStore {
                         s.last_activity_at = meta.last_activity_at;
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
+                        s.member_id = meta.member_id;
                         s.entries = entries;
                         // Rebuild the per-source `streams` mirror (phase 2c) —
                         // the desktop render reads it, and this cold-load path
@@ -1464,6 +1468,7 @@ impl SolutionAgentStore {
                         s.last_activity_at = meta.last_activity_at;
                         s.context_count = meta.context_count;
                         s.cwd = meta.cwd.clone();
+                        s.member_id = meta.member_id;
                         // Blob not loaded yet — left empty, filled by the
                         // background pass below. `hydrating` flips the
                         // session view's empty state to a spinner.

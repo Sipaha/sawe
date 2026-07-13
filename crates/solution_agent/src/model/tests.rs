@@ -93,6 +93,7 @@
             last_activity_at: Utc::now(),
             state: SessionState::Idle,
             cwd: PathBuf::new(),
+            member_id: None,
             context_count: 1,
             project: None,
             _acp_subscription: None,

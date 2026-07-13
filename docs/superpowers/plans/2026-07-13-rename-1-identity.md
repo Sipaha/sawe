@@ -2611,7 +2611,7 @@ git commit -m "Migrate solution_agent sessions to numeric solution ids and bind 
   - `SolutionSession.member_id: Option<MemberId>` (public field on the session entity).
   - `SolutionAgentStore::create_session_with_parent(..., member_id: Option<MemberId>, ...)` — the `cwd` parameter stays (it is what the subprocess is spawned in) but `member_id` is what the label and tab scoping read.
 
-- [ ] **Step 1: Write the failing label test**
+- [x] **Step 1: Write the failing label test**
 
 Append to `crates/solution_agent/src/store/tests/misc.rs`:
 
@@ -2658,12 +2658,12 @@ Append to `crates/solution_agent/src/store/tests/misc.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p solution_agent --lib store::tests::misc::project_label_reads_member_id_not_cwd -- --nocapture`
 Expected: FAIL to compile — `error[E0425]: cannot find function 'project_label' in module 'crate::store'`.
 
-- [ ] **Step 3: Replace `project_name_for_cwd` with `project_label`**
+- [x] **Step 3: Replace `project_name_for_cwd` with `project_label`**
 
 In `crates/solution_agent/src/store.rs`, delete `project_name_for_cwd` (lines 518-536 region) and put in its place:
 
@@ -2689,7 +2689,7 @@ pub(crate) fn project_label(
 }
 ```
 
-- [ ] **Step 4: Bind `member_id` onto the session at create and hydrate**
+- [x] **Step 4: Bind `member_id` onto the session at create and hydrate**
 
 Add the field to `SolutionSession` in `crates/solution_agent/src/model.rs`:
 
@@ -2741,7 +2741,7 @@ The title seed at store.rs:899 becomes:
 
 In `store/hydration.rs`, copy `meta.member_id` onto the rebuilt `SolutionSession`.
 
-- [ ] **Step 5: Point the status row at the new function**
+- [x] **Step 5: Point the status row at the new function**
 
 `crates/solution_agent/src/status_row.rs:160`:
 
@@ -2749,12 +2749,12 @@ In `store/hydration.rs`, copy `meta.member_id` onto the rebuilt `SolutionSession
         .and_then(|solution| crate::store::project_label(&solution, s.member_id, cx))
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p solution_agent`
 Expected: PASS. Existing call sites of `create_session_with_cwd` / `create_session_with_parent` in `console_panel`, `git_ui` and `solution_git` do not compile yet (they are fixed in Tasks 4 and 6) — that does not affect `-p solution_agent`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/solution_agent/src
