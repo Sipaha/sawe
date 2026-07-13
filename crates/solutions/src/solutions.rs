@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod migrate;
 mod model;
 mod persistence;
+pub mod rename;
 mod settings;
 mod slug;
 mod store;

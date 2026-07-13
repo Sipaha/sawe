@@ -388,7 +388,7 @@ git commit -m "solutions: Derive on-disk folder names from display names"
   - `pub fn same_filesystem(source: &Path, target_parent: &Path) -> std::io::Result<bool>`
   - `pub fn move_dir_with_compat_link(source: &Path, target: &Path) -> anyhow::Result<()>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/solutions/src/rename.rs` containing **only** the test module:
 
@@ -524,12 +524,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p solutions rename::`
 Expected: FAIL — `error[E0425]: cannot find function 'ensure_folder_available' in this scope` (plus `TakenFolder`, `same_filesystem`, `move_dir_with_compat_link` unresolved).
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Prepend to `crates/solutions/src/rename.rs`:
 
@@ -708,12 +708,12 @@ fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
 
 Register the module in `crates/solutions/src/solutions.rs`: add `pub mod rename;` after `mod persistence;`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p solutions rename::`
 Expected: PASS — 8 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/solutions/src/rename.rs crates/solutions/src/solutions.rs
