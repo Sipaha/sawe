@@ -746,7 +746,7 @@ CREATE TABLE pending_path_migrations (
 );
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `#[cfg(test)] mod tests` block at the bottom of `crates/solutions/src/db.rs` (create the block if the file has none):
 
@@ -812,12 +812,12 @@ mod tests {
 
 Note: `save_solution` / `save_member` / `load_all_solutions_with_members` are plan 1's helpers — if their argument lists differ, adapt the *call sites in this test only*; the assertions are what matters.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p solutions db::tests`
 Expected: FAIL — `no method named 'insert_pending_path_migration' found for struct 'SolutionsDb'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `crates/solutions/src/db.rs`, append a new entry at the **end** of `const MIGRATIONS`:
 
@@ -875,12 +875,12 @@ And inside `impl SolutionsDb`, add:
     }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p solutions db::tests`
 Expected: PASS — 2 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/solutions/src/db.rs

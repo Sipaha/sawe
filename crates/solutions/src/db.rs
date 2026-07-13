@@ -189,6 +189,18 @@ impl Domain for SolutionsDb {
             CREATE INDEX idx_solution_members_position
                 ON solution_members(solution_id, position);
         ),
+        // Hot-half rename bookkeeping: a row per directory move that the cold
+        // reconcile (`path_migrations::drain_and_apply`, next start) still has
+        // to rewrite across the other databases before it drops the compat
+        // symlink left at `old_path`.
+        sql!(
+            CREATE TABLE pending_path_migrations (
+                id         INTEGER PRIMARY KEY,
+                old_path   TEXT    NOT NULL,
+                new_path   TEXT    NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+        ),
     ];
 }
 
@@ -424,6 +436,45 @@ impl SolutionsDb {
                    active_before, active_after,
                    catalog_before, catalog_after
             FROM identity_migration_report WHERE id = 1
+        }
+    }
+
+    query! {
+        pub async fn insert_pending_path_migration(
+            old_path: String,
+            new_path: String,
+            created_at: i64
+        ) -> Result<()> {
+            INSERT INTO pending_path_migrations (old_path, new_path, created_at)
+            VALUES (?, ?, ?)
+        }
+    }
+
+    query! {
+        pub fn load_pending_path_migrations() -> Result<Vec<(i64, String, String)>> {
+            SELECT id, old_path, new_path FROM pending_path_migrations ORDER BY id ASC
+        }
+    }
+
+    query! {
+        pub async fn delete_pending_path_migration(id: i64) -> Result<()> {
+            DELETE FROM pending_path_migrations WHERE id = ?
+        }
+    }
+
+    // Plain UPDATEs. `INSERT OR REPLACE` on `solutions` deletes the parent row
+    // first, and both `solution_members` and `active_member` are
+    // `ON DELETE CASCADE` — that wiped every member the last time a rename
+    // shipped (docs/findings/2026-07-13-rename-solution-cascade-data-loss.md).
+    query! {
+        pub async fn update_solution_row(id: i64, name: String, root: String) -> Result<()> {
+            UPDATE solutions SET name = ?2, root = ?3 WHERE id = ?1
+        }
+    }
+
+    query! {
+        pub async fn update_member_row(id: i64, name: String, local_path: String) -> Result<()> {
+            UPDATE solution_members SET name = ?2, local_path = ?3 WHERE id = ?1
         }
     }
 }
@@ -814,4 +865,61 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    #[gpui::test]
+    async fn pending_path_migrations_round_trip() {
+        let db = SolutionsDb::open_test_db("pending_path_migrations_round_trip").await;
+
+        db.insert_pending_path_migration("/sol/old".into(), "/sol/new".into(), 17)
+            .await
+            .expect("insert");
+        db.insert_pending_path_migration("/sol/a".into(), "/sol/b".into(), 18)
+            .await
+            .expect("insert");
+
+        let rows = db.load_pending_path_migrations().expect("load");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "/sol/old");
+        assert_eq!(rows[0].2, "/sol/new");
+        assert_eq!(rows[1].1, "/sol/a");
+
+        db.delete_pending_path_migration(rows[0].0)
+            .await
+            .expect("delete");
+        let rows = db.load_pending_path_migrations().expect("load");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "/sol/a");
+    }
+
+    // The rename path rewrites a solution row and its members' paths. A REPLACE
+    // on `solutions` would cascade the members away — assert they survive.
+    #[gpui::test]
+    async fn update_solution_row_keeps_members() {
+        let db = SolutionsDb::open_test_db("update_solution_row_keeps_members").await;
+        let sol = db
+            .insert_solution("Old".into(), "/sol/old".into(), None)
+            .await
+            .expect("insert solution");
+        let member = db
+            .insert_solution_member(sol, "member".into(), "/sol/old/member".into(), 0, None)
+            .await
+            .expect("insert member");
+
+        db.update_solution_row(sol, "New".into(), "/sol/new".into())
+            .await
+            .expect("update solution");
+        db.update_member_row(member, "member".into(), "/sol/new/member".into())
+            .await
+            .expect("update member");
+
+        let rows = db
+            .load_all_solutions_with_members()
+            .await
+            .expect("load solutions");
+        assert_eq!(rows.len(), 1, "members must survive a rename: {rows:?}");
+        assert_eq!(rows[0].0, sol);
+        assert_eq!(rows[0].1, "New");
+        assert_eq!(rows[0].2, "/sol/new");
+        assert_eq!(rows[0].4, member);
+        assert_eq!(rows[0].6, "/sol/new/member");
+    }
 }
