@@ -2289,7 +2289,7 @@ git commit -m "solutions: Reconcile agent-db rows, transcript buckets and legacy
 
 `init_with_db` blocks on the returned task **before** hydrating the store, so the store loads already-rewritten rows and no window can open on a stale path. `gpui::block_on` on a *background* task is the pattern already used in `init_with_db` (`gpui::block_on(db.load_all_active_members())`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `mod tests` in `crates/solutions/src/path_migrations.rs`:
 
@@ -2364,12 +2364,12 @@ Append to `mod tests` in `crates/solutions/src/path_migrations.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p solutions path_migrations::tests::apply_one`
 Expected: FAIL — `cannot find function 'apply_one_with_connections' in this scope`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Append to the non-test part of `crates/solutions/src/path_migrations.rs`:
 
@@ -2523,17 +2523,17 @@ Then wire the drain into `crates/solutions/src/store.rs::init_with_db`, as the *
             // … unchanged …
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p solutions path_migrations`
 Expected: PASS — 10 tests, including `apply_one_removes_the_compat_symlink_and_is_crash_safe` and `apply_one_refuses_to_delete_a_real_directory_at_the_old_path`.
 
-- [ ] **Step 5: Verify the whole crate still builds**
+- [x] **Step 5: Verify the whole crate still builds**
 
 Run: `cargo check -p solutions`
 Expected: PASS, no warnings about the new module.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/solutions/src/path_migrations.rs crates/solutions/src/store.rs crates/solutions/Cargo.toml

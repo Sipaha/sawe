@@ -134,6 +134,14 @@ impl SolutionStore {
         if let Err(err) = crate::migrate::verify_identity_migration(&db) {
             log::error!("solutions::store: IDENTITY MIGRATION VERIFICATION FAILED: {err}");
         }
+        // Cold reconcile of any folder move a rename recorded in a previous run.
+        // MUST complete before the store is hydrated and before any window opens
+        // — it rewrites `solutions.root`, `solution_members.local_path` and the
+        // workspace identity rows the window layout is keyed on. A failure here
+        // is loud but never fatal: booting with stale paths beats not booting.
+        if let Err(err) = gpui::block_on(crate::path_migrations::drain_and_apply_with_db(&db, cx)) {
+            log::error!("solutions::store: path-migration reconcile failed: {err:#}");
+        }
         let config = match Self::load_from_db_blocking(&db) {
             Ok(cfg) => cfg,
             Err(err) => {

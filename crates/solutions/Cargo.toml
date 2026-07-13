@@ -22,6 +22,7 @@ chrono.workspace = true
 collections.workspace = true
 context_server.workspace = true
 db.workspace = true
+dirs.workspace = true
 editor_mcp.workspace = true
 fs.workspace = true
 globset.workspace = true

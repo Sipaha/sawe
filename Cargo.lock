@@ -17998,6 +17998,7 @@ dependencies = [
  "collections",
  "context_server",
  "db",
+ "dirs",
  "editor_mcp",
  "fs",
  "globset",

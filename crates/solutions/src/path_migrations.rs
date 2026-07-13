@@ -8,6 +8,8 @@
 
 use anyhow::{Context as _, Result};
 use db::sqlez::connection::Connection;
+use db::sqlez::thread_safe_connection::ThreadSafeConnection;
+use gpui::{App, Task};
 use std::path::{Path, PathBuf};
 use util::path_list::{PathList, SerializedPathList};
 
@@ -637,6 +639,161 @@ fn owning_repo(tree: &Path, rewrite: &PathRewrite) -> Option<PathBuf> {
         .unwrap_or_else(|| pointer.to_string());
     // <repo>/.git/worktrees/<name> → <repo>
     Path::new(&pointer).ancestors().nth(3).map(Path::to_path_buf)
+}
+
+pub struct ReconcileContext {
+    pub app_db: ThreadSafeConnection,
+    /// `None` when the agent DB file does not exist yet (fresh install).
+    pub agent_db_path: Option<PathBuf>,
+    /// `~/.claude/projects`. `None` when the home directory cannot be resolved.
+    pub claude_projects_dir: Option<PathBuf>,
+}
+
+impl ReconcileContext {
+    fn from_app(cx: &App) -> Self {
+        Self {
+            app_db: db::AppDatabase::global(cx).clone(),
+            agent_db_path: Some(
+                paths::data_dir()
+                    .join("solution_agent")
+                    .join("solution_agent.db"),
+            ),
+            // Mirrors `solution_agent::store::teammate_reconciler::claude_project_dir_for`,
+            // which resolves the bucket root the same way — the two must agree
+            // or the moved bucket lands where nothing reads it.
+            claude_projects_dir: dirs::home_dir().map(|home| home.join(".claude").join("projects")),
+        }
+    }
+}
+
+/// Apply one recorded move. The app-database writes are funnelled through
+/// `ThreadSafeConnection::write` because the thread-local connection a plain
+/// deref hands out is deliberately **read-only** (`sqlez` serializes every write
+/// onto one worker thread), so the whole sequence runs inside that callback.
+pub fn apply_one(context: &ReconcileContext, rewrite: &PathRewrite) -> Result<()> {
+    let agent = match context.agent_db_path.as_ref() {
+        Some(path) if path.exists() => Some(Connection::open_file(&path.to_string_lossy())),
+        _ => None,
+    };
+    let claude_projects_dir = context.claude_projects_dir.clone();
+    let rewrite = rewrite.clone();
+    gpui::block_on(context.app_db.write(move |connection| {
+        apply_one_with_connections(
+            connection,
+            agent.as_ref(),
+            claude_projects_dir.as_deref(),
+            &rewrite,
+        )
+    }))
+}
+
+/// The whole per-migration sequence, on plain connections so it is testable
+/// without an `App`. Every step is a no-op when it has already been applied,
+/// which is what makes a crash mid-reconcile recoverable by re-running.
+pub(crate) fn apply_one_with_connections(
+    app_db: &Connection,
+    agent_db: Option<&Connection>,
+    claude_projects_dir: Option<&Path>,
+    rewrite: &PathRewrite,
+) -> Result<()> {
+    rewrite_app_db(app_db, rewrite)?;
+    if let Some(agent_db) = agent_db {
+        rewrite_agent_db(agent_db, rewrite)?;
+    }
+    if let Some(projects) = claude_projects_dir {
+        move_transcript_bucket(projects, rewrite)?;
+    }
+
+    // `(member_root, solution_root)` for every member that now lives under the
+    // moved path. The solution root is needed because the relocated agent
+    // worktrees sit at `<solution_root>/.agents/worktrees/<member-dir>/*`,
+    // outside the member itself.
+    let members: Vec<(PathBuf, PathBuf)> = app_db
+        .select::<(String, String)>(
+            "SELECT solution_members.local_path, solutions.root
+             FROM solution_members
+             JOIN solutions ON solutions.id = solution_members.solution_id",
+        )
+        .context("preparing member select")?()
+    .context("selecting members")?
+    .into_iter()
+    .map(|(member, solution)| (PathBuf::from(member), PathBuf::from(solution)))
+    .filter(|(member, _)| member.starts_with(&rewrite.new))
+    .collect();
+    repair_git_worktrees(&members, rewrite)?;
+
+    remove_compat_link(&rewrite.old)?;
+    Ok(())
+}
+
+/// Only ever removes a *symlink*. If the user re-created a real directory at the
+/// old path after the rename, it is theirs and must survive.
+fn remove_compat_link(old: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(old) {
+        Err(_) => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::remove_file(old)
+            .with_context(|| format!("removing the compat link at {}", old.display())),
+        Ok(_) => {
+            log::warn!(
+                "path_migrations: {} is a real directory, not our compat link — leaving it alone",
+                old.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Drain `pending_path_migrations` and apply every recorded move. Called from
+/// `SolutionStore::init_with_db` **before the store is hydrated and before any
+/// window opens** — nothing is live, so this is the moment to rewrite the paths
+/// that the hot rename deliberately left stale.
+pub fn drain_and_apply(cx: &mut App) -> Task<Result<()>> {
+    let db = crate::db::SolutionsDb::global(cx);
+    drain_and_apply_with_db(&db, cx)
+}
+
+/// The work runs **synchronously on the caller's thread** and the result is
+/// handed back as an already-resolved `Task`, rather than being spawned on the
+/// background executor: `init_with_db` has to block on it either way (no window
+/// may open on a stale path), and a `block_on` of a *background-spawned* task
+/// deadlocks under GPUI's deterministic test executor, which only advances
+/// background work when the test pumps it — and `init_global_for_test` runs
+/// inside `cx.update`. The sqlite writes still happen on sqlez's own worker
+/// thread, which is a real OS thread in both configurations.
+pub(crate) fn drain_and_apply_with_db(
+    db: &crate::db::SolutionsDb,
+    cx: &mut App,
+) -> Task<Result<()>> {
+    Task::ready(drain_and_apply_blocking(
+        db,
+        &ReconcileContext::from_app(cx),
+    ))
+}
+
+fn drain_and_apply_blocking(db: &crate::db::SolutionsDb, context: &ReconcileContext) -> Result<()> {
+    let pending = db
+        .load_pending_path_migrations()
+        .context("loading pending_path_migrations")?;
+    for (id, old_path, new_path) in pending {
+        let rewrite = PathRewrite {
+            old: PathBuf::from(old_path),
+            new: PathBuf::from(new_path),
+        };
+        if let Err(err) = apply_one(context, &rewrite) {
+            // Leave the row in place: the next start retries. Every step is
+            // idempotent, so a partially applied migration resumes cleanly — and
+            // one bad migration must never keep the editor from booting.
+            log::error!(
+                "path_migrations: reconciling {} → {} failed: {err:#}. Will retry on the next start.",
+                rewrite.old.display(),
+                rewrite.new.display(),
+            );
+            continue;
+        }
+        gpui::block_on(db.delete_pending_path_migration(id))
+            .context("deleting the drained pending_path_migrations row")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1350,6 +1507,108 @@ mod tests {
         std::fs::create_dir_all(&member).expect("mkdir");
         repair_git_worktrees(&[(member, base.path().to_path_buf())], &rewrite())
             .expect("no worktrees, no error");
+    }
+
+    #[test]
+    fn apply_one_removes_the_compat_symlink_and_is_crash_safe() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let old_root = base.path().join("old");
+        let new_root = base.path().join("new");
+        std::fs::create_dir_all(&new_root).expect("mkdir new");
+        std::os::unix::fs::symlink(&new_root, &old_root).expect("symlink");
+
+        let projects = tempfile::tempdir().expect("projects tempdir");
+        let rewrite = PathRewrite {
+            old: old_root.clone(),
+            new: new_root.clone(),
+        };
+        let old_bucket = projects.path().join(encode_claude_bucket(&old_root));
+        std::fs::create_dir_all(&old_bucket).expect("mkdir bucket");
+        std::fs::write(old_bucket.join("s.jsonl"), b"{}").expect("write");
+
+        let app = Connection::open_memory(Some("apply_one_removes_the_compat_symlink"));
+        seed(&app);
+        let agent = Connection::open_memory(Some("apply_one_agent"));
+        seed_agent_db(&agent);
+
+        apply_one_with_connections(&app, Some(&agent), Some(projects.path()), &rewrite)
+            .expect("apply");
+        assert!(!old_root.exists(), "the compat symlink is gone");
+        assert!(
+            projects
+                .path()
+                .join(encode_claude_bucket(&new_root))
+                .join("s.jsonl")
+                .is_file()
+        );
+
+        // Crash-safe: re-running a fully applied migration is a clean no-op.
+        apply_one_with_connections(&app, Some(&agent), Some(projects.path()), &rewrite)
+            .expect("apply again");
+        assert!(!old_root.exists());
+    }
+
+    #[gpui::test]
+    async fn drain_and_apply_deletes_the_drained_row(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let base = tempfile::tempdir().expect("tempdir");
+        let old_root = base.path().join("old");
+        let new_root = base.path().join("new");
+        std::fs::create_dir_all(&new_root).expect("mkdir new");
+        std::os::unix::fs::symlink(&new_root, &old_root).expect("symlink");
+
+        let db =
+            crate::db::SolutionsDb::open_test_db("drain_and_apply_deletes_the_drained_row").await;
+        db.insert_pending_path_migration(
+            old_root.to_string_lossy().into_owned(),
+            new_root.to_string_lossy().into_owned(),
+            1,
+        )
+        .await
+        .expect("insert pending row");
+
+        cx.update(|cx| gpui::block_on(crate::path_migrations::drain_and_apply_with_db(&db, cx)))
+            .expect("drain");
+
+        assert!(
+            db.load_pending_path_migrations().expect("load").is_empty(),
+            "the drained row is deleted"
+        );
+        assert!(!old_root.exists(), "the compat symlink is gone");
+
+        // A second drain over an empty table is a clean no-op.
+        cx.update(|cx| gpui::block_on(crate::path_migrations::drain_and_apply_with_db(&db, cx)))
+            .expect("drain again");
+    }
+
+    #[test]
+    fn apply_one_refuses_to_delete_a_real_directory_at_the_old_path() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let old_root = base.path().join("old");
+        let new_root = base.path().join("new");
+        std::fs::create_dir_all(&new_root).expect("mkdir new");
+        // The user re-created a *real* directory at the old path after the
+        // rename — it is not our symlink and must never be removed.
+        std::fs::create_dir_all(&old_root).expect("mkdir old");
+        std::fs::write(old_root.join("user-file.txt"), b"precious").expect("write");
+
+        let app = Connection::open_memory(Some("apply_one_refuses_to_delete"));
+        seed(&app);
+        apply_one_with_connections(
+            &app,
+            None,
+            None,
+            &PathRewrite {
+                old: old_root.clone(),
+                new: new_root,
+            },
+        )
+        .expect("apply");
+
+        assert!(
+            old_root.join("user-file.txt").is_file(),
+            "a real directory at the old path is left alone"
+        );
     }
 
     #[test]
