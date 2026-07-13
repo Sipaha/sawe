@@ -2237,29 +2237,21 @@ impl AcpThread {
         // For text chunks going to an existing Markdown block, buffer for smooth
         // streaming instead of appending all at once which may feel more choppy.
         if let acp::ContentBlock::Text(text_content) = &chunk {
-            if let Some(markdown) =
+            if let Some((idx, markdown)) =
                 self.streaming_markdown_target(is_thought, indented, &subagent_id)
             {
-                let entries_len = self.entries.len();
-                cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
+                cx.emit(AcpThreadEvent::EntryUpdated(idx));
                 self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
                 return;
             }
         }
 
         let language_registry = self.project.read(cx).languages().clone();
-        let entries_len = self.entries.len();
-        if let Some(last_entry) = self.entries.last_mut()
-            && let AgentThreadEntry::AssistantMessage(AssistantMessage {
-                chunks,
-                indented: existing_indented,
-                is_subagent_output: _,
-                subagent_id: existing_subagent_id,
-            }) = last_entry
-            && *existing_indented == indented
-            && *existing_subagent_id == subagent_id
+        let open = self.open_assistant_message_index(indented, &subagent_id);
+        if let Some(idx) = open
+            && let Some(AgentThreadEntry::AssistantMessage(AssistantMessage { chunks, .. })) =
+                self.entries.get_mut(idx)
         {
-            let idx = entries_len - 1;
             Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
             cx.emit(AcpThreadEvent::EntryUpdated(idx));
             match (chunks.last_mut(), is_thought) {
@@ -2296,21 +2288,55 @@ impl AcpThread {
         }
     }
 
+    /// Index of the assistant message this chunk should CONTINUE, if any.
+    ///
+    /// Not simply "the last entry": with Agent Teams the parent thread and its
+    /// subagents stream concurrently, so a teammate's chunk (or a teammate's
+    /// tool call) routinely lands between two chunks of the parent's sentence.
+    /// Keying continuation on `entries.last()` made that foreign entry close the
+    /// parent's message, and the next parent chunk opened a NEW one — tearing a
+    /// live message mid-word into two bubbles (the reported "обрывы сообщений в
+    /// main"). Scan back instead, stepping over entries that belong to a
+    /// DIFFERENT stream, and continue the first entry belonging to THIS stream.
+    ///
+    /// Anything else — a same-stream tool call, a user message, a system note —
+    /// still closes the message, which is the pre-existing (and correct)
+    /// behavior: assistant text, then a tool call, then more text is genuinely
+    /// two messages.
+    fn open_assistant_message_index(
+        &self,
+        indented: bool,
+        subagent_id: &Option<SharedString>,
+    ) -> Option<usize> {
+        for (idx, entry) in self.entries.iter().enumerate().rev() {
+            match entry {
+                AgentThreadEntry::AssistantMessage(message) => {
+                    if message.subagent_id != *subagent_id {
+                        continue;
+                    }
+                    return (message.indented == indented).then_some(idx);
+                }
+                AgentThreadEntry::ToolCall(tool_call) => {
+                    if tool_call.subagent_id != *subagent_id {
+                        continue;
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn streaming_markdown_target(
         &self,
         is_thought: bool,
         indented: bool,
         subagent_id: &Option<SharedString>,
-    ) -> Option<Entity<Markdown>> {
-        let last_entry = self.entries.last()?;
-        if let AgentThreadEntry::AssistantMessage(AssistantMessage {
-            chunks,
-            indented: existing_indented,
-            subagent_id: existing_subagent_id,
-            ..
-        }) = last_entry
-            && *existing_indented == indented
-            && existing_subagent_id == subagent_id
+    ) -> Option<(usize, Entity<Markdown>)> {
+        let idx = self.open_assistant_message_index(indented, subagent_id)?;
+        if let Some(AgentThreadEntry::AssistantMessage(AssistantMessage { chunks, .. })) =
+            self.entries.get(idx)
             && let [.., chunk] = chunks.as_slice()
         {
             match (chunk, is_thought) {
@@ -2325,7 +2351,7 @@ impl AcpThread {
                         block: ContentBlock::Markdown { markdown },
                     },
                     true,
-                ) => Some(markdown.clone()),
+                ) => Some((idx, markdown.clone())),
                 _ => None,
             }
         } else {
@@ -7390,6 +7416,58 @@ mod tests {
                 panic!("expected AssistantMessage");
             };
             assert_eq!(msg.subagent_id, Some(SharedString::from("T1")));
+        });
+    }
+
+    /// Regression: the parent and its teammates stream CONCURRENTLY, so a
+    /// teammate chunk routinely lands between two chunks of the parent's
+    /// sentence. Continuation used to key on `entries.last()`, so the foreign
+    /// entry closed the parent's message and its next chunk opened a new one —
+    /// tearing a live message mid-word into two bubbles. The parent's chunks
+    /// must reunite in ONE entry.
+    #[gpui::test]
+    async fn test_interleaved_subagent_chunk_does_not_tear_parent_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            for update in [
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "и это мо".into(),
+                )),
+                acp::SessionUpdate::AgentMessageChunk(chunk_with_subagent("teammate", "T1")),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("я регрессия".into())),
+            ] {
+                thread.handle_session_update(update, cx).unwrap();
+            }
+            thread.flush_streaming_text_and_signal(cx);
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let parents: Vec<&AssistantMessage> = thread
+                .entries()
+                .iter()
+                .filter_map(|e| match e {
+                    AgentThreadEntry::AssistantMessage(m) if m.subagent_id.is_none() => Some(m),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                parents.len(),
+                1,
+                "the parent's sentence must stay in ONE message, not be split by the teammate"
+            );
+            assert_eq!(parents[0].to_markdown(cx), "## Assistant\n\nи это моя регрессия\n\n");
         });
     }
 
