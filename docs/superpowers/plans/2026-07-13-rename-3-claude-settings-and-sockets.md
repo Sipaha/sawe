@@ -604,7 +604,7 @@ and docs.
 
 **Steps**
 
-- [ ] Write the failing tests first — create `crates/claude_native/src/worktree_hook.rs`
+- [x] Write the failing tests first — create `crates/claude_native/src/worktree_hook.rs`
       containing **only** the test module:
       ```rust
       #[cfg(test)]
@@ -751,13 +751,13 @@ and docs.
           }
       }
       ```
-- [ ] Register the module: add `pub mod worktree_hook;` to
+- [x] Register the module: add `pub mod worktree_hook;` to
       `crates/claude_native/src/claude_native.rs`; add `tempfile.workspace = true`
       to `[dev-dependencies]` in `crates/claude_native/Cargo.toml`.
-- [ ] Run `cargo test -p claude_native --lib worktree_hook` — expect **compile
+- [x] Run `cargo test -p claude_native --lib worktree_hook` — expect **compile
       errors**: ``cannot find function `create` in this scope``, ``cannot find
       struct `CreateInput` in this scope``, etc.
-- [ ] Implement, above the test module in `crates/claude_native/src/worktree_hook.rs`:
+- [x] Implement, above the test module in `crates/claude_native/src/worktree_hook.rs`:
       ```rust
       //! `sawe --worktree-hook {create|remove}` — claude's `WorktreeCreate` /
       //! `WorktreeRemove` hooks, implemented by the editor binary itself (the same
@@ -918,9 +918,9 @@ and docs.
           Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
       }
       ```
-- [ ] Run `cargo test -p claude_native --lib worktree_hook` — expect all five
+- [x] Run `cargo test -p claude_native --lib worktree_hook` — expect all five
       tests to pass.
-- [ ] Commit: `Add the WorktreeCreate/WorktreeRemove hook implementation`
+- [x] Commit: `Add the WorktreeCreate/WorktreeRemove hook implementation`
 
 ## Task 2.3 — wire `--worktree-hook` into the binary
 

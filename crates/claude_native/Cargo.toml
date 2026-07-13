@@ -41,3 +41,4 @@ gpui = { workspace = true, features = ["test-support"] }
 acp_thread = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

@@ -9,6 +9,7 @@ pub mod process;
 pub mod protocol;
 mod translate;
 mod watchdog;
+pub mod worktree_hook;
 
 pub use connection::{ClaudeNativeAgentServer, ClaudeNativeConnection};
 pub use protocol::ModelInfo;
