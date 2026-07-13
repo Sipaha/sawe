@@ -472,6 +472,42 @@ pub fn refresh_active_solution_for_branch_protection(cx: &App) {
     set_active_solution_for_branch_protection(active);
 }
 
+/// A store holding exactly one solution with one member, both rooted at the
+/// caller's (real, on-disk) paths — the fixture the rename tests need, since
+/// a rename touches the filesystem and cannot run against the synthetic temp
+/// paths `create_for_test_minimal` invents.
+#[cfg(test)]
+pub(crate) fn for_test_with_solution(
+    cx: &mut App,
+    solution_root: &std::path::Path,
+    member_path: &std::path::Path,
+) -> Entity<SolutionStore> {
+    cx.new(|_| SolutionStore {
+        config: SolutionsConfig {
+            version: CURRENT_VERSION,
+            solutions: vec![Solution {
+                id: SolutionId(1),
+                name: "My Solution".into(),
+                root: solution_root.to_path_buf(),
+                members: vec![SolutionMember {
+                    id: MemberId(1),
+                    name: "Old Project".into(),
+                    local_path: member_path.to_path_buf(),
+                    origin_catalog_id: None,
+                }],
+                last_opened_at: None,
+            }],
+            ..Default::default()
+        },
+        db: None,
+        fs_lock: Arc::new(smol::lock::Mutex::new(())),
+        in_flight_adds: HashMap::default(),
+        tab_snapshots: TabSnapshots::default(),
+        active_member: HashMap::default(),
+        open_solutions: HashSet::default(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

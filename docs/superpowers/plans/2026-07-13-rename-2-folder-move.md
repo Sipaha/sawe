@@ -901,7 +901,7 @@ git commit -m "solutions: Add the pending_path_migrations table and row-update q
 
 Behavior: derive the folder from `new_name`; collide against the *sibling members of the same solution* (DB) and against the filesystem; require the same filesystem; move + link; update the in-memory member (`name`, `local_path`) and its DB row; insert the `pending_path_migrations` row; emit `SolutionStoreEvent::Changed`. Live sessions/terminals are untouched by design.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the test module at the bottom of `crates/solutions/src/store/members.rs`:
 
@@ -1006,12 +1006,12 @@ pub(crate) fn for_test_with_solution(
 
 (`db: None` means the DB writes are skipped — the same escape hatch `db_save_solution` already uses. Adjust the field list if plan 1 added fields.)
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p solutions rename_member`
 Expected: FAIL — `no method named 'rename_member' found for struct 'SolutionStore'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add to `impl SolutionStore` in `crates/solutions/src/store/members.rs`:
 
@@ -1125,12 +1125,12 @@ Add to `impl SolutionStore` in `crates/solutions/src/store/members.rs`:
 
 Make sure the file's imports cover `anyhow::{Context as _, Result}`, `crate::model::{MemberId, SolutionMember}` and `super::{SolutionStore, SolutionStoreEvent}`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p solutions rename_member`
 Expected: PASS — `rename_member_moves_the_folder_and_leaves_a_link`, `rename_member_rejects_a_sibling_collision`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/solutions/src/store/members.rs crates/solutions/src/store.rs
