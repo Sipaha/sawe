@@ -81,6 +81,7 @@ call.workspace = true
 chrono.workspace = true
 channel.workspace = true
 clap.workspace = true
+claude_native.workspace = true
 cli.workspace = true
 client.workspace = true
 codestral.workspace = true

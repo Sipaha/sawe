@@ -256,6 +256,28 @@ fn main() {
         }
     }
 
+    // `sawe --worktree-hook {create|remove}` runs as claude's WorktreeCreate /
+    // WorktreeRemove hook. Like `--nc`, it must exit before any GPUI / paths
+    // init and before the single-instance handoff — claude spawns it per
+    // worktree, a cold editor boot would add seconds to every subagent launch,
+    // and handing these args to a running editor would mean the hook never runs
+    // at all.
+    if let Some(mode) = &args.worktree_hook {
+        let Some(base) = args.worktree_base.clone() else {
+            eprintln!("--worktree-hook requires --worktree-base");
+            process::exit(1);
+        };
+        let mut stdin = io::stdin().lock();
+        let mut stdout = io::stdout().lock();
+        match claude_native::worktree_hook::main(mode, &base, &mut stdin, &mut stdout) {
+            Ok(()) => process::exit(0),
+            Err(err) => {
+                eprintln!("--worktree-hook: {err:#}");
+                process::exit(1);
+            }
+        }
+    }
+
     // `sawe --git-rebase-helper <todo-path>` runs as `GIT_SEQUENCE_EDITOR`
     // during programmatic interactive rebase (S-RBL). The implementation lives
     // in `git::operations::helpers` so it can be exercised by unit tests
@@ -2115,6 +2137,19 @@ struct Args {
     /// `git commit --amend -F <path>` in the rebase worktree. See plan task S-RBL.
     #[arg(long, hide = true)]
     git_message_set: Option<String>,
+
+    /// Runs the editor binary as claude's `WorktreeCreate` / `WorktreeRemove`
+    /// hook (`create` / `remove`). Reads the hook payload as JSON on stdin and,
+    /// for `create`, prints the absolute path of the worktree it made on stdout.
+    /// Configured by the editor-owned claude settings layer so agent worktrees
+    /// land under `<solution_root>/.agents/worktrees/` instead of
+    /// `<member>/.claude/worktrees/`.
+    #[arg(long, hide = true, value_name = "create|remove")]
+    worktree_hook: Option<String>,
+
+    /// Base directory for `--worktree-hook` — `<solution_root>/.agents/worktrees`.
+    #[arg(long, hide = true, value_name = "DIR")]
+    worktree_base: Option<PathBuf>,
 
     /// Used for recording minidumps on crashes by having Sawe run a separate
     /// process communicating over a socket.

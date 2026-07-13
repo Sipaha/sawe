@@ -936,7 +936,7 @@ and docs.
 
 **Steps**
 
-- [ ] Add the flags to `Args` in `crates/zed/src/main.rs`, right after the `nc`
+- [x] Add the flags to `Args` in `crates/zed/src/main.rs`, right after the `nc`
       field:
       ```rust
       /// Runs the editor binary as claude's `WorktreeCreate` / `WorktreeRemove`
@@ -952,7 +952,7 @@ and docs.
       #[arg(long, hide = true, value_name = "DIR")]
       worktree_base: Option<PathBuf>,
       ```
-- [ ] Add the early-return, immediately after the `--nc` block (`main.rs:248-256`):
+- [x] Add the early-return, immediately after the `--nc` block (`main.rs:248-256`):
       ```rust
       // `sawe --worktree-hook {create|remove}` runs as claude's WorktreeCreate /
       // WorktreeRemove hook. Like `--nc`, it must exit before any GPUI / paths
@@ -977,8 +977,8 @@ and docs.
       (`io` is already imported at `main.rs:56`; add `claude_native.workspace = true`
       to `[dependencies]` in `crates/zed/Cargo.toml`, alphabetically near
       `client`.)
-- [ ] Run `cargo build --bin sawe` — expect a clean debug build.
-- [ ] Verify by hand against a throwaway repo (real end-to-end exercise of the
+- [x] Run `cargo build --bin sawe` — expect a clean debug build.
+- [x] Verify by hand against a throwaway repo (real end-to-end exercise of the
       flag, no editor needed):
       ```bash
       set -e
@@ -991,7 +991,7 @@ and docs.
       ```
       Expect exactly one line on stdout: `<tmp>/.agents/worktrees/member/fox`, and
       `git -C "$tmp/member" worktree list` to show it.
-- [ ] Commit: `Run the editor binary as claude's worktree hook`
+- [x] Commit: `Run the editor binary as claude's worktree hook`
 
 ## Task 2.4 — build the settings JSON
 
