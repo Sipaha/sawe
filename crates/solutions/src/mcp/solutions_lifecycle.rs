@@ -51,7 +51,7 @@ impl<'de> Deserialize<'de> for ListSolutionsParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SolutionSummary {
-    pub id: String,
+    pub id: i64,
     pub name: String,
     pub root: String,
     pub member_count: usize,
@@ -111,23 +111,31 @@ pub fn build_summary(sol: &Solution, cx: &App) -> SolutionSummary {
     // stored runtime data so tests can flip it without spawning real windows.
     let main_window_id = find_window_id_for_solution(&sol.root, cx);
     let open = SolutionStore::try_global(cx)
-        .map(|store| store.read(cx).is_open(&sol.id))
+        .map(|store| store.read(cx).is_open(sol.id))
         .unwrap_or(false);
+    // `editor_mcp`'s socket API still takes a &str id; the per-solution socket
+    // directory is the numeric id rendered as text. Task 5 flips it to i64.
     let mcp_socket = open.then(|| {
-        editor_mcp::solution_socket_path(sol.id.as_str())
+        editor_mcp::solution_socket_path(&sol.id.0.to_string())
             .to_string_lossy()
             .into_owned()
     });
     SolutionSummary {
-        id: sol.id.as_str().to_string(),
+        id: sol.id.0,
         name: sol.name.clone(),
         root: sol.root.to_string_lossy().into_owned(),
         member_count: sol.members.len(),
-        last_opened_at: sol.last_opened_at.map(|t| t.to_rfc3339()),
+        last_opened_at: format_last_opened(sol.last_opened_at),
         open,
         main_window_id,
         mcp_socket,
     }
+}
+
+/// Epoch millis → RFC3339, the wire format every MCP consumer already expects.
+fn format_last_opened(ms: Option<i64>) -> Option<String> {
+    ms.and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|t| t.to_rfc3339())
 }
 
 fn find_window_id_for_solution(solution_root: &std::path::Path, cx: &App) -> Option<String> {
@@ -161,7 +169,7 @@ fn find_window_id_for_solution(solution_root: &std::path::Path, cx: &App) -> Opt
 /// Get full details of a Solution by id, including any active window info.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GetSolutionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 impl<'de> Deserialize<'de> for GetSolutionParams {
@@ -169,7 +177,7 @@ impl<'de> Deserialize<'de> for GetSolutionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -180,7 +188,7 @@ impl<'de> Deserialize<'de> for GetSolutionParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SolutionDetail {
-    pub id: String,
+    pub id: i64,
     pub name: String,
     pub root: String,
     pub members: Vec<MemberDetail>,
@@ -200,8 +208,11 @@ pub struct SolutionDetail {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct MemberDetail {
-    pub catalog_id: String,
+    pub id: i64,
+    pub name: String,
     pub local_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_catalog_id: Option<i64>,
     pub status: String, // "ok" | "missing_on_disk"
 }
 
@@ -239,8 +250,8 @@ impl McpServerTool for GetSolutionTool {
             store.read_with(cx, |s, _| {
                 s.solutions()
                     .iter()
-                    .find(|sol| sol.id.as_str() == input.solution_id)
-                    .map(|sol| (build_detail(sol, s.is_open(&sol.id)), sol.root.clone()))
+                    .find(|sol| sol.id.0 == input.solution_id)
+                    .map(|sol| (build_detail(sol, s.is_open(sol.id)), sol.root.clone()))
                     .with_context(|| format!("solution_not_found: {}", input.solution_id))
             })
         })?;
@@ -261,12 +272,12 @@ impl McpServerTool for GetSolutionTool {
 
 fn build_detail(sol: &Solution, open: bool) -> SolutionDetail {
     let mcp_socket = open.then(|| {
-        editor_mcp::solution_socket_path(sol.id.as_str())
+        editor_mcp::solution_socket_path(&sol.id.0.to_string())
             .to_string_lossy()
             .into_owned()
     });
     SolutionDetail {
-        id: sol.id.as_str().to_string(),
+        id: sol.id.0,
         name: sol.name.clone(),
         root: sol.root.to_string_lossy().into_owned(),
         members: sol
@@ -275,13 +286,15 @@ fn build_detail(sol: &Solution, open: bool) -> SolutionDetail {
             .map(|m| {
                 let exists = m.local_path.exists();
                 MemberDetail {
-                    catalog_id: m.catalog_id.as_str().to_string(),
+                    id: m.id.0,
+                    name: m.name.clone(),
                     local_path: m.local_path.to_string_lossy().into_owned(),
+                    origin_catalog_id: m.origin_catalog_id.map(|c| c.0),
                     status: if exists { "ok" } else { "missing_on_disk" }.to_string(),
                 }
             })
             .collect(),
-        last_opened_at: sol.last_opened_at.map(|t| t.to_rfc3339()),
+        last_opened_at: format_last_opened(sol.last_opened_at),
         open,
         mcp_socket,
     }
@@ -364,7 +377,7 @@ impl<'de> Deserialize<'de> for CreateSolutionParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CreateSolutionResult {
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 #[derive(Clone)]
@@ -384,7 +397,7 @@ impl McpServerTool for CreateSolutionTool {
             !input.name.trim().is_empty(),
             "invalid_params: name is required"
         );
-        let id = cx.update(|cx| -> Result<String> {
+        let id = cx.update(|cx| -> Result<i64> {
             use ::settings::Settings as _;
             let store = SolutionStore::global(cx);
             let root_base = crate::SolutionsSettings::get_global(cx).root.clone();
@@ -398,8 +411,8 @@ impl McpServerTool for CreateSolutionTool {
             // (no-op for a fresh empty solution — no member paths yet) and
             // the mobile `workspace.solution_opened` wire delta the mirror
             // listens for.
-            store.update(cx, |s, cx| s.mark_open(id.clone(), cx));
-            Ok(id.as_str().to_string())
+            store.update(cx, |s, cx| s.mark_open(id, cx));
+            Ok(id.0)
         })?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
@@ -418,7 +431,7 @@ impl McpServerTool for CreateSolutionTool {
 /// are unchanged.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RenameSolutionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     pub new_name: String,
 }
 
@@ -427,7 +440,7 @@ impl<'de> Deserialize<'de> for RenameSolutionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             new_name: String,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -440,7 +453,7 @@ impl<'de> Deserialize<'de> for RenameSolutionParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RenameSolutionResult {
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 #[derive(Clone)]
@@ -457,18 +470,18 @@ impl McpServerTool for RenameSolutionTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(
             !input.new_name.trim().is_empty(),
             "invalid_params: new_name is required"
         );
-        let solution_id = input.solution_id.clone();
+        let solution_id = input.solution_id;
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
             let id = crate::SolutionId(input.solution_id);
-            store.update(cx, |s, cx| s.rename_solution(&id, &input.new_name, cx))?;
+            store.update(cx, |s, cx| s.rename_solution(id, &input.new_name, cx))?;
             Ok(())
         })?;
         Ok(ToolResponse {
@@ -490,7 +503,7 @@ impl McpServerTool for RenameSolutionTool {
 /// catalog-backed projects can be re-cloned later.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct DeleteSolutionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 impl<'de> Deserialize<'de> for DeleteSolutionParams {
@@ -498,7 +511,7 @@ impl<'de> Deserialize<'de> for DeleteSolutionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
         }
         Ok(Self {
             solution_id: Option::<Inner>::deserialize(de)?
@@ -527,12 +540,12 @@ impl McpServerTool for DeleteSolutionTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         let root = cx.update(|cx| -> Result<Option<std::path::PathBuf>> {
             let store = SolutionStore::global(cx);
-            let id = crate::SolutionId(input.solution_id.clone());
+            let id = crate::SolutionId(input.solution_id);
             // Capture the root before removal so we can delete its on-disk
             // worktrees afterwards.
             let root = store.read_with(cx, |s, _| {
@@ -541,7 +554,7 @@ impl McpServerTool for DeleteSolutionTool {
                     .find(|sol| sol.id == id)
                     .map(|sol| sol.root.clone())
             });
-            store.update(cx, |s, cx| s.delete_solution(&id, cx))?;
+            store.update(cx, |s, cx| s.delete_solution(id, cx))?;
             Ok(root)
         })?;
         // Match the desktop delete (`delete_solution_with_cleanup`): a
@@ -585,7 +598,7 @@ impl McpServerTool for DeleteSolutionTool {
 /// `None` leaves the workspace's default behaviour intact.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct OpenSolutionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub focus: Option<bool>,
 }
@@ -595,7 +608,7 @@ impl<'de> Deserialize<'de> for OpenSolutionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             focus: Option<bool>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -632,14 +645,14 @@ impl McpServerTool for OpenSolutionTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
-        let sol_id = crate::SolutionId(input.solution_id.clone());
+        let sol_id = crate::SolutionId(input.solution_id);
 
         let paths = cx.update(|cx| -> Result<Vec<std::path::PathBuf>> {
             let store = SolutionStore::global(cx);
-            store.read_with(cx, |s, _| s.paths_for_open(&sol_id))
+            store.read_with(cx, |s, _| s.paths_for_open(sol_id))
         })?;
 
         anyhow::ensure!(
@@ -692,8 +705,8 @@ impl McpServerTool for OpenSolutionTool {
         cx.update(|cx| {
             let store = SolutionStore::global(cx);
             store.update(cx, |s, cx| {
-                s.touch_last_opened(&sol_id, cx).log_err();
-                s.mark_open(sol_id.clone(), cx);
+                s.touch_last_opened(sol_id, cx).log_err();
+                s.mark_open(sol_id, cx);
             });
             if let Some(welcome) = welcome_window {
                 welcome
@@ -733,7 +746,7 @@ impl McpServerTool for OpenSolutionTool {
 /// buffers. Callers should ensure modifications are saved beforehand.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct CloseSolutionParams {
-    pub solution_id: String,
+    pub solution_id: i64,
 }
 
 impl<'de> Deserialize<'de> for CloseSolutionParams {
@@ -741,7 +754,7 @@ impl<'de> Deserialize<'de> for CloseSolutionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
         }
         Ok(Self {
             solution_id: Option::<Inner>::deserialize(de)?
@@ -770,7 +783,7 @@ impl McpServerTool for CloseSolutionTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         let closed = cx.update(|cx| -> Result<bool> {
@@ -779,7 +792,7 @@ impl McpServerTool for CloseSolutionTool {
                 .read_with(cx, |s, _| {
                     s.solutions()
                         .iter()
-                        .find(|sol| sol.id.as_str() == input.solution_id)
+                        .find(|sol| sol.id.0 == input.solution_id)
                         .map(|sol| sol.root.clone())
                 })
                 .with_context(|| format!("solution_not_found: {}", input.solution_id))?;
@@ -847,7 +860,7 @@ impl<'de> Deserialize<'de> for FindForPathParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct FindForPathMatch {
-    pub solution_id: String,
+    pub solution_id: i64,
     pub solution_name: String,
 }
 
@@ -880,7 +893,7 @@ impl McpServerTool for FindForPathTool {
             SolutionStore::try_global(cx).and_then(|store| {
                 store.read_with(cx, |s, _| {
                     s.solution_for_path(&path).map(|sol| FindForPathMatch {
-                        solution_id: sol.id.as_str().to_string(),
+                        solution_id: sol.id.0,
                         solution_name: sol.name.clone(),
                     })
                 })

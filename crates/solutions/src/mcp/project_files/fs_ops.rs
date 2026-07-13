@@ -149,7 +149,7 @@ fn collect_files(
     let Some(root) = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.as_str() == solution_id)
+            .find(|sol| sol.id.0.to_string() == solution_id)
             .map(|sol| sol.root.clone())
     }) else {
         return (Vec::new(), None);

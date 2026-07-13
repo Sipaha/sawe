@@ -36,8 +36,8 @@ pub(crate) fn register_member_mgmt(cx: &mut App) {
 /// **Slow**: cloning can take seconds-to-minutes for large repos.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct AddMemberParams {
-    pub solution_id: String,
-    pub catalog_id: String,
+    pub solution_id: i64,
+    pub catalog_id: i64,
 }
 
 impl<'de> Deserialize<'de> for AddMemberParams {
@@ -45,8 +45,8 @@ impl<'de> Deserialize<'de> for AddMemberParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
-            catalog_id: String,
+            solution_id: i64,
+            catalog_id: i64,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -75,23 +75,20 @@ impl McpServerTool for AddMemberTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
-        anyhow::ensure!(
-            !input.catalog_id.is_empty(),
-            "invalid_params: catalog_id is required"
-        );
+        anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
 
-        let sol_id = crate::SolutionId(input.solution_id.clone());
-        let cat_id = crate::CatalogId(input.catalog_id.clone());
+        let sol_id = crate::SolutionId(input.solution_id);
+        let cat_id = crate::CatalogId(input.catalog_id);
         let cache_root = crate::default_cache_root();
 
         let operation_id = cx.update(|cx| editor_mcp::op_start("solutions.add_member", cx));
 
         let op_id_for_task = operation_id.clone();
-        let solution_id_for_log = input.solution_id.clone();
-        let catalog_id_for_log = input.catalog_id.clone();
+        let solution_id_for_log = input.solution_id;
+        let catalog_id_for_log = input.catalog_id;
 
         cx.spawn(async move |cx| {
             // Forward every git progress tick to op_record_progress so the
@@ -152,10 +149,10 @@ impl McpServerTool for AddMemberTool {
 /// history can be pushed somewhere later, and registers it — no clone. The
 /// member never enters the catalog, so a remote-less local project is not
 /// offered in the picker for other solutions. Returns the new member's
-/// `catalog_id` synchronously.
+/// `member_id` synchronously.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct AddEmptyMemberParams {
-    pub solution_id: String,
+    pub solution_id: i64,
     pub name: String,
 }
 
@@ -164,7 +161,7 @@ impl<'de> Deserialize<'de> for AddEmptyMemberParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
+            solution_id: i64,
             name: String,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
@@ -177,7 +174,7 @@ impl<'de> Deserialize<'de> for AddEmptyMemberParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct AddEmptyMemberResult {
-    pub catalog_id: String,
+    pub member_id: i64,
 }
 
 #[derive(Clone)]
@@ -194,7 +191,7 @@ impl McpServerTool for AddEmptyMemberTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         anyhow::ensure!(
@@ -202,18 +199,18 @@ impl McpServerTool for AddEmptyMemberTool {
             "invalid_params: name is required"
         );
 
-        let sol_id = crate::SolutionId(input.solution_id.clone());
-        let cat_id = cx.update(|cx| -> Result<crate::CatalogId> {
+        let sol_id = crate::SolutionId(input.solution_id);
+        let member_id = cx.update(|cx| -> Result<crate::MemberId> {
             let store = SolutionStore::global(cx);
-            store.update(cx, |s, cx| s.add_empty_member(&sol_id, &input.name, cx))
+            store.update(cx, |s, cx| s.add_empty_member(sol_id, &input.name, cx))
         })?;
 
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
-                text: cat_id.0.clone(),
+                text: member_id.to_string(),
             }],
             structured_content: AddEmptyMemberResult {
-                catalog_id: cat_id.0,
+                member_id: member_id.0,
             },
         })
     }
@@ -228,8 +225,7 @@ impl McpServerTool for AddEmptyMemberTool {
 /// (the existing dir will be reused if origin matches).
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RemoveMemberParams {
-    pub solution_id: String,
-    pub catalog_id: String,
+    pub member_id: i64,
 }
 
 impl<'de> Deserialize<'de> for RemoveMemberParams {
@@ -237,13 +233,10 @@ impl<'de> Deserialize<'de> for RemoveMemberParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
-            catalog_id: String,
+            member_id: i64,
         }
-        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
-            solution_id: inner.solution_id,
-            catalog_id: inner.catalog_id,
+            member_id: Option::<Inner>::deserialize(de)?.unwrap_or_default().member_id,
         })
     }
 }
@@ -266,19 +259,11 @@ impl McpServerTool for RemoveMemberTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            !input.solution_id.is_empty(),
-            "invalid_params: solution_id is required"
-        );
-        anyhow::ensure!(
-            !input.catalog_id.is_empty(),
-            "invalid_params: catalog_id is required"
-        );
+        anyhow::ensure!(input.member_id > 0, "invalid_params: member_id is required");
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
-            let sol_id = crate::SolutionId(input.solution_id);
-            let cat_id = crate::CatalogId(input.catalog_id);
-            store.update(cx, |s, cx| s.remove_member(&sol_id, &cat_id, cx))?;
+            let member_id = crate::MemberId(input.member_id);
+            store.update(cx, |s, cx| s.remove_member(member_id, cx))?;
             Ok(())
         })?;
         Ok(ToolResponse {
@@ -295,12 +280,12 @@ impl McpServerTool for RemoveMemberTool {
 // =====================================================================
 
 /// Reorder Solution members. The new order MUST contain exactly the same
-/// catalog_ids as the current member list (same set, different order).
+/// member_ids as the current member list (same set, different order).
 /// Order matters — the first member becomes the agent CWD.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ReorderMembersParams {
-    pub solution_id: String,
-    pub ordered_catalog_ids: Vec<String>,
+    pub solution_id: i64,
+    pub member_ids: Vec<i64>,
 }
 
 impl<'de> Deserialize<'de> for ReorderMembersParams {
@@ -308,13 +293,13 @@ impl<'de> Deserialize<'de> for ReorderMembersParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
-            ordered_catalog_ids: Vec<String>,
+            solution_id: i64,
+            member_ids: Vec<i64>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             solution_id: inner.solution_id,
-            ordered_catalog_ids: inner.ordered_catalog_ids,
+            member_ids: inner.member_ids,
         })
     }
 }
@@ -338,18 +323,18 @@ impl McpServerTool for ReorderMembersTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
             let sol_id = crate::SolutionId(input.solution_id);
-            let order: Vec<crate::CatalogId> = input
-                .ordered_catalog_ids
+            let order: Vec<crate::MemberId> = input
+                .member_ids
                 .into_iter()
-                .map(crate::CatalogId)
+                .map(crate::MemberId)
                 .collect();
-            store.update(cx, |s, cx| s.reorder_members(&sol_id, order, cx))?;
+            store.update(cx, |s, cx| s.reorder_members(sol_id, order, cx))?;
             Ok(())
         })?;
         Ok(ToolResponse {
@@ -368,11 +353,11 @@ impl McpServerTool for ReorderMembersTool {
 /// Set the solution-wide active member (the selected project tab). Emits
 /// `ActiveMemberChanged`, which drives the per-member layout swap and the
 /// project-panel tree rebuild — the same path a project-tab click triggers.
-/// No-op if `catalog_id` is already the active member.
+/// No-op if `member_id` is already the active member.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct SetActiveMemberParams {
-    pub solution_id: String,
-    pub catalog_id: String,
+    pub solution_id: i64,
+    pub member_id: i64,
 }
 
 impl<'de> Deserialize<'de> for SetActiveMemberParams {
@@ -380,21 +365,21 @@ impl<'de> Deserialize<'de> for SetActiveMemberParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            solution_id: String,
-            catalog_id: String,
+            solution_id: i64,
+            member_id: i64,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             solution_id: inner.solution_id,
-            catalog_id: inner.catalog_id,
+            member_id: inner.member_id,
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SetActiveMemberResult {
-    pub solution_id: String,
-    pub active_member: String,
+    pub solution_id: i64,
+    pub active_member: i64,
 }
 
 #[derive(Clone)]
@@ -411,38 +396,38 @@ impl McpServerTool for SetActiveMemberTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         anyhow::ensure!(
-            !input.solution_id.is_empty(),
+            input.solution_id > 0,
             "invalid_params: solution_id is required"
         );
-        anyhow::ensure!(
-            !input.catalog_id.is_empty(),
-            "invalid_params: catalog_id is required"
-        );
-        let (solution_id, catalog_id) = (input.solution_id.clone(), input.catalog_id.clone());
+        anyhow::ensure!(input.member_id > 0, "invalid_params: member_id is required");
+        let (solution_id, member_id) = (input.solution_id, input.member_id);
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
-            let sol = crate::SolutionId(input.solution_id);
-            let cat = crate::CatalogId(input.catalog_id);
-            // Guard against recording a bogus active member: the catalog must be
-            // an actual member of the solution (a non-member would leave the
-            // window pointing at a project with no worktree).
-            let is_member = store.read(cx).solutions().iter().find(|s| s.id == sol).is_some_and(
-                |s| s.members.iter().any(|m| m.catalog_id == cat),
-            );
+            let sol = crate::SolutionId(solution_id);
+            let member = crate::MemberId(member_id);
+            // Guard against recording a bogus active member: the member must
+            // actually belong to the solution (a stranger would leave the window
+            // pointing at a project with no worktree).
+            let is_member = store
+                .read(cx)
+                .solutions()
+                .iter()
+                .find(|s| s.id == sol)
+                .is_some_and(|s| s.members.iter().any(|m| m.id == member));
             anyhow::ensure!(
                 is_member,
-                "not_found: catalog_id is not a member of the solution"
+                "not_found: member_id is not a member of the solution"
             );
-            store.update(cx, |s, cx| s.set_active_member(sol, cat, cx));
+            store.update(cx, |s, cx| s.set_active_member(sol, member, cx));
             Ok(())
         })?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
-                text: format!("active_member: {solution_id} -> {catalog_id}"),
+                text: format!("active_member: {solution_id} -> {member_id}"),
             }],
             structured_content: SetActiveMemberResult {
                 solution_id,
-                active_member: catalog_id,
+                active_member: member_id,
             },
         })
     }

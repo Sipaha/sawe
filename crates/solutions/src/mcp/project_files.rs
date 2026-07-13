@@ -101,7 +101,7 @@ pub fn validate_path_in_solution(
     let valid = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.as_str() == solution_id)
+            .find(|sol| sol.id.0.to_string() == solution_id)
             .map(|sol| {
                 sol.members.iter().any(|m| {
                     let canon_member = m
@@ -153,7 +153,7 @@ pub(crate) fn project_for_solution(solution_id: &str, cx: &mut App) -> Option<gp
     let root = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.as_str() == solution_id)
+            .find(|sol| sol.id.0.to_string() == solution_id)
             .map(|sol| sol.root.clone())
     })?;
 

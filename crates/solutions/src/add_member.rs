@@ -2,7 +2,7 @@
 
 use crate::cache;
 use crate::git::{self, GitProgress};
-use crate::model::{CatalogId, SolutionId, SolutionMember};
+use crate::model::{CatalogId, MemberId, SolutionId, SolutionMember};
 use crate::store::{SolutionStore, SolutionStoreEvent};
 use anyhow::{Context as _, Result, bail};
 use gpui::{App, AppContext as _, AsyncApp, Task};
@@ -107,19 +107,24 @@ impl SolutionStore {
         let sol = match self.config.solutions.iter().find(|s| s.id == solution_id) {
             Some(s) => s.clone(),
             None => {
-                let id = solution_id.0.clone();
-                return cx.background_spawn(async move { bail!("solution not found: {id}") });
+                return cx.background_spawn(async move {
+                    bail!("solution not found: {solution_id}")
+                });
             }
         };
         let cat = match self.config.catalog.iter().find(|c| c.id == catalog_id) {
             Some(c) => c.clone(),
             None => {
-                let id = catalog_id.0.clone();
-                return cx
-                    .background_spawn(async move { bail!("catalog project not found: {id}") });
+                return cx.background_spawn(async move {
+                    bail!("catalog project not found: {catalog_id}")
+                });
             }
         };
-        if sol.members.iter().any(|m| m.catalog_id == catalog_id) {
+        if sol
+            .members
+            .iter()
+            .any(|m| m.origin_catalog_id == Some(catalog_id))
+        {
             let sol_name = sol.name;
             let cat_name = cat.name;
             return cx.background_spawn(async move {
@@ -127,7 +132,7 @@ impl SolutionStore {
             });
         }
 
-        let key = (solution_id.clone(), catalog_id.clone());
+        let key = (solution_id, catalog_id);
         // Reject overlapping calls so two pickers can't race for the same
         // (solution, catalog) and double-clone into the target directory.
         if self.in_flight_adds.contains_key(&key) {
@@ -138,7 +143,11 @@ impl SolutionStore {
             });
         }
 
-        let target = sol.root.join(&catalog_id.0);
+        // The clone folder is derived from the catalog project's NAME (it used
+        // to be derived from the catalog id, which WAS the slug of the name —
+        // same string, different source).
+        let folder = crate::slug::slugify(&cat.name);
+        let target = sol.root.join(&folder);
         let remote_url = cat.remote_url.clone();
         let default_branch = cat.default_branch.clone();
         let lock = Arc::clone(&self.fs_lock);
@@ -155,8 +164,8 @@ impl SolutionStore {
             },
         );
         cx.emit(SolutionStoreEvent::MemberAddProgress {
-            solution: solution_id.clone(),
-            catalog: catalog_id.clone(),
+            solution: solution_id,
+            catalog: catalog_id,
             stage: "queued".into(),
             percent: Some(0),
         });
@@ -173,23 +182,20 @@ impl SolutionStore {
                 // complete or remove it.
                 let pump = cx.spawn({
                     let weak = weak.clone();
-                    let solution_id = solution_id.clone();
-                    let catalog_id = catalog_id.clone();
                     async move |cx: &mut AsyncApp| {
                         while let Ok(p) = rx.recv().await {
                             let stage_for_event = p.stage.clone();
                             let percent_for_event = p.percent;
                             weak.update(cx, |store, cx| {
-                                if let Some(entry) = store
-                                    .in_flight_adds
-                                    .get_mut(&(solution_id.clone(), catalog_id.clone()))
+                                if let Some(entry) =
+                                    store.in_flight_adds.get_mut(&(solution_id, catalog_id))
                                 {
                                     entry.stage = p.stage.clone();
                                     entry.percent = p.percent;
                                 }
                                 cx.emit(SolutionStoreEvent::MemberAddProgress {
-                                    solution: solution_id.clone(),
-                                    catalog: catalog_id.clone(),
+                                    solution: solution_id,
+                                    catalog: catalog_id,
                                     stage: stage_for_event,
                                     percent: percent_for_event,
                                 });
@@ -257,44 +263,61 @@ impl SolutionStore {
 
                 match work_result {
                     Ok(()) => {
-                        weak.update(cx, |store, cx| {
-                            let new_member_and_pos: Option<(SolutionMember, i32)> = store
+                        weak.update(cx, |store, cx| -> Result<()> {
+                            let position = store
                                 .config
                                 .solutions
-                                .iter_mut()
+                                .iter()
                                 .find(|s| s.id == solution_id)
-                                .map(|sol| {
-                                    sol.members.push(SolutionMember {
-                                        catalog_id: catalog_id.clone(),
-                                        local_path: target.clone(),
-                                    });
-                                    let new_member =
-                                        sol.members.last().expect("just pushed").clone();
-                                    let position = (sol.members.len() - 1) as i32;
-                                    (new_member, position)
-                                });
-                            if let Some((new_member, position)) = new_member_and_pos {
-                                store
-                                    .db_set_member(&solution_id, &new_member, position)
-                                    .log_err();
+                                .map(|sol| sol.members.len() as i32);
+                            if let Some(position) = position {
+                                // Allocate the member id through the DB so the
+                                // row and the in-memory member agree; `for_test`
+                                // stores with no DB fall back to the shared
+                                // in-memory counter.
+                                let member_id = match store.db.as_ref() {
+                                    Some(db) => MemberId(gpui::block_on(
+                                        db.insert_solution_member(
+                                            solution_id.0,
+                                            folder.clone(),
+                                            target.to_string_lossy().into_owned(),
+                                            position,
+                                            Some(catalog_id.0),
+                                        ),
+                                    )?),
+                                    None => MemberId(store.next_id_without_db()),
+                                };
+                                let member = SolutionMember {
+                                    id: member_id,
+                                    name: folder.clone(),
+                                    local_path: target.clone(),
+                                    origin_catalog_id: Some(catalog_id),
+                                };
+                                if let Some(sol) = store
+                                    .config
+                                    .solutions
+                                    .iter_mut()
+                                    .find(|s| s.id == solution_id)
+                                {
+                                    sol.members.push(member);
+                                }
                             }
-                            store
-                                .in_flight_adds
-                                .remove(&(solution_id.clone(), catalog_id.clone()));
+                            store.in_flight_adds.remove(&(solution_id, catalog_id));
                             // First project in the solution → make it the
                             // active member so panels and new AI sessions
                             // scope to it instead of the solution root. No-op
                             // when a member is already active. See the matching
                             // note in `add_empty_member`.
-                            store.seed_active_member_if_unset(&solution_id, cx);
+                            store.seed_active_member_if_unset(solution_id, cx);
                             cx.emit(SolutionStoreEvent::MemberAddCompleted {
-                                solution: solution_id.clone(),
-                                catalog: catalog_id.clone(),
+                                solution: solution_id,
+                                catalog: catalog_id,
                                 error: None,
                             });
                             cx.emit(SolutionStoreEvent::Changed);
                             cx.notify();
-                        })?;
+                            Ok(())
+                        })??;
                         Ok(())
                     }
                     Err(err) => {
@@ -306,16 +329,15 @@ impl SolutionStore {
                             // Re-emitting here would double-fire the completion
                             // event for one user action. Gate the failure
                             // mutation + emit on the entry still being present.
-                            if let Some(entry) = store
-                                .in_flight_adds
-                                .get_mut(&(solution_id.clone(), catalog_id.clone()))
+                            if let Some(entry) =
+                                store.in_flight_adds.get_mut(&(solution_id, catalog_id))
                             {
                                 entry.stage = "failed".into();
                                 entry.percent = None;
                                 entry.error = Some(err_text.clone());
                                 cx.emit(SolutionStoreEvent::MemberAddCompleted {
-                                    solution: solution_id.clone(),
-                                    catalog: catalog_id.clone(),
+                                    solution: solution_id,
+                                    catalog: catalog_id,
                                     error: Some(err_text),
                                 });
                                 cx.notify();
@@ -332,43 +354,51 @@ impl SolutionStore {
     /// Create a member that has no catalog backing — the user wanted a
     /// fresh empty project that lives only inside this solution. Spec D4:
     /// solutions are built only from catalog clones or empty projects;
-    /// external folders are not addable. The new member's `catalog_id` is a
-    /// slug derived from `project_name` and uniquified against the
-    /// solution's existing member catalog ids; nothing is inserted into
-    /// `catalog_projects`. The directory `solution.root/<slug>` is created
-    /// (incl. parents) and `git init`-ed with no remote, so the new project
-    /// tracks history from the start and can be pushed somewhere later via
-    /// the normal git UI. It never enters the catalog (which requires a
-    /// `remote_url`), so a remote-less local project is not offered in the
-    /// project picker when creating or editing other solutions. Display
-    /// name in selectors comes from the path's last segment via the
-    /// orphan-rendering rule.
+    /// external folders are not addable. The new member's folder name is a
+    /// slug derived from `project_name` and uniquified against the solution's
+    /// existing member names; nothing is inserted into `catalog_projects`. The
+    /// directory `solution.root/<slug>` is created (incl. parents) and
+    /// `git init`-ed with no remote, so the new project tracks history from
+    /// the start and can be pushed somewhere later via the normal git UI. It
+    /// never enters the catalog (which requires a `remote_url`), so a
+    /// remote-less local project is not offered in the project picker when
+    /// creating or editing other solutions.
     pub fn add_empty_member(
         &mut self,
-        solution_id: &SolutionId,
+        solution_id: SolutionId,
         project_name: &str,
         cx: &mut gpui::Context<Self>,
-    ) -> Result<CatalogId> {
+    ) -> Result<MemberId> {
         let trimmed = project_name.trim();
         if trimmed.is_empty() {
             bail!("empty project name");
         }
-        let sol = self.find_solution_mut(solution_id)?;
-        let taken: Vec<String> = sol.members.iter().map(|m| m.catalog_id.0.clone()).collect();
-        let slug = crate::slug::unique_slug(trimmed, &taken);
-        let cat_id = CatalogId(slug.clone());
-        let local_path = sol.root.join(&slug);
+        let sol = self.find_solution(solution_id)?;
+        let taken: Vec<String> = sol.members.iter().map(|m| m.name.clone()).collect();
+        let folder = crate::slug::unique_slug(trimmed, &taken);
+        let local_path = sol.root.join(&folder);
+        let position = sol.members.len() as i32;
         std::fs::create_dir_all(&local_path)
             .with_context(|| format!("creating {}", local_path.display()))?;
         init_empty_git_repo(&local_path).log_err();
+
+        let member_id = match self.db.as_ref() {
+            Some(db) => MemberId(gpui::block_on(db.insert_solution_member(
+                solution_id.0,
+                folder.clone(),
+                local_path.to_string_lossy().into_owned(),
+                position,
+                None,
+            ))?),
+            None => MemberId(self.next_id_without_db()),
+        };
+        let sol = self.find_solution_mut(solution_id)?;
         sol.members.push(SolutionMember {
-            catalog_id: cat_id.clone(),
+            id: member_id,
+            name: folder,
             local_path,
+            origin_catalog_id: None,
         });
-        let position = (sol.members.len() - 1) as i32;
-        let new_member = sol.members.last().expect("just pushed").clone();
-        self.db_set_member(solution_id, &new_member, position)
-            .log_err();
         // Seed the solution-wide active member when this is the first
         // project, so panels and newly-started AI / terminal sessions scope
         // to it immediately. Without this, `active_member` stays `None` until
@@ -379,17 +409,17 @@ impl SolutionStore {
         self.seed_active_member_if_unset(solution_id, cx);
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
-        Ok(cat_id)
+        Ok(member_id)
     }
 
     /// Snapshot of every in-flight or failed add for a solution. The dock
     /// panel renders these as ghost rows with spinners or error messages.
-    pub fn pending_adds_for(&self, sol_id: &SolutionId) -> Vec<PendingAddView> {
+    pub fn pending_adds_for(&self, sol_id: SolutionId) -> Vec<PendingAddView> {
         self.in_flight_adds
             .iter()
-            .filter(|((s, _), _)| s == sol_id)
+            .filter(|((s, _), _)| *s == sol_id)
             .map(|((_, cat_id), entry)| PendingAddView {
-                catalog_id: cat_id.clone(),
+                catalog_id: *cat_id,
                 catalog_name: entry.catalog_name.clone(),
                 stage: entry.stage.clone(),
                 percent: entry.percent,
@@ -404,18 +434,17 @@ impl SolutionStore {
     /// the next successful add for the same `(solution, catalog)`.
     pub fn cancel_add_member(
         &mut self,
-        solution_id: &SolutionId,
-        catalog_id: &CatalogId,
+        solution_id: SolutionId,
+        catalog_id: CatalogId,
         cx: &mut gpui::Context<Self>,
     ) {
-        let key = (solution_id.clone(), catalog_id.clone());
-        let Some(entry) = self.in_flight_adds.remove(&key) else {
+        let Some(entry) = self.in_flight_adds.remove(&(solution_id, catalog_id)) else {
             return;
         };
         entry.cancel_flag.store(true, Ordering::SeqCst);
         cx.emit(SolutionStoreEvent::MemberAddCompleted {
-            solution: solution_id.clone(),
-            catalog: catalog_id.clone(),
+            solution: solution_id,
+            catalog: catalog_id,
             error: Some("cancelled".into()),
         });
         cx.notify();
@@ -426,11 +455,11 @@ impl SolutionStore {
     /// that) or already gone.
     pub fn clear_failed_add(
         &mut self,
-        solution_id: &SolutionId,
-        catalog_id: &CatalogId,
+        solution_id: SolutionId,
+        catalog_id: CatalogId,
         cx: &mut gpui::Context<Self>,
     ) {
-        let key = (solution_id.clone(), catalog_id.clone());
+        let key = (solution_id, catalog_id);
         let drop_it = self
             .in_flight_adds
             .get(&key)
@@ -474,9 +503,7 @@ mod tests {
             .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
             .expect("create solution");
 
-        let task = store.update(cx, |s, cx| {
-            s.add_member(sol_id.clone(), cat_id.clone(), cache_root, cx)
-        });
+        let task = store.update(cx, |s, cx| s.add_member(sol_id, cat_id, cache_root, cx));
         task.await.expect("add_member");
 
         let target = store.read_with(cx, |s, _| {
@@ -516,22 +543,20 @@ mod tests {
             .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
             .expect("create solution");
 
-        let task = store.update(cx, |s, cx| {
-            s.add_member(sol_id.clone(), cat_id.clone(), cache_root, cx)
-        });
+        let task = store.update(cx, |s, cx| s.add_member(sol_id, cat_id, cache_root, cx));
 
         // The store inserts the in-flight entry synchronously before the
         // spawned task takes its first poll, so the UI can render the row
         // immediately. Without this, "Add looks frozen for 2 minutes" is
         // exactly what you'd see in the UI.
-        let pending = store.read_with(cx, |s, _| s.pending_adds_for(&sol_id));
+        let pending = store.read_with(cx, |s, _| s.pending_adds_for(sol_id));
         assert_eq!(pending.len(), 1);
         assert!(pending[0].error.is_none());
         assert_eq!(pending[0].catalog_id, cat_id);
 
         task.await.expect("add_member success");
 
-        let pending = store.read_with(cx, |s, _| s.pending_adds_for(&sol_id));
+        let pending = store.read_with(cx, |s, _| s.pending_adds_for(sol_id));
         assert!(
             pending.is_empty(),
             "in-flight entry must be cleared on success"
@@ -559,20 +584,18 @@ mod tests {
             .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
             .expect("create solution");
 
-        let task = store.update(cx, |s, cx| {
-            s.add_member(sol_id.clone(), cat_id.clone(), cache_root, cx)
-        });
+        let task = store.update(cx, |s, cx| s.add_member(sol_id, cat_id, cache_root, cx));
         let result = task.await;
         assert!(result.is_err(), "expected failure for non-existent source");
 
-        let pending = store.read_with(cx, |s, _| s.pending_adds_for(&sol_id));
+        let pending = store.read_with(cx, |s, _| s.pending_adds_for(sol_id));
         assert_eq!(pending.len(), 1, "failed entry must persist as a row");
         assert!(pending[0].error.is_some());
         assert_eq!(pending[0].catalog_id, cat_id);
 
         // Clearing the failed entry removes the row.
-        store.update(cx, |s, cx| s.clear_failed_add(&sol_id, &cat_id, cx));
-        let pending = store.read_with(cx, |s, _| s.pending_adds_for(&sol_id));
+        store.update(cx, |s, cx| s.clear_failed_add(sol_id, cat_id, cx));
+        let pending = store.read_with(cx, |s, _| s.pending_adds_for(sol_id));
         assert!(pending.is_empty());
     }
 
@@ -605,17 +628,15 @@ mod tests {
         // we want to exercise `cancel_add_member` against an actively
         // running spawned future, mirroring what happens when the user
         // hits the Cancel button.
-        let _task = store.update(cx, |s, cx| {
-            s.add_member(sol_id.clone(), cat_id.clone(), cache_root, cx)
-        });
+        let _task = store.update(cx, |s, cx| s.add_member(sol_id, cat_id, cache_root, cx));
 
         assert_eq!(
-            store.read_with(cx, |s, _| s.pending_adds_for(&sol_id).len()),
+            store.read_with(cx, |s, _| s.pending_adds_for(sol_id).len()),
             1
         );
-        store.update(cx, |s, cx| s.cancel_add_member(&sol_id, &cat_id, cx));
+        store.update(cx, |s, cx| s.cancel_add_member(sol_id, cat_id, cx));
         assert_eq!(
-            store.read_with(cx, |s, _| s.pending_adds_for(&sol_id).len()),
+            store.read_with(cx, |s, _| s.pending_adds_for(sol_id).len()),
             0,
             "UI row must disappear synchronously on cancel"
         );
@@ -636,21 +657,22 @@ mod tests {
             })
             .expect("create solution");
 
-        let cat_id = store
-            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Frontend", cx))
+        let member_id = store
+            .update(cx, |s, cx| s.add_empty_member(sol_id, "Frontend", cx))
             .expect("add_empty_member");
 
-        let (member_path, member_cat_id) = store.read_with(cx, |s, _| {
+        let (member_path, stored_member_id, origin) = store.read_with(cx, |s, _| {
             let sol = s
                 .solutions()
                 .iter()
                 .find(|x| x.id == sol_id)
                 .expect("solution");
             let m = sol.members.first().expect("member");
-            (m.local_path.clone(), m.catalog_id.clone())
+            (m.local_path.clone(), m.id, m.origin_catalog_id)
         });
 
-        assert_eq!(member_cat_id, cat_id);
+        assert_eq!(stored_member_id, member_id);
+        assert_eq!(origin, None, "an empty member has no catalog provenance");
         assert!(member_path.is_dir(), "directory must exist on disk");
         assert!(
             member_path.starts_with(&solutions_root),
@@ -680,25 +702,25 @@ mod tests {
             .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
             .expect("create solution");
         assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
+            store.read_with(cx, |s, _| s.active_member(sol_id)),
             None,
             "no active member before any project"
         );
         let first = store
-            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Frontend", cx))
+            .update(cx, |s, cx| s.add_empty_member(sol_id, "Frontend", cx))
             .expect("first add");
         assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
-            Some(first.clone()),
+            store.read_with(cx, |s, _| s.active_member(sol_id)),
+            Some(first),
             "first project must become the active member"
         );
         // A second project must not steal the active selection.
         let second = store
-            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Backend", cx))
+            .update(cx, |s, cx| s.add_empty_member(sol_id, "Backend", cx))
             .expect("second add");
         assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
-            Some(first.clone()),
+            store.read_with(cx, |s, _| s.active_member(sol_id)),
+            Some(first),
             "adding a second project must not change the active member"
         );
         // Make a NON-first member active, then add a third. This discriminates
@@ -706,14 +728,12 @@ mod tests {
         // would pick `members.first()` (= the first project), so without the
         // guard the active member would be reset to `first` here. The assertion
         // that it stays on `second` only holds because the guard short-circuits.
-        store.update(cx, |s, cx| {
-            s.set_active_member(sol_id.clone(), second.clone(), cx)
-        });
+        store.update(cx, |s, cx| s.set_active_member(sol_id, second, cx));
         store
-            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Infra", cx))
+            .update(cx, |s, cx| s.add_empty_member(sol_id, "Infra", cx))
             .expect("third add");
         assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
+            store.read_with(cx, |s, _| s.active_member(sol_id)),
             Some(second),
             "adding a project must not reset a non-first active member to the first"
         );
@@ -732,14 +752,14 @@ mod tests {
             .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
             .expect("create solution");
         let id1 = store
-            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Frontend", cx))
+            .update(cx, |s, cx| s.add_empty_member(sol_id, "Frontend", cx))
             .expect("first add");
         let id2 = store
-            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Frontend", cx))
+            .update(cx, |s, cx| s.add_empty_member(sol_id, "Frontend", cx))
             .expect("second add — must not collide");
         assert_ne!(
             id1, id2,
-            "two empty members from the same name must get distinct slugs"
+            "two empty members from the same name must get distinct ids"
         );
     }
 
@@ -756,7 +776,7 @@ mod tests {
             .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
             .expect("create solution");
         let _ = store
-            .update(cx, |s, cx| s.add_empty_member(&sol_id, "Frontend", cx))
+            .update(cx, |s, cx| s.add_empty_member(sol_id, "Frontend", cx))
             .expect("add empty");
         store.read_with(cx, |s, _| {
             assert!(
@@ -800,11 +820,11 @@ mod tests {
 
         let cb: AddProgressCallback = Box::new(|_stage, _percent, _app| {});
         let task = store.update(cx, |s, cx| {
-            s.add_member_with_progress(sol_id.clone(), cat_id.clone(), cache_root, cb, cx)
+            s.add_member_with_progress(sol_id, cat_id, cache_root, cb, cx)
         });
         task.await.expect("add_member success");
 
-        let pending = store.read_with(cx, |s, _| s.pending_adds_for(&sol_id));
+        let pending = store.read_with(cx, |s, _| s.pending_adds_for(sol_id));
         assert!(pending.is_empty());
     }
 }

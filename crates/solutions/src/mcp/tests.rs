@@ -56,16 +56,16 @@ use context_server::listener::McpServerTool;
     #[test]
     fn get_params_round_trip() {
         let p: GetSolutionParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo"
+            "solution_id": 7
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 7);
     }
 
     #[test]
     fn get_params_accepts_null() {
         let p: GetSolutionParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
+        assert_eq!(p.solution_id, 0);
     }
 
     #[test]
@@ -85,41 +85,41 @@ use context_server::listener::McpServerTool;
     #[test]
     fn rename_params_round_trip() {
         let p: RenameSolutionParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 3,
             "new_name": "Renamed"
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 3);
         assert_eq!(p.new_name, "Renamed");
     }
 
     #[test]
     fn delete_params_round_trip() {
         let p: DeleteSolutionParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo"
+            "solution_id": 3
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 3);
     }
 
     #[test]
     fn open_params_with_focus() {
         let p: OpenSolutionParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo",
+            "solution_id": 3,
             "focus": false
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 3);
         assert_eq!(p.focus, Some(false));
     }
 
     #[test]
     fn close_params_round_trip() {
         let p: CloseSolutionParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "demo"
+            "solution_id": 3
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "demo");
+        assert_eq!(p.solution_id, 3);
     }
 
     // NOTE: live-runner test for `solutions.create` requires a `SettingsStore`
@@ -144,7 +144,7 @@ use context_server::listener::McpServerTool;
         let response = cx
             .update(|cx| {
                 let tool = RenameSolutionTool;
-                let id = sol_id.as_str().to_string();
+                let id = sol_id.0;
                 cx.spawn(async move |cx| {
                     tool.run(
                         RenameSolutionParams {
@@ -159,7 +159,7 @@ use context_server::listener::McpServerTool;
             .await
             .expect("run task");
 
-        assert_eq!(response.structured_content.solution_id, sol_id.as_str());
+        assert_eq!(response.structured_content.solution_id, sol_id.0);
 
         let new_name = store.read_with(cx, |s, _| {
             s.solutions()
@@ -185,7 +185,7 @@ use context_server::listener::McpServerTool;
         let response = cx
             .update(|cx| {
                 let tool = DeleteSolutionTool;
-                let id = sol_id.as_str().to_string();
+                let id = sol_id.0;
                 cx.spawn(async move |cx| {
                     tool.run(DeleteSolutionParams { solution_id: id }, cx).await
                 })
@@ -228,20 +228,20 @@ use context_server::listener::McpServerTool;
     #[test]
     fn remove_catalog_params_round_trip() {
         let p: RemoveCatalogProjectParams = serde_json::from_value(serde_json::json!({
-            "catalog_id": "demo"
+            "catalog_id": 5
         }))
         .expect("parse");
-        assert_eq!(p.catalog_id, "demo");
+        assert_eq!(p.catalog_id, 5);
     }
 
     #[test]
     fn edit_catalog_params_partial() {
         let p: EditCatalogProjectParams = serde_json::from_value(serde_json::json!({
-            "catalog_id": "demo",
+            "catalog_id": 5,
             "name": "Renamed"
         }))
         .expect("parse");
-        assert_eq!(p.catalog_id, "demo");
+        assert_eq!(p.catalog_id, 5);
         assert_eq!(p.name.as_deref(), Some("Renamed"));
         assert!(p.default_branch.is_none());
     }
@@ -249,10 +249,10 @@ use context_server::listener::McpServerTool;
     #[test]
     fn refresh_cache_params_round_trip() {
         let p: RefreshCacheParams = serde_json::from_value(serde_json::json!({
-            "catalog_id": "demo"
+            "catalog_id": 5
         }))
         .expect("parse");
-        assert_eq!(p.catalog_id, "demo");
+        assert_eq!(p.catalog_id, 5);
     }
 
     #[gpui::test]
@@ -279,7 +279,10 @@ use context_server::listener::McpServerTool;
             .await
             .expect("run task");
 
-        assert_eq!(response.structured_content.catalog_id, "demo");
+        assert!(
+            response.structured_content.catalog_id > 0,
+            "a counter id must be allocated"
+        );
         let count = store.read_with(cx, |s, _| s.catalog().len());
         assert_eq!(count, 1);
     }
@@ -287,30 +290,29 @@ use context_server::listener::McpServerTool;
     #[test]
     fn add_member_params_round_trip() {
         let p: AddMemberParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "sol",
-            "catalog_id": "cat"
+            "solution_id": 1,
+            "catalog_id": 2
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "sol");
-        assert_eq!(p.catalog_id, "cat");
+        assert_eq!(p.solution_id, 1);
+        assert_eq!(p.catalog_id, 2);
     }
 
     #[test]
     fn remove_member_params_accepts_null() {
         let p: RemoveMemberParams = serde_json::from_value(serde_json::Value::Null).expect("null");
-        assert!(p.solution_id.is_empty());
-        assert!(p.catalog_id.is_empty());
+        assert_eq!(p.member_id, 0);
     }
 
     #[test]
     fn reorder_members_params_round_trip() {
         let p: ReorderMembersParams = serde_json::from_value(serde_json::json!({
-            "solution_id": "sol",
-            "ordered_catalog_ids": ["a", "b", "c"]
+            "solution_id": 1,
+            "member_ids": [3, 1, 2]
         }))
         .expect("parse");
-        assert_eq!(p.solution_id, "sol");
-        assert_eq!(p.ordered_catalog_ids, vec!["a", "b", "c"]);
+        assert_eq!(p.solution_id, 1);
+        assert_eq!(p.member_ids, vec![3, 1, 2]);
     }
 
     #[gpui::test]
@@ -329,9 +331,7 @@ use context_server::listener::McpServerTool;
                 s.create_solution("Sol", dir.path().to_path_buf(), cx)
             })
             .expect("create");
-        store.update(cx, |s, _| {
-            s.test_force_add_member(&sol_id, &cat_id);
-        });
+        let member_id = store.update(cx, |s, _| s.test_force_add_member(sol_id, cat_id));
 
         let count_before = store.read_with(cx, |s, _| {
             s.solutions()
@@ -345,17 +345,9 @@ use context_server::listener::McpServerTool;
         let response = cx
             .update(|cx| {
                 let tool = RemoveMemberTool;
-                let solution_id = sol_id.as_str().to_string();
-                let catalog_id = cat_id.as_str().to_string();
+                let member_id = member_id.0;
                 cx.spawn(async move |cx| {
-                    tool.run(
-                        RemoveMemberParams {
-                            solution_id,
-                            catalog_id,
-                        },
-                        cx,
-                    )
-                    .await
+                    tool.run(RemoveMemberParams { member_id }, cx).await
                 })
             })
             .await
@@ -546,12 +538,15 @@ use context_server::listener::McpServerTool;
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("c.json"), cx));
         cx.update(|cx| crate::store::install_global_for_test(store.clone(), cx));
-        let _sol_id = store
+        let sol_id = store
             .update(cx, |s, cx| {
                 s.create_solution("Sol", dir.path().to_path_buf(), cx)
             })
             .expect("create");
-        let result = cx.update(|cx| validate_path_in_solution("sol", "/etc/passwd", cx));
+        // `project.*` tools still take the solution id as a string on the wire;
+        // it is now the numeric id rendered as text.
+        let sol_id = sol_id.0.to_string();
+        let result = cx.update(|cx| validate_path_in_solution(&sol_id, "/etc/passwd", cx));
         assert!(matches!(
             result,
             Err(PathValidationError::PathOutsideSolution)

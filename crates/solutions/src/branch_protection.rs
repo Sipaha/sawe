@@ -105,8 +105,10 @@ pub fn check_with_snapshot(
     op: &str,
 ) -> Decision {
     let member = resolve_member(snapshot.solution.as_ref(), repo_path);
+    // Settings key the per-member overrides by the member's folder name (which
+    // is what the old `catalog_id` slug was).
     let member_rules = member
-        .and_then(|m| snapshot.settings.members.get(m.catalog_id.as_str()))
+        .and_then(|m| snapshot.settings.members.get(m.name.as_str()))
         .cloned()
         .unwrap_or_default();
 
@@ -274,7 +276,7 @@ pub fn make_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CatalogId, SolutionId, SolutionMember};
+    use crate::model::{MemberId, SolutionId, SolutionMember};
     use crate::settings::BranchProtectionMember;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -304,12 +306,14 @@ mod tests {
         // synthetic Solution+member to exercise the no_force_push path.
         s.members.insert("alpha".into(), member);
         let solution = Solution {
-            id: SolutionId("s".into()),
+            id: SolutionId(1),
             name: "S".into(),
             root: PathBuf::from("/repo"),
             members: vec![SolutionMember {
-                catalog_id: CatalogId("alpha".into()),
+                id: MemberId(1),
+                name: "alpha".into(),
                 local_path: PathBuf::from("/repo/a"),
+                origin_catalog_id: None,
             }],
             last_opened_at: None,
         };
@@ -386,12 +390,14 @@ mod tests {
             },
         );
         let solution = Solution {
-            id: SolutionId("s".into()),
+            id: SolutionId(1),
             name: "S".into(),
             root: PathBuf::from("/repo"),
             members: vec![SolutionMember {
-                catalog_id: CatalogId("alpha".into()),
+                id: MemberId(1),
+                name: "alpha".into(),
                 local_path: PathBuf::from("/repo/a"),
+                origin_catalog_id: None,
             }],
             last_opened_at: None,
         };

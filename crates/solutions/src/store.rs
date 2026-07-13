@@ -1,6 +1,6 @@
 use crate::add_member::InFlightAdd;
 use crate::db::SolutionsDb;
-use crate::model::{CatalogId, CatalogProject, Solution, SolutionId, SolutionMember};
+use crate::model::{CatalogId, CatalogProject, MemberId, Solution, SolutionId, SolutionMember};
 use crate::persistence::{CURRENT_VERSION, SolutionsConfig};
 use crate::tabs_snapshot::{SolutionTabsSnapshot, TabSnapshots};
 use collections::{HashMap, HashSet};
@@ -30,11 +30,11 @@ pub struct SolutionStore {
     /// tabs themselves), and persistence would mean keeping
     /// `solutions.json` in sync with potentially-stale path lists.
     pub(crate) tab_snapshots: TabSnapshots,
-    /// Solution-wide active catalog member selection. Hydrated from the
+    /// Solution-wide active member selection. Hydrated from the
     /// `active_member` DB table at init time and updated through
     /// `set_active_member`. The cache exists so callers don't round-trip
     /// through SQL on every render.
-    pub(crate) active_member: HashMap<SolutionId, CatalogId>,
+    pub(crate) active_member: HashMap<SolutionId, MemberId>,
     /// Runtime-only set of solutions whose desktop window is currently open.
     /// Populated by `event_sources::install` from MultiWorkspace lifecycle
     /// (observe_new fires on window creation; observe_release fires on close).
@@ -78,7 +78,7 @@ pub enum SolutionStoreEvent {
     /// just-removed project — `Changed` alone does not drive a panel rebuild.
     ActiveMemberChanged {
         solution: SolutionId,
-        catalog: Option<CatalogId>,
+        member: Option<MemberId>,
     },
     /// Emitted when a Solution is removed from the store. Carries the
     /// solution's `root` path captured *before* removal, because the
@@ -131,6 +131,9 @@ impl SolutionStore {
         if let Err(err) = crate::migrate::run_one_time_migration(&db, &json_path) {
             log::error!("solutions::store: legacy import failed: {err}. Continuing with empty DB.");
         }
+        if let Err(err) = crate::migrate::verify_identity_migration(&db) {
+            log::error!("solutions::store: IDENTITY MIGRATION VERIFICATION FAILED: {err}");
+        }
         let config = match Self::load_from_db_blocking(&db) {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -148,9 +151,9 @@ impl SolutionStore {
                 Vec::new()
             }
         };
-        let mut active_member: HashMap<SolutionId, CatalogId> = HashMap::default();
-        for (sid, cid) in active_member_rows {
-            active_member.insert(SolutionId(sid), CatalogId(cid));
+        let mut active_member: HashMap<SolutionId, MemberId> = HashMap::default();
+        for (sid, mid) in active_member_rows {
+            active_member.insert(SolutionId(sid), MemberId(mid));
         }
         let store = cx.new(|_| SolutionStore {
             config,
@@ -177,25 +180,38 @@ impl SolutionStore {
             .collect();
 
         let solution_rows = gpui::block_on(db.load_all_solutions_with_members())?;
-        let mut by_id: collections::HashMap<String, Solution> = collections::HashMap::default();
-        let mut order: Vec<String> = Vec::new();
-        for (sid, sname, sroot, last_opened_at, catalog_id, local_path, _position) in solution_rows
+        let mut by_id: collections::HashMap<i64, Solution> = collections::HashMap::default();
+        let mut order: Vec<i64> = Vec::new();
+        for (
+            sid,
+            sname,
+            sroot,
+            last_opened_at,
+            member_id,
+            member_name,
+            local_path,
+            _position,
+            origin_catalog_id,
+        ) in solution_rows
         {
-            let entry = by_id.entry(sid.clone()).or_insert_with(|| {
-                order.push(sid.clone());
+            let entry = by_id.entry(sid).or_insert_with(|| {
+                order.push(sid);
                 Solution {
-                    id: SolutionId(sid.clone()),
+                    id: SolutionId(sid),
                     name: sname,
                     root: PathBuf::from(sroot),
                     members: vec![],
-                    last_opened_at: last_opened_at
-                        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis),
+                    last_opened_at,
                 }
             });
-            if !catalog_id.is_empty() {
+            // The LEFT JOIN yields a NULL member id for a memberless solution;
+            // sqlez reads that back as 0, and counter ids start at 1.
+            if member_id != 0 {
                 entry.members.push(SolutionMember {
-                    catalog_id: CatalogId(catalog_id),
+                    id: MemberId(member_id),
+                    name: member_name,
                     local_path: PathBuf::from(local_path),
+                    origin_catalog_id: origin_catalog_id.map(CatalogId),
                 });
             }
         }
@@ -239,8 +255,8 @@ impl SolutionStore {
     /// Empty / missing entries return `None`. Used by the in-place
     /// switch orchestrator after worktrees have been swapped to find
     /// out which buffers to re-open.
-    pub fn tab_snapshot(&self, id: &SolutionId) -> Option<&SolutionTabsSnapshot> {
-        self.tab_snapshots.get(id)
+    pub fn tab_snapshot(&self, id: SolutionId) -> Option<&SolutionTabsSnapshot> {
+        self.tab_snapshots.get(&id)
     }
 
     /// Write the open-tab snapshot for a given Solution. An empty
@@ -293,17 +309,12 @@ impl SolutionStore {
     /// Only available in test builds.
     #[cfg(any(test, feature = "test-support"))]
     pub fn create_for_test_minimal(&mut self, name: &str, cx: &mut Context<Self>) -> SolutionId {
-        let taken: Vec<String> = self
-            .config
-            .solutions
-            .iter()
-            .map(|s| s.id.0.clone())
-            .collect();
-        let slug = crate::slug::unique_slug(name, &taken);
-        let id = SolutionId(slug.clone());
-        let root = std::env::temp_dir().join("spke-test-solutions").join(&slug);
+        let id = SolutionId(self.next_id_without_db());
+        let root = std::env::temp_dir()
+            .join("spke-test-solutions")
+            .join(crate::slug::slugify(name));
         self.config.solutions.push(Solution {
-            id: id.clone(),
+            id,
             name: name.into(),
             root,
             members: vec![],
@@ -319,10 +330,9 @@ impl SolutionStore {
     /// `merge_catalog_project` exists to clean up).
     #[cfg(test)]
     pub fn test_force_add_catalog(&mut self, name: &str, remote_url: &str) -> CatalogId {
-        let taken: Vec<String> = self.config.catalog.iter().map(|c| c.id.0.clone()).collect();
-        let id = CatalogId(crate::slug::unique_slug(name, &taken));
+        let id = CatalogId(self.next_id_without_db());
         self.config.catalog.push(CatalogProject {
-            id: id.clone(),
+            id,
             name: name.into(),
             remote_url: remote_url.into(),
             default_branch: None,
@@ -331,17 +341,29 @@ impl SolutionStore {
     }
 
     #[cfg(test)]
-    pub fn test_force_add_member(&mut self, sid: &SolutionId, cid: &CatalogId) {
+    pub fn test_force_add_member(&mut self, sid: SolutionId, cid: CatalogId) -> MemberId {
+        let member_id = MemberId(self.next_id_without_db());
+        let name = self
+            .config
+            .catalog
+            .iter()
+            .find(|c| c.id == cid)
+            .map(|c| crate::slug::slugify(&c.name))
+            .unwrap_or_else(|| format!("member-{}", member_id.0));
         let sol = self
             .config
             .solutions
             .iter_mut()
-            .find(|s| s.id == *sid)
+            .find(|s| s.id == sid)
             .expect("test_force_add_member: solution not found");
+        let local_path = sol.root.join(&name);
         sol.members.push(SolutionMember {
-            catalog_id: cid.clone(),
-            local_path: sol.root.join(&cid.0),
+            id: member_id,
+            name,
+            local_path,
+            origin_catalog_id: Some(cid),
         });
+        member_id
     }
 
     /// Push a member with an explicit `local_path` onto a solution, bypassing
@@ -350,20 +372,24 @@ impl SolutionStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_add_member_with_path(
         &mut self,
-        sid: &SolutionId,
-        cid: &CatalogId,
+        sid: SolutionId,
+        name: &str,
         local_path: PathBuf,
-    ) {
+    ) -> MemberId {
+        let member_id = MemberId(self.next_id_without_db());
         let sol = self
             .config
             .solutions
             .iter_mut()
-            .find(|s| s.id == *sid)
+            .find(|s| s.id == sid)
             .expect("test_add_member_with_path: solution not found");
         sol.members.push(SolutionMember {
-            catalog_id: cid.clone(),
+            id: member_id,
+            name: name.into(),
             local_path,
+            origin_catalog_id: None,
         });
+        member_id
     }
 }
 
@@ -470,7 +496,7 @@ mod tests {
                 s.add_catalog_project("Foo", "git@x:foo.git", None, cx)
             })
             .expect("first add");
-        assert_eq!(id1.as_str(), "foo");
+        assert!(id1.0 > 0, "a counter id must be allocated");
 
         let same_name = store.update(cx, |s, cx| {
             s.add_catalog_project("Foo", "git@x:other-foo.git", None, cx)
@@ -518,7 +544,7 @@ mod tests {
             .expect("add bar");
 
         let clash = store.update(cx, |s, cx| {
-            s.edit_catalog_project(&bar, Some("foo".into()), None, None, cx)
+            s.edit_catalog_project(bar, Some("foo".into()), None, None, cx)
         });
         assert!(
             clash.unwrap_err().to_string().contains("duplicate_name"),
@@ -536,7 +562,7 @@ mod tests {
         // A no-op self-rename is still allowed.
         store
             .update(cx, |s, cx| {
-                s.edit_catalog_project(&bar, Some("Bar".into()), None, None, cx)
+                s.edit_catalog_project(bar, Some("Bar".into()), None, None, cx)
             })
             .expect("self-rename must be allowed");
     }
@@ -565,7 +591,7 @@ mod tests {
         let sol = store
             .update(cx, |s, cx| s.create_solution("Sol", root, cx))
             .expect("create solution");
-        store.update(cx, |s, _| s.test_force_add_member(&sol, &duplicate));
+        store.update(cx, |s, _| s.test_force_add_member(sol, duplicate));
         let path_before = store.read_with(cx, |s, _| {
             s.solutions()
                 .iter()
@@ -574,7 +600,7 @@ mod tests {
         });
 
         let repointed = store
-            .update(cx, |s, cx| s.merge_catalog_project(&duplicate, &canonical, cx))
+            .update(cx, |s, cx| s.merge_catalog_project(duplicate, canonical, cx))
             .expect("merge");
         assert_eq!(repointed, 1);
 
@@ -585,12 +611,15 @@ mod tests {
                     .find(|x| x.id == sol)
                     .map(|x| x.members.clone())
                     .unwrap_or_default(),
-                s.catalog().iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+                s.catalog().iter().map(|c| c.id).collect::<Vec<_>>(),
             )
         });
         assert_eq!(
-            members.iter().map(|m| &m.catalog_id).collect::<Vec<_>>(),
-            vec![&canonical],
+            members
+                .iter()
+                .map(|m| m.origin_catalog_id)
+                .collect::<Vec<_>>(),
+            vec![Some(canonical)],
             "the member must now point at the canonical entry"
         );
         assert_eq!(
@@ -623,8 +652,8 @@ mod tests {
 
         // Merge is deduplication, not a repoint tool.
         let err = store
-            .update(cx, |s, cx| s.merge_catalog_project(&bar, &foo, cx))
-            .unwrap_err()
+            .update(cx, |s, cx| s.merge_catalog_project(bar, foo, cx))
+            .expect_err("merging unrelated entries must fail")
             .to_string();
         assert!(err.contains("not_duplicates"), "got {err}");
 
@@ -635,12 +664,12 @@ mod tests {
             .update(cx, |s, cx| s.create_solution("Sol", root, cx))
             .expect("create solution");
         store.update(cx, |s, _| {
-            s.test_force_add_member(&sol, &foo);
-            s.test_force_add_member(&sol, &dup);
+            s.test_force_add_member(sol, foo);
+            s.test_force_add_member(sol, dup);
         });
         let err = store
-            .update(cx, |s, cx| s.merge_catalog_project(&dup, &foo, cx))
-            .unwrap_err()
+            .update(cx, |s, cx| s.merge_catalog_project(dup, foo, cx))
+            .expect_err("a solution holding both halves must refuse")
             .to_string();
         assert!(err.contains("solution_holds_both"), "got {err}");
     }
@@ -660,11 +689,9 @@ mod tests {
         let sol_id = store
             .update(cx, |s, cx| s.create_solution("Sol", solutions_root, cx))
             .expect("create solution");
-        store.update(cx, |s, _| {
-            s.test_force_add_member(&sol_id, &cat_id);
-        });
+        store.update(cx, |s, _| s.test_force_add_member(sol_id, cat_id));
 
-        let result = store.update(cx, |s, cx| s.remove_catalog_project(&cat_id, cx));
+        let result = store.update(cx, |s, cx| s.remove_catalog_project(cat_id, cx));
         assert!(result.is_err(), "expected refusal");
     }
 
@@ -675,23 +702,20 @@ mod tests {
         let sol_id = store
             .update(cx, |s, cx| s.create_solution("Sol", dir.path().to_path_buf(), cx))
             .expect("create");
-        let a = CatalogId("alpha".into());
-        let b = CatalogId("beta".into());
-        store.update(cx, |s, _| {
-            s.test_force_add_member(&sol_id, &a);
-            s.test_force_add_member(&sol_id, &b);
+        let (a, b) = store.update(cx, |s, _| {
+            (
+                s.test_add_member_with_path(sol_id, "alpha", dir.path().join("alpha")),
+                s.test_add_member_with_path(sol_id, "beta", dir.path().join("beta")),
+            )
         });
         // Make `alpha` the active member, then remove it.
-        store.update(cx, |s, cx| s.set_active_member(sol_id.clone(), a.clone(), cx));
+        store.update(cx, |s, cx| s.set_active_member(sol_id, a, cx));
         store
-            .update(cx, |s, cx| s.remove_member(&sol_id, &a, cx))
+            .update(cx, |s, cx| s.remove_member(a, cx))
             .expect("remove active member");
         // Active member must follow to the surviving member, not go `None`
         // (which would make the project panel fall back to "show all").
-        assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
-            Some(b),
-        );
+        assert_eq!(store.read_with(cx, |s, _| s.active_member(sol_id)), Some(b));
     }
 
     #[gpui::test]
@@ -701,9 +725,10 @@ mod tests {
         let sol_id = store
             .update(cx, |s, cx| s.create_solution("Sol", dir.path().to_path_buf(), cx))
             .expect("create");
-        let only = CatalogId("only".into());
-        store.update(cx, |s, _| s.test_force_add_member(&sol_id, &only));
-        store.update(cx, |s, cx| s.set_active_member(sol_id.clone(), only.clone(), cx));
+        let only = store.update(cx, |s, _| {
+            s.test_add_member_with_path(sol_id, "only", dir.path().join("only"))
+        });
+        store.update(cx, |s, cx| s.set_active_member(sol_id, only, cx));
 
         // Collect events so we can assert the cleared-member notification
         // actually fires — member-scoped panels rebuild on `ActiveMemberChanged`
@@ -719,19 +744,16 @@ mod tests {
         });
 
         store
-            .update(cx, |s, cx| s.remove_member(&sol_id, &only, cx))
+            .update(cx, |s, cx| s.remove_member(only, cx))
             .expect("remove last member");
         cx.run_until_parked();
-        assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol_id).cloned()),
-            None,
-        );
+        assert_eq!(store.read_with(cx, |s, _| s.active_member(sol_id)), None);
         let events = events.lock().expect("events lock");
         assert!(
             events.iter().any(|e| matches!(e,
-                SolutionStoreEvent::ActiveMemberChanged { solution, catalog }
-                    if *solution == sol_id && catalog.is_none())),
-            "expected ActiveMemberChanged {{ catalog: None }} on last-member removal; got: {events:?}"
+                SolutionStoreEvent::ActiveMemberChanged { solution, member }
+                    if *solution == sol_id && member.is_none())),
+            "expected ActiveMemberChanged {{ member: None }} on last-member removal; got: {events:?}"
         );
     }
 
@@ -759,14 +781,14 @@ mod tests {
         store.read_with(cx, |s, _| {
             // Exact match on the stored root.
             assert_eq!(
-                s.solution_for_path(&actual_root).map(|x| x.id.clone()),
-                Some(sol_id.clone()),
+                s.solution_for_path(&actual_root).map(|x| x.id),
+                Some(sol_id),
             );
             // Descendant.
             assert_eq!(
                 s.solution_for_path(&actual_root.join("nested/file.rs"))
-                    .map(|x| x.id.clone()),
-                Some(sol_id.clone()),
+                    .map(|x| x.id),
+                Some(sol_id),
             );
             // Sibling at the same parent — not under actual_root.
             let sibling = root_base.join("not-alpha");
@@ -813,14 +835,14 @@ mod tests {
             })
             .expect("sol Two");
         store.update(cx, |s, _| {
-            s.test_force_add_member(&sol_one, &cat_a);
-            s.test_force_add_member(&sol_one, &cat_b);
-            s.test_force_add_member(&sol_two, &cat_a);
+            s.test_force_add_member(sol_one, cat_a);
+            s.test_force_add_member(sol_one, cat_b);
+            s.test_force_add_member(sol_two, cat_a);
         });
 
         // Removing A cascades into both solutions; B is untouched.
         let dropped_paths = store
-            .update(cx, |s, cx| s.remove_catalog_project_cascade(&cat_a, cx))
+            .update(cx, |s, cx| s.remove_catalog_project_cascade(cat_a, cx))
             .expect("cascade remove");
         // Cascade returns the local paths the caller now owns the
         // responsibility of wiping. test_force_add_member assigns them
@@ -833,10 +855,18 @@ mod tests {
                 "catalog entry must be gone"
             );
             assert!(s.catalog().iter().any(|c| c.id == cat_b), "B preserved");
-            let one = s.solutions().iter().find(|x| x.id == sol_one).unwrap();
+            let one = s
+                .solutions()
+                .iter()
+                .find(|x| x.id == sol_one)
+                .expect("solution One");
             assert_eq!(one.members.len(), 1, "One keeps only B");
-            assert_eq!(one.members[0].catalog_id, cat_b);
-            let two = s.solutions().iter().find(|x| x.id == sol_two).unwrap();
+            assert_eq!(one.members[0].origin_catalog_id, Some(cat_b));
+            let two = s
+                .solutions()
+                .iter()
+                .find(|x| x.id == sol_two)
+                .expect("solution Two");
             assert!(two.members.is_empty(), "Two had only A so it ends up empty");
         });
     }
@@ -845,9 +875,8 @@ mod tests {
     async fn remove_catalog_project_cascade_errors_for_unknown_id(cx: &mut TestAppContext) {
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("solutions.json"), cx));
-        let result = store.update(cx, |s, cx| {
-            s.remove_catalog_project_cascade(&CatalogId("ghost".into()), cx)
-        });
+        let result =
+            store.update(cx, |s, cx| s.remove_catalog_project_cascade(CatalogId(999), cx));
         assert!(result.is_err());
     }
 
@@ -869,10 +898,10 @@ mod tests {
             })
             .expect("sol B");
         store.update(cx, |s, _| {
-            s.test_force_add_member(&sol_a, &cat);
-            s.test_force_add_member(&sol_b, &cat);
+            s.test_force_add_member(sol_a, cat);
+            s.test_force_add_member(sol_b, cat);
         });
-        let mut refs = store.read_with(cx, |s, _| s.solutions_referencing(&cat));
+        let mut refs = store.read_with(cx, |s, _| s.solutions_referencing(cat));
         refs.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].0, sol_a);
@@ -899,15 +928,13 @@ mod tests {
         let sol_id = store
             .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
             .expect("create solution");
-        let task = store.update(cx, |s, cx| {
-            s.add_member(sol_id.clone(), cat_id.clone(), cache_root, cx)
-        });
+        let task = store.update(cx, |s, cx| s.add_member(sol_id, cat_id, cache_root, cx));
         task.await.expect("add_member success");
 
         let new_url = format!("{original_url}-renamed");
         store
             .update(cx, |s, cx| {
-                s.edit_catalog_project(&cat_id, None, None, Some(new_url.clone()), cx)
+                s.edit_catalog_project(cat_id, None, None, Some(new_url.clone()), cx)
             })
             .expect("edit catalog");
 
@@ -915,7 +942,7 @@ mod tests {
             s.solutions()
                 .iter()
                 .find(|x| x.id == sol_id)
-                .unwrap()
+                .expect("solution exists")
                 .members[0]
                 .local_path
                 .clone()
@@ -968,10 +995,10 @@ mod tests {
             .update(cx, |s, cx| s.add_catalog_project("B", "git@x:b", None, cx))
             .expect("add B");
         store.update(cx, |s, _| {
-            s.test_force_add_member(&sol_id, &cat_a);
-            s.test_force_add_member(&sol_id, &cat_b);
+            s.test_force_add_member(sol_id, cat_a);
+            s.test_force_add_member(sol_id, cat_b);
         });
-        let paths = store.read_with(cx, |s, _| s.paths_for_open(&sol_id).expect("paths"));
+        let paths = store.read_with(cx, |s, _| s.paths_for_open(sol_id).expect("paths"));
         assert_eq!(paths.len(), 2);
         assert!(paths[0].ends_with("a"));
         assert!(paths[1].ends_with("b"));
@@ -991,9 +1018,9 @@ mod tests {
             active_path: Some(PathBuf::from("/y")),
         };
         store.update(cx, |s, cx| {
-            s.store_tab_snapshot(sol_id.clone(), snapshot.clone(), cx);
+            s.store_tab_snapshot(sol_id, snapshot.clone(), cx);
         });
-        let recovered = store.read_with(cx, |s, _| s.tab_snapshot(&sol_id).cloned());
+        let recovered = store.read_with(cx, |s, _| s.tab_snapshot(sol_id).cloned());
         assert_eq!(recovered, Some(snapshot));
     }
 
@@ -1008,16 +1035,16 @@ mod tests {
             .expect("create solution");
         store.update(cx, |s, cx| {
             s.store_tab_snapshot(
-                sol_id.clone(),
+                sol_id,
                 SolutionTabsSnapshot {
                     open_paths: vec![PathBuf::from("/x")],
                     active_path: None,
                 },
                 cx,
             );
-            s.store_tab_snapshot(sol_id.clone(), SolutionTabsSnapshot::default(), cx);
+            s.store_tab_snapshot(sol_id, SolutionTabsSnapshot::default(), cx);
         });
-        let still = store.read_with(cx, |s, _| s.tab_snapshot(&sol_id).cloned());
+        let still = store.read_with(cx, |s, _| s.tab_snapshot(sol_id).cloned());
         assert!(
             still.is_none(),
             "default (empty) snapshot must evict the entry; got {still:?}"
@@ -1028,8 +1055,8 @@ mod tests {
     async fn set_active_member_emits(cx: &mut TestAppContext) {
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("s.json"), cx));
-        let sol = SolutionId("s1".into());
-        let cat = CatalogId("cat-a".into());
+        let sol = SolutionId(1);
+        let member = MemberId(2);
         let events: std::sync::Arc<std::sync::Mutex<Vec<SolutionStoreEvent>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let _sub = cx.update(|cx| {
@@ -1038,17 +1065,17 @@ mod tests {
                 events.lock().expect("events lock").push(ev.clone());
             })
         });
-        store.update(cx, |s, cx| s.set_active_member(sol.clone(), cat.clone(), cx));
+        store.update(cx, |s, cx| s.set_active_member(sol, member, cx));
         cx.run_until_parked();
         assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol).cloned()),
-            Some(cat.clone())
+            store.read_with(cx, |s, _| s.active_member(sol)),
+            Some(member)
         );
         let events = events.lock().expect("events lock");
         assert!(
             events.iter().any(|e| matches!(e,
-                SolutionStoreEvent::ActiveMemberChanged { solution, catalog }
-                    if *solution == sol && catalog.as_ref() == Some(&cat))),
+                SolutionStoreEvent::ActiveMemberChanged { solution, member: m }
+                    if *solution == sol && *m == Some(member))),
             "expected ActiveMemberChanged event; got: {events:?}"
         );
     }
@@ -1057,42 +1084,48 @@ mod tests {
     async fn ensure_active_member_seeds_first_when_absent(cx: &mut TestAppContext) {
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("s.json"), cx));
-        let sol = SolutionId("s1".into());
-        let cat_a = CatalogId("cat-a".into());
-        let cat_b = CatalogId("cat-b".into());
+        let sol = SolutionId(1);
+        let member_a = MemberId(10);
+        let member_b = MemberId(11);
         let members = vec![
             SolutionMember {
-                catalog_id: cat_a.clone(),
+                id: member_a,
+                name: "a".into(),
                 local_path: std::path::PathBuf::from("/tmp/a"),
+                origin_catalog_id: None,
             },
             SolutionMember {
-                catalog_id: cat_b.clone(),
+                id: member_b,
+                name: "b".into(),
                 local_path: std::path::PathBuf::from("/tmp/b"),
+                origin_catalog_id: None,
             },
         ];
         // No selection yet → seeds first member.
-        let result = store.update(cx, |s, cx| s.ensure_active_member(&sol, &members, cx));
-        assert_eq!(result, Some(cat_a.clone()));
+        let result = store.update(cx, |s, cx| s.ensure_active_member(sol, &members, cx));
+        assert_eq!(result, Some(member_a));
         assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol).cloned()),
-            Some(cat_a.clone())
+            store.read_with(cx, |s, _| s.active_member(sol)),
+            Some(member_a)
         );
         // Already set to a member → returns existing without change.
-        let result2 = store.update(cx, |s, cx| s.ensure_active_member(&sol, &members, cx));
-        assert_eq!(result2, Some(cat_a));
+        let result2 = store.update(cx, |s, cx| s.ensure_active_member(sol, &members, cx));
+        assert_eq!(result2, Some(member_a));
         // Existing selection removed from members → reseeds to first remaining.
         let members2 = vec![SolutionMember {
-            catalog_id: cat_b.clone(),
+            id: member_b,
+            name: "b".into(),
             local_path: std::path::PathBuf::from("/tmp/b"),
+            origin_catalog_id: None,
         }];
-        let result3 = store.update(cx, |s, cx| s.ensure_active_member(&sol, &members2, cx));
-        assert_eq!(result3, Some(cat_b.clone()));
+        let result3 = store.update(cx, |s, cx| s.ensure_active_member(sol, &members2, cx));
+        assert_eq!(result3, Some(member_b));
         assert_eq!(
-            store.read_with(cx, |s, _| s.active_member(&sol).cloned()),
-            Some(cat_b)
+            store.read_with(cx, |s, _| s.active_member(sol)),
+            Some(member_b)
         );
         // Empty members → returns None.
-        let result4 = store.update(cx, |s, cx| s.ensure_active_member(&sol, &[], cx));
+        let result4 = store.update(cx, |s, cx| s.ensure_active_member(sol, &[], cx));
         assert_eq!(result4, None);
     }
 
@@ -1114,14 +1147,14 @@ mod tests {
             })
         });
         store
-            .update(cx, |s, cx| s.touch_last_opened(&sol_id, cx))
+            .update(cx, |s, cx| s.touch_last_opened(sol_id, cx))
             .expect("touch");
         cx.run_until_parked();
         let events = events.lock().expect("events lock");
         let active_changes: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                SolutionStoreEvent::ActiveSolutionChanged(id) => Some(id.clone()),
+                SolutionStoreEvent::ActiveSolutionChanged(id) => Some(*id),
                 _ => None,
             })
             .collect();

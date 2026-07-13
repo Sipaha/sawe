@@ -1,7 +1,6 @@
 use super::{SolutionStore, SolutionStoreEvent};
 use crate::git;
-use crate::model::{CatalogId, CatalogProject, SolutionId, SolutionMember};
-use crate::slug::unique_slug;
+use crate::model::{CatalogId, CatalogProject, MemberId, SolutionId, SolutionMember};
 use anyhow::{Context as _, Result, bail};
 use std::path::PathBuf;
 use util::ResultExt as _;
@@ -47,16 +46,20 @@ impl SolutionStore {
                 clash.remote_url,
             );
         }
-        let taken: Vec<String> = self.config.catalog.iter().map(|c| c.id.0.clone()).collect();
-        let slug = unique_slug(name, &taken);
-        let id = CatalogId(slug);
+        let id = match self.db.as_ref() {
+            Some(db) => CatalogId(gpui::block_on(db.insert_catalog_project(
+                name.to_string(),
+                remote_url.to_string(),
+                default_branch.clone(),
+            ))?),
+            None => CatalogId(self.next_id_without_db()),
+        };
         self.config.catalog.push(CatalogProject {
-            id: id.clone(),
+            id,
             name: name.into(),
             remote_url: remote_url.into(),
             default_branch,
         });
-        self.db_save_catalog(self.config.catalog.last().expect("just pushed"))?;
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
         Ok(id)
@@ -64,7 +67,7 @@ impl SolutionStore {
 
     pub fn edit_catalog_project(
         &mut self,
-        id: &CatalogId,
+        id: CatalogId,
         new_name: Option<String>,
         new_default_branch: Option<String>,
         new_remote_url: Option<String>,
@@ -80,7 +83,7 @@ impl SolutionStore {
                 .config
                 .catalog
                 .iter()
-                .find(|c| c.id != *id && same_name(&c.name, name))
+                .find(|c| c.id != id && same_name(&c.name, name))
         {
             bail!(
                 "duplicate_name: catalog already has a project named \"{}\" ({})",
@@ -93,7 +96,7 @@ impl SolutionStore {
                 .config
                 .catalog
                 .iter()
-                .find(|c| c.id != *id && same_remote(&c.remote_url, url))
+                .find(|c| c.id != id && same_remote(&c.remote_url, url))
         {
             bail!(
                 "duplicate_remote: catalog already has \"{}\" pointing at {}",
@@ -105,8 +108,8 @@ impl SolutionStore {
             .config
             .catalog
             .iter_mut()
-            .find(|p| p.id == *id)
-            .with_context(|| format!("catalog_not_found: {}", id.0))?;
+            .find(|p| p.id == id)
+            .with_context(|| format!("catalog_not_found: {id}"))?;
         if let Some(name) = new_name {
             proj.name = name;
         }
@@ -130,8 +133,8 @@ impl SolutionStore {
             .config
             .catalog
             .iter()
-            .find(|c| c.id == *id)
-            .expect("just edited")
+            .find(|c| c.id == id)
+            .context("catalog entry vanished mid-edit")?
             .clone();
         self.db_save_catalog(&updated)?;
         cx.emit(SolutionStoreEvent::Changed);
@@ -153,7 +156,7 @@ impl SolutionStore {
                 .solutions
                 .iter()
                 .flat_map(|sol| sol.members.iter())
-                .filter(|m| m.catalog_id == *id)
+                .filter(|m| m.origin_catalog_id == Some(id))
                 .map(|m| m.local_path.clone())
                 .collect();
             if !targets.is_empty() {
@@ -175,24 +178,23 @@ impl SolutionStore {
 
     pub fn remove_catalog_project(
         &mut self,
-        id: &CatalogId,
+        id: CatalogId,
         cx: &mut gpui::Context<Self>,
     ) -> Result<()> {
         let referenced_by: Vec<String> = self
             .config
             .solutions
             .iter()
-            .filter(|s| s.members.iter().any(|m| m.catalog_id == *id))
+            .filter(|s| s.members.iter().any(|m| m.origin_catalog_id == Some(id)))
             .map(|s| s.name.clone())
             .collect();
         if !referenced_by.is_empty() {
             bail!(
-                "catalog project {} is used by solution(s): {}",
-                id.0,
+                "catalog project {id} is used by solution(s): {}",
                 referenced_by.join(", ")
             );
         }
-        self.config.catalog.retain(|c| c.id != *id);
+        self.config.catalog.retain(|c| c.id != id);
         self.db_delete_catalog(id)?;
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
@@ -200,8 +202,8 @@ impl SolutionStore {
     }
 
     /// Fold the duplicate catalog entry `from` into the canonical `into`,
-    /// repointing every solution member that referenced `from`, then deleting
-    /// the `from` row. Returns how many members were repointed.
+    /// repointing every solution member whose provenance was `from`, then
+    /// deleting the `from` row. Returns how many members were repointed.
     ///
     /// This is the ONLY way to clean up duplicates that predate the uniqueness
     /// checks in `add_catalog_project`: both halves of such a pair are typically
@@ -209,9 +211,9 @@ impl SolutionStore {
     /// whichever row existed at the time), so `remove_catalog_project` rightly
     /// refuses them and a raw delete would break those solutions.
     ///
-    /// A member is `(catalog_id, local_path)`. Only `catalog_id` is rewritten —
-    /// `local_path` and the member's position are preserved, so the checked-out
-    /// working tree on disk is not touched, moved, or re-cloned.
+    /// Only `origin_catalog_id` is rewritten — the member's id, name, position
+    /// and `local_path` are preserved, so the checked-out working tree on disk
+    /// is not touched, moved, or re-cloned.
     ///
     /// Refuses to merge entries that don't point at the same repository (this is
     /// deduplication, not a repoint tool), and refuses when a single solution
@@ -219,54 +221,50 @@ impl SolutionStore {
     /// drop one of the two working trees, which is the user's call, not ours.
     pub fn merge_catalog_project(
         &mut self,
-        from: &CatalogId,
-        into: &CatalogId,
+        from: CatalogId,
+        into: CatalogId,
         cx: &mut gpui::Context<Self>,
     ) -> Result<usize> {
         if from == into {
-            bail!("merge_self: {} is both source and target", from.0);
+            bail!("merge_self: {from} is both source and target");
         }
         let from_url = self
             .config
             .catalog
             .iter()
-            .find(|c| c.id == *from)
-            .with_context(|| format!("catalog_not_found: {}", from.0))?
+            .find(|c| c.id == from)
+            .with_context(|| format!("catalog_not_found: {from}"))?
             .remote_url
             .clone();
         let into_url = self
             .config
             .catalog
             .iter()
-            .find(|c| c.id == *into)
-            .with_context(|| format!("catalog_not_found: {}", into.0))?
+            .find(|c| c.id == into)
+            .with_context(|| format!("catalog_not_found: {into}"))?
             .remote_url
             .clone();
         if !same_remote(&from_url, &into_url) {
             bail!(
-                "not_duplicates: {} points at {from_url}, {} at {into_url} — merge only folds two \
-                 entries for the SAME repository",
-                from.0,
-                into.0,
+                "not_duplicates: {from} points at {from_url}, {into} at {into_url} — merge only \
+                 folds two entries for the SAME repository",
             );
         }
         if let Some(both) = self.config.solutions.iter().find(|s| {
-            s.members.iter().any(|m| m.catalog_id == *from)
-                && s.members.iter().any(|m| m.catalog_id == *into)
+            s.members.iter().any(|m| m.origin_catalog_id == Some(from))
+                && s.members.iter().any(|m| m.origin_catalog_id == Some(into))
         }) {
             bail!(
-                "solution_holds_both: solution \"{}\" has members for BOTH {} and {} — remove one \
-                 of them yourself first (merging would drop a working tree)",
+                "solution_holds_both: solution \"{}\" has members for BOTH {from} and {into} — \
+                 remove one of them yourself first (merging would drop a working tree)",
                 both.name,
-                from.0,
-                into.0,
             );
         }
 
         // Plan the writes WITHOUT touching `config` — the DB goes first. A
         // half-applied merge (in-memory rewritten, then a `?` on the third DB
         // write) would leave RAM and SQLite disagreeing about which catalog a
-        // member belongs to, and the disagreement only surfaces on the next
+        // member came from, and the disagreement only surfaces on the next
         // restart. Persist everything first; mutate memory only once every write
         // has landed, so a failure aborts with both sides still consistent.
         let planned: Vec<(SolutionId, SolutionMember, i32)> = self
@@ -278,13 +276,13 @@ impl SolutionStore {
                     .members
                     .iter()
                     .enumerate()
-                    .filter(|(_, member)| member.catalog_id == *from)
+                    .filter(|(_, member)| member.origin_catalog_id == Some(from))
                     .map(|(position, member)| {
                         (
-                            solution.id.clone(),
+                            solution.id,
                             SolutionMember {
-                                catalog_id: into.clone(),
-                                local_path: member.local_path.clone(),
+                                origin_catalog_id: Some(into),
+                                ..member.clone()
                             },
                             position as i32,
                         )
@@ -293,56 +291,35 @@ impl SolutionStore {
             })
             .collect();
         for (solution_id, member, position) in &planned {
-            // Order matters: the row is keyed by (solution_id, catalog_id), so
-            // drop the old key before writing the new one — otherwise the stale
-            // row survives and the member appears twice on next load.
-            self.db_delete_member(solution_id, from)?;
-            self.db_set_member(solution_id, member, *position)?;
+            self.db_set_member(*solution_id, member, *position)?;
         }
         self.db_delete_catalog(from)?;
 
         // Every write landed — now make memory match.
         for solution in self.config.solutions.iter_mut() {
             for member in solution.members.iter_mut() {
-                if member.catalog_id == *from {
-                    member.catalog_id = into.clone();
+                if member.origin_catalog_id == Some(from) {
+                    member.origin_catalog_id = Some(into);
                 }
             }
         }
-        let repointed = planned;
-        // An active-member pointer at the dead id would leave the solution with
-        // no resolvable active project.
-        let stale_active: Vec<SolutionId> = self
-            .active_member
-            .iter()
-            .filter(|(_, catalog)| *catalog == from)
-            .map(|(solution, _)| solution.clone())
-            .collect();
-        for solution in stale_active {
-            self.set_active_member(solution, into.clone(), cx);
-        }
-
-        self.config.catalog.retain(|c| c.id != *from);
-        log::info!(
-            "solutions: merged catalog {} into {} ({} member(s) repointed)",
-            from.0,
-            into.0,
-            repointed.len(),
-        );
+        let repointed = planned.len();
+        self.config.catalog.retain(|c| c.id != from);
+        log::info!("solutions: merged catalog {from} into {into} ({repointed} member(s) repointed)");
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
-        Ok(repointed.len())
+        Ok(repointed)
     }
 
     /// Snapshot of which solutions reference a given catalog entry. Used
     /// by the delete-confirmation modal to render "this will be removed
     /// from N solution(s):" before the user pulls the trigger.
-    pub fn solutions_referencing(&self, id: &CatalogId) -> Vec<(SolutionId, String)> {
+    pub fn solutions_referencing(&self, id: CatalogId) -> Vec<(SolutionId, String)> {
         self.config
             .solutions
             .iter()
-            .filter(|s| s.members.iter().any(|m| m.catalog_id == *id))
-            .map(|s| (s.id.clone(), s.name.clone()))
+            .filter(|s| s.members.iter().any(|m| m.origin_catalog_id == Some(id)))
+            .map(|s| (s.id, s.name.clone()))
             .collect()
     }
 
@@ -355,17 +332,19 @@ impl SolutionStore {
     /// if the id is not in the catalog.
     pub fn remove_catalog_project_cascade(
         &mut self,
-        id: &CatalogId,
+        id: CatalogId,
         cx: &mut gpui::Context<Self>,
     ) -> Result<Vec<PathBuf>> {
-        if !self.config.catalog.iter().any(|c| c.id == *id) {
-            bail!("catalog_not_found: {}", id.0);
+        if !self.config.catalog.iter().any(|c| c.id == id) {
+            bail!("catalog_not_found: {id}");
         }
         let mut clone_paths: Vec<PathBuf> = Vec::new();
+        let mut removed_members: Vec<MemberId> = Vec::new();
         for sol in self.config.solutions.iter_mut() {
             sol.members.retain(|m| {
-                if m.catalog_id == *id {
+                if m.origin_catalog_id == Some(id) {
                     clone_paths.push(m.local_path.clone());
+                    removed_members.push(m.id);
                     false
                 } else {
                     true
@@ -375,16 +354,18 @@ impl SolutionStore {
         // Also drop any in-flight or failed `add_member` rows for this
         // catalog id so the panel doesn't paint orphan "Adding…" /
         // "Failed: …" rows after the catalog entry itself is gone.
-        self.in_flight_adds.retain(|(_, cat), _| cat != id);
-        self.config.catalog.retain(|c| c.id != *id);
+        self.in_flight_adds.retain(|(_, cat), _| *cat != id);
+        self.config.catalog.retain(|c| c.id != id);
+        // `active_member.member_id` is ON DELETE CASCADE in SQLite; mirror that
+        // on the in-memory cache so no selection points at a deleted member.
+        self.active_member
+            .retain(|_, member| !removed_members.contains(member));
         if let Some(db) = self.db.as_ref() {
             gpui::block_on(async {
-                for sol in self.config.solutions.iter() {
-                    db.delete_solution_member(sol.id.0.clone(), id.0.clone())
-                        .await
-                        .log_err();
+                for member_id in &removed_members {
+                    db.delete_solution_member(member_id.0).await.log_err();
                 }
-                db.delete_catalog_project(id.0.clone()).await
+                db.delete_catalog_project(id.0).await
             })?;
         }
         cx.emit(SolutionStoreEvent::Changed);
@@ -397,20 +378,21 @@ impl SolutionStore {
             return Ok(());
         };
         gpui::block_on(db.save_catalog_project(
-            c.id.0.clone(),
+            c.id.0,
             c.name.clone(),
             c.remote_url.clone(),
             c.default_branch.clone(),
         ))
     }
 
-    fn db_delete_catalog(&self, id: &CatalogId) -> anyhow::Result<()> {
+    fn db_delete_catalog(&self, id: CatalogId) -> anyhow::Result<()> {
         let Some(db) = self.db.as_ref() else {
             return Ok(());
         };
-        gpui::block_on(db.delete_catalog_project(id.0.clone()))
+        gpui::block_on(db.delete_catalog_project(id.0))
     }
 }
+
 
 /// Do two remote URLs name the same repository? Compared on a normalized form
 /// (case-folded, trailing `/` and `.git` stripped) so `…/foo.git` and `…/foo`

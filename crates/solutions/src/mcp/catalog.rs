@@ -47,7 +47,7 @@ impl<'de> Deserialize<'de> for ListCatalogParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CatalogProjectInfo {
-    pub id: String,
+    pub id: i64,
     pub name: String,
     pub remote_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,7 +110,7 @@ fn build_catalog_info(
         None
     };
     CatalogProjectInfo {
-        id: p.id.as_str().to_string(),
+        id: p.id.0,
         name: p.name.clone(),
         remote_url: p.remote_url.clone(),
         default_branch: p.default_branch.clone(),
@@ -123,8 +123,8 @@ fn build_catalog_info(
 // catalog.add_project
 // =====================================================================
 
-/// Add a new catalog entry. The id is derived from `name` (slug) and is
-/// returned in `catalog_id`. `remote_url` is immutable after creation.
+/// Add a new catalog entry. A surrogate counter id is allocated and returned
+/// in `catalog_id`.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct AddCatalogProjectParams {
     pub name: String,
@@ -153,7 +153,7 @@ impl<'de> Deserialize<'de> for AddCatalogProjectParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct AddCatalogProjectResult {
-    pub catalog_id: String,
+    pub catalog_id: i64,
 }
 
 #[derive(Clone)]
@@ -177,7 +177,7 @@ impl McpServerTool for AddCatalogProjectTool {
             !input.remote_url.trim().is_empty(),
             "invalid_params: remote_url is required"
         );
-        let id = cx.update(|cx| -> Result<String> {
+        let id = cx.update(|cx| -> Result<i64> {
             let store = SolutionStore::global(cx);
             let id = store.update(cx, |s, cx| {
                 s.add_catalog_project(
@@ -187,7 +187,7 @@ impl McpServerTool for AddCatalogProjectTool {
                     cx,
                 )
             })?;
-            Ok(id.as_str().to_string())
+            Ok(id.0)
         })?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
@@ -206,7 +206,7 @@ impl McpServerTool for AddCatalogProjectTool {
 /// references it; remove the member from the Solution(s) first.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RemoveCatalogProjectParams {
-    pub catalog_id: String,
+    pub catalog_id: i64,
 }
 
 impl<'de> Deserialize<'de> for RemoveCatalogProjectParams {
@@ -214,7 +214,7 @@ impl<'de> Deserialize<'de> for RemoveCatalogProjectParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            catalog_id: String,
+            catalog_id: i64,
         }
         Ok(Self {
             catalog_id: Option::<Inner>::deserialize(de)?
@@ -242,14 +242,11 @@ impl McpServerTool for RemoveCatalogProjectTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            !input.catalog_id.is_empty(),
-            "invalid_params: catalog_id is required"
-        );
+        anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
             let id = crate::CatalogId(input.catalog_id);
-            store.update(cx, |s, cx| s.remove_catalog_project(&id, cx))?;
+            store.update(cx, |s, cx| s.remove_catalog_project(id, cx))?;
             Ok(())
         })?;
         Ok(ToolResponse {
@@ -266,8 +263,9 @@ impl McpServerTool for RemoveCatalogProjectTool {
 // =====================================================================
 
 /// Fold a duplicate catalog entry into the canonical one: every solution member
-/// referencing `from` is repointed at `into` (keeping its checked-out clone —
-/// only the `catalog_id` link is rewritten), then the `from` row is deleted.
+/// whose provenance was `from` is repointed at `into` (keeping its checked-out
+/// clone — only the `origin_catalog_id` link is rewritten), then the `from` row
+/// is deleted.
 ///
 /// This is the cleanup path for duplicates created before `add_project` started
 /// rejecting them. `remove_project` can't do it: both halves of such a pair are
@@ -278,9 +276,9 @@ impl McpServerTool for RemoveCatalogProjectTool {
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct MergeCatalogProjectParams {
     /// The duplicate to fold away — this row is deleted.
-    pub from: String,
+    pub from: i64,
     /// The canonical entry to keep.
-    pub into: String,
+    pub into: i64,
 }
 
 impl<'de> Deserialize<'de> for MergeCatalogProjectParams {
@@ -288,8 +286,8 @@ impl<'de> Deserialize<'de> for MergeCatalogProjectParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            from: String,
-            into: String,
+            from: i64,
+            into: i64,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -318,13 +316,13 @@ impl McpServerTool for MergeCatalogProjectTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(!input.from.is_empty(), "invalid_params: from is required");
-        anyhow::ensure!(!input.into.is_empty(), "invalid_params: into is required");
+        anyhow::ensure!(input.from > 0, "invalid_params: from is required");
+        anyhow::ensure!(input.into > 0, "invalid_params: into is required");
         let repointed = cx.update(|cx| -> Result<usize> {
             let store = SolutionStore::global(cx);
             let from = crate::CatalogId(input.from);
             let into = crate::CatalogId(input.into);
-            store.update(cx, |s, cx| s.merge_catalog_project(&from, &into, cx))
+            store.update(cx, |s, cx| s.merge_catalog_project(from, into, cx))
         })?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
@@ -349,7 +347,7 @@ impl McpServerTool for MergeCatalogProjectTool {
 /// and no use case has come up yet. Use the UI modal for URL edits.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct EditCatalogProjectParams {
-    pub catalog_id: String,
+    pub catalog_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -361,7 +359,7 @@ impl<'de> Deserialize<'de> for EditCatalogProjectParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            catalog_id: String,
+            catalog_id: i64,
             name: Option<String>,
             default_branch: Option<String>,
         }
@@ -376,7 +374,7 @@ impl<'de> Deserialize<'de> for EditCatalogProjectParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct EditCatalogProjectResult {
-    pub catalog_id: String,
+    pub catalog_id: i64,
 }
 
 #[derive(Clone)]
@@ -392,16 +390,13 @@ impl McpServerTool for EditCatalogProjectTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            !input.catalog_id.is_empty(),
-            "invalid_params: catalog_id is required"
-        );
-        let catalog_id = input.catalog_id.clone();
+        anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
+        let catalog_id = input.catalog_id;
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
             let id = crate::CatalogId(input.catalog_id);
             store.update(cx, |s, cx| {
-                s.edit_catalog_project(&id, input.name, input.default_branch, None, cx)
+                s.edit_catalog_project(id, input.name, input.default_branch, None, cx)
             })?;
             Ok(())
         })?;
@@ -431,7 +426,7 @@ pub struct ClearCacheParams {
     /// Specific catalog entry to clear. If omitted, clears the cache for
     /// every catalog entry currently in the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catalog_id: Option<String>,
+    pub catalog_id: Option<i64>,
 }
 
 impl<'de> Deserialize<'de> for ClearCacheParams {
@@ -439,7 +434,7 @@ impl<'de> Deserialize<'de> for ClearCacheParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            catalog_id: Option<String>,
+            catalog_id: Option<i64>,
         }
         Ok(Self {
             catalog_id: Option::<Inner>::deserialize(de)?
@@ -470,11 +465,11 @@ impl McpServerTool for ClearCacheTool {
         let urls = cx.update(|cx| -> Result<Vec<String>> {
             let store = SolutionStore::global(cx);
             store.read_with(cx, |s, _| {
-                if let Some(id) = input.catalog_id.as_deref() {
+                if let Some(id) = input.catalog_id {
                     let url = s
                         .catalog()
                         .iter()
-                        .find(|p| p.id.as_str() == id)
+                        .find(|p| p.id.0 == id)
                         .map(|p| p.remote_url.clone())
                         .with_context(|| format!("catalog_not_found: {id}"))?;
                     Ok(vec![url])
@@ -521,7 +516,7 @@ impl McpServerTool for ClearCacheTool {
 /// polled via `editor.get_operation`.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RefreshCacheParams {
-    pub catalog_id: String,
+    pub catalog_id: i64,
 }
 
 impl<'de> Deserialize<'de> for RefreshCacheParams {
@@ -529,7 +524,7 @@ impl<'de> Deserialize<'de> for RefreshCacheParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
-            catalog_id: String,
+            catalog_id: i64,
         }
         Ok(Self {
             catalog_id: Option::<Inner>::deserialize(de)?
@@ -557,16 +552,13 @@ impl McpServerTool for RefreshCacheTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            !input.catalog_id.is_empty(),
-            "invalid_params: catalog_id is required"
-        );
+        anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
         let remote_url = cx.update(|cx| -> Result<String> {
             let store = SolutionStore::global(cx);
             let url = store.read_with(cx, |s, _| {
                 s.catalog()
                     .iter()
-                    .find(|p| p.id.as_str() == input.catalog_id)
+                    .find(|p| p.id.0 == input.catalog_id)
                     .map(|p| p.remote_url.clone())
             });
             url.with_context(|| format!("catalog_not_found: {}", input.catalog_id))
@@ -575,7 +567,7 @@ impl McpServerTool for RefreshCacheTool {
         let operation_id = cx.update(|cx| editor_mcp::op_start("catalog.refresh_cache", cx));
 
         let op_id_for_task = operation_id.clone();
-        let catalog_id_for_log = input.catalog_id.clone();
+        let catalog_id_for_log = input.catalog_id;
         let cache_root = crate::default_cache_root();
 
         cx.spawn(async move |cx| {

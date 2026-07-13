@@ -99,7 +99,7 @@ fn collect_buffers(solution_id: &str, cx: &mut App) -> Vec<BufferInfo> {
     let Some(root) = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.as_str() == solution_id)
+            .find(|sol| sol.id.0.to_string() == solution_id)
             .map(|sol| sol.root.clone())
     }) else {
         return Vec::new();
@@ -346,7 +346,7 @@ pub(crate) fn find_window_for_solution(solution_id: &str, cx: &mut App) -> Optio
     let root = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.as_str() == solution_id)
+            .find(|sol| sol.id.0.to_string() == solution_id)
             .map(|sol| sol.root.clone())
     })?;
     for handle in cx.windows() {

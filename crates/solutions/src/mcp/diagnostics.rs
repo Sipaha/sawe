@@ -126,7 +126,7 @@ fn collect_diagnostic_summaries(
     let Some(root) = store.read_with(cx, |s, _| {
         s.solutions()
             .iter()
-            .find(|sol| sol.id.as_str() == input.solution_id)
+            .find(|sol| sol.id.0.to_string() == input.solution_id)
             .map(|sol| sol.root.clone())
     }) else {
         return Vec::new();

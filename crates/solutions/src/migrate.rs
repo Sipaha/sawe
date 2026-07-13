@@ -1,13 +1,14 @@
-//! One-time import of the legacy solutions.json file into SolutionsDb.
+//! One-time import of the legacy solutions.json file into SolutionsDb, plus
+//! verification of the identity migration's row counts.
 //!
-//! Runs at SolutionStore::init_global on every startup but exits early
-//! when the JSON file is absent or the DB already has rows. After a
-//! successful import, renames the JSON file to *.migrated.bak so the
+//! `run_one_time_migration` runs at SolutionStore::init_global on every startup
+//! but exits early when the JSON file is absent or the DB already has rows.
+//! After a successful import it renames the JSON file to *.migrated.bak so the
 //! user can verify and so we never re-import the same data.
 
 use crate::db::SolutionsDb;
 use crate::persistence::load_or_default;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 pub fn run_one_time_migration(db: &SolutionsDb, json_path: &Path) -> Result<()> {
@@ -33,28 +34,28 @@ pub fn run_one_time_migration(db: &SolutionsDb, json_path: &Path) -> Result<()> 
         json_path.display()
     );
 
+    let mut catalog_ids: collections::HashMap<String, i64> = collections::HashMap::default();
     for c in &cfg.catalog {
-        gpui::block_on(db.save_catalog_project(
-            c.id.0.clone(),
+        let id = gpui::block_on(db.insert_catalog_project(
             c.name.clone(),
             c.remote_url.clone(),
             c.default_branch.clone(),
         ))?;
+        catalog_ids.insert(c.id.clone(), id);
     }
     for s in &cfg.solutions {
-        let last_ms = s.last_opened_at.map(|t| t.timestamp_millis());
-        gpui::block_on(db.save_solution(
-            s.id.0.clone(),
+        let solution_id = gpui::block_on(db.insert_solution(
             s.name.clone(),
             s.root.to_string_lossy().into_owned(),
-            last_ms,
+            s.last_opened_at.map(|t| t.timestamp_millis()),
         ))?;
         for (i, m) in s.members.iter().enumerate() {
-            gpui::block_on(db.set_solution_member(
-                s.id.0.clone(),
-                m.catalog_id.0.clone(),
+            gpui::block_on(db.insert_solution_member(
+                solution_id,
+                m.catalog_id.clone(),
                 m.local_path.to_string_lossy().into_owned(),
                 i as i32,
+                catalog_ids.get(&m.catalog_id).copied(),
             ))?;
         }
     }
@@ -67,4 +68,88 @@ pub fn run_one_time_migration(db: &SolutionsDb, json_path: &Path) -> Result<()> 
         bak.display()
     );
     Ok(())
+}
+
+/// Read the row-count report the identity migration wrote inside its own
+/// transaction and fail loudly if any table lost a row. `Ok(())` when the report
+/// row is absent (a DB predating the report table); a DB created fresh at the
+/// numeric schema has a report of all-zeroes, which trivially verifies.
+pub fn verify_identity_migration(db: &SolutionsDb) -> Result<()> {
+    let Some((
+        solutions_before,
+        solutions_after,
+        members_before,
+        members_after,
+        active_before,
+        active_after,
+        catalog_before,
+        catalog_after,
+    )) = gpui::block_on(db.load_identity_migration_report())?
+    else {
+        return Ok(());
+    };
+
+    let mismatches: Vec<String> = [
+        ("solutions", solutions_before, solutions_after),
+        ("solution_members", members_before, members_after),
+        ("active_member", active_before, active_after),
+        ("catalog_projects", catalog_before, catalog_after),
+    ]
+    .iter()
+    .filter(|(_, before, after)| before != after)
+    .map(|(table, before, after)| format!("{table}: {before} rows before, {after} after"))
+    .collect();
+
+    if !mismatches.is_empty() {
+        bail!(
+            "identity migration lost rows — {}. The pre-migration data is NOT recoverable from \
+             this DB; restore the backup taken before the upgrade.",
+            mismatches.join("; ")
+        );
+    }
+    log::info!(
+        "solutions::migrate: identity migration verified — {solutions_after} solution(s), \
+         {members_after} member(s), {active_after} active selection(s), {catalog_after} catalog row(s)"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::SolutionsDb;
+
+    #[gpui::test]
+    async fn verify_passes_on_a_fresh_db() {
+        let db = SolutionsDb::open_test_db("solutions_migrate_verify_fresh").await;
+        // A fresh DB still runs the identity migration, over empty legacy
+        // tables — so the report row exists and reads 0-before/0-after.
+        verify_identity_migration(&db).expect("a fresh DB's all-zero report must verify");
+    }
+
+    #[gpui::test]
+    async fn verify_fails_when_the_report_shows_a_lost_row() {
+        let db = SolutionsDb::open_test_db("solutions_migrate_verify_lost").await;
+        // The migration already wrote the (all-zero) row 1; overwrite it with a
+        // report that lost a member row. REPLACE is safe here — the report table
+        // is not an FK parent of anything.
+        db.write(|connection| {
+            connection
+                .exec(
+                    "INSERT OR REPLACE INTO identity_migration_report (
+                         id, solutions_before, solutions_after, members_before, members_after,
+                         active_before, active_after, catalog_before, catalog_after)
+                     VALUES (1, 16, 16, 40, 39, 5, 5, 12, 12)",
+                )
+                .expect("prepare report insert")()
+            .expect("report insert");
+        })
+        .await;
+        let err = verify_identity_migration(&db).expect_err("a lost member row must fail");
+        assert!(
+            err.to_string()
+                .contains("solution_members: 40 rows before, 39 after"),
+            "the error must name the table and the counts; got: {err}"
+        );
+    }
 }

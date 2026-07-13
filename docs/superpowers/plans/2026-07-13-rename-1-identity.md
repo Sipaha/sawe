@@ -68,7 +68,7 @@
   - `SolutionsDb::load_all_solutions_with_members() -> Result<Vec<(i64, String, String, Option<i64>, i64, String, String, i32, Option<i64>)>>`
   - `solutions::migrate::verify_identity_migration(db: &SolutionsDb) -> anyhow::Result<()>`
 
-- [ ] **Step 1: Write the failing migration test**
+- [x] **Step 1: Write the failing migration test**
 
 Append to `mod tests` in `crates/solutions/src/db.rs` (keep the existing tests for now; they are rewritten in Step 8):
 
@@ -248,12 +248,12 @@ Append to `mod tests` in `crates/solutions/src/db.rs` (keep the existing tests f
     }
 ```
 
-- [ ] **Step 2: Run the migration tests to verify they fail**
+- [x] **Step 2: Run the migration tests to verify they fail**
 
 Run: `cargo test -p solutions --lib db::tests::identity_migration -- --nocapture`
 Expected: FAIL — `identity_migration_converts_text_ids_to_counters` panics on `select solutions: no such column: last_opened_at` / `no such table: solution_legacy_ids` (only two migrations exist, so nothing was converted).
 
-- [ ] **Step 3: Append migration #3 to `MIGRATIONS`**
+- [x] **Step 3: Append migration #3 to `MIGRATIONS`**
 
 In `crates/solutions/src/db.rs`, append a third `sql!(…)` entry to `MIGRATIONS` (after the `active_member` migration, never editing the first two). Legacy tables are renamed aside first — SQLite rewrites the children's FK clauses to follow the renamed parent, so the legacy island stays internally consistent while the new tables take over the canonical names:
 
@@ -388,12 +388,12 @@ Note for the implementer: `active_member_legacy` rows whose `catalog_id` no long
 
 `solution_legacy_ids` is deliberately kept forever: it is the only bridge that lets `solution_agent.db` (a separate file, separate connection, no `ATTACH`) remap its `solution_sessions.solution_id` slugs in Task 2.
 
-- [ ] **Step 4: Run the migration tests to verify they pass**
+- [x] **Step 4: Run the migration tests to verify they pass**
 
 Run: `cargo test -p solutions --lib db::tests::identity_migration -- --nocapture`
 Expected: PASS (3 tests). The rest of `cargo test -p solutions` still fails — the old `query!` fns bind `String` ids into the new INTEGER columns. That is fixed next.
 
-- [ ] **Step 5: Write the failing numeric-DB-API test**
+- [x] **Step 5: Write the failing numeric-DB-API test**
 
 Replace the whole `#[cfg(test)] mod tests` *pre-existing* body in `crates/solutions/src/db.rs` (the `open_test_db_applies_migration` / `catalog_save_and_load_roundtrips` / `solution_with_members_roundtrips` / `solution_with_no_members_still_returned` / `resaving_solution_preserves_members_and_active_member` / `active_member_roundtrips` tests) with the numeric versions below. Keep the three `identity_migration_*` tests and the two helpers from Step 1.
 
@@ -600,12 +600,12 @@ Replace the whole `#[cfg(test)] mod tests` *pre-existing* body in `crates/soluti
     }
 ```
 
-- [ ] **Step 6: Run the DB API tests to verify they fail**
+- [x] **Step 6: Run the DB API tests to verify they fail**
 
 Run: `cargo test -p solutions --lib db::tests -- --nocapture`
 Expected: FAIL to compile — `error[E0599]: no method named 'insert_solution' found for struct 'SolutionsDb'` (and the same for `insert_solution_member` / `insert_catalog_project`), plus mismatched-type errors on the existing `String`-taking fns.
 
-- [ ] **Step 7: Rewrite the `impl SolutionsDb` query block**
+- [x] **Step 7: Rewrite the `impl SolutionsDb` query block**
 
 Replace the whole `impl SolutionsDb { … }` block in `crates/solutions/src/db.rs` (everything between `use db::query;` and `#[cfg(test)] mod tests`) with:
 
@@ -844,7 +844,7 @@ impl SolutionsDb {
 }
 ```
 
-- [ ] **Step 8: Flip the identity types in `model.rs`**
+- [x] **Step 8: Flip the identity types in `model.rs`**
 
 Replace the whole non-test body of `crates/solutions/src/model.rs`:
 
@@ -1015,7 +1015,7 @@ Then export the new type from `crates/solutions/src/solutions.rs`:
 pub use model::{CatalogId, CatalogProject, MemberId, Solution, SolutionId, SolutionMember};
 ```
 
-- [ ] **Step 9: Rewrite the store's hydration and caches**
+- [x] **Step 9: Rewrite the store's hydration and caches**
 
 In `crates/solutions/src/store.rs`:
 
@@ -1242,7 +1242,7 @@ Replace the `#[cfg(any(test, feature = "test-support"))]` helpers at the bottom 
 
 Also update `refresh_active_solution_for_branch_protection` — `max_by_key(|s| s.last_opened_at)` still compiles (`Option<i64>: Ord`), no change needed there.
 
-- [ ] **Step 10: Rewrite `store/lifecycle.rs`**
+- [x] **Step 10: Rewrite `store/lifecycle.rs`**
 
 `create_solution` now allocates the id from the DB (or from `next_test_id` when there is no DB), and the root folder name comes from the slug of the display name (unchanged behaviour — Phase 2 replaces `slugify` with the Unicode-preserving derivation):
 
@@ -1474,7 +1474,7 @@ impl SolutionStore {
 
 Delete `next_test_id` from Step 9 and have the three test helpers call `self.next_id_without_db()` instead (one allocator, not two). `slugify` is imported for `create_for_test_minimal`'s root path.
 
-- [ ] **Step 11: Rewrite `store/members.rs` around `MemberId`**
+- [x] **Step 11: Rewrite `store/members.rs` around `MemberId`**
 
 ```rust
 use super::{SolutionStore, SolutionStoreEvent};
@@ -1743,7 +1743,7 @@ In `store.rs`, rename the event payload field to match (`SolutionStoreEvent::Act
 
 Also update `SolutionStore::tab_snapshot(&self, id: SolutionId)` / `store_tab_snapshot(&mut self, id: SolutionId, …)` and `solution_for_path` (unchanged body).
 
-- [ ] **Step 12: Convert `store/catalog.rs`**
+- [x] **Step 12: Convert `store/catalog.rs`**
 
 Mechanical, driven by the compiler. The three load-bearing changes:
 
@@ -1813,7 +1813,7 @@ Mechanical, driven by the compiler. The three load-bearing changes:
 
 Note the semantic shift the spec mandates: `origin_catalog_id` is provenance only, so `remove_catalog_project` no longer needs to refuse when members reference it. Keep the existing refusal for now (Phase 1 is "no behavior change"); the FK is `ON DELETE SET NULL`, so a future phase can drop the guard without orphaning anything.
 
-- [ ] **Step 13: Convert `add_member.rs`**
+- [x] **Step 13: Convert `add_member.rs`**
 
 Three changes:
 
@@ -1896,7 +1896,7 @@ Three changes:
 
 Update this file's own tests to assert on `m.name` / `m.origin_catalog_id` instead of `m.catalog_id`, and to call `add_empty_member(sol_id, "name", cx)` by value.
 
-- [ ] **Step 14: Convert `mcp/*.rs`, `event_sources.rs`, `branch_protection.rs`, `persistence.rs`**
+- [x] **Step 14: Convert `mcp/*.rs`, `event_sources.rs`, `branch_protection.rs`, `persistence.rs`**
 
 - `mcp/solutions_lifecycle.rs`: `SolutionSummary.id: i64`; every tool input's `solution_id: i64`; `build_summary` renders `last_opened_at` via `chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|t| t.to_rfc3339())`. `is_open(sol.id)` takes the id by value.
   **Ordering note:** `editor_mcp::solution_socket_path` / `open_solution_socket` / `close_solution_socket` still take `&str` at this point (Task 5 flips them to `i64`). Call them with the numeric id rendered as a string so this task compiles on its own — the directory name is already the right one:
@@ -1965,7 +1965,7 @@ pub fn load_or_default(path: &Path) -> Result<LegacySolutionsConfig, LoadError> 
 
 (`CURRENT_VERSION` and the version guard stay on `SolutionsConfig` for the in-memory struct; the legacy loader drops the version check — a file that old has no newer-version case left to guard.)
 
-- [ ] **Step 15: Rewrite `migrate.rs` (JSON import + identity verification)**
+- [x] **Step 15: Rewrite `migrate.rs` (JSON import + identity verification)**
 
 ```rust
 //! One-time import of the legacy solutions.json file into SolutionsDb, plus
@@ -2117,12 +2117,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 16: Run the whole `solutions` suite**
+- [x] **Step 16: Run the whole `solutions` suite**
 
 Run: `cargo test -p solutions`
 Expected: PASS. Fix compile errors in `store.rs`'s own `mod tests`, `tests/persistence_e2e.rs` and `add_member.rs`'s tests as the compiler surfaces them — the substitutions are mechanical: `SolutionId("x".into())` → the id returned by `create_solution` / `create_for_test_minimal`; `store.remove_member(&sol, &cat, cx)` → `store.remove_member(member_id, cx)`; `s.active_member(&sol)` → `s.active_member(sol)`; `m.catalog_id` → `m.name` / `m.origin_catalog_id`.
 
-- [ ] **Step 17: Commit**
+- [x] **Step 17: Commit**
 
 ```bash
 git add crates/solutions/src

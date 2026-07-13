@@ -113,7 +113,7 @@ pub fn install(cx: &mut App) {
                             }),
                         );
                     }
-                    SolutionStoreEvent::ActiveMemberChanged { solution, catalog } => {
+                    SolutionStoreEvent::ActiveMemberChanged { solution, member } => {
                         editor_mcp::emit_notification(
                             cx,
                             "solution_active_member_changed",
@@ -121,7 +121,7 @@ pub fn install(cx: &mut App) {
                                 "solution_id": solution.0,
                                 // `null` when the solution's last member was
                                 // removed and the selection was cleared.
-                                "catalog_id": catalog.as_ref().map(|c| c.0.as_str()),
+                                "member_id": member.map(|m| m.0),
                             }),
                         );
                     }
@@ -150,11 +150,14 @@ pub fn install(cx: &mut App) {
                             .find(|sol| &sol.id == id)
                             .map(|sol| sol.root.clone());
                         if let Some(root) = root {
-                            editor_mcp::open_solution_socket(cx, id.0.as_str(), root);
+                            // `editor_mcp`'s socket API still takes a &str id;
+                            // the directory name is the numeric id rendered as
+                            // text. Task 5 flips the signature to i64.
+                            editor_mcp::open_solution_socket(cx, &id.0.to_string(), root);
                         }
                     }
                     SolutionStoreEvent::Closed { id } => {
-                        editor_mcp::close_solution_socket(cx, id.0.as_str());
+                        editor_mcp::close_solution_socket(cx, &id.0.to_string());
                     }
                 }),
             );
@@ -204,7 +207,7 @@ pub fn install(cx: &mut App) {
                                     .visible_worktrees(_cx)
                                     .any(|tree| tree.read(_cx).abs_path().starts_with(&sol.root));
                                 if has_match {
-                                    ids.push(sol.id.clone());
+                                    ids.push(sol.id);
                                     break 'ws;
                                 }
                             }
@@ -237,7 +240,7 @@ pub fn install(cx: &mut App) {
                         if let Some(store) = SolutionStore::try_global(cx) {
                             store.update(cx, |s, cx| {
                                 for id in &open_ids {
-                                    s.mark_open(id.clone(), cx);
+                                    s.mark_open(*id, cx);
                                 }
                             });
                         }
@@ -253,7 +256,7 @@ pub fn install(cx: &mut App) {
                                 if let Some(store) = SolutionStore::try_global(cx) {
                                     store.update(cx, |s, cx| {
                                         for id in &close_ids {
-                                            s.mark_closed(id, cx);
+                                            s.mark_closed(*id, cx);
                                         }
                                     });
                                 }
