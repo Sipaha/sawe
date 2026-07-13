@@ -8,7 +8,7 @@
 
 use anyhow::{Context as _, Result};
 use db::sqlez::connection::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use util::path_list::{PathList, SerializedPathList};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,6 +382,261 @@ fn delete_stale_toolchains(connection: &Connection, rewrite: &PathRewrite) -> Re
             .with_context(|| format!("deleting stale rows from {table}"))?;
     }
     Ok(())
+}
+
+/// Rewrite the path-bearing rows of the `solution_agent` database, which is a
+/// *separate* sqlite file from the shared `AppDatabase` one. The `solutions`
+/// crate cannot depend on `solution_agent` (that would be a dependency cycle),
+/// so the caller opens the file by path and hands the connection in.
+pub fn rewrite_agent_db(connection: &Connection, rewrite: &PathRewrite) -> Result<()> {
+    if has_column(connection, "solution_sessions", "cwd")? {
+        let sessions: Vec<(String, String)> = connection
+            .select::<(String, String)>("SELECT id, cwd FROM solution_sessions WHERE cwd IS NOT NULL")
+            .context("preparing select on solution_sessions")?()
+        .context("selecting from solution_sessions")?;
+        let mut update_session = connection
+            .exec_bound::<(String, String)>("UPDATE solution_sessions SET cwd = ?1 WHERE id = ?2")
+            .context("preparing update on solution_sessions")?;
+        for (id, cwd) in sessions {
+            if let Some(rewritten) = rewrite.apply_str(&cwd) {
+                update_session((rewritten, id)).context("updating solution_sessions")?;
+            }
+        }
+    }
+
+    if has_column(
+        connection,
+        "solution_session_background_agent",
+        "jsonl_path",
+    )? {
+        let agents: Vec<(String, String, String)> = connection
+            .select::<(String, String, String)>(
+                "SELECT solution_session_id, agent_id, jsonl_path
+                 FROM solution_session_background_agent
+                 WHERE jsonl_path IS NOT NULL",
+            )
+            .context("preparing select on solution_session_background_agent")?()
+        .context("selecting from solution_session_background_agent")?;
+        let mut update_agent = connection
+            .exec_bound::<(String, String, String)>(
+                "UPDATE solution_session_background_agent SET jsonl_path = ?1
+                 WHERE solution_session_id = ?2 AND agent_id = ?3",
+            )
+            .context("preparing update on solution_session_background_agent")?;
+        for (session_id, agent_id, jsonl_path) in agents {
+            if let Some(rewritten) = rewrite.apply_str(&jsonl_path) {
+                update_agent((rewritten, session_id, agent_id))
+                    .context("updating solution_session_background_agent")?;
+            }
+        }
+    }
+
+    // `path` is part of the attachment primary key, so an UPDATE would have to
+    // move the key — delete + reinsert instead. `INSERT OR IGNORE` (not
+    // `INSERT OR REPLACE`, which would delete a conflicting parent row) keeps a
+    // row that already sits at the rewritten path.
+    if has_column(connection, "solution_session_attachment", "path")? {
+        let attachments: Vec<(String, String, String, i64)> = connection
+            .select::<(String, String, String, i64)>(
+                "SELECT session_id, solution_id, path, created_at_ms
+                 FROM solution_session_attachment
+                 WHERE path IS NOT NULL",
+            )
+            .context("preparing select on solution_session_attachment")?()
+        .context("selecting from solution_session_attachment")?;
+        let mut delete_attachment = connection
+            .exec_bound::<(String, String)>(
+                "DELETE FROM solution_session_attachment WHERE session_id = ?1 AND path = ?2",
+            )
+            .context("preparing delete on solution_session_attachment")?;
+        let mut insert_attachment = connection
+            .exec_bound::<(String, String, String, i64)>(
+                "INSERT OR IGNORE INTO solution_session_attachment
+                     (session_id, solution_id, path, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .context("preparing insert on solution_session_attachment")?;
+        for (session_id, solution_id, path, created_at_ms) in attachments {
+            if let Some(rewritten) = rewrite.apply_str(&path) {
+                delete_attachment((session_id.clone(), path))
+                    .context("deleting solution_session_attachment")?;
+                insert_attachment((session_id, solution_id, rewritten, created_at_ms))
+                    .context("reinserting solution_session_attachment")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// claude keys its transcript bucket by the session cwd with every `/` and `.`
+/// replaced by `-` (`<CLAUDE_CONFIG_DIR|~/.claude>/projects/<enc(cwd)>`).
+/// Mirrors `solution_agent::store::teammate_reconciler::claude_project_dir_for`;
+/// there is no setting that overrides the encoding.
+pub fn encode_claude_bucket(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut encoded = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            '/' | '.' => encoded.push('-'),
+            other => encoded.push(other),
+        }
+    }
+    encoded
+}
+
+/// Move the transcript bucket of the moved directory to the bucket its new path
+/// encodes to. When the target bucket already exists (the user had opened a
+/// directory of that name before), the two are merged file-by-file instead of
+/// renaming over it — a `rename(2)` onto a non-empty directory would fail, and
+/// a forced one would destroy transcripts.
+pub fn move_transcript_bucket(claude_projects_dir: &Path, rewrite: &PathRewrite) -> Result<()> {
+    let source = claude_projects_dir.join(encode_claude_bucket(&rewrite.old));
+    if !source.exists() {
+        return Ok(());
+    }
+    let target = claude_projects_dir.join(encode_claude_bucket(&rewrite.new));
+    if !target.exists() {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::rename(&source, &target)
+            .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
+        return Ok(());
+    }
+    merge_dir(&source, &target)?;
+    std::fs::remove_dir_all(&source)
+        .with_context(|| format!("removing drained bucket {}", source.display()))?;
+    Ok(())
+}
+
+/// Copy every entry of `source` into `target`, never overwriting an existing
+/// file. A transcript file we already have at the target is by definition the
+/// same session (the session id is the file name), so keeping the target's copy
+/// is safe and preserves anything written since the rename.
+fn merge_dir(source: &Path, target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("reading {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading an entry of {}", source.display()))?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", from.display()))?;
+        if file_type.is_dir() {
+            merge_dir(&from, &to)?;
+        } else if !to.exists() {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// A claude agent worktree is a *linked* git worktree: the tree lives in one
+/// place, but its **admin directory always lives inside the member repo** at
+/// `<member>/.git/worktrees/<name>/`, and the two point at each other with
+/// **absolute** paths. So a rename breaks it in one of two directions:
+///
+///   * a **member** rename moves the repo (and with it the admin dir) — the
+///     tree's `.git` file still names the old admin dir;
+///   * a **solution** rename moves the *trees* — the admin dir's `gitdir` file
+///     still names the old tree location. (Plan 3's `WorktreeCreate` hook
+///     relocates new trees to `<solution_root>/.agents/worktrees/<member-dir>/<name>`;
+///     legacy trees are still at `<member>/.claude/worktrees/<name>`. Both are
+///     scanned here.)
+///
+/// `git -C <member> worktree repair <tree paths…>` fixes **both** directions —
+/// but only when the moved tree paths are passed as **arguments**. A bare
+/// `git worktree repair` can only repair trees it can still reach through the
+/// (possibly stale) admin entries, so it silently misses the trees whose
+/// location changed.
+///
+/// Best-effort: a missing/old `git` binary or an unrepairable tree is logged,
+/// never fatal — the DB rewrites this reconcile also performs are the part that
+/// must not be lost.
+pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)], rewrite: &PathRewrite) -> Result<()> {
+    for (member_root, solution_root) in members {
+        // Candidate trees, both locations. The `<member-dir>` level under
+        // `.agents/worktrees` is itself named after the member's *old* folder
+        // after a member rename, so do NOT filter by that name — collect every
+        // tree and decide ownership from the tree's own `.git` pointer.
+        let mut candidates = Vec::new();
+        collect_dirs(
+            &member_root.join(".claude").join("worktrees"),
+            &mut candidates,
+        );
+        let relocated = solution_root.join(".agents").join("worktrees");
+        let mut member_dirs = Vec::new();
+        collect_dirs(&relocated, &mut member_dirs);
+        for member_dir in &member_dirs {
+            collect_dirs(member_dir, &mut candidates);
+        }
+
+        let trees: Vec<PathBuf> = candidates
+            .into_iter()
+            .filter(|tree| owning_repo(tree, rewrite).as_deref() == Some(member_root.as_path()))
+            .collect();
+        if trees.is_empty() {
+            continue;
+        }
+        run_worktree_repair(member_root, &trees);
+    }
+    Ok(())
+}
+
+// Sync `std::process::Command` is deliberate: the cold reconcile runs before any
+// window exists, `git worktree repair` is a local sub-100ms one-shot, and the
+// async `smol::process::Command` the lint suggests would force this whole
+// module's sync API to become async for no gain.
+#[allow(clippy::disallowed_methods)]
+fn run_worktree_repair(member_root: &Path, trees: &[PathBuf]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(member_root)
+        .arg("worktree")
+        .arg("repair")
+        .args(trees)
+        .output();
+    match output {
+        Ok(output) if !output.status.success() => log::warn!(
+            "path_migrations: `git worktree repair` in {} failed: {}",
+            member_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ),
+        Err(err) => log::warn!(
+            "path_migrations: running `git worktree repair` in {} failed: {err}",
+            member_root.display(),
+        ),
+        Ok(_) => {}
+    }
+}
+
+fn collect_dirs(parent: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            out.push(entry.path());
+        }
+    }
+}
+
+/// A linked worktree's `.git` is a file reading
+/// `gitdir: <repo>/.git/worktrees/<name>` — an **absolute** path that may still
+/// name the pre-rename location, hence the rewrite before matching. Returns the
+/// repo (member) the tree belongs to.
+fn owning_repo(tree: &Path, rewrite: &PathRewrite) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(tree.join(".git")).ok()?;
+    let pointer = contents.trim().strip_prefix("gitdir:")?.trim();
+    let pointer = rewrite
+        .apply_str(pointer)
+        .unwrap_or_else(|| pointer.to_string());
+    // <repo>/.git/worktrees/<name> → <repo>
+    Path::new(&pointer).ancestors().nth(3).map(Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -795,6 +1050,306 @@ mod tests {
             "a second pass must not duplicate or drop rows"
         );
         assert_eq!(counts(&connection, "SELECT COUNT(*) FROM editors"), vec![2]);
+    }
+
+    fn seed_agent_db(connection: &Connection) {
+        connection
+            .exec(
+                "CREATE TABLE solution_sessions (id TEXT PRIMARY KEY, solution_id TEXT, cwd TEXT);
+                 CREATE TABLE solution_session_background_agent (solution_session_id TEXT, agent_id TEXT, jsonl_path TEXT, PRIMARY KEY (solution_session_id, agent_id));
+                 CREATE TABLE solution_session_attachment (session_id TEXT, solution_id TEXT, path TEXT, created_at_ms INTEGER, PRIMARY KEY (session_id, path));",
+            )
+            .expect("prepare schema")()
+        .expect("create schema");
+        connection
+            .exec(
+                "INSERT INTO solution_sessions VALUES ('s1', '1', '/base/old/member');
+                 INSERT INTO solution_sessions VALUES ('s2', '2', '/base/older/member');
+                 INSERT INTO solution_session_background_agent VALUES ('s1', 'a1', '/base/old/member/.claude/x.jsonl');
+                 INSERT INTO solution_session_background_agent VALUES ('s2', 'a1', '/base/older/member/.claude/x.jsonl');
+                 INSERT INTO solution_session_attachment VALUES ('s1', '1', '/base/old/member/inbox/a.png', 5);
+                 INSERT INTO solution_session_attachment VALUES ('s2', '2', '/base/older/member/inbox/a.png', 5);",
+            )
+            .expect("prepare seed")()
+        .expect("seed rows");
+    }
+
+    #[test]
+    fn rewrites_agent_db_rows_including_the_pk_path() {
+        let connection = Connection::open_memory(Some("rewrites_agent_db_rows"));
+        seed_agent_db(&connection);
+
+        rewrite_agent_db(&connection, &rewrite()).expect("rewrite");
+        // Idempotent.
+        rewrite_agent_db(&connection, &rewrite()).expect("rewrite again");
+
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT cwd FROM solution_sessions WHERE id = 's1'"
+            ),
+            vec!["/base/new/member"]
+        );
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT jsonl_path FROM solution_session_background_agent WHERE solution_session_id = 's1'"
+            ),
+            vec!["/base/new/member/.claude/x.jsonl"]
+        );
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT path FROM solution_session_attachment WHERE session_id = 's1'"
+            ),
+            vec!["/base/new/member/inbox/a.png"]
+        );
+        assert_eq!(
+            counts(&connection, "SELECT COUNT(*) FROM solution_session_attachment"),
+            vec![2],
+            "delete+reinsert must not duplicate the row"
+        );
+
+        // The `/base/older` sibling shares a string prefix and must be intact.
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT cwd FROM solution_sessions WHERE id = 's2'"
+            ),
+            vec!["/base/older/member"]
+        );
+        assert_eq!(
+            text(
+                &connection,
+                "SELECT path FROM solution_session_attachment WHERE session_id = 's2'"
+            ),
+            vec!["/base/older/member/inbox/a.png"]
+        );
+    }
+
+    #[test]
+    fn a_missing_agent_table_is_not_an_error() {
+        let connection = Connection::open_memory(Some("a_missing_agent_table_is_not_an_error"));
+        rewrite_agent_db(&connection, &rewrite()).expect("rewrite an empty agent db");
+    }
+
+    #[test]
+    fn encodes_a_claude_bucket_name_like_claude_does() {
+        assert_eq!(
+            encode_claude_bucket(Path::new("/home/spk/.spk/sawe/ss/spk-solutions")),
+            "-home-spk--spk-sawe-ss-spk-solutions"
+        );
+    }
+
+    #[test]
+    fn moves_the_transcript_bucket() {
+        let projects = tempfile::tempdir().expect("tempdir");
+        let rewrite = rewrite();
+        let old_bucket = projects.path().join(encode_claude_bucket(&rewrite.old));
+        std::fs::create_dir_all(&old_bucket).expect("mkdir bucket");
+        std::fs::write(old_bucket.join("session.jsonl"), b"{}").expect("write");
+
+        move_transcript_bucket(projects.path(), &rewrite).expect("move");
+
+        let new_bucket = projects.path().join(encode_claude_bucket(&rewrite.new));
+        assert!(new_bucket.join("session.jsonl").is_file());
+        assert!(!old_bucket.exists());
+
+        // Idempotent: a second run with no source bucket is a no-op.
+        move_transcript_bucket(projects.path(), &rewrite).expect("move again");
+        assert!(new_bucket.join("session.jsonl").is_file());
+    }
+
+    #[test]
+    fn a_missing_transcript_bucket_is_a_no_op() {
+        let projects = tempfile::tempdir().expect("tempdir");
+        let rewrite = rewrite();
+
+        move_transcript_bucket(projects.path(), &rewrite).expect("no source bucket");
+
+        assert!(
+            !projects
+                .path()
+                .join(encode_claude_bucket(&rewrite.new))
+                .exists(),
+            "an absent source bucket must not conjure an empty target bucket"
+        );
+    }
+
+    #[test]
+    fn merges_into_an_existing_transcript_bucket() {
+        let projects = tempfile::tempdir().expect("tempdir");
+        let rewrite = rewrite();
+        let old_bucket = projects.path().join(encode_claude_bucket(&rewrite.old));
+        let new_bucket = projects.path().join(encode_claude_bucket(&rewrite.new));
+        std::fs::create_dir_all(old_bucket.join("subagents")).expect("mkdir old");
+        std::fs::write(old_bucket.join("a.jsonl"), b"a").expect("write a");
+        std::fs::write(old_bucket.join("subagents/s.jsonl"), b"s").expect("write s");
+        std::fs::create_dir_all(&new_bucket).expect("mkdir new");
+        std::fs::write(new_bucket.join("b.jsonl"), b"b").expect("write b");
+        std::fs::write(new_bucket.join("a.jsonl"), b"keep").expect("write existing a");
+
+        move_transcript_bucket(projects.path(), &rewrite).expect("merge");
+
+        assert_eq!(std::fs::read(new_bucket.join("b.jsonl")).expect("b"), b"b");
+        assert_eq!(
+            std::fs::read(new_bucket.join("a.jsonl")).expect("a"),
+            b"keep",
+            "an existing file in the target bucket is never overwritten"
+        );
+        assert_eq!(
+            std::fs::read(new_bucket.join("subagents/s.jsonl")).expect("s"),
+            b"s"
+        );
+        assert!(
+            !old_bucket.exists(),
+            "the source bucket is drained and removed"
+        );
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn git(args: &[&str], cwd: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("running git");
+        assert!(
+            output.status.success(),
+            "git {args:?} in {} failed: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A member repo with one commit and one linked worktree at `tree`.
+    fn repo_with_worktree(member: &Path, tree: &Path) {
+        std::fs::create_dir_all(member).expect("mkdir member");
+        git(&["init", "-q", "-b", "main", "."], member);
+        git(&["config", "user.email", "t@example.com"], member);
+        git(&["config", "user.name", "Test"], member);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"], member);
+        std::fs::create_dir_all(tree.parent().expect("tree parent")).expect("mkdir tree parent");
+        git(
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent",
+                tree.to_str().expect("tree str"),
+            ],
+            member,
+        );
+    }
+
+    /// After a solution rename the whole tree moved: both the tree's `.git`
+    /// pointer and the admin dir's `gitdir` file name the old location.
+    fn assert_worktree_is_healthy(tree: &Path) {
+        let inside = git(&["rev-parse", "--is-inside-work-tree"], tree);
+        assert_eq!(inside, "true", "worktree at {} is broken", tree.display());
+    }
+
+    #[test]
+    fn repairs_a_legacy_agent_worktree_after_the_solution_moved() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let old_root = base.path().join("old");
+        let member = old_root.join("member");
+        let tree = member.join(".claude").join("worktrees").join("agent-1");
+        repo_with_worktree(&member, &tree);
+
+        let new_root = base.path().join("new");
+        std::fs::rename(&old_root, &new_root).expect("move the solution root");
+        let rewrite = PathRewrite {
+            old: old_root,
+            new: new_root.clone(),
+        };
+        let new_member = new_root.join("member");
+        let new_tree = new_member.join(".claude").join("worktrees").join("agent-1");
+
+        repair_git_worktrees(&[(new_member.clone(), new_root.clone())], &rewrite)
+            .expect("repair");
+
+        assert_worktree_is_healthy(&new_tree);
+        // Idempotent — a second pass on an already-healthy tree is harmless.
+        repair_git_worktrees(&[(new_member, new_root)], &rewrite).expect("repair again");
+        assert_worktree_is_healthy(&new_tree);
+    }
+
+    #[test]
+    fn repairs_a_relocated_agent_worktree_after_the_solution_moved() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let old_root = base.path().join("old");
+        let member = old_root.join("member");
+        // Plan 3's `WorktreeCreate` hook puts new trees here, *outside* the
+        // member repo but inside the solution root.
+        let tree = old_root
+            .join(".agents")
+            .join("worktrees")
+            .join("member")
+            .join("agent-1");
+        repo_with_worktree(&member, &tree);
+
+        let new_root = base.path().join("new");
+        std::fs::rename(&old_root, &new_root).expect("move the solution root");
+        let rewrite = PathRewrite {
+            old: old_root,
+            new: new_root.clone(),
+        };
+        let new_member = new_root.join("member");
+        let new_tree = new_root
+            .join(".agents")
+            .join("worktrees")
+            .join("member")
+            .join("agent-1");
+
+        repair_git_worktrees(&[(new_member, new_root)], &rewrite).expect("repair");
+
+        assert_worktree_is_healthy(&new_tree);
+    }
+
+    #[test]
+    fn worktree_repair_ignores_a_tree_owned_by_another_member() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path().join("root");
+        let mine = root.join("mine");
+        let theirs = root.join("theirs");
+        // Both members keep their trees under the shared relocated area; the
+        // `<member-dir>` folder name is *not* trustworthy after a member
+        // rename, so ownership must come from the tree's own `.git` pointer.
+        let their_tree = root
+            .join(".agents")
+            .join("worktrees")
+            .join("mine")
+            .join("agent-1");
+        repo_with_worktree(&mine, &root.join("unused-tree"));
+        repo_with_worktree(&theirs, &their_tree);
+
+        let rewrite = PathRewrite {
+            old: base.path().join("nowhere"),
+            new: base.path().join("elsewhere"),
+        };
+        // `mine` must not try to repair `theirs`'s tree: passing a foreign tree
+        // to `git worktree repair` would be a no-op at best, so assert on the
+        // pointer staying intact.
+        repair_git_worktrees(&[(mine, root)], &rewrite).expect("repair");
+
+        let pointer = std::fs::read_to_string(their_tree.join(".git")).expect("read .git");
+        assert!(
+            pointer.contains("theirs/.git/worktrees/"),
+            "a foreign tree's pointer was rewritten: {pointer}"
+        );
+        assert_worktree_is_healthy(&their_tree);
+    }
+
+    #[test]
+    fn a_missing_worktree_directory_is_not_an_error() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let member = base.path().join("member");
+        std::fs::create_dir_all(&member).expect("mkdir");
+        repair_git_worktrees(&[(member, base.path().to_path_buf())], &rewrite())
+            .expect("no worktrees, no error");
     }
 
     #[test]

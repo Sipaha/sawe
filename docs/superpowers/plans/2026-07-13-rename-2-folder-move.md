@@ -1920,7 +1920,7 @@ git commit -m "solutions: Rewrite every path-bearing app-db row on a cold reconc
   - `pub fn move_transcript_bucket(claude_projects_dir: &Path, rewrite: &PathRewrite) -> Result<()>` — moves `<enc(old)>` → `<enc(new)>`, merging file-by-file when the target bucket exists; never renames over an existing bucket.
   - `pub fn repair_git_worktrees(members: &[(PathBuf, PathBuf)], rewrite: &PathRewrite) -> Result<()>` — `(member_root, solution_root)` pairs. Runs `git -C <member_root> worktree repair <tree paths…>` for every claude agent worktree owned by that member, in **both** locations: the legacy `<member_root>/.claude/worktrees/*` and the relocated `<solution_root>/.agents/worktrees/<member-dir>/*` (plan 3's `WorktreeCreate` hook puts them there). The tree paths are passed as **arguments** — see the doc comment in the code for why a bare `git worktree repair` is not enough, and why ownership is decided from the tree's `.git` pointer rather than from the `<member-dir>` folder name.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the `mod tests` in `crates/solutions/src/path_migrations.rs`:
 
@@ -2028,12 +2028,12 @@ Append to the `mod tests` in `crates/solutions/src/path_migrations.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p solutions path_migrations`
 Expected: FAIL — `cannot find function 'rewrite_agent_db'`, `cannot find function 'encode_claude_bucket'`, `cannot find function 'move_transcript_bucket'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Append to the non-test part of `crates/solutions/src/path_migrations.rs`:
 
@@ -2259,12 +2259,12 @@ fn owning_repo(tree: &Path, rewrite: &PathRewrite) -> Option<PathBuf> {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p solutions path_migrations`
 Expected: PASS — 8 tests total in the module.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/solutions/src/path_migrations.rs
