@@ -134,14 +134,22 @@ teammate when the authoritative signal is absent, in two cases:
 
 1. **Parent subprocess confirmed dead** — close immediately (no hook can arrive;
    this overlaps the kill path).
-2. **Stale mtime past a short window** — safety net for a *lost* `Stop` hook
-   while the parent is still alive. Because the hook now handles every normal
-   completion, this window can be short (order of a minute or two), not the old
-   3600 s live-parent cap — but it must remain non-zero so a dropped hook cannot
-   strand a tab forever.
+2. **Stale mtime past the live-parent cap** — safety net for a *lost* `Stop`
+   hook while the parent is still alive. This window MUST stay long (keep the
+   existing ~3600 s cap — do NOT shorten it). The `Stop` hook fires only at
+   end-of-turn, never mid-tool-call, so a *live, working* subagent running one
+   long SILENT tool call (`cargo build --release`, a slow test, a quiet `curl`)
+   also has a stalled JSONL mtime — indistinguishable, at this layer, from a
+   lost hook. Reaping on a short window would kill a still-running agent
+   mid-flight — the exact regression hardening #9 exists to prevent. Because the
+   hook already closes every *normal* completion immediately, the length of this
+   safety-net window does not affect normal UX; it only bounds the rare
+   genuinely-lost-hook case, so erring long is correct.
 
 The backstop is a safety net, not a primary path; the hook closes the common
-case immediately.
+case immediately. (Design correction: an earlier draft proposed shortening this
+window to "a minute or two" — that was wrong for live-parent silence and was
+reverted after the whole-branch review flagged the #9 re-regression.)
 
 ### Race: `Stop` before registration
 
