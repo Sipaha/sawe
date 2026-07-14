@@ -761,19 +761,13 @@ impl SolutionAgentStore {
                     .contains_key(&shell_id);
                 if !already {
                     // Command label: prefer `raw_input.command`, fall back to
-                    // `raw_input.description`; truncate to 120 chars so a long
-                    // pipeline doesn't blow out the strip.
+                    // `raw_input.description`; capped generously so a long
+                    // pipeline is stored whole (only pathological inputs clip).
                     let command_label: SharedString = snapshot
                         .raw_input
                         .as_ref()
-                        .and_then(|v| {
-                            v.get("command")
-                                .or_else(|| v.get("description"))
-                                .and_then(|c| c.as_str())
-                        })
-                        .map(|s| s.chars().take(120).collect::<String>())
-                        .unwrap_or_default()
-                        .into();
+                        .map(crate::background_shell::command_label_from_raw_input)
+                        .unwrap_or_default();
                     let registered_at = chrono::Utc::now();
                     let id_for_insert = shell_id.clone();
                     let path_for_insert = output_path.clone();

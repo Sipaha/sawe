@@ -178,6 +178,32 @@ impl BackgroundShell {
     }
 }
 
+/// Cap on the command string captured for a background shell. Generous: the
+/// pill label truncates to 24 chars for the strip and the tab content renders
+/// the command as its own fenced block, so display never depends on this being
+/// short — it only guards against a pathological multi-megabyte
+/// `raw_input.command`.
+pub const COMMAND_CAP: usize = 4096;
+
+/// Extract a background shell's launch command from a Bash tool call's
+/// `raw_input`: prefer `command`, fall back to `description`. Capped at
+/// [`COMMAND_CAP`] chars (ellipsis suffix on overflow). Empty `SharedString`
+/// when neither key holds a non-empty string.
+pub fn command_label_from_raw_input(raw_input: &serde_json::Value) -> SharedString {
+    let picked = raw_input
+        .get("command")
+        .or_else(|| raw_input.get("description"))
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    if picked.chars().count() > COMMAND_CAP {
+        let truncated: String = picked.chars().take(COMMAND_CAP).collect();
+        SharedString::from(format!("{truncated}…"))
+    } else {
+        SharedString::from(picked.to_string())
+    }
+}
+
 /// "X ago" formatter for a shell snapshot's `SystemTime` mtime. Converts to a
 /// UTC `DateTime` and formats relative to `now`; an mtime before the epoch
 /// (clock skew) or in the future degrades to `"just now"`. Lives here (moved
@@ -642,6 +668,35 @@ mod tests {
         let mut shell = running_shell("ls -la", None);
         shell.id = BackgroundShellId::new("abc");
         assert_eq!(shell.stream_label().as_ref(), "abc·ls -la");
+    }
+
+    #[test]
+    fn command_label_prefers_command_then_description() {
+        let v = serde_json::json!({"command": "ls -la", "description": "listing"});
+        assert_eq!(command_label_from_raw_input(&v).as_ref(), "ls -la");
+        let v = serde_json::json!({"description": "listing"});
+        assert_eq!(command_label_from_raw_input(&v).as_ref(), "listing");
+        let v = serde_json::json!({});
+        assert_eq!(command_label_from_raw_input(&v).as_ref(), "");
+    }
+
+    #[test]
+    fn command_label_keeps_commands_longer_than_120_chars() {
+        // Old behaviour truncated at 120; a 205-char command must now survive whole.
+        let long = format!("echo {}", "x".repeat(200));
+        let v = serde_json::json!({ "command": long });
+        let out = command_label_from_raw_input(&v);
+        assert_eq!(out.chars().count(), 205);
+        assert!(!out.ends_with('…'));
+    }
+
+    #[test]
+    fn command_label_caps_pathological_command() {
+        let huge = "a".repeat(COMMAND_CAP + 500);
+        let v = serde_json::json!({ "command": huge });
+        let out = command_label_from_raw_input(&v);
+        assert_eq!(out.chars().count(), COMMAND_CAP + 1); // COMMAND_CAP chars + ellipsis
+        assert!(out.ends_with('…'));
     }
 
     #[test]
