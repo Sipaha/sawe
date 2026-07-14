@@ -1143,6 +1143,11 @@ impl SolutionSessionView {
                 cx.listener(|this, e: &MouseDownEvent, _, cx| {
                     this.resize_start_y = e.position.y;
                     this.resize_start_height = this.compose_height;
+                    log::debug!(
+                        "compose drag down: start_y={:?} start_h={:?}",
+                        this.resize_start_y,
+                        this.resize_start_height,
+                    );
                     cx.stop_propagation();
                 }),
             )

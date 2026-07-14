@@ -296,6 +296,17 @@ where
         .into_any_element()
 }
 
+/// Tooltip text for a background-shell pill: the full command, falling back to
+/// the (truncated) strip label when the command string is empty so the tooltip
+/// is never blank.
+fn pill_tooltip_text(full_command: SharedString, label: SharedString) -> SharedString {
+    if full_command.is_empty() {
+        label
+    } else {
+        full_command
+    }
+}
+
 /// One background-shell pill (phase 6d-A). A shell stream exists only while
 /// `Running` (terminal shells auto-close and drop out of `session.streams`), so
 /// there is no per-state colouring and no × close affordance — just a bordered,
@@ -325,11 +336,7 @@ where
     // Hover shows the FULL command (the visible label is truncated to fit the
     // narrow strip). Empty command falls back to the label so the tooltip is
     // never blank.
-    let tooltip_text = if full_command.is_empty() {
-        label.clone()
-    } else {
-        full_command
-    };
+    let tooltip_text = pill_tooltip_text(full_command, label.clone());
     h_flex()
         .id(id)
         .flex_none()
@@ -357,4 +364,21 @@ where
                 .truncate(),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pill_tooltip_prefers_full_command() {
+        let out = pill_tooltip_text(SharedString::from("cd /very/long/path && make"), SharedString::from("abc·cd …"));
+        assert_eq!(out.as_ref(), "cd /very/long/path && make");
+    }
+
+    #[test]
+    fn pill_tooltip_falls_back_to_label_when_command_empty() {
+        let out = pill_tooltip_text(SharedString::from(""), SharedString::from("abc·cd …"));
+        assert_eq!(out.as_ref(), "abc·cd …");
+    }
 }
