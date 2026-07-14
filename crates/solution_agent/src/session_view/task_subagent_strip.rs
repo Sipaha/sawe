@@ -76,11 +76,20 @@ pub(super) fn render_task_subagent_strip(
     // while `Running`, so terminal shells have already auto-closed and drop out
     // here — no `ShellDisplayState`, no × affordance). Insertion order in
     // `streams` matches `background_shell_order`, so pill order stays stable.
-    let shell_streams: Vec<(BackgroundShellId, SharedString)> = session_ref
+    let shell_streams: Vec<(BackgroundShellId, SharedString, SharedString)> = session_ref
         .streams
         .iter()
         .filter_map(|(id, stream)| match id {
-            crate::stream::StreamId::Shell(bsid) => Some((bsid.clone(), stream.label.clone())),
+            crate::stream::StreamId::Shell(bsid) => {
+                // Full command for the hover tooltip; fall back to the short
+                // strip label when the shell row is somehow absent.
+                let full_command = session_ref
+                    .background_shells
+                    .get(bsid)
+                    .map(|sh| sh.command.clone())
+                    .unwrap_or_else(|| stream.label.clone());
+                Some((bsid.clone(), stream.label.clone(), full_command))
+            }
             _ => None,
         })
         .collect();
@@ -151,13 +160,14 @@ pub(super) fn render_task_subagent_strip(
             },
         ));
     }
-    for (id, label) in shell_streams {
+    for (id, label, full_command) in shell_streams {
         let is_active = matches!(&selected, StreamId::Shell(s) if s == &id);
         let id_for_listener = id.clone();
         let pill_id = SharedString::from(format!("task-subagent-strip-shell-{}", id));
         row = row.child(shell_pill(
             pill_id,
             label,
+            full_command,
             is_active,
             cx,
             move |this, _, _, cx| {
@@ -293,6 +303,7 @@ where
 fn shell_pill<F>(
     id: SharedString,
     label: SharedString,
+    full_command: SharedString,
     is_active: bool,
     cx: &mut Context<SolutionSessionView>,
     on_click: F,
@@ -311,7 +322,14 @@ where
     } else {
         (Color::Accent, colors.border)
     };
-    let tooltip_text = SharedString::from(format!("Show {}", label));
+    // Hover shows the FULL command (the visible label is truncated to fit the
+    // narrow strip). Empty command falls back to the label so the tooltip is
+    // never blank.
+    let tooltip_text = if full_command.is_empty() {
+        label.clone()
+    } else {
+        full_command
+    };
     h_flex()
         .id(id)
         .flex_none()
