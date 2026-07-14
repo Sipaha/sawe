@@ -151,17 +151,18 @@ impl BackgroundShell {
             None => "no output yet".to_string(),
         };
         let header = format!(
-            "`{}` · {} · {} · {}",
-            self.command,
+            "{} · {} · id: {} · out: {}",
             state_label,
             observed,
-            self.id.short()
+            self.id.short(),
+            self.output_path.display(),
         );
+        let command_block = format!("```\n{}\n```", self.command);
         let body = match &self.latest {
             Some(snapshot) => format!("```\n{}\n```", snapshot.output_tail),
             None => "_No output captured yet._".to_string(),
         };
-        let text = format!("{header}\n\n{body}");
+        let text = format!("{header}\n\n{command_block}\n\n{body}");
         let ms = self
             .latest
             .as_ref()
@@ -704,8 +705,6 @@ mod tests {
         let shell = running_shell("echo hi", Some("hello\nworld\n"));
         let entry = shell.stream_entry(chrono::Utc::now());
         assert!(entry.subagent_id.is_none());
-        // mtime = 1_720_000_000 s → unix-ms; both created_ms and mod_seq derive
-        // from it so a per-stream seq advances when the tail (and mtime) change.
         assert_eq!(entry.mod_seq, 1_720_000_000_000);
         assert_eq!(entry.created_ms, 1_720_000_000_000);
         let SessionEntryKind::AssistantMessage { chunks } = &entry.kind else {
@@ -714,8 +713,16 @@ mod tests {
         let AssistantChunk::Message(text) = &chunks[0] else {
             panic!("expected a plain Message chunk");
         };
-        assert!(text.contains("```\nhello\nworld\n\n```"));
-        assert!(text.contains("`echo hi`"));
+        // Output tail still fenced.
+        assert!(text.contains("```\nhello\nworld\n\n```"), "output: {text}");
+        // Command is now its OWN fenced block, not an inline `code` span.
+        assert!(text.contains("```\necho hi\n```"), "command block: {text}");
+        assert!(!text.contains("`echo hi`"), "command must not be inline: {text}");
+        // Metadata line carries id + output path.
+        assert!(
+            text.contains("id: bvb4ful1z · out: /tmp/claude/tasks/bvb4ful1z.output"),
+            "metadata: {text}"
+        );
     }
 
     #[test]
