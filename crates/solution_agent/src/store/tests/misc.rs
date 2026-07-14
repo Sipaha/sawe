@@ -3904,6 +3904,187 @@ async fn registered_store_pull_drains_queue_and_returns_followup_text(cx: &mut T
     drop(server);
 }
 
+/// The `subscribe_to_session` pull closure's authoritative-teammate-close
+/// branch (`delivered.is_none() && is_end_of_turn && agent_id.is_some()` →
+/// `close_teammate_on_stop`, `store.rs`). The pre-existing coverage above
+/// exercises `Some(agent_id)+mid-turn` (must not drain) and `None+end-of-turn`
+/// (drains the main queue) via `invoke_store_pull_for_test`, but never
+/// `Some(agent_id)+end-of-turn` — the exact combo this branch adds: a
+/// subagent's `Stop` hook with nothing left to deliver must close its
+/// teammate stream.
+#[gpui::test]
+async fn native_pull_subagent_end_of_turn_closes_teammate_stream(cx: &mut TestAppContext) {
+    use acp_thread::AgentConnection;
+    use agent_servers::{AgentServer, AgentServerDelegate};
+    use claude_native::ClaudeNativeConnection;
+    use project::AgentId;
+
+    let mock_binary = native_mock_binary();
+    if !mock_binary.exists() {
+        panic!(
+            "mock claude binary missing at {} — tests/fixtures/mock_claude.sh not bundled?",
+            mock_binary.display()
+        );
+    }
+    cx.executor().allow_parking();
+
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("claude-native");
+
+    let server = Rc::new(claude_native::ClaudeNativeAgentServer::with_binary(
+        AgentId::new("claude-native"),
+        mock_binary,
+        Vec::new(),
+    ));
+
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.register_agent_server(agent_id.clone(), server.clone());
+        });
+    });
+
+    let connection: Rc<dyn acp_thread::AgentConnection> = cx
+        .update(|cx| {
+            let store = project.read(cx).agent_server_store().clone();
+            let delegate = AgentServerDelegate::new(store, None, None);
+            AgentServer::connect(server.as_ref(), delegate, project.clone(), cx)
+        })
+        .await
+        .expect("native connect");
+    let native = connection
+        .clone()
+        .downcast::<ClaudeNativeConnection>()
+        .expect("downcast to ClaudeNativeConnection");
+
+    let work_dirs = util::path_list::PathList::new(&[std::env::temp_dir().as_path()]);
+    let acp_thread = cx
+        .update(|cx| Rc::clone(&native).new_session(project.clone(), work_dirs, cx))
+        .await
+        .expect("new_session");
+
+    let acp_session_id = acp_thread.read_with(cx, |t, _| t.session_id().clone());
+
+    let session_id = SolutionSessionId::new();
+    cx.update(|cx| {
+        let session = cx.new(|_| {
+            let mut s = crate::model::SolutionSession::new_idle(
+                session_id,
+                solution_id,
+                agent_id.clone(),
+                acp_session_id.clone(),
+            );
+            s.title = SharedString::from("native-pull-subagent-stop-test");
+            s.project = Some(project.clone());
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            s
+        });
+        session.update(cx, |session, cx| {
+            session.set_acp_thread(Some(acp_thread.clone()), cx);
+        });
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.sessions.insert(session_id, session.clone());
+            store
+                .by_solution
+                .entry(solution_id)
+                .or_default()
+                .push(session_id);
+            let sub = store.subscribe_to_session(session_id, acp_thread.clone(), cx);
+            session.update(cx, |s, _| s._acp_subscription = Some(sub));
+        });
+    });
+    assert!(
+        native.store_pull_registered_for_test(),
+        "subscribe_to_session must register the native store pull"
+    );
+
+    // A live teammate: parent-thread entries tagged with the spawn tool-call's
+    // id (demux produces the `Teammate` stream) plus a registered
+    // `BackgroundAgent` whose `parent_tool_use_id` maps back to it — the shape
+    // `close_teammate_on_stop` expects.
+    let bg_id = crate::background_agent::BackgroundAgentId::new("sub-agent-1");
+    let parent_toolu = SharedString::from("toolu_sub_1");
+    let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![crate::session_entry::SessionEntry {
+                    created_ms: 0,
+                    mod_seq: 0,
+                    subagent_id: Some(parent_toolu.clone()),
+                    kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Message(
+                            "streaming".to_string(),
+                        )],
+                    },
+                }],
+                cx,
+            );
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: PathBuf::new(),
+                    registered_at: chrono::Utc::now(),
+                    latest: None,
+                    last_offset: 0,
+                    parent_tool_use_id: Some(parent_toolu.clone()),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+            assert!(s.streams.contains_key(&teammate), "teammate live before Stop");
+        });
+    });
+
+    // Drive the REAL closure via `invoke_store_pull_for_test` with an empty
+    // queue (⇒ `take_pending_for_delivery` returns `None`) and
+    // `Some(agent_id) + is_end_of_turn=true` — the exact combo Task 1 adds.
+    let mut async_cx = cx.to_async();
+    let sub_pull =
+        native.invoke_store_pull_for_test(&acp_session_id, Some("sub-agent-1"), true, &mut async_cx);
+    assert!(
+        sub_pull.is_none(),
+        "empty queue ⇒ nothing to deliver, got {sub_pull:?}"
+    );
+
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "end-of-turn subagent Stop with nothing to deliver must close the teammate stream"
+            );
+            assert!(
+                s.closed_streams.contains_key(&teammate),
+                "close reason recorded"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store
+            .update(cx, |store, cx| store.close_session(session_id, cx))
+            .ok();
+    });
+    drop(acp_thread);
+    drop(native);
+    drop(server);
+}
+
 // =====================================================================
 // Create-implies-open: a freshly-created top-level session must be
 // pinned into its solution's tab strip (tab_order set) so it surfaces

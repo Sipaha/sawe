@@ -1353,26 +1353,18 @@ async fn subagent_stop_hook_closes_teammate_stream(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn subagent_stop_before_registration_buffers_then_closes(cx: &mut TestAppContext) {
-    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    use agent_client_protocol::schema as acp;
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
     let bg_id = crate::background_agent::BackgroundAgentId::new("b11122233344455566");
     let parent_toolu = SharedString::from("toolu_Y");
     let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
 
-    // Stop arrives BEFORE the agent is registered → buffered, nothing closed.
+    // A parent-thread entry tagged with the teammate's parent tool_use id so
+    // the demux produces a live `Teammate` stream before the Stop races in —
+    // same shape as `subagent_stop_hook_closes_teammate_stream`.
     cx.update(|cx| {
         let s = SolutionAgentStore::global(cx);
-        s.update(cx, |s, cx| {
-            s.close_teammate_on_stop(session_id, "b11122233344455566", cx)
-        });
         let session = s.read(cx).session(session_id).unwrap();
-        session.read_with(cx, |s, _| {
-            assert!(s.pending_stop.contains(&bg_id), "stop buffered until registration");
-        });
-    });
-
-    // Registration lands → drain the buffered stop → close the stream.
-    cx.update(|cx| {
-        let session = SolutionAgentStore::global(cx).read(cx).session(session_id).unwrap();
         session.update(cx, |s, cx| {
             s.set_entries(
                 vec![crate::session_entry::SessionEntry {
@@ -1385,11 +1377,82 @@ async fn subagent_stop_before_registration_buffers_then_closes(cx: &mut TestAppC
                 }],
                 cx,
             );
-            assert!(s.streams.contains_key(&teammate), "teammate live pre-drain");
-            if s.take_pending_stop(&bg_id) {
-                s.close_stream(teammate.clone(), SharedString::new_static("done"));
-            }
-            assert!(!s.streams.contains_key(&teammate), "drained stop closes the teammate");
+            assert!(s.streams.contains_key(&teammate), "teammate live before Stop");
+        });
+    });
+
+    // Stop arrives BEFORE the agent is registered → buffered, nothing closed.
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| {
+            s.close_teammate_on_stop(session_id, "b11122233344455566", cx)
+        });
+        let session = s.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(s.pending_stop.contains(&bg_id), "stop buffered until registration");
+            assert!(
+                s.streams.contains_key(&teammate),
+                "teammate still live — nothing closed yet"
+            );
+            assert!(
+                !s.closed_streams.contains_key(&teammate),
+                "no close recorded yet"
+            );
+        });
+    });
+
+    // Registration lands via the REAL `apply_subagent_lifecycle` path — the
+    // `Agent` tool call's terminal `agentId:`/`output_file:` announcement,
+    // same shape as
+    // `agent_terminal_with_parseable_raw_output_registers_background_agent`.
+    // This must drain the buffered stop through the production drain (not a
+    // hand-rolled re-implementation), or a bug in that drain would go
+    // uncaught.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            let call = acp::ToolCall::new(
+                acp::ToolCallId::new(parent_toolu.to_string()),
+                "Agent".to_string(),
+            )
+            .kind(acp::ToolKind::Think)
+            .status(acp::ToolCallStatus::InProgress)
+            .meta(Some(acp_thread::meta_with_tool_name("Agent")));
+            t.upsert_tool_call(call, cx).expect("upsert in-progress");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            let raw = serde_json::Value::String(
+                "agentId: b11122233344455566\noutput_file: /tmp/agent-b11122233344455566.output"
+                    .to_string(),
+            );
+            let call = acp::ToolCall::new(
+                acp::ToolCallId::new(parent_toolu.to_string()),
+                "Agent".to_string(),
+            )
+            .kind(acp::ToolKind::Think)
+            .status(acp::ToolCallStatus::Completed)
+            .raw_output(raw)
+            .meta(Some(acp_thread::meta_with_tool_name("Agent")));
+            t.upsert_tool_call(call, cx).expect("upsert completed");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx).read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                s.background_agents.contains_key(&bg_id),
+                "registration succeeded via the real apply_subagent_lifecycle path"
+            );
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "drained stop closes the teammate on real registration"
+            );
+            assert!(s.closed_streams.contains_key(&teammate), "close reason recorded");
         });
     });
 }
