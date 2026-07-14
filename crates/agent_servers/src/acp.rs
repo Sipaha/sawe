@@ -3828,7 +3828,10 @@ fn sawe_mcp_bridge_server(solution_socket: Option<PathBuf>) -> Option<acp::McpSe
     if !socket.exists() {
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
+    // `current_exe_resolved` strips Linux's " (deleted)" marker so a
+    // rebuild-while-running doesn't hand the subagent a non-existent `--nc`
+    // bridge binary path.
+    let exe = util::current_exe_resolved().ok()?;
 
     // Per P-4 / S-BAK: `--nc` bridge subagents default to `Write` tier;
     // `Destructive` requires the user opting in via the parent process env

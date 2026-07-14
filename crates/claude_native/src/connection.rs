@@ -781,7 +781,10 @@ impl ClaudeNativeConnection {
             agents_dir: solution_root.join(".agents"),
             // The *running* binary hooks itself: a dev build and a release build
             // must not end up pointing at whichever `sawe` happens to be on PATH.
-            editor_exe: std::env::current_exe().log_err()?,
+            // `current_exe_resolved` strips Linux's " (deleted)" marker so a
+            // rebuild-while-running doesn't bake a non-existent path into the
+            // worktree-hook command.
+            editor_exe: util::current_exe_resolved().log_err()?,
             work_dir: work_dir.to_path_buf(),
         };
         let path = crate::claude_settings::settings_path(solution_id);

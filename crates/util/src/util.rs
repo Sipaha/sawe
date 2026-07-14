@@ -284,25 +284,46 @@ fn load_shell_from_passwd() -> Result<()> {
     Ok(())
 }
 
-/// Returns a shell escaped path for the current zed executable
-pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<String> {
+/// `std::env::current_exe()` with Linux's " (deleted)" marker resolved away.
+///
+/// On Linux, once the running binary's file is replaced (e.g. a rebuild while
+/// the app is running), `current_exe()` reads `/proc/self/exe` as
+/// `…/foo (deleted)` — a path that no longer exists, which breaks anything that
+/// execs it by that path (the claude worktree hook, the `--nc` MCP bridge, the
+/// shell-env path). If the raw path is not a file but the same path without the
+/// marker is, return that (the freshly-rebuilt binary at the same location).
+pub fn current_exe_resolved() -> anyhow::Result<PathBuf> {
     use anyhow::Context as _;
-    use paths::PathExt;
-    let mut zed_path =
-        std::env::current_exe().context("Failed to determine current zed executable path.")?;
+    let exe =
+        std::env::current_exe().context("Failed to determine current executable path.")?;
+    Ok(resolve_deleted_exe(exe, |path| path.is_file()))
+}
+
+/// Core of [`current_exe_resolved`] with the filesystem probe injected so it can
+/// be unit-tested. On Linux, when `exe` is not a file and its name ends in
+/// " (deleted)", strip the marker and return the underlying path; otherwise
+/// return `exe` unchanged.
+fn resolve_deleted_exe(exe: PathBuf, is_file: impl Fn(&std::path::Path) -> bool) -> PathBuf {
     if cfg!(target_os = "linux")
-        && !zed_path.is_file()
-        && let Some(truncated) = zed_path
-            .clone()
+        && !is_file(&exe)
+        && let Some(truncated) = exe
             .file_name()
             .and_then(|s| s.to_str())
             .and_then(|n| n.strip_suffix(" (deleted)"))
     {
-        // Might have been deleted during update; let's use the new binary if there is one.
-        zed_path.set_file_name(truncated);
+        let truncated = truncated.to_owned();
+        let mut fixed = exe;
+        fixed.set_file_name(truncated);
+        return fixed;
     }
+    exe
+}
 
-    zed_path
+/// Returns a shell escaped path for the current zed executable
+pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use paths::PathExt;
+    current_exe_resolved()?
         .try_shell_safe(shell_kind)
         .context("Failed to shell-escape Zed executable path.")
 }
@@ -1072,5 +1093,31 @@ Line 3"#
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (0..6, "héllo")); // 'é' is 2 bytes
         assert_eq!(result[1], (10..15, "world")); // '🦀' is 4 bytes
+    }
+
+    #[test]
+    fn resolve_deleted_exe_strips_marker_when_the_raw_path_is_missing() {
+        // The literal `… (deleted)` path never exists on disk → strip the marker
+        // so we exec the freshly-rebuilt binary at the underlying path.
+        let got = resolve_deleted_exe(PathBuf::from("/opt/app/sawe (deleted)"), |_| false);
+        if cfg!(target_os = "linux") {
+            assert_eq!(got, PathBuf::from("/opt/app/sawe"));
+        } else {
+            // Non-Linux: `current_exe()` doesn't add the marker, so never rewrite.
+            assert_eq!(got, PathBuf::from("/opt/app/sawe (deleted)"));
+        }
+    }
+
+    #[test]
+    fn resolve_deleted_exe_keeps_a_real_file_untouched() {
+        let got = resolve_deleted_exe(PathBuf::from("/opt/app/sawe"), |_| true);
+        assert_eq!(got, PathBuf::from("/opt/app/sawe"));
+    }
+
+    #[test]
+    fn resolve_deleted_exe_leaves_a_markerless_missing_path_alone() {
+        // Missing but no " (deleted)" marker → don't fabricate a different path.
+        let got = resolve_deleted_exe(PathBuf::from("/opt/app/sawe"), |_| false);
+        assert_eq!(got, PathBuf::from("/opt/app/sawe"));
     }
 }
