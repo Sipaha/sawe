@@ -714,21 +714,25 @@ impl SolutionSession {
     }
 
     /// Flip every still-running background agent to `killed` (its owning
-    /// subprocess is gone) and rebuild the mirror so their teammate streams
-    /// re-state as `Done { killed }`. Returns whether anything changed, so the
-    /// store can decide whether to emit `SessionBackgroundAgentsChanged`.
-    /// Idempotent.
+    /// subprocess is gone) and close each one's teammate stream immediately
+    /// (never a lingering `Done { killed }` tab left for the reaper — see
+    /// `close_stream`). Returns whether anything changed, so the store can
+    /// decide whether to emit `SessionBackgroundAgentsChanged`. Idempotent.
     pub fn mark_background_agents_killed(&mut self) -> bool {
-        let to_kill: Vec<crate::background_agent::BackgroundAgentId> = self
+        let to_kill: Vec<(
+            crate::background_agent::BackgroundAgentId,
+            Option<SharedString>,
+        )> = self
             .background_agents
             .iter()
             .filter(|(_, agent)| !agent.killed && agent.is_messageable())
-            .map(|(id, _)| id.clone())
+            .map(|(id, agent)| (id.clone(), agent.parent_tool_use_id.clone()))
             .collect();
         if to_kill.is_empty() {
             return false;
         }
-        for id in to_kill {
+        let mut parent_toolus = Vec::with_capacity(to_kill.len());
+        for (id, parent_toolu) in to_kill {
             // A fresh `change_seq` stamp per killed agent: the folded pill's entry
             // rides the same monotonic axis as demux entries, so the mobile delta
             // cursor picks the terminal state up as a normal advance.
@@ -737,6 +741,15 @@ impl SolutionSession {
                 agent.killed = true;
                 agent.latest_seq = seq;
             }
+            parent_toolus.push(parent_toolu);
+        }
+        // Close AFTER the `background_agents` borrow above ends: `close_stream`
+        // takes `&mut self` too.
+        for parent_toolu in parent_toolus.into_iter().flatten() {
+            self.close_stream(
+                crate::stream::StreamId::Teammate(parent_toolu),
+                crate::background_agent::KILLED_REASON,
+            );
         }
         self.rebuild_streams();
         true

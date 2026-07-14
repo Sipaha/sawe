@@ -2939,7 +2939,9 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
 /// work (which suppresses the stuck-session watchdog, `turn_is_wedged`).
 ///
 /// The terminal state is `killed`, NOT a `stop_reason` completion: the agent was
-/// reaped mid-flight and must never be reported as done.
+/// reaped mid-flight and must never be reported as done. Task 4: the kill also
+/// closes the teammate stream immediately (`close_stream`, reason `killed`)
+/// rather than leaving a lingering `Done { killed }` tab for the reaper.
 #[gpui::test]
 async fn dropping_the_thread_kills_background_agents(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
@@ -3032,34 +3034,79 @@ async fn dropping_the_thread_kills_background_agents(cx: &mut TestAppContext) {
                 .all(|a| a.latest.as_ref().is_none_or(|snap| snap.stop_reason.is_none())),
             "killed is NOT a stop_reason completion — the agent never finished"
         );
+        // Task 4: kill closes the teammate stream IMMEDIATELY — no lingering
+        // `Done { killed }` tab left for the reaper to age out.
         for id in [&detached, &demuxed] {
-            let stream = s.streams.get(id).expect("teammate tab survives the kill");
+            assert!(
+                !s.streams.contains_key(id),
+                "a killed teammate's stream must close immediately, not linger as Done{{killed}}"
+            );
             assert_eq!(
-                stream.state,
-                crate::stream::StreamState::Done {
-                    reason: crate::background_agent::KILLED_REASON
-                },
-                "the tab must go terminal-killed, not keep claiming the teammate runs"
+                s.closed_streams.get(id).cloned(),
+                Some(crate::background_agent::KILLED_REASON),
+                "the immediate close must record the `killed` reason, never `done`"
             );
         }
-        // The demuxed teammate keeps its real entries; only its state changed.
-        assert_eq!(
-            s.streams.get(&demuxed).expect("demuxed").entries.len(),
-            1,
-            "re-stating a demuxed teammate must not clobber its transcript"
-        );
-        let body = match &s.streams.get(&detached).expect("detached").entries[0].kind {
-            crate::session_entry::SessionEntryKind::AssistantMessage { chunks } => match &chunks[0]
-            {
-                crate::session_entry::AssistantChunk::Message(text) => text.clone(),
-                other => panic!("unexpected chunk: {other:?}"),
-            },
-            other => panic!("unexpected entry kind: {other:?}"),
-        };
-        assert!(
-            body.contains("killed") && body.contains("did NOT finish"),
-            "the folded agent's body must say it was killed, not that it is running: {body}"
-        );
+    });
+}
+
+/// Task 4: killing a background agent's teammate stream must close it
+/// IMMEDIATELY (`close_stream`), not merely re-state it `Done { killed }` and
+/// leave it for `tick_background_agents` to age out later. A dedicated,
+/// minimal counterpart to `dropping_the_thread_kills_background_agents`
+/// (which covers both the detached and demuxed stream shapes) — this one
+/// isolates the single assertion the redesign is about.
+#[gpui::test]
+async fn killed_agent_closes_teammate_stream_immediately(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let toolu = "toolu_killed_immediately";
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from(toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            let bg_id = crate::background_agent::BackgroundAgentId::new("bg_killed_immediately");
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: "/nonexistent".into(),
+                    registered_at: Utc::now(),
+                    latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                        mtime: std::time::SystemTime::now(),
+                        activity_label: SharedString::from("Grep: foo"),
+                        stop_reason: None,
+                    }),
+                    last_offset: 0,
+                    parent_tool_use_id: Some(SharedString::from(toolu)),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id);
+            s.rebuild_streams();
+            assert_eq!(
+                s.streams.get(&teammate).expect("live teammate stream").state,
+                crate::stream::StreamState::Live,
+                "a running background agent's tab is Live while its subprocess is up"
+            );
+
+            // Dropping the live thread marks every still-running background
+            // agent of this session `killed`.
+            s.set_acp_thread(None, cx);
+
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "the killed teammate's stream must close immediately, not \
+                 linger as Done{{killed}} for the reaper"
+            );
+            assert_eq!(
+                s.closed_streams.get(&teammate).cloned(),
+                Some(crate::background_agent::KILLED_REASON),
+                "the immediate close must record the `killed` reason"
+            );
+        });
     });
 }
 
