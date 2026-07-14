@@ -82,7 +82,7 @@ impl ShellRuntimeState {
 #[derive(Clone, Debug)]
 pub struct BackgroundShell {
     pub id: BackgroundShellId,
-    /// Command line captured at launch (truncated to ~120 chars at the call-site).
+    /// Command line captured at launch (truncated to `COMMAND_CAP` (4096) chars at the call-site).
     pub command: SharedString,
     /// The `/tmp/claude-<uid>/.../tasks/<id>.output` path from the launch announcement.
     pub output_path: PathBuf,
@@ -200,7 +200,7 @@ pub fn command_label_from_raw_input(raw_input: &serde_json::Value) -> SharedStri
         let truncated: String = picked.chars().take(COMMAND_CAP).collect();
         SharedString::from(format!("{truncated}…"))
     } else {
-        SharedString::from(picked.to_string())
+        SharedString::from(picked)
     }
 }
 
