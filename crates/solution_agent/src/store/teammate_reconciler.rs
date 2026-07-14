@@ -269,7 +269,6 @@ impl SolutionAgentStore {
         });
         let mut changed = false;
         session.update(cx, |s, _| {
-            let mut close_teammate: Option<(SharedString, SharedString)> = None; // (parent toolu, reason)
             // Allocate the pill's next `change_seq`-axis stamp BEFORE the
             // `get_mut` borrow (both need `&mut s`). Only consumed when this
             // tail yields a new snapshot.
@@ -288,40 +287,28 @@ impl SolutionAgentStore {
                     // on its own before judging, exactly like a background shell
                     // completing (`mark_background_shell_state`). Only on the
                     // transition into terminal (a done agent's JSONL stops
-                    // growing, so this fires once).
+                    // growing, so this fires once). `stop_reason` still feeds
+                    // `is_messageable`/supervisor gating, but no longer drives a
+                    // stream close — the subagent `Stop` hook is the sole close
+                    // authority (`close_teammate_on_stop`).
                     let was_terminal = ba
                         .latest
                         .as_ref()
                         .is_some_and(|s| s.stop_reason.is_some());
                     let now_terminal = snap.stop_reason.is_some();
-                    let parent = ba.parent_tool_use_id.clone();
-                    let reason = snap.stop_reason.clone();
                     ba.latest = Some(snap);
                     ba.latest_seq = next_seq.unwrap_or(ba.latest_seq);
                     changed = true;
                     if now_terminal && !was_terminal {
                         s.last_activity_at = Utc::now();
-                        if let Some(parent_toolu) = parent {
-                            close_teammate = Some((
-                                parent_toolu,
-                                reason.unwrap_or_else(|| gpui::SharedString::new_static("done")),
-                            ));
-                        }
                     }
                 }
             }
-            // Auto-close the async `Agent` teammate's demux stream on its REAL
-            // terminal signal (deferred from phase 3, where the spawn tool-call
-            // terminal is only spawn-ack). Done after the `ba` borrow ends so
-            // `close_stream` can take `&mut s`.
-            if let Some((parent_toolu, reason)) = close_teammate {
-                s.close_stream(crate::stream::StreamId::Teammate(parent_toolu), reason);
-            } else if changed {
+            if changed {
                 // The folded pill's body + `seq` derive from `ba.latest` ONLY
                 // inside `rebuild_streams`, so a non-terminal snapshot advance
                 // must rebuild or the pill freezes at its first-observed state
-                // (mirrors the shell twin's unconditional rebuild). The terminal
-                // path already rebuilt via `close_stream`.
+                // (mirrors the shell twin's unconditional rebuild).
                 s.rebuild_streams();
             }
         });

@@ -1203,13 +1203,13 @@ async fn refresh_rebuilds_a_detached_agent_pill_so_it_is_not_frozen(cx: &mut Tes
     });
 }
 
-/// Sub-task C (deferred #1): an async `Agent` teammate's demux `Teammate`
-/// stream — which phase 3 deliberately kept live past the spawn tool-call's
-/// terminal (that's only spawn-ack) — is auto-closed when the managed
-/// background agent reaches its REAL terminal `stop_reason`, via the
-/// `BackgroundAgent.parent_tool_use_id` → `StreamId::Teammate` mapping.
+/// A terminal `stop_reason` observed in the JSONL tail no longer closes the
+/// async `Agent` teammate's demux `Teammate` stream — the subagent `Stop`
+/// hook is the sole close authority (Task 1). The snapshot content is still
+/// updated (feeds `is_messageable`/supervisor gating), but the stream stays
+/// live until the hook fires.
 #[gpui::test]
-async fn background_agent_terminal_closes_teammate_stream(cx: &mut TestAppContext) {
+async fn background_agent_terminal_does_not_close_teammate_stream(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
     let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc");
     let parent_toolu = SharedString::from("toolu_X");
@@ -1282,12 +1282,8 @@ async fn background_agent_terminal_closes_teammate_stream(cx: &mut TestAppContex
             .unwrap();
         session.read_with(cx, |s, _| {
             assert!(
-                !s.streams.contains_key(&teammate),
-                "teammate stream must be closed on the agent's real terminal"
-            );
-            assert!(
-                s.closed_streams.contains_key(&teammate),
-                "close reason recorded in the overlay"
+                s.streams.contains_key(&teammate),
+                "JSONL terminal no longer closes the stream — the Stop hook does"
             );
         });
     });
