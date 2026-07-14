@@ -122,6 +122,7 @@
             teammate_labels: HashMap::new(),
             background_agents: HashMap::new(),
             background_agent_order: Vec::new(),
+            pending_stop: std::collections::HashSet::new(),
             background_shells: HashMap::new(),
             background_shell_order: Vec::new(),
             tab_order: None,

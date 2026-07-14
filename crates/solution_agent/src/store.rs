@@ -1721,6 +1721,47 @@ impl SolutionAgentStore {
         Some(text)
     }
 
+    /// A subagent's `Stop` hook fired (`is_end_of_turn`, its `agent_id`) with
+    /// nothing left to deliver — it is idle and done. Close its demux teammate
+    /// stream immediately. If the `agentId:` announcement has not registered the
+    /// agent yet, buffer the stop (`pending_stop`) so `apply_subagent_lifecycle`
+    /// closes it on registration. Authoritative: replaces the JSONL-tail guess.
+    pub fn close_teammate_on_stop(
+        &mut self,
+        session_id: SolutionSessionId,
+        agent_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+        let bg_id = crate::background_agent::BackgroundAgentId::new(agent_id.to_string());
+        let closed = session.update(cx, |s, _| {
+            match s
+                .background_agents
+                .get(&bg_id)
+                .and_then(|ba| ba.parent_tool_use_id.clone())
+            {
+                Some(parent_toolu) => {
+                    s.close_stream(
+                        crate::stream::StreamId::Teammate(parent_toolu),
+                        gpui::SharedString::new_static("done"),
+                    );
+                    true
+                }
+                None => {
+                    s.pending_stop.insert(bg_id);
+                    false
+                }
+            }
+        });
+        if closed {
+            cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
+                session_id,
+            ));
+        }
+    }
+
     /// Test-only helper: register a session whose `acp_thread` was constructed
     /// elsewhere (or left `None`). Real `create_session` (Task 3.3) replaces
     /// this for production use.
@@ -3087,7 +3128,19 @@ impl SolutionAgentStore {
                       cx: &mut AsyncApp| {
                     weak.update(cx, |store, cx| {
                         let session_id = store.session_id_for_acp(acp_sid, cx)?;
-                        store.take_pending_for_delivery(session_id, agent_id, is_end_of_turn, cx)
+                        let delivered = store.take_pending_for_delivery(
+                            session_id, agent_id, is_end_of_turn, cx,
+                        );
+                        // Authoritative teammate completion: a subagent `Stop`
+                        // (end-of-turn + its own agent_id) with nothing left to
+                        // deliver means that teammate is idle and done — close
+                        // its stream now, not on the JSONL/stale backstop.
+                        if delivered.is_none() && is_end_of_turn {
+                            if let Some(agent_id) = agent_id {
+                                store.close_teammate_on_stop(session_id, agent_id, cx);
+                            }
+                        }
+                        delivered
                     })
                     .ok()
                     .flatten()

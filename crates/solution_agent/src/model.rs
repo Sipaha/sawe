@@ -526,6 +526,11 @@ pub struct SolutionSession {
     /// Insertion order of `background_agents`. Used to render pills in
     /// spawn order (HashMap iteration is hash-seeded and unstable).
     pub background_agent_order: Vec<background_agent::BackgroundAgentId>,
+    /// Subagent `Stop` hooks that arrived before the agent's `agentId:`
+    /// announcement registered it in `background_agents`. Drained at
+    /// registration (`take_pending_stop`) to close the teammate stream. Same
+    /// `BackgroundAgentId` namespace as `background_agents`.
+    pub pending_stop: std::collections::HashSet<background_agent::BackgroundAgentId>,
     /// Background shells (`Bash(run_in_background=true)`) launched from
     /// this session. Keyed by [`background_shell::BackgroundShellId`].
     /// Output lives in an on-disk `.output` file tracked per-shell.
@@ -647,6 +652,7 @@ impl SolutionSession {
             teammate_labels: HashMap::new(),
             background_agents: HashMap::new(),
             background_agent_order: Vec::new(),
+            pending_stop: std::collections::HashSet::new(),
             background_shells: HashMap::new(),
             background_shell_order: Vec::new(),
             tab_order: None,
@@ -914,6 +920,16 @@ impl SolutionSession {
         }
         self.closed_streams.insert(id, reason);
         self.rebuild_streams();
+    }
+
+    /// Remove and return whether a `Stop` was buffered for this agent (arrived
+    /// before its registration). The registration site closes the teammate
+    /// stream when this returns `true`.
+    pub fn take_pending_stop(
+        &mut self,
+        id: &crate::background_agent::BackgroundAgentId,
+    ) -> bool {
+        self.pending_stop.remove(id)
     }
 
     /// Drop the whole close overlay so previously-closed streams reappear on the

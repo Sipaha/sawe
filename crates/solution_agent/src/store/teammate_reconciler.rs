@@ -998,6 +998,7 @@ impl SolutionAgentStore {
                     let id_for_insert = id.clone();
                     let path_for_insert = canonical.clone();
                     session_entity.update(cx, |s, _| {
+                        let parent_toolu_for_pending = parent_toolu.clone();
                         s.background_agents.insert(
                             id_for_insert.clone(),
                             crate::background_agent::BackgroundAgent {
@@ -1011,7 +1012,16 @@ impl SolutionAgentStore {
                                 killed: false,
                             },
                         );
-                        s.background_agent_order.push(id_for_insert);
+                        s.background_agent_order.push(id_for_insert.clone());
+                        // A `Stop` hook may have arrived before this registration
+                        // (the hook races the `agentId:` announcement). Honor it
+                        // now: close the teammate stream immediately.
+                        if s.take_pending_stop(&id_for_insert) {
+                            s.close_stream(
+                                crate::stream::StreamId::Teammate(parent_toolu_for_pending),
+                                gpui::SharedString::new_static("done"),
+                            );
+                        }
                     });
                     cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
                         session_id,

@@ -1293,6 +1293,107 @@ async fn background_agent_terminal_closes_teammate_stream(cx: &mut TestAppContex
     });
 }
 
+#[gpui::test]
+async fn subagent_stop_hook_closes_teammate_stream(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc");
+    let parent_toolu = SharedString::from("toolu_X");
+    let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![crate::session_entry::SessionEntry {
+                    created_ms: 0,
+                    mod_seq: 0,
+                    subagent_id: Some(parent_toolu.clone()),
+                    kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Message(
+                            "streaming".to_string(),
+                        )],
+                    },
+                }],
+                cx,
+            );
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: std::path::PathBuf::new(),
+                    registered_at: chrono::Utc::now(),
+                    latest: None,
+                    last_offset: 0,
+                    parent_tool_use_id: Some(parent_toolu.clone()),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+            assert!(s.streams.contains_key(&teammate), "teammate live before Stop");
+        });
+    });
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| {
+            s.close_teammate_on_stop(session_id, "a30f92a688e431edc", cx)
+        });
+    });
+
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx).read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(!s.streams.contains_key(&teammate), "Stop hook closes the teammate");
+            assert!(s.closed_streams.contains_key(&teammate), "close reason recorded");
+        });
+    });
+}
+
+#[gpui::test]
+async fn subagent_stop_before_registration_buffers_then_closes(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("b11122233344455566");
+    let parent_toolu = SharedString::from("toolu_Y");
+    let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
+
+    // Stop arrives BEFORE the agent is registered → buffered, nothing closed.
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| {
+            s.close_teammate_on_stop(session_id, "b11122233344455566", cx)
+        });
+        let session = s.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(s.pending_stop.contains(&bg_id), "stop buffered until registration");
+        });
+    });
+
+    // Registration lands → drain the buffered stop → close the stream.
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx).read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![crate::session_entry::SessionEntry {
+                    created_ms: 0,
+                    mod_seq: 0,
+                    subagent_id: Some(parent_toolu.clone()),
+                    kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Message("x".into())],
+                    },
+                }],
+                cx,
+            );
+            assert!(s.streams.contains_key(&teammate), "teammate live pre-drain");
+            if s.take_pending_stop(&bg_id) {
+                s.close_stream(teammate.clone(), SharedString::new_static("done"));
+            }
+            assert!(!s.streams.contains_key(&teammate), "drained stop closes the teammate");
+        });
+    });
+}
+
 /// Sub-task C negative case: a NON-terminal snapshot refresh must leave the
 /// teammate's demux stream live (only the terminal `stop_reason` closes it).
 #[gpui::test]
