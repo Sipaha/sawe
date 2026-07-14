@@ -1075,18 +1075,22 @@ impl SolutionAgentStore {
     /// agents that have been silently dead beyond
     /// `agent.managed_agent_stale_timeout_secs +
     /// agent.managed_agent_dead_linger_secs`, plus (for a still-live parent)
-    /// agents that went silent past the short
-    /// [`MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS`] window — catching a dropped
-    /// hook or a wedged subprocess without waiting on the generous shell-style
-    /// live-parent cap. Dead detection itself (orange pill) is rendering-side
-    /// using the same stale timeout — the tick just drops the entries that
-    /// have fully expired.
+    /// agents that went silent past the generous
+    /// [`BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS`] cap — catching a genuinely
+    /// dropped hook or a wedged subprocess. This window has to stay long: the
+    /// `Stop` hook fires only at end-of-turn, never mid-tool-call, so a
+    /// background `Agent` running one long silent tool call (a multi-minute
+    /// build, a slow test, a quiet network call) writes nothing to its JSONL
+    /// for the duration and must not be mistaken for a lost hook (hardening
+    /// #9). Dead detection itself (orange pill) is rendering-side using the
+    /// same stale timeout — the tick just drops the entries that have fully
+    /// expired.
     pub fn tick_background_agents(&mut self, cx: &mut Context<Self>) {
         let expiry = std::time::Duration::from_secs(
             MANAGED_AGENT_STALE_TIMEOUT_SECS + MANAGED_AGENT_DEAD_LINGER_SECS,
         );
         let lost_hook_backstop =
-            std::time::Duration::from_secs(MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS);
+            std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();
@@ -1106,11 +1110,13 @@ impl SolutionAgentStore {
                     // backstop for a dropped hook or a wedged subprocess — it no
                     // longer treats JSONL `stop_reason` as a signal at all. A live
                     // `acp_thread` means the owning subprocess is still up and the
-                    // hook SHOULD fire soon, so a live-parent agent only gets the
-                    // short `MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS` window before
-                    // being presumed lost — not the shell-style generous cap. With
-                    // no thread (reconnect / crash / close) no hook can ever
-                    // arrive, so the ordinary stale+linger timeout applies.
+                    // hook SHOULD fire soon, so a live-parent agent gets the same
+                    // generous `BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS` cap the
+                    // shell reaper uses — output-silence alone is not death, a
+                    // long silent tool call (build/test/curl) writes nothing to
+                    // the JSONL for the duration (hardening #9). With no thread
+                    // (reconnect / crash / close) no hook can ever arrive, so the
+                    // ordinary stale+linger timeout applies.
                     let parent_alive = s.acp_thread().is_some();
                     let candidates: Vec<crate::background_agent::BackgroundAgentId> = s
                         .background_agent_order
@@ -1241,11 +1247,14 @@ impl SolutionAgentStore {
     ///   3. it is an async `Agent` (some `background_agent` has
     ///      `parent_tool_use_id == toolu`) whose latest snapshot is stale
     ///      beyond [`MANAGED_AGENT_STALE_TIMEOUT_SECS`] (dead/orphaned parent)
-    ///      or, with a still-live parent, beyond the short
-    ///      [`MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS`] window. Normal
-    ///      completion is closed by the `Stop` hook
-    ///      ([`Self::close_teammate_on_stop`]) — a JSONL `stop_reason` is no
-    ///      longer, by itself, a close trigger here.
+    ///      or, with a still-live parent, beyond the generous
+    ///      [`BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS`] cap (a genuinely lost
+    ///      hook or wedged subprocess — kept long because the `Stop` hook
+    ///      fires only at end-of-turn, so a long silent tool call must not be
+    ///      mistaken for a lost hook, hardening #9). Normal completion is
+    ///      closed by the `Stop` hook ([`Self::close_teammate_on_stop`]) — a
+    ///      JSONL `stop_reason` is no longer, by itself, a close trigger
+    ///      here.
     ///
     /// It is NEVER closed for a live inline `Task` (tool-call present +
     /// non-terminal), a fresh async `Agent` (snapshot recent), or —
@@ -1277,12 +1286,14 @@ impl SolutionAgentStore {
             // The `Stop` hook is authoritative for normal completion, so this
             // is purely a lost-hook / wedged-subprocess backstop. A live
             // `acp_thread` means the hook SHOULD fire soon, so a live-parent
-            // agent only gets the short lost-hook backstop window before being
-            // presumed lost; with no thread no hook can ever arrive and the
-            // tight ordinary timeout applies.
+            // agent gets the same generous `BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS`
+            // cap the shell reaper uses before being presumed lost — the hook
+            // fires only at end-of-turn, so a long silent tool call must not be
+            // mistaken for a dropped hook (hardening #9); with no thread no
+            // hook can ever arrive and the tight ordinary timeout applies.
             let parent_alive = s.acp_thread().is_some();
             let live_parent_stale =
-                std::time::Duration::from_secs(MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS);
+                std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
             let teammate_ids: Vec<SharedString> = s
                 .streams
                 .keys()

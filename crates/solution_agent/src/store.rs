@@ -65,11 +65,6 @@ pub(crate) use teammate_reconciler::{
 // candidate for tear-down; dead-linger = grace period before reaping.
 const MANAGED_AGENT_STALE_TIMEOUT_SECS: u64 = 120;
 const MANAGED_AGENT_DEAD_LINGER_SECS: u64 = 300;
-/// Lost-hook / dead-process backstop for a managed background agent. The `Stop`
-/// hook closes every normal completion immediately; this only catches a dropped
-/// hook or a silently-dead subprocess, so it is short (minutes), NOT the shell
-/// live-parent hour cap. Non-zero so a lost hook cannot strand a tab forever.
-const MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS: u64 = MANAGED_AGENT_STALE_TIMEOUT_SECS;
 /// Hard cap on how long a still-`Running` background shell whose PARENT agent
 /// subprocess is still alive may go silent before it's reaped anyway. While the
 /// parent is alive, a completing shell is flipped to `Exited` by the
