@@ -47,6 +47,23 @@ pub struct SolutionStore {
 #[derive(Clone, Debug)]
 pub enum SolutionStoreEvent {
     Changed,
+    /// Emitted immediately **before** `Changed` whenever a rename physically
+    /// moved a folder — a solution root (`rename_solution`) or a member dir
+    /// (`rename_member`). Carries the path-prefix rewrite (`old_prefix` →
+    /// `new_prefix`) so cross-crate holders of absolute paths can fix them in
+    /// memory *before* any `Changed`-driven reconciliation runs against the new
+    /// paths. The critical consumer is `solution_agent`: `rename_*` rewrites the
+    /// store's root/member paths and emits `Changed`, on which
+    /// `gc_orphan_members` hard-purges every hydrated session whose `cwd` no
+    /// longer matches — and live session cwds still point at `old_prefix`, since
+    /// the cold reconcile only rewrites the persisted DB rows at the next
+    /// startup. Without this event those open sessions are deleted as false
+    /// orphans (docs/findings/2026-07-14-rename-purges-open-sessions.md).
+    PathsMoved {
+        id: SolutionId,
+        old_prefix: std::path::PathBuf,
+        new_prefix: std::path::PathBuf,
+    },
     /// Emitted by `touch_last_opened` whenever a Solution is opened
     /// (or switched to). Subscribers that only need to react to "the
     /// active Solution flipped" — e.g. fork panels refreshing their

@@ -355,6 +355,25 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Rewrite `solution_sessions.cwd` for every session of `solution_id` whose
+    /// cwd sits at or under `rewrite.old`, moving it under `rewrite.new`. Mirrors
+    /// the cold-reconcile `rewrite_agent_db` step but scoped to one solution and
+    /// run **hot**, on a rename's `PathsMoved`. Covers the COLD (un-hydrated)
+    /// sessions the in-memory rewrite can't reach, so a same-process solution
+    /// reopen re-hydrates a valid cwd instead of a stale one that
+    /// `gc_orphan_members` would purge.
+    pub fn rewrite_session_cwds(
+        &self,
+        solution_id: SolutionId,
+        rewrite: solutions::path_migrations::PathRewrite,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            rewrite_session_cwds_by_solution(&connection, solution_id, &rewrite)
+        })
+    }
+
     /// Rewrite `solution_sessions.solution_id` / `solution_session_attachment
     /// .solution_id` from the pre-identity TEXT slug to the numeric counter id
     /// the solutions DB now uses, and bind each session to the member whose
@@ -618,6 +637,28 @@ fn delete_by_solution(connection: &Connection, solution_id: SolutionId) -> Resul
         Ok(())
     });
     tx.map_err(|e| anyhow!("delete_by_solution failed: {e}"))
+}
+
+fn rewrite_session_cwds_by_solution(
+    connection: &Connection,
+    solution_id: SolutionId,
+    rewrite: &solutions::path_migrations::PathRewrite,
+) -> Result<()> {
+    // `solution_id` is bound as the numeric counter — SQLite applies the
+    // column's TEXT affinity to the integer, so it matches the stored decimal
+    // text (same convention as `select_open_tabs`). `cwd` is plain TEXT.
+    let mut select = connection.select_bound::<i64, (String, String)>(
+        "SELECT id, cwd FROM solution_sessions WHERE solution_id = ? AND cwd IS NOT NULL",
+    )?;
+    let rows = select(solution_id.0)?;
+    let mut update = connection
+        .exec_bound::<(String, String)>("UPDATE solution_sessions SET cwd = ?1 WHERE id = ?2")?;
+    for (id, cwd) in rows {
+        if let Some(rewritten) = rewrite.apply_str(&cwd) {
+            update((rewritten, id))?;
+        }
+    }
+    Ok(())
 }
 
 mod attachments;

@@ -3367,6 +3367,53 @@ impl SolutionAgentStore {
         }
     }
 
+    /// Rewrite every live and persisted session `cwd` for `solution_id` from
+    /// `old_prefix` to the `new_prefix` a rename just moved a folder to (the
+    /// solution root or a member dir). Runs on `SolutionStoreEvent::PathsMoved`.
+    /// Live sessions are fixed in memory (so the `Changed`-driven
+    /// `gc_orphan_members` sees a valid cwd) and re-persisted; cold sessions are
+    /// rewritten straight in the DB so a same-process reopen doesn't re-hydrate a
+    /// stale cwd into the gc. See
+    /// docs/findings/2026-07-14-rename-purges-open-sessions.md.
+    fn rewrite_session_cwds_for_move(
+        &mut self,
+        solution_id: SolutionId,
+        old_prefix: &std::path::Path,
+        new_prefix: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let rewrite = solutions::path_migrations::PathRewrite {
+            old: old_prefix.to_path_buf(),
+            new: new_prefix.to_path_buf(),
+        };
+        // Live (hydrated) sessions: fix the in-memory cwd BEFORE the gc reads it.
+        if let Some(ids) = self.by_solution.get(&solution_id).cloned() {
+            for id in ids {
+                let Some(entity) = self.sessions.get(&id) else {
+                    continue;
+                };
+                let rewritten = entity
+                    .read(cx)
+                    .cwd
+                    .to_str()
+                    .and_then(|cwd| rewrite.apply_str(cwd));
+                let Some(new_cwd) = rewritten else {
+                    // cwd is not under the moved prefix (or non-UTF-8) — leave it.
+                    continue;
+                };
+                entity.update(cx, |session, _| {
+                    session.cwd = std::path::PathBuf::from(new_cwd);
+                });
+                self.persist_session_row(id, cx);
+            }
+        }
+        // Cold (un-hydrated) sessions: rewrite their persisted cwd directly.
+        if let Some(db) = self.persistence.clone() {
+            db.rewrite_session_cwds(solution_id, rewrite)
+                .detach_and_log_err(cx);
+        }
+    }
+
     fn on_solution_event(
         &mut self,
         _: Entity<SolutionStore>,
@@ -3374,6 +3421,17 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         match event {
+            SolutionStoreEvent::PathsMoved {
+                id,
+                old_prefix,
+                new_prefix,
+            } => {
+                // Emitted BEFORE the rename's `Changed` (below). Fix live +
+                // persisted session cwds under the moved prefix now, so the
+                // `gc_orphan_members` that runs on `Changed` sees the new paths
+                // instead of purging every open session as a false orphan.
+                self.rewrite_session_cwds_for_move(*id, old_prefix, new_prefix, cx);
+            }
             SolutionStoreEvent::Changed => {
                 // A member add/remove (among other store mutations) lands here.
                 // First reap whole vanished solutions, then individual sessions

@@ -156,6 +156,11 @@ pub fn install(cx: &mut App) {
                     SolutionStoreEvent::Closed { id } => {
                         editor_mcp::close_solution_socket(cx, id.0);
                     }
+                    // Internal path-reconciliation signal for in-process holders
+                    // of absolute paths (solution_agent). The accompanying
+                    // `Changed` already drives the `solution_changed` remote
+                    // notification, so nothing to fan out here.
+                    SolutionStoreEvent::PathsMoved { .. } => {}
                 }),
             );
         }

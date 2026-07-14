@@ -131,6 +131,15 @@ impl SolutionStore {
         }
         self.db_insert_pending_path_migration(&old_root, &new_root)?;
 
+        // Emit `PathsMoved` BEFORE `Changed`: `solution_agent` rewrites its live
+        // session cwds on the former, and `gc_orphan_members` (which would
+        // otherwise hard-purge those still-stale-cwd sessions as false orphans)
+        // fires on the latter — so the rewrite must land first.
+        cx.emit(SolutionStoreEvent::PathsMoved {
+            id,
+            old_prefix: old_root,
+            new_prefix: new_root,
+        });
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
         Ok(())

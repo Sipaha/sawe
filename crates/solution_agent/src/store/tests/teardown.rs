@@ -727,3 +727,198 @@ fn stale_archive_dirs_gates_on_count_then_age() {
         );
     }
 }
+
+/// A rename that physically moves the solution root must NOT let
+/// `gc_orphan_members` (fired on the `Changed` the rename emits) hard-purge the
+/// solution's open sessions. At rename time the store already points at the new
+/// root while every live session still holds its old `cwd`, so without the
+/// `PathsMoved` cwd-rewrite each open session is a false orphan and is deleted.
+/// Regression for docs/findings/2026-07-14-rename-purges-open-sessions.md.
+#[gpui::test]
+async fn rename_solution_folder_move_keeps_open_sessions(cx: &mut gpui::TestAppContext) {
+    use solutions::SolutionStore;
+
+    let registry = Arc::new(AdapterRegistry::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("solutions.json");
+    let solutions_root = dir.path().join("solutions");
+    std::fs::create_dir_all(&solutions_root).unwrap();
+
+    let (solution_store, sol, member_path) = cx.update(|cx| {
+        let settings_store = settings::SettingsStore::test(cx);
+        cx.set_global(settings_store);
+        let solution_store = SolutionStore::for_test(cfg_path, cx);
+        solutions::install_global_for_test(solution_store.clone(), cx);
+        let sol = solution_store
+            .update(cx, |s, cx| s.create_solution("Sol", solutions_root.clone(), cx))
+            .expect("create_solution");
+        let root = solution_store.read(cx).solutions()[0].root.clone();
+        let member_path = root.join("member");
+        solution_store.update(cx, |s, _| {
+            s.test_add_member_with_path(sol, "member", member_path.clone());
+        });
+        (solution_store, sol, member_path)
+    });
+
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+
+    let session_id = SolutionSessionId::new();
+    store.update(cx, |store, cx| {
+        let session = insert_cold_session(
+            session_id,
+            sol,
+            SharedString::from("claude-acp"),
+            None,
+            None,
+            store,
+            cx,
+        );
+        session.update(cx, |s, _| s.cwd = member_path.join("sub"));
+    });
+    cx.run_until_parked();
+
+    // Rename the solution — the folder slug changes, so the root is physically
+    // moved and `PathsMoved` + `Changed` fire.
+    solution_store
+        .update(cx, |s, cx| s.rename_solution(sol, "Renamed", cx))
+        .expect("rename_solution");
+    cx.run_until_parked();
+
+    let new_root = solution_store.read_with(cx, |s, _| s.solutions()[0].root.clone());
+    store.update(cx, |store, cx| {
+        let session = store.session(session_id);
+        assert!(
+            session.is_some(),
+            "the open session must survive a folder-moving rename"
+        );
+        let cwd = session.unwrap().read(cx).cwd.clone();
+        assert_eq!(
+            cwd,
+            new_root.join("member").join("sub"),
+            "the session cwd must be rewritten to the new root"
+        );
+    });
+}
+
+/// The same protection for a **member** rename: `rename_member` physically moves
+/// the member's subfolder and emits `PathsMoved` for that subtree, so sessions
+/// whose cwd sits under the renamed member survive instead of being purged as
+/// false orphans.
+#[gpui::test]
+async fn rename_member_folder_move_keeps_open_sessions(cx: &mut gpui::TestAppContext) {
+    use solutions::SolutionStore;
+
+    let registry = Arc::new(AdapterRegistry::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("solutions.json");
+    let solutions_root = dir.path().join("solutions");
+    std::fs::create_dir_all(&solutions_root).unwrap();
+
+    let (solution_store, sol, member_id, member_path) = cx.update(|cx| {
+        let settings_store = settings::SettingsStore::test(cx);
+        cx.set_global(settings_store);
+        let solution_store = SolutionStore::for_test(cfg_path, cx);
+        solutions::install_global_for_test(solution_store.clone(), cx);
+        let sol = solution_store
+            .update(cx, |s, cx| s.create_solution("Sol", solutions_root.clone(), cx))
+            .expect("create_solution");
+        let root = solution_store.read(cx).solutions()[0].root.clone();
+        let member_path = root.join("member");
+        // The member subdir must exist on disk — `rename_member` does a real
+        // `rename(2)` of it (unlike `rename_solution`, which moves the root).
+        std::fs::create_dir_all(&member_path).unwrap();
+        let member_id = solution_store.update(cx, |s, _| {
+            s.test_add_member_with_path(sol, "member", member_path.clone())
+        });
+        (solution_store, sol, member_id, member_path)
+    });
+
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+
+    let session_id = SolutionSessionId::new();
+    store.update(cx, |store, cx| {
+        let session = insert_cold_session(
+            session_id,
+            sol,
+            SharedString::from("claude-acp"),
+            None,
+            None,
+            store,
+            cx,
+        );
+        session.update(cx, |s, _| s.cwd = member_path.join("sub"));
+    });
+    cx.run_until_parked();
+
+    solution_store
+        .update(cx, |s, cx| s.rename_member(member_id, "renamed-member", cx))
+        .expect("rename_member");
+    cx.run_until_parked();
+
+    let new_member_path = solution_store.read_with(cx, |s, _| {
+        s.solutions()[0].members[0].local_path.clone()
+    });
+    store.update(cx, |store, cx| {
+        let session = store.session(session_id);
+        assert!(
+            session.is_some(),
+            "the open session must survive a member folder rename"
+        );
+        assert_eq!(
+            session.unwrap().read(cx).cwd.clone(),
+            new_member_path.join("sub"),
+            "the session cwd must be rewritten to the new member path"
+        );
+    });
+}
+
+/// The cold (un-hydrated) half of the `PathsMoved` fix: sessions not currently
+/// in memory get their persisted `cwd` rewritten in the DB, so a same-process
+/// solution reopen re-hydrates a valid path instead of a stale one that the gc
+/// would purge. Guards the SQLite `solution_id` bind (TEXT column vs numeric id).
+#[gpui::test]
+async fn rewrite_session_cwds_rewrites_cold_db_rows(cx: &mut TestAppContext) {
+    let (store, seeded, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (sol, db) = store.read_with(cx, |s, cx| {
+        (
+            s.session(seeded).expect("seeded").read(cx).solution_id,
+            s.persistence().expect("persistence"),
+        )
+    });
+
+    let old_root = PathBuf::from("/old/root");
+    let new_root = PathBuf::from("/new/root");
+
+    // Persist a cwd under the old prefix, then evict the session from memory so
+    // only the cold DB-rewrite branch can reach it.
+    store.update(cx, |store, cx| {
+        store
+            .session(seeded)
+            .unwrap()
+            .update(cx, |s, _| s.cwd = old_root.join("member").join("sub"));
+        store.persist_session_row(seeded, cx);
+    });
+    cx.run_until_parked();
+
+    store.update(cx, |store, cx| {
+        store.sessions.remove(&seeded);
+        store.by_solution.remove(&sol);
+        store.rewrite_session_cwds_for_move(sol, &old_root, &new_root, cx);
+    });
+    cx.run_until_parked();
+
+    let metas = db.list_for_solution(sol).await.expect("list_for_solution");
+    let cwd = metas
+        .iter()
+        .find(|m| m.id == seeded)
+        .expect("seeded row present")
+        .cwd
+        .clone();
+    assert_eq!(
+        cwd,
+        new_root.join("member").join("sub"),
+        "the cold session's persisted cwd must be rewritten to the new root"
+    );
+}

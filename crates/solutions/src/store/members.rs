@@ -264,6 +264,7 @@ impl SolutionStore {
 
         crate::rename::move_dir_with_compat_link(&old_path, &new_path)?;
 
+        let solution_id = self.config.solutions[solution_index].id;
         let member = &mut self.config.solutions[solution_index].members[member_index];
         member.name = new_name.to_string();
         member.local_path = new_path.clone();
@@ -271,6 +272,15 @@ impl SolutionStore {
         self.db_update_member(&member)?;
         self.db_insert_pending_path_migration(&old_path, &new_path)?;
 
+        // Emit `PathsMoved` BEFORE `Changed` so `solution_agent` rewrites its
+        // live session cwds under the moved member dir before `gc_orphan_members`
+        // (fired on `Changed`) would purge them as false orphans. See the event
+        // doc on `SolutionStoreEvent::PathsMoved`.
+        cx.emit(SolutionStoreEvent::PathsMoved {
+            id: solution_id,
+            old_prefix: old_path,
+            new_prefix: new_path,
+        });
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
         Ok(())
