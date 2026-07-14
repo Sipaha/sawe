@@ -952,6 +952,9 @@ impl SolutionSession {
     pub fn clear_closed_streams(&mut self) {
         self.closed_streams.clear();
         self.hydration_orphan_streams.clear();
+        // A buffered subagent `Stop` for an agent that never registered is stale
+        // after a context reset — drop it so it can't strand across the wipe.
+        self.pending_stop.clear();
         self.hydration_watermark = 0;
         // A context reset / clear wipes the transcript, so the next persist must
         // treat the (now-empty or fresh) Main stream as un-persisted and re-flush

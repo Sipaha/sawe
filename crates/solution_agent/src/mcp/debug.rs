@@ -60,12 +60,14 @@ pub struct SeedColdSessionParams {
     /// When set, register ONE background (Managed) `Agent` on the seeded session,
     /// keyed by this id, with a synthetic snapshot — so its derived
     /// `StreamId::Teammate` tab paints without a real `Agent` dispatch. Combine
-    /// with `background_agent_killed` to screenshot the two render states of a
-    /// background agent whose parent subprocess died. Debug/screenshot-only.
+    /// with `background_agent_killed` to exercise the kill path. Debug/screenshot-only.
     pub background_agent: Option<String>,
     /// Apply the SAME transition a reconnect applies (`mark_background_agents_killed`)
-    /// to the seeded `background_agent`: its teammate tab must then read as the
-    /// terminal `killed` state instead of claiming the agent is still running.
+    /// to the seeded `background_agent`. NOTE: since the teammate-completion rework
+    /// a killed agent's stream now CLOSES immediately (its tab is removed from the
+    /// strip), it no longer lingers as a `Done { killed }` render — so this seeds
+    /// the "killed → tab gone" end state, useful as a regression check that a
+    /// killed teammate does not stay visible.
     pub background_agent_killed: bool,
 }
 

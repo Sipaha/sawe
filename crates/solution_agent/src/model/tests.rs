@@ -316,6 +316,19 @@
         });
     }
 
+    #[test]
+    fn clear_closed_streams_drops_buffered_pending_stop() {
+        let mut session = build_session();
+        session
+            .pending_stop
+            .insert(crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc"));
+        session.clear_closed_streams();
+        assert!(
+            session.pending_stop.is_empty(),
+            "a context reset drops a buffered stop for an agent that never registered"
+        );
+    }
+
     #[gpui::test]
     fn clear_closed_streams_reopens(cx: &mut TestAppContext) {
         use crate::stream::StreamId;
