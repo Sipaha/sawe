@@ -101,7 +101,18 @@ impl McpServerTool for CapabilitiesTool {
             // friendly label now rides `StreamDto.label`; the
             // `agent_session_active_subagents_changed` notification is a bare
             // `{session_id}` dirty-poke. HARD CUTOVER.
-            wire_schema_version: 5,
+            // v6 (numeric identity — HARD CUTOVER): the identity migration made
+            // Solution / member / catalog ids surrogate counters, so every wire
+            // field carrying one is now a JSON **number** (`i64`), not a quoted
+            // string: `SolutionSummary.id`, `SessionSummary.solution_id` /
+            // `member_id`, `WorkspaceSolution.id`, the `workspace.*` payloads'
+            // `solution_id`, `catalog_id` everywhere, and the `solution_id`
+            // *parameter* of the workspace lifecycle tools. Session ids and
+            // agent ids stay strings. This shape shipped with the migration but
+            // was not versioned then; v6 makes the break explicit so an
+            // un-migrated client gates instead of crash-decoding a number into a
+            // string field.
+            wire_schema_version: 6,
         };
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {

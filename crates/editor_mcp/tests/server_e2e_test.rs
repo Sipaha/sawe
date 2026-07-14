@@ -116,8 +116,8 @@ async fn end_to_end_capabilities_via_socket(cx: &mut TestAppContext) {
         .and_then(|v| v.as_u64())
         .expect("wire_schema_version field");
     assert!(
-        wire_schema_version >= 5,
-        "wire_schema_version should be >= 5 after the v5 cutover (SessionSummary.active_subagents removed; a teammate stream's friendly label now rides StreamDto.label; the active_subagents_changed notification is a bare {{session_id}} dirty-poke); got {}",
+        wire_schema_version >= 6,
+        "wire_schema_version should be >= 6 after the v6 cutover (numeric identity: Solution / member / catalog ids are JSON numbers on the wire, including the workspace lifecycle tools' solution_id param; session + agent ids stay strings); got {}",
         wire_schema_version
     );
 }
