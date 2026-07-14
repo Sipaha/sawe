@@ -993,9 +993,13 @@ async fn task_notification_unknown_shell_is_noop(cx: &mut TestAppContext) {
     });
 }
 
-/// Task 9: a Managed Agent whose `latest.stop_reason` is `Some(...)` is
-/// removed from the session on the next `tick_background_agents` pass,
-/// and a `SessionBackgroundAgentsChanged` event is emitted.
+/// Task 9 (superseded by Task 3's lost-hook backstop): a Managed Agent whose
+/// snapshot is stale beyond the live-parent backstop is removed from the
+/// session on the next `tick_background_agents` pass, and a
+/// `SessionBackgroundAgentsChanged` event is emitted. The JSONL `stop_reason`
+/// field is still stored on the snapshot but is no longer, by itself, what
+/// drives removal — the `Stop` hook closes normal completions; this reaper is
+/// the backstop for a lost hook.
 #[gpui::test]
 async fn done_agent_removed_on_tick(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
@@ -1011,7 +1015,10 @@ async fn done_agent_removed_on_tick(cx: &mut TestAppContext) {
                     jsonl_path: "/nonexistent".into(),
                     registered_at: chrono::Utc::now(),
                     latest: Some(crate::background_agent::BackgroundAgentSnapshot {
-                        mtime: std::time::SystemTime::now(),
+                        // Past the lost-hook backstop (120s) even with a live
+                        // parent — proves staleness, not `stop_reason`, drives
+                        // the reap.
+                        mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(130),
                         activity_label: SharedString::from("Done."),
                         stop_reason: Some(SharedString::from("end_turn")),
                     }),
@@ -1033,12 +1040,81 @@ async fn done_agent_removed_on_tick(cx: &mut TestAppContext) {
         let session = s.read(cx).session(session_id).unwrap();
         assert!(
             session.read(cx).background_agents.is_empty(),
-            "done agent must be removed on tick"
+            "stale-past-backstop agent must be removed on tick"
         );
         assert!(
             session.read(cx).background_agent_order.is_empty(),
             "order vec must be pruned in lockstep"
         );
+    });
+}
+
+/// Task 3: the `Stop` hook closes every normal completion immediately
+/// ([`subagent_stop_hook_closes_teammate_stream`]); `tick_background_agents`
+/// is now only a backstop for a dropped hook or a silently-dead subprocess. A
+/// managed agent with a LIVE parent, `latest.stop_reason: None` (no hook
+/// arrived), and an `mtime` older than
+/// `MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS` must have its teammate stream
+/// closed on the next tick — NOT held for the old shell-style hour-long
+/// live-parent cap.
+#[gpui::test]
+async fn managed_agent_lost_hook_closes_on_short_backstop(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc");
+    let parent_toolu = SharedString::from("toolu_lost_hook");
+    let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.set_entries(vec![reconcile_tagged_body(parent_toolu.as_ref())], cx);
+            assert!(
+                s.streams.contains_key(&teammate),
+                "teammate stream live before the tick"
+            );
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: "/nonexistent".into(),
+                    registered_at: chrono::Utc::now() - chrono::Duration::seconds(200),
+                    latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                        // Older than MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS (120s),
+                        // no stop_reason — the hook never arrived.
+                        mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(121),
+                        activity_label: SharedString::from("Bash: cargo build"),
+                        stop_reason: None,
+                    }),
+                    last_offset: 0,
+                    parent_tool_use_id: Some(parent_toolu.clone()),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+            assert!(
+                s.acp_thread().is_some(),
+                "parent subprocess is live — the point of this test"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        s.update(cx, |s, cx| s.tick_background_agents(cx));
+    });
+
+    cx.update(|cx| {
+        let s = SolutionAgentStore::global(cx);
+        let session = s.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "a lost-hook agent silent past the short backstop must close \
+                 even with a live parent"
+            );
+        });
     });
 }
 
@@ -1703,6 +1779,12 @@ fn orphan_session(cx: &mut TestAppContext, session_id: SolutionSessionId) {
     });
 }
 
+/// Task 3: a fresh async agent whose JSONL snapshot happens to carry a
+/// terminal `stop_reason` (e.g. a race where the JSONL line lands before the
+/// reconcile but the `Stop` hook hasn't drained yet) must NOT be closed by
+/// that field alone anymore — the hook is the sole authority for normal
+/// completion, and `reconcile_finished_teammate_streams` only closes on
+/// staleness now.
 #[gpui::test]
 async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
@@ -1712,7 +1794,7 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
     let stop_toolu = "toolu_async_stop";
     let live = crate::stream::StreamId::Teammate(SharedString::from(live_toolu));
     let stale = crate::stream::StreamId::Teammate(SharedString::from(stale_toolu));
-    let stopped = crate::stream::StreamId::Teammate(SharedString::from(stop_toolu));
+    let fresh_with_stop_reason = crate::stream::StreamId::Teammate(SharedString::from(stop_toolu));
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -1780,6 +1862,8 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
                 "bg_stop",
                 stop_toolu,
                 crate::background_agent::BackgroundAgentSnapshot {
+                    // Fresh mtime — the point is that a terminal `stop_reason`
+                    // alone, with no staleness, must not trigger a close.
                     mtime: std::time::SystemTime::now(),
                     activity_label: SharedString::from("done"),
                     stop_reason: Some(SharedString::from("end_turn")),
@@ -1787,7 +1871,7 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
             );
             assert!(s.streams.contains_key(&live));
             assert!(s.streams.contains_key(&stale));
-            assert!(s.streams.contains_key(&stopped));
+            assert!(s.streams.contains_key(&fresh_with_stop_reason));
         });
     });
 
@@ -1811,8 +1895,9 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
                 "an async agent stale beyond MANAGED_AGENT_STALE_TIMEOUT_SECS must be closed"
             );
             assert!(
-                !s.streams.contains_key(&stopped),
-                "an async agent with a terminal stop_reason must be closed"
+                s.streams.contains_key(&fresh_with_stop_reason),
+                "a terminal stop_reason alone (fresh mtime) must NOT close the \
+                 stream anymore — only the Stop hook or staleness do"
             );
         });
     });
@@ -2073,14 +2158,16 @@ async fn stale_agent_lingers_briefly_then_removed(cx: &mut TestAppContext) {
     });
 }
 
-/// #9 twin for ASYNC AGENTS (the asymmetry the shell reaper already fixed): a
-/// detached agent grinding through a long tool call writes nothing to its JSONL
-/// for minutes. While its parent subprocess is LIVE its terminal `stop_reason`
-/// will still be observed, so silence is not death — reaping it at the ~7min
-/// mark would drop a running agent's pill AND lie to the supervisor's
-/// `has_live_background_work`.
+/// Task 3 (supersedes the #9-extended-to-agents shield): a detached agent
+/// grinding through a long tool call writes nothing to its JSONL for minutes.
+/// Previously a LIVE parent shielded it up to the generous shell-style hour
+/// cap on the theory that its terminal `stop_reason` would eventually be
+/// observed via the JSONL scan; now the `Stop` hook is what closes normal
+/// completion, so a live-parent agent only gets the short
+/// `MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS` window before being presumed lost
+/// and reaped.
 #[gpui::test]
-async fn silent_async_agent_with_live_parent_survives_below_cap(cx: &mut TestAppContext) {
+async fn silent_async_agent_with_live_parent_reaped_past_backstop(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
     let bg_id = crate::background_agent::BackgroundAgentId::new("a30f92a688e431edc");
     cx.update(|cx| {
@@ -2094,8 +2181,8 @@ async fn silent_async_agent_with_live_parent_survives_below_cap(cx: &mut TestApp
                     jsonl_path: "/nonexistent".into(),
                     registered_at: chrono::Utc::now(),
                     latest: Some(crate::background_agent::BackgroundAgentSnapshot {
-                        // 600s: past STALE+DEAD_LINGER (420s), far under the 60min cap.
-                        mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+                        // Past MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS (120s).
+                        mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(130),
                         activity_label: SharedString::from("Bash: long build"),
                         stop_reason: None,
                     }),
@@ -2116,9 +2203,9 @@ async fn silent_async_agent_with_live_parent_survives_below_cap(cx: &mut TestApp
         let s = SolutionAgentStore::global(cx);
         let session = s.read(cx).session(session_id).unwrap();
         assert!(
-            session.read(cx).background_agents.contains_key(&bg_id),
-            "a silent async agent with a live parent must survive past the ~7min \
-             stale mark — its completion still arrives via the JSONL scan"
+            !session.read(cx).background_agents.contains_key(&bg_id),
+            "a silent async agent with a live parent must be reaped once past \
+             the short lost-hook backstop — it is no longer shielded for an hour"
         );
     });
 }
@@ -2976,11 +3063,13 @@ async fn dropping_the_thread_kills_background_agents(cx: &mut TestAppContext) {
     });
 }
 
-/// A killed agent must not be shielded by the LIVE-parent staleness cap once the
-/// reconnect has attached a NEW thread: the agent is a child of the OLD process,
-/// so no completion can ever arrive for it and the tight `STALE + DEAD_LINGER`
-/// reap applies. A still-running (not killed) agent of the same age IS shielded —
-/// silence is not death while its own parent is up (hardening #9).
+/// A killed agent must not be shielded by the live-parent lost-hook backstop
+/// once the reconnect has attached a NEW thread: the agent is a child of the
+/// OLD process, so no completion can ever arrive for it and the tight
+/// `STALE + DEAD_LINGER` reap applies (420s — unaffected by Task 3, since it
+/// never depends on parent liveness). A still-running (not killed) agent well
+/// within `MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS` (120s) IS shielded — it just
+/// hasn't gone silent long enough for the backstop to presume its hook lost.
 #[gpui::test]
 async fn killed_agent_is_reaped_despite_a_live_parent(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
@@ -2990,7 +3079,12 @@ async fn killed_agent_is_reaped_despite_a_live_parent(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).unwrap();
         session.update(cx, |s, _| {
-            for (id, killed) in [(&killed_id, true), (&running_id, false)] {
+            // killed_id: past STALE+DEAD_LINGER (420s) — reaped regardless of
+            // parent liveness. running_id: fresh, well under the lost-hook
+            // backstop (120s) — still shielded.
+            for (id, killed, mtime_age_secs) in
+                [(&killed_id, true, 500), (&running_id, false, 5)]
+            {
                 s.background_agents.insert(
                     id.clone(),
                     crate::background_agent::BackgroundAgent {
@@ -2998,10 +3092,8 @@ async fn killed_agent_is_reaped_despite_a_live_parent(cx: &mut TestAppContext) {
                         jsonl_path: "/nonexistent".into(),
                         registered_at: Utc::now() - chrono::Duration::seconds(600),
                         latest: Some(crate::background_agent::BackgroundAgentSnapshot {
-                            // Older than STALE+DEAD_LINGER (420s), well under the
-                            // live-parent cap (1h).
                             mtime: std::time::SystemTime::now()
-                                - std::time::Duration::from_secs(500),
+                                - std::time::Duration::from_secs(mtime_age_secs),
                             activity_label: SharedString::from("Bash: cargo build"),
                             stop_reason: None,
                         }),
@@ -3029,7 +3121,8 @@ async fn killed_agent_is_reaped_despite_a_live_parent(cx: &mut TestAppContext) {
         );
         assert!(
             s.background_agents.contains_key(&running_id),
-            "a merely-silent RUNNING agent is still shielded by the live-parent cap"
+            "a merely-silent RUNNING agent well under the lost-hook backstop is \
+             still shielded"
         );
         assert_eq!(
             s.closed_streams

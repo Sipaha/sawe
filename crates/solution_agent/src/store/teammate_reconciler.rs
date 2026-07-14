@@ -1069,19 +1069,24 @@ impl SolutionAgentStore {
         self.reconcile_finished_teammate_streams(session_id, cx);
     }
 
-    /// One pass over every session's background agents. Removes agents
-    /// whose latest snapshot carries a `stop_reason` (terminal done),
-    /// plus agents that have been silently dead beyond
+    /// One pass over every session's background agents. The `Stop` hook
+    /// ([`Self::close_teammate_on_stop`]) closes every normal completion the
+    /// moment it happens, so this tick is now a pure backstop: it removes
+    /// agents that have been silently dead beyond
     /// `agent.managed_agent_stale_timeout_secs +
-    /// agent.managed_agent_dead_linger_secs`. Dead detection itself
-    /// (orange pill) is rendering-side using the same stale timeout —
-    /// the tick just drops the entries that have fully expired.
+    /// agent.managed_agent_dead_linger_secs`, plus (for a still-live parent)
+    /// agents that went silent past the short
+    /// [`MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS`] window — catching a dropped
+    /// hook or a wedged subprocess without waiting on the generous shell-style
+    /// live-parent cap. Dead detection itself (orange pill) is rendering-side
+    /// using the same stale timeout — the tick just drops the entries that
+    /// have fully expired.
     pub fn tick_background_agents(&mut self, cx: &mut Context<Self>) {
         let expiry = std::time::Duration::from_secs(
             MANAGED_AGENT_STALE_TIMEOUT_SECS + MANAGED_AGENT_DEAD_LINGER_SECS,
         );
-        let live_parent_cap =
-            std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
+        let lost_hook_backstop =
+            std::time::Duration::from_secs(MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();
@@ -1096,17 +1101,16 @@ impl SolutionAgentStore {
             }
             let to_remove: Vec<crate::background_agent::BackgroundAgentId> =
                 session.update(cx, |s, _| {
-                    // Same liveness gate as the shell reaper (hardening #9). A
-                    // live `acp_thread` means the owning subprocess is still up,
-                    // so a finished agent's terminal `stop_reason` will still be
-                    // observed — an agent that is merely SILENT (a long research
-                    // pass writing nothing to its JSONL) is presumed alive and is
-                    // only aged out at the generous cap. Reaping it at the flat
-                    // ~7min mark dropped its pill AND lied to the supervisor's
-                    // `has_live_background_work`, which is exactly the bug #9 fixed
-                    // for shells; the agent twin was left behind. With no thread
-                    // (reconnect / crash / close) the terminal transition can never
-                    // arrive, so the ordinary staleness timeout applies.
+                    // The `Stop` hook is authoritative for normal completion
+                    // (`Self::close_teammate_on_stop`), so this filter is purely a
+                    // backstop for a dropped hook or a wedged subprocess — it no
+                    // longer treats JSONL `stop_reason` as a signal at all. A live
+                    // `acp_thread` means the owning subprocess is still up and the
+                    // hook SHOULD fire soon, so a live-parent agent only gets the
+                    // short `MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS` window before
+                    // being presumed lost — not the shell-style generous cap. With
+                    // no thread (reconnect / crash / close) no hook can ever
+                    // arrive, so the ordinary stale+linger timeout applies.
                     let parent_alive = s.acp_thread().is_some();
                     let candidates: Vec<crate::background_agent::BackgroundAgentId> = s
                         .background_agent_order
@@ -1118,12 +1122,12 @@ impl SolutionAgentStore {
                             // A KILLED agent (its subprocess was replaced by a
                             // reconnect) can never report anything again, even
                             // though the session now has a NEW live thread — so
-                            // the generous live-parent cap must not apply to it.
-                            // It lingers on the ordinary stale+linger window, long
+                            // the lost-hook backstop must not apply to it. It
+                            // lingers on the ordinary stale+linger window, long
                             // enough for the user to see the terminal tab, and is
                             // then reaped like any dead agent.
                             let stale_threshold = if parent_alive && !ba.killed {
-                                live_parent_cap
+                                lost_hook_backstop
                             } else {
                                 expiry
                             };
@@ -1133,12 +1137,7 @@ impl SolutionAgentStore {
                             // must still age out or its map entry (and stream)
                             // would leak forever.
                             let age = match ba.latest.as_ref() {
-                                Some(snap) => {
-                                    if snap.stop_reason.is_some() {
-                                        return true;
-                                    }
-                                    now.duration_since(snap.mtime).unwrap_or_default()
-                                }
+                                Some(snap) => now.duration_since(snap.mtime).unwrap_or_default(),
                                 None => {
                                     let registered: std::time::SystemTime =
                                         ba.registered_at.into();
@@ -1240,13 +1239,17 @@ impl SolutionAgentStore {
     ///   2. it is an inline `Task` (its spawn tool-call's `tool_name` is NOT
     ///      agent) whose tool-call entry is TERMINAL; or
     ///   3. it is an async `Agent` (some `background_agent` has
-    ///      `parent_tool_use_id == toolu`) whose latest snapshot either carries
-    ///      a terminal `stop_reason` OR is stale beyond
-    ///      [`MANAGED_AGENT_STALE_TIMEOUT_SECS`].
+    ///      `parent_tool_use_id == toolu`) whose latest snapshot is stale
+    ///      beyond [`MANAGED_AGENT_STALE_TIMEOUT_SECS`] (dead/orphaned parent)
+    ///      or, with a still-live parent, beyond the short
+    ///      [`MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS`] window. Normal
+    ///      completion is closed by the `Stop` hook
+    ///      ([`Self::close_teammate_on_stop`]) — a JSONL `stop_reason` is no
+    ///      longer, by itself, a close trigger here.
     ///
     /// It is NEVER closed for a live inline `Task` (tool-call present +
-    /// non-terminal), a fresh async `Agent` (snapshot recent, no stop_reason),
-    /// or — critically — an async `Agent` merely because its spawn tool-call is
+    /// non-terminal), a fresh async `Agent` (snapshot recent), or —
+    /// critically — an async `Agent` merely because its spawn tool-call is
     /// terminal: that is spawn-ack, the teammate streams for minutes after, and
     /// closing there is the pre-6c premature-close regression. Async
     /// classification is by the `background_agents` map (NOT the tool-call
@@ -1271,17 +1274,15 @@ impl SolutionAgentStore {
         let now = std::time::SystemTime::now();
         let stale = std::time::Duration::from_secs(MANAGED_AGENT_STALE_TIMEOUT_SECS);
         let closed_any = session.update(cx, |s, _| {
-            // Silence is not death while the owning subprocess is up (hardening
-            // #9, applied here to the ASYNC-AGENT arm as well as the shell one):
-            // a detached agent grinding through a long tool call writes nothing
-            // to its JSONL for minutes, and closing its pill at the 120s stale
-            // mark made a running agent's tab vanish with no backstop. A live
-            // `acp_thread` guarantees the terminal `stop_reason` will still be
-            // observed, so only age out at the generous cap; with no thread the
-            // terminal transition can never arrive and the tight timeout applies.
+            // The `Stop` hook is authoritative for normal completion, so this
+            // is purely a lost-hook / wedged-subprocess backstop. A live
+            // `acp_thread` means the hook SHOULD fire soon, so a live-parent
+            // agent only gets the short lost-hook backstop window before being
+            // presumed lost; with no thread no hook can ever arrive and the
+            // tight ordinary timeout applies.
             let parent_alive = s.acp_thread().is_some();
             let live_parent_stale =
-                std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
+                std::time::Duration::from_secs(MANAGED_AGENT_LOST_HOOK_BACKSTOP_SECS);
             let teammate_ids: Vec<SharedString> = s
                 .streams
                 .keys()
@@ -1305,7 +1306,7 @@ impl SolutionAgentStore {
                 if let Some(ba) = async_agent {
                     // A KILLED agent (subprocess replaced by a reconnect) can
                     // never report again even though the session now holds a NEW
-                    // live thread, so the generous live-parent cap must not shield
+                    // live thread, so the lost-hook backstop must not shield
                     // it — it ages out on the tight staleness window like any
                     // orphan, keeping its terminal tab visible only briefly.
                     let stale = if parent_alive && !ba.killed {
@@ -1313,24 +1314,20 @@ impl SolutionAgentStore {
                     } else {
                         stale
                     };
-                    let terminal_stop = ba
-                        .latest
-                        .as_ref()
-                        .is_some_and(|snap| snap.stop_reason.is_some());
                     let stale_mtime = ba.latest.as_ref().is_some_and(|snap| {
                         now.duration_since(snap.mtime).unwrap_or_default() > stale
                     });
                     // An async agent whose JSONL never produced a parseable
                     // snapshot (`latest == None`) has no mtime to age from, so
-                    // neither branch above ever fires and its `Teammate` pill
-                    // would linger forever (the →Idle GC excludes async parents).
+                    // the branch above never fires and its `Teammate` pill would
+                    // linger forever (the →Idle GC excludes async parents).
                     // Mirror the shell reaper's fallback: age from
                     // `registered_at` and close once older than `stale`.
                     let stale_no_snapshot = ba.latest.is_none() && {
                         let registered: std::time::SystemTime = ba.registered_at.into();
                         now.duration_since(registered).unwrap_or_default() > stale
                     };
-                    if terminal_stop || stale_mtime || stale_no_snapshot {
+                    if stale_mtime || stale_no_snapshot {
                         // Never report a killed agent's stream as "done" — it was
                         // reaped mid-flight with its parent subprocess.
                         let reason = if ba.killed {
