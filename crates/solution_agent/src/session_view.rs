@@ -1124,6 +1124,33 @@ impl SolutionSessionView {
         }
         self.terminal_observers.retain(|id, _| keep.contains(id));
     }
+
+    /// The 3px drag strip that resizes the compose region. Shared by the
+    /// enabled and disabled compose arms so a locked shell tab is still
+    /// resizable (the input stays disabled; only `compose_height` changes).
+    fn render_compose_resize_handle(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("solution-session-compose-resize")
+            .flex_none()
+            .h(px(3.0))
+            .w_full()
+            .cursor_row_resize()
+            .bg(cx.theme().colors().border)
+            .hover(|s| s.bg(cx.theme().colors().border_focused))
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                    this.resize_start_y = e.position.y;
+                    this.resize_start_height = this.compose_height;
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag(DraggedComposeHandle, |handle, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| handle.clone())
+            })
+    }
 }
 
 impl Render for SolutionSessionView {
@@ -1732,25 +1759,30 @@ impl Render for SolutionSessionView {
                 // (`submit_compose_now` etc.) also early-return on
                 // this predicate as a belt-and-braces guard for any
                 // keybinding path that bypasses the button.
-                h_flex()
-                    .id("compose-row-disabled")
-                    .w_full()
+                div()
+                    .flex()
+                    .flex_col()
                     .flex_none()
-                    // Match the compose row's exact height (see the `else` arm:
-                    // `compose_height + 3px` for its resize handle). A
-                    // content-sized row here made the whole conversation jump
-                    // vertically every time the user flipped between the Main
-                    // pill and a shell pill — the strip and transcript above it
-                    // shift by the height delta on each switch.
+                    // Same total height as the enabled arm (handle 3px +
+                    // compose_height) so switching Main↔shell doesn't jump.
                     .h(self.compose_height + px(3.0))
-                    .px_3()
-                    .bg(cx.theme().colors().panel_background)
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border_variant)
+                    .child(self.render_compose_resize_handle(cx))
                     .child(
-                        Label::new("View only · switch to Main to send")
-                            .color(Color::Muted)
-                            .size(LabelSize::Small),
+                        h_flex()
+                            .id("compose-row-disabled")
+                            .w_full()
+                            .flex_none()
+                            .h(self.compose_height)
+                            .px_3()
+                            .items_center()
+                            .bg(cx.theme().colors().panel_background)
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new("View only · switch to Main to send")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            ),
                     )
                     .into_any_element()
             } else {
@@ -1766,34 +1798,7 @@ impl Render for SolutionSessionView {
                     .flex_col()
                     .flex_none()
                     .h(self.compose_height + px(3.0))
-                    .child(
-                        div()
-                            .id("solution-session-compose-resize")
-                            .flex_none()
-                            .h(px(3.0))
-                            .w_full()
-                            .cursor_row_resize()
-                            .bg(cx.theme().colors().border)
-                            .hover(|s| s.bg(cx.theme().colors().border_focused))
-                            .occlude()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                                    this.resize_start_y = e.position.y;
-                                    this.resize_start_height = this.compose_height;
-                                    log::debug!(
-                                        "compose drag down: start_y={:?} start_h={:?}",
-                                        this.resize_start_y,
-                                        this.resize_start_height,
-                                    );
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .on_drag(DraggedComposeHandle, |handle, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.new(|_| handle.clone())
-                            }),
-                    );
+                    .child(self.render_compose_resize_handle(cx));
                 let compose_inner = div()
                     .flex()
                     .flex_none()
