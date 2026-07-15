@@ -1,8 +1,9 @@
 use collections::HashMap;
+use editor::{Editor, EditorEvent, EditorSettings};
 use futures::StreamExt as _;
 use gpui::{
-    actions, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Render, Styled, Task, Window,
+    App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    IntoElement, ParentElement, Render, Styled, Subscription, Task, Window, actions,
 };
 use language::{Anchor, Buffer, BufferSnapshot, Point};
 use project::{
@@ -11,6 +12,7 @@ use project::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use settings::Settings as _;
 use std::{
     ops::Range,
     path::{Path, PathBuf},
@@ -22,7 +24,10 @@ use ui::prelude::*;
 use util::paths::PathMatcher;
 use workspace::{ModalView, Workspace};
 
-use crate::SearchOptions;
+use crate::{
+    SearchOption, SearchOptions, SearchSource, ToggleCaseSensitive, ToggleRegex, ToggleWholeWord,
+    search_bar,
+};
 
 #[cfg(test)]
 #[path = "find_in_path_tests.rs"]
@@ -49,11 +54,7 @@ pub fn init(cx: &mut App) {
     cx.observe_new(register).detach();
 }
 
-fn register(
-    workspace: &mut Workspace,
-    _window: Option<&mut Window>,
-    _cx: &mut Context<Workspace>,
-) {
+fn register(workspace: &mut Workspace, _window: Option<&mut Window>, _cx: &mut Context<Workspace>) {
     workspace.register_action(|workspace, action: &Toggle, window, cx| {
         FindInPath::toggle(workspace, action.replace_enabled, window, cx);
     });
@@ -75,11 +76,13 @@ pub enum Scope {
 
 /// Resolve the active member's root path for the Solution that owns `workspace`'s project, if any.
 ///
-/// Unused until the modal is constructed with a `&Workspace` (Task 4), which stores the result on
-/// `FindInPath` for `Scope::Project` to consume via `include_patterns_for_scope`'s `member_root`.
-#[allow(dead_code)]
+/// Called from `FindInPath::toggle`, which stores the result on `FindInPath` for `Scope::Project`
+/// to consume via `include_patterns_for_scope`'s `member_root`.
 fn active_member_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
-    let store = solutions::SolutionStore::global(cx);
+    // `try_global`, not `global` — this runs for every `FindInPath::toggle`, including plain
+    // (non-Solution) workspaces and tests that never call `solutions::init`, where the
+    // `SolutionStore` global is never installed at all.
+    let store = solutions::SolutionStore::try_global(cx)?;
     let project = workspace.project().read(cx);
     let first_root = project.visible_worktrees(cx).next()?.read(cx).abs_path();
     let solution = store.read(cx).solution_for_path(&first_root)?;
@@ -133,7 +136,11 @@ fn include_patterns_for_scope(
                     .next()
                     .map(|worktree| worktree.read(cx).abs_path().to_path_buf()),
             };
-            owned_root.as_deref().and_then(root_glob).into_iter().collect()
+            owned_root
+                .as_deref()
+                .and_then(root_glob)
+                .into_iter()
+                .collect()
         }
         Scope::Directory(dir) => root_glob(dir).into_iter().collect(),
     }
@@ -364,9 +371,14 @@ pub struct FindInPath {
     focus_handle: FocusHandle,
     replace_enabled: bool,
     project: Entity<Project>,
+    query_editor: Entity<Editor>,
+    search_options: SearchOptions,
+    scope: Scope,
+    member_root: Option<PathBuf>,
     results: MatchList,
     status: SearchStatus,
     search_task: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl FindInPath {
@@ -379,30 +391,118 @@ impl FindInPath {
         if let Some(existing) = workspace.active_modal::<Self>(cx) {
             existing.update(cx, |this, cx| {
                 this.replace_enabled |= replace_enabled;
-                this.focus_handle.focus(window, cx);
+                this.query_editor.focus_handle(cx).focus(window, cx);
                 cx.notify();
             });
             return;
         }
         let project = workspace.project().clone();
-        workspace.toggle_modal(window, cx, |_window, cx| Self {
-            focus_handle: cx.focus_handle(),
-            replace_enabled,
-            project,
-            results: MatchList::default(),
-            status: SearchStatus::Idle,
-            search_task: None,
+        let member_root = active_member_root(workspace, cx);
+        workspace.toggle_modal(window, cx, |window, cx| {
+            let query_editor = cx.new(|cx| Editor::single_line(window, cx));
+            // Re-run the search on every query edit, mirroring `ProjectSearchView`'s
+            // `cx.subscribe(&query_editor, ...)` in `project_search.rs`.
+            let query_editor_subscription = cx.subscribe(
+                &query_editor,
+                |this: &mut Self, _, event: &EditorEvent, cx| {
+                    if let EditorEvent::Edited { .. } = event {
+                        this.update_search(cx);
+                    }
+                },
+            );
+            Self {
+                focus_handle: cx.focus_handle(),
+                replace_enabled,
+                project,
+                query_editor,
+                search_options: SearchOptions::from_settings(
+                    &EditorSettings::get_global(cx).search,
+                ),
+                scope: Scope::Solution,
+                member_root,
+                results: MatchList::default(),
+                status: SearchStatus::Idle,
+                search_task: None,
+                _subscriptions: vec![query_editor_subscription],
+            }
         });
+    }
+
+    /// Rebuild the `SearchQuery` from the current editor/option/scope state and (re)run it, or
+    /// clear the results when the query text is empty / fails to parse (`build_query` returns
+    /// `None`). Include/exclude masks are wired in Task 7; empty text means "no restriction" here.
+    fn update_search(&mut self, cx: &mut Context<Self>) {
+        let query_text = self.query_editor.read(cx).text(cx);
+        if let Some(query) = build_query(
+            &query_text,
+            self.search_options,
+            "",
+            "",
+            &self.scope,
+            self.member_root.as_deref(),
+            &self.project,
+            cx,
+        ) {
+            self.spawn_search(query, cx);
+        } else {
+            self.results = MatchList::default();
+            self.status = SearchStatus::Idle;
+            self.search_task = None;
+            cx.notify();
+        }
+    }
+
+    fn toggle_case_sensitive(
+        &mut self,
+        _: &ToggleCaseSensitive,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_options.toggle(SearchOptions::CASE_SENSITIVE);
+        self.update_search(cx);
+    }
+
+    fn toggle_whole_word(
+        &mut self,
+        _: &ToggleWholeWord,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_options.toggle(SearchOptions::WHOLE_WORD);
+        self.update_search(cx);
+    }
+
+    fn toggle_regex(&mut self, _: &ToggleRegex, _window: &mut Window, cx: &mut Context<Self>) {
+        self.search_options.toggle(SearchOptions::REGEX);
+        self.update_search(cx);
+    }
+
+    /// Short summary of `self.results`/`self.status` for the modal's status bar.
+    fn status_label(&self) -> SharedString {
+        match self.status {
+            SearchStatus::Idle if self.results.file_count() == 0 => "Type to search".into(),
+            SearchStatus::Searching => "Searching…".into(),
+            _ => {
+                let matches = self.results.total_matches();
+                if matches == 0 {
+                    "No results".into()
+                } else {
+                    let files = self.results.file_count();
+                    let suffix = if self.status == SearchStatus::LimitReached {
+                        " (limit reached)"
+                    } else {
+                        ""
+                    };
+                    format!("{matches} matches in {files} files{suffix}").into()
+                }
+            }
+        }
     }
 
     /// Debounce, then run `query` against `self.project` and stream results into `self.results`.
     ///
     /// Replacing `self.search_task` drops (and thus cancels) any in-flight search — including one
     /// still sitting in the debounce timer — before this one starts.
-    ///
-    /// Not yet wired to editor input (Tasks 4/7 build the `SearchQuery` from the query/include/
-    /// exclude editors via `build_query` and call this).
-    #[allow(dead_code)]
     fn spawn_search(&mut self, query: SearchQuery, cx: &mut Context<Self>) {
         let project = self.project.clone();
         self.results = MatchList::default();
@@ -483,8 +583,10 @@ impl FindInPath {
 }
 
 impl Focusable for FindInPath {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    // Delegate to the query editor (mirroring `BufferSearchBar`) so the modal layer's
+    // "focus after being shown" (`ModalLayer::show_modal`) lands the caret in the query field.
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.query_editor.focus_handle(cx)
     }
 }
 
@@ -502,16 +604,44 @@ impl ModalView for FindInPath {
 
 impl Render for FindInPath {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Placeholder shell — replaced in Task 4 with the real header/results/preview.
         v_flex()
             .key_context("FindInPath")
             .track_focus(&self.focus_handle)
-            .w(rems(60.))
-            .h(rems(30.))
+            .w(relative(0.85))
+            .h(relative(0.80))
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()
             .border_color(cx.theme().colors().border)
             .rounded_lg()
-            .child("Find in Path")
+            .on_action(cx.listener(Self::toggle_case_sensitive))
+            .on_action(cx.listener(Self::toggle_whole_word))
+            .on_action(cx.listener(Self::toggle_regex))
+            .child(
+                h_flex()
+                    .p_2()
+                    .gap_1()
+                    .child(
+                        search_bar::input_base_styles(cx.theme().colors().border, |d| d)
+                            .child(search_bar::render_text_input(&self.query_editor, None, cx)),
+                    )
+                    .child(SearchOption::CaseSensitive.as_button(
+                        self.search_options,
+                        SearchSource::Buffer,
+                        self.focus_handle.clone(),
+                    ))
+                    .child(SearchOption::WholeWord.as_button(
+                        self.search_options,
+                        SearchSource::Buffer,
+                        self.focus_handle.clone(),
+                    ))
+                    .child(SearchOption::Regex.as_button(
+                        self.search_options,
+                        SearchSource::Buffer,
+                        self.focus_handle.clone(),
+                    )),
+            )
+            // Results area — Task 5 replaces this with the flattened `MatchList` row list.
+            .child(div().flex_1())
+            .child(h_flex().p_1().child(self.status_label()))
     }
 }

@@ -38,6 +38,85 @@ async fn test_toggle_opens_modal(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+async fn test_query_edit_drives_search(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "a.txt": "token\n",
+            "b.txt": "nothing here\n",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    // Editing the query editor should fire `EditorEvent::Edited`, which the modal's
+    // subscription turns into `update_search` -> `build_query` -> `spawn_search`.
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert!(
+            find_in_path.results.total_matches() > 0,
+            "editing the query editor should drive build_query -> spawn_search end-to-end"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_toggle_regex_action_flips_search_options(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "hello\n" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    let was_regex = find_in_path.read_with(cx, |find_in_path, _| {
+        find_in_path.search_options.contains(SearchOptions::REGEX)
+    });
+
+    // `ToggleRegex` dispatches to the currently focused node (the query editor, focused by the
+    // modal layer on open) and bubbles up to the `on_action` handler registered on the modal root.
+    cx.dispatch_action(ToggleRegex);
+
+    find_in_path.read_with(cx, |find_in_path, _| {
+        assert_eq!(
+            find_in_path.search_options.contains(SearchOptions::REGEX),
+            !was_regex,
+            "dispatching ToggleRegex to the focused modal should flip the REGEX bit"
+        );
+    });
+}
+
 fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
         let state = AppState::test(cx);
