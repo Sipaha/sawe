@@ -650,7 +650,7 @@
       "new": "workspace::NewFile",
       "ctrl-n": "workspace::NewFile",
       "shift-new": "workspace::NewWindow",
-      "ctrl-shift-n": "workspace::NewWindow",
+      "ctrl-shift-n": "file_finder::Toggle",
       "ctrl-`": "console_panel::ToggleFocus",
       "f10": ["app_menu::OpenApplicationMenu", "Zed"],
       "alt-1": ["workspace::ActivatePane", 0],
