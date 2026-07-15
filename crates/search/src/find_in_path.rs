@@ -1,9 +1,10 @@
+use collections::HashMap;
 use futures::StreamExt as _;
 use gpui::{
-    actions, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    actions, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     IntoElement, ParentElement, Render, Styled, Task, Window,
 };
-use language::{Anchor, Buffer, Point};
+use language::{Anchor, Buffer, BufferSnapshot, Point};
 use project::{
     Project, SearchResults,
     search::{SearchQuery, SearchResult},
@@ -258,55 +259,75 @@ pub enum Row {
     Match(usize, usize),
 }
 
+/// Compute the line + trimmed snippet preview for each range in `ranges`.
+///
+/// Pure and `cx`-free so it can run on a background thread — `BufferSnapshot` is `Send`, unlike the
+/// `Entity<Buffer>`/`cx` pair needed to obtain it. Callers grab the snapshot on the foreground and
+/// offload this (the actual per-range work) to `cx.background_executor()`.
+fn compute_match_rows(snapshot: &BufferSnapshot, ranges: &[Range<Anchor>]) -> Vec<MatchRow> {
+    ranges
+        .iter()
+        .map(|range| {
+            let line = snapshot.summary_for_anchor::<Point>(&range.start).row;
+            let line_end = snapshot.line_len(line);
+            let snippet = snapshot
+                .text_for_range(Point::new(line, 0)..Point::new(line, line_end))
+                .collect::<String>();
+            MatchRow {
+                range: range.clone(),
+                line,
+                snippet: snippet.trim().to_string().into(),
+            }
+        })
+        .collect()
+}
+
 /// Streaming search results grouped by file, plus the flattened row list the results view renders.
 #[derive(Default)]
 pub struct MatchList {
     pub groups: Vec<FileGroup>,
     pub rows: Vec<Row>,
+    index_by_buffer: HashMap<EntityId, usize>,
 }
 
 impl MatchList {
-    /// Merge a batch of matches for `buffer` into the existing group for that buffer (creating one
-    /// if this is the first batch seen for it). Does not touch `rows` — call `rebuild_rows` after.
+    /// Merge a batch of already-computed `rows` for `buffer` into the existing group for that
+    /// buffer (creating one, using `path`, if this is the first batch seen for it). `cx`-free and
+    /// does no snippet computation — callers produce `rows` via `compute_match_rows`, typically on
+    /// a background thread. Does not touch `rows` (the flattened list) — call `rebuild_rows` after.
+    pub fn push_matches(&mut self, buffer: Entity<Buffer>, path: Arc<Path>, rows: Vec<MatchRow>) {
+        if rows.is_empty() {
+            return;
+        }
+
+        if let Some(&group_index) = self.index_by_buffer.get(&buffer.entity_id()) {
+            self.groups[group_index].matches.extend(rows);
+        } else {
+            let group_index = self.groups.len();
+            self.index_by_buffer.insert(buffer.entity_id(), group_index);
+            self.groups.push(FileGroup {
+                path,
+                buffer,
+                matches: rows,
+            });
+        }
+    }
+
+    /// Convenience wrapper around `compute_match_rows` + `push_matches` for callers (tests, and any
+    /// non-streaming caller) that don't need to offload snippet computation to a background thread.
+    /// The streaming `spawn_search` path does NOT use this — it offloads `compute_match_rows` itself.
+    #[cfg(test)]
     pub fn push_result(&mut self, buffer: Entity<Buffer>, ranges: Vec<Range<Anchor>>, cx: &App) {
         if ranges.is_empty() {
             return;
         }
-
         let snapshot = buffer.read(cx).snapshot();
-        let matches = ranges
-            .into_iter()
-            .map(|range| {
-                let line = snapshot.summary_for_anchor::<Point>(&range.start).row;
-                let line_end = snapshot.line_len(line);
-                let snippet = snapshot
-                    .text_for_range(Point::new(line, 0)..Point::new(line, line_end))
-                    .collect::<String>();
-                MatchRow {
-                    range,
-                    line,
-                    snippet: snippet.trim().to_string().into(),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if let Some(group) = self
-            .groups
-            .iter_mut()
-            .find(|group| group.buffer.entity_id() == buffer.entity_id())
-        {
-            group.matches.extend(matches);
-        } else {
-            let path: Arc<Path> = snapshot
-                .file()
-                .map(|file| Arc::from(file.full_path(cx)))
-                .unwrap_or_else(|| Arc::from(Path::new("")));
-            self.groups.push(FileGroup {
-                path,
-                buffer,
-                matches,
-            });
-        }
+        let path: Arc<Path> = snapshot
+            .file()
+            .map(|file| Arc::from(file.full_path(cx)))
+            .unwrap_or_else(|| Arc::from(Path::new("")));
+        let rows = compute_match_rows(&snapshot, &ranges);
+        self.push_matches(buffer, path, rows);
     }
 
     /// Flatten `groups` into `rows` (one `Header` per group followed by its `Match` rows).
@@ -397,29 +418,45 @@ impl FindInPath {
 
             let mut limit_reached = false;
             while let Some(batch) = chunks.next().await {
+                let mut buffers_with_ranges = Vec::with_capacity(batch.len());
                 for result in batch {
                     match result {
                         SearchResult::Buffer { buffer, ranges } => {
-                            if this
-                                .update(cx, |this, cx| this.results.push_result(buffer, ranges, cx))
-                                .is_err()
-                            {
-                                return;
-                            }
+                            buffers_with_ranges.push((buffer, ranges));
                         }
                         SearchResult::LimitReached => limit_reached = true,
                         SearchResult::WaitingForScan | SearchResult::Searching => {}
                     }
                 }
-                let update_result = this.update(cx, |this, cx| {
-                    this.results.rebuild_rows();
-                    this.status = SearchStatus::Searching;
-                    cx.notify();
-                });
-                if update_result.is_err() {
-                    return;
+
+                // Snippet computation is offloaded per buffer (not batched as one background job)
+                // so the foreground gets a `yield_now` between every buffer, keeping the modal
+                // responsive while draining up to `MAX_SEARCH_RESULT_FILES` buffers per search.
+                for (buffer, ranges) in buffers_with_ranges {
+                    let (snapshot, path) = buffer.read_with(cx, |buffer, cx| {
+                        let snapshot = buffer.snapshot();
+                        let path: Arc<Path> = snapshot
+                            .file()
+                            .map(|file| Arc::from(file.full_path(cx)))
+                            .unwrap_or_else(|| Arc::from(Path::new("")));
+                        (snapshot, path)
+                    });
+                    let rows = cx
+                        .background_executor()
+                        .spawn(async move { compute_match_rows(&snapshot, &ranges) })
+                        .await;
+
+                    let update_result = this.update(cx, |this, cx| {
+                        this.results.push_matches(buffer, path, rows);
+                        this.results.rebuild_rows();
+                        this.status = SearchStatus::Searching;
+                        cx.notify();
+                    });
+                    if update_result.is_err() {
+                        return;
+                    }
+                    futures_lite::future::yield_now().await;
                 }
-                futures_lite::future::yield_now().await;
             }
 
             this.update(cx, |this, cx| {
