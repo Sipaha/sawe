@@ -668,3 +668,177 @@ async fn test_streaming_batch_without_selection_change_does_not_redirty_preview(
         });
     });
 }
+
+#[gpui::test]
+async fn test_set_scope_directory_restricts_results(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/alpha", json!({ "x.rs": "token\n" })).await;
+    fs.insert_tree("/beta", json!({ "x.rs": "token\n" })).await;
+    let project = Project::test(fs, ["/alpha".as_ref(), "/beta".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            2,
+            "Scope::Solution (the default) should search both worktrees"
+        );
+    });
+
+    cx.update(|_window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.set_scope(Scope::Directory(PathBuf::from("/alpha")), cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            1,
+            "Scope::Directory(\"/alpha\") should restrict the search to that worktree only"
+        );
+        assert_eq!(
+            find_in_path.results.groups[0].path.as_ref(),
+            std::path::Path::new("alpha/x.rs"),
+            "the sole remaining result should be alpha's x.rs, not beta's"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_set_scope_project_falls_back_to_first_worktree(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/alpha", json!({ "x.rs": "token\n" })).await;
+    fs.insert_tree("/beta", json!({ "x.rs": "token\n" })).await;
+    let project = Project::test(fs, ["/alpha".as_ref(), "/beta".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    cx.update(|_window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            // `init_test` never installs a `SolutionStore` global, so `member_root` is `None` and
+            // `include_patterns_for_scope` falls back to the first visible worktree ("alpha").
+            find_in_path.set_scope(Scope::Project, cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            1,
+            "Scope::Project with no active member should restrict to the first worktree"
+        );
+        assert_eq!(
+            find_in_path.results.groups[0].path.as_ref(),
+            std::path::Path::new("alpha/x.rs"),
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_include_mask_filters_results(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "match.rs": "token\n",
+            "match.txt": "token\n",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            2,
+            "with no mask, both match.rs and match.txt should be found"
+        );
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.included_files_editor.update(cx, |editor, cx| {
+                editor.set_text("*.rs", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            1,
+            "a '*.rs' include mask should filter out match.txt"
+        );
+        assert_eq!(
+            find_in_path.results.groups[0].path.as_ref(),
+            std::path::Path::new("root/match.rs"),
+        );
+    });
+}

@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use ui::prelude::*;
+use ui::{ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, prelude::*};
 use util::paths::PathMatcher;
 use workspace::{ModalView, Workspace};
 
@@ -375,6 +375,14 @@ pub struct FindInPath {
     replace_enabled: bool,
     project: Entity<Project>,
     query_editor: Entity<Editor>,
+    /// User-typed include-glob mask ("File mask"), merged in front of `scope`'s own include
+    /// patterns by `build_query` — see that function's doc comment.
+    included_files_editor: Entity<Editor>,
+    /// User-typed exclude-glob mask ("Exclude").
+    excluded_files_editor: Entity<Editor>,
+    /// Path field for `Scope::Directory`, only rendered while that tab is selected. Its text
+    /// becomes the new `Scope::Directory` payload on every edit (see `toggle`'s subscription).
+    directory_editor: Entity<Editor>,
     search_options: SearchOptions,
     scope: Scope,
     member_root: Option<PathBuf>,
@@ -430,11 +438,47 @@ impl FindInPath {
                     }
                 },
             );
+
+            let included_files_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let included_files_editor_subscription = cx.subscribe(
+                &included_files_editor,
+                |this: &mut Self, _, event: &EditorEvent, cx| {
+                    if let EditorEvent::Edited { .. } = event {
+                        this.update_search(cx);
+                    }
+                },
+            );
+            let excluded_files_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let excluded_files_editor_subscription = cx.subscribe(
+                &excluded_files_editor,
+                |this: &mut Self, _, event: &EditorEvent, cx| {
+                    if let EditorEvent::Edited { .. } = event {
+                        this.update_search(cx);
+                    }
+                },
+            );
+            // Its own `Edited` subscription (rather than piggy-backing on the scope-tab click)
+            // covers the common flow of clicking the Directory tab first (with an empty path,
+            // matching nothing) and then typing the path — every keystroke re-searches.
+            let directory_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let directory_editor_subscription = cx.subscribe(
+                &directory_editor,
+                |this: &mut Self, editor, event: &EditorEvent, cx| {
+                    if let EditorEvent::Edited { .. } = event {
+                        let text = editor.read(cx).text(cx);
+                        this.set_scope(Scope::Directory(PathBuf::from(text.trim())), cx);
+                    }
+                },
+            );
+
             Self {
                 focus_handle: cx.focus_handle(),
                 replace_enabled,
                 project,
                 query_editor,
+                included_files_editor,
+                excluded_files_editor,
+                directory_editor,
                 search_options: SearchOptions::from_settings(
                     &EditorSettings::get_global(cx).search,
                 ),
@@ -448,21 +492,28 @@ impl FindInPath {
                 preview_editor: None,
                 preview_dirty: false,
                 previewed_match: None,
-                _subscriptions: vec![query_editor_subscription],
+                _subscriptions: vec![
+                    query_editor_subscription,
+                    included_files_editor_subscription,
+                    excluded_files_editor_subscription,
+                    directory_editor_subscription,
+                ],
             }
         });
     }
 
-    /// Rebuild the `SearchQuery` from the current editor/option/scope state and (re)run it, or
-    /// clear the results when the query text is empty / fails to parse (`build_query` returns
-    /// `None`). Include/exclude masks are wired in Task 7; empty text means "no restriction" here.
+    /// Rebuild the `SearchQuery` from the current editor/option/scope/mask state and (re)run it,
+    /// or clear the results when the query text is empty / fails to parse (`build_query` returns
+    /// `None`).
     fn update_search(&mut self, cx: &mut Context<Self>) {
         let query_text = self.query_editor.read(cx).text(cx);
+        let include_text = self.included_files_editor.read(cx).text(cx);
+        let exclude_text = self.excluded_files_editor.read(cx).text(cx);
         if let Some(query) = build_query(
             &query_text,
             self.search_options,
-            "",
-            "",
+            &include_text,
+            &exclude_text,
             &self.scope,
             self.member_root.as_deref(),
             &self.project,
@@ -479,6 +530,13 @@ impl FindInPath {
             self.previewed_match = None;
             cx.notify();
         }
+    }
+
+    /// Switch the search scope (In Solution / In Project / Directory tab) and re-run the search.
+    fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        self.scope = scope;
+        self.update_search(cx);
+        cx.notify();
     }
 
     fn toggle_case_sensitive(
@@ -850,6 +908,49 @@ impl FindInPath {
         }
     }
 
+    /// Segmented "In Solution / In Project / Directory" scope control, mirroring the
+    /// `ToggleButtonGroup` pattern used by `debugger_ui::new_process_modal`'s mode tabs. Clicking
+    /// a tab calls `set_scope`, which re-runs the search; clicking Directory also seeds the scope
+    /// from whatever's already typed into `directory_editor` (empty on first click).
+    fn render_scope_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected_index = match &self.scope {
+            Scope::Solution => 0,
+            Scope::Project => 1,
+            Scope::Directory(_) => 2,
+        };
+        h_flex().w_full().child(
+            ToggleButtonGroup::single_row(
+                "find-in-path-scope",
+                [
+                    ToggleButtonSimple::new(
+                        "In Solution",
+                        cx.listener(|this, _, _window, cx| {
+                            this.set_scope(Scope::Solution, cx);
+                        }),
+                    ),
+                    ToggleButtonSimple::new(
+                        "In Project",
+                        cx.listener(|this, _, _window, cx| {
+                            this.set_scope(Scope::Project, cx);
+                        }),
+                    ),
+                    ToggleButtonSimple::new(
+                        "Directory",
+                        cx.listener(|this, _, window, cx| {
+                            let text = this.directory_editor.read(cx).text(cx);
+                            this.set_scope(Scope::Directory(PathBuf::from(text.trim())), cx);
+                            this.directory_editor.focus_handle(cx).focus(window, cx);
+                        }),
+                    ),
+                ],
+            )
+            .style(ToggleButtonGroupStyle::Outlined)
+            .label_size(LabelSize::Small)
+            .auto_width()
+            .selected_index(selected_index),
+        )
+    }
+
     /// The left pane of the results split: the flattened `MatchList` row list, one file-header
     /// row per group followed by its indented match rows.
     fn render_results(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -911,28 +1012,108 @@ impl Render for FindInPath {
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
             .child(
-                h_flex()
+                v_flex()
                     .p_2()
-                    .gap_1()
+                    .gap_2()
                     .child(
-                        search_bar::input_base_styles(cx.theme().colors().border, |d| d)
-                            .child(search_bar::render_text_input(&self.query_editor, None, cx)),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                search_bar::input_base_styles(cx.theme().colors().border, |d| d)
+                                    .child(search_bar::render_text_input(
+                                        &self.query_editor,
+                                        None,
+                                        cx,
+                                    )),
+                            )
+                            .child(SearchOption::CaseSensitive.as_button(
+                                self.search_options,
+                                SearchSource::Buffer,
+                                self.focus_handle.clone(),
+                            ))
+                            .child(SearchOption::WholeWord.as_button(
+                                self.search_options,
+                                SearchSource::Buffer,
+                                self.focus_handle.clone(),
+                            ))
+                            .child(SearchOption::Regex.as_button(
+                                self.search_options,
+                                SearchSource::Buffer,
+                                self.focus_handle.clone(),
+                            )),
                     )
-                    .child(SearchOption::CaseSensitive.as_button(
-                        self.search_options,
-                        SearchSource::Buffer,
-                        self.focus_handle.clone(),
-                    ))
-                    .child(SearchOption::WholeWord.as_button(
-                        self.search_options,
-                        SearchSource::Buffer,
-                        self.focus_handle.clone(),
-                    ))
-                    .child(SearchOption::Regex.as_button(
-                        self.search_options,
-                        SearchSource::Buffer,
-                        self.focus_handle.clone(),
-                    )),
+                    .child(self.render_scope_tabs(cx))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(
+                                        Label::new("File mask")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        search_bar::input_base_styles(
+                                            cx.theme().colors().border,
+                                            |d| d,
+                                        )
+                                        .flex_1()
+                                        .child(search_bar::render_text_input(
+                                            &self.included_files_editor,
+                                            None,
+                                            cx,
+                                        )),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(
+                                        Label::new("Exclude")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        search_bar::input_base_styles(
+                                            cx.theme().colors().border,
+                                            |d| d,
+                                        )
+                                        .flex_1()
+                                        .child(search_bar::render_text_input(
+                                            &self.excluded_files_editor,
+                                            None,
+                                            cx,
+                                        )),
+                                    ),
+                            ),
+                    )
+                    .when(matches!(self.scope, Scope::Directory(_)), |this| {
+                        this.child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Label::new("Directory")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    search_bar::input_base_styles(
+                                        cx.theme().colors().border,
+                                        |d| d,
+                                    )
+                                    .flex_1()
+                                    .child(search_bar::render_text_input(
+                                        &self.directory_editor,
+                                        None,
+                                        cx,
+                                    )),
+                                ),
+                        )
+                    }),
             )
             .child(
                 h_flex()
