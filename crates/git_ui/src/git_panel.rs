@@ -6,7 +6,7 @@ use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::pre_commit;
 use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
-use crate::solo_diff_view::SoloDiffView;
+use crate::solo_diff_view::{SoloDiffOpen, SoloDiffView};
 use crate::{branch_picker, picker_prompt, render_remote_button};
 use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
@@ -215,7 +215,7 @@ fn git_panel_context_menu(
             .action_disabled_when(!state.has_stash_items, "Stash Pop", StashPop.boxed_clone())
             .action("View Stash", zed_actions::git::ViewStash.boxed_clone())
             .separator()
-            .action("Open Diff", project_diff::Diff.boxed_clone())
+            .action("Open All Changes", project_diff::Diff.boxed_clone())
             .separator()
             .action_disabled_when(
                 !state.has_tracked_changes,
@@ -1336,7 +1336,10 @@ impl GitPanel {
         }
     }
 
-    /// Show diff view at selected entry, only if the diff view is open
+    /// Follow the selection with whichever diff view is already open: scroll the
+    /// stacked accordion to the entry, and/or replace the single-file preview tab
+    /// with the newly-selected file (IntelliJ-IDEA "preview follows selection").
+    /// Never opens a diff from nothing — only updates one that is already showing.
     fn move_diff_to_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         maybe!({
             let workspace = self.workspace.upgrade()?;
@@ -1347,6 +1350,23 @@ impl GitPanel {
                 project_diff.update(cx, |project_diff, cx| {
                     project_diff.move_to_entry(entry.clone(), window, cx);
                 });
+            }
+
+            // If the active pane's preview slot currently holds a single-file
+            // diff, swap it to track the selection (keeps focus in the panel).
+            let preview_is_solo_diff = workspace
+                .read(cx)
+                .active_pane()
+                .read(cx)
+                .preview_item_id()
+                .is_some_and(|preview_id| {
+                    workspace
+                        .read(cx)
+                        .items_of_type::<SoloDiffView>(cx)
+                        .any(|view| view.entity_id() == preview_id)
+                });
+            if preview_is_solo_diff {
+                self.open_diff_for_selected(SoloDiffOpen::Preview, window, cx);
             }
 
             Some(())
@@ -1404,6 +1424,9 @@ impl GitPanel {
         self.selected_entry.and_then(|i| self.entries.get(i))
     }
 
+    /// `menu::Confirm` (Enter / plain click deferred here): open the selected
+    /// file's single-file diff as a pinned tab. IntelliJ-IDEA model — one file at
+    /// a time, not the stacked accordion.
     fn open_diff(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == GitPanelTab::History {
             self.open_selected_history_commit(window, cx);
@@ -1417,6 +1440,59 @@ impl GitPanel {
             self.toggle_directory(&dir_entry.key, window, cx);
             return;
         }
+        self.open_diff_for_selected(SoloDiffOpen::Permanent, window, cx);
+    }
+
+    /// `menu::SecondaryConfirm` (alt-enter / cmd-click): open the stacked
+    /// all-files accordion (`ProjectDiff`), kept reachable for reviewing every
+    /// change at once.
+    fn open_accordion_diff(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_tab == GitPanelTab::History {
+            self.open_selected_history_commit(window, cx);
+            return;
+        }
+        if let Some(GitListEntry::Directory(dir_entry)) = self
+            .selected_entry
+            .and_then(|i| self.entries.get(i))
+            .cloned()
+        {
+            self.toggle_directory(&dir_entry.key, window, cx);
+            return;
+        }
+        self.open_all_diffs(window, cx);
+    }
+
+    /// Open the selected file's single-file diff (`SoloDiffView`). `Preview`
+    /// opens a replaceable italic tab and keeps focus in the panel; `Permanent`
+    /// pins it and moves focus into the diff.
+    fn open_diff_for_selected(
+        &mut self,
+        mode: SoloDiffOpen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        maybe!({
+            let entry = self
+                .entries
+                .get(self.selected_entry?)?
+                .status_entry()?
+                .clone();
+            let repository = self.active_repository.clone()?;
+
+            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), mode, window, cx)
+                .detach_and_notify_err(self.workspace.clone(), window, cx);
+
+            Some(())
+        });
+    }
+
+    /// Open (or reuse+scroll) the stacked all-files diff accordion.
+    fn open_all_diffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         maybe!({
             let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
             let workspace = self.workspace.upgrade()?;
@@ -1441,27 +1517,6 @@ impl GitPanel {
                 })
                 .ok();
             self.focus_handle.focus(window, cx);
-
-            Some(())
-        });
-    }
-
-    fn open_solo_diff(
-        &mut self,
-        _: &menu::SecondaryConfirm,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        maybe!({
-            let entry = self
-                .entries
-                .get(self.selected_entry?)?
-                .status_entry()?
-                .clone();
-            let repository = self.active_repository.clone()?;
-
-            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), window, cx)
-                .detach_and_notify_err(self.workspace.clone(), window, cx);
 
             Some(())
         });
@@ -6381,7 +6436,7 @@ impl GitPanel {
                 )
                 .separator()
                 .action("Open Diff", menu::Confirm.boxed_clone())
-                .action("Open Diff (File)", menu::SecondaryConfirm.boxed_clone())
+                .action("Open All Changes", menu::SecondaryConfirm.boxed_clone())
                 .when(!is_created, |context_menu| {
                     context_menu
                         .separator()
@@ -6660,10 +6715,15 @@ impl GitPanel {
                     this.selected_entry = Some(ix);
                     cx.notify();
                     if event.modifiers().secondary() {
-                        this.open_solo_diff(&Default::default(), window, cx)
+                        // Cmd/Ctrl-click → stacked all-files accordion.
+                        this.open_all_diffs(window, cx);
+                    } else if event.click_count() > 1 {
+                        // Double-click → pin the single-file diff (focus moves in).
+                        this.open_diff_for_selected(SoloDiffOpen::Permanent, window, cx);
                     } else {
-                        this.open_diff(&Default::default(), window, cx);
-                        this.focus_handle.focus(window, cx);
+                        // Single click → replaceable preview; keep focus in the
+                        // panel so arrow-nav can keep driving the preview.
+                        this.open_diff_for_selected(SoloDiffOpen::Preview, window, cx);
                     }
                 })
             })
@@ -7210,7 +7270,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::last_entry))
             .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(Self::open_diff))
-            .on_action(cx.listener(Self::open_solo_diff))
+            .on_action(cx.listener(Self::open_accordion_diff))
             .on_action(cx.listener(Self::focus_changes_list))
             .on_action(cx.listener(Self::focus_editor))
             .on_action(cx.listener(Self::expand_commit_editor))
@@ -8899,11 +8959,31 @@ mod tests {
         })
         .await;
 
-        // Confirm that `Open Diff` still works for the untracked file, updating
-        // the Project Diff's active path.
+        // `Open Diff` (menu::Confirm) opens the selected file's single-file diff
+        // (IntelliJ-IDEA one-file-at-a-time), NOT the stacked accordion.
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_entry = Some(1);
             panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            let solo_diffs = workspace.items_of_type::<SoloDiffView>(cx).count();
+            assert_eq!(
+                solo_diffs, 1,
+                "a single-file diff should open for the selected file"
+            );
+            assert!(
+                workspace.item_of_type::<ProjectDiff>(cx).is_none(),
+                "the stacked accordion should not open on a plain Open Diff"
+            );
+        });
+
+        // `Open All Changes` (menu::SecondaryConfirm) opens the stacked accordion
+        // (`ProjectDiff`), scrolled to the selected file.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(1);
+            panel.open_accordion_diff(&menu::SecondaryConfirm, window, cx);
         });
         cx.run_until_parked();
 

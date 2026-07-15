@@ -33,10 +33,21 @@ use util::paths::{PathExt as _, PathStyle};
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
-    item::{ItemEvent, SaveOptions, TabContentParams},
+    item::{ItemEvent, PreviewTabsSettings, SaveOptions, TabContentParams},
     notifications::NotifyTaskExt,
     searchable::SearchableItemHandle,
 };
+
+/// How a [`SoloDiffView`] should be placed in the pane.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SoloDiffOpen {
+    /// Replaceable preview tab (single click / selection-follow). Rendered
+    /// italic and swapped out when the next preview opens. Keeps keyboard focus
+    /// wherever it was (e.g. the git panel), so arrow-nav can keep driving it.
+    Preview,
+    /// Pinned permanent tab (double-click / Enter). Moves focus into the diff.
+    Permanent,
+}
 
 pub struct SoloDiffView {
     repository: Entity<Repository>,
@@ -53,6 +64,7 @@ impl SoloDiffView {
         entry: GitStatusEntry,
         repository: Entity<Repository>,
         workspace: WeakEntity<Workspace>,
+        mode: SoloDiffOpen,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
@@ -65,10 +77,20 @@ impl SoloDiffView {
             .items_of_type::<SoloDiffView>(cx)
             .find(|item| item.read(cx).matches(&repository, &entry.repo_path, cx));
         if let Some(existing) = existing {
+            let focus_item = mode == SoloDiffOpen::Permanent;
             workspace_entity.update(cx, |workspace, cx| {
-                workspace.activate_item(&existing, true, true, window, cx);
+                workspace.activate_item(&existing, true, focus_item, window, cx);
+                // A deliberate "open" pins an existing preview; a preview gesture
+                // never demotes an already-pinned tab.
+                if mode == SoloDiffOpen::Permanent {
+                    workspace.active_pane().update(cx, |pane, _cx| {
+                        pane.unpreview_item_if_preview(existing.item_id());
+                    });
+                }
             });
-            existing.focus_handle(cx).focus(window, cx);
+            if focus_item {
+                existing.focus_handle(cx).focus(window, cx);
+            }
             return Task::ready(Ok(existing));
         }
 
@@ -111,7 +133,20 @@ impl SoloDiffView {
                     )
                 });
 
-                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+                let item: Box<dyn ItemHandle> = Box::new(view.clone());
+                let focus_item = mode == SoloDiffOpen::Permanent;
+                workspace.active_pane().update(cx, |pane, cx| {
+                    // A preview opens into (and replaces) the pane's single
+                    // preview slot; a permanent open appends its own tab.
+                    let destination_index = if mode == SoloDiffOpen::Preview
+                        && PreviewTabsSettings::get_global(cx).enabled
+                    {
+                        pane.replace_preview_item_id(item.item_id(), window, cx)
+                    } else {
+                        None
+                    };
+                    pane.add_item(item, true, focus_item, destination_index, window, cx);
+                });
                 view
             })
         })
