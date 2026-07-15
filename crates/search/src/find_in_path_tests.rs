@@ -372,9 +372,7 @@ async fn test_spawn_search_streams_grouped_results(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_selection_lands_on_first_match_and_select_next_skips_header(
-    cx: &mut TestAppContext,
-) {
+async fn test_selection_lands_on_first_match_and_select_next_skips_header(cx: &mut TestAppContext) {
     let _app_state = init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
@@ -451,6 +449,126 @@ async fn test_selection_lands_on_first_match_and_select_next_skips_header(
                 Some(Row::Match(_, _))
             ),
             "SelectNext should land on a Match row, skipping any intervening Header row"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_selecting_match_builds_and_reuses_preview_editor(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "a.txt": "token\ntoken\n",
+            "b.txt": "token\n",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    let query = project.read_with(cx, |_project, cx| {
+        super::build_query(
+            "token",
+            SearchOptions::NONE,
+            "",
+            "",
+            &Scope::Solution,
+            None,
+            &project,
+            cx,
+        )
+        .expect("non-empty query text with a valid scope should build a query")
+    });
+
+    find_in_path.update(cx, |find_in_path, cx| {
+        find_in_path.spawn_search(query, cx);
+    });
+
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    // Streaming results auto-select the first Match row, but that happens inside `spawn_search`'s
+    // async task (no `&mut Window` available there) so it only sets `preview_dirty`; dispatching
+    // `SelectNext` (which has a real `Window`) drives `update_preview` directly and gives us
+    // something deterministic to assert on without depending on whether a `render` pass already
+    // drained the flag.
+    cx.dispatch_action(menu::SelectNext);
+
+    let (first_selected_buffer_id, first_preview_editor_id) =
+        find_in_path.read_with(cx, |find_in_path, _cx| {
+            let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
+            else {
+                panic!("selected_row should be a Match row after SelectNext");
+            };
+            let buffer_id = find_in_path.results.groups[group_index].buffer.entity_id();
+            let (preview_buffer_id, preview_editor) = find_in_path
+                .preview_editor
+                .as_ref()
+                .expect("selecting a match should build a preview editor");
+            assert_eq!(
+                *preview_buffer_id, buffer_id,
+                "the preview editor should be keyed by the selected match's buffer id"
+            );
+            (buffer_id, preview_editor.entity_id())
+        });
+
+    // a.txt has two matches in a row, so a second `SelectNext` (assuming the first landed on
+    // a.txt's first match) stays within the same file: `update_preview` should reuse the existing
+    // editor entity rather than rebuilding it.
+    cx.dispatch_action(menu::SelectNext);
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
+        else {
+            panic!("selected_row should be a Match row after a second SelectNext");
+        };
+        let buffer_id = find_in_path.results.groups[group_index].buffer.entity_id();
+        let (preview_buffer_id, preview_editor) = find_in_path
+            .preview_editor
+            .as_ref()
+            .expect("preview editor should still be present");
+        if buffer_id == first_selected_buffer_id {
+            assert_eq!(
+                preview_editor.entity_id(),
+                first_preview_editor_id,
+                "staying within the same file should reuse the existing preview editor"
+            );
+        }
+        assert_eq!(*preview_buffer_id, buffer_id);
+    });
+
+    // Jump to the last match (b.txt, a different file) and confirm the preview editor rebuilds
+    // against the new buffer.
+    cx.dispatch_action(menu::SelectLast);
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
+        else {
+            panic!("selected_row should be a Match row after SelectLast");
+        };
+        let buffer_id = find_in_path.results.groups[group_index].buffer.entity_id();
+        let (preview_buffer_id, preview_editor) = find_in_path
+            .preview_editor
+            .as_ref()
+            .expect("preview editor should still be present");
+        assert_eq!(*preview_buffer_id, buffer_id);
+        assert_ne!(
+            buffer_id, first_selected_buffer_id,
+            "SelectLast should land on a different file's match given two files with matches"
+        );
+        assert_ne!(
+            preview_editor.entity_id(),
+            first_preview_editor_id,
+            "selecting a match in a different file should rebuild the preview editor"
         );
     });
 }

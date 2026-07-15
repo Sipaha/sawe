@@ -1,10 +1,12 @@
 use collections::HashMap;
-use editor::{Editor, EditorEvent, EditorSettings};
+use editor::{
+    Editor, EditorEvent, EditorSettings, HighlightKey, SelectionEffects, scroll::Autoscroll,
+};
 use futures::StreamExt as _;
 use gpui::{
-    AnyElement, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement,
-    Styled, Subscription, Task, UniformListScrollHandle, Window, actions, uniform_list,
+    AnyElement, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    IntoElement, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement, Styled,
+    Subscription, Task, UniformListScrollHandle, Window, actions, uniform_list,
 };
 use language::{Anchor, Buffer, BufferSnapshot, Point};
 use project::{
@@ -381,6 +383,15 @@ pub struct FindInPath {
     search_task: Option<Task<()>>,
     selected_row: usize,
     list_scroll_handle: UniformListScrollHandle,
+    /// The editor previewing the currently-selected match, keyed by the previewed buffer's
+    /// `EntityId` so `update_preview` can tell whether it needs to rebuild (selection moved to a
+    /// different file) or can just re-highlight + re-autoscroll (selection moved within the same
+    /// file).
+    preview_editor: Option<(EntityId, Entity<Editor>)>,
+    /// Set instead of calling `update_preview` directly from the streaming-search batch handler,
+    /// which runs in `spawn_search`'s async task and has no `&mut Window`. Consumed (and cleared)
+    /// at the top of `render`, which does have one.
+    preview_dirty: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -428,6 +439,8 @@ impl FindInPath {
                 search_task: None,
                 selected_row: 0,
                 list_scroll_handle: UniformListScrollHandle::new(),
+                preview_editor: None,
+                preview_dirty: false,
                 _subscriptions: vec![query_editor_subscription],
             }
         });
@@ -454,6 +467,8 @@ impl FindInPath {
             self.selected_row = 0;
             self.status = SearchStatus::Idle;
             self.search_task = None;
+            self.preview_editor = None;
+            self.preview_dirty = false;
             cx.notify();
         }
     }
@@ -514,6 +529,8 @@ impl FindInPath {
         self.results = MatchList::default();
         self.selected_row = 0;
         self.status = SearchStatus::Searching;
+        self.preview_editor = None;
+        self.preview_dirty = false;
         self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(150))
@@ -567,6 +584,11 @@ impl FindInPath {
                     this.results.rebuild_rows();
                     this.status = SearchStatus::Searching;
                     this.clamp_selection();
+                    // `spawn_search` runs with no `&mut Window` (it's an async task), so the
+                    // preview editor can't be (re)built here even though the selection may have
+                    // just landed on a match for the first time. `render` (which does have a
+                    // `Window`) drains this flag on its next pass instead.
+                    this.preview_dirty = true;
                     cx.notify();
                 });
                 if update_result.is_err() {
@@ -609,15 +631,14 @@ impl FindInPath {
             self.selected_row = 0;
             return;
         }
-        if self.selected_row >= rows.len() || !matches!(rows[self.selected_row], Row::Match(_, _))
-        {
+        if self.selected_row >= rows.len() || !matches!(rows[self.selected_row], Row::Match(_, _)) {
             self.selected_row = Self::first_match_row(rows).unwrap_or(0);
         }
     }
 
     /// Move `selected_row` to the next/previous `Row::Match`, skipping over `Row::Header` rows,
     /// clamping (not wrapping) at the ends. Scrolls the list to keep the new selection visible.
-    fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
+    fn move_selection(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
         let rows = &self.results.rows;
         if rows.is_empty() {
             return;
@@ -635,43 +656,100 @@ impl FindInPath {
         self.selected_row = ix as usize;
         self.list_scroll_handle
             .scroll_to_item(self.selected_row, ScrollStrategy::Center);
+        self.update_preview(window, cx);
         cx.notify();
     }
 
-    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection(1, cx);
+    fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(1, window, cx);
     }
 
     fn select_previous(
         &mut self,
         _: &menu::SelectPrevious,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.move_selection(-1, cx);
+        self.move_selection(-1, window, cx);
     }
 
-    fn select_first(
-        &mut self,
-        _: &menu::SelectFirst,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn select_first(&mut self, _: &menu::SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = Self::first_match_row(&self.results.rows) {
             self.selected_row = ix;
             self.list_scroll_handle
                 .scroll_to_item(self.selected_row, ScrollStrategy::Center);
+            self.update_preview(window, cx);
             cx.notify();
         }
     }
 
-    fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_last(&mut self, _: &menu::SelectLast, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = Self::last_match_row(&self.results.rows) {
             self.selected_row = ix;
             self.list_scroll_handle
                 .scroll_to_item(self.selected_row, ScrollStrategy::Center);
+            self.update_preview(window, cx);
             cx.notify();
         }
+    }
+
+    /// Resolve `selected_row` to a `Row::Match` and (re)build/refresh the read-only preview
+    /// editor: a fresh `Editor::for_buffer` when the selection just moved to a different file,
+    /// otherwise the existing preview editor is reused and just re-highlighted/re-scrolled. A
+    /// selection that isn't (or is no longer) a `Row::Match` — empty results, or a `Row::Header`
+    /// — leaves any existing preview in place rather than tearing it down, so a stray
+    /// `clamp_selection` mid-stream doesn't flash the pane empty.
+    fn update_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Row::Match(group_index, match_index)) =
+            self.results.rows.get(self.selected_row).copied()
+        else {
+            return;
+        };
+        let Some(group) = self.results.groups.get(group_index) else {
+            return;
+        };
+        let Some(match_row) = group.matches.get(match_index) else {
+            return;
+        };
+        let buffer = group.buffer.clone();
+        let buffer_id = buffer.entity_id();
+        let range = match_row.range.clone();
+
+        let needs_rebuild = self
+            .preview_editor
+            .as_ref()
+            .is_none_or(|(existing_id, _)| *existing_id != buffer_id);
+        if needs_rebuild {
+            let project = self.project.clone();
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
+                editor.set_read_only(true);
+                editor
+            });
+            self.preview_editor = Some((buffer_id, editor));
+        }
+
+        let Some((_, editor)) = self.preview_editor.clone() else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let Some(multibuffer_range) = snapshot.anchor_range_in_buffer(range) else {
+                return;
+            };
+            editor.highlight_background(
+                HighlightKey::FindInPathPreview,
+                &[multibuffer_range.clone()],
+                |_, theme| theme.colors().search_match_background,
+                cx,
+            );
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::center()),
+                window,
+                cx,
+                |selections| selections.select_ranges([multibuffer_range]),
+            );
+        });
     }
 
     /// Render one row of `self.results.rows` for the `uniform_list`. Bounds-checked against
@@ -729,8 +807,9 @@ impl FindInPath {
                             .color(Color::Muted),
                     )
                     .child(Label::new(match_row.snippet.clone()).size(LabelSize::Small))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                    .on_click(cx.listener(move |this, _event, window, cx| {
                         this.selected_row = ix;
+                        this.update_preview(window, cx);
                         cx.notify();
                     }))
                     .into_any_element()
@@ -777,7 +856,11 @@ impl ModalView for FindInPath {
 }
 
 impl Render for FindInPath {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.preview_dirty {
+            self.preview_dirty = false;
+            self.update_preview(window, cx);
+        }
         v_flex()
             .key_context("FindInPath")
             .track_focus(&self.focus_handle)
@@ -832,8 +915,11 @@ impl Render for FindInPath {
                             .border_color(cx.theme().colors().border)
                             .child(self.render_results(cx)),
                     )
-                    // Preview pane — Task 6 fills this with the selected match's editor preview.
-                    .child(
+                    // Live read-only preview of the selected match, scrolled/highlighted by
+                    // `update_preview`. Falls back to a placeholder until a match is selected.
+                    .child(if let Some((_, editor)) = self.preview_editor.as_ref() {
+                        div().flex_1().h_full().child(editor.clone())
+                    } else {
                         div()
                             .flex_1()
                             .h_full()
@@ -844,8 +930,8 @@ impl Render for FindInPath {
                                 Label::new("Select a match")
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
-                            ),
-                    ),
+                            )
+                    }),
             )
             .child(h_flex().p_1().child(self.status_label()))
     }
