@@ -117,6 +117,137 @@ async fn test_toggle_regex_action_flips_search_options(cx: &mut TestAppContext) 
     });
 }
 
+#[gpui::test]
+async fn test_replace_all(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "foo foo\n" }))
+        .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle {
+        replace_enabled: true,
+    });
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("foo", window, cx);
+            });
+            find_in_path.replace_editor.update(cx, |editor, cx| {
+                editor.set_text("bar", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.replace_all(&ReplaceAll, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer("/root/a.txt", cx))
+        .await
+        .unwrap();
+    buffer.read_with(cx, |buffer, _cx| {
+        assert_eq!(buffer.text(), "bar bar\n");
+    });
+}
+
+#[gpui::test]
+async fn test_replace_next_replaces_only_selected_match(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "a.txt": "foo\n",
+            "b.txt": "foo\n",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle {
+        replace_enabled: true,
+    });
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("foo", window, cx);
+            });
+            find_in_path.replace_editor.update(cx, |editor, cx| {
+                editor.set_text("bar", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    // Two files, one match each: the modal auto-selects the first Match row (row 1, since row 0
+    // is always that group's Header) — see `test_selection_lands_on_first_match_...`.
+    let selected_path = find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(find_in_path.results.total_matches(), 2);
+        let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
+        else {
+            panic!("selected_row should be a Match row after streaming results in");
+        };
+        find_in_path.results.groups[group_index].path.clone()
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.replace_next(&ReplaceNext, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let buffer_a = project
+        .update(cx, |p, cx| p.open_local_buffer("/root/a.txt", cx))
+        .await
+        .unwrap();
+    let buffer_b = project
+        .update(cx, |p, cx| p.open_local_buffer("/root/b.txt", cx))
+        .await
+        .unwrap();
+
+    let (replaced_text, untouched_text) =
+        if selected_path.as_ref() == std::path::Path::new("root/a.txt") {
+            (buffer_a.read_with(cx, |b, _| b.text()), buffer_b.read_with(cx, |b, _| b.text()))
+        } else {
+            (buffer_b.read_with(cx, |b, _| b.text()), buffer_a.read_with(cx, |b, _| b.text()))
+        };
+    assert_eq!(
+        replaced_text, "bar\n",
+        "replace_next should replace the selected match"
+    );
+    assert_eq!(
+        untouched_text, "foo\n",
+        "replace_next should leave the other file's match untouched"
+    );
+}
+
 fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
         let state = AppState::test(cx);

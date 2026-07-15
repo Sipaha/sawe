@@ -1,4 +1,4 @@
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use editor::{
     Editor, EditorEvent, EditorSettings, HighlightKey, SelectionEffects, scroll::Autoscroll,
 };
@@ -6,7 +6,7 @@ use futures::StreamExt as _;
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     IntoElement, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement, Styled,
-    Subscription, Task, UniformListScrollHandle, Window, actions, uniform_list,
+    Subscription, Task, TaskExt as _, UniformListScrollHandle, Window, actions, uniform_list,
 };
 use language::{Anchor, Buffer, BufferSnapshot, Point};
 use project::{
@@ -25,11 +25,14 @@ use std::{
 };
 use ui::{ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, prelude::*};
 use util::paths::PathMatcher;
-use workspace::{ModalView, Workspace};
+use workspace::{
+    ModalView, Workspace,
+    searchable::{SearchToken, SearchableItem},
+};
 
 use crate::{
-    SearchOption, SearchOptions, SearchSource, ToggleCaseSensitive, ToggleRegex, ToggleWholeWord,
-    search_bar,
+    ReplaceAll, ReplaceNext, SearchOption, SearchOptions, SearchSource, ToggleCaseSensitive,
+    ToggleRegex, ToggleWholeWord, search_bar,
 };
 
 #[cfg(test)]
@@ -390,6 +393,9 @@ pub struct FindInPath {
     /// Path field for `Scope::Directory`, only rendered while that tab is selected. Its text
     /// becomes the new `Scope::Directory` payload on every edit (see `toggle`'s subscription).
     directory_editor: Entity<Editor>,
+    /// Replacement text field, rendered below the query row while `replace_enabled`. Consumed by
+    /// `replace_next`/`replace_all` via `build_replace_query`.
+    replace_editor: Entity<Editor>,
     search_options: SearchOptions,
     scope: Scope,
     member_root: Option<PathBuf>,
@@ -478,6 +484,8 @@ impl FindInPath {
                 },
             );
 
+            let replace_editor = cx.new(|cx| Editor::single_line(window, cx));
+
             Self {
                 focus_handle: cx.focus_handle(),
                 replace_enabled,
@@ -486,6 +494,7 @@ impl FindInPath {
                 included_files_editor,
                 excluded_files_editor,
                 directory_editor,
+                replace_editor,
                 search_options: SearchOptions::from_settings(
                     &EditorSettings::get_global(cx).search,
                 ),
@@ -544,6 +553,131 @@ impl FindInPath {
         self.scope = scope;
         self.update_search(cx);
         cx.notify();
+    }
+
+    /// Rebuild the current `SearchQuery` (mirroring `update_search`'s construction) with
+    /// `replace_editor`'s text applied as the replacement. Returns `None` under the same
+    /// conditions as `build_query` (empty query text, unresolved `Scope::Directory`, invalid
+    /// glob) — `replace_next`/`replace_all` treat that as a no-op.
+    fn build_replace_query(&self, cx: &App) -> Option<SearchQuery> {
+        let query_text = self.query_editor.read(cx).text(cx);
+        let include_text = self.included_files_editor.read(cx).text(cx);
+        let exclude_text = self.excluded_files_editor.read(cx).text(cx);
+        let query = build_query(
+            &query_text,
+            self.search_options,
+            &include_text,
+            &exclude_text,
+            &self.scope,
+            self.member_root.as_deref(),
+            &self.project,
+            cx,
+        )?;
+        Some(query.with_replacement(self.replace_editor.read(cx).text(cx)))
+    }
+
+    /// Replace every match across every result group. For each `FileGroup`, opens a transient
+    /// writable `Editor::for_buffer` (unlike the read-only preview editor) wrapping the group's
+    /// shared buffer entity purely to reuse the proven `SearchableItem::replace_all` edit path —
+    /// its regex-capture-aware replacement text computation lives there, not in `SearchQuery`
+    /// itself. Each `MatchRow`'s buffer-native anchor range is converted to a multibuffer range
+    /// via `anchor_range_in_buffer` before being handed to `replace_all`; the edits land on the
+    /// real buffer entity.
+    ///
+    /// Unlike `project_search`'s results editor, find_in_path never keeps an editor open on these
+    /// buffers, so nothing else necessarily holds a strong reference to them — `BufferStore` only
+    /// tracks open buffers weakly (`OpenBuffer::Complete { buffer: WeakEntity<Buffer> }`). Without
+    /// an explicit save, `self.update_search`'s reset of `self.results` (dropping the last strong
+    /// `Entity<Buffer>` handle) could silently GC an edited-but-unsaved buffer before the user
+    /// ever sees the change persisted. So every edited buffer is saved via `project.save_buffers`,
+    /// whose `Task` holds its own strong references for the duration of the write, before
+    /// `self.results` is torn down. Finishes by re-running the search so the result list reflects
+    /// the edited (and now-saved) buffers.
+    fn replace_all(&mut self, _: &ReplaceAll, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(query) = self.build_replace_query(cx) else {
+            return;
+        };
+        let project = self.project.clone();
+        let mut edited_buffers = HashSet::default();
+        for group_index in 0..self.results.groups.len() {
+            let Some(group) = self.results.groups.get(group_index) else {
+                continue;
+            };
+            if group.matches.is_empty() {
+                continue;
+            }
+            let buffer = group.buffer.clone();
+            let ranges: Vec<Range<Anchor>> =
+                group.matches.iter().map(|row| row.range.clone()).collect();
+
+            let editor =
+                cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx));
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let multibuffer_ranges: Vec<_> = ranges
+                    .iter()
+                    .filter_map(|range| snapshot.anchor_range_in_buffer(range.clone()))
+                    .collect();
+                editor.replace_all(
+                    &mut multibuffer_ranges.iter(),
+                    &query,
+                    SearchToken::default(),
+                    window,
+                    cx,
+                );
+            });
+            edited_buffers.insert(buffer);
+        }
+        if !edited_buffers.is_empty() {
+            self.project
+                .update(cx, |project, cx| project.save_buffers(edited_buffers, cx))
+                .detach_and_log_err(cx);
+        }
+        self.update_search(cx);
+    }
+
+    /// Replace only the currently selected match — a no-op if `selected_row` doesn't resolve to
+    /// a `Row::Match` (empty results, or the row is a `Header`). Uses the same transient-editor
+    /// approach as `replace_all`, scoped to the one match. Advances the selection to the next
+    /// match, then re-runs the search so the result list reflects the edit.
+    fn replace_next(&mut self, _: &ReplaceNext, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(query) = self.build_replace_query(cx) else {
+            return;
+        };
+        let Some(Row::Match(group_index, match_index)) =
+            self.results.rows.get(self.selected_row).copied()
+        else {
+            return;
+        };
+        let Some(group) = self.results.groups.get(group_index) else {
+            return;
+        };
+        let Some(match_row) = group.matches.get(match_index) else {
+            return;
+        };
+        let buffer = group.buffer.clone();
+        let range = match_row.range.clone();
+        let project = self.project.clone();
+
+        let editor = cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project), window, cx));
+        let replaced = editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let Some(multibuffer_range) = snapshot.anchor_range_in_buffer(range) else {
+                return false;
+            };
+            editor.replace(&multibuffer_range, &query, SearchToken::default(), window, cx);
+            true
+        });
+        // See `replace_all`'s doc comment: `BufferStore` only tracks open buffers weakly, so the
+        // edit must be saved before `self.update_search` can drop the last strong reference.
+        if replaced {
+            self.project
+                .update(cx, |project, cx| project.save_buffer(buffer, cx))
+                .detach_and_log_err(cx);
+        }
+
+        self.move_selection(1, window, cx);
+        self.update_search(cx);
     }
 
     fn toggle_case_sensitive(
@@ -1018,6 +1152,8 @@ impl Render for FindInPath {
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::replace_all))
+            .on_action(cx.listener(Self::replace_next))
             .child(
                 v_flex()
                     .p_2()
@@ -1049,6 +1185,40 @@ impl Render for FindInPath {
                                 self.focus_handle.clone(),
                             )),
                     )
+                    .when(self.replace_enabled, |this| {
+                        let focus_handle = self.replace_editor.read(cx).focus_handle(cx);
+                        this.child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    search_bar::input_base_styles(
+                                        cx.theme().colors().border,
+                                        |d| d,
+                                    )
+                                    .child(search_bar::render_text_input(
+                                        &self.replace_editor,
+                                        None,
+                                        cx,
+                                    )),
+                                )
+                                .child(search_bar::render_action_button(
+                                    "find-in-path-replace-button",
+                                    IconName::ReplaceNext,
+                                    None,
+                                    "Replace",
+                                    &ReplaceNext,
+                                    focus_handle.clone(),
+                                ))
+                                .child(search_bar::render_action_button(
+                                    "find-in-path-replace-button",
+                                    IconName::ReplaceAll,
+                                    None,
+                                    "Replace All",
+                                    &ReplaceAll,
+                                    focus_handle,
+                                )),
+                        )
+                    })
                     .child(self.render_scope_tabs(cx))
                     .child(
                         h_flex()
