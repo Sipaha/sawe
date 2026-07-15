@@ -677,7 +677,7 @@
       "ctrl-alt-_": ["workspace::DecreaseOpenDocksSize", { "px": 0 }],
       "ctrl-alt-+": ["workspace::IncreaseOpenDocksSize", { "px": 0 }],
       "shift-find": "pane::DeploySearch",
-      "ctrl-shift-f": "pane::DeploySearch",
+      "ctrl-shift-f": "find_in_path::Toggle",
       "ctrl-shift-h": ["pane::DeploySearch", { "replace_enabled": true }],
       "ctrl-shift-t": "pane::ReopenClosedItem",
       "ctrl-k ctrl-s": "zed::OpenKeymap",
@@ -714,7 +714,7 @@
       "ctrl-shift-x": "zed::Extensions",
       // All task parameters are captured and unchanged between reruns by default.
       // Use the `"reevaluate_context"` parameter to control this.
-      "ctrl-shift-r": ["task::Rerun", { "reevaluate_context": false }],
+      "ctrl-shift-r": ["find_in_path::Toggle", { "replace_enabled": true }],
       "ctrl-alt-r": "task::Rerun",
       "alt-t": "task::Rerun",
       "alt-shift-t": "task::Spawn",
@@ -1204,6 +1204,15 @@
       "ctrl-k": "pane::SplitUp",
       "ctrl-h": "pane::SplitLeft",
       "ctrl-l": "pane::SplitRight",
+    },
+  },
+  {
+    "context": "FindInPath || (FindInPath > Editor)",
+    "bindings": {
+      "escape": "menu::Cancel",
+      "enter": "menu::Confirm",
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
     },
   },
   {
