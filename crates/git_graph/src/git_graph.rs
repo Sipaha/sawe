@@ -178,10 +178,13 @@ use workspace::{
     item::{Item, ItemEvent, TabTooltipContent},
 };
 
-const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
+const COMMIT_CIRCLE_RADIUS: Pixels = px(3.0);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
-const LANE_WIDTH: Pixels = px(16.0);
-const LEFT_PADDING: Pixels = px(12.0);
+// Tight IDEA-style lane spacing: pack several branch lanes into a narrow column
+// so the graph stays compact and the description sits close to it, instead of a
+// wide graph column shoving the message text far to the right.
+const LANE_WIDTH: Pixels = px(10.0);
+const LEFT_PADDING: Pixels = px(8.0);
 // The commit-graph column has a fixed (non-user-resizable) width, IDEA-style:
 // sized to the number of lanes in the loaded history, but always at least
 // `MIN_GRAPH_LANES` (so even a linear history reserves sensible space) and
@@ -195,6 +198,14 @@ const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
 // Extra vertical breathing room added to the UI line height when computing
 // the git graph's row height, so commit dots and lines have space around them.
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
+
+/// Whether a search string should be treated as a commit-hash lookup rather
+/// than a message grep: all-hex and at least git's default short-hash length
+/// (7), so ordinary words — even the odd 4-char hex word like `face`/`dead` —
+/// still search commit messages.
+fn is_hash_like(text: &str) -> bool {
+    (7..=40).contains(&text.len()) && text.chars().all(|c| c.is_ascii_hexdigit())
+}
 
 struct CopiedState {
     copied_at: Option<Instant>,
@@ -1274,7 +1285,25 @@ impl GitGraph {
     /// toggle click so the active query stays in sync with UI state.
     fn update_query_filter(&mut self, cx: &mut Context<Self>) {
         let text = self.search_state.editor.read(cx).text(cx);
-        let query = if text.is_empty() {
+        let trimmed = text.trim();
+
+        // A hex string (>= 7 chars, git's short-hash length) is a commit-hash
+        // lookup, not a message grep: `git --grep` never matches a SHA, so we
+        // instead jump to and highlight the matching commit. This keeps commits
+        // findable by hash even though the hash column was removed from the
+        // table. Message search still works for any non-hash text.
+        if is_hash_like(trimmed) {
+            // Don't also grep — that would empty the list.
+            if self.filters.query.is_some() {
+                self.set_query_filter(None, cx);
+            }
+            if let Some(oid) = self.find_loaded_commit_by_prefix(trimmed) {
+                self.select_commit_by_sha(oid, cx);
+            }
+            return;
+        }
+
+        let query = if trimmed.is_empty() {
             None
         } else {
             Some(filters::QueryFilter {
@@ -1285,6 +1314,18 @@ impl GitGraph {
             })
         };
         self.set_query_filter(query, cx);
+    }
+
+    /// First loaded commit whose full SHA starts with `prefix` (case-insensitive
+    /// hex). Used to resolve a hash typed into the search box to a concrete
+    /// commit to select. Only loaded commits are matched — a hash for a commit
+    /// below the currently-fetched window won't resolve here.
+    fn find_loaded_commit_by_prefix(&self, prefix: &str) -> Option<Oid> {
+        let needle = prefix.to_ascii_lowercase();
+        self.graph_data.commits.iter().find_map(|commit| {
+            let oid = commit.data.sha;
+            oid.to_string().starts_with(&needle).then_some(oid)
+        })
     }
 
     pub fn set_all_refs(&mut self, all_refs: bool, cx: &mut Context<Self>) {
@@ -1509,21 +1550,21 @@ impl GitGraph {
 
         let table_interaction_state = cx.new(|cx| TableInteractionState::new(cx));
 
-        // The table holds only the four text columns (Description / Date /
-        // Author / Commit); they're user-resizable. The commit-graph column is
-        // *not* a table column — it's rendered separately at a fixed width to
-        // the left of the table (IDEA-style), so it has no resize handle.
+        // The table holds only the three text columns (Description / Date /
+        // Author); they're user-resizable. The commit hash is intentionally not
+        // a column here (it's noise while scanning the graph — it lives in the
+        // detail panel on click, and search-by-hash is server-side). The
+        // commit-graph column is *not* a table column — it's rendered separately
+        // at a fixed width to the left of the table (IDEA-style), no resize handle.
         let column_widths = cx.new(|_cx| {
             RedistributableColumnsState::new(
-                4,
+                3,
                 vec![
-                    DefiniteLength::Fraction(0.72),
-                    DefiniteLength::Fraction(0.12),
-                    DefiniteLength::Fraction(0.1),
-                    DefiniteLength::Fraction(0.06),
+                    DefiniteLength::Fraction(0.74),
+                    DefiniteLength::Fraction(0.13),
+                    DefiniteLength::Fraction(0.13),
                 ],
                 vec![
-                    TableResizeBehavior::Resizable,
                     TableResizeBehavior::Resizable,
                     TableResizeBehavior::Resizable,
                     TableResizeBehavior::Resizable,
@@ -1931,7 +1972,6 @@ impl GitGraph {
                         .clone()
                 });
 
-                let short_sha = commit.data.sha.display_short();
                 let mut formatted_time = String::new();
                 let subject: SharedString;
                 let author_name: SharedString;
@@ -2079,7 +2119,6 @@ impl GitGraph {
                         .into_any_element(),
                     column_label(formatted_time.into()),
                     column_label(author_name),
-                    column_label(short_sha.into()),
                 ]
             })
             .collect()
@@ -3440,11 +3479,8 @@ impl Render for GitGraph {
                                                 Label::new("Author")
                                                     .color(Color::Muted)
                                                     .into_any_element(),
-                                                Label::new("Commit")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
                                             ],
-                                        4,
+                                        3,
                                     ),
                                     header_context,
                                     Some(header_resize_info),
@@ -3478,7 +3514,7 @@ impl Render for GitGraph {
                                     }
                                 }));
 
-                            let commits_table = Table::new(4)
+                            let commits_table = Table::new(3)
                                 .interactable(&self.table_interaction_state)
                                 .hide_row_borders()
                                 .hide_row_hover()
@@ -4705,6 +4741,22 @@ mod persistence {
 mod tests {
     use super::*;
     use anyhow::{Context, Result, bail};
+
+    #[test]
+    fn test_is_hash_like() {
+        // Full and short (>= 7) hex → hash lookup.
+        assert!(is_hash_like("9509ee5"));
+        assert!(is_hash_like("63ecdb1a2f"));
+        assert!(is_hash_like(&"a".repeat(40)));
+        assert!(is_hash_like("ABCDEF0")); // case-insensitive
+        // Too short, over-long, or non-hex → treated as a message grep.
+        assert!(!is_hash_like("face")); // 4-char hex word stays a message search
+        assert!(!is_hash_like("abc")); // < 7
+        assert!(!is_hash_like("")); //
+        assert!(!is_hash_like(&"a".repeat(41))); // > 40
+        assert!(!is_hash_like("fix bug")); // non-hex
+        assert!(!is_hash_like("9509ee5z")); // trailing non-hex
+    }
     use collections::{HashMap, HashSet};
     use fs::FakeFs;
     use git::Oid;

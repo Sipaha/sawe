@@ -777,6 +777,17 @@ Deliberately out of scope (there was no data / the ask didn't need it): per-file
 
 How to apply: when you need a directory tree over `RepoPath`-bearing leaves, this local builder is the lightweight template; only reach for extracting the git-panel one if the leaf really needs staging/section semantics. Plan: `docs/superpowers/plans/2026-07-15-idea-commit-changed-files-tree.md`.
 
+### 56. Git-graph is tuned IDEA-tight, drops its hash column, and makes the search box find commits by hash
+
+What: three coupled changes to the dedicated `crates/git_graph` panel (the columned Graph | Description | Date | Author log with colored lane lines), all in `git_graph.rs`:
+1. **Tighter lanes.** `LANE_WIDTH` 16→10, `LEFT_PADDING` 12→8, `COMMIT_CIRCLE_RADIUS` 3.5→3.0 — the graph column (`graph_column_width` = `LANE_WIDTH * lanes + LEFT_PADDING*2`, min `MIN_GRAPH_LANES`=4) is now compact, so the description text sits close to the graph instead of being shoved right. Lane *assignment* is pixel-agnostic; only these x-mapping constants changed. Lines were already bezier-curved (`builder.curve_to` for merge/checkout) — untouched.
+2. **No hash column.** The 4th table column (short SHA) is gone: `render_table_rows` drops the `short_sha` cell, header drops "Commit", `Table::new(4)`→`(3)`, and `RedistributableColumnsState::new(4, …)`→`(3, …)` with the freed width redistributed. The full/short SHA still lives in the commit **detail panel** on select (`# <short>`), so the hash is one click away, not column noise while scanning.
+3. **Search-by-hash.** Removing the column would strand hash lookups (the search box only ever built `--grep=<text>`, which matches commit *messages* — a SHA matched nothing and the list hung empty). `update_query_filter` now detects a hex query ≥7 chars (`is_hash_like`) and, instead of grepping, resolves it against loaded commits by SHA prefix (`find_loaded_commit_by_prefix`) and `select_commit_by_sha` — jumping to + highlighting the matching commit (IDEA "find by hash"), list unfiltered. Non-hash text still greps messages.
+
+Why: the maintainer compared our graph to IDEA's and wanted it visually tighter (reference screenshot: ~4 lanes packed into a narrow column with the message right beside them), the per-row hash column removed as scanning noise, but — explicitly — search-by-hash kept working. It didn't work before (pre-existing: `--grep` on a SHA), so "keep it working" meant "make it work."
+
+Limits (accepted): hash search resolves only among **loaded** commits — a SHA for a commit below the fetched window won't jump (no `git rev-parse` round-trip). The `>= 7` hex threshold is deliberate so 4-char hex words (`face`, `dead`) still search messages. True *per-row* огибание (each row's text starting at that row's own lane extent, vs one global fixed graph-column width) was NOT done — IDEA itself uses a fixed graph column, and our layout already matches that; tightening `LANE_WIDTH` was the real lever. Guard: `git_graph::tests::test_is_hash_like`. Plan: `docs/superpowers/plans/2026-07-15-idea-git-graph-polish.md`.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.
