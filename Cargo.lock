@@ -16974,6 +16974,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "solutions",
  "theme",
  "theme_settings",
  "tracing",
