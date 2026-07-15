@@ -572,3 +572,99 @@ async fn test_selecting_match_builds_and_reuses_preview_editor(cx: &mut TestAppC
         );
     });
 }
+
+#[gpui::test]
+async fn test_streaming_batch_without_selection_change_does_not_redirty_preview(
+    cx: &mut TestAppContext,
+) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "a.txt": "token\ntoken\n",
+            "b.txt": "token\n",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    let query = project.read_with(cx, |_project, cx| {
+        super::build_query(
+            "token",
+            SearchOptions::NONE,
+            "",
+            "",
+            &Scope::Solution,
+            None,
+            &project,
+            cx,
+        )
+        .expect("non-empty query text with a valid scope should build a query")
+    });
+
+    find_in_path.update(cx, |find_in_path, cx| {
+        find_in_path.spawn_search(query, cx);
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    // `spawn_search`'s batch handler already ran `clamp_selection` + set `preview_dirty` for the
+    // batch that first landed the selection on a match, and `run_until_parked` drove a `render`
+    // pass that consumed the flag via `update_preview`. Capture the resulting `previewed_match`
+    // identity.
+    let target_after_first_batch = find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert!(
+            !find_in_path.preview_dirty,
+            "the render pass driven by run_until_parked should have consumed preview_dirty"
+        );
+        find_in_path
+            .previewed_match
+            .clone()
+            .expect("update_preview should have recorded the displayed match")
+    });
+
+    // Simulate a later streaming batch that grows `results.rows` without moving
+    // `selected_row` — this is exactly what `clamp_selection` does when the current selection is
+    // already a valid `Row::Match`, the case the fix targets.
+    find_in_path.update(cx, |find_in_path, _cx| {
+        let changed = find_in_path.clamp_selection();
+        assert!(
+            !changed,
+            "clamp_selection should report no change when selected_row already points at a valid match"
+        );
+    });
+
+    // The batch handler only sets `preview_dirty` when `clamp_selection` reports a change, so a
+    // no-op reclamp must leave it false — no re-render-triggered `update_preview` call, so the
+    // preview's scroll position is left alone instead of snapping back to center.
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert!(
+            !find_in_path.preview_dirty,
+            "a streaming batch that doesn't move the selection must not re-dirty the preview"
+        );
+    });
+
+    // And even if `update_preview` were invoked again anyway (e.g. a stray render pass), it must
+    // be a no-op against the same match: `previewed_match` stays exactly as it was.
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.update_preview(window, cx);
+            assert_eq!(
+                find_in_path.previewed_match,
+                Some(target_after_first_batch),
+                "update_preview should be idempotent when the selected match hasn't changed"
+            );
+        });
+    });
+}

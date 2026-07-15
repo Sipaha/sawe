@@ -392,6 +392,12 @@ pub struct FindInPath {
     /// which runs in `spawn_search`'s async task and has no `&mut Window`. Consumed (and cleared)
     /// at the top of `render`, which does have one.
     preview_dirty: bool,
+    /// Identity of the match currently shown in `preview_editor` (previewed buffer's `EntityId` +
+    /// the match's anchor range), so `update_preview` can no-op when the selection is re-resolved
+    /// to the same match it already displays — e.g. a streaming batch that runs `clamp_selection`
+    /// without moving `selected_row`. Without this, every batch would re-highlight and
+    /// re-autoscroll the preview even though nothing the user is looking at changed.
+    previewed_match: Option<(EntityId, Range<Anchor>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -441,6 +447,7 @@ impl FindInPath {
                 list_scroll_handle: UniformListScrollHandle::new(),
                 preview_editor: None,
                 preview_dirty: false,
+                previewed_match: None,
                 _subscriptions: vec![query_editor_subscription],
             }
         });
@@ -469,6 +476,7 @@ impl FindInPath {
             self.search_task = None;
             self.preview_editor = None;
             self.preview_dirty = false;
+            self.previewed_match = None;
             cx.notify();
         }
     }
@@ -531,6 +539,7 @@ impl FindInPath {
         self.status = SearchStatus::Searching;
         self.preview_editor = None;
         self.preview_dirty = false;
+        self.previewed_match = None;
         self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(150))
@@ -583,12 +592,14 @@ impl FindInPath {
                 let update_result = this.update(cx, |this, cx| {
                     this.results.rebuild_rows();
                     this.status = SearchStatus::Searching;
-                    this.clamp_selection();
-                    // `spawn_search` runs with no `&mut Window` (it's an async task), so the
-                    // preview editor can't be (re)built here even though the selection may have
-                    // just landed on a match for the first time. `render` (which does have a
-                    // `Window`) drains this flag on its next pass instead.
-                    this.preview_dirty = true;
+                    // Only mark the preview dirty when this batch actually moved the selection
+                    // (e.g. the first batch landing on the first match). A later batch that
+                    // `clamp_selection` leaves untouched must not re-trigger `update_preview` —
+                    // that would snap the preview's scroll back to center on every streamed
+                    // batch, fighting a user who has manually scrolled the preview pane.
+                    if this.clamp_selection() {
+                        this.preview_dirty = true;
+                    }
                     cx.notify();
                 });
                 if update_result.is_err() {
@@ -624,16 +635,20 @@ impl FindInPath {
     /// Called after every `rebuild_rows()` (streaming search grows `rows` batch by batch) so
     /// `selected_row` always lands on a `Row::Match`, never a `Row::Header` or an index past the
     /// end. Leaves an already-valid `Match` selection untouched, so incoming batches don't yank
-    /// the highlight away from a row the user is looking at.
-    fn clamp_selection(&mut self) {
+    /// the highlight away from a row the user is looking at. Returns whether `selected_row`
+    /// actually changed, so callers (the streaming batch handler) can tell a genuine
+    /// first-match-lands-in-view transition from a no-op reclamp.
+    fn clamp_selection(&mut self) -> bool {
+        let previous = self.selected_row;
         let rows = &self.results.rows;
         if rows.is_empty() {
             self.selected_row = 0;
-            return;
-        }
-        if self.selected_row >= rows.len() || !matches!(rows[self.selected_row], Row::Match(_, _)) {
+        } else if self.selected_row >= rows.len()
+            || !matches!(rows[self.selected_row], Row::Match(_, _))
+        {
             self.selected_row = Self::first_match_row(rows).unwrap_or(0);
         }
+        self.selected_row != previous
     }
 
     /// Move `selected_row` to the next/previous `Row::Match`, skipping over `Row::Header` rows,
@@ -699,6 +714,11 @@ impl FindInPath {
     /// selection that isn't (or is no longer) a `Row::Match` — empty results, or a `Row::Header`
     /// — leaves any existing preview in place rather than tearing it down, so a stray
     /// `clamp_selection` mid-stream doesn't flash the pane empty.
+    ///
+    /// Early-returns before touching the editor at all when the resolved match is identical to
+    /// `previewed_match` — otherwise every call (including ones triggered by a streaming batch
+    /// that didn't move the selection) would re-highlight and re-autoscroll the preview, snapping
+    /// a user's manual scroll back to center.
     fn update_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Row::Match(group_index, match_index)) =
             self.results.rows.get(self.selected_row).copied()
@@ -714,6 +734,11 @@ impl FindInPath {
         let buffer = group.buffer.clone();
         let buffer_id = buffer.entity_id();
         let range = match_row.range.clone();
+
+        let target = (buffer_id, range.clone());
+        if self.previewed_match.as_ref() == Some(&target) {
+            return;
+        }
 
         let needs_rebuild = self
             .preview_editor
@@ -732,10 +757,10 @@ impl FindInPath {
         let Some((_, editor)) = self.preview_editor.clone() else {
             return;
         };
-        editor.update(cx, |editor, cx| {
+        let displayed = editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let Some(multibuffer_range) = snapshot.anchor_range_in_buffer(range) else {
-                return;
+                return false;
             };
             editor.highlight_background(
                 HighlightKey::FindInPathPreview,
@@ -749,7 +774,15 @@ impl FindInPath {
                 cx,
                 |selections| selections.select_ranges([multibuffer_range]),
             );
+            true
         });
+        // Only remember this match as "displayed" once it's actually been highlighted/scrolled to
+        // — if `anchor_range_in_buffer` failed to resolve, leave `previewed_match` as-is so a
+        // later call (e.g. once the buffer has caught up) still retries instead of being
+        // short-circuited by the identity check above.
+        if displayed {
+            self.previewed_match = Some(target);
+        }
     }
 
     /// Render one row of `self.results.rows` for the `uniform_list`. Bounds-checked against
