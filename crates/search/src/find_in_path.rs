@@ -192,7 +192,10 @@ fn parse_glob_patterns(text: &str) -> Vec<String> {
 ///
 /// `scope`'s include patterns are merged in front of `include_text`'s user-typed patterns so an
 /// empty `Scope::Solution` leaves the user's own include filter untouched. Returns `None` when the
-/// query text is empty or when either glob list fails to parse.
+/// query text is empty, when either glob list fails to parse, or when `scope` is `Directory` but
+/// resolves to no include patterns (empty/whitespace path, or a path outside every visible
+/// worktree) — an empty include list otherwise means "match everything", which would silently
+/// widen a Directory-scoped search to the whole Solution instead of matching nothing.
 fn build_query(
     query_text: &str,
     options: SearchOptions,
@@ -209,7 +212,11 @@ fn build_query(
 
     let path_style = project.read(cx).path_style(cx);
 
-    let mut include_patterns = include_patterns_for_scope(scope, member_root, project, cx);
+    let scope_patterns = include_patterns_for_scope(scope, member_root, project, cx);
+    if matches!(scope, Scope::Directory(_)) && scope_patterns.is_empty() {
+        return None;
+    }
+    let mut include_patterns = scope_patterns;
     include_patterns.extend(parse_glob_patterns(include_text));
     let included_files = PathMatcher::new(&include_patterns, path_style).ok()?;
 

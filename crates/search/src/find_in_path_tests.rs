@@ -779,6 +779,155 @@ async fn test_set_scope_project_falls_back_to_first_worktree(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+async fn test_build_query_empty_or_unresolved_directory_scope_yields_none(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/alpha", json!({ "x.rs": "token\n" })).await;
+    let project = Project::test(fs, ["/alpha".as_ref()], cx).await;
+
+    project.read_with(cx, |_project, cx| {
+        assert!(
+            super::build_query(
+                "token",
+                SearchOptions::NONE,
+                "",
+                "",
+                &Scope::Directory(PathBuf::from("")),
+                None,
+                &project,
+                cx,
+            )
+            .is_none(),
+            "an empty Scope::Directory path should build no query rather than falling back to \
+             an unrestricted (Solution-wide) search"
+        );
+
+        assert!(
+            super::build_query(
+                "token",
+                SearchOptions::NONE,
+                "",
+                "",
+                &Scope::Directory(PathBuf::from("/nonexistent")),
+                None,
+                &project,
+                cx,
+            )
+            .is_none(),
+            "a Scope::Directory path that matches no visible worktree should build no query"
+        );
+
+        assert!(
+            super::build_query(
+                "token",
+                SearchOptions::NONE,
+                "",
+                "",
+                &Scope::Directory(PathBuf::from("/alpha")),
+                None,
+                &project,
+                cx,
+            )
+            .is_some(),
+            "a Scope::Directory path that resolves to a real worktree should still build a query"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_set_scope_empty_directory_shows_no_results(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/alpha", json!({ "x.rs": "token\n" })).await;
+    fs.insert_tree("/beta", json!({ "x.rs": "token\n" })).await;
+    let project = Project::test(fs, ["/alpha".as_ref(), "/beta".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            2,
+            "Scope::Solution (the default) should search both worktrees"
+        );
+    });
+
+    // Simulates a user clicking the "Directory" tab, whose path field starts out empty.
+    cx.update(|_window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.set_scope(Scope::Directory(PathBuf::from("")), cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            0,
+            "an empty Scope::Directory path must show no results, not silently widen to the \
+             whole Solution"
+        );
+        assert_eq!(find_in_path.status, SearchStatus::Idle);
+    });
+
+    // Typing a path that matches no visible worktree should behave the same way.
+    cx.update(|_window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.set_scope(Scope::Directory(PathBuf::from("/nonexistent")), cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            0,
+            "a Scope::Directory path outside every visible worktree must show no results"
+        );
+        assert_eq!(find_in_path.status, SearchStatus::Idle);
+    });
+
+    // Recovering to a valid directory should restore restricted results.
+    cx.update(|_window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.set_scope(Scope::Directory(PathBuf::from("/alpha")), cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            1,
+            "typing a valid directory afterward should resume restricting results to it"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_include_mask_filters_results(cx: &mut TestAppContext) {
     let _app_state = init_test(cx);
     let fs = FakeFs::new(cx.executor());
