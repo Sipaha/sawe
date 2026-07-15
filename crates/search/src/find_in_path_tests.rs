@@ -370,3 +370,87 @@ async fn test_spawn_search_streams_grouped_results(cx: &mut TestAppContext) {
         assert!(find_in_path.search_task.is_none());
     });
 }
+
+#[gpui::test]
+async fn test_selection_lands_on_first_match_and_select_next_skips_header(
+    cx: &mut TestAppContext,
+) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "a.txt": "token\ntoken\n",
+            "b.txt": "token\n",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    let query = project.read_with(cx, |_project, cx| {
+        super::build_query(
+            "token",
+            SearchOptions::NONE,
+            "",
+            "",
+            &Scope::Solution,
+            None,
+            &project,
+            cx,
+        )
+        .expect("non-empty query text with a valid scope should build a query")
+    });
+
+    find_in_path.update(cx, |find_in_path, cx| {
+        find_in_path.spawn_search(query, cx);
+    });
+
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    let first_selected_row = find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(find_in_path.results.file_count(), 2);
+        // `rebuild_rows` always emits `Header(0)` first, so the earliest possible `Match` row
+        // (whichever group streamed in first) is row 1.
+        assert_eq!(
+            find_in_path.selected_row, 1,
+            "selection should reset onto the first Match row (row 0 is always a Header)"
+        );
+        assert!(
+            matches!(
+                find_in_path.results.rows.get(find_in_path.selected_row),
+                Some(Row::Match(_, _))
+            ),
+            "selected_row should land on a Match row, not a Header, after streaming results in"
+        );
+        find_in_path.selected_row
+    });
+
+    // `menu::SelectNext` dispatches to the currently focused node (the query editor, focused by
+    // the modal layer on open) and bubbles up to the `on_action` handler on the modal root.
+    cx.dispatch_action(menu::SelectNext);
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert!(
+            find_in_path.selected_row > first_selected_row,
+            "SelectNext should move the selection forward"
+        );
+        assert!(
+            matches!(
+                find_in_path.results.rows.get(find_in_path.selected_row),
+                Some(Row::Match(_, _))
+            ),
+            "SelectNext should land on a Match row, skipping any intervening Header row"
+        );
+    });
+}

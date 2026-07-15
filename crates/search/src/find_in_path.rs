@@ -2,8 +2,9 @@ use collections::HashMap;
 use editor::{Editor, EditorEvent, EditorSettings};
 use futures::StreamExt as _;
 use gpui::{
-    App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Render, Styled, Subscription, Task, Window, actions,
+    AnyElement, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, IntoElement, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement,
+    Styled, Subscription, Task, UniformListScrollHandle, Window, actions, uniform_list,
 };
 use language::{Anchor, Buffer, BufferSnapshot, Point};
 use project::{
@@ -378,6 +379,8 @@ pub struct FindInPath {
     results: MatchList,
     status: SearchStatus,
     search_task: Option<Task<()>>,
+    selected_row: usize,
+    list_scroll_handle: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -423,6 +426,8 @@ impl FindInPath {
                 results: MatchList::default(),
                 status: SearchStatus::Idle,
                 search_task: None,
+                selected_row: 0,
+                list_scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: vec![query_editor_subscription],
             }
         });
@@ -446,6 +451,7 @@ impl FindInPath {
             self.spawn_search(query, cx);
         } else {
             self.results = MatchList::default();
+            self.selected_row = 0;
             self.status = SearchStatus::Idle;
             self.search_task = None;
             cx.notify();
@@ -506,6 +512,7 @@ impl FindInPath {
     fn spawn_search(&mut self, query: SearchQuery, cx: &mut Context<Self>) {
         let project = self.project.clone();
         self.results = MatchList::default();
+        self.selected_row = 0;
         self.status = SearchStatus::Searching;
         self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -559,6 +566,7 @@ impl FindInPath {
                 let update_result = this.update(cx, |this, cx| {
                     this.results.rebuild_rows();
                     this.status = SearchStatus::Searching;
+                    this.clamp_selection();
                     cx.notify();
                 });
                 if update_result.is_err() {
@@ -579,6 +587,172 @@ impl FindInPath {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Index of the first `Row::Match` in `rows`, or `None` if `rows` has no matches (e.g. it's
+    /// empty, or every group somehow ended up with zero matches).
+    fn first_match_row(rows: &[Row]) -> Option<usize> {
+        rows.iter().position(|row| matches!(row, Row::Match(_, _)))
+    }
+
+    fn last_match_row(rows: &[Row]) -> Option<usize> {
+        rows.iter().rposition(|row| matches!(row, Row::Match(_, _)))
+    }
+
+    /// Called after every `rebuild_rows()` (streaming search grows `rows` batch by batch) so
+    /// `selected_row` always lands on a `Row::Match`, never a `Row::Header` or an index past the
+    /// end. Leaves an already-valid `Match` selection untouched, so incoming batches don't yank
+    /// the highlight away from a row the user is looking at.
+    fn clamp_selection(&mut self) {
+        let rows = &self.results.rows;
+        if rows.is_empty() {
+            self.selected_row = 0;
+            return;
+        }
+        if self.selected_row >= rows.len() || !matches!(rows[self.selected_row], Row::Match(_, _))
+        {
+            self.selected_row = Self::first_match_row(rows).unwrap_or(0);
+        }
+    }
+
+    /// Move `selected_row` to the next/previous `Row::Match`, skipping over `Row::Header` rows,
+    /// clamping (not wrapping) at the ends. Scrolls the list to keep the new selection visible.
+    fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let rows = &self.results.rows;
+        if rows.is_empty() {
+            return;
+        }
+        let mut ix = self.selected_row.min(rows.len() - 1) as isize;
+        loop {
+            ix += direction;
+            if ix < 0 || ix >= rows.len() as isize {
+                return;
+            }
+            if matches!(rows[ix as usize], Row::Match(_, _)) {
+                break;
+            }
+        }
+        self.selected_row = ix as usize;
+        self.list_scroll_handle
+            .scroll_to_item(self.selected_row, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(1, cx);
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(-1, cx);
+    }
+
+    fn select_first(
+        &mut self,
+        _: &menu::SelectFirst,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = Self::first_match_row(&self.results.rows) {
+            self.selected_row = ix;
+            self.list_scroll_handle
+                .scroll_to_item(self.selected_row, ScrollStrategy::Center);
+            cx.notify();
+        }
+    }
+
+    fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = Self::last_match_row(&self.results.rows) {
+            self.selected_row = ix;
+            self.list_scroll_handle
+                .scroll_to_item(self.selected_row, ScrollStrategy::Center);
+            cx.notify();
+        }
+    }
+
+    /// Render one row of `self.results.rows` for the `uniform_list`. Bounds-checked against
+    /// `groups`/`matches` since streaming updates and click closures can race a row's index
+    /// against a shrinking/rebuilt result set — an out-of-range row renders as an empty element
+    /// rather than panicking.
+    fn render_row(&self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.results.rows.get(ix).copied() else {
+            return div().into_any_element();
+        };
+        match row {
+            Row::Header(group_index) => {
+                let Some(group) = self.results.groups.get(group_index) else {
+                    return div().into_any_element();
+                };
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .child(
+                        Label::new(group.path.to_string_lossy().into_owned())
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        Label::new(group.matches.len().to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+            Row::Match(group_index, match_index) => {
+                let Some(group) = self.results.groups.get(group_index) else {
+                    return div().into_any_element();
+                };
+                let Some(match_row) = group.matches.get(match_index) else {
+                    return div().into_any_element();
+                };
+                let selected = ix == self.selected_row;
+                h_flex()
+                    .id(("find-in-path-row", ix))
+                    .w_full()
+                    .pl_6()
+                    .pr_2()
+                    .py_0p5()
+                    .gap_2()
+                    .cursor_pointer()
+                    .when(selected, |this| {
+                        this.bg(cx.theme().colors().element_selected)
+                    })
+                    .child(
+                        Label::new((match_row.line + 1).to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(match_row.snippet.clone()).size(LabelSize::Small))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.selected_row = ix;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// The left pane of the results split: the flattened `MatchList` row list, one file-header
+    /// row per group followed by its indented match rows.
+    fn render_results(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let row_count = self.results.rows.len();
+        uniform_list(
+            "find-in-path-results",
+            row_count,
+            cx.processor(move |this, range: Range<usize>, window, cx| {
+                range
+                    .map(|ix| this.render_row(ix, window, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(&self.list_scroll_handle)
+        .size_full()
     }
 }
 
@@ -616,6 +790,10 @@ impl Render for FindInPath {
             .on_action(cx.listener(Self::toggle_case_sensitive))
             .on_action(cx.listener(Self::toggle_whole_word))
             .on_action(cx.listener(Self::toggle_regex))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
             .child(
                 h_flex()
                     .p_2()
@@ -640,8 +818,35 @@ impl Render for FindInPath {
                         self.focus_handle.clone(),
                     )),
             )
-            // Results area — Task 5 replaces this with the flattened `MatchList` row list.
-            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        div()
+                            .w(relative(0.4))
+                            .h_full()
+                            .border_r_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(self.render_results(cx)),
+                    )
+                    // Preview pane — Task 6 fills this with the selected match's editor preview.
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Label::new("Select a match")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    ),
+            )
             .child(h_flex().p_1().child(self.status_label()))
     }
 }
