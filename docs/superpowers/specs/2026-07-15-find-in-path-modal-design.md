@@ -1,7 +1,7 @@
 # Find in Path modal — design spec
 
 **Date:** 2026-07-15
-**Status:** Approved (design), pending implementation plan
+**Status:** Implemented on branch `find-in-path` (pending merge to main)
 **Author:** supervisor session `gf2kf7wn` (c02)
 **Feature:** IntelliJ-IDEA-style "Find in Path" centered modal, replacing the pane-tab
 project search on `ctrl-shift-f` (and `ctrl-shift-r` for replace).

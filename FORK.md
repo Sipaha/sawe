@@ -123,6 +123,11 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/git_ui/src/repository_selector.rs` | **(decision #27 follow-up)** Repo switcher list scoped to the active member's `local_path` (fallback: all repos for non-solution projects). | `git_ui` / `solutions` |
 | `crates/git_ui/src/providers.rs`, `crates/solution_git/src/solution_git.rs` | **(decision #27 follow-up)** `SolutionPanelProvider` (solution-wide commit) deleted: removed the trait re-export/registry slot/setter+getter and the `solution_git` registration block. Deleted files: `git_ui/src/providers/solution_panel.rs`, `solution_git/src/commit.rs` (+ its `solution.git.commit_all` MCP tool). PUSH/UPDATE providers + dashboard kept. | `git_ui` / `solution_git` |
 | `crates/solution_agent/src/store/supervisor_engine.rs` | **New (god-object refactor Tier 3).** Partial-class split of `SolutionAgentStore`: the ~36 observer/supervisor methods (judge/auditor spawn + verdict application `apply_verdict{,_authenticated}` / `apply_audit_verdict{,_authenticated}` / `on_judge_failed` / `apply_usage_limit_stop`, the `tick_supervisor` + `tick_stuck_sessions` watchdogs carrying the #5–#9 hardening, supervision state/nudge glue) plus the `JudgeHandle` / `VerdictAuth` types relocated VERBATIM out of `store.rs` (10161→7998 lines) into a `mod supervisor_engine` child (mirrors `store/queue.rs`). Same idiom as queue: `impl SolutionAgentStore` blocks, `self`/`Context<Self>`/fields unchanged — source text split, not state ownership. | `solution_agent` |
+| `crates/search/src/find_in_path.rs` | **New.** IDEA-style Find-in-Path modal (see decision #53) — bespoke `ModalView`: header input + option toggles + scope tabs (In Solution / In Project / Directory) + file mask fields, grouped streaming results list, live read-only preview editor, Replace/Replace All. | `search` |
+| `crates/search/src/find_in_path_tests.rs` | **New.** Unit tests for `find_in_path.rs`. | `search` |
+| `crates/search/src/search.rs` | Registers `find_in_path::init` alongside the existing `project_search` registration. | `search` |
+| `crates/search/Cargo.toml` | Adds `schemars` (modal action/settings schema) + `solutions` (Solution/member scope resolution for the scope tabs) deps. | `search` |
+| `crates/editor/src/display_map.rs` | Adds `HighlightKey::FindInPathPreview` variant used to highlight the active match in the Find-in-Path preview editor. | `search` |
 
 Locked rebrand identifiers (display name, bundle ids, URL scheme, config dirs, etc.) — see `.rules` § "Locked rebrand identifiers". Changing any requires explicit approval — they're cross-referenced in spec docs.
 
@@ -737,6 +742,20 @@ by prefix — it must be *re-keyed* instead: `remap_repo_hashed_tables` recomput
 `repo_hash` lives in one place (`crates/git/src/git.rs`) precisely so the reconcile
 and the production writers hash identically; a second textual copy of that
 `DefaultHasher` one-liner would compile and silently stop matching.
+
+### 53. IDEA-style Find-in-Path modal is a bespoke `ModalView` in `crates/search`, not a re-shell of `ProjectSearchView`
+
+What: `crates/search/src/find_in_path.rs` adds an IntelliJ-style "Find in Path" centered overlay modal (bound `ctrl-shift-f` / replace `ctrl-shift-r`) — input row + option toggles (case/word/regex) + scope tabs (**In Solution** / **In Project** / **Directory**) + file-mask fields, a grouped streaming results list with keyboard nav, and a live read-only preview editor pane showing the selected match with its surrounding context. It is its own `ModalView` entity, not the existing pane-tab `ProjectSearchView` reused inside a modal shell.
+
+Why: `ProjectSearchView` is a full pane *tab* — results replace the editor's tab content, there's no split preview, and it can't be summoned as a transient centered overlay without a structural rewrite of a widely-used, stable component. IDEA-fidelity (results tree on one side, a live preview of the selected match on the other, no tab churn) needs a different shell. Crate placement stays `search` (not a new crate) because the modal reuses `search`'s crate-private input-row helpers, `SearchOptions`, and the `Project::search` streaming backend + replace machinery wholesale — only the presentation layer is new.
+
+**Scope tabs map to include-pattern shaping on ONE `Project::search` call, not a fan-out.** A Sawe Solution is a single `project::Project` with each catalog member mounted as its own worktree (decision #2/#27), so there is no per-member `Project` to query separately: *In Solution* = empty include pattern (searches every worktree), *In Project* = `<active-member-root-name>/**` (derived from `SolutionStore::active_member`), *Directory* = `<typed-dir>/**`. An empty or unresolvable Directory path returns zero results rather than silently falling back to "search everything" (a `Regression: Fix empty/unresolved Directory scope silently matching everything` fix landed mid-branch — see commit `059122131d`) — a typo'd directory scope must fail closed, not widen.
+
+**Replace / Replace All write straight to disk (`project.save_buffer`) instead of leaving dirty tabs.** The maintainer's editing model is IDEA-like: autosave is always on and **Local History** (a separate, not-yet-built feature) is the undo net, not per-buffer dirty state. Each affected file gets a transient `Editor::for_buffer` for the replace op; since `BufferStore` holds buffers weakly, an explicit save is required or the edit is lost the moment the transient editor drops.
+
+**Coexistence, not replacement:** `ProjectSearchView` and its pane-tab UX stay fully intact — reachable from the modal via an "Open in Find Window" button (dispatches `workspace::DeploySearch`) and via `shift-find` (uses the deprecated keybinding pattern search already had). Users who want the old dedicated tab keep it.
+
+How to apply: any future search-shaped modal (e.g. "Find Usages" if it ever needs a similar split view) should follow the same shell pattern — bespoke `ModalView` reusing the domain crate's backend, not shoehorning `ProjectSearchView`. Don't add a second Scope-tab-like concept without checking whether it can reduce to include-pattern shaping on the existing single-`Project` search the same way. Spec: `docs/superpowers/specs/2026-07-15-find-in-path-modal-design.md`.
 
 ## Where specs and plans live
 
