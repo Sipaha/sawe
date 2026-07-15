@@ -1223,11 +1223,19 @@ impl Render for FindInPath {
             self.preview_dirty = false;
             self.update_preview(window, cx);
         }
+        // `ModalLayer` wraps modal content in a zero-height `v_flex()` (it centers modals with
+        // `top_20()` rather than reserving layout space), so sizing with `relative(..)` here
+        // resolves against a 0px parent and collapses this modal to its header's intrinsic
+        // height — the results list + preview (`flex_1` below) silently get zero space. Deriving
+        // pixel dimensions from the viewport directly (mirroring `rate_prediction_modal.rs` /
+        // `which_key_modal.rs`) sidesteps the zero-height parent entirely.
+        let viewport = window.viewport_size();
         v_flex()
             .key_context("FindInPath")
             .track_focus(&self.focus_handle)
-            .w(relative(0.85))
-            .h(relative(0.80))
+            .w(viewport.width * 0.85)
+            .h(viewport.height * 0.8)
+            .max_w(px(1400.))
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()
             .border_color(cx.theme().colors().border)
