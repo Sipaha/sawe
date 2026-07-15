@@ -430,8 +430,10 @@ impl FindInPath {
                 }
 
                 // Snippet computation is offloaded per buffer (not batched as one background job)
-                // so the foreground gets a `yield_now` between every buffer, keeping the modal
-                // responsive while draining up to `MAX_SEARCH_RESULT_FILES` buffers per search.
+                // so no single buffer's snippet extraction blocks the others. `rebuild_rows` is
+                // O(total-accumulated-rows), so it (and the foreground yield) happen once per
+                // drained batch rather than once per buffer — with up to `MAX_SEARCH_RESULT_FILES`
+                // buffers per search, a per-buffer rebuild would be quadratic in the result count.
                 for (buffer, ranges) in buffers_with_ranges {
                     let (snapshot, path) = buffer.read_with(cx, |buffer, cx| {
                         let snapshot = buffer.snapshot();
@@ -446,17 +448,23 @@ impl FindInPath {
                         .spawn(async move { compute_match_rows(&snapshot, &ranges) })
                         .await;
 
-                    let update_result = this.update(cx, |this, cx| {
+                    let update_result = this.update(cx, |this, _cx| {
                         this.results.push_matches(buffer, path, rows);
-                        this.results.rebuild_rows();
-                        this.status = SearchStatus::Searching;
-                        cx.notify();
                     });
                     if update_result.is_err() {
                         return;
                     }
-                    futures_lite::future::yield_now().await;
                 }
+
+                let update_result = this.update(cx, |this, cx| {
+                    this.results.rebuild_rows();
+                    this.status = SearchStatus::Searching;
+                    cx.notify();
+                });
+                if update_result.is_err() {
+                    return;
+                }
+                futures_lite::future::yield_now().await;
             }
 
             this.update(cx, |this, cx| {
