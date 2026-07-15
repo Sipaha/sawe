@@ -644,8 +644,9 @@ impl FindInPath {
 
     /// Replace only the currently selected match — a no-op if `selected_row` doesn't resolve to
     /// a `Row::Match` (empty results, or the row is a `Header`). Uses the same transient-editor
-    /// approach as `replace_all`, scoped to the one match. Advances the selection to the next
-    /// match, then re-runs the search so the result list reflects the edit.
+    /// approach as `replace_all`, scoped to the one match. Replaces the selected match's text,
+    /// then re-runs the search (via `update_search`), which resets the selection onto the first
+    /// surviving match.
     fn replace_next(&mut self, _: &ReplaceNext, window: &mut Window, cx: &mut Context<Self>) {
         let Some(query) = self.build_replace_query(cx) else {
             return;

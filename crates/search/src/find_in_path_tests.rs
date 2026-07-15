@@ -1124,6 +1124,184 @@ async fn test_include_mask_filters_results(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_replace_all_regex_capture_group(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "foo123 fooABC\n" }))
+        .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle {
+        replace_enabled: true,
+    });
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    // `ToggleRegex` dispatches to the currently focused node (the query editor, focused by the
+    // modal layer on open) and bubbles up to the `on_action` handler registered on the modal
+    // root — see `test_toggle_regex_action_flips_search_options`.
+    cx.dispatch_action(ToggleRegex);
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text(r"foo(\w+)", window, cx);
+            });
+            find_in_path.replace_editor.update(cx, |editor, cx| {
+                // `${1}` matches the capture-group replacement syntax exercised by
+                // `buffer_search::test_replace_simple` for `SearchQuery::replacement_for`'s
+                // underlying `fancy_regex::Regex::replace`.
+                editor.set_text("bar${1}", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.replace_all(&ReplaceAll, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer("/root/a.txt", cx))
+        .await
+        .unwrap();
+    buffer.read_with(cx, |buffer, _cx| {
+        assert_eq!(
+            buffer.text(),
+            "bar123 barABC\n",
+            "regex Replace All should substitute the capture group into the replacement text"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_exclude_mask_filters_results(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "match.rs": "token\n",
+            "match.txt": "token\n",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            2,
+            "with no mask, both match.rs and match.txt should be found"
+        );
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.excluded_files_editor.update(cx, |editor, cx| {
+                editor.set_text("*.rs", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            1,
+            "a '*.rs' exclude mask should filter out match.rs"
+        );
+        assert_eq!(
+            find_in_path.results.groups[0].path.as_ref(),
+            std::path::Path::new("root/match.txt"),
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_case_sensitive_toggle_changes_results(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "Needle needle\n" }))
+        .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("needle", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.total_matches(),
+            2,
+            "case-insensitive (default) search should match both 'Needle' and 'needle'"
+        );
+    });
+
+    // `ToggleCaseSensitive` dispatches to the currently focused node (the query editor, focused
+    // by the modal layer on open) and bubbles up to the `on_action` handler on the modal root —
+    // see `test_toggle_regex_action_flips_search_options`.
+    cx.dispatch_action(ToggleCaseSensitive);
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.total_matches(),
+            1,
+            "enabling case sensitivity should restrict the search to the lowercase 'needle'"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_confirm_opens_selected_match_and_dismisses(cx: &mut TestAppContext) {
     let _app_state = init_test(cx);
     let fs = FakeFs::new(cx.executor());
