@@ -1,7 +1,24 @@
 # Completed async-`Agent` teammate tabs linger ~1 h — missing `SubagentStop`
 
 Date: 2026-07-15
-Status: **root cause confirmed + fix approach (A) validated by a dev experiment; NO fix started** (awaiting user go-ahead to implement A)
+Status: **SHIPPED** (approach A, `origin/main` `3db92de5ac`). Root-cause + experiment history below.
+
+## SHIPPED (2026-07-15, `3db92de5ac`)
+
+Wired `SubagentStop` → the existing teammate-close path, one file
+(`crates/claude_native/src/connection.rs`): registered the `SubagentStop` hook,
+made its callback `is_end_of_turn` (so the store pull `store.rs:3138` calls
+`close_teammate_on_stop` with the sub-agent's `agent_id`), and mapped its response
+`hookEventName` while keeping `decision:"block"` main-`Stop`-only. `solution_agent`
+unchanged; reaper stays as the lost-hook backstop. Subagent-driven (1 task + e2e),
+opus whole-branch review = MERGE, 85 `claude_native` tests. Live e2e confirmed the
+teammate pill closes on completion for BOTH an in-turn echo Agent and a detached
+background Agent (SubagentStop delivered post-idle). Spec/plan
+`2026-07-15-subagentstop-teammate-close`. Two accepted Minors (non-blocking,
+pre-existing): (1) if a follow-up is queued for the exact subagent whose
+SubagentStop fires, that tick skips the close and falls back to the reaper (same
+as the Main-`Stop` path); (2) the fix relies on SubagentStop always carrying
+`agent_id` (confirmed by experiment).
 Reporter: user pointed at ~12 sub-agent pills in the live session strip and asked "все активные? не баг?"
 
 ## Verdict: BUG (regression of the 2026-07-14 teammate-completion rework)
