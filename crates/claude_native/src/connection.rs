@@ -61,6 +61,11 @@ const HOOK_CALLBACK_POST_TOOL_USE: &str = "pti";
 /// follow-up is pending and `Stop` fires (no tool ran), we respond with
 /// `decision: "block"` so the agent keeps generating to address it.
 const HOOK_CALLBACK_STOP: &str = "stop_inj";
+/// Stable id for the `SubagentStop` hook callback. Claude Code fires
+/// `SubagentStop` (not `Stop`) when a sub-agent finishes; its input carries the
+/// sub-agent's `agent_id`, so routing it as end-of-turn drives the same
+/// `close_teammate_on_stop` path that closes the teammate's tab.
+const HOOK_CALLBACK_SUBAGENT_STOP: &str = "sub_stop";
 
 /// Max times within a single turn we'll nudge the agent after it emitted a
 /// tool call as literal `<invoke …>` text (a known opus degradation — it
@@ -390,6 +395,14 @@ fn build_default_hooks() -> std::collections::BTreeMap<String, Vec<HookConfig>> 
             timeout: 30_000,
         }],
     );
+    hooks.insert(
+        "SubagentStop".to_string(),
+        vec![HookConfig {
+            matcher: None,
+            hook_callback_ids: vec![HOOK_CALLBACK_SUBAGENT_STOP.to_string()],
+            timeout: 30_000,
+        }],
+    );
     hooks
 }
 
@@ -422,7 +435,11 @@ fn build_hook_response(
 
     let formatted = format_inject_message(&message);
     let is_stop = callback_id == HOOK_CALLBACK_STOP;
-    let event_name = if is_stop { "Stop" } else { "PostToolUse" };
+    let event_name = match callback_id {
+        HOOK_CALLBACK_STOP => "Stop",
+        HOOK_CALLBACK_SUBAGENT_STOP => "SubagentStop",
+        _ => "PostToolUse",
+    };
 
     let mut response = serde_json::json!({
         "hookSpecificOutput": {
@@ -1527,7 +1544,10 @@ async fn run_update_pump(
                     // buffer (kept for tests with no registered pull). Ship it
                     // back as `additionalContext` (or, for Stop, also as `reason`
                     // with `decision: "block"`). No pending → empty success no-op.
-                    let is_end_of_turn = callback_id.as_str() == HOOK_CALLBACK_STOP;
+                    let is_end_of_turn = matches!(
+                        callback_id.as_str(),
+                        HOOK_CALLBACK_STOP | HOOK_CALLBACK_SUBAGENT_STOP
+                    );
                     // Agent Teams: a subagent's hook input carries `agent_id`
                     // (the main agent's does not). Forward it so the store can
                     // route the queued follow-up to the agent the user aimed it
@@ -2290,6 +2310,14 @@ mod tests {
     }
 
     #[test]
+    fn build_default_hooks_registers_subagent_stop() {
+        let hooks = build_default_hooks();
+        let sub = hooks.get("SubagentStop").expect("SubagentStop registered");
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].hook_callback_ids, vec![HOOK_CALLBACK_SUBAGENT_STOP.to_string()]);
+    }
+
+    #[test]
     fn detects_tool_call_written_as_text() {
         // The exact degraded shape opus emits (leaked function-calling XML).
         let degraded = "card\n<invoke name=\"Bash\">\n<parameter name=\"command\">echo hi</parameter>\n</invoke>";
@@ -2335,6 +2363,17 @@ mod tests {
         assert_eq!(inner["decision"], "block");
         let reason = inner["reason"].as_str().unwrap();
         assert!(reason.contains("FOLLOWUP"), "reason={reason}");
+    }
+
+    #[test]
+    fn hook_response_subagent_stop_sets_event_name_and_does_not_block() {
+        // A SubagentStop response must name the event correctly but must NOT
+        // carry decision:block — a finished sub-agent is not forced to continue.
+        let response = build_hook_response("hk3", HOOK_CALLBACK_SUBAGENT_STOP, Some("FOLLOWUP".to_string()));
+        let inner = &response["response"];
+        assert_eq!(inner["hookSpecificOutput"]["hookEventName"], "SubagentStop");
+        assert!(inner.get("decision").is_none(), "sub-agent stop must not block");
+        assert!(inner.get("reason").is_none());
     }
 
     #[test]
