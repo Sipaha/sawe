@@ -1,10 +1,19 @@
 use super::*;
 use gpui::TestAppContext;
+use language::Buffer;
 use project::{FakeFs, Project};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use workspace::{AppState, MultiWorkspace};
+
+/// A single-point match range at `offset`, sufficient for exercising `MatchList` grouping without
+/// depending on the real search backend to produce ranges.
+fn anchor_range(buffer: &Entity<Buffer>, cx: &App) -> Range<Anchor> {
+    let buffer = buffer.read(cx);
+    buffer.anchor_before(0)..buffer.anchor_after(0)
+}
 
 #[gpui::test]
 async fn test_toggle_opens_modal(cx: &mut TestAppContext) {
@@ -158,5 +167,127 @@ async fn test_build_query_restricts_to_project_scope(cx: &mut TestAppContext) {
             .is_none(),
             "an empty query string should not build a query"
         );
+    });
+}
+
+#[gpui::test]
+async fn test_matchlist_groups_and_flattens(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "foo\nfoo\n", "b.txt": "foo\n" }))
+        .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let buffer_a = project
+        .update(cx, |p, cx| p.open_local_buffer("/root/a.txt", cx))
+        .await
+        .unwrap();
+    let buffer_b = project
+        .update(cx, |p, cx| p.open_local_buffer("/root/b.txt", cx))
+        .await
+        .unwrap();
+
+    let mut list = MatchList::default();
+    cx.update(|cx| {
+        list.push_result(
+            buffer_a.clone(),
+            vec![anchor_range(&buffer_a, cx), anchor_range(&buffer_a, cx)],
+            cx,
+        );
+        list.push_result(buffer_b.clone(), vec![anchor_range(&buffer_b, cx)], cx);
+        list.rebuild_rows();
+    });
+
+    assert_eq!(list.file_count(), 2);
+    assert_eq!(list.total_matches(), 3);
+    assert_eq!(list.rows.len(), 5);
+    assert!(matches!(list.rows[0], Row::Header(0)));
+    assert!(matches!(list.rows[1], Row::Match(0, 0)));
+    assert!(matches!(list.rows[2], Row::Match(0, 1)));
+    assert!(matches!(list.rows[3], Row::Header(1)));
+    assert!(matches!(list.rows[4], Row::Match(1, 0)));
+}
+
+#[gpui::test]
+async fn test_matchlist_push_result_ignores_empty_ranges(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "foo\n" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let buffer_a = project
+        .update(cx, |p, cx| p.open_local_buffer("/root/a.txt", cx))
+        .await
+        .unwrap();
+
+    let mut list = MatchList::default();
+    cx.update(|cx| {
+        list.push_result(buffer_a.clone(), Vec::new(), cx);
+        list.rebuild_rows();
+    });
+
+    assert_eq!(
+        list.file_count(),
+        0,
+        "an empty ranges batch should not create a group"
+    );
+    assert_eq!(list.rows.len(), 0);
+}
+
+#[gpui::test]
+async fn test_spawn_search_streams_grouped_results(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "a.txt": "token\ntoken\n",
+            "b.txt": "token\n",
+            "c.txt": "nothing here\n",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    // Dispatch through `MultiWorkspace` (see `test_toggle_opens_modal`) so the modal is
+    // constructed via `FindInPath::toggle`, which is what wires `self.project`.
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    let query = project.read_with(cx, |_project, cx| {
+        super::build_query(
+            "token",
+            SearchOptions::NONE,
+            "",
+            "",
+            &Scope::Solution,
+            None,
+            &project,
+            cx,
+        )
+        .expect("non-empty query text with a valid scope should build a query")
+    });
+
+    find_in_path.update(cx, |find_in_path, cx| {
+        find_in_path.spawn_search(query, cx);
+    });
+
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            2,
+            "a.txt and b.txt both contain 'token'; c.txt should not match"
+        );
+        assert_eq!(find_in_path.results.total_matches(), 3);
+        assert_eq!(find_in_path.status, SearchStatus::Done);
+        assert!(find_in_path.search_task.is_none());
     });
 }

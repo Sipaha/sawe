@@ -1,11 +1,22 @@
+use futures::StreamExt as _;
 use gpui::{
     actions, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Render, Styled, Window,
+    IntoElement, ParentElement, Render, Styled, Task, Window,
 };
-use project::{Project, search::SearchQuery};
+use language::{Anchor, Buffer, Point};
+use project::{
+    Project, SearchResults,
+    search::{SearchQuery, SearchResult},
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    pin::pin,
+    sync::Arc,
+    time::Duration,
+};
 use ui::prelude::*;
 use util::paths::PathMatcher;
 use workspace::{ModalView, Workspace};
@@ -226,9 +237,115 @@ fn build_query(
     if query.is_empty() { None } else { Some(query) }
 }
 
+/// A single search match, resolved to a snapshot-relative line and a trimmed preview snippet.
+pub struct MatchRow {
+    pub range: Range<Anchor>,
+    pub line: u32,
+    pub snippet: SharedString,
+}
+
+/// All matches found in one buffer.
+pub struct FileGroup {
+    pub path: Arc<Path>,
+    pub buffer: Entity<Buffer>,
+    pub matches: Vec<MatchRow>,
+}
+
+/// One row of the flattened (group header / match) result list, as consumed by the results view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    Header(usize),
+    Match(usize, usize),
+}
+
+/// Streaming search results grouped by file, plus the flattened row list the results view renders.
+#[derive(Default)]
+pub struct MatchList {
+    pub groups: Vec<FileGroup>,
+    pub rows: Vec<Row>,
+}
+
+impl MatchList {
+    /// Merge a batch of matches for `buffer` into the existing group for that buffer (creating one
+    /// if this is the first batch seen for it). Does not touch `rows` — call `rebuild_rows` after.
+    pub fn push_result(&mut self, buffer: Entity<Buffer>, ranges: Vec<Range<Anchor>>, cx: &App) {
+        if ranges.is_empty() {
+            return;
+        }
+
+        let snapshot = buffer.read(cx).snapshot();
+        let matches = ranges
+            .into_iter()
+            .map(|range| {
+                let line = snapshot.summary_for_anchor::<Point>(&range.start).row;
+                let line_end = snapshot.line_len(line);
+                let snippet = snapshot
+                    .text_for_range(Point::new(line, 0)..Point::new(line, line_end))
+                    .collect::<String>();
+                MatchRow {
+                    range,
+                    line,
+                    snippet: snippet.trim().to_string().into(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(group) = self
+            .groups
+            .iter_mut()
+            .find(|group| group.buffer.entity_id() == buffer.entity_id())
+        {
+            group.matches.extend(matches);
+        } else {
+            let path: Arc<Path> = snapshot
+                .file()
+                .map(|file| Arc::from(file.full_path(cx)))
+                .unwrap_or_else(|| Arc::from(Path::new("")));
+            self.groups.push(FileGroup {
+                path,
+                buffer,
+                matches,
+            });
+        }
+    }
+
+    /// Flatten `groups` into `rows` (one `Header` per group followed by its `Match` rows).
+    pub fn rebuild_rows(&mut self) {
+        self.rows.clear();
+        for (group_index, group) in self.groups.iter().enumerate() {
+            self.rows.push(Row::Header(group_index));
+            for match_index in 0..group.matches.len() {
+                self.rows.push(Row::Match(group_index, match_index));
+            }
+        }
+    }
+
+    pub fn total_matches(&self) -> usize {
+        self.groups.iter().map(|group| group.matches.len()).sum()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.groups.len()
+    }
+}
+
+/// Status line for the in-progress / completed search, folded from the `SearchResult` stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchStatus {
+    #[default]
+    Idle,
+    Searching,
+    Done,
+    LimitReached,
+}
+
 pub struct FindInPath {
     focus_handle: FocusHandle,
     replace_enabled: bool,
+    project: Entity<Project>,
+    results: MatchList,
+    status: SearchStatus,
+    search_task: Option<Task<()>>,
 }
 
 impl FindInPath {
@@ -246,10 +363,77 @@ impl FindInPath {
             });
             return;
         }
+        let project = workspace.project().clone();
         workspace.toggle_modal(window, cx, |_window, cx| Self {
             focus_handle: cx.focus_handle(),
             replace_enabled,
+            project,
+            results: MatchList::default(),
+            status: SearchStatus::Idle,
+            search_task: None,
         });
+    }
+
+    /// Debounce, then run `query` against `self.project` and stream results into `self.results`.
+    ///
+    /// Replacing `self.search_task` drops (and thus cancels) any in-flight search — including one
+    /// still sitting in the debounce timer — before this one starts.
+    ///
+    /// Not yet wired to editor input (Tasks 4/7 build the `SearchQuery` from the query/include/
+    /// exclude editors via `build_query` and call this).
+    #[allow(dead_code)]
+    fn spawn_search(&mut self, query: SearchQuery, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        self.results = MatchList::default();
+        self.status = SearchStatus::Searching;
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+
+            let SearchResults { rx, _task_handle } =
+                project.update(cx, |project, cx| project.search(query, cx));
+            let mut chunks = pin!(rx.ready_chunks(1024));
+
+            let mut limit_reached = false;
+            while let Some(batch) = chunks.next().await {
+                for result in batch {
+                    match result {
+                        SearchResult::Buffer { buffer, ranges } => {
+                            if this
+                                .update(cx, |this, cx| this.results.push_result(buffer, ranges, cx))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        SearchResult::LimitReached => limit_reached = true,
+                        SearchResult::WaitingForScan | SearchResult::Searching => {}
+                    }
+                }
+                let update_result = this.update(cx, |this, cx| {
+                    this.results.rebuild_rows();
+                    this.status = SearchStatus::Searching;
+                    cx.notify();
+                });
+                if update_result.is_err() {
+                    return;
+                }
+                futures_lite::future::yield_now().await;
+            }
+
+            this.update(cx, |this, cx| {
+                this.status = if limit_reached {
+                    SearchStatus::LimitReached
+                } else {
+                    SearchStatus::Done
+                };
+                this.search_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 }
 
