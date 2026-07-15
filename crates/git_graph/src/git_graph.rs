@@ -1119,31 +1119,17 @@ fn to_row_center(
 fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &mut Window) {
     let radius = COMMIT_CIRCLE_RADIUS;
 
-    let mut builder = PathBuilder::fill();
-
-    // Start at the rightmost point of the circle
-    builder.move_to(point(center_x + radius, center_y));
-
-    // Draw the circle using two arc_to calls (top half, then bottom half)
-    builder.arc_to(
-        point(radius, radius),
-        px(0.),
-        false,
-        true,
-        point(center_x - radius, center_y),
+    // A quad whose corner radius equals half its side renders as a filled circle.
+    // This is reliable across GPU backends; a hand-built two-arc fill path
+    // rasterized blocky ("square") at this tiny radius.
+    let bounds = Bounds::new(
+        point(center_x - radius, center_y - radius),
+        gpui::Size {
+            width: radius * 2.0,
+            height: radius * 2.0,
+        },
     );
-    builder.arc_to(
-        point(radius, radius),
-        px(0.),
-        false,
-        true,
-        point(center_x + radius, center_y),
-    );
-    builder.close();
-
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, color);
-    }
+    window.paint_quad(gpui::fill(bounds, color).corner_radii(gpui::Corners::all(radius)));
 }
 
 fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {

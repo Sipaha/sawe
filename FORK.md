@@ -786,6 +786,8 @@ What: three coupled changes to the dedicated `crates/git_graph` panel (the colum
 
 Why: the maintainer compared our graph to IDEA's and wanted it visually tighter (reference screenshot: ~4 lanes packed into a narrow column with the message right beside them), the per-row hash column removed as scanning noise, but — explicitly — search-by-hash kept working. It didn't work before (pre-existing: `--grep` on a SHA), so "keep it working" meant "make it work."
 
+Commit nodes are drawn as a fully-rounded `paint_quad` (`gpui::fill(bounds).corner_radii(Corners::all(radius))`), not a hand-built two-arc `PathBuilder` fill — the arc path rasterized blocky/"square" at the ~3px node radius; a quad with corner-radius = half its side is a reliable circle across GPU backends.
+
 Limits (accepted): hash search resolves only among **loaded** commits — a SHA for a commit below the fetched window won't jump (no `git rev-parse` round-trip). The `>= 7` hex threshold is deliberate so 4-char hex words (`face`, `dead`) still search messages. True *per-row* огибание (each row's text starting at that row's own lane extent, vs one global fixed graph-column width) was NOT done — IDEA itself uses a fixed graph column, and our layout already matches that; tightening `LANE_WIDTH` was the real lever. Guard: `git_graph::tests::test_is_hash_like`. Plan: `docs/superpowers/plans/2026-07-15-idea-git-graph-polish.md`.
 
 ## Where specs and plans live
