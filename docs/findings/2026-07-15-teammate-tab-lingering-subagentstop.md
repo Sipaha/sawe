@@ -1,7 +1,7 @@
 # Completed async-`Agent` teammate tabs linger ~1 h — missing `SubagentStop`
 
 Date: 2026-07-15
-Status: **diagnosed, root-cause confirmed; NO fix started** (awaiting user's A/B/C choice)
+Status: **root cause confirmed + fix approach (A) validated by a dev experiment; NO fix started** (awaiting user go-ahead to implement A)
 Reporter: user pointed at ~12 sub-agent pills in the live session strip and asked "все активные? не баг?"
 
 ## Verdict: BUG (regression of the 2026-07-14 teammate-completion rework)
@@ -48,6 +48,32 @@ close would fire instantly if the `Stop` hook arrived; it simply never does.
 
 Inline **`Task`** teammates are unaffected — they close on their spawn tool-call going terminal
 (`teammate_reconciler.rs:917-924`), no hook needed. Only the async `Agent` path is broken.
+
+## Experiment (2026-07-15, dev build, reverted): approach A CONFIRMED
+
+Temporarily registered a `SubagentStop` hook + logged every hook callback's raw
+input in a dev build, then drove a real editor claude session (scratch solution,
+`Agent` tool) to dispatch one async `Agent` sub-agent. Result:
+
+- **`SubagentStop` fires** on the sub-agent's completion (`connection.rs` hook
+  callback, id we registered).
+- Its raw input carries the sub-agent's **`agent_id`** — the SAME id the close
+  path already keys on (matched the `hook pull agent_id=Some(...)` id). Full
+  payload also had `agent_type`, `agent_transcript_path`, `last_assistant_message`,
+  and `background_tasks:[{id, type:"subagent", status:"running", ...}]`.
+- The Main **`Stop`** payload has **no** `agent_id` (confirms Stop = main-only).
+- The session used the **`Agent`** tool (`subagent_id`-tagged entries absent →
+  fully-detached async Agent = the exact buggy case), not `Task`.
+
+Conclusion: **A is viable.** The handler already reads `input["agent_id"]`
+(`connection.rs:1536`); registering `SubagentStop` and treating its callback as
+`is_end_of_turn` routes straight into the existing
+`close_teammate_on_stop(session, agent_id)` (`store.rs:3138-3140`), which resolves
+`agent_id → BackgroundAgentId → parent_tool_use_id → StreamId::Teammate` via
+`background_agents` (populated for async Agents). Nuances to handle in the fix,
+not blockers: `background_tasks[0].status` reads `"running"` at SubagentStop time
+(key off the event + agent_id, not that field); and confirm the detached-background
+case (SubagentStop firing after the parent turn ends) still delivers.
 
 ## Fix directions (NOT started — user chooses)
 
