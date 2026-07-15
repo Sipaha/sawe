@@ -4,13 +4,14 @@ use editor::{
 };
 use futures::StreamExt as _;
 use gpui::{
-    AnyElement, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement, Styled,
-    Subscription, Task, TaskExt as _, UniformListScrollHandle, Window, actions, uniform_list,
+    AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, IntoElement, ParentElement, Render, ScrollStrategy,
+    StatefulInteractiveElement, Styled, Subscription, Task, TaskExt as _, UniformListScrollHandle,
+    WeakEntity, Window, actions, uniform_list,
 };
 use language::{Anchor, Buffer, BufferSnapshot, Point};
 use project::{
-    Project, SearchResults,
+    Project, ProjectItem as _, SearchResults,
     search::{SearchQuery, SearchResult},
 };
 use schemars::JsonSchema;
@@ -383,6 +384,9 @@ pub enum SearchStatus {
 pub struct FindInPath {
     focus_handle: FocusHandle,
     replace_enabled: bool,
+    /// Used by `open_selected` (`workspace.open_path`) and `open_in_find_window`
+    /// (`window.dispatch_action(DeploySearch)`) — both hand off to the owning workspace.
+    workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     query_editor: Entity<Editor>,
     /// User-typed include-glob mask ("File mask"), merged in front of `scope`'s own include
@@ -439,6 +443,7 @@ impl FindInPath {
         }
         let project = workspace.project().clone();
         let member_root = active_member_root(workspace, cx);
+        let weak_workspace = cx.entity().downgrade();
         workspace.toggle_modal(window, cx, |window, cx| {
             let query_editor = cx.new(|cx| Editor::single_line(window, cx));
             // Re-run the search on every query edit, mirroring `ProjectSearchView`'s
@@ -489,6 +494,7 @@ impl FindInPath {
             Self {
                 focus_handle: cx.focus_handle(),
                 replace_enabled,
+                workspace: weak_workspace,
                 project,
                 query_editor,
                 included_files_editor,
@@ -676,7 +682,6 @@ impl FindInPath {
                 .detach_and_log_err(cx);
         }
 
-        self.move_selection(1, window, cx);
         self.update_search(cx);
     }
 
@@ -907,6 +912,85 @@ impl FindInPath {
         }
     }
 
+    /// Open the selected match in the workspace's active pane and dismiss the modal. A no-op if
+    /// `selected_row` doesn't resolve to a `Row::Match` (empty results, or the row is a Header) or
+    /// if `self.workspace` no longer resolves (its window closed out from under the modal).
+    ///
+    /// Reuses `workspace.open_path` — the same path a normal file-open goes through, so this opens
+    /// (or reactivates) a real, persistent tab rather than a preview-only view like
+    /// `preview_editor`. Once the item lands, `go_to_singleton_buffer_range` (mirroring
+    /// `edit_prediction::open_editor_at_anchor`) selects the exact match range and autoscrolls to
+    /// it; a no-op if the opened item isn't an `Editor` over a singleton buffer (shouldn't happen
+    /// for a plain text file, but `open_path` return types aren't specific to `Editor`).
+    fn open_selected(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Row::Match(group_index, match_index)) =
+            self.results.rows.get(self.selected_row).copied()
+        else {
+            return;
+        };
+        let Some(group) = self.results.groups.get(group_index) else {
+            return;
+        };
+        let Some(match_row) = group.matches.get(match_index) else {
+            return;
+        };
+        let buffer = group.buffer.clone();
+        let Some(project_path) = buffer.read(cx).project_path(cx) else {
+            return;
+        };
+        let snapshot = buffer.read(cx).snapshot();
+        let range = match_row.range.clone();
+        let start = snapshot.summary_for_anchor::<Point>(&range.start);
+        let end = snapshot.summary_for_anchor::<Point>(&range.end);
+
+        // `update`, not `update_in` — the latter looks the workspace's window up via
+        // `App::current_window_by_entity`, which is only populated by a handful of GPUI-internal
+        // call sites (`defer_in`/`observe`/`subscribe`) and is empty for a `Workspace` that's
+        // mounted as a child of `MultiWorkspace` rather than a window's root view, so it fails with
+        // "entity has no current window" here. `FindInPath`'s own `window` (its modal lives inside
+        // the owning workspace's render tree, so it's the same window) is threaded through instead.
+        let open_task = match self.workspace.update(cx, |workspace, cx| {
+            workspace.open_path(project_path, None, true, window, cx)
+        }) {
+            Ok(task) => task,
+            Err(_) => return,
+        };
+
+        cx.spawn_in(window, async move |_this, cx| {
+            let item = open_task.await?;
+            if let Some(editor) = item.downcast::<Editor>() {
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.go_to_singleton_buffer_range(start..end, window, cx);
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+
+        cx.emit(DismissEvent);
+    }
+
+    /// Hand the current query/options/masks off to the classic project-search tab
+    /// (`ProjectSearchView`) via `workspace::DeploySearch`, then dismiss the modal. Empty file-mask
+    /// fields are sent as `None` rather than `Some("")` so `DeploySearch` doesn't clobber the
+    /// target search view's existing masks with an empty filter.
+    fn open_in_find_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let included_files = self.included_files_editor.read(cx).text(cx);
+        let excluded_files = self.excluded_files_editor.read(cx).text(cx);
+        let action = workspace::DeploySearch {
+            query: Some(self.query_editor.read(cx).text(cx)),
+            regex: Some(self.search_options.contains(SearchOptions::REGEX)),
+            case_sensitive: Some(self.search_options.contains(SearchOptions::CASE_SENSITIVE)),
+            whole_word: Some(self.search_options.contains(SearchOptions::WHOLE_WORD)),
+            include_ignored: Some(self.search_options.contains(SearchOptions::INCLUDE_IGNORED)),
+            included_files: (!included_files.is_empty()).then_some(included_files),
+            excluded_files: (!excluded_files.is_empty()).then_some(excluded_files),
+            replace_enabled: self.replace_enabled,
+        };
+        window.dispatch_action(Box::new(action), cx);
+        cx.emit(DismissEvent);
+    }
+
     /// Resolve `selected_row` to a `Row::Match` and (re)build/refresh the read-only preview
     /// editor: a fresh `Editor::for_buffer` when the selection just moved to a different file,
     /// otherwise the existing preview editor is reused and just re-highlighted/re-scrolled. A
@@ -1039,10 +1123,13 @@ impl FindInPath {
                             .color(Color::Muted),
                     )
                     .child(Label::new(match_row.snippet.clone()).size(LabelSize::Small))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.selected_row = ix;
                         this.update_preview(window, cx);
                         cx.notify();
+                        if event.click_count() >= 2 {
+                            this.open_selected(&menu::Confirm, window, cx);
+                        }
                     }))
                     .into_any_element()
             }
@@ -1154,6 +1241,10 @@ impl Render for FindInPath {
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::replace_all))
             .on_action(cx.listener(Self::replace_next))
+            .on_action(cx.listener(Self::open_selected))
+            .on_action(cx.listener(|_, _: &menu::Cancel, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
             .child(
                 v_flex()
                     .p_2()
@@ -1324,6 +1415,18 @@ impl Render for FindInPath {
                             )
                     }),
             )
-            .child(h_flex().p_1().child(self.status_label()))
+            .child(
+                h_flex()
+                    .p_1()
+                    .justify_between()
+                    .child(self.status_label())
+                    .child(
+                        Button::new("find-in-path-open-in-find-window", "Open in Find Window")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.open_in_find_window(window, cx);
+                            })),
+                    ),
+            )
     }
 }

@@ -1122,3 +1122,168 @@ async fn test_include_mask_filters_results(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+async fn test_confirm_opens_selected_match_and_dismisses(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({ "a.txt": "no match here\ntoken on this line\nanother line\n" }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    let matched_buffer = find_in_path.read_with(cx, |find_in_path, _cx| {
+        let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
+        else {
+            panic!(
+                "streaming results should auto-select the first Match row before Confirm is tested"
+            );
+        };
+        find_in_path.results.groups[group_index].buffer.clone()
+    });
+
+    // `menu::Confirm` dispatches to the currently focused node (the query editor, focused by the
+    // modal layer on open) and bubbles up to `open_selected`, registered on the modal root.
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_modal::<FindInPath>(cx).is_none(),
+            "Confirm should dismiss the FindInPath modal"
+        );
+
+        let editor = workspace
+            .active_item(cx)
+            .and_then(|item| item.downcast::<Editor>())
+            .expect("Confirm should open the matched file as the active pane item");
+        editor.read_with(cx, |editor, cx| {
+            let opened_buffer = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("opened item should wrap a singleton buffer");
+            assert_eq!(
+                opened_buffer.entity_id(),
+                matched_buffer.entity_id(),
+                "Confirm should open the buffer the selected match belongs to"
+            );
+
+            let multibuffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+            let head = editor.selections.newest_anchor().head();
+            let point = multibuffer_snapshot.summary_for_anchor::<Point>(&head);
+            assert_eq!(
+                point.row, 1,
+                "Confirm should navigate the opened editor to the matched line"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn test_cancel_dismisses_modal(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "hello\n" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_modal::<FindInPath>(cx).is_some(),
+            "Toggle should open the FindInPath modal"
+        );
+    });
+
+    cx.dispatch_action(menu::Cancel);
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_modal::<FindInPath>(cx).is_none(),
+            "menu::Cancel (Esc) should dismiss the FindInPath modal"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_open_in_find_window_deploys_project_search_and_dismisses(cx: &mut TestAppContext) {
+    let _app_state = cx.update(|cx| {
+        let state = AppState::test(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        crate::init(cx);
+        state
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "token\n" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.open_in_find_window(window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_modal::<FindInPath>(cx).is_none(),
+            "Open in Find Window should dismiss the FindInPath modal"
+        );
+        assert!(
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<crate::project_search::ProjectSearchView>())
+                .is_some(),
+            "Open in Find Window should deploy a ProjectSearchView tab"
+        );
+    });
+}
