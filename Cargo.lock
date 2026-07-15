@@ -16970,6 +16970,7 @@ dependencies = [
  "multi_buffer",
  "pretty_assertions",
  "project",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings",
