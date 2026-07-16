@@ -1660,6 +1660,26 @@ impl GitGraph {
                 let extra_paths = extra_paths.clone();
                 match event {
                     GitGraphEvent::FullyLoaded => {
+                        // Pull any commits that finished loading but weren't
+                        // delivered as a `CountUpdated` we observed (e.g. the
+                        // fetch resolved in a window where our local count was
+                        // still 0), then repaint. Without this the graph can
+                        // stay stuck on "Loading" on a freshly-created solution:
+                        // the render fast-path won't re-read the repository once
+                        // `max_commit_count` is cached, and no other event would
+                        // arrive to nudge it.
+                        repository.update(cx, |repository, cx| {
+                            let GraphDataResponse { commits, .. } = repository.graph_data(
+                                source.clone(),
+                                *order,
+                                extra_args.clone(),
+                                extra_paths.clone(),
+                                self.graph_data.commits.len()..usize::MAX,
+                                cx,
+                            );
+                            self.graph_data.add_commits(commits);
+                        });
+
                         if let Some(pending_sha_data_index) =
                             self.pending_select_sha.take().and_then(|oid| {
                                 repository
@@ -1676,6 +1696,7 @@ impl GitGraph {
                             let view_index = self.data_to_view_idx(pending_sha_data_index);
                             self.select_entry(view_index, ScrollStrategy::Nearest, cx);
                         }
+                        cx.notify();
                     }
                     GitGraphEvent::LoadingError => {
                         // todo(git_graph): Wire this up with the UI
@@ -3338,14 +3359,28 @@ impl GitGraph {
     }
 }
 
-impl Render for GitGraph {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (mut commit_count, is_loading) = match self.graph_data.max_commit_count {
-            AllCommitCount::Loaded(count) => (count, true),
-            AllCommitCount::NotLoaded => {
+impl GitGraph {
+    /// Commit count to render plus whether the underlying fetch is still in
+    /// flight. Extracted from `render` so tests can assert the loading state
+    /// (a stuck "Loading" is otherwise invisible to assertions).
+    fn resolve_commit_count(&mut self, cx: &mut Context<Self>) -> (usize, bool) {
+        match self.graph_data.max_commit_count {
+            // A locally-cached `Loaded(count)` with `count > 0` is the steady
+            // state — render from the cache. But `Loaded(0)` is NOT terminal:
+            // the very first paint calls `add_commits(&[])` with an empty batch
+            // (the async fetch has only just been kicked off, nothing streamed
+            // yet), and `add_commits` unconditionally sets `Loaded(0)`. If we
+            // treated that as terminal the graph would stick on "Loading"
+            // forever — the fast-path never re-reads the repository, so a fetch
+            // that finishes later (or a freshly-created solution whose repo only
+            // becomes ready after mount) is never picked up. Fall through to the
+            // re-read path, which reports the repository's real `is_loading` and
+            // pulls in whatever has loaded.
+            AllCommitCount::Loaded(count) if count > 0 => (count, true),
+            AllCommitCount::Loaded(_) | AllCommitCount::NotLoaded => {
                 let extra_args = self.combined_extra_args();
                 let extra_paths = self.filters.paths_args();
-                let (commit_count, is_loading) = if let Some(repository) = self.get_repository(cx) {
+                if let Some(repository) = self.get_repository(cx) {
                     repository.update(cx, |repository, cx| {
                         // Start loading the graph data if we haven't started already
                         let GraphDataResponse {
@@ -3365,11 +3400,15 @@ impl Render for GitGraph {
                     })
                 } else {
                     (0, false)
-                };
-
-                (commit_count, is_loading)
+                }
             }
-        };
+        }
+    }
+}
+
+impl Render for GitGraph {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (mut commit_count, is_loading) = self.resolve_commit_count(cx);
 
         // S-FHT: when "With Local Changes" is enabled, prepend a synthetic
         // row at index 0 representing the uncommitted state. The row has no
@@ -5561,6 +5600,141 @@ mod tests {
         );
     }
 
+    /// Regression: a paint that lands while the initial fetch is still in
+    /// flight caches `max_commit_count = Loaded(0)` (via `add_commits(&[])`).
+    /// That state must NOT be terminal — once the fetch resolves the graph
+    /// must show the commits instead of sticking on "Loading" forever
+    /// (reported on a freshly-created Solution: the git graph opened right
+    /// after add_member showed an eternal loader until a search query nudged
+    /// an invalidate).
+    #[gpui::test]
+    async fn test_graph_not_stuck_loading_after_empty_first_paint(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let mut rng = StdRng::seed_from_u64(7);
+        let commits = generate_random_commit_dag(&mut rng, 10, false);
+        fs.set_graph_commits(Path::new("/project/.git"), commits.clone());
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+
+        // Kick off the fetch and let it fully resolve into the repository's
+        // cache.
+        git_graph.update(cx, |graph, cx| {
+            graph.resolve_commit_count(cx);
+        });
+        cx.run_until_parked();
+
+        // Force the production race's end state: the repository has all the
+        // commits, but the graph's LOCAL cache is an empty `Loaded(0)` (an
+        // empty paint landed and the delivery events were missed). The next
+        // resolve must fall through to re-read the repository instead of
+        // treating `Loaded(0)` as terminal.
+        git_graph.update(cx, |graph, cx| {
+            graph.graph_data.clear();
+            graph.graph_data.add_commits(&[]);
+            assert!(matches!(
+                graph.graph_data.max_commit_count,
+                AllCommitCount::Loaded(0)
+            ));
+
+            let (count, is_loading) = graph.resolve_commit_count(cx);
+            assert_eq!(
+                count,
+                commits.len(),
+                "graph must pick up the fetched commits after an empty first paint"
+            );
+            assert!(count > 0);
+            let _ = is_loading;
+        });
+    }
+
+    /// Regression: a repository with NO commits must render "No commits
+    /// found", not an eternal "Loading" — `Loaded(0)` used to hard-code
+    /// `is_loading = true` without ever re-reading the repository.
+    #[gpui::test]
+    async fn test_commitless_repo_reports_not_loading(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        // No set_graph_commits: the repo has zero commits.
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+
+        // Kick off the fetch (first paint) and let it resolve.
+        git_graph.update(cx, |graph, cx| {
+            graph.resolve_commit_count(cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, cx| {
+            let (count, is_loading) = graph.resolve_commit_count(cx);
+            assert_eq!(count, 0);
+            assert!(
+                !is_loading,
+                "a commitless repo must settle on 'No commits found', not loading forever"
+            );
+        });
+    }
+
     /// FileHistory dispatched while a project-panel selection in a NON-git
     /// worktree is focused must not open a graph (no fall-back source). Lives
     /// here (not in `project_panel`) because it exercises git_graph's
@@ -6653,12 +6827,12 @@ mod tests {
             assert_eq!(graph.data_to_view_idx(0), 1);
         });
 
-        // Column-count assertion: in file-history mode the table is the
-        // four columns Description / Date / Author / Hash (the graph lane
-        // is hidden).
+        // Column-count assertion: three columns Description / Date / Author —
+        // the hash column was dropped everywhere (decision #56; the SHA lives
+        // in the commit detail panel), file-history mode included.
         graph.read_with(cx, |graph, cx| {
             let widths = graph.column_widths.read(cx);
-            assert_eq!(widths.cols(), 4);
+            assert_eq!(widths.cols(), 3);
         });
 
         // Toggle Follow Renames off; combined_extra_args picks up

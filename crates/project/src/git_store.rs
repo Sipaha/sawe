@@ -5989,12 +5989,16 @@ impl Repository {
                 }
             });
 
-        let max_start = initial_commit_data.commit_data.len().saturating_sub(1);
-        let max_end = initial_commit_data.commit_data.len();
+        // Clamp both ends to the data length. Clamping start to `len - 1`
+        // (as this used to) made a fully-out-of-range request like
+        // `len..usize::MAX` return `[len-1..len]` — duplicating the last
+        // commit instead of yielding an empty slice.
+        let len = initial_commit_data.commit_data.len();
+        let start = range.start.min(len);
+        let end = range.end.min(len).max(start);
 
         GraphDataResponse {
-            commits: &initial_commit_data.commit_data
-                [range.start.min(max_start)..range.end.min(max_end)],
+            commits: &initial_commit_data.commit_data[start..end],
             is_loading: !initial_commit_data.fetch_task.is_ready(),
             error: initial_commit_data.error.clone(),
         }

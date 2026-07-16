@@ -733,8 +733,9 @@ pub struct GitPanel {
     git_access: GitAccess,
 
     // Refreshes the active repository when the solution-wide active member
-    // flips (replaces the retired per-panel project selector).
-    _store_subscription: Subscription,
+    // flips (replaces the retired per-panel project selector). `None` when
+    // no SolutionStore global exists (tests / non-Solution contexts).
+    _store_subscription: Option<Subscription>,
 
     // S-PCH-HK — per-repo before-commit checks state. `pre_commit_config`
     // is loaded lazily when the panel sees a new active repository
@@ -894,18 +895,18 @@ impl GitPanel {
 
             // Re-pick the active repository whenever the solution-wide active
             // member flips so the panel tracks the newly-selected project.
-            let _store_subscription = cx.subscribe_in(
-                &solutions::SolutionStore::global(cx),
-                window,
-                |this, _store, event, window, cx| {
+            // (`try_global`: tests and non-Solution contexts have no store —
+            // an unconditional `global` panics there.)
+            let _store_subscription = solutions::SolutionStore::try_global(cx).map(|store| {
+                cx.subscribe_in(&store, window, |this, _store, event, window, cx| {
                     if matches!(
                         event,
                         solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
                     ) {
                         this.schedule_update(window, cx);
                     }
-                },
-            );
+                })
+            });
 
             let mut this = Self {
                 active_repository,
