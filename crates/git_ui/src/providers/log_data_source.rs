@@ -69,10 +69,16 @@ pub trait LogDataSource: Send + Sync {
     /// safe to call repeatedly with overlapping ranges.
     ///
     /// `members` optionally narrows the active member set (Members chip
-    /// filter). Empty / `None` ⇒ all members of the active Solution.
+    /// filter). Empty / `None` ⇒ all members of the target Solution.
+    ///
+    /// `solution_id` pins the target Solution explicitly (the per-solution
+    /// MCP socket injects it so a scoped agent can never read another
+    /// Solution's log); `None` falls back to the most-recently-opened
+    /// Solution.
     fn fetch_log(
         &self,
         query: LogQuery,
+        solution_id: Option<i64>,
         members: Option<Vec<SharedString>>,
         range: Range<usize>,
         cx: &mut App,

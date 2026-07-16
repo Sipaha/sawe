@@ -182,16 +182,19 @@ impl SolutionGitAggregator {
         }
     }
 
-    /// Resolve the active Solution from the store. Returns `None` if no
-    /// Solution is open, the store global is missing, or every member's
-    /// path is missing on disk.
-    fn active_solution(&self, cx: &App) -> Option<Solution> {
+    /// Resolve the target Solution: by explicit id when given (the
+    /// per-solution MCP socket injects one so a scoped agent stays inside
+    /// its own Solution), else the most-recently-opened Solution — the
+    /// heuristic the title bar uses (last touched = current).
+    fn target_solution(&self, solution_id: Option<i64>, cx: &App) -> Option<Solution> {
         let store = self.store.upgrade()?;
         let store = store.read(cx);
-        // Pick the most-recently-opened Solution as the "active" one —
-        // mirrors the heuristic the title bar uses (last touched =
-        // current). When two Solutions share the same `last_opened_at`
-        // (e.g. fresh DB) we fall through to the first.
+        if let Some(id) = solution_id {
+            return store
+                .find_solution(solutions::SolutionId(id))
+                .ok()
+                .cloned();
+        }
         let mut best: Option<&Solution> = None;
         for sol in store.solutions() {
             best = Some(match best {
@@ -213,10 +216,11 @@ impl SolutionGitAggregator {
     fn plan_session(
         &self,
         query: &LogQuery,
+        solution_id: Option<i64>,
         members_filter: Option<&[SharedString]>,
         cx: &App,
     ) -> Option<SessionPlan> {
-        let solution = self.active_solution(cx)?;
+        let solution = self.target_solution(solution_id, cx)?;
         if solution.members.is_empty() {
             return None;
         }
@@ -337,11 +341,12 @@ impl LogDataSource for SolutionGitAggregator {
     fn fetch_log(
         &self,
         query: LogQuery,
+        solution_id: Option<i64>,
         members: Option<Vec<SharedString>>,
         range: std::ops::Range<usize>,
         cx: &mut App,
     ) -> Task<Result<Vec<AggregatedCommit>>> {
-        let plan = match self.plan_session(&query, members.as_deref(), cx) {
+        let plan = match self.plan_session(&query, solution_id, members.as_deref(), cx) {
             Some(p) => p,
             None => return Task::ready(Ok(Vec::new())),
         };

@@ -179,6 +179,7 @@ impl McpServerTool for AggregatedLogTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
+        let solution_id = input.solution_id;
         let (query, members, limit) = input.into_query();
         // `AsyncApp::update` returns the closure's return value directly.
         // The closure produces `Result<Task<Result<…>>, anyhow::Error>` so a
@@ -192,7 +193,7 @@ impl McpServerTool for AggregatedLogTool {
                      `solution_git::init` must run before this tool is invoked"
                 )
             })?;
-            Ok::<_, anyhow::Error>(source.fetch_log(query, members, 0..limit, cx))
+            Ok::<_, anyhow::Error>(source.fetch_log(query, solution_id, members, 0..limit, cx))
         })?;
         let commits: Vec<AggregatedCommit> = task.await?;
         let truncated = commits.len() >= limit;

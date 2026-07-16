@@ -650,10 +650,32 @@ fn active_solution(cx: &App) -> Option<Solution> {
     best.cloned()
 }
 
+/// Resolve the target Solution: by explicit id when the caller (or the
+/// per-solution socket's `solution_id` injection) supplied one, falling back
+/// to the most-recently-opened heuristic otherwise. Honoring the injected id
+/// is what keeps a scoped agent from reading/mutating ANOTHER Solution's
+/// repos when several Solutions are open — see `.rules` § two-tier sockets.
+fn target_solution(cx: &App, solution_id: Option<i64>) -> Result<Solution> {
+    if let Some(id) = solution_id {
+        let store = SolutionStore::try_global(cx)
+            .ok_or_else(|| anyhow!("no SolutionStore global"))?;
+        let store = store.read(cx);
+        return store
+            .find_solution(solutions::SolutionId(id))
+            .map(|s| s.clone())
+            .map_err(|_| anyhow!("solution {id} not found"));
+    }
+    active_solution(cx).ok_or_else(|| anyhow!("no active Solution"))
+}
+
 /// Resolve `members` filter (catalog ids; empty/None ⇒ all members of
-/// the active Solution) into `(member_id, work_dir)` pairs.
-fn resolve_targets(cx: &App, filter: Option<&[String]>) -> Result<Vec<(SharedString, PathBuf)>> {
-    let solution = active_solution(cx).ok_or_else(|| anyhow!("no active Solution"))?;
+/// the target Solution) into `(member_id, work_dir)` pairs.
+fn resolve_targets(
+    cx: &App,
+    solution_id: Option<i64>,
+    filter: Option<&[String]>,
+) -> Result<Vec<(SharedString, PathBuf)>> {
+    let solution = target_solution(cx, solution_id)?;
     let allowed: Option<std::collections::HashSet<&str>> =
         filter.map(|ids| ids.iter().map(String::as_str).collect());
     let pairs: Vec<(SharedString, PathBuf)> = solution
@@ -701,10 +723,10 @@ impl McpServerTool for StatusDashboardTool {
 
     async fn run(
         &self,
-        _input: Self::Input,
+        input: Self::Input,
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
-        let pairs = cx.update(|cx| resolve_targets(cx, None))?;
+        let pairs = cx.update(|cx| resolve_targets(cx, input.solution_id, None))?;
         let mut tasks = Vec::new();
         for (id, path) in pairs {
             tasks.push(cx.background_spawn(async move {
@@ -783,7 +805,7 @@ impl McpServerTool for BatchFetchTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
-        let pairs = cx.update(|cx| resolve_targets(cx, input.members.as_deref()))?;
+        let pairs = cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
         let mut tasks = Vec::new();
         for (id, path) in pairs {
             tasks.push(cx.background_spawn(async move {
@@ -825,7 +847,7 @@ impl McpServerTool for BatchPullTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
-        let pairs = cx.update(|cx| resolve_targets(cx, input.members.as_deref()))?;
+        let pairs = cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
         let skip_dirty = input.skip_dirty.unwrap_or(true);
         let mut tasks = Vec::new();
         for (id, path) in pairs {
@@ -902,7 +924,7 @@ impl McpServerTool for CheckoutPatternTool {
         if input.pattern.trim().is_empty() {
             return Err(anyhow!("`pattern` is required and must be non-empty"));
         }
-        let pairs = cx.update(|cx| resolve_targets(cx, input.members.as_deref()))?;
+        let pairs = cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
         let pattern = Arc::new(input.pattern);
 
         let mut classify_tasks = Vec::new();
