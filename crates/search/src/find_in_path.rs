@@ -1263,6 +1263,7 @@ impl Render for FindInPath {
                             .gap_1()
                             .child(
                                 search_bar::input_base_styles(cx.theme().colors().border, |d| d)
+                                    .flex_1()
                                     .child(search_bar::render_text_input(
                                         &self.query_editor,
                                         None,
@@ -1295,6 +1296,7 @@ impl Render for FindInPath {
                                         cx.theme().colors().border,
                                         |d| d,
                                     )
+                                    .flex_1()
                                     .child(search_bar::render_text_input(
                                         &self.replace_editor,
                                         None,
@@ -1321,11 +1323,14 @@ impl Render for FindInPath {
                     })
                     .child(self.render_scope_tabs(cx))
                     .child(
+                        // File mask / Exclude are secondary filters — keep them
+                        // compact and left-aligned (IDEA-style) rather than
+                        // stretching them across the full width; the query field
+                        // above is the one that should be wide.
                         h_flex()
-                            .gap_2()
+                            .gap_4()
                             .child(
                                 h_flex()
-                                    .flex_1()
                                     .gap_1()
                                     .child(
                                         Label::new("File mask")
@@ -1337,7 +1342,7 @@ impl Render for FindInPath {
                                             cx.theme().colors().border,
                                             |d| d,
                                         )
-                                        .flex_1()
+                                        .w_64()
                                         .child(search_bar::render_text_input(
                                             &self.included_files_editor,
                                             None,
@@ -1347,7 +1352,6 @@ impl Render for FindInPath {
                             )
                             .child(
                                 h_flex()
-                                    .flex_1()
                                     .gap_1()
                                     .child(
                                         Label::new("Exclude")
@@ -1359,7 +1363,7 @@ impl Render for FindInPath {
                                             cx.theme().colors().border,
                                             |d| d,
                                         )
-                                        .flex_1()
+                                        .w_64()
                                         .child(search_bar::render_text_input(
                                             &self.excluded_files_editor,
                                             None,
