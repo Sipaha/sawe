@@ -306,12 +306,14 @@ pub fn parse_task_notification(text: &str) -> Option<TaskNotification> {
 // Task 4 — `parse_kill_shell_input`
 // ---------------------------------------------------------------------------
 
-/// Extract the target shell id from a `KillShell` tool_call's `raw_input`.
-/// Accepts either `shell_id` or `bash_id` (string). Returns `None` if neither
-/// is a non-empty string.
+/// Extract the target shell id from a `KillShell`/`TaskStop` tool_call's
+/// `raw_input`. Accepts `task_id` (current TaskStop schema), `shell_id`
+/// (deprecated TaskStop alias / KillShell), or `bash_id` (string). Returns
+/// `None` if none is a non-empty string.
 pub fn parse_kill_shell_input(raw_input: &Value) -> Option<BackgroundShellId> {
     let id_str = raw_input
-        .get("shell_id")
+        .get("task_id")
+        .or_else(|| raw_input.get("shell_id"))
         .or_else(|| raw_input.get("bash_id"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())?;
@@ -545,6 +547,13 @@ mod tests {
         let input = serde_json::json!({"shell_id": "bvb4ful1z"});
         let result = parse_kill_shell_input(&input).unwrap();
         assert_eq!(result.as_str(), "bvb4ful1z");
+    }
+
+    #[test]
+    fn parse_kill_shell_input_task_id_key() {
+        let input = serde_json::json!({"task_id": "b56qcfq3o"});
+        let result = parse_kill_shell_input(&input).unwrap();
+        assert_eq!(result.as_str(), "b56qcfq3o");
     }
 
     #[test]

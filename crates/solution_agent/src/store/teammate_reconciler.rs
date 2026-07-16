@@ -837,23 +837,37 @@ impl SolutionAgentStore {
             }
         }
 
-        // `KillShell` terminal tool_call → mark the targeted background shell
-        // `Killed`. claude emits a `KillShell` ToolCall (Execute kind) whose
-        // `raw_input` carries the `shell_id`/`bash_id` of the shell to stop;
-        // when it completes, the shell is dead. Like the `Bash(bg)` branch
-        // above, this runs BEFORE the `is_task_like` early-return because
-        // `KillShell` is not in the `Task | Agent` set.
-        if snapshot.is_terminal && snapshot.tool_name.as_deref() == Some("KillShell") {
+        // `KillShell`/`TaskStop` terminal tool_call → mark the targeted
+        // background shell `Killed`. claude stops a background task with a
+        // `TaskStop` ToolCall (`KillShell` is the legacy spelling) whose
+        // `raw_input` carries the `task_id`/`shell_id`/`bash_id` of the shell
+        // to stop; when it completes, the shell is dead. A stop never produces
+        // a `<task-notification>`, so this tool_call is the ONLY terminal
+        // signal for a killed shell. Like the `Bash(bg)` branch above, this
+        // runs BEFORE the `is_task_like` early-return because neither name is
+        // in the `Task | Agent` set. (`TaskStop` also stops non-shell tasks —
+        // agents, monitors — hence the `background_shells` membership check.)
+        if snapshot.is_terminal
+            && matches!(
+                snapshot.tool_name.as_deref(),
+                Some("KillShell") | Some("TaskStop")
+            )
+        {
             if let Some(shell_id) = snapshot
                 .raw_input
                 .as_ref()
                 .and_then(crate::background_shell::parse_kill_shell_input)
             {
-                if session_entity
+                // Only a RUNNING shell can be killed — a late/failed stop on a
+                // shell that already exited must not clobber its exit status.
+                let is_running = session_entity
                     .read(cx)
                     .background_shells
-                    .contains_key(&shell_id)
-                {
+                    .get(&shell_id)
+                    .is_some_and(|shell| {
+                        shell.state == crate::background_shell::ShellRuntimeState::Running
+                    });
+                if is_running {
                     self.mark_background_shell_state(
                         session_id,
                         shell_id,

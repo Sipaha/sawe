@@ -908,6 +908,105 @@ async fn kill_shell_terminal_marks_shell_killed(cx: &mut TestAppContext) {
     );
 }
 
+/// `TaskStop` is the current spelling of `KillShell` and identifies the shell
+/// via `task_id` — a terminal `TaskStop` must flip the shell to `Killed` too
+/// (a stop never produces a `<task-notification>`, so this is the only
+/// terminal signal and the pill would otherwise read "running" forever).
+#[gpui::test]
+async fn task_stop_terminal_marks_shell_killed(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    register_background_shell(cx, session_id, "b56qcfq3o");
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            use agent_client_protocol::schema as acp;
+            let mut raw_input = serde_json::Map::new();
+            raw_input.insert(
+                "task_id".into(),
+                serde_json::Value::String("b56qcfq3o".into()),
+            );
+            let call = acp::ToolCall::new(
+                acp::ToolCallId::new("toolu_stop_1".to_string()),
+                "TaskStop".to_string(),
+            )
+            .kind(acp::ToolKind::Execute)
+            .status(acp::ToolCallStatus::Completed)
+            .meta(Some(acp_thread::meta_with_tool_name("TaskStop")))
+            .raw_input(serde_json::Value::Object(raw_input));
+            t.upsert_tool_call(call, cx).expect("upsert TaskStop");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session exists");
+        let s = session.read(cx);
+        let id = crate::background_shell::BackgroundShellId::new("b56qcfq3o");
+        let shell = s.background_shells.get(&id).expect("shell still tracked");
+        assert_eq!(
+            shell.state,
+            crate::background_shell::ShellRuntimeState::Killed,
+            "TaskStop tool_call flips the shell to Killed"
+        );
+    });
+}
+
+/// A late `TaskStop` on a shell that has already exited must NOT clobber the
+/// recorded exit status with `Killed` — only a `Running` shell can be killed.
+#[gpui::test]
+async fn task_stop_on_exited_shell_keeps_exit_status(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    register_background_shell(cx, session_id, "bexited01");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.mark_background_shell_state(
+                session_id,
+                crate::background_shell::BackgroundShellId::new("bexited01"),
+                crate::background_shell::ShellRuntimeState::Exited(Some(0)),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            use agent_client_protocol::schema as acp;
+            let mut raw_input = serde_json::Map::new();
+            raw_input.insert(
+                "task_id".into(),
+                serde_json::Value::String("bexited01".into()),
+            );
+            let call = acp::ToolCall::new(
+                acp::ToolCallId::new("toolu_stop_2".to_string()),
+                "TaskStop".to_string(),
+            )
+            .kind(acp::ToolKind::Execute)
+            .status(acp::ToolCallStatus::Completed)
+            .meta(Some(acp_thread::meta_with_tool_name("TaskStop")))
+            .raw_input(serde_json::Value::Object(raw_input));
+            t.upsert_tool_call(call, cx).expect("upsert TaskStop");
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session exists");
+        let s = session.read(cx);
+        let id = crate::background_shell::BackgroundShellId::new("bexited01");
+        let shell = s.background_shells.get(&id).expect("shell still tracked");
+        assert_eq!(
+            shell.state,
+            crate::background_shell::ShellRuntimeState::Exited(Some(0)),
+            "late TaskStop must not clobber a recorded exit status"
+        );
+    });
+}
+
 /// Task 8: a `<task-notification>` user-role message whose `<task-id>` matches
 /// a tracked background shell flips it to `Exited(Some(code))`. Drives the
 /// real NewEntry wiring: `push_user_content_block` appends a `UserMessage`
