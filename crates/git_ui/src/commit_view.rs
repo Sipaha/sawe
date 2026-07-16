@@ -392,7 +392,13 @@ impl CommitView {
         let compact = single_file.is_some();
         let language_registry = project.read(cx).languages().clone();
         let multibuffer = cx.new(|cx| {
-            let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
+            // Single-file mode shows exactly one file whose name is already in
+            // the tab — the multibuffer path header would be redundant chrome.
+            let mut multibuffer = if compact {
+                MultiBuffer::without_headers(Capability::ReadOnly)
+            } else {
+                MultiBuffer::new(Capability::ReadOnly)
+            };
             multibuffer.set_all_diff_hunks_expanded(cx);
             multibuffer
         });
