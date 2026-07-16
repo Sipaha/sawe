@@ -15,7 +15,7 @@ use any_vec::AnyVec;
 use collections::HashMap;
 use editor::{
     Editor, EditorSettings, MultiBufferOffset, SplittableEditor, ToggleSplitDiff,
-    actions::{Backtab, FoldAll, Tab, ToggleFoldAll, UnfoldAll},
+    actions::{Backtab, FoldAll, GoToHunk, GoToPreviousHunk, Tab, ToggleFoldAll, UnfoldAll},
     scroll::Autoscroll,
 };
 use futures::channel::oneshot;
@@ -130,6 +130,47 @@ impl Render for BufferSearchBar {
 
                     h_flex()
                         .gap_1()
+                        // IDEA puts change navigation first in a diff toolbar.
+                        .child(
+                            IconButton::new("diff-prev-hunk", IconName::ArrowUp)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Go to previous hunk"))
+                                .on_click({
+                                    let splittable_editor = splittable_editor.downgrade();
+                                    move |_, window, cx| {
+                                        splittable_editor
+                                            .update(cx, |editor, cx| {
+                                                let rhs = editor.rhs_editor().clone();
+                                                rhs.focus_handle(cx).focus(window, cx);
+                                                window.dispatch_action(
+                                                    GoToPreviousHunk.boxed_clone(),
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                    }
+                                }),
+                        )
+                        .child(
+                            IconButton::new("diff-next-hunk", IconName::ArrowDown)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Go to next hunk"))
+                                .on_click({
+                                    let splittable_editor = splittable_editor.downgrade();
+                                    move |_, window, cx| {
+                                        splittable_editor
+                                            .update(cx, |editor, cx| {
+                                                let rhs = editor.rhs_editor().clone();
+                                                rhs.focus_handle(cx).focus(window, cx);
+                                                window.dispatch_action(
+                                                    GoToHunk.boxed_clone(),
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                    }
+                                }),
+                        )
                         .child(
                             IconButton::new("diff-unified", IconName::DiffUnified)
                                 .icon_size(IconSize::Small)

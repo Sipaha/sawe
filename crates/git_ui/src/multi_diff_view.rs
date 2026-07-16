@@ -310,8 +310,10 @@ impl Item for MultiDiffView {
             .update(cx, |editor, cx| editor.navigate(data, window, cx))
     }
 
-    fn breadcrumb_location(&self, _: &App) -> ToolbarItemLocation {
-        ToolbarItemLocation::PrimaryLeft
+    fn breadcrumb_location(&self, cx: &App) -> ToolbarItemLocation {
+        // Defer to the embedded editor: respects `toolbar.breadcrumbs`
+        // (hidden by default in this fork — the tab already names the file).
+        self.editor.breadcrumb_location(cx)
     }
 
     fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<Font>)> {

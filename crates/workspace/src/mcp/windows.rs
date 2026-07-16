@@ -704,6 +704,114 @@ fn dispatch_mouse_click(
 }
 
 // =====================================================================
+// windows.drag_at
+// =====================================================================
+
+/// Drag the mouse from one point to another: MouseDown at (from_x, from_y),
+/// interpolated MouseMove events with the button pressed, MouseUp at
+/// (to_x, to_y). Drives drag-to-resize handles (e.g. the split-diff divider)
+/// and drag-and-drop UI programmatically. Coordinates are window-relative
+/// logical pixels, top-left origin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct DragAtParams {
+    pub window_id: String,
+    pub from_x: f32,
+    pub from_y: f32,
+    pub to_x: f32,
+    pub to_y: f32,
+    /// Number of intermediate MouseMove events (default 8, clamped 1..=64).
+    pub steps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DragAtResult {
+    pub dragged: bool,
+}
+
+#[derive(Clone)]
+pub struct DragAtTool;
+
+impl McpServerTool for DragAtTool {
+    type Input = DragAtParams;
+    type Output = DragAtResult;
+    const NAME: &'static str = "windows.drag_at";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        let steps = input.steps.unwrap_or(8).clamp(1, 64);
+        let from = Point::new(px(input.from_x), px(input.from_y));
+        let to = Point::new(px(input.to_x), px(input.to_y));
+        cx.update(|cx| -> anyhow::Result<()> {
+            let handle = find_window_by_id(&input.window_id, cx)?;
+            handle
+                .update(cx, |_view, window, cx| {
+                    let modifiers = Modifiers::default();
+                    // Rest the cursor on the start point first so the target's
+                    // hitbox is hovered when the press lands — GPUI only arms
+                    // a drag from a MouseDown on a hovered hitbox.
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: from,
+                            pressed_button: None,
+                            modifiers,
+                        }),
+                        cx,
+                    );
+                    window.dispatch_event(
+                        PlatformInput::MouseDown(MouseDownEvent {
+                            position: from,
+                            modifiers,
+                            button: MouseButton::Left,
+                            click_count: 1,
+                            first_mouse: false,
+                        }),
+                        cx,
+                    );
+                    for step in 1..=steps {
+                        let t = step as f32 / steps as f32;
+                        let position = Point::new(
+                            from.x + (to.x - from.x) * t,
+                            from.y + (to.y - from.y) * t,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position,
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers,
+                            }),
+                            cx,
+                        );
+                    }
+                    window.dispatch_event(
+                        PlatformInput::MouseUp(MouseUpEvent {
+                            position: to,
+                            modifiers,
+                            button: MouseButton::Left,
+                            click_count: 1,
+                        }),
+                        cx,
+                    );
+                })
+                .map_err(|err| anyhow::anyhow!("drag_at dispatch failed: {err}"))?;
+            Ok(())
+        })?;
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: format!(
+                    "drag from ({}, {}) to ({}, {})",
+                    input.from_x, input.from_y, input.to_x, input.to_y
+                ),
+            }],
+            structured_content: DragAtResult { dragged: true },
+        })
+    }
+}
+
+// =====================================================================
 // windows.scroll_at
 // =====================================================================
 
@@ -1323,6 +1431,21 @@ mod tests {
         }))
         .expect("parse");
         assert_eq!(p.text, "hello");
+    }
+
+    #[test]
+    fn drag_at_params_default_steps() {
+        let p: DragAtParams = serde_json::from_value(serde_json::json!({
+            "window_id": "window:1",
+            "from_x": 100.0,
+            "from_y": 50.0,
+            "to_x": 200.0,
+            "to_y": 60.0
+        }))
+        .expect("parse");
+        assert_eq!(p.from_x, 100.0);
+        assert_eq!(p.to_x, 200.0);
+        assert!(p.steps.is_none());
     }
 
     #[test]

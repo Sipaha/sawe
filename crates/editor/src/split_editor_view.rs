@@ -26,7 +26,7 @@ use crate::{
     split::SplittableEditor,
 };
 
-const RESIZE_HANDLE_WIDTH: f32 = 8.0;
+const RESIZE_HANDLE_WIDTH: f32 = 12.0;
 
 #[derive(Debug, Clone)]
 struct DraggedSplitHandle;

@@ -445,8 +445,10 @@ impl Item for SoloDiffView {
         })
     }
 
-    fn breadcrumb_location(&self, _: &App) -> ToolbarItemLocation {
-        ToolbarItemLocation::PrimaryLeft
+    fn breadcrumb_location(&self, cx: &App) -> ToolbarItemLocation {
+        // Defer to the embedded editor: respects `toolbar.breadcrumbs`
+        // (hidden by default in this fork — the tab already names the file).
+        self.editor.breadcrumb_location(cx)
     }
 
     fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<gpui::Font>)> {
@@ -562,11 +564,23 @@ impl ToolbarItemView for SoloDiffStyleToolbar {
     }
 }
 
+impl SoloDiffStyleToolbar {
+    fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(solo_diff) = self.solo_diff() {
+            solo_diff.update(cx, |solo_diff, cx| {
+                solo_diff.dispatch_action(action, window, cx);
+            });
+        }
+    }
+}
+
 impl Render for SoloDiffStyleToolbar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(solo_diff) = self.solo_diff() else {
             return div();
         };
+        let focus_handle = solo_diff.focus_handle(cx);
+        let prev_next = solo_diff.read(cx).button_states(cx).prev_next;
         let editor_entity = solo_diff.read(cx).editor.clone();
         let editor = editor_entity.read(cx);
         let diff_view_style = editor.diff_view_style();
@@ -581,6 +595,34 @@ impl Render for SoloDiffStyleToolbar {
             .h_8()
             .items_center()
             .gap_1()
+            // IDEA puts change navigation first in the diff toolbar.
+            .child(
+                IconButton::new("solo-diff-prev", IconName::ArrowUp)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::for_action_title_in(
+                        "Go to previous hunk",
+                        &GoToPreviousHunk,
+                        &focus_handle,
+                    ))
+                    .disabled(!prev_next)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&GoToPreviousHunk, window, cx)
+                    })),
+            )
+            .child(
+                IconButton::new("solo-diff-next", IconName::ArrowDown)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::for_action_title_in(
+                        "Go to next hunk",
+                        &GoToHunk,
+                        &focus_handle,
+                    ))
+                    .disabled(!prev_next)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&GoToHunk, window, cx)
+                    })),
+            )
+            .child(vertical_divider())
             .child(
                 IconButton::new("solo-diff-unified", IconName::DiffUnified)
                     .icon_size(IconSize::Small)
@@ -746,35 +788,6 @@ impl Render for SoloDiffGitToolbar {
                             .disabled(!button_states.restore)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dispatch_action(&Restore, window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                h_group_sm()
-                    .child(
-                        IconButton::new("up", IconName::ArrowUp)
-                            .shape(IconButtonShape::Square)
-                            .tooltip(Tooltip::for_action_title_in(
-                                "Go to previous hunk",
-                                &GoToPreviousHunk,
-                                &focus_handle,
-                            ))
-                            .disabled(!button_states.prev_next)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dispatch_action(&GoToPreviousHunk, window, cx)
-                            })),
-                    )
-                    .child(
-                        IconButton::new("down", IconName::ArrowDown)
-                            .shape(IconButtonShape::Square)
-                            .tooltip(Tooltip::for_action_title_in(
-                                "Go to next hunk",
-                                &GoToHunk,
-                                &focus_handle,
-                            ))
-                            .disabled(!button_states.prev_next)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dispatch_action(&GoToHunk, window, cx)
                             })),
                     ),
             )

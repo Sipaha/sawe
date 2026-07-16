@@ -3686,8 +3686,16 @@ impl EditorElement {
             };
 
             if block.style == BlockStyle::Spacer {
+                // Spacers start where the text area starts — after the gutter
+                // only when the gutter is on the left (a split-diff left pane
+                // right-aligns its gutter).
+                let gutter_offset = if gutter_hitbox.left() <= hitbox.left() {
+                    gutter_hitbox.size.width
+                } else {
+                    Pixels::ZERO
+                };
                 origin += point(
-                    gutter_hitbox.size.width + editor_margins.gutter.margin,
+                    gutter_offset + editor_margins.gutter.margin,
                     Pixels::ZERO,
                 );
             }
@@ -4861,8 +4869,11 @@ impl EditorElement {
                     if show_active_line_background && !contains_non_empty_selection.selection {
                         let highlight_h_range =
                             match layout.position_map.snapshot.current_line_highlight {
+                                // The gutter band (equals hitbox.left()..gutter.right()
+                                // for the usual left-aligned gutter; stays correct when
+                                // a split-diff left pane right-aligns its gutter).
                                 CurrentLineHighlight::Gutter => Some(Range {
-                                    start: layout.hitbox.left(),
+                                    start: layout.gutter_hitbox.left(),
                                     end: layout.gutter_hitbox.right(),
                                 }),
                                 CurrentLineHighlight::Line => Some(Range {
@@ -4906,7 +4917,11 @@ impl EditorElement {
                     let mut origin_x = layout.hitbox.left();
                     let mut width = layout.hitbox.size.width;
                     if !highlight.include_gutter {
-                        origin_x += layout.gutter_hitbox.size.width;
+                        // Exclude the gutter band wherever it sits: shift the
+                        // origin only when the gutter is on the left.
+                        if layout.gutter_hitbox.left() <= layout.hitbox.left() {
+                            origin_x += layout.gutter_hitbox.size.width;
+                        }
                         width -= layout.gutter_hitbox.size.width;
                     }
 
@@ -6432,9 +6447,8 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let bounds = text_area_mask_bounds(layout);
         for mut block in layout.spacer_blocks.drain(..) {
-            let mut bounds = layout.hitbox.bounds;
-            bounds.origin.x += layout.gutter_hitbox.bounds.size.width;
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 block.element.paint(window, cx);
             })
@@ -6447,13 +6461,12 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let mask_bounds = text_area_mask_bounds(layout);
         for mut block in layout.blocks.drain(..) {
             if block.overlaps_gutter {
                 block.element.paint(window, cx);
             } else {
-                let mut bounds = layout.hitbox.bounds;
-                bounds.origin.x += layout.gutter_hitbox.bounds.size.width;
-                window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                window.with_content_mask(Some(ContentMask { bounds: mask_bounds }), |window| {
                     block.element.paint(window, cx);
                 })
             }
@@ -7986,13 +7999,18 @@ impl Element for EditorElement {
                     });
 
                     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+                    let gutter_right_aligned = self.split_side == Some(SplitSide::Left);
                     let gutter_hitbox = window.insert_hitbox(
-                        gutter_bounds(bounds, gutter_dimensions),
+                        gutter_bounds(bounds, gutter_dimensions, gutter_right_aligned),
                         HitboxBehavior::Normal,
                     );
                     let text_hitbox = window.insert_hitbox(
                         Bounds {
-                            origin: gutter_hitbox.top_right(),
+                            origin: if gutter_right_aligned {
+                                bounds.origin
+                            } else {
+                                gutter_hitbox.top_right()
+                            },
                             size: size(text_width, bounds.size.height),
                         },
                         HitboxBehavior::Normal,
@@ -9437,12 +9455,35 @@ impl Element for EditorElement {
     }
 }
 
+/// The editor hitbox minus the gutter band, wherever the gutter sits (a
+/// split-diff left pane right-aligns its gutter). Used to mask block
+/// decorations out of the gutter area.
+fn text_area_mask_bounds(layout: &EditorLayout) -> Bounds<Pixels> {
+    let mut bounds = layout.hitbox.bounds;
+    bounds.size.width -= layout.gutter_hitbox.bounds.size.width;
+    if layout.gutter_hitbox.left() <= layout.hitbox.left() {
+        bounds.origin.x += layout.gutter_hitbox.bounds.size.width;
+    }
+    bounds
+}
+
 pub(super) fn gutter_bounds(
     editor_bounds: Bounds<Pixels>,
     gutter_dimensions: GutterDimensions,
+    right_aligned: bool,
 ) -> Bounds<Pixels> {
+    // IDEA-style split diff: the LEFT pane's gutter sits at its RIGHT edge so
+    // both panes' line numbers meet at the divider.
+    let origin = if right_aligned {
+        point(
+            editor_bounds.right() - gutter_dimensions.width,
+            editor_bounds.origin.y,
+        )
+    } else {
+        editor_bounds.origin
+    };
     Bounds {
-        origin: editor_bounds.origin,
+        origin,
         size: size(gutter_dimensions.width, editor_bounds.size.height),
     }
 }

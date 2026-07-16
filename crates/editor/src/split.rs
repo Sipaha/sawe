@@ -515,6 +515,11 @@ impl SplittableEditor {
             editor.disable_mouse_wheel_zoom();
             editor.set_minimap_visibility(crate::MinimapVisibility::Disabled, window, cx);
             editor.start_temporary_diff_override();
+            // Diff views are for reviewing changes — breakpoint/bookmark
+            // gutter affordances (and the hover "add breakpoint" dot) are
+            // out of place in every SplittableEditor consumer.
+            editor.set_show_breakpoints(false, cx);
+            editor.set_show_bookmarks(false, cx);
             editor
         });
         // TODO(split-diff) we might want to tag editor events with whether they came from rhs/lhs
