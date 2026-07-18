@@ -56,6 +56,23 @@ impl SolutionAgentStore {
                     // resumed on its own — re-arm supervision so the status stops
                     // hanging at "waiting for user" while the agent works again.
                     self.rearm_supervisor_on_self_activity(session_id, cx);
+                    // External usage-limit lift: a claude limit can clear EARLY
+                    // (the user tops up quota / an external reset) rather than at
+                    // the scheduled reset time the wall announced. `apply_usage_
+                    // limit_stop` parks the supervisor in `Watching` with
+                    // `next_eligible_ms = reset+jitter`, and `rearm_…` above
+                    // early-returns for `Watching`, so that gate would otherwise
+                    // survive until the (now-wrong) scheduled time even while the
+                    // agent is visibly working again. Any genuine activity that is
+                    // NOT itself a wall proves requests are flowing, so drop the
+                    // gate now — don't wait for the full `Stopped` (a long resumed
+                    // turn keeps the supervisor parked for its whole duration
+                    // otherwise). A genuine re-hit arrives AS a wall message (and
+                    // never reaches `Stopped`), so the gate must survive that: skip
+                    // the clear when the latest message is a wall.
+                    if self.session_wall_message(session_id, cx).is_none() {
+                        self.clear_resume_gate_on_agent_response(session_id, cx);
+                    }
                 }
                 // First user message appends a NewEntry — refresh DB so the
                 // History popover preview stops being NULL.

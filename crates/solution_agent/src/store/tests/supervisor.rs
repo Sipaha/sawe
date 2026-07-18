@@ -2669,6 +2669,93 @@ async fn successful_turn_clears_pending_usage_limit_resume_gate(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn agent_activity_clears_usage_limit_gate_on_external_reset(cx: &mut TestAppContext) {
+    // A usage limit can clear EARLY (the user tops up quota) rather than at the
+    // announced reset time. `apply_usage_limit_stop` parks the supervisor in
+    // `Watching` with `next_eligible_ms` in the future; the agent resuming work
+    // (any genuine, non-wall activity) proves requests flow again and must drop
+    // that gate NOW — not wait for the stale scheduled time (nor for the full
+    // `Stopped`, which may be a long turn away).
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| arm_resume_gate(store, session_id));
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "Continuing the build…".to_string(),
+                    ),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.next_eligible_ms, None,
+                "non-wall agent activity must clear the gate (external limit lift)",
+            );
+            assert!(
+                !store.backoff_timers.contains_key(&session_id),
+                "resume wake timer must be removed when the agent resumes",
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn agent_wall_message_keeps_usage_limit_gate(cx: &mut TestAppContext) {
+    // The other half: if the "activity" IS the wall itself (a genuine re-hit —
+    // the agent immediately hit the limit again), the gate must SURVIVE. A
+    // re-hit never reaches `Stopped`, so clearing here would strand supervision.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| arm_resume_gate(store, session_id));
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "You've hit your session limit · resets 8:20pm".to_string(),
+                    ),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert!(
+                st.next_eligible_ms.is_some(),
+                "a wall re-hit (activity that is itself the wall) must keep the gate",
+            );
+            assert!(
+                store.backoff_timers.contains_key(&session_id),
+                "resume wake timer must survive a wall re-hit",
+            );
+        });
+    });
+}
+
+#[gpui::test]
 async fn rehit_error_keeps_pending_usage_limit_resume_gate(cx: &mut TestAppContext) {
     // #7 (the other half): a NEW user message that re-hits the wall surfaces as
     // `AcpThreadEvent::Error` (not `Stopped`), so the pending resume gate must
