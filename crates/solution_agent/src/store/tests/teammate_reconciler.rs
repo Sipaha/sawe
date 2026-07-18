@@ -1744,6 +1744,20 @@ fn reconcile_toolcall_entry(
     }
 }
 
+/// Like [`reconcile_toolcall_entry`] but with an explicit `run_in_background`
+/// flag in `raw_input` — for the sync-vs-async `Agent` distinction.
+fn reconcile_agent_toolcall_entry(
+    id: &str,
+    status: crate::session_entry::ToolStatus,
+    run_in_background: bool,
+) -> crate::session_entry::SessionEntry {
+    let mut entry = reconcile_toolcall_entry(id, "Agent", status);
+    if let crate::session_entry::SessionEntryKind::ToolCall { raw_input, .. } = &mut entry.kind {
+        *raw_input = Some(serde_json::json!({ "run_in_background": run_in_background }));
+    }
+    entry
+}
+
 /// Build a teammate body entry tagged with `toolu` — this is what the demux
 /// turns into a `Teammate(toolu)` stream.
 fn reconcile_tagged_body(toolu: &str) -> crate::session_entry::SessionEntry {
@@ -1814,6 +1828,112 @@ async fn reconcile_closes_finished_inline_task_teammate_mid_session(cx: &mut Tes
             assert!(
                 !matches!(s.state, SessionState::Idle),
                 "guard: the session never went Idle"
+            );
+        });
+    });
+}
+
+/// A SYNCHRONOUS `Agent` (`run_in_background: false`) blocks like an inline
+/// `Task`: its terminal spawn tool-call means the subagent finished and its
+/// teammate stream MUST close. Keying off `tool_name == "Agent"` alone kept
+/// every synchronous-`Agent` tab open forever (the reported pile-up).
+#[gpui::test]
+async fn reconcile_closes_finished_synchronous_agent_teammate(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let toolu = "toolu_sync_agent";
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from(toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            s.teammate_labels
+                .insert(SharedString::from(toolu), SharedString::from("Worker"));
+            s.set_entries(
+                vec![
+                    reconcile_agent_toolcall_entry(
+                        toolu,
+                        crate::session_entry::ToolStatus::Completed,
+                        false, // run_in_background: false → synchronous
+                    ),
+                    reconcile_tagged_body(toolu),
+                ],
+                cx,
+            );
+            assert!(s.streams.contains_key(&teammate));
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reconcile_finished_teammate_streams(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "a terminal synchronous Agent teammate must be reconciled closed",
+            );
+        });
+    });
+}
+
+/// An ASYNC `Agent` (`run_in_background: true`) flips its spawn tool-call to
+/// terminal at spawn-ack while the teammate keeps streaming — the reconcile
+/// must NOT close it here (its background_agent GC owns the close).
+#[gpui::test]
+async fn reconcile_keeps_async_agent_spawn_ack_teammate(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let toolu = "toolu_async_agent";
+    let teammate = crate::stream::StreamId::Teammate(SharedString::from(toolu));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            s.teammate_labels
+                .insert(SharedString::from(toolu), SharedString::from("Worker"));
+            s.set_entries(
+                vec![
+                    reconcile_agent_toolcall_entry(
+                        toolu,
+                        crate::session_entry::ToolStatus::Completed,
+                        true, // run_in_background: true → async spawn-ack
+                    ),
+                    reconcile_tagged_body(toolu),
+                ],
+                cx,
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reconcile_finished_teammate_streams(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                s.streams.contains_key(&teammate),
+                "an async Agent spawn-ack teammate must survive (its bg-agent GC closes it)",
             );
         });
     });

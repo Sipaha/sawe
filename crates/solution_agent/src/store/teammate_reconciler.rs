@@ -914,20 +914,27 @@ impl SolutionAgentStore {
             // a status flip on a cold→live transition) is a no-op.
             let tracked = session_entity.read(cx).teammate_labels.contains_key(&id);
             if tracked {
-                // Terminal status is a GENUINE "teammate done" signal ONLY for an
-                // inline `Task` (its tool-call stays InProgress for the whole run
-                // and completes only when the Task finishes). An async `Agent`
-                // teammate's spawn tool-call flips to Completed IMMEDIATELY at
-                // spawn-ack while the teammate keeps streaming `subagent_id`-tagged
-                // entries into the parent thread for minutes — so closing its
-                // demux `Teammate` stream here would suppress the still-live
-                // teammate (decision #5: the parent-thread demux IS its source of
-                // truth). So auto-close the stream for `Task` only; the async
-                // `Agent`'s real done-signal (stop_reason / completion) drives its
-                // close in a later phase. `close_stream` reclaims the inline Task's
-                // `teammate_labels` entry; the async `Agent` keeps its label (its
-                // stream stays open past spawn-ack) and reclaims it on its own close.
-                let is_async_agent = tool_name_is_agent(snapshot.tool_name.as_deref());
+                // Terminal status is a GENUINE "teammate done" signal for an
+                // inline `Task` AND for a SYNCHRONOUS `Agent`
+                // (`run_in_background: false`) — both block for the whole run and
+                // their tool-call completes only when the subagent finishes. It
+                // is NOT a done signal for an ASYNC `Agent` (background): its
+                // spawn tool-call flips to Completed IMMEDIATELY at spawn-ack
+                // while the teammate keeps streaming `subagent_id`-tagged entries
+                // into the parent thread for minutes — closing its demux stream
+                // here would suppress the still-live teammate (decision #5). So
+                // auto-close on terminal for everything EXCEPT an async `Agent`,
+                // whose real done-signal (stop_reason / completion) drives its
+                // close later. Keying off tool_name alone kept every synchronous-
+                // `Agent` teammate tab open forever (the pile-up this fixes) —
+                // `run_in_background` is what actually distinguishes them.
+                let is_async_agent = tool_name_is_agent(snapshot.tool_name.as_deref())
+                    && snapshot
+                        .raw_input
+                        .as_ref()
+                        .and_then(|v| v.get("run_in_background"))
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(false);
                 session_entity.update(cx, |s, _| {
                     if !is_async_agent {
                         s.close_stream(
@@ -1366,15 +1373,17 @@ impl SolutionAgentStore {
                     // else: fresh async teammate still streaming → keep.
                     continue;
                 }
-                // Not a registered async agent → an inline `Task` or an orphan.
+                // Not a registered async agent → an inline `Task`, a
+                // synchronous `Agent`, or an orphan.
                 let toolcall = s.entries.iter().find_map(|e| match &e.kind {
                     crate::session_entry::SessionEntryKind::ToolCall {
                         id,
                         status,
                         tool_name,
+                        raw_input,
                         ..
                     } if id.as_str() == toolu.as_ref() => {
-                        Some((status.clone(), tool_name.clone()))
+                        Some((status.clone(), tool_name.clone(), raw_input.clone()))
                     }
                     _ => None,
                 });
@@ -1384,19 +1393,33 @@ impl SolutionAgentStore {
                         // removed) and this is not a live async agent → orphaned.
                         to_close.push((toolu, gpui::SharedString::new_static("orphaned")));
                     }
-                    Some((status, tool_name)) => {
-                        if tool_name_is_agent(tool_name.as_deref()) {
-                            // Spawn-ack terminal on an async `Agent` whose
-                            // background_agent registration hasn't landed yet:
-                            // the teammate keeps streaming. Keep it — the async
-                            // branch (once registered) or the background-agent GC
-                            // owns its real close. Closing here is the pre-6c
-                            // premature-close bug.
+                    Some((status, tool_name, raw_input)) => {
+                        // An `Agent` spawn is ASYNC only when `run_in_background`
+                        // is not explicitly `false` (the tool defaults to
+                        // background). A SYNCHRONOUS `Agent` (`run_in_background:
+                        // false`) blocks like an inline `Task` — it produces no
+                        // `output_file` announcement, so no `background_agent` is
+                        // ever registered, and its stream must close on the
+                        // terminal tool-call. Keying off the tool_name alone kept
+                        // every synchronous-`Agent` teammate tab open forever,
+                        // waiting for a registration that never comes (the pile-up
+                        // this fixes). An async `Agent` still keeps streaming —
+                        // its background_agent registration / GC owns the close
+                        // (closing here is the pre-6c premature-close bug).
+                        let is_async_agent = tool_name_is_agent(tool_name.as_deref())
+                            && raw_input
+                                .as_ref()
+                                .and_then(|v| v.get("run_in_background"))
+                                .and_then(serde_json::Value::as_bool)
+                                != Some(false);
+                        if is_async_agent {
+                            // Async spawn-ack: keep, the bg-agent path owns close.
                         } else if status.is_terminal() {
-                            // Rule 2: inline `Task` tool-call terminal → done.
+                            // Rule 2: inline `Task` OR synchronous `Agent`
+                            // tool-call terminal → done.
                             to_close.push((toolu, gpui::SharedString::new_static("done")));
                         }
-                        // else: live inline `Task` (non-terminal) → keep.
+                        // else: live inline `Task` / sync `Agent` (non-terminal).
                     }
                 }
             }
