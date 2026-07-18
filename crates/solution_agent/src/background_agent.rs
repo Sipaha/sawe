@@ -154,6 +154,11 @@ pub struct BackgroundAgent {
 /// "done": the agent was reaped mid-flight.
 pub const KILLED_REASON: SharedString = SharedString::new_static("killed");
 
+/// Close reason recorded on a teammate that hit a claude usage/session-limit
+/// wall. Distinct from "done" (didn't finish) and "killed" (subprocess
+/// replaced): the work is paused at the wall, awaiting the reset.
+pub const USAGE_LIMIT_REASON: SharedString = SharedString::new_static("limit reached");
+
 impl BackgroundAgent {
     /// True while the managed agent is still running — no terminal
     /// `stop_reason` has been observed in its JSONL yet (or it has only
@@ -165,10 +170,17 @@ impl BackgroundAgent {
     /// would suppress the stuck-session watchdog forever after a reconnect.
     pub fn is_messageable(&self) -> bool {
         !self.killed
+            && !self.hit_usage_limit()
             && self
                 .latest
                 .as_ref()
                 .map_or(true, |snapshot| snapshot.stop_reason.is_none())
+    }
+
+    /// True once this agent's last snapshot is a claude usage-limit wall — a
+    /// distinct terminal outcome (see [`BackgroundAgentSnapshot::usage_limited`]).
+    pub fn hit_usage_limit(&self) -> bool {
+        self.latest.as_ref().is_some_and(|s| s.usage_limited)
     }
 
     /// Whether this agent still contributes a derived teammate stream to the
@@ -178,7 +190,7 @@ impl BackgroundAgent {
     /// `stop_reason` is dropped straight away (`tick_background_agents` removes
     /// it from the map on the next pass) — its transcript ended normally.
     pub fn renders_stream(&self) -> bool {
-        self.killed || self.is_messageable()
+        self.killed || self.hit_usage_limit() || self.is_messageable()
     }
 
     /// Render state of this agent's derived teammate stream.
@@ -186,6 +198,10 @@ impl BackgroundAgent {
         if self.killed {
             crate::stream::StreamState::Done {
                 reason: KILLED_REASON,
+            }
+        } else if self.hit_usage_limit() {
+            crate::stream::StreamState::Done {
+                reason: USAGE_LIMIT_REASON,
             }
         } else {
             crate::stream::StreamState::Live
@@ -214,6 +230,8 @@ impl BackgroundAgent {
         };
         let state_label = if self.killed {
             "killed"
+        } else if self.hit_usage_limit() {
+            "limit reached"
         } else if done {
             "done"
         } else {
@@ -229,6 +247,12 @@ impl BackgroundAgent {
             format!(
                 "{activity}\n\nKilled: the parent claude process was restarted \
                  (reconnect). This background agent did NOT finish its work."
+            )
+        } else if self.hit_usage_limit() {
+            format!(
+                "{activity}\n\nЛимит claude достигнут — этот фоновый агент \
+                 остановлен и не завершил работу. Наблюдатель перезапустит \
+                 после сброса лимита."
             )
         } else {
             activity
@@ -278,6 +302,14 @@ pub struct BackgroundAgentSnapshot {
     pub mtime: SystemTime,
     pub activity_label: SharedString,
     pub stop_reason: Option<SharedString>,
+    /// The last assistant message is a claude usage/session-limit wall
+    /// ("You've hit your session limit · resets 12:50pm"). The subagent is
+    /// dead-in-place: it hit the wall and will emit no terminal `stop_reason`
+    /// (the wall isn't `end_turn`), so without recognising it here the teammate
+    /// tab spins "Thinking…" until the 2-minute stale reaper — 30 minutes of a
+    /// visibly-dead tab in practice. Treated as a distinct terminal outcome
+    /// (like `killed`): the tab immediately goes `Done { limit }`, spinner off.
+    pub usage_limited: bool,
 }
 
 /// 64 KiB cap on individual JSONL line size. A claude tool_use entry
@@ -324,6 +356,7 @@ pub fn parse_jsonl_snapshot(line: &str) -> BackgroundAgentSnapshot {
                     mtime: SystemTime::now(),
                     activity_label: SharedString::new_static("Starting…"),
                     stop_reason: None,
+                    usage_limited: false,
                 }
             } else {
                 generating_snapshot()
@@ -336,11 +369,20 @@ pub fn parse_jsonl_snapshot(line: &str) -> BackgroundAgentSnapshot {
                 .and_then(Value::as_str)
                 .filter(|s| is_terminal_stop_reason(s))
                 .map(SharedString::from);
-            let label = derive_assistant_label(&message);
+            // A usage-limit wall arrives as an ordinary assistant TEXT message
+            // (no terminal `stop_reason`), so classify it from the message text.
+            let usage_limited = assistant_text(&message)
+                .is_some_and(|text| crate::supervisor::is_usage_limit_error(&text));
+            let label = if usage_limited {
+                SharedString::new_static("Достигнут лимит claude")
+            } else {
+                derive_assistant_label(&message)
+            };
             BackgroundAgentSnapshot {
                 mtime: SystemTime::now(),
                 activity_label: label,
                 stop_reason,
+                usage_limited,
             }
         }
         _ => generating_snapshot(),
@@ -352,7 +394,24 @@ fn generating_snapshot() -> BackgroundAgentSnapshot {
         mtime: SystemTime::now(),
         activity_label: SharedString::new_static("Generating…"),
         stop_reason: None,
+        usage_limited: false,
     }
+}
+
+/// Concatenate the `text` blocks of an assistant message (usage-limit walls
+/// arrive as plain text, not `tool_use`). `None` when there is no text.
+fn assistant_text(message: &Value) -> Option<String> {
+    let content = message.get("content").and_then(Value::as_array)?;
+    let mut out = String::new();
+    for block in content {
+        if block.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(text) = block.get("text").and_then(Value::as_str)
+        {
+            out.push_str(text);
+            out.push('\n');
+        }
+    }
+    (!out.trim().is_empty()).then_some(out)
 }
 
 fn derive_assistant_label(message: &Value) -> SharedString {
@@ -874,6 +933,57 @@ mod tests {
         assert!(
             snap.stop_reason.is_none(),
             "a tool_use stop means the agent loop continues"
+        );
+    }
+
+    /// A usage/session-limit wall arrives as a plain assistant TEXT message
+    /// with no terminal `stop_reason`. It must be flagged `usage_limited` so the
+    /// teammate tab goes terminal (`Done { limit reached }`, spinner off) at
+    /// once instead of spinning "Thinking…" until the 2-minute stale reaper.
+    #[test]
+    fn parse_jsonl_snapshot_usage_limit_wall_is_flagged() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm (Asia/Novosibirsk)"}]}}"#;
+        let snap = parse_jsonl_snapshot(line);
+        assert!(snap.usage_limited, "the session-limit wall must be recognised");
+        assert!(
+            snap.stop_reason.is_none(),
+            "the wall carries no terminal stop_reason — usage_limited is the signal"
+        );
+    }
+
+    #[test]
+    fn ordinary_assistant_text_is_not_usage_limited() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"added rate limit handling to the client"}]}}"#;
+        let snap = parse_jsonl_snapshot(line);
+        assert!(
+            !snap.usage_limited,
+            "prose mentioning rate limits must not trip the wall detector"
+        );
+    }
+
+    #[test]
+    fn usage_limited_agent_is_terminal_not_live() {
+        let mut agent = BackgroundAgent {
+            id: BackgroundAgentId::new("a30f92a688e431edc"),
+            jsonl_path: PathBuf::from("/tmp/x.jsonl"),
+            registered_at: Utc::now(),
+            latest: None,
+            last_offset: 0,
+            parent_tool_use_id: Some(SharedString::new_static("toolu_1")),
+            latest_seq: 0,
+            killed: false,
+        };
+        agent.latest = Some(parse_jsonl_snapshot(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm"}]}}"#,
+        ));
+        assert!(agent.hit_usage_limit());
+        assert!(!agent.is_messageable(), "a walled agent is not live work");
+        assert!(agent.renders_stream(), "but its tab stays visible with the reason");
+        assert_eq!(
+            agent.stream_state(),
+            crate::stream::StreamState::Done {
+                reason: USAGE_LIMIT_REASON,
+            },
         );
     }
 

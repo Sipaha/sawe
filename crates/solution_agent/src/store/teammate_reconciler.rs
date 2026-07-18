@@ -1178,6 +1178,8 @@ impl SolutionAgentStore {
                             // must not be reported as a completion.
                             let reason = if ba.killed {
                                 crate::background_agent::KILLED_REASON
+                            } else if ba.hit_usage_limit() {
+                                crate::background_agent::USAGE_LIMIT_REASON
                             } else {
                                 ba.latest
                                     .as_ref()
@@ -1351,6 +1353,8 @@ impl SolutionAgentStore {
                         // reaped mid-flight with its parent subprocess.
                         let reason = if ba.killed {
                             crate::background_agent::KILLED_REASON
+                        } else if ba.hit_usage_limit() {
+                            crate::background_agent::USAGE_LIMIT_REASON
                         } else {
                             ba.latest
                                 .as_ref()

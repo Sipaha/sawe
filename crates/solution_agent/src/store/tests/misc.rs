@@ -4981,6 +4981,7 @@ async fn idle_transition_gc_excludes_live_async_agent_teammate(cx: &mut TestAppC
                             mtime: std::time::SystemTime::now(),
                             activity_label: SharedString::from("Bash: cargo test"),
                             stop_reason: None,
+                            usage_limited: false,
                         }),
                         last_offset: 0,
                         parent_tool_use_id: Some(SharedString::from("toolu_async_gc")),

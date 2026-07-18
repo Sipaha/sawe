@@ -827,6 +827,7 @@
                         + std::time::Duration::from_secs(1_720_000_000),
                     activity_label: SharedString::from("Bash: cargo test"),
                     stop_reason: stop_reason.map(SharedString::from),
+                    usage_limited: false,
                 }),
                 last_offset: 0,
                 parent_tool_use_id: Some(SharedString::from(parent_toolu)),

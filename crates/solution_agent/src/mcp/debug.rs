@@ -69,6 +69,11 @@ pub struct SeedColdSessionParams {
     /// the "killed → tab gone" end state, useful as a regression check that a
     /// killed teammate does not stay visible.
     pub background_agent_killed: bool,
+    /// Seed the `background_agent` in the usage-limit terminal state (its last
+    /// snapshot is a claude session-limit wall). Its `StreamId::Teammate` tab
+    /// renders `Done { limit reached }` — spinner off — instead of spinning
+    /// "Thinking…". Debug/screenshot-only.
+    pub background_agent_usage_limited: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -163,9 +168,16 @@ impl McpServerTool for SeedColdSessionTool {
                     entries,
                     input.live_teammates,
                     input.live_shell,
-                    input
-                        .background_agent
-                        .map(|id| (id, input.background_agent_killed)),
+                    input.background_agent.map(|id| {
+                        let state = if input.background_agent_killed {
+                            crate::store::SeededAgentState::Killed
+                        } else if input.background_agent_usage_limited {
+                            crate::store::SeededAgentState::UsageLimited
+                        } else {
+                            crate::store::SeededAgentState::Running
+                        };
+                        (id, state)
+                    }),
                     cx,
                 )
             })

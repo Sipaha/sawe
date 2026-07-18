@@ -558,6 +558,16 @@ pub(crate) fn project_label(
 /// moved into `model_catalog`.
 pub use crate::model_catalog::EFFORT_LEVELS;
 
+/// Which state to seed a debug `background_agent` in (`seed_cold_session`).
+/// The three outcomes are mutually exclusive — an enum instead of a pile of
+/// bools, so `(killed, usage_limited) = (true, true)` is unrepresentable.
+/// Debug/screenshot-only.
+pub(crate) enum SeededAgentState {
+    Running,
+    Killed,
+    UsageLimited,
+}
+
 impl SolutionAgentStore {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalSolutionAgentStore>().0.clone()
@@ -2781,9 +2791,9 @@ impl SolutionAgentStore {
         entries: Vec<crate::session_entry::SessionEntry>,
         live_teammates: bool,
         live_shell: Option<String>,
-        // `(agent id, killed)` — register one background (Managed) `Agent`, in
-        // the running or the reconnect-`killed` terminal state.
-        background_agent: Option<(String, bool)>,
+        // Register one background (Managed) `Agent` in the given terminal /
+        // running state. `None` = no agent.
+        background_agent: Option<(String, SeededAgentState)>,
         cx: &mut Context<Self>,
     ) -> SolutionSessionId {
         let session_id = SolutionSessionId::new();
@@ -2863,24 +2873,40 @@ impl SolutionAgentStore {
                 s.background_shell_order.push(shell_id);
                 s.rebuild_streams();
             }
-            if let Some((agent_id, killed)) = background_agent {
+            if let Some((agent_id, state)) = background_agent {
                 // Register ONE Managed Agent with a synthetic snapshot so
                 // `rebuild_streams` folds it into `session.streams` as its
                 // `StreamId::Teammate` tab (a detached async agent interleaves no
                 // tagged entries, so the fold is its only stream source).
                 let parent_toolu = SharedString::from(format!("toolu_{agent_id}"));
                 let bg_id = crate::background_agent::BackgroundAgentId::new(agent_id);
+                // For the usage-limit state, feed a real wall JSONL line through
+                // the PRODUCTION parser so the seed can't diverge from what a
+                // live subagent produces; running/killed keep the synthetic
+                // activity snapshot (killed is reached via the real transition
+                // below).
+                let latest = match state {
+                    SeededAgentState::UsageLimited => {
+                        crate::background_agent::parse_jsonl_snapshot(
+                            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm (Asia/Novosibirsk)"}]}}"#,
+                        )
+                    }
+                    SeededAgentState::Running | SeededAgentState::Killed => {
+                        crate::background_agent::BackgroundAgentSnapshot {
+                            mtime: std::time::SystemTime::now(),
+                            activity_label: SharedString::from("Grep: solution_agent"),
+                            stop_reason: None,
+                            usage_limited: false,
+                        }
+                    }
+                };
                 s.background_agents.insert(
                     bg_id.clone(),
                     crate::background_agent::BackgroundAgent {
                         id: bg_id.clone(),
                         jsonl_path: std::path::PathBuf::from("/tmp/sawe-seed-agent.jsonl"),
                         registered_at: chrono::Utc::now(),
-                        latest: Some(crate::background_agent::BackgroundAgentSnapshot {
-                            mtime: std::time::SystemTime::now(),
-                            activity_label: SharedString::from("Grep: solution_agent"),
-                            stop_reason: None,
-                        }),
+                        latest: Some(latest),
                         last_offset: 0,
                         parent_tool_use_id: Some(parent_toolu.clone()),
                         latest_seq: 0,
@@ -2891,7 +2917,7 @@ impl SolutionAgentStore {
                 s.teammate_labels
                     .insert(parent_toolu, SharedString::from("agent-research"));
                 s.rebuild_streams();
-                if killed {
+                if matches!(state, SeededAgentState::Killed) {
                     // The exact transition the reconnect path performs when it
                     // drops the wedged thread — the state whose render we want to
                     // verify, reached through the production routine.
