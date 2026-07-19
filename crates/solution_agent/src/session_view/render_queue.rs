@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use agent_client_protocol::schema as acp;
-use gpui::{Context, Div, IntoElement, ParentElement, SharedString, Styled};
+use gpui::{AnyElement, Context, Div, IntoElement, ParentElement, SharedString, Styled, relative};
 use markdown::MarkdownElement;
 use ui::prelude::*;
 use ui::{Color, IconName, IconSize, Label, LabelSize, Tooltip};
@@ -36,7 +36,7 @@ impl SolutionSessionView {
         &self,
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
-    ) -> Option<Div> {
+    ) -> Option<AnyElement> {
         let bundles = self.visible_pending_bundles(cx);
         if bundles.is_empty() {
             return None;
@@ -151,11 +151,25 @@ impl SolutionSessionView {
         // Compose: just the ghost bubble (the send-now bolt now lives on the
         // bubble itself; see above).
         let _ = window;
-        let mut section = v_flex().w_full().px_1();
+        // Cap the queued-message ghost at a fraction of the panel height and
+        // let it scroll internally. A queued follow-up (typed while the agent
+        // is mid-turn) is painted as a non-flex sibling *beneath* the
+        // scrollable transcript; without a height cap a long message grows to
+        // its full intrinsic height and squeezes the flex_1 transcript to
+        // zero, so the user can't see the conversation at all. `relative(0.4)`
+        // resolves against the outer flex_col's definite height, keeping ~60%
+        // for the transcript, and `overflow_y_scroll` lets the ghost itself
+        // scroll when it exceeds the cap.
+        let mut section = v_flex()
+            .id("solution-pending-queue")
+            .w_full()
+            .px_1()
+            .max_h(relative(0.4))
+            .overflow_y_scroll();
         if let Some(bubble) = bubble {
             section = section.child(bubble);
         }
-        Some(section)
+        Some(section.into_any_element())
     }
 
     /// Optimistic-resume section painted while a cold tab is doing its

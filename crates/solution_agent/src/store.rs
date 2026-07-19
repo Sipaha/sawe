@@ -2794,6 +2794,11 @@ impl SolutionAgentStore {
         // Register one background (Managed) `Agent` in the given terminal /
         // running state. `None` = no agent.
         background_agent: Option<(String, SeededAgentState)>,
+        // Seed ONE Main-targeted queued follow-up (the dashed "ghost" bubble
+        // beneath the transcript) and flip the session to `Running`, so the
+        // screenshot gate can exercise the pending-queue render — including its
+        // height cap — without a live agent turn. Omitted = no queued message.
+        pending_message: Option<String>,
         cx: &mut Context<Self>,
     ) -> SolutionSessionId {
         let session_id = SolutionSessionId::new();
@@ -2923,6 +2928,16 @@ impl SolutionAgentStore {
                     // verify, reached through the production routine.
                     s.mark_background_agents_killed();
                 }
+            }
+            if let Some(text) = pending_message {
+                s.pending_messages.push_back(crate::model::PendingBundle {
+                    target: crate::model::QueueTarget::Main,
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+                });
+                s.state = crate::model::SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
             }
             s
         });

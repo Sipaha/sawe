@@ -74,6 +74,11 @@ pub struct SeedColdSessionParams {
     /// renders `Done { limit reached }` — spinner off — instead of spinning
     /// "Thinking…". Debug/screenshot-only.
     pub background_agent_usage_limited: bool,
+    /// Seed ONE Main-targeted queued follow-up (the dashed "ghost" bubble
+    /// beneath the transcript) with this text and flip the session to
+    /// `Running`, so the screenshot gate can exercise the pending-queue render
+    /// — including its height cap for very long messages. Omitted = no queue.
+    pub pending_message: Option<String>,
 }
 
 #[cfg(debug_assertions)]
@@ -178,6 +183,7 @@ impl McpServerTool for SeedColdSessionTool {
                         };
                         (id, state)
                     }),
+                    input.pending_message,
                     cx,
                 )
             })
