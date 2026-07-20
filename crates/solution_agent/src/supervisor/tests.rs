@@ -324,6 +324,50 @@ fn usage_limit_detects_both_subscription_limits() {
     ));
 }
 
+/// The wall arrives as a text chunk appended to whatever the agent was already
+/// saying, and chunks concatenate without a separator — so the state text must
+/// be narrowed to the wall sentence. Without this the whole assistant message
+/// became `Errored(...)` and the status row rendered "Error: " followed by
+/// paragraphs of unrelated prose (observed live).
+#[test]
+fn extract_usage_limit_line_narrows_to_the_wall_sentence() {
+    let glued = "Не повисла — работает штатно. В журнале 33 события: все 16 финдеров \
+                 отработали, сейчас идёт стадия дедупа. Принесу результат с триажем, как \
+                 только придёт уведомление о завершении.You've hit your session limit · \
+                 resets 3:50pm (Asia/Novosibirsk)";
+    assert_eq!(
+        extract_usage_limit_line(glued).as_deref(),
+        Some("You've hit your session limit · resets 3:50pm (Asia/Novosibirsk)"),
+        "the agent's unrelated prose must not end up in the error state text",
+    );
+
+    // Same shape but the wall lands on its own line.
+    let on_own_line = "Продолжаю работу над задачей.\n\
+                       You've reached your weekly limit · resets Wed 9am (America/New_York)\n";
+    assert_eq!(
+        extract_usage_limit_line(on_own_line).as_deref(),
+        Some("You've reached your weekly limit · resets Wed 9am (America/New_York)"),
+    );
+
+    // A bare wall stays byte-identical (no over-trimming).
+    let bare = "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)";
+    assert_eq!(extract_usage_limit_line(bare).as_deref(), Some(bare));
+
+    // The narrowed slice must still parse its reset time — that is what quota
+    // recovery schedules the auto-resume from.
+    let now = 1_700_000_000_000;
+    assert!(
+        parse_usage_limit_reset_ms(&extract_usage_limit_line(glued).unwrap(), now).is_some(),
+        "narrowing must not destroy the `resets <time>` clause",
+    );
+
+    // No wall at all → None, so a transient error is never reclassified.
+    assert_eq!(
+        extract_usage_limit_line("added rate limit handling; insufficient test coverage"),
+        None,
+    );
+}
+
 #[test]
 fn parse_reset_session_limit_named_tz() {
     use chrono::{TimeZone, Utc};

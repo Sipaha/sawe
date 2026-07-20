@@ -133,7 +133,10 @@ impl SolutionAgentStore {
                 acp_thread::AgentThreadEntry::UserMessage(_) => Some(None),
                 _ => None,
             })??;
-        crate::supervisor::is_usage_limit_error(&text).then_some(text)
+        // Narrow to the wall sentence: the wall arrives glued onto whatever the
+        // agent was mid-sentence about, and this string becomes the `Errored`
+        // state text the status row renders.
+        crate::supervisor::extract_usage_limit_line(&text)
     }
 
     /// If session `id`'s in-flight JUDGE has itself stalled on a usage/session
@@ -1850,7 +1853,7 @@ impl SolutionAgentStore {
                         ),
                         _ => None,
                     })
-                    .filter(|text| crate::supervisor::is_usage_limit_error(text));
+                    .and_then(|text| crate::supervisor::extract_usage_limit_line(&text));
                 Some((*id, limit_message))
             })
             .collect();

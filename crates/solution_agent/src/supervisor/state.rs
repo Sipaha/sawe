@@ -388,6 +388,64 @@ pub fn is_usage_limit_error(message: &str) -> bool {
         || m.contains("credit balance") // "your credit balance is too low"
 }
 
+/// The wall phrasings, lowercased. Ordered longest-first only for readability;
+/// [`extract_usage_limit_line`] picks the EARLIEST match position regardless.
+const USAGE_LIMIT_MARKERS: &[&str] = &[
+    "usage limit",
+    "session limit",
+    "weekly limit",
+    "limit · resets",
+    "limit reached",
+    "hit your limit",
+    "reached your limit",
+    "rate_limit",
+    "rate limit reached",
+    "rate limit exceeded",
+    "insufficient quota",
+    "quota exceeded",
+    "exceeded your quota",
+    "credit balance",
+];
+
+/// Narrow a wall-carrying assistant message down to just the wall sentence.
+///
+/// claude prints the wall as an ordinary text chunk appended to whatever the
+/// agent was already saying, and the transcript concatenates chunks without a
+/// separator — so the real observed shape is one line like
+///   "…как только придёт уведомление о завершении.You've hit your session limit
+///    · resets 3:50pm (Asia/Novosibirsk)"
+/// [`is_usage_limit_error`] deliberately matches over the WHOLE message (a wall
+/// anywhere in it still means "stop issuing requests"), but surfacing that whole
+/// blob is wrong: it became the `Errored` state text, so the status row rendered
+/// "Error: " followed by three paragraphs of the agent's unrelated prose.
+///
+/// Walks back from the earliest marker to the preceding sentence/line boundary
+/// and forward to the end of that line. Returns `None` when the text carries no
+/// wall at all, and falls back to the trimmed whole text if the narrowed slice
+/// somehow no longer classifies (so a caller can never end up with nothing).
+pub fn extract_usage_limit_line(text: &str) -> Option<String> {
+    // `to_ascii_lowercase` leaves non-ASCII bytes untouched, so byte offsets
+    // stay aligned with `text` even when the prose around the wall is Cyrillic.
+    let lower = text.to_ascii_lowercase();
+    let marker = USAGE_LIMIT_MARKERS
+        .iter()
+        .filter_map(|m| lower.find(m))
+        .min()?;
+    let start = lower[..marker]
+        .rfind(['\n', '.', '!', '?'])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end = lower[marker..]
+        .find('\n')
+        .map(|i| marker + i)
+        .unwrap_or(lower.len());
+    let line = text[start..end].trim();
+    if line.is_empty() || !is_usage_limit_error(line) {
+        return Some(text.trim().to_string());
+    }
+    Some(line.to_string())
+}
+
 pub fn classify_judge_error(message: &str) -> JudgeFailure {
     // Quota/usage/billing exhaustion → stop immediately, do not retry.
     if is_usage_limit_error(message) {
