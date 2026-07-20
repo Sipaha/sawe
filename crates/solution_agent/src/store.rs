@@ -134,6 +134,16 @@ fn background_work_shows_liveness(quiet_secs: i64) -> bool {
     quiet_secs < TOOL_OUTPUT_SILENCE_SECS as i64
 }
 
+/// How long after an auto-reconnect the stuck-turn watchdog must leave a
+/// session alone. The respawned `claude --resume` re-ingests the entire
+/// transcript before producing its first event, which on a large context runs
+/// well past [`STUCK_TURN_SECS`] — so the watchdog would classify its own
+/// in-progress recovery as a fresh hang and reconnect again, stacking one more
+/// live process on the same acp session id every round. Must exceed
+/// `STUCK_TURN_SECS` by enough to cover a slow cold resume (which is itself
+/// bounded by two `RECONNECT_RESUME_TIMEOUT_SECS` attempts).
+const RECONNECT_COOLDOWN_SECS: u64 = 10 * 60;
+
 /// Per-attempt timeout for a reconnect's `resume_session` (subprocess respawn +
 /// ACP handshake). A dead subprocess can start but never complete the handshake,
 /// hanging the resume forever and stranding the session at `Errored("reconnecting…")`.
@@ -272,6 +282,15 @@ pub struct SolutionAgentStore {
     /// phase-6b keystone bug). Stored as `Task<()>` so it stays alive across
     /// links; removed on `purge_session_hard`.
     entries_persist_chain: HashMap<SolutionSessionId, Task<()>>,
+    /// When the stuck-turn watchdog last auto-reconnected each session, as
+    /// epoch-millis. A fresh `claude --resume` must re-ingest the whole
+    /// transcript before it emits anything, and on a large context that easily
+    /// outlasts [`STUCK_TURN_SECS`] — so without a cooldown the watchdog reads
+    /// its own recovery as another hang and reconnects again, each round
+    /// spawning one more process on the SAME acp session id. Observed live:
+    /// three concurrent `claude --resume 7c9cc1a3…` writing one worktree.
+    /// See [`RECONNECT_COOLDOWN_SECS`].
+    last_auto_reconnect_ms: HashMap<SolutionSessionId, i64>,
     /// Per-session teammate-watching state (survey cluster C10): the managed-
     /// agent + background-shell JSONL/`.output` watcher tasks and the
     /// forward-only parent-JSONL scan cursors. The arming / tailing methods
@@ -636,6 +655,7 @@ impl SolutionAgentStore {
             focus_resolver: None,
             entry_update_throttles: HashMap::new(),
             entries_persist_chain: HashMap::new(),
+            last_auto_reconnect_ms: HashMap::new(),
             teammate_watchers: TeammateWatchers::new(),
             metrics_emitter: MetricsEmitter::new(),
             _solution_subscription: solution_subscription,
@@ -1617,6 +1637,19 @@ impl SolutionAgentStore {
             target: "solution_agent::queue",
             "session={session_id} hook pull (agent_id={agent_id:?}, end_of_turn={is_end_of_turn}, queue_len={queue_len})",
         );
+        // A hook pull is the `claude` subprocess calling INTO the editor, so it
+        // is direct proof of life — stronger than any thread event, since it
+        // comes from the process itself rather than from parsing its output.
+        // The stuck-turn watchdog reads `last_activity_at`, which until now only
+        // moved on `NewEntry` / `EntryUpdated` / `Stopped` on the PARENT thread.
+        // A turn whose work happens inside a subagent emits none of those on the
+        // parent for minutes at a time while hook-pulling every few seconds — so
+        // a demonstrably-alive agent crossed `STUCK_TURN_SECS` and was
+        // "recovered" out from under itself. Observed live: session 6chefmfl
+        // hook-pulled continuously from 17:46:47 to 17:48:07 (including with a
+        // subagent's `agent_id`) and was declared "wedged … no progress 300s" at
+        // 17:48:09 — the second such false reconnect in six minutes.
+        session.update(cx, |s, _| s.last_activity_at = Utc::now());
         let combined: Vec<acp::ContentBlock> = session.update(cx, |s, _| {
             let mut taken: Vec<acp::ContentBlock> = Vec::new();
             let mut kept: std::collections::VecDeque<crate::model::PendingBundle> =
@@ -2014,6 +2047,46 @@ impl SolutionAgentStore {
             }
         };
         let pair = (meta.solution_id, meta.agent_id.clone());
+        // Kill the wedged ACP session's subprocess EXPLICITLY, exactly as the
+        // /compact and reset_context rotations do. Dropping the pool entry and
+        // the thread is NOT enough: the process lives in the connection's
+        // `sessions` map, so a live co-tenant session of the same
+        // (solution, agent) keeps that map — and the wedged `claude` — alive;
+        // and even with no co-tenant nothing kills on drop (neither
+        // `ClaudeProcess` nor `util::process::Child` killed on drop until the
+        // Drop guard added alongside this change).
+        //
+        // The leak was not merely a stray process: the orphan is a
+        // `claude --resume <same session id>` still executing the interrupted
+        // turn, and the reconnect spawns a SECOND one on the same id. Both then
+        // write the same worktree and append the same transcript — every
+        // "Агент не отвечал — переподключил сессию" added another writer.
+        // Observed live: three processes resuming one session, committing over
+        // each other in a shared worktree.
+        if let Some(thread) = session.read(cx).acp_thread().cloned() {
+            let (connection, acp_session_id) = {
+                let thread = thread.read(cx);
+                (thread.connection().clone(), thread.session_id().clone())
+            };
+            if connection.supports_close_session() {
+                log::info!(
+                    target: "solution_agent::store",
+                    "session={session_id} reconnect: closing wedged acp session {acp_session_id} \
+                     to kill its subprocess before respawn",
+                );
+                connection.close_session(&acp_session_id, cx).detach();
+            } else {
+                log::warn!(
+                    target: "solution_agent::store",
+                    "session={session_id} reconnect: connection does not support close_session — \
+                     the wedged subprocess for {acp_session_id} may outlive the respawn",
+                );
+            }
+            // The pair's live-session slot was taken by the ACP session just
+            // closed; release it so the refcount can still reach zero (mirrors
+            // the compact rotation).
+            self.pool_release_session(pair.clone(), cx);
+        }
         // Drop the pooled connection so `resume_session`'s
         // `get_or_spawn_connection` forces a fresh subprocess — the current one
         // is wedged. Live co-tenant sessions of the same (solution, agent) keep

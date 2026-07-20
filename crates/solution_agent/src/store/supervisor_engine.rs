@@ -1890,6 +1890,28 @@ impl SolutionAgentStore {
                 }
                 // Genuine hang: reconnect (respawn subprocess + replay transcript).
                 None => {
+                    // Cooldown: never reconnect a session we just reconnected.
+                    // The respawned subprocess re-ingests the whole transcript
+                    // before its first event, which on a large context outlasts
+                    // `STUCK_TURN_SECS` — so the watchdog would read its own
+                    // recovery as a fresh hang and fire again, each round adding
+                    // another live `claude --resume <same id>` racing the last
+                    // one in the same worktree.
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    if let Some(last_ms) = self.last_auto_reconnect_ms.get(&id)
+                        && now_ms.saturating_sub(*last_ms)
+                            < (RECONNECT_COOLDOWN_SECS as i64) * 1000
+                    {
+                        log::warn!(
+                            target: "solution_agent::store",
+                            "session={id} looks wedged again {}s after the last auto-reconnect — \
+                             within the {RECONNECT_COOLDOWN_SECS}s cooldown, NOT reconnecting \
+                             (the respawn is probably still re-ingesting the transcript)",
+                            now_ms.saturating_sub(*last_ms) / 1000,
+                        );
+                        continue;
+                    }
+                    self.last_auto_reconnect_ms.insert(id, now_ms);
                     log::warn!(
                         target: "solution_agent::store",
                         "session={id} wedged in Running (no progress {STUCK_TURN_SECS}s, no live \

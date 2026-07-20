@@ -1115,6 +1115,27 @@ fn turn_wedged_decision_gates_on_tool_liveness() {
     assert!(!turn_is_wedged(Some((TOOL_STUCK_SECS as i64, true)), false));
 }
 
+/// The reconnect cooldown must outlast the silence window the watchdog fires on,
+/// or the watchdog reads its own in-progress recovery as a fresh hang: a
+/// respawned `claude --resume` re-ingests the whole transcript before emitting
+/// anything, and each spurious round spawns ANOTHER process on the same acp
+/// session id. Observed live (session 6chefmfl): reconnects at 17:42:34 and
+/// 17:48:09 — 335s apart, i.e. one `STUCK_TURN_SECS` window — leaving three
+/// concurrent `claude --resume 7c9cc1a3…` writing one worktree.
+#[test]
+fn reconnect_cooldown_outlasts_the_stuck_window() {
+    assert!(
+        RECONNECT_COOLDOWN_SECS > STUCK_TURN_SECS,
+        "a cooldown at or below the silence window cannot break the reconnect loop",
+    );
+    // Must also cover a slow resume: two bounded attempts plus the window that
+    // re-arms the watchdog afterwards.
+    assert!(
+        RECONNECT_COOLDOWN_SECS >= 2 * RECONNECT_RESUME_TIMEOUT_SECS + STUCK_TURN_SECS,
+        "cooldown must outlast both resume attempts plus a full silence window",
+    );
+}
+
 /// A parent that dispatched background agents legitimately goes quiet while they
 /// work: the spawning `Agent` tool call returns immediately, so the watchdog sees
 /// `Running` + no in-progress tool — the exact shape it treats as a hang. Two live

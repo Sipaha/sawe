@@ -330,6 +330,7 @@ impl SolutionAgentStore {
         // editor's whole lifetime.
         self.metrics_emitter.clear_session(&id);
         self.raw_transcript_history.remove(&id);
+        self.last_auto_reconnect_ms.remove(&id);
     }
 
     /// Tear down the IN-MEMORY runtime state shared by every per-session

@@ -15,6 +15,7 @@ use futures::future::Shared;
 use futures::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, Task};
+use util::ResultExt as _;
 use util::process::Child;
 
 use crate::command::ClaudeCommandSpec;
@@ -27,9 +28,9 @@ use crate::protocol::{ControlRequestOut, InputMessage, OutputMessage};
 type PendingControls = Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>;
 
 /// One running `claude` process. Holds the child plus the three stdio tasks;
-/// dropping it cancels the tasks and (via `Child`'s process-group kill on an
-/// explicit `kill`) tears down the subprocess. Messages flow over the
-/// `outgoing` sender (stdin) and `incoming` receiver (stdout).
+/// dropping it cancels the tasks AND process-group-kills the subprocess (see
+/// the `Drop` impl below). Messages flow over the `outgoing` sender (stdin)
+/// and `incoming` receiver (stdout).
 pub struct ClaudeProcess {
     child: Child,
     pub outgoing: UnboundedSender<InputMessage>,
@@ -190,6 +191,28 @@ impl ClaudeProcess {
     /// place.
     pub fn kill(&mut self) -> Result<()> {
         self.child.kill()
+    }
+}
+
+/// Reap the subprocess when the owning `ClaudeProcess` goes away.
+///
+/// Neither `smol::process::Child` nor `util::process::Child` kills on drop
+/// (the latter's process-group machinery only covers the *editor* exiting), so
+/// every drop path that did not remember an explicit `kill()` orphaned a live
+/// `claude`. That was not a benign leak: an orphan spawned with
+/// `--resume <session id>` keeps executing the interrupted turn, and the
+/// recovery that dropped it immediately spawns another process on the SAME
+/// session id — so a stuck-turn reconnect loop accumulates concurrent writers
+/// on one worktree and one transcript (observed live: three processes resuming
+/// a single session, committing over each other).
+///
+/// Killing here makes "drop == reaped" true for every path at once, which is
+/// what the reconnect / pool-eviction call sites already assumed. Explicit
+/// `kill()` callers are unaffected — `killpg` on an already-dead group is a
+/// no-op `ESRCH`.
+impl Drop for ClaudeProcess {
+    fn drop(&mut self) {
+        self.child.kill().log_err();
     }
 }
 
@@ -438,6 +461,76 @@ fn is_benign_agent_stderr(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The load-bearing claim behind the reconnect fix: dropping a
+    /// `ClaudeProcess` REAPS the subprocess.
+    ///
+    /// It did not, before the `Drop` impl — neither `smol::process::Child` nor
+    /// `util::process::Child` kills on drop — and the stuck-turn reconnect path
+    /// dropped the wedged connection expecting exactly that. Each spurious
+    /// reconnect therefore left a live `claude --resume <session id>` still
+    /// executing the interrupted turn while a fresh process resumed the SAME
+    /// id, so N recoveries produced N concurrent writers on one worktree and
+    /// one transcript (observed live: three).
+    ///
+    /// Uses a stub binary that ignores the claude CLI args and sleeps, so the
+    /// test exercises the real spawn → drop → reap path without needing claude.
+    #[gpui::test]
+    async fn dropping_the_process_kills_the_child(cx: &mut gpui::TestAppContext) {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("fake-claude");
+        {
+            let mut f = std::fs::File::create(&stub).expect("create stub");
+            // `exec` so the sleeping process keeps THIS pid — the one we assert on.
+            writeln!(f, "#!/bin/sh\nexec sleep 300").expect("write stub");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+        }
+
+        let spec = crate::command::ClaudeCommandSpec {
+            binary: stub,
+            work_dir: dir.path().to_path_buf(),
+            session: crate::command::SessionArg::New("drop-reap-test".to_string()),
+            mcp_servers_json: "{}".to_string(),
+            append_system_prompt: None,
+            extra_env: Vec::new(),
+            model: None,
+            settings_path: None,
+        };
+
+        let pid = cx.update(|cx| {
+            let process = ClaudeProcess::spawn(spec, cx).expect("spawn stub");
+            let pid = process.process_id();
+            assert!(process_alive(pid), "stub must be running before the drop");
+            drop(process);
+            pid
+        });
+
+        // SIGKILL delivery + reap is asynchronous; poll briefly rather than
+        // assuming the process is gone the instant `drop` returns.
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                return;
+            }
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(20))
+                .await;
+        }
+        panic!("subprocess {pid} survived the drop — the Drop impl is not reaping");
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        // Signal 0 probes for existence without delivering anything. A zombie
+        // still answers, so the stub `exec`s (no intermediate shell to reap).
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
 
     #[test]
     fn parses_hook_callback_error_header() {
