@@ -5,11 +5,12 @@ use futures::future::join_all;
 use gpui::{
     Action, Anchor, App, AppContext as _, AsyncApp, AsyncWindowContext, Context, DismissEvent,
     Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, Pixels,
-    Point, Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
+    Point, PromptLevel, Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
 };
 use project::Project;
 use settings::Settings as _;
 use solution_agent::SolutionSessionId;
+use solution_agent::model::SessionState;
 use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
 use solution_agent::rename_session_modal::RenameSessionModal;
 use solution_agent::reopen_session_modal::{ReopenSessionModal, ReopenableSession};
@@ -809,7 +810,11 @@ impl ConsolePanel {
                 .child(
                     IconButton::new(("console-close", ix), IconName::Close)
                         .icon_size(IconSize::Small)
-                        .on_click(cx.listener(move |this, _, _, cx| this.close_tab_at(ix, cx))),
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.close_tab_at(ix, window, cx)
+                            }),
+                        ),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1822,13 +1827,56 @@ impl ConsolePanel {
     /// the session is evicted + marked `closed_at` in the DB (so it surfaces
     /// in "Reopen Closed Chat"), and the resulting `SessionClosed` →
     /// `ChatProviderEvent::SessionRemoved` round-trip removes the tab here.
-    fn close_tab_at(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         match self.tabs.get(index) {
             Some(ConsoleTab::Chat { session_id, .. }) => {
                 let id = *session_id;
-                SolutionAgentStore::global(cx)
-                    .update(cx, |store, cx| store.close_session(id, cx))
-                    .log_err();
+                // Closing a chat tab is destructive-looking: the session is
+                // evicted and has to be dug back out of "Reopen Closed Chat".
+                // Doing that to an agent that is still mid-turn also abandons
+                // work in flight, so a non-terminal session gets a speed-bump.
+                // Terminal states (Idle / AwaitingInput / Errored) close
+                // straight through — a confirmation on every close would just
+                // train the user to dismiss it.
+                let busy = SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .session(id)
+                    .map(|session| match session.read(cx).state {
+                        SessionState::Running { .. } => Some("Агент сейчас работает"),
+                        SessionState::Stopping { .. } => Some("Агент останавливается"),
+                        SessionState::Idle
+                        | SessionState::AwaitingInput
+                        | SessionState::Errored(_) => None,
+                    })
+                    .unwrap_or(None);
+                let Some(busy) = busy else {
+                    SolutionAgentStore::global(cx)
+                        .update(cx, |store, cx| store.close_session(id, cx))
+                        .log_err();
+                    return;
+                };
+                let answer = window.prompt(
+                    PromptLevel::Warning,
+                    "Закрыть вкладку с агентом?",
+                    Some(&format!(
+                        "{busy}. Закрытие прервёт текущий ход — вкладку можно будет вернуть \
+                         через «Reopen Closed Chat»."
+                    )),
+                    &["Закрыть", "Отмена"],
+                    cx,
+                );
+                cx.spawn(async move |this, cx| {
+                    if answer.await.ok() != Some(0) {
+                        return;
+                    }
+                    this.update(cx, |_, cx| {
+                        SolutionAgentStore::global(cx)
+                            .update(cx, |store, cx| store.close_session(id, cx))
+                            .log_err();
+                    })
+                    .ok();
+                })
+                .detach();
             }
             Some(ConsoleTab::Terminal { .. }) => self.close_tab(index, cx),
             None => {}

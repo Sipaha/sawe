@@ -68,6 +68,22 @@ pub(crate) fn cold_entries_from_persisted(
     (cold_entries, restored_created_ms)
 }
 
+/// Flip a non-terminal tool-call status to `Canceled`. Shared by the cold
+/// hydration path (a restored row can never transition again) and the
+/// turn-end sweep in `store::terminalize_stranded_tool_calls` (once the
+/// session is Idle the turn that owned the call is over).
+pub(crate) fn normalize_stranded_tool_status(
+    kind: &mut crate::session_entry::SessionEntryKind,
+) -> bool {
+    if let crate::session_entry::SessionEntryKind::ToolCall { status, .. } = kind
+        && !status.is_terminal()
+    {
+        *status = crate::session_entry::ToolStatus::Canceled;
+        return true;
+    }
+    false
+}
+
 /// Decode per-entry DB rows (Phase 4 `solution_session_entries`) into the
 /// store's `SessionEntry` shape. Rows arrive `ORDER BY idx`; each `payload`
 /// is the JSON-encoded `SessionEntryKind` and the meta (`mod_seq`,
@@ -80,12 +96,25 @@ pub(crate) fn entries_from_rows(
     rows.into_iter()
         .filter_map(
             |r| match crate::session_entry::kind_from_payload(&r.payload) {
-                Ok(kind) => Some(crate::session_entry::SessionEntry {
-                    created_ms: r.created_ms,
-                    mod_seq: r.mod_seq as u64,
-                    subagent_id: r.subagent_id.map(SharedString::from),
-                    kind,
-                }),
+                Ok(mut kind) => {
+                    // Every row decoded here is COLD-PREFIX history: the live
+                    // thread (when one attaches) contributes its own entries
+                    // that `build_entries` concatenates AFTER this prefix, so
+                    // nothing can ever transition a restored row again. A row
+                    // persisted mid-flight (a turn that ended without
+                    // terminalising its tool call — e.g. a synchronous `Agent`
+                    // call whose turn was cut short) would otherwise rehydrate
+                    // as `InProgress` and render a live-ticking "running Xm Ys"
+                    // badge for a tool that no longer exists. Terminalise on the
+                    // way in so the transcript can't lie about a dead call.
+                    normalize_stranded_tool_status(&mut kind);
+                    Some(crate::session_entry::SessionEntry {
+                        created_ms: r.created_ms,
+                        mod_seq: r.mod_seq as u64,
+                        subagent_id: r.subagent_id.map(SharedString::from),
+                        kind,
+                    })
+                }
                 Err(e) => {
                     log::warn!(
                         target: "solution_agent::store",
@@ -620,18 +649,27 @@ impl SolutionAgentStore {
                     let had_pending = existing.update(cx, |session, cx| {
                         let had_pending = !session.pending_messages.is_empty();
                         if had_pending {
-                            // Cold→live transition with queued messages
-                            // shouldn't normally happen (cold sessions
-                            // can't queue), but log if it ever does so
-                            // we don't lose them silently.
+                            // The queue is PRESERVED across the promotion. This
+                            // path is not only the benign cold→live case: the
+                            // stuck-turn watchdog reconnects a *running* session
+                            // through here, and a follow-up the user typed while
+                            // the agent was wedged lives in exactly this queue.
+                            // Clearing it dropped the user's message on the
+                            // floor with nothing but a log line, while
+                            // `maybe_send_reconnect_continuation` went on to send
+                            // its canned "твой процесс завис" nudge — so the chat
+                            // showed a recovery that silently ate what the user
+                            // had said. Keeping the bundles lets the normal
+                            // idle-flush deliver them as the turn after the
+                            // continuation prompt.
                             let previews: Vec<String> = session
                                 .pending_messages
                                 .iter()
                                 .map(|b| queue::summarize_blocks_for_log(&b.blocks))
                                 .collect();
-                            log::warn!(
+                            log::info!(
                                 target: "solution_agent::queue",
-                                "session={session_id} dropped {} queued bundle(s) on resume_session cold→live promotion — content: [{}]",
+                                "session={session_id} preserved {} queued bundle(s) across resume_session promotion — content: [{}]",
                                 session.pending_messages.len(),
                                 previews.join(" | "),
                             );
@@ -641,7 +679,6 @@ impl SolutionAgentStore {
                         session.state = SessionState::Idle;
                         session.context_count = meta.context_count;
                         session.project = Some(project.clone());
-                        session.pending_messages.clear();
                         session.flush_after_cancel = false;
                         session.cwd = resume_cwd.clone();
                         session.member_id = meta.member_id;

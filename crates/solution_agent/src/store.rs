@@ -3380,6 +3380,53 @@ impl SolutionAgentStore {
             if cleared {
                 self.mark_subagents_changed(session_id, cx);
             }
+            // The GC above reclaims the stranded teammate PILL, but the
+            // `ToolCall` ENTRY that spawned it stays non-terminal in the
+            // transcript — and `to_session_entry` persists in-flight calls
+            // verbatim (it is deliberately total). A turn that ended without
+            // terminalising its call (observed: a synchronous `Agent` whose
+            // turn was cut short — the tool never ran) therefore leaves a
+            // "running Xm Ys" badge ticking forever against an agent that no
+            // longer exists, and rehydrates that way after a tab close/reopen.
+            // Once the session is Idle the owning turn is over, so any
+            // non-terminal call is dead by definition.
+            //
+            // Async `Agent` teammates OUTLIVE the parent turn, so their calls
+            // are EXCLUDED via the same `background_agents` parent set the
+            // stream GC uses above.
+            let terminalized = session.update(cx, |s, _| {
+                let async_parents: std::collections::HashSet<SharedString> = s
+                    .background_agents
+                    .values()
+                    .filter_map(|ba| ba.parent_tool_use_id.clone())
+                    .collect();
+                let mut entries = std::mem::take(&mut s.entries);
+                let mut changed = false;
+                for entry in entries.iter_mut() {
+                    if let crate::session_entry::SessionEntryKind::ToolCall { id, .. } = &entry.kind
+                        && async_parents.contains(id.as_str())
+                    {
+                        continue;
+                    }
+                    changed |= crate::store::hydration::normalize_stranded_tool_status(
+                        &mut entry.kind,
+                    );
+                }
+                s.entries = entries;
+                if changed {
+                    s.rebuild_streams();
+                }
+                changed
+            });
+            if terminalized {
+                // Re-flush the whole main stream: the mutated rows sit at
+                // arbitrary indices below the append watermark, so the
+                // incremental `persist_main_stream` path (which only upserts
+                // newly-appended entries) would leave the stale `InProgress`
+                // payloads on disk.
+                self.persist_all_rows(session_id, cx);
+                cx.notify();
+            }
         }
         let now = std::time::Instant::now();
         let is_focused = self

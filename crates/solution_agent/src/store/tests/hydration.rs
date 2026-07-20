@@ -491,6 +491,66 @@ fn entries_from_rows_skips_corrupt_and_preserves_order() {
     );
 }
 
+/// A tool call persisted mid-flight (its turn ended without terminalising it —
+/// e.g. a synchronous `Agent` whose turn was cut short) must NOT rehydrate as
+/// `InProgress`. Every restored row is cold-prefix history that nothing can
+/// transition again, so an `InProgress` row would render a live-ticking
+/// "running Xm Ys" badge forever against an agent that no longer exists (the
+/// close-tab → reopen → stuck-plaque bug). Terminal statuses pass through
+/// untouched.
+#[test]
+fn entries_from_rows_terminalizes_stranded_tool_calls() {
+    let tool_call = |status: crate::session_entry::ToolStatus| {
+        crate::session_entry::SessionEntryKind::ToolCall {
+            id: "toolu_1".into(),
+            label_md: "Agent".into(),
+            kind: agent_client_protocol::schema::ToolKind::Think,
+            status,
+            content_md: vec![],
+            raw_input: None,
+            raw_output: None,
+            tool_name: Some("Agent".into()),
+            locations: vec![],
+            status_started_at: Some(1_700_000_000_000),
+        }
+    };
+    let row = |idx: i64, kind: &crate::session_entry::SessionEntryKind| crate::db::EntryRow {
+        idx,
+        mod_seq: idx,
+        created_ms: 1_700_000_000_000 + idx,
+        subagent_id: None,
+        payload: serde_json::to_vec(kind).unwrap(),
+    };
+    let in_progress = tool_call(crate::session_entry::ToolStatus::InProgress);
+    let pending = tool_call(crate::session_entry::ToolStatus::Pending);
+    let awaiting = tool_call(crate::session_entry::ToolStatus::WaitingForConfirmation);
+    let completed = tool_call(crate::session_entry::ToolStatus::Completed);
+    let failed = tool_call(crate::session_entry::ToolStatus::Failed);
+
+    let entries = crate::store::entries_from_rows(vec![
+        row(0, &in_progress),
+        row(1, &pending),
+        row(2, &awaiting),
+        row(3, &completed),
+        row(4, &failed),
+    ]);
+
+    let status_of = |i: usize| match &entries[i].kind {
+        crate::session_entry::SessionEntryKind::ToolCall { status, .. } => status.clone(),
+        other => panic!("expected ToolCall at {i}, got {other:?}"),
+    };
+    assert_eq!(entries.len(), 5);
+    for i in 0..3 {
+        assert_eq!(
+            status_of(i),
+            crate::session_entry::ToolStatus::Canceled,
+            "non-terminal row {i} must rehydrate as Canceled, not keep ticking",
+        );
+    }
+    assert_eq!(status_of(3), crate::session_entry::ToolStatus::Completed);
+    assert_eq!(status_of(4), crate::session_entry::ToolStatus::Failed);
+}
+
 /// (a) A session whose transcript is already stored as ROWS (no blob touched)
 /// cold-restores from those rows and reads the persisted epoch verbatim
 /// (NO bump — a restart loading the same transcript must not look like a new
