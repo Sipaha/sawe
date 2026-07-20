@@ -325,6 +325,24 @@ pub struct SolutionSession {
     acp_thread: Option<Entity<AcpThread>>,
     pub title: SharedString,
     pub created_at: DateTime<Utc>,
+    /// THE session activity clock — the single source of truth for "when did
+    /// anything last prove this session is not dead". Deliberately ONE field
+    /// with one meaning, because the alternatives diverge and lie:
+    ///
+    /// * The stuck-turn watchdog (`tick_stuck_sessions`) fires on it.
+    /// * The status-row "just now / 6m ago" badge renders it. That badge used
+    ///   to derive its own value from `entries.last().created_ms`, a weaker
+    ///   signal (a subagent's work appends nothing to the parent transcript
+    ///   for minutes) — so the badge and the watchdog could disagree about the
+    ///   same session, which is what made the spurious-reconnect incident
+    ///   unreadable.
+    /// * The DB row and the MCP/mobile DTO persist and ship it.
+    ///
+    /// Bump it from ANY evidence of life, preferring evidence that comes FROM
+    /// the subprocess (a hook pull — claude calling into the editor) over
+    /// evidence parsed out of its output (thread events), since the former
+    /// cannot go quiet while the agent is busy. Do not add a second clock —
+    /// add a bump site here instead.
     pub last_activity_at: DateTime<Utc>,
     pub state: SessionState,
     /// Working directory the session was originally created against.

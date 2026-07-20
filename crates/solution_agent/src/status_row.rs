@@ -287,11 +287,20 @@ pub(crate) fn render_status_row(
             .map(|m| SharedString::from(m.name))
             .or_else(|| Some(SharedString::from(current.0.to_string())))
     });
-    // Newest entry's server-stamped time, if it has a real one. The newest
-    // entry is the last element of `entries`; `> 0` filters out the
-    // NO_TIMESTAMP_MS sentinel and 0/missing. An all-historical or empty
-    // session has no real newest time → we render no relative label at all.
-    let last_activity_ms = s.entries.last().map(|e| e.created_ms).filter(|&ms| ms > 0);
+    // THE session activity clock — the same `last_activity_at` the stuck-turn
+    // watchdog reads, deliberately not a second one derived from the
+    // transcript.
+    //
+    // This badge used to read `entries.last().created_ms` ("time since the
+    // newest transcript entry"), which is a strictly weaker signal: a turn
+    // whose work happens inside a subagent appends nothing to the parent
+    // transcript for minutes while the subprocess is demonstrably alive. Two
+    // clocks meant the badge could read "6m ago" for an agent the watchdog
+    // considered freshly active (or vice versa) — and "the indicator said one
+    // thing, the watchdog did another" is exactly the confusion that made the
+    // spurious-reconnect incident so hard to read. One clock, one meaning:
+    // "when did anything last prove this session is not dead".
+    let last_activity_ms = Some(s.last_activity_at.timestamp_millis()).filter(|&ms| ms > 0);
     let _ = s;
     // While the active session is in `Running`, drive a 1 Hz tick
     // so the elapsed counter ("Thinking… Ns") in `state_text`
