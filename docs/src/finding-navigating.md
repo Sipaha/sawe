@@ -23,6 +23,8 @@ The Project Panel ({#kb project_panel::ToggleFocus}) shows a tree view of your w
 
 Open any file in your project with {#kb file_finder::Toggle}. Type part of the filename or path to narrow results.
 
+If text is selected in the active editor when you open the file finder, that selection is used as the initial query — select a path in a buffer and hit {#kb file_finder::Toggle} to jump straight to it. Only single-line selections are used, and setting `seed_search_query_from_cursor` to `never` turns this off.
+
 ## Project Search
 
 Search across all files with {#kb pane::DeploySearch}. Type the query in the search field, then press Enter to run the search.

@@ -4382,6 +4382,98 @@ async fn test_open_without_dismiss_then_confirm_closes_finder(cx: &mut TestAppCo
     });
 }
 
+#[gpui::test]
+async fn test_seeds_query_from_editor_selection(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({
+                "main.rs": "collab_panel.rs",
+                "collab_panel.rs": "",
+                "multiline.rs": "collab_panel.rs\nsecond line",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let worktree_id = cx.read(|cx| {
+        workspace
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .unwrap()
+            .read(cx)
+            .id()
+    });
+
+    let open_in_workspace = |name: &'static str, cx: &mut VisualTestContext| {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(
+                ProjectPath {
+                    worktree_id,
+                    path: rel_path(name).into(),
+                },
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+    };
+
+    open_in_workspace("main.rs", cx).await.unwrap();
+    let editor = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+
+    let picker = open_file_picker(&workspace, cx);
+    picker.update(cx, |picker, cx| {
+        assert_eq!(
+            picker.query(cx),
+            "",
+            "Without a selection, the finder should open on the plain history list"
+        );
+    });
+    cx.dispatch_action(Cancel);
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_all(&editor::actions::SelectAll, window, cx)
+    });
+    let picker = open_file_picker(&workspace, cx);
+    cx.run_until_parked();
+    picker.update(cx, |picker, cx| {
+        assert_eq!(picker.query(cx), "collab_panel.rs");
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only(),
+            vec![rel_path("collab_panel.rs").into()],
+            "The selected text should have been searched for"
+        );
+    });
+    cx.dispatch_action(Cancel);
+
+    open_in_workspace("multiline.rs", cx).await.unwrap();
+    let multiline_editor = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+    multiline_editor.update_in(cx, |editor, window, cx| {
+        editor.select_all(&editor::actions::SelectAll, window, cx)
+    });
+    let picker = open_file_picker(&workspace, cx);
+    picker.update(cx, |picker, cx| {
+        assert_eq!(
+            picker.query(cx),
+            "",
+            "A multi-line selection is never a useful file query"
+        );
+    });
+}
+
 async fn open_close_queried_buffer(
     input: &str,
     expected_matches: usize,

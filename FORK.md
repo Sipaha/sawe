@@ -128,6 +128,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/search/src/search.rs` | Registers `find_in_path::init` alongside the existing `project_search` registration. | `search` |
 | `crates/search/Cargo.toml` | Adds `schemars` (modal action/settings schema) + `solutions` (Solution/member scope resolution for the scope tabs) deps. | `search` |
 | `crates/editor/src/display_map.rs` | Adds `HighlightKey::FindInPathPreview` variant used to highlight the active match in the Find-in-Path preview editor. | `search` |
+| `crates/file_finder/src/file_finder.rs` | IDEA parity: `ToggleFileFinder` seeds the picker query from the active editor's **selection** (`FileFinder::query_from_selection`), so selecting a path in a buffer and hitting `ctrl-shift-n` searches for it. Single-line selections only; suppressed entirely when `seed_search_query_from_cursor` is `never`. | `file_finder` |
 
 Locked rebrand identifiers (display name, bundle ids, URL scheme, config dirs, etc.) — see `.rules` § "Locked rebrand identifiers". Changing any requires explicit approval — they're cross-referenced in spec docs.
 

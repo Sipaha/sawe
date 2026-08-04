@@ -7,7 +7,7 @@ pub use open_path_prompt::OpenPathDelegate;
 use channel::ChannelStore;
 use client::ChannelId;
 use collections::HashMap;
-use editor::Editor;
+use editor::{Editor, EditorSettings};
 use file_icons::FileIcons;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use fuzzy_nucleo::{PathMatch, PathMatchCandidate};
@@ -26,7 +26,7 @@ use project::{
     PathMatchCandidateSet, Project, ProjectPath, WorktreeId, worktree_store::WorktreeStore,
 };
 use project_panel::project_panel_settings::ProjectPanelSettings;
-use settings::Settings;
+use settings::{SeedQuerySetting, Settings};
 use std::{
     borrow::Cow,
     cmp,
@@ -50,7 +50,7 @@ use util::{
 };
 use workspace::{
     ModalView, OpenChannelNotesById, OpenOptions, OpenVisible, SplitDirection, Workspace,
-    item::PreviewTabsSettings, notifications::NotifyResultExt, pane,
+    item::PreviewTabsSettings, notifications::NotifyResultExt, pane, searchable::SearchableItem,
 };
 use zed_actions::search::ToggleIncludeIgnored;
 
@@ -130,6 +130,7 @@ impl FileFinder {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
+        let initial_query = Self::query_from_selection(workspace, window, cx);
         let project = workspace.project().read(cx);
         let fs = project.fs();
 
@@ -183,18 +184,49 @@ impl FileFinder {
                             cx,
                         );
 
-                        FileFinder::new(delegate, window, cx)
+                        FileFinder::new(delegate, initial_query, window, cx)
                     });
                 })
                 .ok();
         })
     }
 
-    fn new(delegate: FileFinderDelegate, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Seeds the finder with the active editor's selection, so that selecting a
+    /// path (or a name) in a buffer and hitting the file finder binding searches
+    /// for it right away. Only a single-line selection is used: a path never
+    /// spans lines, and a multi-line selection is never a useful file query.
+    fn query_from_selection(
+        workspace: &Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<String> {
+        if EditorSettings::get_global(cx).seed_search_query_from_cursor == SeedQuerySetting::Never {
+            return None;
+        }
+        let editor = workspace.active_item(cx)?.act_as::<Editor>(cx)?;
+        let selection = editor.update(cx, |editor, cx| {
+            editor.query_suggestion(Some(SeedQuerySetting::Selection), window, cx)
+        });
+        let selection = selection.trim();
+        if selection.is_empty() || selection.contains('\n') {
+            return None;
+        }
+        Some(selection.to_string())
+    }
+
+    fn new(
+        delegate: FileFinderDelegate,
+        initial_query: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx));
         let picker_focus_handle = picker.focus_handle(cx);
-        picker.update(cx, |picker, _| {
+        picker.update(cx, |picker, cx| {
             picker.delegate.focus_handle = picker_focus_handle.clone();
+            if let Some(initial_query) = initial_query {
+                picker.set_query(&initial_query, window, cx);
+            }
         });
         Self {
             picker,
