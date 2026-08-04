@@ -1,6 +1,7 @@
 use collections::{HashMap, HashSet};
 use editor::{
-    Editor, EditorEvent, EditorSettings, HighlightKey, SelectionEffects, scroll::Autoscroll,
+    Editor, EditorEvent, EditorSettings, HighlightKey, SelectionEffects, actions::MoveToEnd,
+    scroll::Autoscroll,
 };
 use futures::StreamExt as _;
 use gpui::{
@@ -441,6 +442,7 @@ impl FindInPath {
             });
             return;
         }
+        let initial_query = Self::query_from_active_editor(workspace, window, cx);
         let project = workspace.project().clone();
         let member_root = active_member_root(workspace, cx);
         let weak_workspace = cx.entity().downgrade();
@@ -522,6 +524,39 @@ impl FindInPath {
                 ],
             }
         });
+
+        // Seeded after the modal exists rather than inside the constructor, so the
+        // `Edited` event lands on an already-registered `query_editor_subscription`
+        // and drives `update_search` through the exact same path as user typing.
+        if let Some(initial_query) = initial_query
+            && let Some(modal) = workspace.active_modal::<Self>(cx)
+        {
+            modal.update(cx, |this, cx| {
+                this.query_editor.update(cx, |editor, cx| {
+                    editor.set_text(initial_query, window, cx);
+                    editor.move_to_end(&MoveToEnd, window, cx);
+                });
+            });
+        }
+    }
+
+    /// Text to open the modal with: the active editor's selection, or the word under the
+    /// cursor when `seed_search_query_from_cursor` says so — the same seeding
+    /// `ProjectSearchView` does for `pane::DeploySearch`. Multi-line selections are skipped:
+    /// the query editor is single-line, and a literal spanning lines is never what the user
+    /// is reaching for here.
+    fn query_from_active_editor(
+        workspace: &Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<String> {
+        let editor = workspace.active_item(cx)?.act_as::<Editor>(cx)?;
+        let query = editor.update(cx, |editor, cx| editor.query_suggestion(None, window, cx));
+        let query = query.trim();
+        if query.is_empty() || query.contains('\n') {
+            return None;
+        }
+        Some(query.to_string())
     }
 
     /// Rebuild the `SearchQuery` from the current editor/option/scope/mask state and (re)run it,

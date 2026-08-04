@@ -31,6 +31,12 @@ Search across all files with {#kb pane::DeploySearch}. Type the query in the sea
 
 Results appear in a [multibuffer](./multibuffers.md), letting you edit matches in place.
 
+## Find in Path
+
+{#kb find_in_path::Toggle} opens the Find in Path modal — a project-wide search overlay with scope tabs (In Solution / In Project / Directory), file masks, a live results list and a preview of the selected match. {#kb find_in_path::ToggleReplace} opens it with the replace field revealed.
+
+Like project search, it opens pre-filled from the active editor: the selection if there is one, otherwise the word under the cursor. The `seed_search_query_from_cursor` setting controls this (`always`, `selection`, `never`); multi-line selections are skipped.
+
 ## Go to Definition
 
 Jump to where a symbol is defined with {#kb editor::GoToDefinition} (or `Cmd+Click` / `Ctrl+Click`). If there are multiple definitions, they open in a multibuffer.

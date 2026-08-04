@@ -248,6 +248,101 @@ async fn test_replace_next_replaces_only_selected_match(cx: &mut TestAppContext)
     );
 }
 
+#[gpui::test]
+async fn test_toggle_seeds_query_from_active_editor(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "a.txt": "token",
+            "b.txt": "token appears here too\n",
+            "multiline.txt": "token\nsecond line",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let worktree_id = cx.read(|cx| {
+        workspace
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .unwrap()
+            .read(cx)
+            .id()
+    });
+
+    let open = |name: &'static str, cx: &mut gpui::VisualTestContext| {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(
+                project::ProjectPath {
+                    worktree_id,
+                    path: util::rel_path::rel_path(name).into(),
+                },
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+    };
+
+    open("a.txt", cx).await.unwrap();
+    let editor = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_all(&editor::actions::SelectAll, window, cx)
+    });
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, cx| {
+        assert_eq!(
+            find_in_path.query_editor.read(cx).text(cx),
+            "token",
+            "the selection should be carried into the query editor"
+        );
+        assert!(
+            find_in_path.results.total_matches() > 0,
+            "the seeded query should have driven a search, not just filled the field"
+        );
+    });
+
+    cx.dispatch_action(menu::Cancel);
+    open("multiline.txt", cx).await.unwrap();
+    let multiline_editor = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+    multiline_editor.update_in(cx, |editor, window, cx| {
+        editor.select_all(&editor::actions::SelectAll, window, cx)
+    });
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+    find_in_path.read_with(cx, |find_in_path, cx| {
+        assert_eq!(
+            find_in_path.query_editor.read(cx).text(cx),
+            "",
+            "a multi-line selection is not a useful literal for a single-line query field"
+        );
+    });
+}
+
 fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
         let state = AppState::test(cx);
