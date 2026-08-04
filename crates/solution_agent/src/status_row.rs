@@ -528,13 +528,13 @@ pub(crate) fn render_status_row(
                                              session. The agent's history is preserved on disk \
                                              but cannot be restored through History.",
                                     ),
-                                    &["Cancel", "Clear"],
+                                    &["Clear", "Cancel"],
                                     cx,
                                 );
                                 window
                                     .spawn(cx, async move |cx| {
-                                        // Button index 1 = Clear; 0 / Esc cancels.
-                                        if prompt.await.ok() != Some(1) {
+                                        // Button index 0 = Clear; 1 / Esc cancels.
+                                        if prompt.await.ok() != Some(0) {
                                             return;
                                         }
                                         cx.update(|_, cx| {
