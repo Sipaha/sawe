@@ -766,7 +766,7 @@ pub struct ProjectPanelSettingsContent {
     /// Whether to fold directories automatically
     /// when directory has only one directory inside.
     ///
-    /// Default: true
+    /// Default: false
     pub auto_fold_dirs: Option<bool>,
     /// Whether to show folder names with bold text in the project panel.
     ///
@@ -794,7 +794,7 @@ pub struct ProjectPanelSettingsContent {
     pub hide_hidden: Option<bool>,
     /// Whether to stick parent directories at top of the project panel.
     ///
-    /// Default: true
+    /// Default: false
     pub sticky_scroll: Option<bool>,
     /// Whether to enable drag-and-drop operations in the project panel.
     ///

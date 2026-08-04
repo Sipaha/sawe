@@ -29,8 +29,9 @@ project panel and scroll it into view. This can be disabled with the
 
 ### Sticky Scroll
 
-When `project_panel.sticky_scroll` is enabled (the default), ancestor directories pin themselves to the top
-of the panel as you scroll, so you always know which directory you're on.
+When `project_panel.sticky_scroll` is enabled, ancestor directories pin themselves to the top
+of the panel as you scroll, so you always know which directory you're on. It is off by default in
+Sawe — the pinned rows cover the tree while you scroll; set `"sticky_scroll": true` to bring them back.
 
 ![Project Panel: Sticky Scroll Enabled](https://images.zed.dev/docs/project-panel/sticky-scroll-true.png)
 
@@ -38,11 +39,12 @@ of the panel as you scroll, so you always know which directory you're on.
 
 ### Directory Folding
 
-When `project_panel.auto_fold_dirs` is enabled (the default), chains of directories that each contain a
+When `project_panel.auto_fold_dirs` is enabled, chains of directories that each contain a
 single child directory are collapsed into one row (for example,
 `src/utils/helpers` instead of three separate levels). Right-click a folded
 directory and choose **Unfold Directory** to expand the chain, or **Fold
-Directory** to collapse it again.
+Directory** to collapse it again. It is off by default in Sawe — every directory gets its own
+row; set `"auto_fold_dirs": true` to bring the collapsed chains back.
 
 ![Project Panel: Auto Fold Directories Enabled](https://images.zed.dev/docs/project-panel/auto-fold-dirs-true.png)
 

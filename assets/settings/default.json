@@ -797,7 +797,7 @@
     "starts_open": true,
     // Whether to fold directories automatically and show compact folders
     // (e.g. "a/b/c" ) when a directory has only one subdirectory inside.
-    "auto_fold_dirs": true,
+    "auto_fold_dirs": false,
     // Whether to show folder names with bold text in the project panel.
     "bold_folder_labels": false,
     // Scrollbar-related settings
@@ -831,7 +831,7 @@
     //    "all"
     "show_diagnostics": "all",
     // Whether to stick parent directories at top of the project panel.
-    "sticky_scroll": true,
+    "sticky_scroll": false,
     // Settings related to indent guides in the project panel.
     "indent_guides": {
       // When to show indent guides in the project panel.
