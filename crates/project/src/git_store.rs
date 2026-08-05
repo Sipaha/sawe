@@ -4919,6 +4919,49 @@ impl MergeDetails {
     }
 }
 
+/// Re-read the branch list (and with it `branch.upstream`, i.e. the ahead/behind
+/// counts) from the backend, publish it on the repository snapshot and tell
+/// downstream collaborators. Shared by [`Repository::push`] and
+/// [`Repository::refresh_branches`] — see the latter for why a push needs this
+/// at all.
+async fn rescan_branches(
+    this: &WeakEntity<Repository>,
+    backend: &Arc<dyn GitRepository>,
+    updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let branches_scan = backend.branches().await?;
+    let branch_list_error = branches_scan.error;
+    let branch_list: Arc<[Branch]> = branches_scan.branches.into();
+    let branch = branch_list.iter().find(|branch| branch.is_head).cloned();
+    log::info!("head branch after scan is {branch:?}");
+    let snapshot = this.update(cx, |this, cx| {
+        let branch_list_changed = *branch_list != *this.snapshot.branch_list;
+        let branch_list_error_changed = this.snapshot.branch_list_error != branch_list_error;
+        this.snapshot.branch = branch;
+        this.snapshot.branch_list = branch_list;
+        this.snapshot.branch_list_error = branch_list_error;
+        // Unconditional, unlike the `scan_id > 2` guard `handle_subscribe_self`
+        // puts on the generic `HeadChanged` arm: that guard is there to survive
+        // the initial-load scan storm, and a rescan only ever runs after an
+        // explicit push. Leaving it to the guard means a push early in a
+        // session (`scan_id` still 2) keeps serving the cached log, so the
+        // graph goes on drawing `origin/…` on the pre-push commit.
+        this.initial_graph_data.clear();
+        cx.emit(RepositoryEvent::HeadChanged);
+        if branch_list_changed || branch_list_error_changed {
+            cx.emit(RepositoryEvent::BranchListChanged);
+        }
+        this.snapshot.clone()
+    })?;
+    if let Some(updates_tx) = updates_tx {
+        updates_tx
+            .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+            .ok();
+    }
+    Ok(())
+}
+
 impl Repository {
     pub fn is_trusted(&self) -> bool {
         match self.repository_state.peek() {
@@ -7309,6 +7352,44 @@ impl Repository {
         )
     }
 
+    /// Re-read the branch list from the backend and republish the snapshot.
+    ///
+    /// A `git push` only moves `refs/remotes/**`, which the fs watcher does not
+    /// report, so the cached `branch.upstream` — the ahead/behind counts the UI
+    /// renders, and the ref decorations the graph draws — keeps its pre-push
+    /// value until something re-scans explicitly. Any code path that pushes
+    /// WITHOUT going through [`Repository::push`] (the push dialog shells out to
+    /// `git push` directly, for flags `PushOptions` cannot express) must call
+    /// this, or the UI silently lies about what has been pushed.
+    pub fn refresh_branches(&mut self, cx: &mut Context<Self>) -> oneshot::Receiver<Result<()>> {
+        let updates_tx = self.downstream_updates_tx(cx);
+        let this = cx.weak_entity();
+        self.send_job(
+            "refresh_branches",
+            None,
+            move |git_repo, mut cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        rescan_branches(&this, &backend, updates_tx, &mut cx).await
+                    }
+                    // The branch list of a remote project is owned by the host,
+                    // which republishes it over the wire on its own.
+                    RepositoryState::Remote(_) => Ok(()),
+                }
+            },
+        )
+    }
+
+    fn downstream_updates_tx(&self, cx: &App) -> Option<mpsc::UnboundedSender<DownstreamUpdate>> {
+        self.git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            })
+    }
+
     pub fn push(
         &mut self,
         branch: SharedString,
@@ -7329,14 +7410,7 @@ impl Repository {
             })
             .unwrap_or("");
 
-        let updates_tx = self
-            .git_store()
-            .and_then(|git_store| match &git_store.read(cx).state {
-                GitStoreState::Local { downstream, .. } => downstream
-                    .as_ref()
-                    .map(|downstream| downstream.updates_tx.clone()),
-                _ => None,
-            });
+        let updates_tx = self.downstream_updates_tx(cx);
 
         let this = cx.weak_entity();
         self.send_job(
@@ -7360,32 +7434,8 @@ impl Repository {
                                 cx.clone(),
                             )
                             .await;
-                        // TODO would be nice to not have to do this manually
                         if result.is_ok() {
-                            let branches_scan = backend.branches().await?;
-                            let branch_list_error = branches_scan.error;
-                            let branch_list: Arc<[Branch]> = branches_scan.branches.into();
-                            let branch = branch_list.iter().find(|branch| branch.is_head).cloned();
-                            log::info!("head branch after scan is {branch:?}");
-                            let snapshot = this.update(&mut cx, |this, cx| {
-                                let branch_list_changed =
-                                    *branch_list != *this.snapshot.branch_list;
-                                let branch_list_error_changed =
-                                    this.snapshot.branch_list_error != branch_list_error;
-                                this.snapshot.branch = branch;
-                                this.snapshot.branch_list = branch_list;
-                                this.snapshot.branch_list_error = branch_list_error;
-                                cx.emit(RepositoryEvent::HeadChanged);
-                                if branch_list_changed || branch_list_error_changed {
-                                    cx.emit(RepositoryEvent::BranchListChanged);
-                                }
-                                this.snapshot.clone()
-                            })?;
-                            if let Some(updates_tx) = updates_tx {
-                                updates_tx
-                                    .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
-                                    .ok();
-                            }
+                            rescan_branches(&this, &backend, updates_tx, &mut cx).await?;
                         }
                         result
                     }

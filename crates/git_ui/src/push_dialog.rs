@@ -22,6 +22,7 @@ use gpui::{
     InteractiveElement, ParentElement, Render, SharedString, Styled, Task, WeakEntity, Window, div,
 };
 use menu::Cancel;
+use project::git_store::Repository;
 use ui::{
     App, Button, Checkbox, Clickable, Color, Context, Headline, HeadlineSize, Icon, IconName,
     IconSize, IntoElement, Label, LabelCommon, LabelSize, ToggleState, Tooltip, h_flex, prelude::*,
@@ -63,6 +64,10 @@ impl PushPreview {
 /// Push dialog modal view.
 pub struct PushDialog {
     workspace: WeakEntity<Workspace>,
+    /// Kept so a completed push can ask the git store to re-scan branches —
+    /// `run_push_cli` bypasses `Repository::push`, which is what normally
+    /// refreshes the ahead/behind counts. See `Repository::refresh_branches`.
+    repository: Entity<Repository>,
     work_dir: PathBuf,
     branch: SharedString,
     remote: SharedString,
@@ -136,9 +141,9 @@ impl PushDialog {
                 editor.set_placeholder_text("remote/branch", window, cx);
                 editor
             });
-            let _repo = repo;
             let mut dialog = PushDialog {
                 workspace: workspace_handle,
+                repository: repo,
                 work_dir,
                 branch,
                 remote: SharedString::from(""),
@@ -345,6 +350,26 @@ impl PushDialog {
                         );
                         let success = format_output(&action, output);
                         log::info!("PushDialog: push succeeded — {}", success.message);
+                        // The push moved `refs/remotes/**` behind the git
+                        // store's back (no fs-watcher event covers that), so
+                        // without this the branch widget keeps its `↑N` badge
+                        // and the graph keeps drawing `origin/…` on the
+                        // pre-push commit.
+                        let rescan = this
+                            .repository
+                            .update(cx, |repository, cx| repository.refresh_branches(cx));
+                        cx.background_spawn(async move {
+                            match rescan.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => {
+                                    log::warn!("PushDialog: branch rescan after push failed: {err}")
+                                }
+                                Err(_) => log::warn!(
+                                    "PushDialog: branch rescan after push was dropped by the git store"
+                                ),
+                            }
+                        })
+                        .detach();
                         cx.emit(DismissEvent);
                     }
                     Err(err) => {

@@ -5423,6 +5423,85 @@ mod tests {
         );
     }
 
+    /// The counterpart to the test above: the initial-load scan must NOT drop
+    /// the cached log, but an explicit post-push rescan must. The push dialog
+    /// shells out to `git push`, so `refresh_branches` is the only thing that
+    /// tells the graph its `origin/…` decorations moved — and it has to do so
+    /// even here, where `scan_id` is still at its initial value and the generic
+    /// `HeadChanged` cache-clear is therefore guarded off.
+    #[gpui::test]
+    async fn test_refresh_branches_clears_cached_graph_data(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let commits = generate_random_commit_dag(&mut rng, 10, false);
+        fs.set_graph_commits(Path::new("/project/.git"), commits.clone());
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        repository.update(cx, |repo, cx| {
+            repo.graph_data(
+                crate::LogSource::default(),
+                crate::LogOrder::default(),
+                Vec::new(),
+                Vec::new(),
+                0..usize::MAX,
+                cx,
+            );
+        });
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let cached = repository.read_with(cx, |repo, _| {
+            repo.get_graph_data(
+                crate::LogSource::default(),
+                crate::LogOrder::default(),
+                &[],
+                &[],
+            )
+            .is_some()
+        });
+        assert!(cached, "graph data should be cached before the rescan");
+
+        let rescan = repository.update(cx, |repo, cx| repo.refresh_branches(cx));
+        cx.run_until_parked();
+        rescan
+            .await
+            .expect("rescan job should report back")
+            .expect("rescan should succeed");
+
+        let cached = repository.read_with(cx, |repo, _| {
+            repo.get_graph_data(
+                crate::LogSource::default(),
+                crate::LogOrder::default(),
+                &[],
+                &[],
+            )
+            .is_some()
+        });
+        assert!(
+            !cached,
+            "refresh_branches should drop the cached log so the graph re-reads its ref decorations"
+        );
+    }
+
     #[gpui::test]
     async fn test_initial_graph_data_propagates_error(cx: &mut TestAppContext) {
         init_test(cx);
