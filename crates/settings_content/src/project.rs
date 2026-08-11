@@ -549,7 +549,7 @@ pub struct GitSettings {
     pub path_style: Option<GitPathStyle>,
     /// Whether to show the stage and restore buttons on diff hunks.
     ///
-    /// Default: true
+    /// Default: false
     pub show_stage_restore_buttons: Option<bool>,
     /// Directory where git worktrees are created, relative to the repository
     /// working directory.

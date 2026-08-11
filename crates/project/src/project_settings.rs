@@ -485,7 +485,7 @@ pub struct GitSettings {
     pub path_style: GitPathStyle,
     /// Whether to show the stage and restore buttons on diff hunks.
     ///
-    /// Default: true
+    /// Default: false
     pub show_stage_restore_buttons: bool,
     /// Directory where git worktrees are created, relative to the repository
     /// working directory. When the resolved directory is outside the project
@@ -692,7 +692,7 @@ impl Settings for ProjectSettings {
             },
             hunk_style: git.hunk_style.unwrap(),
             path_style: git.path_style.unwrap().into(),
-            show_stage_restore_buttons: git.show_stage_restore_buttons.unwrap_or(true),
+            show_stage_restore_buttons: git.show_stage_restore_buttons.unwrap_or(false),
             worktree_directory: git
                 .worktree_directory
                 .clone()
