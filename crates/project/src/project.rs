@@ -28,7 +28,7 @@ mod environment;
 use buffer_diff::BufferDiff;
 use context_server_store::ContextServerStore;
 pub use environment::ProjectEnvironmentEvent;
-use git::repository::get_git_committer;
+use git::repository::{RepoPath, get_git_committer};
 use git_store::{Repository, RepositoryId};
 pub mod search_history;
 pub mod yarn;
@@ -5236,6 +5236,18 @@ impl Project {
     ) -> Task<Result<Option<Blame>>> {
         self.git_store.update(cx, |git_store, cx| {
             git_store.blame_buffer(buffer, version, cx)
+        })
+    }
+
+    pub fn blame_path_at_revision(
+        &self,
+        repository: &Entity<Repository>,
+        repo_path: RepoPath,
+        revision: String,
+        cx: &mut App,
+    ) -> Task<Result<Option<Blame>>> {
+        self.git_store.update(cx, |git_store, cx| {
+            git_store.blame_path_at_revision(repository, repo_path, revision, cx)
         })
     }
 

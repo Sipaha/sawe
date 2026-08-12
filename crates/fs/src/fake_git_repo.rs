@@ -12,10 +12,9 @@ use git::{
     blame::Blame,
     repository::{
         AskPassDelegate, AuthorHistoryEntry, Branch, CommitData, CommitDataReader, CommitDetails,
-        CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
+        CommitOptions, CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets,
+        GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
     },
     stash::GitStash,
     status::{
@@ -66,6 +65,7 @@ pub struct FakeGitRepositoryState {
     pub merge_base_contents: HashMap<RepoPath, Oid>,
     pub oids: HashMap<Oid, String>,
     pub blames: HashMap<RepoPath, Blame>,
+    pub blames_at_revision: HashMap<(String, RepoPath), Blame>,
     pub current_branch_name: Option<String>,
     pub branches: HashSet<String>,
     /// List of remotes, keys are names and values are URLs
@@ -89,6 +89,7 @@ impl FakeGitRepositoryState {
             index_contents: Default::default(),
             unmerged_paths: Default::default(),
             blames: Default::default(),
+            blames_at_revision: Default::default(),
             current_branch_name: Default::default(),
             branches: Default::default(),
             simulated_index_write_error_message: Default::default(),
@@ -937,6 +938,20 @@ impl GitRepository for FakeGitRepository {
                 .blames
                 .get(&path)
                 .with_context(|| format!("failed to get blame for {:?}", path))
+                .cloned()
+        })
+    }
+
+    fn blame_at_revision(
+        &self,
+        path: RepoPath,
+        revision: String,
+    ) -> BoxFuture<'_, Result<git::blame::Blame>> {
+        self.with_state_async(false, move |state| {
+            state
+                .blames_at_revision
+                .get(&(revision.clone(), path.clone()))
+                .with_context(|| format!("failed to get blame for {:?} at {}", path, revision))
                 .cloned()
         })
     }

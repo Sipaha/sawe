@@ -1547,6 +1547,43 @@ impl GitStore {
         })
     }
 
+    /// Blames `repo_path` as it existed at `revision`.
+    ///
+    /// Unlike [`Self::blame_buffer`] this does not need an open buffer, and it
+    /// annotates the file's content at that revision rather than working-tree
+    /// content against HEAD — which is what the left-hand pane of a diff
+    /// shows.
+    ///
+    /// Returns `Ok(None)` for remote projects: the `BlameBuffer` proto message
+    /// is keyed by buffer id and has no revision field, so there is nothing to
+    /// forward the request over. Callers degrade to "no blame" rather than
+    /// reporting a wrong annotation.
+    pub fn blame_path_at_revision(
+        &self,
+        repository: &Entity<Repository>,
+        repo_path: RepoPath,
+        revision: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Blame>>> {
+        let repository = repository.downgrade();
+        cx.spawn(async move |_, cx| {
+            let repository_state = repository
+                .update(cx, |repository, _| repository.repository_state.clone())?
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
+            match repository_state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
+                    .blame_at_revision(repo_path.clone(), revision.clone())
+                    .await
+                    .with_context(|| {
+                        format!("Failed to blame {:?} at {revision}", repo_path.as_ref())
+                    })
+                    .map(Some),
+                RepositoryState::Remote(_) => Ok(None),
+            }
+        })
+    }
+
     pub fn get_permalink_to_line(
         &self,
         buffer: &Entity<Buffer>,
@@ -2970,10 +3007,12 @@ impl GitStore {
                 let is_loading = response.is_loading;
 
                 if is_loading {
-                    if let Some(graph_data) = repository
-                        .initial_graph_data
-                        .get_mut(&(log_source.clone(), log_order, Vec::new(), Vec::new()))
-                    {
+                    if let Some(graph_data) = repository.initial_graph_data.get_mut(&(
+                        log_source.clone(),
+                        log_order,
+                        Vec::new(),
+                        Vec::new(),
+                    )) {
                         graph_data.subscribers.push(subscriber_sender);
                     }
                 }

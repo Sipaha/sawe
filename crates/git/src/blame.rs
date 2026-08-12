@@ -19,6 +19,22 @@ pub struct Blame {
     pub messages: HashMap<Oid, String>,
 }
 
+/// What `git blame` should annotate.
+#[derive(Clone, Copy)]
+enum BlameTarget<'a> {
+    /// Blame the working-tree content piped in on stdin, against HEAD's
+    /// history. This is what an ordinary editor buffer needs, because the
+    /// buffer may hold unsaved edits.
+    Contents {
+        content: &'a Rope,
+        line_ending: LineEnding,
+    },
+    /// Blame the file exactly as it existed at `revision`. Used for the
+    /// left-hand pane of a diff, whose text is the base revision's content
+    /// and therefore has line numbers that only line up with that revision.
+    Revision(&'a str),
+}
+
 impl Blame {
     pub(crate) async fn for_path(
         git: &GitBinary,
@@ -26,7 +42,28 @@ impl Blame {
         content: &Rope,
         line_ending: LineEnding,
     ) -> Result<Self> {
-        let mut entries = run_git_blame(git, path, content, line_ending).await?;
+        Self::run(
+            git,
+            path,
+            BlameTarget::Contents {
+                content,
+                line_ending,
+            },
+        )
+        .await
+    }
+
+    /// Blame `path` as of `revision` rather than as of the working tree.
+    pub(crate) async fn for_path_at_revision(
+        git: &GitBinary,
+        path: &RepoPath,
+        revision: &str,
+    ) -> Result<Self> {
+        Self::run(git, path, BlameTarget::Revision(revision)).await
+    }
+
+    async fn run(git: &GitBinary, path: &RepoPath, target: BlameTarget<'_>) -> Result<Self> {
+        let mut entries = run_git_blame(git, path, target).await?;
 
         let mut unique_shas = HashSet::default();
 
@@ -51,13 +88,21 @@ const BLAME_PARSE_YIELD_INTERVAL: usize = 512;
 async fn run_git_blame(
     git: &GitBinary,
     path: &RepoPath,
-    contents: &Rope,
-    line_ending: LineEnding,
+    target: BlameTarget<'_>,
 ) -> Result<Vec<BlameEntry>> {
+    let mut arguments = vec!["blame", "--incremental"];
+    if let BlameTarget::Contents { .. } = target {
+        arguments.extend_from_slice(&["--contents", "-"]);
+    }
+    if let BlameTarget::Revision(revision) = target {
+        arguments.push(revision);
+    }
+    arguments.push("--");
+
     let mut child = {
         let span = ztracing::debug_span!("spawning git-blame command", path = path.as_unix_str());
         let _enter = span.enter();
-        git.build_command(&["blame", "--incremental", "--contents", "-", "--"])
+        git.build_command(&arguments)
             .arg(path.as_unix_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -81,10 +126,20 @@ async fn run_git_blame(
         .context("failed to get stderr from git blame command")?;
 
     let write_stdin = async move {
-        for chunk in text::chunks_with_line_ending(contents, line_ending) {
-            stdin.write_all(chunk.as_bytes()).await?;
+        if let BlameTarget::Contents {
+            content,
+            line_ending,
+        } = target
+        {
+            for chunk in text::chunks_with_line_ending(content, line_ending) {
+                stdin.write_all(chunk.as_bytes()).await?;
+            }
+            stdin.flush().await?;
         }
-        stdin.flush().await.map_err(Into::into)
+        // Dropping the handle closes the pipe, which a revision blame needs
+        // in order for git to see EOF and exit.
+        drop(stdin);
+        Result::<()>::Ok(())
     };
 
     let read_stdout = async move {

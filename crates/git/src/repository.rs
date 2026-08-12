@@ -566,7 +566,10 @@ impl CommitDetails {
         // produced, and the title bar renders it on every repaint — a
         // truncated sha must degrade, not crash the window.
         let sha: &str = &self.sha;
-        sha.get(..SHORT_SHA_LENGTH).unwrap_or(sha).to_string().into()
+        sha.get(..SHORT_SHA_LENGTH)
+            .unwrap_or(sha)
+            .to_string()
+            .into()
     }
 }
 
@@ -1022,6 +1025,15 @@ pub trait GitRepository: Send + Sync {
         path: RepoPath,
         content: Rope,
         line_ending: LineEnding,
+    ) -> BoxFuture<'_, Result<crate::blame::Blame>>;
+
+    /// Blame `path` as it existed at `revision`, instead of blaming
+    /// working-tree content against HEAD. The resulting line ranges refer to
+    /// the file's content at that revision.
+    fn blame_at_revision(
+        &self,
+        path: RepoPath,
+        revision: String,
     ) -> BoxFuture<'_, Result<crate::blame::Blame>>;
 
     /// Returns the absolute path to the repository. For worktrees, this will be the path to the
@@ -2565,6 +2577,21 @@ impl GitRepository for RealGitRepository {
             .spawn(async move {
                 let git = git?;
                 crate::blame::Blame::for_path(&git, &path, &content, line_ending).await
+            })
+            .boxed()
+    }
+
+    fn blame_at_revision(
+        &self,
+        path: RepoPath,
+        revision: String,
+    ) -> BoxFuture<'_, Result<crate::blame::Blame>> {
+        let git = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                crate::blame::Blame::for_path_at_revision(&git, &path, &revision).await
             })
             .boxed()
     }
@@ -6025,8 +6052,8 @@ mod tests {
                 Vec::new(),
                 tx,
             )
-                .await
-                .unwrap();
+            .await
+            .unwrap();
             let mut commits = std::collections::HashSet::new();
             while let Ok(chunk) = rx.try_recv() {
                 for commit in chunk {
