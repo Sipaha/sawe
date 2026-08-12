@@ -8,10 +8,11 @@ use git::{
     GitHostingProviderRegistry, Oid,
     blame::{Blame, BlameEntry},
     commit::ParsedCommitMessage,
+    repository::RepoPath,
 };
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, Hsla, ScrollHandle, Subscription, Task,
-    TextStyle, WeakEntity, Window,
+    AnyElement, App, AppContext as _, Context, Entity, Hsla, ScrollHandle, SharedString,
+    Subscription, Task, TextStyle, WeakEntity, Window,
 };
 use itertools::Itertools;
 use language::{Bias, BufferSnapshot, Edit};
@@ -46,6 +47,23 @@ pub struct BlameOptions {
     /// otherwise relative ("3d ago"). Configurable via the gutter
     /// toolbar.
     pub absolute_dates: bool,
+}
+
+/// Tells [`GitBlame`] how to annotate a buffer that is not a project file.
+///
+/// The left-hand pane of a split diff is built from
+/// `BufferDiff::base_text_buffer()`, a detached in-memory buffer with no
+/// `File`, so `GitStore::repository_and_path_for_buffer_id` cannot find a
+/// repository for it. Rather than faking a `File` on that buffer — which would
+/// make unrelated code treat it as a real project file — the owner of the
+/// editor registers this side-channel entry, which also carries the revision
+/// the base text was taken from. Blaming HEAD would be wrong whenever the diff
+/// base is not HEAD.
+#[derive(Clone, Debug)]
+pub struct BlameBaseSource {
+    pub repository: Entity<Repository>,
+    pub repo_path: RepoPath,
+    pub revision: SharedString,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,6 +116,7 @@ pub struct GitBlame {
     project: Entity<Project>,
     multi_buffer: WeakEntity<MultiBuffer>,
     buffers: HashMap<BufferId, GitBlameBuffer>,
+    base_sources: HashMap<BufferId, BlameBaseSource>,
     task: Task<Result<()>>,
     focused: bool,
     changed_while_blurred: bool,
@@ -250,6 +269,7 @@ impl GitBlame {
     pub fn new(
         multi_buffer: Entity<MultiBuffer>,
         project: Entity<Project>,
+        base_sources: HashMap<BufferId, BlameBaseSource>,
         user_triggered: bool,
         focused: bool,
         cx: &mut Context<Self>,
@@ -307,6 +327,7 @@ impl GitBlame {
             project,
             multi_buffer: multi_buffer.downgrade(),
             buffers: HashMap::default(),
+            base_sources,
             user_triggered,
             focused,
             changed_while_blurred: false,
@@ -324,12 +345,37 @@ impl GitBlame {
     }
 
     pub fn repository(&self, cx: &App, id: BufferId) -> Option<Entity<Repository>> {
+        if let Some(source) = self.base_sources.get(&id) {
+            return Some(source.repository.clone());
+        }
         self.project
             .read(cx)
             .git_store()
             .read(cx)
             .repository_and_path_for_buffer_id(id, cx)
             .map(|(repo, _)| repo)
+    }
+
+    /// Replaces the detached-buffer blame sources (see [`BlameBaseSource`])
+    /// and re-runs blame if they changed.
+    pub fn set_base_sources(
+        &mut self,
+        base_sources: HashMap<BufferId, BlameBaseSource>,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = base_sources.len() == self.base_sources.len()
+            && base_sources.iter().all(|(id, source)| {
+                self.base_sources.get(id).is_some_and(|existing| {
+                    existing.repository == source.repository
+                        && existing.repo_path == source.repo_path
+                        && existing.revision == source.revision
+                })
+            });
+        if unchanged {
+            return;
+        }
+        self.base_sources = base_sources;
+        self.generate(cx);
     }
 
     pub fn has_generated_entries(&self) -> bool {
@@ -604,6 +650,7 @@ impl GitBlame {
             })
             .unwrap_or_default();
         let project = self.project.downgrade();
+        let base_sources = self.base_sources.clone();
 
         self.task = cx.spawn(async move |this, cx| {
             let mut all_results = Vec::new();
@@ -622,22 +669,35 @@ impl GitBlame {
                             let snapshot = buffer.read(cx).snapshot();
                             let buffer_edits = buffer.update(cx, |buffer, _| buffer.subscribe());
 
-                            let repository = project
-                                .read(cx)
-                                .git_store()
-                                .read(cx)
-                                .repository_and_path_for_buffer_id(id, cx);
+                            let base_source = base_sources.get(&id);
+                            let repository = match base_source {
+                                Some(source) => Some(source.repository.clone()),
+                                None => project
+                                    .read(cx)
+                                    .git_store()
+                                    .read(cx)
+                                    .repository_and_path_for_buffer_id(id, cx)
+                                    .map(|(repo, _)| repo),
+                            };
 
                             let remote_url = repository
                                 .as_ref()
-                                .and_then(|(repo, _)| repo.read(cx).default_remote_url());
+                                .and_then(|repo| repo.read(cx).default_remote_url());
 
-                            let blame_buffer = if repository.is_some() {
-                                project.update(cx, |project, cx| {
-                                    project.blame_buffer(&buffer, None, cx)
-                                })
-                            } else {
-                                Task::ready(Ok(None))
+                            let blame_buffer = match base_source {
+                                Some(source) => project.update(cx, |project, cx| {
+                                    project.blame_path_at_revision(
+                                        &source.repository,
+                                        source.repo_path.clone(),
+                                        source.revision.to_string(),
+                                        cx,
+                                    )
+                                }),
+                                None if repository.is_some() => project
+                                    .update(cx, |project, cx| {
+                                        project.blame_buffer(&buffer, None, cx)
+                                    }),
+                                None => Task::ready(Ok(None)),
                             };
 
                             Ok(async move {
@@ -890,7 +950,16 @@ mod tests {
             .unwrap();
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
 
-        let blame = cx.new(|cx| GitBlame::new(buffer.clone(), project.clone(), true, true, cx));
+        let blame = cx.new(|cx| {
+            GitBlame::new(
+                buffer.clone(),
+                project.clone(),
+                HashMap::default(),
+                true,
+                true,
+                cx,
+            )
+        });
 
         let event = project.next_event(cx).await;
         assert_eq!(
@@ -963,7 +1032,16 @@ mod tests {
             })
         });
 
-        let blame = cx.new(|cx| GitBlame::new(buffer.clone(), project.clone(), true, true, cx));
+        let blame = cx.new(|cx| {
+            GitBlame::new(
+                buffer.clone(),
+                project.clone(),
+                HashMap::default(),
+                true,
+                true,
+                cx,
+            )
+        });
 
         cx.executor().run_until_parked();
 
@@ -1039,7 +1117,8 @@ mod tests {
         let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
 
-        let git_blame = cx.new(|cx| GitBlame::new(buffer.clone(), project, false, true, cx));
+        let git_blame = cx
+            .new(|cx| GitBlame::new(buffer.clone(), project, HashMap::default(), false, true, cx));
 
         cx.executor().run_until_parked();
 
@@ -1110,6 +1189,112 @@ mod tests {
         });
     }
 
+    /// A left-hand diff pane is backed by a detached base-text buffer. Without
+    /// a `BlameBaseSource` it must produce nothing (it has no repository), and
+    /// with one it must be annotated from the base revision — not from HEAD.
+    #[gpui::test]
+    async fn test_blame_for_detached_base_text_buffer(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/my-repo"),
+            json!({
+                ".git": {},
+                "file.txt": "Line 1\nLine 2\nLine 3\n"
+            }),
+        )
+        .await;
+
+        fs.set_blame_for_repo(
+            Path::new(path!("/my-repo/.git")),
+            vec![(
+                repo_path("file.txt"),
+                Blame {
+                    entries: vec![blame_entry("aaaaaa", 0..3)],
+                    ..Default::default()
+                },
+            )],
+        );
+        fs.set_blame_at_revision_for_repo(
+            Path::new(path!("/my-repo/.git")),
+            "HEAD",
+            vec![(
+                repo_path("file.txt"),
+                Blame {
+                    entries: vec![blame_entry("bbbbbb", 0..2)],
+                    ..Default::default()
+                },
+            )],
+        );
+
+        let project = Project::test(fs, [path!("/my-repo").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let base_text_buffer = cx.new(|cx| language::Buffer::local("Base 1\nBase 2\n", cx));
+        let base_text_buffer_id = base_text_buffer.read_with(cx, |buffer, _| buffer.remote_id());
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(base_text_buffer, cx));
+
+        let without_source = cx.new(|cx| {
+            GitBlame::new(
+                multi_buffer.clone(),
+                project.clone(),
+                HashMap::default(),
+                false,
+                true,
+                cx,
+            )
+        });
+        cx.executor().run_until_parked();
+        without_source.update(cx, |blame, cx| {
+            assert_blame_rows(blame, base_text_buffer_id, 0..2, vec![None, None], cx);
+        });
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .git_store()
+                .read(cx)
+                .repositories()
+                .values()
+                .next()
+                .cloned()
+                .expect("git store should have discovered /my-repo")
+        });
+        let mut base_sources = HashMap::default();
+        base_sources.insert(
+            base_text_buffer_id,
+            BlameBaseSource {
+                repository,
+                repo_path: repo_path("file.txt"),
+                revision: "HEAD".into(),
+            },
+        );
+
+        let with_source = cx.new(|cx| {
+            GitBlame::new(
+                multi_buffer.clone(),
+                project.clone(),
+                base_sources,
+                false,
+                true,
+                cx,
+            )
+        });
+        cx.executor().run_until_parked();
+        with_source.update(cx, |blame, cx| {
+            assert_blame_rows(
+                blame,
+                base_text_buffer_id,
+                0..2,
+                vec![
+                    Some(blame_entry("bbbbbb", 0..2)),
+                    Some(blame_entry("bbbbbb", 0..2)),
+                ],
+                cx,
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_blame_for_rows_with_edits(cx: &mut gpui::TestAppContext) {
         init_test(cx);
@@ -1150,7 +1335,8 @@ mod tests {
         let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
 
-        let git_blame = cx.new(|cx| GitBlame::new(buffer.clone(), project, false, true, cx));
+        let git_blame = cx
+            .new(|cx| GitBlame::new(buffer.clone(), project, HashMap::default(), false, true, cx));
 
         cx.executor().run_until_parked();
 
@@ -1317,7 +1503,16 @@ mod tests {
             .unwrap();
         let mbuffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
 
-        let git_blame = cx.new(|cx| GitBlame::new(mbuffer.clone(), project, false, true, cx));
+        let git_blame = cx.new(|cx| {
+            GitBlame::new(
+                mbuffer.clone(),
+                project,
+                HashMap::default(),
+                false,
+                true,
+                cx,
+            )
+        });
         cx.executor().run_until_parked();
         git_blame.update(cx, |blame, cx| blame.check_invariants(cx));
 

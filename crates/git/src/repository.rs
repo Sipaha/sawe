@@ -566,7 +566,10 @@ impl CommitDetails {
         // produced, and the title bar renders it on every repaint — a
         // truncated sha must degrade, not crash the window.
         let sha: &str = &self.sha;
-        sha.get(..SHORT_SHA_LENGTH).unwrap_or(sha).to_string().into()
+        sha.get(..SHORT_SHA_LENGTH)
+            .unwrap_or(sha)
+            .to_string()
+            .into()
     }
 }
 
@@ -1022,6 +1025,15 @@ pub trait GitRepository: Send + Sync {
         path: RepoPath,
         content: Rope,
         line_ending: LineEnding,
+    ) -> BoxFuture<'_, Result<crate::blame::Blame>>;
+
+    /// Blame `path` as it existed at `revision`, instead of blaming
+    /// working-tree content against HEAD. The resulting line ranges refer to
+    /// the file's content at that revision.
+    fn blame_at_revision(
+        &self,
+        path: RepoPath,
+        revision: String,
     ) -> BoxFuture<'_, Result<crate::blame::Blame>>;
 
     /// Returns the absolute path to the repository. For worktrees, this will be the path to the
@@ -2565,6 +2577,21 @@ impl GitRepository for RealGitRepository {
             .spawn(async move {
                 let git = git?;
                 crate::blame::Blame::for_path(&git, &path, &content, line_ending).await
+            })
+            .boxed()
+    }
+
+    fn blame_at_revision(
+        &self,
+        path: RepoPath,
+        revision: String,
+    ) -> BoxFuture<'_, Result<crate::blame::Blame>> {
+        let git = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                crate::blame::Blame::for_path_at_revision(&git, &path, &revision).await
             })
             .boxed()
     }
@@ -5253,6 +5280,95 @@ mod tests {
         );
     }
 
+    #[allow(clippy::disallowed_methods)]
+    #[track_caller]
+    fn git_commit_all_as(working_directory: &Path, author: &str, message: &str) {
+        let output = std::process::Command::new("git")
+            .args(["commit", "-a", "-m", message])
+            .current_dir(working_directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", author)
+            .env("GIT_AUTHOR_EMAIL", "author@zed.dev")
+            .env("GIT_COMMITTER_NAME", author)
+            .env("GIT_COMMITTER_EMAIL", "author@zed.dev")
+            .output()
+            .expect("failed to run git commit");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// `blame_at_revision` must annotate the file as it existed at the given
+    /// commit — a different answer, over a different set of lines, than
+    /// blaming the working tree against HEAD.
+    #[gpui::test]
+    async fn test_blame_at_revision(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let file_path = repo_dir.path().join("file.txt");
+
+        smol::fs::write(&file_path, "one\ntwo\n").await.unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_commit_all_as(repo_dir.path(), "Ancient Author", "first");
+
+        smol::fs::write(&file_path, "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        git_commit_all_as(repo_dir.path(), "Recent Author", "second");
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let at_head = repository
+            .blame_at_revision(repo_path("file.txt"), "HEAD".into())
+            .await
+            .unwrap();
+        let head_authors: Vec<_> = at_head
+            .entries
+            .iter()
+            .filter_map(|entry| entry.author.clone())
+            .collect();
+        assert!(
+            head_authors.iter().any(|author| author == "Recent Author"),
+            "HEAD blame should attribute the third line, got {head_authors:?}"
+        );
+        assert_eq!(
+            at_head.entries.iter().map(|e| e.range.end).max(),
+            Some(3),
+            "HEAD blame should cover all three lines"
+        );
+
+        let at_parent = repository
+            .blame_at_revision(repo_path("file.txt"), "HEAD~1".into())
+            .await
+            .unwrap();
+        let parent_authors: Vec<_> = at_parent
+            .entries
+            .iter()
+            .filter_map(|entry| entry.author.clone())
+            .collect();
+        assert!(
+            parent_authors.iter().all(|author| author == "Ancient Author"),
+            "the parent commit predates the second author, got {parent_authors:?}"
+        );
+        assert_eq!(
+            at_parent.entries.iter().map(|e| e.range.end).max(),
+            Some(2),
+            "the file only had two lines at HEAD~1"
+        );
+    }
+
     #[gpui::test]
     async fn test_checkpoint_basic(cx: &mut TestAppContext) {
         disable_git_global_config();
@@ -6025,8 +6141,8 @@ mod tests {
                 Vec::new(),
                 tx,
             )
-                .await
-                .unwrap();
+            .await
+            .unwrap();
             let mut commits = std::collections::HashSet::new();
             while let Ok(chunk) = rx.try_recv() {
                 for commit in chunk {

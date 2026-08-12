@@ -187,6 +187,19 @@ unreachable because `language_settings::SoftWrap` has no `GitDiff` variant.
 
 ## Shipped
 
+- Item 5 (workstream B) — git blame in both panes of the split diff, plus a
+  reachable gutter menu entry. `git blame <rev> -- <path>` added at the backend
+  (`GitRepository::blame_at_revision` → `Project::blame_path_at_revision`);
+  `GitBlame` learned a `BlameBaseSource` side-channel keyed by `BufferId` that
+  the `SplittableEditor` fills for the left pane's detached base-text buffers.
+  Consumers opt in: `project_diff` on `DiffBase::Head` and `solo_diff_view` use
+  `HEAD`. **Not covered:** `DiffBase::Merge` (blame has no merge-base syntax and
+  the resolved merge-base sha isn't plumbed) and `commit_view` (both of its
+  panes are detached buffers, so it needs base sources on the right too).
+  Gutter right-click now offers "Annotate with Git Blame", and its
+  breakpoint/bookmark sections are gated on those affordances being enabled so
+  diff panes stop showing a menu of dead entries. See FORK.md decision #58.
+
 - Item 1 — per-hunk Stage/Restore hover buttons hidden by default:
   `bc8467fca5`. `git.show_stage_restore_buttons` already existed; only the
   default flipped (4 sites). Verified with a control test on a live instance

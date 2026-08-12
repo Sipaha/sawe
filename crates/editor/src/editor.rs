@@ -156,7 +156,7 @@ use futures::{
     future::{self, Shared},
 };
 use fuzzy::{StringMatch, StringMatchCandidate};
-use git::blame::{GitBlame, GlobalBlameRenderer};
+use git::blame::{BlameBaseSource, GitBlame, GlobalBlameRenderer};
 use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, AppContext, AsyncWindowContext,
     AvailableSpace, Background, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context,
@@ -1081,6 +1081,7 @@ pub struct Editor {
     show_selection_menu: Option<bool>,
     blame: Option<Entity<GitBlame>>,
     blame_subscription: Option<Subscription>,
+    blame_base_sources: HashMap<BufferId, BlameBaseSource>,
     custom_context_menu: Option<
         Box<
             dyn 'static
@@ -2292,6 +2293,7 @@ impl Editor {
             }),
             blame: None,
             blame_subscription: None,
+            blame_base_sources: HashMap::default(),
 
             bookmark_store,
             breakpoint_store,
@@ -4016,12 +4018,15 @@ impl Editor {
         breakpoint_display_points
     }
 
+    /// Builds the right-click menu for the line-number gutter, or `None` when
+    /// every entry it could offer is unavailable — a diff pane with blame
+    /// turned off would otherwise pop an empty menu.
     fn gutter_context_menu(
         &self,
         anchor: Anchor,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<ContextMenu> {
+    ) -> Option<Entity<ContextMenu>> {
         let weak_editor = cx.weak_entity();
         let focus_handle = self.focus_handle(cx);
 
@@ -4031,6 +4036,11 @@ impl Editor {
             .snapshot(cx)
             .summary_for_anchor::<Point>(&anchor)
             .row;
+
+        let gutter_settings = EditorSettings::get_global(cx).gutter;
+        let show_breakpoints = self.show_breakpoints.unwrap_or(gutter_settings.breakpoints);
+        let show_bookmarks = self.show_bookmarks.unwrap_or(gutter_settings.bookmarks);
+        let blame_entry = self.gutter_blame_menu_entry(cx);
 
         let breakpoint = self
             .breakpoint_at_row(row, window, cx)
@@ -4086,10 +4096,14 @@ impl Editor {
                 }
             });
 
+        if !show_breakpoints && !show_bookmarks && blame_entry.is_none() {
+            return None;
+        }
+
         let (anchor, breakpoint) =
             breakpoint.unwrap_or_else(|| (anchor, Arc::new(Breakpoint::new_standard())));
 
-        ContextMenu::build(window, cx, |menu, _, _cx| {
+        Some(ContextMenu::build(window, cx, |menu, _, _cx| {
             menu.on_blur_subscription(Subscription::new(|| {}))
                 .context(focus_handle)
                 .when(run_to_cursor, |this| {
@@ -4118,48 +4132,67 @@ impl Editor {
                     )
                     .separator()
                 })
-                .when_some(toggle_state_entry, |this, (msg, action)| {
-                    this.entry(msg, Some(action), {
-                        let weak_editor = weak_editor.clone();
-                        let breakpoint = breakpoint.clone();
-                        move |_window, cx| {
-                            weak_editor
-                                .update(cx, |this, cx| {
-                                    this.edit_breakpoint_at_anchor(
-                                        anchor,
-                                        breakpoint.as_ref().clone(),
-                                        BreakpointEditAction::InvertState,
-                                        cx,
-                                    );
-                                })
-                                .log_err();
-                        }
+                .when(show_breakpoints, |this| {
+                    this.when_some(toggle_state_entry, |this, (msg, action)| {
+                        this.entry(msg, Some(action), {
+                            let weak_editor = weak_editor.clone();
+                            let breakpoint = breakpoint.clone();
+                            move |_window, cx| {
+                                weak_editor
+                                    .update(cx, |this, cx| {
+                                        this.edit_breakpoint_at_anchor(
+                                            anchor,
+                                            breakpoint.as_ref().clone(),
+                                            BreakpointEditAction::InvertState,
+                                            cx,
+                                        );
+                                    })
+                                    .log_err();
+                            }
+                        })
                     })
-                })
-                .entry(
-                    set_breakpoint_msg,
-                    Some(crate::actions::ToggleBreakpoint.boxed_clone()),
-                    {
-                        let weak_editor = weak_editor.clone();
-                        let breakpoint = breakpoint.clone();
-                        move |_window, cx| {
-                            weak_editor
-                                .update(cx, |this, cx| {
-                                    this.edit_breakpoint_at_anchor(
-                                        anchor,
-                                        breakpoint.as_ref().clone(),
-                                        BreakpointEditAction::Toggle,
-                                        cx,
-                                    );
-                                })
-                                .log_err();
-                        }
-                    },
-                )
-                .entry(
-                    log_breakpoint_msg,
-                    Some(crate::actions::EditLogBreakpoint.boxed_clone()),
-                    {
+                    .entry(
+                        set_breakpoint_msg,
+                        Some(crate::actions::ToggleBreakpoint.boxed_clone()),
+                        {
+                            let weak_editor = weak_editor.clone();
+                            let breakpoint = breakpoint.clone();
+                            move |_window, cx| {
+                                weak_editor
+                                    .update(cx, |this, cx| {
+                                        this.edit_breakpoint_at_anchor(
+                                            anchor,
+                                            breakpoint.as_ref().clone(),
+                                            BreakpointEditAction::Toggle,
+                                            cx,
+                                        );
+                                    })
+                                    .log_err();
+                            }
+                        },
+                    )
+                    .entry(
+                        log_breakpoint_msg,
+                        Some(crate::actions::EditLogBreakpoint.boxed_clone()),
+                        {
+                            let breakpoint = breakpoint.clone();
+                            let weak_editor = weak_editor.clone();
+                            move |window, cx| {
+                                weak_editor
+                                    .update(cx, |this, cx| {
+                                        this.add_edit_breakpoint_block(
+                                            anchor,
+                                            breakpoint.as_ref(),
+                                            BreakpointPromptEditAction::Log,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .log_err();
+                            }
+                        },
+                    )
+                    .entry(condition_breakpoint_msg, None, {
                         let breakpoint = breakpoint.clone();
                         let weak_editor = weak_editor.clone();
                         move |window, cx| {
@@ -4168,61 +4201,77 @@ impl Editor {
                                     this.add_edit_breakpoint_block(
                                         anchor,
                                         breakpoint.as_ref(),
-                                        BreakpointPromptEditAction::Log,
+                                        BreakpointPromptEditAction::Condition,
                                         window,
                                         cx,
                                     );
                                 })
                                 .log_err();
                         }
-                    },
-                )
-                .entry(condition_breakpoint_msg, None, {
-                    let breakpoint = breakpoint.clone();
-                    let weak_editor = weak_editor.clone();
-                    move |window, cx| {
-                        weak_editor
-                            .update(cx, |this, cx| {
-                                this.add_edit_breakpoint_block(
-                                    anchor,
-                                    breakpoint.as_ref(),
-                                    BreakpointPromptEditAction::Condition,
-                                    window,
-                                    cx,
-                                );
-                            })
-                            .log_err();
-                    }
+                    })
+                    .entry(hit_condition_breakpoint_msg, None, {
+                        let breakpoint = breakpoint.clone();
+                        let weak_editor = weak_editor.clone();
+                        move |window, cx| {
+                            weak_editor
+                                .update(cx, |this, cx| {
+                                    this.add_edit_breakpoint_block(
+                                        anchor,
+                                        breakpoint.as_ref(),
+                                        BreakpointPromptEditAction::HitCondition,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                        }
+                    })
                 })
-                .entry(hit_condition_breakpoint_msg, None, {
-                    let breakpoint = breakpoint.clone();
-                    let weak_editor = weak_editor.clone();
-                    move |window, cx| {
-                        weak_editor
-                            .update(cx, |this, cx| {
-                                this.add_edit_breakpoint_block(
-                                    anchor,
-                                    breakpoint.as_ref(),
-                                    BreakpointPromptEditAction::HitCondition,
-                                    window,
-                                    cx,
-                                );
-                            })
-                            .log_err();
-                    }
+                .when(show_bookmarks, |this| {
+                    this.separator()
+                        .entry(set_bookmark_msg, Some(ToggleBookmark.boxed_clone()), {
+                            let weak_editor = weak_editor.clone();
+                            move |_window, cx| {
+                                weak_editor
+                                    .update(cx, |this, cx| {
+                                        this.toggle_bookmark_at_anchor(anchor, cx);
+                                    })
+                                    .log_err();
+                            }
+                        })
                 })
-                .separator()
-                .entry(
-                    set_bookmark_msg,
-                    Some(ToggleBookmark.boxed_clone()),
-                    move |_window, cx| {
-                        weak_editor
-                            .update(cx, |this, cx| {
-                                this.toggle_bookmark_at_anchor(anchor, cx);
-                            })
-                            .log_err();
-                    },
-                )
+                .when_some(blame_entry, |this, label| {
+                    this.separator()
+                        .entry(label, Some(::git::Blame.boxed_clone()), {
+                            let weak_editor = weak_editor.clone();
+                            move |window, cx| {
+                                weak_editor
+                                    .update(cx, |editor, cx| {
+                                        editor.toggle_git_blame(&::git::Blame, window, cx);
+                                    })
+                                    .log_err();
+                            }
+                        })
+                })
+        }))
+    }
+
+    /// Label for the gutter context menu's blame toggle, or `None` when the
+    /// editor cannot produce blame at all (no project, or a scratch buffer).
+    fn gutter_blame_menu_entry(&self, cx: &App) -> Option<&'static str> {
+        self.project.as_ref()?;
+        if self
+            .buffer
+            .read(cx)
+            .as_singleton()
+            .is_some_and(|buffer| buffer.read(cx).file().is_none())
+        {
+            return None;
+        }
+        Some(if self.show_git_blame_gutter {
+            "Close Git Blame Annotations"
+        } else {
+            "Annotate with Git Blame"
         })
     }
 
@@ -5705,7 +5754,10 @@ impl Editor {
             .snapshot(cx)
             .anchor_before(Point::new(display_row.0, 0u32));
 
-        let context_menu = self.gutter_context_menu(position.unwrap_or(source), window, cx);
+        let Some(context_menu) = self.gutter_context_menu(position.unwrap_or(source), window, cx)
+        else {
+            return;
+        };
 
         self.mouse_context_menu = MouseContextMenu::pinned_to_editor(
             self,
