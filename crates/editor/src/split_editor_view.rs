@@ -2,10 +2,10 @@ use std::cmp;
 
 use collections::{HashMap, HashSet};
 use gpui::{
-    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, Context, DragMoveEvent, Element,
-    Entity, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length,
-    ParentElement, Pixels, StatefulInteractiveElement, Styled, TextStyleRefinement, Window,
-    deferred, div, linear_color_stop, linear_gradient, point, px, size,
+    AnyElement, App, AvailableSpace, Bounds, Context, DragMoveEvent, Element, Entity,
+    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length, ParentElement,
+    Pixels, StatefulInteractiveElement, Styled, TextStyleRefinement, Window, deferred, div,
+    linear_color_stop, linear_gradient, point, px, size,
 };
 use multi_buffer::{Anchor, ExcerptBoundaryInfo};
 use settings::Settings;
@@ -24,7 +24,7 @@ use crate::{
     element::{EditorElement, SplitSide, header_jump_data, render_buffer_header},
     scroll::ScrollOffset,
     split::SplittableEditor,
-    split_connectors::{CONNECTOR_STRIP_WIDTH, connector_ribbons},
+    split_connectors::{CONNECTOR_STRIP_WIDTH, connector_ribbons, editor_rem_size},
 };
 
 #[derive(Debug, Clone)]
@@ -122,6 +122,9 @@ fn render_connector_strip(
 ) -> AnyElement {
     let state_for_click = state.clone();
     let rhs_editor_for_scroll = rhs_editor.clone();
+    let scroll_line_height = style
+        .text
+        .line_height_in_pixels(editor_rem_size(&style).unwrap_or(_window.rem_size()));
 
     let separator = |align_right: bool| {
         let separator = div()
@@ -151,9 +154,14 @@ fn render_connector_strip(
         // naturally rests while comparing hunks. Both panes share one scroll
         // anchor, so driving the right one carries the left with it.
         .on_scroll_wheel(move |event: &gpui::ScrollWheelEvent, window, cx| {
-            let line_height = window.line_height();
+            // `window.line_height()` is the ambient UI line height during event
+            // dispatch — the text-style stack is empty here, so it has nothing
+            // to do with the buffer font a pixel delta must be measured in.
             let lines = match event.delta {
-                gpui::ScrollDelta::Pixels(pixels) => ScrollOffset::from(pixels.y / line_height),
+                gpui::ScrollDelta::Pixels(pixels) if scroll_line_height > px(0.) => {
+                    ScrollOffset::from(pixels.y / scroll_line_height)
+                }
+                gpui::ScrollDelta::Pixels(_) => return,
                 gpui::ScrollDelta::Lines(lines) => ScrollOffset::from(lines.y),
             };
             if lines == 0. {
@@ -165,16 +173,21 @@ fn render_connector_strip(
                 EditorSettings::get_global(cx).scroll_sensitivity
             }
             .max(0.01);
-            rhs_editor_for_scroll.update(cx, |editor, cx| {
+            let scrolled = rhs_editor_for_scroll.update(cx, |editor, cx| {
                 let current = editor.scroll_position(cx);
                 let target = point(
                     current.x,
                     (current.y - lines * ScrollOffset::from(sensitivity)).max(0.),
                 );
-                if target != current {
-                    editor.set_scroll_position(target, window, cx);
+                if target == current {
+                    return false;
                 }
+                editor.set_scroll_position(target, window, cx);
+                true
             });
+            if scrolled {
+                cx.stop_propagation();
+            }
         })
         .child(connector_ribbons(lhs_editor, rhs_editor, style))
         .child(separator(false))
@@ -423,18 +436,7 @@ impl Element for SplitBufferHeadersElement {
 
 impl SplitBufferHeadersElement {
     fn rem_size(&self) -> Option<Pixels> {
-        match self.style.text.font_size {
-            AbsoluteLength::Pixels(pixels) => {
-                let rem_size_scale = {
-                    let default_font_size_scale = 14. / ui::BASE_REM_SIZE_IN_PX;
-                    let default_font_size_delta = 1. - default_font_size_scale;
-                    1. + default_font_size_delta
-                };
-
-                Some(pixels * rem_size_scale)
-            }
-            AbsoluteLength::Rems(rems) => Some(rems.to_pixels(ui::BASE_REM_SIZE_IN_PX.into())),
-        }
+        editor_rem_size(&self.style)
     }
 
     fn prepaint_inner(

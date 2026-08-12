@@ -4106,7 +4106,11 @@ impl Editor {
                 }
             });
 
-        if !show_breakpoints && !show_bookmarks && blame_entry.is_none() {
+        // `run_to_cursor` is rendered unconditionally below, so it counts
+        // towards the menu having something to show — otherwise an active debug
+        // session loses its only gutter entry point whenever breakpoints and
+        // bookmarks are both off.
+        if !show_breakpoints && !show_bookmarks && !run_to_cursor && blame_entry.is_none() {
             return None;
         }
 

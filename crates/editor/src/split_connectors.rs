@@ -345,8 +345,13 @@ fn horizontal_s_curve(
 }
 
 /// The editor's own rem size, which is what its line height was resolved
-/// against. Mirrors `SplitBufferHeadersElement::rem_size`.
-fn editor_rem_size(style: &EditorStyle) -> Option<Pixels> {
+/// against.
+///
+/// Everything that positions by row against a split pane — the ribbons here,
+/// the buffer-header overlay, the connector strip's wheel handler — has to
+/// agree on this, or they disagree about where a row is. `window.rem_size()`
+/// is the UI rem, not the buffer's, so it is the wrong answer for all of them.
+pub(crate) fn editor_rem_size(style: &EditorStyle) -> Option<Pixels> {
     match style.text.font_size {
         AbsoluteLength::Pixels(pixels) => {
             let default_font_size_scale = 14. / ui::BASE_REM_SIZE_IN_PX;

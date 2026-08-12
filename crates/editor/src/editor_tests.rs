@@ -38146,3 +38146,87 @@ async fn test_toggle_markdown_block_quote(cx: &mut TestAppContext) {
         fourthˇ»
     "});
 }
+
+/// The gutter is carved into four spans that must tile it exactly:
+/// `left_padding`, the line-number area, the indicator column and the fold
+/// area. The indicator column is a slice taken off the *front* of
+/// `right_padding`, which is the part that is easy to get wrong — a fold
+/// toggle that starts before the indicator column ends draws the chevron on
+/// top of the run arrow.
+#[gpui::test]
+fn test_gutter_columns_tile_without_overlap(_cx: &mut TestAppContext) {
+    let cases = [
+        (
+            "numbers, indicators and folds",
+            px(30.),
+            px(60.),
+            px(20.),
+            px(150.),
+        ),
+        ("no indicator column", px(30.), px(40.), px(0.), px(150.)),
+        ("no fold column", px(30.), px(20.), px(20.), px(150.)),
+        ("no right padding at all", px(30.), px(0.), px(0.), px(150.)),
+    ];
+
+    for (name, left_padding, right_padding, indicator_column_width, width) in cases {
+        let dimensions = GutterDimensions {
+            left_padding,
+            right_padding,
+            indicator_column_width,
+            width,
+            margin: px(0.),
+            git_blame_entries_width: None,
+        };
+
+        let numbers = dimensions.line_number_area();
+        let fold_start = dimensions.fold_area_start();
+        let indicator_start = width - right_padding;
+
+        assert_eq!(
+            numbers.start, left_padding,
+            "{name}: numbers start after the left padding"
+        );
+        assert_eq!(
+            numbers.end, indicator_start,
+            "{name}: numbers end where right padding begins"
+        );
+        assert!(
+            numbers.start <= numbers.end,
+            "{name}: number area is not inverted"
+        );
+        assert_eq!(
+            fold_start,
+            indicator_start + indicator_column_width,
+            "{name}: the fold area starts after the indicator column, never inside it",
+        );
+        assert!(
+            fold_start <= width,
+            "{name}: the fold area starts inside the gutter",
+        );
+        assert_eq!(
+            dimensions.fold_area_width(),
+            right_padding - indicator_column_width,
+            "{name}: the fold area gets whatever the indicator column left over",
+        );
+    }
+}
+
+/// `line_number_area` must never invert, even when the paddings alone exceed
+/// the gutter width — an inverted range would panic anything that iterates it.
+#[gpui::test]
+fn test_line_number_area_never_inverts(_cx: &mut TestAppContext) {
+    let dimensions = GutterDimensions {
+        left_padding: px(80.),
+        right_padding: px(80.),
+        indicator_column_width: px(20.),
+        width: px(100.),
+        margin: px(0.),
+        git_blame_entries_width: None,
+    };
+
+    let numbers = dimensions.line_number_area();
+    assert!(
+        numbers.start <= numbers.end,
+        "expected an empty range rather than an inverted one, got {numbers:?}",
+    );
+}

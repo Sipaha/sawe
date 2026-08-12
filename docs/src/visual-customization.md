@@ -213,7 +213,7 @@ TBD: Centered layout related settings
     "runnables": true,            // Show/hide runnables buttons in the gutter.
     "breakpoints": true,          // Show/hide show breakpoints in the gutter.
     "folds": true,                // Show/hide show fold buttons in the gutter.
-    "min_line_number_digits": 4   // Reserve space for N digit line numbers
+    "min_line_number_digits": 3   // Reserve space for N digit line numbers
   },
   "relative_line_numbers": "enabled", // Show relative line numbers in gutter
 

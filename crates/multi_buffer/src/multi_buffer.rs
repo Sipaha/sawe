@@ -61,6 +61,29 @@ use ztracing::instrument;
 
 pub use self::path_key::PathKey;
 
+/// Settings for a multibuffer whose excerpts disagree on their language.
+///
+/// Deliberately resolved at `location` rather than from the global defaults:
+/// a project's own `settings.json` sets language-agnostic keys too, and those
+/// have to keep applying even when no single language can speak for the whole
+/// buffer.
+fn language_agnostic_settings<'a>(
+    location: Option<settings::SettingsLocation<'a>>,
+    cx: &'a App,
+) -> Cow<'a, LanguageSettings> {
+    AllLanguageSettings::get(location, cx).language(location, None, cx)
+}
+
+fn settings_location_for_file<'a>(
+    file: Option<&'a Arc<dyn File>>,
+    cx: &'a App,
+) -> Option<settings::SettingsLocation<'a>> {
+    file.map(|file| settings::SettingsLocation {
+        worktree_id: file.worktree_id(cx),
+        path: file.path().as_ref(),
+    })
+}
+
 pub static EXCERPT_CONTEXT_LINES: OnceLock<fn(&App) -> u32> = OnceLock::new();
 
 pub fn excerpt_context_lines(cx: &App) -> u32 {
@@ -2087,11 +2110,17 @@ impl MultiBuffer {
 
     pub fn language_settings<'a>(&'a self, cx: &'a App) -> Cow<'a, LanguageSettings> {
         let snapshot = self.snapshot(cx);
-        snapshot
+        if let Some(buffer) = snapshot
             .representative_buffer_id()
             .and_then(|buffer_id| self.buffer(buffer_id))
-            .map(|buffer| LanguageSettings::for_buffer(&buffer.read(cx), cx))
-            .unwrap_or_else(move || Cow::Borrowed(&AllLanguageSettings::get_global(cx).defaults))
+        {
+            return LanguageSettings::for_buffer(buffer.read(cx), cx);
+        }
+        let first_excerpt_buffer_id = snapshot.excerpts.first().map(|excerpt| excerpt.buffer_id);
+        let location = first_excerpt_buffer_id
+            .and_then(|buffer_id| self.buffer(buffer_id))
+            .and_then(|buffer| settings_location_for_file(buffer.read(cx).file(), cx));
+        language_agnostic_settings(location, cx)
     }
 
     pub fn language_settings_at<'a, T: ToOffset>(
@@ -6117,10 +6146,18 @@ impl MultiBufferSnapshot {
     }
 
     fn language_settings<'a>(&'a self, cx: &'a App) -> Cow<'a, LanguageSettings> {
-        self.representative_buffer_id()
+        if let Some(buffer) = self
+            .representative_buffer_id()
             .and_then(|buffer_id| self.buffer_for_id(buffer_id))
-            .map(|buffer| LanguageSettings::for_buffer_snapshot(buffer, None, cx))
-            .unwrap_or_else(move || Cow::Borrowed(&AllLanguageSettings::get_global(cx).defaults))
+        {
+            return LanguageSettings::for_buffer_snapshot(buffer, None, cx);
+        }
+        let location = self
+            .excerpts
+            .first()
+            .and_then(|excerpt| self.buffer_for_id(excerpt.buffer_id))
+            .and_then(|buffer| settings_location_for_file(buffer.file(), cx));
+        language_agnostic_settings(location, cx)
     }
 
     /// The buffer whose settings stand in for the whole multibuffer, or `None`
@@ -6135,16 +6172,20 @@ impl MultiBufferSnapshot {
     /// back to the language-agnostic defaults otherwise.
     fn representative_buffer_id(&self) -> Option<BufferId> {
         let first_excerpt_buffer_id = self.excerpts.first()?.buffer_id;
-        let language_name = |buffer_state: &BufferStateSnapshot| {
+        // Compared by id rather than by name: this runs on per-frame paths
+        // (`soft_wrap_mode`, `show_whitespaces`) and a `LanguageName` is a
+        // `SharedString`, so naming every buffer's language here would be an
+        // atomic per buffer per frame.
+        let language_id = |buffer_state: &BufferStateSnapshot| {
             buffer_state
                 .buffer_snapshot
                 .language()
-                .map(|language| language.name())
+                .map(|language| language.id())
         };
-        let shared_language_name = language_name(self.buffers.get(&first_excerpt_buffer_id)?);
+        let shared_language_id = language_id(self.buffers.get(&first_excerpt_buffer_id)?);
         self.buffers
             .values()
-            .all(|buffer_state| language_name(buffer_state) == shared_language_name)
+            .all(|buffer_state| language_id(buffer_state) == shared_language_id)
             .then_some(first_excerpt_buffer_id)
     }
 
