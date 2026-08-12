@@ -34,6 +34,10 @@ const RIBBON_EDGE_INSET: Pixels = px(1.);
 /// the visible part of the curve is unaffected.
 const OFFSCREEN_CLAMP_SCREENS: f32 = 3.0;
 
+/// Ribbons are a background hint, not content: solid enough to trace a block
+/// from one pane to the other, faint enough not to compete with the text.
+const RIBBON_FILL_OPACITY: f32 = 0.3;
+
 struct Ribbon {
     left_top: Pixels,
     left_bottom: Pixels,
@@ -280,6 +284,15 @@ fn hunk_display_rows(
     Some(display_start.row()..DisplayRow(display_end.0 + 1))
 }
 
+/// Paints one ribbon as a **single** path.
+///
+/// It has to be a single path: GPUI rasterizes every path of a batch into one
+/// shared screen-sized texture, then composites each path by drawing a quad
+/// over that path's bounding box and sampling the texture (`fs_path` in
+/// `gpui_wgpu/src/shaders.wgsl`). Two paths whose bounding boxes overlap
+/// therefore composite the shared coverage twice, which showed up as a ribbon
+/// with two different tints when the fill and a separate outline stroke were
+/// drawn on top of each other.
 fn paint_ribbon(ribbon: &Ribbon, left_x: Pixels, right_x: Pixels, window: &mut Window) {
     if ribbon.left_top == ribbon.left_bottom && ribbon.right_top == ribbon.right_bottom {
         // A hunk that collapsed to nothing on both sides has no ribbon; the
@@ -306,33 +319,7 @@ fn paint_ribbon(ribbon: &Ribbon, left_x: Pixels, right_x: Pixels, window: &mut W
     );
     fill.line_to(point(left_x, ribbon.left_top));
     if let Some(path) = fill.build().log_err() {
-        window.paint_path(path, ribbon.color.opacity(0.22));
-    }
-
-    let mut outline = PathBuilder::stroke(px(1.));
-    outline.move_to(point(left_x, ribbon.left_top));
-    horizontal_s_curve(
-        &mut outline,
-        left_x,
-        ribbon.left_top,
-        right_x,
-        ribbon.right_top,
-    );
-    if let Some(path) = outline.build().log_err() {
-        window.paint_path(path, ribbon.color.opacity(0.8));
-    }
-
-    let mut outline = PathBuilder::stroke(px(1.));
-    outline.move_to(point(left_x, ribbon.left_bottom));
-    horizontal_s_curve(
-        &mut outline,
-        left_x,
-        ribbon.left_bottom,
-        right_x,
-        ribbon.right_bottom,
-    );
-    if let Some(path) = outline.build().log_err() {
-        window.paint_path(path, ribbon.color.opacity(0.8));
+        window.paint_path(path, ribbon.color.opacity(RIBBON_FILL_OPACITY));
     }
 }
 

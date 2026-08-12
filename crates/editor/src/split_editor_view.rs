@@ -4,8 +4,8 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, Context, DragMoveEvent, Element,
     Entity, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length,
-    ParentElement, Pixels, StatefulInteractiveElement, Styled, TextStyleRefinement, Window, div,
-    linear_color_stop, linear_gradient, point, px, size,
+    ParentElement, Pixels, StatefulInteractiveElement, Styled, TextStyleRefinement, Window,
+    deferred, div, linear_color_stop, linear_gradient, point, px, size,
 };
 use multi_buffer::{Anchor, ExcerptBoundaryInfo};
 use settings::Settings;
@@ -26,8 +26,6 @@ use crate::{
     split::SplittableEditor,
     split_connectors::{CONNECTOR_STRIP_WIDTH, connector_ribbons},
 };
-
-const RESIZE_HANDLE_WIDTH: f32 = 12.0;
 
 #[derive(Debug, Clone)]
 struct DraggedSplitHandle;
@@ -109,7 +107,9 @@ impl SplitEditorView {
 }
 
 /// The strip between the two line-number columns: connector ribbons, a
-/// separator line on each side, and the drag-to-resize handle down the middle.
+/// separator line on each side, and the drag-to-resize handle. The whole strip
+/// is the drag target — none of it carries text, and a 36px target is far
+/// easier to grab than the 12px one the bare 1px divider used to offer.
 fn render_connector_strip(
     state: &Entity<SplitEditorState>,
     lhs_editor: Entity<Editor>,
@@ -146,15 +146,16 @@ fn render_connector_strip(
         .child(connector_ribbons(lhs_editor, rhs_editor, style))
         .child(separator(false))
         .child(separator(true))
-        .child(
+        // Deferred so the handle's hitbox is painted above the ribbons and
+        // above whichever pane happens to be painted last — same treatment the
+        // dock resize handle gets in `workspace::dock`.
+        .child(deferred(
             div()
                 .id("split-resize-handle")
                 .absolute()
-                .left((CONNECTOR_STRIP_WIDTH - px(RESIZE_HANDLE_WIDTH)) / 2.0)
-                .w(px(RESIZE_HANDLE_WIDTH))
-                .h_full()
+                .inset_0()
                 .cursor_col_resize()
-                .block_mouse_except_scroll()
+                .occlude()
                 .on_click(move |event, _, cx| {
                     if event.click_count() >= 2 {
                         state_for_click.update(cx, |state, _| {
@@ -164,7 +165,7 @@ fn render_connector_strip(
                     cx.stop_propagation();
                 })
                 .on_drag(DraggedSplitHandle, |_, _, _, cx| cx.new(|_| gpui::Empty)),
-        )
+        ))
         .into_any_element()
 }
 
