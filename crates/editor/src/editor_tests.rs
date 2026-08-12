@@ -27005,6 +27005,17 @@ async fn test_goto_definition_preserve_scroll_strategy(cx: &mut TestAppContext) 
 #[gpui::test]
 async fn test_find_all_references_editor_reuse(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
+    // This fork autosaves on focus change, so opening the references multibuffer
+    // saves the source buffer and `ensure_final_newline_on_save` appends a newline
+    // the assertions below do not expect. The reuse behaviour under test has
+    // nothing to do with saving, so take autosave out of the picture.
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.autosave = Some(workspace::AutosaveSetting::Off);
+            });
+        });
+    });
     let mut cx = EditorLspTestContext::new_rust(
         lsp::ServerCapabilities {
             references_provider: Some(lsp::OneOf::Left(true)),
@@ -35532,16 +35543,20 @@ async fn test_local_worktree_trust(cx: &mut TestAppContext) {
     });
 
     let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        path!("/project"),
+    // The folder name comes from `paths` rather than being spelled out: this
+    // fork renamed it away from upstream's `.zed`, and a hard-coded name makes
+    // the local settings silently never load — which looks exactly like the
+    // failure this test exists to catch.
+    let mut project_tree = serde_json::Map::new();
+    project_tree.insert(
+        paths::local_settings_folder_name().to_string(),
         json!({
-            ".zed": {
-                "settings.json": r#"{"languages":{"Rust":{"language_servers":["override-rust-analyzer"]}}}"#
-            },
-            "main.rs": "fn main() {}"
+            "settings.json": r#"{"languages":{"Rust":{"language_servers":["override-rust-analyzer"]}}}"#
         }),
-    )
-    .await;
+    );
+    project_tree.insert("main.rs".to_string(), json!("fn main() {}"));
+    fs.insert_tree(path!("/project"), serde_json::Value::Object(project_tree))
+        .await;
 
     let lsp_inlay_hint_request_count = Arc::new(AtomicUsize::new(0));
     let server_name = "override-rust-analyzer";
