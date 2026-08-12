@@ -658,7 +658,9 @@
     // Whether to show fold buttons in the gutter.
     "folds": true,
     // Minimum number of characters to reserve space for in the gutter.
-    "min_line_number_digits": 4,
+    // Files with more digits than this widen the gutter on their own; the
+    // minimum only decides how early that first widening happens.
+    "min_line_number_digits": 3,
   },
   "indent_guides": {
     // Whether to show indent guides in the editor.

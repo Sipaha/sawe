@@ -2357,6 +2357,14 @@ mod tests {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.editor.diff_view_style = Some(style);
+                    // These tests pin the pane width and assert exactly where
+                    // each line wraps, so the text area they get must not move
+                    // when the gutter's reserved digit count is retuned.
+                    settings
+                        .editor
+                        .gutter
+                        .get_or_insert_default()
+                        .min_line_number_digits = Some(4);
                 });
             });
             theme_settings::init(theme::LoadThemes::JustBase, cx);
