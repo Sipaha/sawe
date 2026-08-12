@@ -1262,6 +1262,12 @@ impl GutterDimensions {
     pub fn full_width(&self) -> Pixels {
         self.margin + self.width
     }
+
+    /// The horizontal span, relative to the gutter's left edge, in which line
+    /// numbers are drawn. Empty when line numbers are hidden.
+    pub fn line_number_area(&self) -> Range<Pixels> {
+        self.left_padding..(self.width - self.right_padding).max(self.left_padding)
+    }
 }
 
 struct CharacterDimensions {
