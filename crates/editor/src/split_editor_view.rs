@@ -4,8 +4,8 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, Context, DragMoveEvent, Element,
     Entity, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length,
-    ParentElement, Pixels, StatefulInteractiveElement, Styled, TextStyleRefinement, Window, div,
-    linear_color_stop, linear_gradient, point, px, size,
+    ParentElement, Pixels, StatefulInteractiveElement, Styled, TextStyleRefinement, Window,
+    deferred, div, linear_color_stop, linear_gradient, point, px, size,
 };
 use multi_buffer::{Anchor, ExcerptBoundaryInfo};
 use settings::Settings;
@@ -24,9 +24,8 @@ use crate::{
     element::{EditorElement, SplitSide, header_jump_data, render_buffer_header},
     scroll::ScrollOffset,
     split::SplittableEditor,
+    split_connectors::{CONNECTOR_STRIP_WIDTH, connector_ribbons},
 };
-
-const RESIZE_HANDLE_WIDTH: f32 = 12.0;
 
 #[derive(Debug, Clone)]
 struct DraggedSplitHandle;
@@ -107,30 +106,56 @@ impl SplitEditorView {
     }
 }
 
-fn render_resize_handle(
+/// The strip between the two line-number columns: connector ribbons, a
+/// separator line on each side, and the drag-to-resize handle. The whole strip
+/// is the drag target — none of it carries text, and a 36px target is far
+/// easier to grab than the 12px one the bare 1px divider used to offer.
+fn render_connector_strip(
     state: &Entity<SplitEditorState>,
+    lhs_editor: Entity<Editor>,
+    rhs_editor: Entity<Editor>,
+    style: EditorStyle,
     separator_color: Hsla,
+    background_color: Hsla,
     _window: &mut Window,
     _cx: &mut App,
 ) -> AnyElement {
     let state_for_click = state.clone();
+
+    let separator = |align_right: bool| {
+        let separator = div()
+            .absolute()
+            .top_0()
+            .h_full()
+            .w(px(1.))
+            .bg(separator_color);
+        if align_right {
+            separator.right_0()
+        } else {
+            separator.left_0()
+        }
+    };
 
     div()
         .id("split-resize-container")
         .relative()
         .h_full()
         .flex_shrink_0()
-        .w(px(1.))
-        .bg(separator_color)
-        .child(
+        .w(CONNECTOR_STRIP_WIDTH)
+        .bg(background_color)
+        .child(connector_ribbons(lhs_editor, rhs_editor, style))
+        .child(separator(false))
+        .child(separator(true))
+        // Deferred so the handle's hitbox is painted above the ribbons and
+        // above whichever pane happens to be painted last — same treatment the
+        // dock resize handle gets in `workspace::dock`.
+        .child(deferred(
             div()
                 .id("split-resize-handle")
                 .absolute()
-                .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
-                .w(px(RESIZE_HANDLE_WIDTH))
-                .h_full()
+                .inset_0()
                 .cursor_col_resize()
-                .block_mouse_except_scroll()
+                .occlude()
                 .on_click(move |event, _, cx| {
                     if event.click_count() >= 2 {
                         state_for_click.update(cx, |state, _| {
@@ -140,7 +165,7 @@ fn render_resize_handle(
                     cx.stop_propagation();
                 })
                 .on_drag(DraggedSplitHandle, |_, _, _, cx| cx.new(|_| gpui::Empty)),
-        )
+        ))
         .into_any_element()
 }
 
@@ -166,8 +191,18 @@ impl RenderOnce for SplitEditorView {
         let right_ratio = self.split_state.read(cx).right_ratio();
 
         let separator_color = cx.theme().colors().border_variant;
+        let strip_background = cx.theme().colors().editor_gutter_background;
 
-        let resize_handle = render_resize_handle(&self.split_state, separator_color, window, cx);
+        let connector_strip = render_connector_strip(
+            &self.split_state,
+            lhs_editor.clone(),
+            rhs_editor.clone(),
+            self.style.clone(),
+            separator_color,
+            strip_background,
+            window,
+            cx,
+        );
 
         let state_for_drag = self.split_state.downgrade();
         let state_for_drop = self.split_state.downgrade();
@@ -217,7 +252,7 @@ impl RenderOnce for SplitEditorView {
                             .overflow_hidden()
                             .child(lhs),
                     )
-                    .child(resize_handle)
+                    .child(connector_strip)
                     .child(
                         div()
                             .id("split-editor-right")
