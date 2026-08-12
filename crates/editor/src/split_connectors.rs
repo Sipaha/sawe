@@ -112,8 +112,18 @@ fn layout_ribbons(
 
     let mut ribbons = Vec::new();
     for connector in connectors {
-        let left_top = row_y(bounds.top(), connector.left.start, lhs_scroll_top, line_height);
-        let left_bottom = row_y(bounds.top(), connector.left.end, lhs_scroll_top, line_height);
+        let left_top = row_y(
+            bounds.top(),
+            connector.left.start,
+            lhs_scroll_top,
+            line_height,
+        );
+        let left_bottom = row_y(
+            bounds.top(),
+            connector.left.end,
+            lhs_scroll_top,
+            line_height,
+        );
         let right_top = row_y(
             bounds.top(),
             connector.right.start,
@@ -186,12 +196,22 @@ pub(crate) fn connector_rows(
             break;
         }
 
-        let Some(left) = hunk_display_rows(lhs_snapshot, &lhs_hunk) else {
+        let Some(mut left) = hunk_display_rows(lhs_snapshot, &lhs_hunk) else {
             continue;
         };
-        let Some(right) = hunk_display_rows(rhs_snapshot, &rhs_hunk) else {
+        let Some(mut right) = hunk_display_rows(rhs_snapshot, &rhs_hunk) else {
             continue;
         };
+
+        // A pure insertion or deletion has no rows of its own on one side —
+        // just the spacer block that keeps the panes row-balanced. The hunk's
+        // anchor there resolves to the row *after* the spacer, so take the row
+        // from the side that does have content: that is where the gap starts.
+        if left.start == left.end && right.start != right.end {
+            left = right.start..right.start;
+        } else if right.start == right.end && left.start != left.end {
+            right = left.start..left.start;
+        }
 
         connectors.push(ConnectorRows {
             left,

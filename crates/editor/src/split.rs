@@ -6362,7 +6362,8 @@ mod tests {
 
         let (editor, cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
 
-        let base_text = "one\nTWO_OLD\nthree\nfour\nOLD_A\nOLD_B\nfive\nDELETED_1\nDELETED_2\nsix\n";
+        let base_text =
+            "one\nTWO_OLD\nthree\nfour\nOLD_A\nOLD_B\nfive\nDELETED_1\nDELETED_2\nsix\n";
         let current_text = "one\nTWO_NEW_1\nTWO_NEW_2\nTWO_NEW_3\nthree\nfour\nNEW_A\nfive\nsix\n";
         let (buffer, diff) = buffer_with_diff(base_text, current_text, cx);
 
@@ -6394,8 +6395,10 @@ mod tests {
         let _ = editor_content_with_blocks_and_width(&lhs_editor, px(3000.), cx);
         cx.run_until_parked();
 
-        let lhs_snapshot = lhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
-        let rhs_snapshot = rhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+        let lhs_snapshot =
+            lhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+        let rhs_snapshot =
+            rhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
 
         let connectors = connector_rows(&lhs_snapshot, &rhs_snapshot, 1000.);
         assert_eq!(
