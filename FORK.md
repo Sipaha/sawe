@@ -837,6 +837,20 @@ How it works: the two panes are separate `Editor`/`MultiBuffer` entities, so cor
 
 Limits (accepted): ribbons have no outline, because a border would need a second overlapping path. Endpoints are clamped to a few screen heights around the strip so a hunk spanning many screens never hands the tessellator absurd coordinates. Guard: `split::tests::test_connector_rows_pair_hunks_across_panes`.
 
+### 61. Gutter indicators are placed by column, IntelliJ-style: breakpoints over the line number, runnables and bookmarks beside the fold chevron
+
+Why: upstream reserves one shared three-character column left of the line numbers for runnables, breakpoints and bookmarks, and shows only the runnable when a row wants more than one. All three settings default to `true`, so every install pays for that column on every row of every singleton buffer, and a row can only ever show one of the three. IntelliJ instead puts the breakpoint dot *on* the line number (hiding it) and the run arrow next to the fold chevron, which costs no dedicated column and lets a row carry two indicators at once.
+
+How it works: `Gutter::prepaint_button` (`element.rs`) is the single place that positions every gutter indicator, so the choice is one `GutterIndicatorColumn` argument threaded through `Gutter::layout_item{,_skipping_folds}` rather than four call-site hacks. `LineNumber` centres the element in `GutterDimensions::line_number_area()` (`left_padding .. width - right_padding`) and `Icon` in the new `indicator_column_width`, the leading slice of `right_padding` that precedes the fold column; each falls back to the old left-hand position when its column has no width, which is what keeps gutters with line numbers turned off unchanged. `prepaint_crease_toggles` starts at `fold_area_start()` instead of `width - right_padding` so the chevron cannot land on the indicator.
+
+Two consequences worth knowing. **Line numbers.** A row that shows a breakpoint or the hover preview must not also paint its number, so `layout_line_numbers` takes a precomputed row set; building it forces the bookmark/breakpoint/hover-preview bookkeeping to be hoisted above the line-number layout, and it reuses `Gutter::renders_item_skipping_folds` so a row whose indicator is suppressed (folded, deleted, expand affordance) keeps its number. **Hover arming.** `mouse_moved` now requires the pointer to be inside the line-number span, since arming from anywhere in the row would drop the preview dot far from the cursor; that needed `GutterDimensions` on the `PositionMap`.
+
+Sizing: the indicator column is three characters, matching the column it replaces, so the same buttons fit unchanged. It is reserved only for singleton buffers with line numbers — multibuffers keep their indicators on the left, in the four characters their expand-excerpt buttons pay for regardless, and fold toggles only ever render in singletons so there is nothing to sit beside elsewhere. When it *is* present it also absorbs the fold column's fourth character, which exists only to keep the numbers off the chevron.
+
+Also here: a one-pixel `border_variant` rule on the gutter↔text boundary (`paint_background`), because `editor_gutter_background` equals the editor background in the default theme and diff hunk tinting floods across the seam. It is painted after the active-line and highlighted-row fills, which span the gutter and would otherwise cover it, and it goes on the gutter's **left** edge in a split diff's left pane, whose gutter is right-aligned against the divider (#57).
+
+How to apply: a new gutter indicator picks a `GutterIndicatorColumn`; it does not compute an x. If it needs a column of its own, add the reservation to `EditorSnapshot::gutter_dimensions` in the same commit that places it — the fallback silently stacks new indicators on top of whatever else sits on the left.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

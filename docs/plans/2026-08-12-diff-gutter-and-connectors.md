@@ -187,6 +187,28 @@ unreachable because `language_settings::SoftWrap` has no `GitDiff` variant.
 
 ## Shipped
 
+- Workstream G, all six items. Measured on a live headless instance, default
+  theme and font, `ch_width` ≈ 9 px:
+
+  | surface | gutter before | gutter after |
+  |---|---|---|
+  | normal editor | 99 px | 108 px |
+  | unified diff | 81 px | 81 px |
+  | split diff (lhs / rhs) | 81 / 80 px | 81 / 80 px |
+
+  G1 landed first as `9b9024939e` (the dead fold reservation, which is where
+  the diff numbers above already sit). G3/G4 are one commit — see FORK.md
+  decision #61 for why the two halves cannot be separated. The normal editor
+  is 9 px (1 ch) *wider*, not narrower: the three characters freed on the left
+  are re-spent on the indicator column right of the numbers, less the fold
+  column's now-redundant fourth character. Dropping `min_line_number_digits`
+  from 4 to 3 returns exactly that character.
+
+  Not done: G2 (trimming multibuffer `left_padding` below four characters).
+  That padding holds the expand-excerpt button, whose width is derived from it
+  (`available_width` in `layout_expand_toggles`), so shrinking it is a
+  button-sizing change rather than a padding change.
+
 - Item 5 (workstream B) — git blame in both panes of the split diff, plus a
   reachable gutter menu entry. `git blame <rev> -- <path>` added at the backend
   (`GitRepository::blame_at_revision` → `Project::blame_path_at_revision`);
