@@ -11475,20 +11475,6 @@ impl EditorSnapshot {
 
             let shows_folds = is_singleton && gutter_settings.folds;
 
-            // Only reserve the fold column where a fold toggle can actually be
-            // drawn. `layout_crease_toggles` renders them for singleton buffers
-            // alone, so in a multibuffer this used to be three characters of
-            // guaranteed-empty gutter on every pane of every diff.
-            let fold_column_width = if shows_folds && show_line_numbers {
-                ch_width * 4.0
-            } else if shows_folds {
-                ch_width * 3.0
-            } else if show_line_numbers {
-                ch_width
-            } else {
-                px(0.)
-            };
-
             // Runnables and bookmarks sit right of the numbers, next to the
             // fold toggles, the way IntelliJ arranges them. Multibuffers keep
             // them in the left column, which their expand-excerpt buttons pay
@@ -11500,6 +11486,25 @@ impl EditorSnapshot {
                 } else {
                     px(0.)
                 };
+
+            // Only reserve the fold column where a fold toggle can actually be
+            // drawn. `layout_crease_toggles` renders them for singleton buffers
+            // alone, so in a multibuffer this used to be three characters of
+            // guaranteed-empty gutter on every pane of every diff. The fourth
+            // character keeps the numbers off the chevron and is redundant once
+            // the indicator column separates them.
+            let fold_column_width = if shows_folds
+                && show_line_numbers
+                && indicator_column_width == px(0.)
+            {
+                ch_width * 4.0
+            } else if shows_folds {
+                ch_width * 3.0
+            } else if show_line_numbers {
+                ch_width
+            } else {
+                px(0.)
+            };
             let right_padding = indicator_column_width + fold_column_width;
 
             GutterDimensions {
