@@ -11493,18 +11493,16 @@ impl EditorSnapshot {
             // guaranteed-empty gutter on every pane of every diff. The fourth
             // character keeps the numbers off the chevron and is redundant once
             // the indicator column separates them.
-            let fold_column_width = if shows_folds
-                && show_line_numbers
-                && indicator_column_width == px(0.)
-            {
-                ch_width * 4.0
-            } else if shows_folds {
-                ch_width * 3.0
-            } else if show_line_numbers {
-                ch_width
-            } else {
-                px(0.)
-            };
+            let fold_column_width =
+                if shows_folds && show_line_numbers && indicator_column_width == px(0.) {
+                    ch_width * 4.0
+                } else if shows_folds {
+                    ch_width * 3.0
+                } else if show_line_numbers {
+                    ch_width
+                } else {
+                    px(0.)
+                };
             let right_padding = indicator_column_width + fold_column_width;
 
             GutterDimensions {

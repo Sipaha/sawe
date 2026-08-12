@@ -121,6 +121,7 @@ fn render_connector_strip(
     _cx: &mut App,
 ) -> AnyElement {
     let state_for_click = state.clone();
+    let rhs_editor_for_scroll = rhs_editor.clone();
 
     let separator = |align_right: bool| {
         let separator = div()
@@ -143,6 +144,38 @@ fn render_connector_strip(
         .flex_shrink_0()
         .w(CONNECTOR_STRIP_WIDTH)
         .bg(background_color)
+        // The strip is a flex sibling of the two panes, not an overlay on top
+        // of them, so no editor's hitbox covers it and the wheel would do
+        // nothing here. Widening the divider from 1px to 36px would otherwise
+        // carve a dead band out of the middle of the diff, where the cursor
+        // naturally rests while comparing hunks. Both panes share one scroll
+        // anchor, so driving the right one carries the left with it.
+        .on_scroll_wheel(move |event: &gpui::ScrollWheelEvent, window, cx| {
+            let line_height = window.line_height();
+            let lines = match event.delta {
+                gpui::ScrollDelta::Pixels(pixels) => ScrollOffset::from(pixels.y / line_height),
+                gpui::ScrollDelta::Lines(lines) => ScrollOffset::from(lines.y),
+            };
+            if lines == 0. {
+                return;
+            }
+            let sensitivity = if event.modifiers.alt {
+                EditorSettings::get_global(cx).fast_scroll_sensitivity
+            } else {
+                EditorSettings::get_global(cx).scroll_sensitivity
+            }
+            .max(0.01);
+            rhs_editor_for_scroll.update(cx, |editor, cx| {
+                let current = editor.scroll_position(cx);
+                let target = point(
+                    current.x,
+                    (current.y - lines * ScrollOffset::from(sensitivity)).max(0.),
+                );
+                if target != current {
+                    editor.set_scroll_position(target, window, cx);
+                }
+            });
+        })
         .child(connector_ribbons(lhs_editor, rhs_editor, style))
         .child(separator(false))
         .child(separator(true))
@@ -155,7 +188,7 @@ fn render_connector_strip(
                 .absolute()
                 .inset_0()
                 .cursor_col_resize()
-                .occlude()
+                .block_mouse_except_scroll()
                 .on_click(move |event, _, cx| {
                     if event.click_count() >= 2 {
                         state_for_click.update(cx, |state, _| {

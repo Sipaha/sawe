@@ -23443,9 +23443,8 @@ fn test_multibuffer_soft_wrap_is_not_taken_from_the_first_excerpt(cx: &mut TestA
     let markdown_buffer = cx.new(|cx| {
         language::Buffer::local("# heading\n\nprose\n", cx).with_language(markdown_lang(), cx)
     });
-    let rust_buffer = cx.new(|cx| {
-        language::Buffer::local("fn main() {}\n", cx).with_language(rust_lang(), cx)
-    });
+    let rust_buffer =
+        cx.new(|cx| language::Buffer::local("fn main() {}\n", cx).with_language(rust_lang(), cx));
 
     let markdown_only = cx.new(|cx| {
         let mut multibuffer = MultiBuffer::new(ReadWrite);
@@ -30349,18 +30348,16 @@ async fn test_hide_pending_blame_popover_when_modal_opens(cx: &mut TestAppContex
     });
 
     editor.update_in(cx, |editor, _, cx| {
-        editor.blame = Some(
-            cx.new(|cx| {
-                GitBlame::new(
-                    editor.buffer.clone(),
-                    project.clone(),
-                    Default::default(),
-                    false,
-                    true,
-                    cx,
-                )
-            }),
-        );
+        editor.blame = Some(cx.new(|cx| {
+            GitBlame::new(
+                editor.buffer.clone(),
+                project.clone(),
+                Default::default(),
+                false,
+                true,
+                cx,
+            )
+        }));
         editor.show_blame_popover(
             buffer_id,
             &::git::blame::BlameEntry {

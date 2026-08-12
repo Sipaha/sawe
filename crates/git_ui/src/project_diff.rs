@@ -1734,7 +1734,11 @@ impl Render for ProjectDiffToolbar {
         let focus_handle = project_diff.focus_handle(cx);
         let button_states = project_diff.read(cx).button_states(cx);
         let review_count = project_diff.read(cx).total_review_comment_count();
-        let is_soft_wrap_enabled = project_diff.read(cx).editor().read(cx).is_soft_wrap_enabled(cx);
+        let is_soft_wrap_enabled = project_diff
+            .read(cx)
+            .editor()
+            .read(cx)
+            .is_soft_wrap_enabled(cx);
 
         h_group_xl()
             .my_neg_1()

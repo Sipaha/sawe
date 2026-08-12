@@ -5359,7 +5359,9 @@ mod tests {
             .filter_map(|entry| entry.author.clone())
             .collect();
         assert!(
-            parent_authors.iter().all(|author| author == "Ancient Author"),
+            parent_authors
+                .iter()
+                .all(|author| author == "Ancient Author"),
             "the parent commit predates the second author, got {parent_authors:?}"
         );
         assert_eq!(
