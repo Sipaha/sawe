@@ -452,6 +452,12 @@ impl SplittableEditor {
         self.lhs.is_some()
     }
 
+    /// Both sides are kept in sync by [`Self::toggle_soft_wrap`], and the rhs
+    /// editor is the side a freshly split lhs copies its state from.
+    pub fn is_soft_wrap_enabled(&self, cx: &App) -> bool {
+        self.rhs_editor.read(cx).is_soft_wrap_enabled(cx)
+    }
+
     pub fn set_render_diff_hunk_controls(
         &self,
         render_diff_hunk_controls: RenderDiffHunkControlsFn,

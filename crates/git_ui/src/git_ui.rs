@@ -460,6 +460,22 @@ pub fn git_status_icon(status: FileStatus) -> impl IntoElement {
     GitStatusIcon::new(status)
 }
 
+pub(crate) fn soft_wrap_icon(is_soft_wrap_enabled: bool) -> IconName {
+    if is_soft_wrap_enabled {
+        IconName::TextUnwrap
+    } else {
+        IconName::TextWrap
+    }
+}
+
+pub(crate) fn soft_wrap_tooltip(is_soft_wrap_enabled: bool) -> &'static str {
+    if is_soft_wrap_enabled {
+        "Disable Soft Wrap"
+    } else {
+        "Enable Soft Wrap"
+    }
+}
+
 struct RenameBranchModal {
     current_branch: SharedString,
     editor: Entity<Editor>,
