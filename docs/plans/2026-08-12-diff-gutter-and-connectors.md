@@ -1,6 +1,9 @@
 # Diff readability arc — gutter diet, IDEA connectors, blame, soft wrap
 
-Status: **in progress**
+Status: **complete** — all seven operator items shipped. One deliberate
+carry-over: G2 (trimming multibuffer `left_padding`) is untouched, because that
+padding *derives* the expand-excerpt button's width rather than merely
+surrounding it. See "Measured outcome" at the end.
 Owner: supervisor session 2026-08-12
 Source: operator request (7 numbered items), decisions taken inline in that session.
 
@@ -226,3 +229,32 @@ unreachable because `language_settings::SoftWrap` has no `GitDiff` variant.
   `bc8467fca5`. `git.show_stage_restore_buttons` already existed; only the
   default flipped (4 sites). Verified with a control test on a live instance
   (forcing the setting back to `true` restores the buttons).
+
+---
+
+## Measured outcome
+
+Live `--headless` debug instance, default theme and font, measured off
+screenshots at each stage rather than computed.
+
+| surface | before the arc | after |
+|---|---|---|
+| split diff — left gutter | 98 px | **72 px** |
+| split diff — right gutter | 104 px | **72 px** |
+| split diff — centre total | 204 px (no ribbons) | **182 px, ribbons included** |
+| normal editor gutter | ~100 px | **~100 px** |
+
+The diff is the win: 26–32 px off each gutter *and* a 36 px connector strip
+that did not exist before, for a net 22 px narrower centre.
+
+The normal editor came out the same width, which is worth stating plainly
+rather than dressing up. Freeing the three-character indicator column on the
+left was paid straight back by the new icon column on the right, which has to
+hold a run arrow and a fold chevron side by side the way IntelliJ does. The
+`min_line_number_digits` 4 → 3 change covered the remaining character. So the
+gain there is the arrangement, not the width.
+
+The next real lever for the normal editor is the icon column itself: it is
+sized for two icons on every row, while most rows show at most one. Making it
+per-row would reintroduce the gutter-width flicker `min_line_number_digits`
+exists to prevent, so it needs a deliberate decision, not a tweak.
