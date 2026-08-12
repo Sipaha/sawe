@@ -582,7 +582,7 @@ impl ProjectDiff {
         });
 
         let editor = cx.new(|cx| {
-            let diff_display_editor = SplittableEditor::new(
+            let mut diff_display_editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
                 multibuffer.clone(),
                 project.clone(),
@@ -591,7 +591,12 @@ impl ProjectDiff {
                 cx,
             );
             match branch_diff.read(cx).diff_base() {
-                DiffBase::Head => {}
+                // The left pane holds each file's content at HEAD.
+                DiffBase::Head => diff_display_editor.set_lhs_blame_base(Some("HEAD".into()), cx),
+                // The left pane holds the content at the merge base of the
+                // target ref and HEAD. `git blame` takes a single commit-ish
+                // and has no syntax for a merge base, so rather than annotate
+                // the wrong revision the left pane goes without blame here.
                 DiffBase::Merge { .. } => diff_display_editor.disable_diff_hunk_controls(cx),
             }
             diff_display_editor.rhs_editor().update(cx, |editor, cx| {
@@ -635,6 +640,13 @@ impl ProjectDiff {
                 }
                 BranchDiffEvent::DiffBaseChanged => {
                     this.pending_scroll.take();
+                    let blame_base = match this.branch_diff.read(cx).diff_base() {
+                        DiffBase::Head => Some(SharedString::from("HEAD")),
+                        DiffBase::Merge { .. } => None,
+                    };
+                    this.editor.update(cx, |editor, cx| {
+                        editor.set_lhs_blame_base(blame_base, cx);
+                    });
                     this._task = window.spawn(cx, {
                         let this = cx.weak_entity();
                         async |cx| Self::refresh(this, cx).await
@@ -2205,8 +2217,10 @@ mod tests {
                     .expect("solution just created")
                     .root
                     .clone();
-                let member_a = store.test_add_member_with_path(sid, "member-a", root.join("memberA"));
-                let member_b = store.test_add_member_with_path(sid, "member-b", root.join("memberB"));
+                let member_a =
+                    store.test_add_member_with_path(sid, "member-a", root.join("memberA"));
+                let member_b =
+                    store.test_add_member_with_path(sid, "member-b", root.join("memberB"));
                 store.set_active_member(sid, member_a, cx);
                 (sid, member_b, root)
             });
@@ -2328,11 +2342,12 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let (multi_workspace, cx) = cx
-            .add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let diff = cx
-            .new_window_entity(|window, cx| ProjectDiff::new(project.clone(), workspace, window, cx));
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
         cx.run_until_parked();
 
         let repo_dir = diff.read_with(cx, |diff, cx| {

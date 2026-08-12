@@ -4,11 +4,11 @@ use std::{
 };
 
 use buffer_diff::{BufferDiff, BufferDiffSnapshot};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 
 use gpui::{
-    Action, AppContext as _, Entity, EventEmitter, Focusable, Font, Pixels, Subscription,
-    WeakEntity, canvas,
+    Action, AppContext as _, Entity, EventEmitter, Focusable, Font, Pixels, SharedString,
+    Subscription, WeakEntity, canvas,
 };
 use itertools::Itertools;
 use language::{Buffer, Capability, HighlightedText};
@@ -40,6 +40,7 @@ use crate::{
     Autoscroll, Editor, EditorEvent, EditorSettings, RenderDiffHunkControlsFn, ToggleSoftWrap,
     actions::{DisableBreakpoint, EditLogBreakpoint, EnableBreakpoint, ToggleBreakpoint},
     display_map::Companion,
+    git::blame::BlameBaseSource,
 };
 use zed_actions::assistant::InlineAssist;
 
@@ -414,8 +415,13 @@ pub struct SplittableEditor {
     /// mode, regardless of the current diff view style setting.
     too_narrow_for_split: bool,
     last_width: Option<Pixels>,
+    lhs_blame_base: Option<LhsBlameBase>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// The git revision the left-hand pane's text was taken from, so `git::Blame`
+/// can annotate it correctly. Anything `git blame` accepts, e.g. `HEAD`.
+type LhsBlameBase = SharedString;
 
 struct LhsEditor {
     multibuffer: Entity<MultiBuffer>,
@@ -589,8 +595,82 @@ impl SplittableEditor {
             searched_side: None,
             too_narrow_for_split: false,
             last_width: None,
+            lhs_blame_base: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Opts this diff into git blame on the left-hand pane, whose text is the
+    /// content of each file at `revision`.
+    ///
+    /// Consumers must opt in: `SplittableEditor` is also used to compare two
+    /// unrelated files (`file_diff_view`, `text_diff_view`) and agent-produced
+    /// snapshots (`agent_diff`), where the left pane's text is not any
+    /// revision of the right pane's path and blaming it would be misleading.
+    /// Passing `None` turns left-pane blame back off, e.g. when a view
+    /// switches to a diff base that has no single commit-ish.
+    pub fn set_lhs_blame_base(&mut self, revision: Option<SharedString>, cx: &mut Context<Self>) {
+        self.lhs_blame_base = revision;
+        let paths = self.diff_paths(cx);
+        self.sync_lhs_blame_sources(&paths, cx);
+    }
+
+    /// Tells the left-hand editor how to blame each detached base-text buffer.
+    /// The repository and repo-relative path come from the right-hand buffer,
+    /// which for an uncommitted diff is a real project file.
+    fn sync_lhs_blame_sources(
+        &self,
+        paths: &[(PathKey, Entity<BufferDiff>)],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(lhs) = &self.lhs else { return };
+        let (Some(revision), Some(project)) = (
+            self.lhs_blame_base.clone(),
+            self.rhs_editor.read(cx).project().cloned(),
+        ) else {
+            if !lhs.editor.read(cx).blame_base_sources().is_empty() {
+                lhs.editor.update(cx, |editor, cx| {
+                    editor.set_blame_base_sources(HashMap::default(), cx);
+                });
+            }
+            return;
+        };
+
+        let mut sources = lhs.editor.read(cx).blame_base_sources().clone();
+        for (_, diff) in paths {
+            let diff = diff.read(cx);
+            let base_buffer_id = diff.base_text_buffer().read(cx).remote_id();
+            let rhs_buffer_id = diff.buffer_id;
+            let Some((repository, repo_path)) = project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .repository_and_path_for_buffer_id(rhs_buffer_id, cx)
+            else {
+                sources.remove(&base_buffer_id);
+                continue;
+            };
+            sources.insert(
+                base_buffer_id,
+                BlameBaseSource {
+                    repository,
+                    repo_path,
+                    revision: revision.clone(),
+                },
+            );
+        }
+
+        let live_buffer_ids = lhs
+            .multibuffer
+            .read(cx)
+            .snapshot(cx)
+            .all_buffer_ids()
+            .collect::<HashSet<_>>();
+        sources.retain(|buffer_id, _| live_buffer_ids.contains(buffer_id));
+
+        lhs.editor.update(cx, |editor, cx| {
+            editor.set_blame_base_sources(sources, cx);
+        });
     }
 
     pub fn split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1206,6 +1286,7 @@ impl SplittableEditor {
         cx: &mut Context<Self>,
     ) {
         let Some(lhs) = &self.lhs else { return };
+        self.sync_lhs_blame_sources(&paths, cx);
 
         self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
             for (path, diff) in paths {

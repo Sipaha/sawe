@@ -201,6 +201,26 @@ impl Editor {
         self.show_git_blame_gutter
     }
 
+    /// Registers how to blame buffers in this editor's multibuffer that are
+    /// not project files — see [`BlameBaseSource`]. Entries whose buffer is no
+    /// longer excerpted are dropped so the map cannot grow without bound as a
+    /// diff's file set changes.
+    pub fn set_blame_base_sources(
+        &mut self,
+        sources: HashMap<BufferId, BlameBaseSource>,
+        cx: &mut Context<Self>,
+    ) {
+        self.blame_base_sources = sources;
+        if let Some(blame) = self.blame.clone() {
+            let sources = self.blame_base_sources.clone();
+            blame.update(cx, |blame, cx| blame.set_base_sources(sources, cx));
+        }
+    }
+
+    pub fn blame_base_sources(&self) -> &HashMap<BufferId, BlameBaseSource> {
+        &self.blame_base_sources
+    }
+
     pub fn expand_selected_diff_hunks(&mut self, cx: &mut Context<Self>) {
         let ranges: Vec<_> = self
             .selections
@@ -1783,8 +1803,17 @@ impl Editor {
             let focused = self.focus_handle(cx).contains_focused(window, cx);
 
             let project = project.clone();
-            let blame = cx
-                .new(|cx| GitBlame::new(self.buffer.clone(), project, user_triggered, focused, cx));
+            let base_sources = self.blame_base_sources.clone();
+            let blame = cx.new(|cx| {
+                GitBlame::new(
+                    self.buffer.clone(),
+                    project,
+                    base_sources,
+                    user_triggered,
+                    focused,
+                    cx,
+                )
+            });
             self.blame_subscription =
                 Some(cx.observe_in(&blame, window, |_, _, _, cx| cx.notify()));
             self.blame = Some(blame);

@@ -170,7 +170,7 @@ impl SoloDiffView {
             multibuffer
         });
         let editor = cx.new(|cx| {
-            let editor = SplittableEditor::new(
+            let mut editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
                 multibuffer,
                 project.clone(),
@@ -178,6 +178,9 @@ impl SoloDiffView {
                 window,
                 cx,
             );
+            // This view shows uncommitted changes, so the left pane's text is
+            // the file's content at HEAD.
+            editor.set_lhs_blame_base(Some("HEAD".into()), cx);
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_should_serialize(false, cx);
                 let snapshot = editor.snapshot(window, cx);
