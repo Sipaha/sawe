@@ -9363,6 +9363,7 @@ impl Element for EditorElement {
                         text_align: self.style.text.text_align,
                         content_width: text_hitbox.size.width,
                         gutter_hitbox: gutter_hitbox.clone(),
+                        gutter_dimensions,
                         text_hitbox: text_hitbox.clone(),
                         inline_blame_bounds: inline_blame_layout
                             .as_ref()
@@ -10109,6 +10110,7 @@ pub(crate) struct PositionMap {
     pub content_width: Pixels,
     pub text_hitbox: Hitbox,
     pub gutter_hitbox: Hitbox,
+    pub gutter_dimensions: GutterDimensions,
     pub inline_blame_bounds: Option<(Bounds<Pixels>, BufferId, BlameEntry)>,
     pub display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
     pub diff_hunk_control_bounds: Vec<(DisplayRow, Bounds<Pixels>)>,
