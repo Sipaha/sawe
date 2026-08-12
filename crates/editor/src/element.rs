@@ -6668,12 +6668,9 @@ impl Gutter<'_> {
         window: &mut Window,
         cx: &mut Context<'_, Editor>,
     ) -> Option<AnyElement> {
-        let row = MultiBufferRow(
-            DisplayPoint::new(display_row, 0)
-                .to_point(self.snapshot)
-                .row,
-        );
-        if self.snapshot.is_line_folded(row) {
+        // Goes through the same predicate the line-number suppression asks, so
+        // a row can never be told it has an indicator and then not get one.
+        if !self.renders_item_skipping_folds(display_row) {
             return None;
         }
 

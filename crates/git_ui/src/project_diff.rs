@@ -1998,6 +1998,11 @@ impl Render for BranchDiffToolbar {
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
 
         let show_review_button = !is_multibuffer_empty && is_ai_enabled;
+        let is_soft_wrap_enabled = project_diff
+            .read(cx)
+            .editor
+            .read(cx)
+            .is_soft_wrap_enabled(cx);
 
         h_group_xl()
             .my_neg_1()
@@ -2053,6 +2058,23 @@ impl Render for BranchDiffToolbar {
                     additions as usize,
                     deletions as usize,
                 ))
+            })
+            .child({
+                let focus_handle = focus_handle.clone();
+                IconButton::new(
+                    "branch-diff-soft-wrap",
+                    soft_wrap_icon(is_soft_wrap_enabled),
+                )
+                .shape(ui::IconButtonShape::Square)
+                .toggle_state(is_soft_wrap_enabled)
+                .tooltip(Tooltip::for_action_title_in(
+                    soft_wrap_tooltip(is_soft_wrap_enabled),
+                    &ToggleSoftWrap,
+                    &focus_handle,
+                ))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.dispatch_action(&ToggleSoftWrap, window, cx)
+                }))
             })
             .when(show_review_button, |this| {
                 let focus_handle = focus_handle.clone();

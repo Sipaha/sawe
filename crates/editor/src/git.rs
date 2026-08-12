@@ -202,9 +202,10 @@ impl Editor {
     }
 
     /// Registers how to blame buffers in this editor's multibuffer that are
-    /// not project files — see [`BlameBaseSource`]. Entries whose buffer is no
-    /// longer excerpted are dropped so the map cannot grow without bound as a
-    /// diff's file set changes.
+    /// not project files — see [`BlameBaseSource`]. The map replaces whatever
+    /// was registered before, so the caller owns dropping entries whose buffer
+    /// is no longer excerpted; nothing here prunes it, and a caller that keeps
+    /// adding as a diff's file set changes will grow it without bound.
     pub fn set_blame_base_sources(
         &mut self,
         sources: HashMap<BufferId, BlameBaseSource>,

@@ -4114,11 +4114,12 @@ impl Editor {
             return None;
         }
 
-        // `ContextMenu` does not trim separators at its edges, so each section
-        // has to know whether anything is actually on the other side of the one
-        // it would draw. Any section can be the only one present.
-        let has_blame_entry = blame_entry.is_some();
-        let separator_after_run_to_cursor = show_breakpoints || show_bookmarks || has_blame_entry;
+        // `ContextMenu` neither trims separators at its edges nor dedupes
+        // adjacent ones, so a separator has to belong to exactly one side of
+        // each junction. Each section draws its own leading separator, and only
+        // when some earlier section actually rendered; no section draws a
+        // trailing one, or two would meet wherever a middle section is absent.
+        let separator_before_breakpoints = run_to_cursor;
         let separator_before_bookmarks = run_to_cursor || show_breakpoints;
         let separator_before_blame = run_to_cursor || show_breakpoints || show_bookmarks;
 
@@ -4152,10 +4153,10 @@ impl Editor {
                             window.dispatch_action(Box::new(RunToCursor), cx);
                         },
                     )
-                    .when(separator_after_run_to_cursor, |this| this.separator())
                 })
                 .when(show_breakpoints, |this| {
-                    this.when_some(toggle_state_entry, |this, (msg, action)| {
+                    this.when(separator_before_breakpoints, |this| this.separator())
+                        .when_some(toggle_state_entry, |this, (msg, action)| {
                         this.entry(msg, Some(action), {
                             let weak_editor = weak_editor.clone();
                             let breakpoint = breakpoint.clone();
