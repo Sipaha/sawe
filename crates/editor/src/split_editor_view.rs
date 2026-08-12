@@ -117,14 +117,14 @@ fn render_connector_strip(
     style: EditorStyle,
     separator_color: Hsla,
     background_color: Hsla,
-    _window: &mut Window,
+    window: &mut Window,
     _cx: &mut App,
 ) -> AnyElement {
     let state_for_click = state.clone();
     let rhs_editor_for_scroll = rhs_editor.clone();
     let scroll_line_height = style
         .text
-        .line_height_in_pixels(editor_rem_size(&style).unwrap_or(_window.rem_size()));
+        .line_height_in_pixels(editor_rem_size(&style).unwrap_or(window.rem_size()));
 
     let separator = |align_right: bool| {
         let separator = div()
@@ -154,6 +154,27 @@ fn render_connector_strip(
         // naturally rests while comparing hunks. Both panes share one scroll
         // anchor, so driving the right one carries the left with it.
         .on_scroll_wheel(move |event: &gpui::ScrollWheelEvent, window, cx| {
+            // Mirrors `EditorElement`'s wheel handling so the strip is not a
+            // patch of the diff where the same gesture means something else.
+            // Horizontal deltas are the one deliberate omission: the strip has
+            // no text of its own to scroll sideways past, and the two panes
+            // scroll horizontally on their own.
+            if event.modifiers.secondary()
+                && rhs_editor_for_scroll.read(cx).enable_mouse_wheel_zoom
+                && EditorSettings::get_global(cx).mouse_wheel_zoom
+            {
+                let delta_y = match event.delta {
+                    gpui::ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+                    gpui::ScrollDelta::Lines(lines) => lines.y,
+                };
+                if delta_y > 0. {
+                    theme_settings::increase_buffer_font_size(cx);
+                } else if delta_y < 0. {
+                    theme_settings::decrease_buffer_font_size(cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
             // `window.line_height()` is the ambient UI line height during event
             // dispatch — the text-style stack is empty here, so it has nothing
             // to do with the buffer font a pixel delta must be measured in.

@@ -4114,6 +4114,14 @@ impl Editor {
             return None;
         }
 
+        // `ContextMenu` does not trim separators at its edges, so each section
+        // has to know whether anything is actually on the other side of the one
+        // it would draw. Any section can be the only one present.
+        let has_blame_entry = blame_entry.is_some();
+        let separator_after_run_to_cursor = show_breakpoints || show_bookmarks || has_blame_entry;
+        let separator_before_bookmarks = run_to_cursor || show_breakpoints;
+        let separator_before_blame = run_to_cursor || show_breakpoints || show_bookmarks;
+
         let (anchor, breakpoint) =
             breakpoint.unwrap_or_else(|| (anchor, Arc::new(Breakpoint::new_standard())));
 
@@ -4144,7 +4152,7 @@ impl Editor {
                             window.dispatch_action(Box::new(RunToCursor), cx);
                         },
                     )
-                    .separator()
+                    .when(separator_after_run_to_cursor, |this| this.separator())
                 })
                 .when(show_breakpoints, |this| {
                     this.when_some(toggle_state_entry, |this, (msg, action)| {
@@ -4242,7 +4250,7 @@ impl Editor {
                     })
                 })
                 .when(show_bookmarks, |this| {
-                    this.separator()
+                    this.when(separator_before_bookmarks, |this| this.separator())
                         .entry(set_bookmark_msg, Some(ToggleBookmark.boxed_clone()), {
                             let weak_editor = weak_editor.clone();
                             move |_window, cx| {
@@ -4255,7 +4263,7 @@ impl Editor {
                         })
                 })
                 .when_some(blame_entry, |this, label| {
-                    this.separator()
+                    this.when(separator_before_blame, |this| this.separator())
                         .entry(label, Some(::git::Blame.boxed_clone()), {
                             let weak_editor = weak_editor.clone();
                             move |window, cx| {

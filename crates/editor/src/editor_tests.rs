@@ -38162,19 +38162,51 @@ fn test_gutter_columns_tile_without_overlap(_cx: &mut TestAppContext) {
             px(60.),
             px(20.),
             px(150.),
+            px(0.),
         ),
-        ("no indicator column", px(30.), px(40.), px(0.), px(150.)),
-        ("no fold column", px(30.), px(20.), px(20.), px(150.)),
-        ("no right padding at all", px(30.), px(0.), px(0.), px(150.)),
+        (
+            "no indicator column",
+            px(30.),
+            px(40.),
+            px(0.),
+            px(150.),
+            px(0.),
+        ),
+        (
+            "no fold column",
+            px(30.),
+            px(20.),
+            px(20.),
+            px(150.),
+            px(0.),
+        ),
+        (
+            "no right padding at all",
+            px(30.),
+            px(0.),
+            px(0.),
+            px(150.),
+            px(0.),
+        ),
+        // Real gutters always carry a margin (`-descent`), and the fold area
+        // deliberately overruns the gutter by exactly that much.
+        (
+            "with the gutter margin real editors have",
+            px(30.),
+            px(60.),
+            px(20.),
+            px(150.),
+            px(4.),
+        ),
     ];
 
-    for (name, left_padding, right_padding, indicator_column_width, width) in cases {
+    for (name, left_padding, right_padding, indicator_column_width, width, margin) in cases {
         let dimensions = GutterDimensions {
             left_padding,
             right_padding,
             indicator_column_width,
             width,
-            margin: px(0.),
+            margin,
             git_blame_entries_width: None,
         };
 
@@ -38205,8 +38237,13 @@ fn test_gutter_columns_tile_without_overlap(_cx: &mut TestAppContext) {
         );
         assert_eq!(
             dimensions.fold_area_width(),
-            right_padding - indicator_column_width,
-            "{name}: the fold area gets whatever the indicator column left over",
+            margin + right_padding - indicator_column_width,
+            "{name}: the fold area gets whatever the indicator column left over, plus the margin",
+        );
+        assert_eq!(
+            fold_start + dimensions.fold_area_width(),
+            width + margin,
+            "{name}: the columns tile the gutter, overrunning it by exactly the margin",
         );
     }
 }
@@ -38229,4 +38266,75 @@ fn test_line_number_area_never_inverts(_cx: &mut TestAppContext) {
         numbers.start <= numbers.end,
         "expected an empty range rather than an inverted one, got {numbers:?}",
     );
+}
+
+/// The mixed-language fallback must still be resolved *at the excerpt's
+/// location*, not from the global defaults: a project sets language-agnostic
+/// keys in its own settings file too, and those have to keep applying when no
+/// single language can speak for the whole multibuffer.
+#[gpui::test]
+async fn test_mixed_multibuffer_keeps_project_local_settings(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.soft_wrap = Some(settings::SoftWrap::None);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let mut project_tree = serde_json::Map::new();
+    project_tree.insert(
+        paths::local_settings_folder_name().to_string(),
+        json!({ "settings.json": r#"{"soft_wrap":"editor_width"}"# }),
+    );
+    project_tree.insert("notes.md".to_string(), json!("# heading\n\nprose\n"));
+    project_tree.insert("main.rs".to_string(), json!("fn main() {}\n"));
+    fs.insert_tree(path!("/project"), serde_json::Value::Object(project_tree))
+        .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(markdown_lang());
+    language_registry.add(rust_lang());
+    cx.run_until_parked();
+
+    let markdown_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/project/notes.md"), cx)
+        })
+        .await
+        .expect("notes.md should open");
+    let rust_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/project/main.rs"), cx)
+        })
+        .await
+        .expect("main.rs should open");
+    cx.run_until_parked();
+
+    let mixed = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::new(ReadWrite);
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            markdown_buffer.clone(),
+            [Point::new(0, 0)..Point::new(2, 0)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(1),
+            rust_buffer.clone(),
+            [Point::new(0, 0)..Point::new(0, 12)],
+            0,
+            cx,
+        );
+        multibuffer
+    });
+
+    let editor = cx.add_window(|window, cx| build_editor(mixed.clone(), window, cx));
+    editor
+        .update(cx, |editor, _, cx| {
+            assert!(
+                editor.is_soft_wrap_enabled(cx),
+                "the project's own language-agnostic soft_wrap must survive a mixed multibuffer"
+            );
+        })
+        .expect("editor window was closed");
 }
