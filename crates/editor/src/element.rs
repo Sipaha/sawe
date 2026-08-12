@@ -1515,7 +1515,7 @@ impl EditorElement {
 
                 let display_row = DisplayRow(start_row.0 + ix as u32);
                 let position = point(
-                    gutter_dimensions.width - gutter_dimensions.right_padding,
+                    gutter_dimensions.fold_area_start(),
                     line_height * (display_row.as_f64() - scroll_position.y) as f32,
                 );
                 let centering_offset = point(
@@ -6704,7 +6704,14 @@ impl Gutter<'_> {
                     centered_in(area.start, area.end - area.start)
                 }
             }
-            GutterIndicatorColumn::Icon => left_column_x,
+            GutterIndicatorColumn::Icon => {
+                let width = self.dimensions.indicator_column_width;
+                if width <= Pixels::ZERO {
+                    left_column_x
+                } else {
+                    centered_in(self.dimensions.width - self.dimensions.right_padding, width)
+                }
+            }
         };
 
         let mut y = Pixels::from(
@@ -10787,6 +10794,7 @@ mod tests {
         const DIMENSIONS: GutterDimensions = GutterDimensions {
             left_padding: Pixels::ZERO,
             right_padding: Pixels::ZERO,
+            indicator_column_width: Pixels::ZERO,
             width: px(30.0),
             margin: Pixels::ZERO,
             git_blame_entries_width: None,

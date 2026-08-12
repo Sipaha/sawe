@@ -1242,6 +1242,9 @@ pub struct NavigationOverlayLabel {
 pub struct GutterDimensions {
     pub left_padding: Pixels,
     pub right_padding: Pixels,
+    /// The leading part of `right_padding` that holds runnable and bookmark
+    /// indicators. The fold toggles get the remainder, so the two never overlap.
+    pub indicator_column_width: Pixels,
     pub width: Pixels,
     pub margin: Pixels,
     pub git_blame_entries_width: Option<Pixels>,
@@ -11454,9 +11457,13 @@ impl EditorSnapshot {
             let left_padding = git_blame_entries_width.unwrap_or(Pixels::ZERO)
                 + if !is_singleton {
                     ch_width * 4.0
-                // runnables, breakpoints and bookmarks are shown in the same place
-                // if all three are there only the runnable is shown
-                } else if show_runnables || show_breakpoints || show_bookmarks {
+                // Breakpoints are drawn over the line number and runnables and
+                // bookmarks in the icon column right of it, so the column these
+                // used to share is only needed where there are no numbers to
+                // draw over.
+                } else if !show_line_numbers
+                    && (show_runnables || show_breakpoints || show_bookmarks)
+                {
                     ch_width * 3.0
                 } else if show_git_gutter && show_line_numbers {
                     ch_width * 2.0
@@ -11472,7 +11479,7 @@ impl EditorSnapshot {
             // drawn. `layout_crease_toggles` renders them for singleton buffers
             // alone, so in a multibuffer this used to be three characters of
             // guaranteed-empty gutter on every pane of every diff.
-            let right_padding = if shows_folds && show_line_numbers {
+            let fold_column_width = if shows_folds && show_line_numbers {
                 ch_width * 4.0
             } else if shows_folds {
                 ch_width * 3.0
@@ -11482,9 +11489,23 @@ impl EditorSnapshot {
                 px(0.)
             };
 
+            // Runnables and bookmarks sit right of the numbers, next to the
+            // fold toggles, the way IntelliJ arranges them. Multibuffers keep
+            // them in the left column, which their expand-excerpt buttons pay
+            // for anyway, and a gutter with no numbers has no cell to sit next
+            // to, so neither reserves this column.
+            let indicator_column_width =
+                if is_singleton && show_line_numbers && (show_runnables || show_bookmarks) {
+                    ch_width * 3.0
+                } else {
+                    px(0.)
+                };
+            let right_padding = indicator_column_width + fold_column_width;
+
             GutterDimensions {
                 left_padding,
                 right_padding,
+                indicator_column_width,
                 width: line_gutter_width + left_padding + right_padding,
                 margin: GutterDimensions::default_gutter_margin(font_id, font_size, cx),
                 git_blame_entries_width,
