@@ -5015,6 +5015,27 @@ impl EditorElement {
                     ));
                 }
             }
+
+            // Painted last so the active-line and highlighted-row fills, which
+            // span the gutter, cannot swallow it.
+            let gutter_bounds = layout.gutter_hitbox.bounds;
+            if gutter_bounds.size.width > px(0.) {
+                // The gutter meets the text on its right edge, except in the
+                // left pane of a split diff, where the gutter is right-aligned
+                // against the divider and the text lies to its left.
+                let border_x = if self.split_side == Some(SplitSide::Left) {
+                    gutter_bounds.left()
+                } else {
+                    gutter_bounds.right() - px(1.)
+                };
+                window.paint_quad(fill(
+                    window.pixel_snap_bounds(Bounds {
+                        origin: point(border_x, gutter_bounds.origin.y),
+                        size: size(px(1.), gutter_bounds.size.height),
+                    }),
+                    cx.theme().colors().border_variant,
+                ));
+            }
         })
     }
 
