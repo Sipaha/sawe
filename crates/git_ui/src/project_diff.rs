@@ -2059,8 +2059,7 @@ impl Render for BranchDiffToolbar {
                     deletions as usize,
                 ))
             })
-            .child({
-                let focus_handle = focus_handle.clone();
+            .child(
                 IconButton::new(
                     "branch-diff-soft-wrap",
                     soft_wrap_icon(is_soft_wrap_enabled),
@@ -2074,8 +2073,8 @@ impl Render for BranchDiffToolbar {
                 ))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.dispatch_action(&ToggleSoftWrap, window, cx)
-                }))
-            })
+                })),
+            )
             .when(show_review_button, |this| {
                 let focus_handle = focus_handle.clone();
                 this.child(Divider::vertical()).child(

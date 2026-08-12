@@ -4154,9 +4154,11 @@ impl Editor {
                         },
                     )
                 })
+                .when(show_breakpoints && separator_before_breakpoints, |this| {
+                    this.separator()
+                })
                 .when(show_breakpoints, |this| {
-                    this.when(separator_before_breakpoints, |this| this.separator())
-                        .when_some(toggle_state_entry, |this, (msg, action)| {
+                    this.when_some(toggle_state_entry, |this, (msg, action)| {
                         this.entry(msg, Some(action), {
                             let weak_editor = weak_editor.clone();
                             let breakpoint = breakpoint.clone();
