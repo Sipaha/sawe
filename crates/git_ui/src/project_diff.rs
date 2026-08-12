@@ -2,6 +2,7 @@ use crate::{
     branch_picker, conflict_view,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
+    soft_wrap_icon, soft_wrap_tooltip,
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -9,7 +10,7 @@ use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
-    actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
+    actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent, ToggleSoftWrap},
     multibuffer_context_lines,
     scroll::Autoscroll,
 };
@@ -1721,6 +1722,7 @@ impl Render for ProjectDiffToolbar {
         let focus_handle = project_diff.focus_handle(cx);
         let button_states = project_diff.read(cx).button_states(cx);
         let review_count = project_diff.read(cx).total_review_comment_count();
+        let is_soft_wrap_enabled = project_diff.read(cx).editor().read(cx).is_soft_wrap_enabled(cx);
 
         h_group_xl()
             .my_neg_1()
@@ -1807,6 +1809,19 @@ impl Render for ProjectDiffToolbar {
                             .disabled(!button_states.prev_next)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dispatch_action(&GoToHunk, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("soft-wrap", soft_wrap_icon(is_soft_wrap_enabled))
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(is_soft_wrap_enabled)
+                            .tooltip(Tooltip::for_action_title_in(
+                                soft_wrap_tooltip(is_soft_wrap_enabled),
+                                &ToggleSoftWrap,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleSoftWrap, window, cx)
                             })),
                     ),
             )

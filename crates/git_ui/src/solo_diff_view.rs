@@ -1,9 +1,9 @@
-use crate::{git_panel::GitStatusEntry, git_status_icon};
+use crate::{git_panel::GitStatusEntry, git_status_icon, soft_wrap_icon, soft_wrap_tooltip};
 use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkSecondaryStatus;
 use editor::{
     Direction, Editor, EditorEvent, EditorSettings, SplittableEditor, ToggleSplitDiff,
-    actions::{GoToHunk, GoToPreviousHunk},
+    actions::{GoToHunk, GoToPreviousHunk, ToggleSoftWrap},
 };
 use fs::Fs;
 use git::{
@@ -584,6 +584,7 @@ impl Render for SoloDiffStyleToolbar {
         let editor_entity = solo_diff.read(cx).editor.clone();
         let editor = editor_entity.read(cx);
         let diff_view_style = editor.diff_view_style();
+        let is_soft_wrap_enabled = editor.is_soft_wrap_enabled(cx);
         let is_split_set = diff_view_style == DiffViewStyle::Split;
         let split_icon = if is_split_set && !editor.is_split() {
             IconName::DiffSplitAuto
@@ -639,6 +640,20 @@ impl Render for SoloDiffStyleToolbar {
                     .tooltip(Tooltip::text("Split"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_diff_view_style(DiffViewStyle::Split, window, cx);
+                    })),
+            )
+            .child(vertical_divider())
+            .child(
+                IconButton::new("solo-diff-soft-wrap", soft_wrap_icon(is_soft_wrap_enabled))
+                    .icon_size(IconSize::Small)
+                    .toggle_state(is_soft_wrap_enabled)
+                    .tooltip(Tooltip::for_action_title_in(
+                        soft_wrap_tooltip(is_soft_wrap_enabled),
+                        &ToggleSoftWrap,
+                        &focus_handle,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&ToggleSoftWrap, window, cx)
                     })),
             )
             .child(vertical_divider())
