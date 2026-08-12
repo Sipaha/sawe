@@ -247,6 +247,15 @@ impl Editor {
         wrap_guides
     }
 
+    /// Whether the editor currently soft wraps, taking both the per-editor
+    /// override and the resolved language settings into account.
+    pub fn is_soft_wrap_enabled(&self, cx: &App) -> bool {
+        match self.soft_wrap_mode(cx) {
+            SoftWrap::EditorWidth | SoftWrap::Bounded(_) => true,
+            SoftWrap::GitDiff | SoftWrap::None => false,
+        }
+    }
+
     pub(super) fn soft_wrap_mode(&self, cx: &App) -> SoftWrap {
         let settings = self.buffer.read(cx).language_settings(cx);
         let mode = self.soft_wrap_mode_override.unwrap_or(settings.soft_wrap);

@@ -2088,11 +2088,10 @@ impl MultiBuffer {
     pub fn language_settings<'a>(&'a self, cx: &'a App) -> Cow<'a, LanguageSettings> {
         let snapshot = self.snapshot(cx);
         snapshot
-            .excerpts
-            .first()
-            .and_then(|excerpt| self.buffer(excerpt.range.context.start.buffer_id))
+            .representative_buffer_id()
+            .and_then(|buffer_id| self.buffer(buffer_id))
             .map(|buffer| LanguageSettings::for_buffer(&buffer.read(cx), cx))
-            .unwrap_or_else(move || self.language_settings_at(MultiBufferOffset::default(), cx))
+            .unwrap_or_else(move || Cow::Borrowed(&AllLanguageSettings::get_global(cx).defaults))
     }
 
     pub fn language_settings_at<'a, T: ToOffset>(
@@ -6118,11 +6117,35 @@ impl MultiBufferSnapshot {
     }
 
     fn language_settings<'a>(&'a self, cx: &'a App) -> Cow<'a, LanguageSettings> {
-        self.excerpts
-            .first()
-            .map(|excerpt| excerpt.buffer_snapshot(self))
+        self.representative_buffer_id()
+            .and_then(|buffer_id| self.buffer_for_id(buffer_id))
             .map(|buffer| LanguageSettings::for_buffer_snapshot(buffer, None, cx))
-            .unwrap_or_else(move || self.language_settings_at(MultiBufferOffset::ZERO, cx))
+            .unwrap_or_else(move || Cow::Borrowed(&AllLanguageSettings::get_global(cx).defaults))
+    }
+
+    /// The buffer whose settings stand in for the whole multibuffer, or `None`
+    /// when its excerpts come from buffers with differing languages.
+    ///
+    /// A multibuffer has no language of its own, yet settings that are applied
+    /// to every row of it — soft wrap above all others — have to come from
+    /// somewhere. Taking them from an arbitrary excerpt (the first one, say)
+    /// leaks that excerpt's language settings onto unrelated files: a single
+    /// Markdown file in a diff used to soft wrap every other file in that same
+    /// diff. Only trust a buffer's settings when all of them agree, and fall
+    /// back to the language-agnostic defaults otherwise.
+    fn representative_buffer_id(&self) -> Option<BufferId> {
+        let first_excerpt_buffer_id = self.excerpts.first()?.buffer_id;
+        let language_name = |buffer_state: &BufferStateSnapshot| {
+            buffer_state
+                .buffer_snapshot
+                .language()
+                .map(|language| language.name())
+        };
+        let shared_language_name = language_name(self.buffers.get(&first_excerpt_buffer_id)?);
+        self.buffers
+            .values()
+            .all(|buffer_state| language_name(buffer_state) == shared_language_name)
+            .then_some(first_excerpt_buffer_id)
     }
 
     pub fn language_settings_at<'a, T: ToOffset>(

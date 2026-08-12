@@ -23428,6 +23428,79 @@ struct Row10;"#};
 }
 
 #[gpui::test]
+fn test_multibuffer_soft_wrap_is_not_taken_from_the_first_excerpt(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.soft_wrap = Some(settings::SoftWrap::None);
+        settings.languages.0.insert(
+            "Markdown".into(),
+            LanguageSettingsContent {
+                soft_wrap: Some(settings::SoftWrap::EditorWidth),
+                ..Default::default()
+            },
+        );
+    });
+
+    let markdown_buffer = cx.new(|cx| {
+        language::Buffer::local("# heading\n\nprose\n", cx).with_language(markdown_lang(), cx)
+    });
+    let rust_buffer = cx.new(|cx| {
+        language::Buffer::local("fn main() {}\n", cx).with_language(rust_lang(), cx)
+    });
+
+    let markdown_only = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::new(ReadWrite);
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            markdown_buffer.clone(),
+            [Point::new(0, 0)..Point::new(2, 0)],
+            0,
+            cx,
+        );
+        multibuffer
+    });
+    let markdown_then_rust = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::new(ReadWrite);
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            markdown_buffer.clone(),
+            [Point::new(0, 0)..Point::new(2, 0)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(1),
+            rust_buffer.clone(),
+            [Point::new(0, 0)..Point::new(0, 12)],
+            0,
+            cx,
+        );
+        multibuffer
+    });
+
+    let markdown_editor =
+        cx.add_window(|window, cx| build_editor(markdown_only.clone(), window, cx));
+    markdown_editor
+        .update(cx, |editor, _, cx| {
+            assert!(
+                editor.is_soft_wrap_enabled(cx),
+                "a multibuffer of Markdown excerpts alone should keep Markdown's soft wrap"
+            );
+        })
+        .expect("markdown editor window was closed");
+
+    let mixed_editor =
+        cx.add_window(|window, cx| build_editor(markdown_then_rust.clone(), window, cx));
+    mixed_editor
+        .update(cx, |editor, _, cx| {
+            assert!(
+                !editor.is_soft_wrap_enabled(cx),
+                "a Markdown excerpt sorting first must not soft wrap the other languages with it"
+            );
+        })
+        .expect("mixed editor window was closed");
+}
+
+#[gpui::test]
 async fn test_multibuffer_reverts(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
