@@ -5,7 +5,12 @@ impl GutterDimensions {
     /// use alongside 'justify_end' and `gutter_width` to
     /// right align content with the line numbers
     pub fn fold_area_width(&self) -> Pixels {
-        self.margin + self.right_padding
+        self.margin + self.right_padding - self.indicator_column_width
+    }
+
+    /// The left edge of the fold area, relative to the gutter's left edge.
+    pub fn fold_area_start(&self) -> Pixels {
+        self.width - self.right_padding + self.indicator_column_width
     }
 }
 
