@@ -1286,10 +1286,10 @@ impl SplittableEditor {
         cx: &mut Context<Self>,
     ) {
         let Some(lhs) = &self.lhs else { return };
-        self.sync_lhs_blame_sources(&paths, cx);
 
         self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
-            for (path, diff) in paths {
+            for (path, diff) in &paths {
+                let (path, diff) = (path.clone(), diff.clone());
                 let main_buffer_id = diff.read(cx).buffer_id;
                 let Some(main_buffer) = rhs_multibuffer.buffer(diff.read(cx).buffer_id) else {
                     lhs.multibuffer.update(cx, |lhs_multibuffer, lhs_cx| {
@@ -1369,6 +1369,10 @@ impl SplittableEditor {
                 }
             }
         });
+
+        // After the excerpts land: the blame sources are pruned against the
+        // left multibuffer's live buffers, which only now include these paths.
+        self.sync_lhs_blame_sources(&paths, cx);
     }
 
     fn width_changed(&mut self, width: Pixels, window: &mut Window, cx: &mut Context<Self>) {
