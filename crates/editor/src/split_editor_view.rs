@@ -24,6 +24,7 @@ use crate::{
     element::{EditorElement, SplitSide, header_jump_data, render_buffer_header},
     scroll::ScrollOffset,
     split::SplittableEditor,
+    split_connectors::{CONNECTOR_STRIP_WIDTH, connector_ribbons},
 };
 
 const RESIZE_HANDLE_WIDTH: f32 = 12.0;
@@ -107,26 +108,49 @@ impl SplitEditorView {
     }
 }
 
-fn render_resize_handle(
+/// The strip between the two line-number columns: connector ribbons, a
+/// separator line on each side, and the drag-to-resize handle down the middle.
+fn render_connector_strip(
     state: &Entity<SplitEditorState>,
+    lhs_editor: Entity<Editor>,
+    rhs_editor: Entity<Editor>,
+    style: EditorStyle,
     separator_color: Hsla,
+    background_color: Hsla,
     _window: &mut Window,
     _cx: &mut App,
 ) -> AnyElement {
     let state_for_click = state.clone();
+
+    let separator = |align_right: bool| {
+        let separator = div()
+            .absolute()
+            .top_0()
+            .h_full()
+            .w(px(1.))
+            .bg(separator_color);
+        if align_right {
+            separator.right_0()
+        } else {
+            separator.left_0()
+        }
+    };
 
     div()
         .id("split-resize-container")
         .relative()
         .h_full()
         .flex_shrink_0()
-        .w(px(1.))
-        .bg(separator_color)
+        .w(CONNECTOR_STRIP_WIDTH)
+        .bg(background_color)
+        .child(connector_ribbons(lhs_editor, rhs_editor, style))
+        .child(separator(false))
+        .child(separator(true))
         .child(
             div()
                 .id("split-resize-handle")
                 .absolute()
-                .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
+                .left((CONNECTOR_STRIP_WIDTH - px(RESIZE_HANDLE_WIDTH)) / 2.0)
                 .w(px(RESIZE_HANDLE_WIDTH))
                 .h_full()
                 .cursor_col_resize()
@@ -166,8 +190,18 @@ impl RenderOnce for SplitEditorView {
         let right_ratio = self.split_state.read(cx).right_ratio();
 
         let separator_color = cx.theme().colors().border_variant;
+        let strip_background = cx.theme().colors().editor_gutter_background;
 
-        let resize_handle = render_resize_handle(&self.split_state, separator_color, window, cx);
+        let connector_strip = render_connector_strip(
+            &self.split_state,
+            lhs_editor.clone(),
+            rhs_editor.clone(),
+            self.style.clone(),
+            separator_color,
+            strip_background,
+            window,
+            cx,
+        );
 
         let state_for_drag = self.split_state.downgrade();
         let state_for_drop = self.split_state.downgrade();
@@ -217,7 +251,7 @@ impl RenderOnce for SplitEditorView {
                             .overflow_hidden()
                             .child(lhs),
                     )
-                    .child(resize_handle)
+                    .child(connector_strip)
                     .child(
                         div()
                             .id("split-editor-right")

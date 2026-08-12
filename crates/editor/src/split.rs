@@ -6354,4 +6354,80 @@ mod tests {
             "SplittableEditor should be able to act as Editor"
         );
     }
+
+    #[gpui::test]
+    async fn test_connector_rows_pair_hunks_across_panes(cx: &mut gpui::TestAppContext) {
+        use crate::split_connectors::connector_rows;
+        use buffer_diff::DiffHunkStatusKind;
+
+        let (editor, cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+
+        let base_text = "one\nTWO_OLD\nthree\nfour\nOLD_A\nOLD_B\nfive\nDELETED_1\nDELETED_2\nsix\n";
+        let current_text = "one\nTWO_NEW_1\nTWO_NEW_2\nTWO_NEW_3\nthree\nfour\nNEW_A\nfive\nsix\n";
+        let (buffer, diff) = buffer_with_diff(base_text, current_text, cx);
+
+        let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+        diff.update(cx, |diff, cx| {
+            diff.recalculate_diff_sync(&buffer_snapshot, cx);
+        });
+        cx.run_until_parked();
+
+        let diff_snapshot = diff.read_with(cx, |diff, cx| diff.snapshot(cx));
+        let ranges = diff_snapshot
+            .hunks(&buffer_snapshot)
+            .map(|hunk| hunk.range)
+            .collect::<Vec<_>>();
+        editor.update(cx, |editor, cx| {
+            let path = PathKey::sorted(0);
+            editor.update_excerpts_for_path(path, buffer.clone(), ranges, 1, diff.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let (rhs_editor, lhs_editor) = editor.update(cx, |editor, _| {
+            let lhs = editor.lhs.as_ref().expect("should have lhs editor");
+            (editor.rhs_editor.clone(), lhs.editor.clone())
+        });
+
+        // Force a layout on both panes so their display maps (and the spacer
+        // blocks that keep the two row counts equal) are up to date.
+        let _ = editor_content_with_blocks_and_width(&rhs_editor, px(3000.), cx);
+        let _ = editor_content_with_blocks_and_width(&lhs_editor, px(3000.), cx);
+        cx.run_until_parked();
+
+        let lhs_snapshot = lhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+        let rhs_snapshot = rhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+
+        let connectors = connector_rows(&lhs_snapshot, &rhs_snapshot, 1000.);
+        assert_eq!(
+            connectors.len(),
+            3,
+            "expected one connector per hunk, got {connectors:?}"
+        );
+
+        for connector in &connectors {
+            assert_eq!(
+                connector.left.start, connector.right.start,
+                "hunk tops must align across panes: {connector:?}"
+            );
+        }
+
+        let row_counts = connectors
+            .iter()
+            .map(|connector| {
+                (
+                    connector.left.end.0 - connector.left.start.0,
+                    connector.right.end.0 - connector.right.start.0,
+                    connector.status,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            row_counts,
+            vec![
+                (1, 3, DiffHunkStatusKind::Modified),
+                (2, 1, DiffHunkStatusKind::Modified),
+                (2, 0, DiffHunkStatusKind::Deleted),
+            ]
+        );
+    }
 }

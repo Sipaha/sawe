@@ -44,6 +44,7 @@ pub mod scroll;
 mod selections_collection;
 pub mod semantic_tokens;
 mod split;
+mod split_connectors;
 pub mod split_editor_view;
 
 mod bookmarks;
