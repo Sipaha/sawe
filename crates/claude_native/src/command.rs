@@ -69,6 +69,20 @@ impl ClaudeCommandSpec {
         // #35240. Set after `extra_env` so it always wins.
         cmd.env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
 
+        // Force-enable cross-session messaging. Upstream gates the whole
+        // feature behind the remote flag `tengu_harbor_kite`, whose default is
+        // `false`, and re-asks it on every process start — so a session that
+        // could message its peers loses that ability the next time it is
+        // respawned (`/clear`, `/compact`, Restart Agent all spawn a new
+        // process). The symptom is invisible: no socket is bound, the session
+        // simply stops appearing in everyone else's `ListAgents` and messages
+        // to it are refused with "kill-switch". This env var is the override
+        // upstream provides right next to the flag lookup (claude 2.1.x):
+        // `rt("tengu_harbor_kite", false) || Boolean(env.CLAUDE_CODE_HARBOR_KITE)`.
+        // If a future version renames it the override silently stops applying
+        // and we are back to the flag's coin toss — no worse than today.
+        cmd.env("CLAUDE_CODE_HARBOR_KITE", "1");
+
         cmd.args([
             "--output-format",
             "stream-json",
@@ -188,6 +202,14 @@ mod tests {
                 && v == Some(std::ffi::OsStr::new("1"))
         });
         assert!(teams, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 must be set");
+        // Cross-session messaging is gated on a remote flag that defaults to
+        // off and is re-asked on every spawn; without this override a session
+        // silently drops off its peers' `ListAgents` after any respawn.
+        let harbor = cmd.get_envs().any(|(k, v)| {
+            k == std::ffi::OsStr::new("CLAUDE_CODE_HARBOR_KITE")
+                && v == Some(std::ffi::OsStr::new("1"))
+        });
+        assert!(harbor, "CLAUDE_CODE_HARBOR_KITE=1 must be set");
     }
 
     #[test]
@@ -227,8 +249,11 @@ mod tests {
             model: Some("opus".into()),
             settings_path: None,
         };
-        let args: Vec<String> = spec.to_std_command().get_args()
-            .map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec
+            .to_std_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == "opus"));
     }
 
@@ -244,8 +269,11 @@ mod tests {
             model: None,
             settings_path: None,
         };
-        let args: Vec<String> = spec.to_std_command().get_args()
-            .map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec
+            .to_std_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert!(!args.iter().any(|a| a == "--model"));
     }
 
@@ -266,8 +294,10 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert!(args.windows(2).any(|w| w[0] == "--settings"
-            && w[1] == "/state/solutions/7/claude-settings.json"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--settings" && w[1] == "/state/solutions/7/claude-settings.json")
+        );
         // `--settings` is a command-line-tier OVERRIDE, not a replacement for the
         // file sources: the user's own settings must keep loading.
         assert!(
@@ -301,10 +331,7 @@ mod tests {
         let server = acp::McpServer::Stdio(
             acp::McpServerStdio::new("sawe", "/path/exe")
                 .args(vec!["--nc".to_string(), "/tmp/mcp.sock".to_string()])
-                .env(vec![acp::EnvVariable::new(
-                    "SAWE_MCP_BRIDGE_CAPS",
-                    "write",
-                )]),
+                .env(vec![acp::EnvVariable::new("SAWE_MCP_BRIDGE_CAPS", "write")]),
         );
         let json: serde_json::Value = serde_json::from_str(&mcp_config_json(&[server])).unwrap();
         let s = &json["mcpServers"]["sawe"];
