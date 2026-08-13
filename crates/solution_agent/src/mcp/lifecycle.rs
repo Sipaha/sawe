@@ -429,10 +429,12 @@ impl McpServerTool for RenameSessionTool {
 // solution_agent.push_system_note
 // =====================================================================
 
-/// Restart the agent backing `session_id`. Drops the pooled subprocess
-/// for the session's `(solution, agent)` pair, closes the existing
-/// session, and opens a fresh one against the same project. v1 does not
-/// replay history. Returns the new session id.
+/// Restart the agent backing `session_id`: kill its `claude` subprocess and
+/// bring the SAME session back by resuming its `acp_session_id`, so the
+/// conversation survives. Same mechanics as `reconnect_agent` — that one is
+/// what the stuck-session watchdog calls, this one is the user's Restart
+/// action — and the returned session id is unchanged. To start an empty
+/// session instead, use `create_session`.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RestartAgentParams {
     pub session_id: String,
@@ -482,14 +484,14 @@ impl McpServerTool for RestartAgentTool {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| store.restart_agent(session_id, cx))
         });
-        let new_session_id = restart_task.await?;
+        let restarted_session_id = restart_task.await?;
 
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
-                text: new_session_id.to_string(),
+                text: restarted_session_id.to_string(),
             }],
             structured_content: RestartAgentResult {
-                session_id: new_session_id.to_string(),
+                session_id: restarted_session_id.to_string(),
             },
         })
     }
@@ -501,8 +503,9 @@ impl McpServerTool for RestartAgentTool {
 
 /// Non-destructively recover a wedged session: respawn its subprocess and
 /// replay the SAME `acp_session_id` from the transcript, keeping the
-/// conversation (entries + claude context). Unlike `restart_agent` this does
-/// not wipe history and keeps the session id/title. Returns the session id.
+/// conversation (entries + claude context). Identical to `restart_agent`
+/// apart from the wording the user is shown; this is the watchdog's entry
+/// point. Returns the session id.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ReconnectAgentParams {
     pub session_id: String,

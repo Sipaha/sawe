@@ -587,6 +587,47 @@ pub(crate) enum SeededAgentState {
     UsageLimited,
 }
 
+/// Why a session's subprocess is being replaced. The respawn itself is
+/// identical either way; this only decides what the user is told, and the
+/// distinction matters because "the agent stopped responding" is alarming
+/// wording to show someone who just pressed Restart themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespawnReason {
+    /// The stuck-session watchdog noticed the agent wedged mid-turn.
+    Watchdog,
+    /// The user pressed Restart.
+    UserRestart,
+}
+
+impl RespawnReason {
+    fn transient_status(self) -> &'static str {
+        match self {
+            RespawnReason::Watchdog => "reconnecting…",
+            RespawnReason::UserRestart => "restarting…",
+        }
+    }
+
+    fn failure_status(self) -> &'static str {
+        match self {
+            RespawnReason::Watchdog => "переподключение не удалось — перезапустите агента (Restart)",
+            RespawnReason::UserRestart => {
+                "перезапуск не удался — история цела, попробуйте ещё раз"
+            }
+        }
+    }
+
+    fn recovered_note(self) -> &'static str {
+        match self {
+            RespawnReason::Watchdog => {
+                "Агент не отвечал — переподключил сессию (история и контекст сохранены)."
+            }
+            RespawnReason::UserRestart => {
+                "Агент перезапущен (история и контекст сохранены)."
+            }
+        }
+    }
+}
+
 impl SolutionAgentStore {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalSolutionAgentStore>().0.clone()
@@ -1874,115 +1915,41 @@ impl SolutionAgentStore {
         Ok(())
     }
 
-    /// Restart the agent backing `session_id`: drop the pool entry so the
-    /// next `create_session` call forces a fresh subprocess spawn, close
-    /// the existing session, and open a new one against the cached project.
-    /// v1 does not replay history — the new session starts empty (deferred
-    /// per Phase-5 spec "Open implementation questions" item 5).
+    /// User-initiated "Restart Agent": replace the `claude` subprocess but keep
+    /// the conversation.
     ///
-    /// Returns the freshly minted `SolutionSessionId` so callers can
-    /// reattach navigator focus to it.
+    /// This used to close the session and create a blank one in its place,
+    /// which is what the "+" button is for — a restart that silently discards
+    /// the history is the one thing a user pressing "Restart" cannot want. It
+    /// now goes through the same respawn the watchdog uses: kill the
+    /// subprocess, resume the same ACP session id, graft the thread back onto
+    /// the existing session. The returned id is therefore the SAME
+    /// `SolutionSessionId`, not a fresh one.
     pub fn restart_agent(
         &mut self,
         session_id: SolutionSessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<SolutionSessionId>> {
-        let Some(session) = self.sessions.get(&session_id).cloned() else {
-            return Task::ready(Err(anyhow!("unknown session {session_id}")));
-        };
-        let (
-            solution_id,
-            agent_id,
-            project,
-            previous_cwd,
-            previous_member,
-            previous_model,
-            previous_effort,
-        ) = {
-            let s = session.read(cx);
-            let project = match s.project.clone() {
-                Some(project) => project,
-                None => {
-                    return Task::ready(Err(anyhow!(
-                        "session {session_id} has no cached project — was it created via \
-                         register_prebuilt_session?"
-                    )));
-                }
-            };
-            // Preserve the session's working directory across restart. Without
-            // this the fresh session falls back to `solution.root` (the
-            // `create_session` default), silently relocating a member-project
-            // session — for the user that looks like "claude lost the project
-            // root after I clicked Restart". Empty cwd is the legacy-row
-            // marker meaning "fall back to solution.root"; pass `None` in
-            // that case so `create_session_with_cwd` takes its own default.
-            let cwd_override = if s.cwd.as_os_str().is_empty() {
-                None
-            } else {
-                Some(s.cwd.clone())
-            };
-            (
-                s.solution_id,
-                s.agent_id.clone(),
-                project,
-                cwd_override,
-                // Carry the member binding across the restart too — the fresh
-                // session must keep its project label and tab scope.
-                s.member_id,
-                s.desired_model.clone(),
-                s.desired_effort.clone(),
-            )
-        };
-        let pair = (solution_id, agent_id.clone());
-        {
-            let mut pool = self.pool.lock();
-            pool.remove(&pair);
-        }
-        // Mark the old session as restarting so the UI can show feedback
-        // before the new session is registered.
-        session.update(cx, |s, _| {
-            s.state = SessionState::Errored(SharedString::from("restarting…"));
-        });
-        self.mark_state_changed(session_id, cx);
-        // Best-effort close of the old session; we still spawn the new
-        // one even if removal fails so the user isn't stranded.
-        if let Err(err) = self.close_session(session_id, cx) {
-            log::warn!("restart_agent: close_session({session_id}) failed: {err:?}");
-        }
-        let create_task = self.create_session_with_cwd(
-            solution_id,
-            agent_id,
-            project,
-            previous_cwd,
-            previous_member,
-            previous_model,
-            previous_effort,
-            cx,
-        );
-        cx.spawn(async move |_this, _cx: &mut AsyncApp| create_task.await)
+        self.respawn_agent(session_id, RespawnReason::UserRestart, cx)
     }
 
-    /// Non-destructive recovery for a wedged session (claude subprocess hung
-    /// or dead): force a fresh subprocess and REPLAY the SAME `acp_session_id`
-    /// from its on-disk transcript, keeping the conversation. Unlike
-    /// [`restart_agent`] (mints a fresh, empty session — "v1 does not replay
-    /// history") this preserves both the displayed entries and claude's own
-    /// context (it `--resume`s the jsonl). Unlike [`rotate_context`] (same
-    /// pooled subprocess, fresh empty ACP session) it drops the pool entry so
-    /// the next connection spawns a clean subprocess.
-    ///
-    /// Implementation: transition the live session into exactly the shape of a
-    /// cold-restored tab (live `AcpThread` dropped, `SolutionSessionId` +
-    /// persisted `entries` kept) and hand off to the proven [`resume_session`]
-    /// cold path, which grafts the replayed thread onto the existing entity
-    /// in place (no duplication, no loss). Returns the (unchanged) session id.
-    ///
-    /// If the session was actively Running when reconnected, a continuation
-    /// prompt ([`RECONNECT_CONTINUATION_PROMPT`]) is sent once it's back so the
-    /// agent resumes instead of parking at Idle.
     pub fn reconnect_agent(
         &mut self,
         session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SolutionSessionId>> {
+        self.respawn_agent(session_id, RespawnReason::Watchdog, cx)
+    }
+
+    /// Kill a session's `claude` subprocess and bring the SAME session back by
+    /// resuming its ACP session id, so the conversation survives.
+    ///
+    /// Both the stuck-session watchdog and the user's Restart action land here:
+    /// the mechanics are identical, only the wording the user sees differs.
+    pub fn respawn_agent(
+        &mut self,
+        session_id: SolutionSessionId,
+        reason: RespawnReason,
         cx: &mut Context<Self>,
     ) -> Task<Result<SolutionSessionId>> {
         let Some(session) = self.sessions.get(&session_id).cloned() else {
@@ -2105,7 +2072,7 @@ impl SolutionAgentStore {
         // they did not survive it). Report whether it did, so the change is
         // broadcast to the MCP/mobile subscribers as well as the local views.
         let background_agents_killed = session.update(cx, |s, cx| {
-            s.state = SessionState::Errored(SharedString::from("reconnecting…"));
+            s.state = SessionState::Errored(SharedString::from(reason.transient_status()));
             s.set_acp_thread(None, cx);
             // Bump the activity clock so the SUPERVISOR tick doesn't treat the
             // mid-reconnect `Errored` session as idle-eligible and fire a judge
@@ -2178,7 +2145,7 @@ impl SolutionAgentStore {
                                     session_id,
                                     |st| {
                                         *st = SessionState::Errored(SharedString::from(
-                                            "переподключение не удалось — перезапустите агента (Restart)",
+                                            reason.failure_status(),
                                         ))
                                     },
                                     cx,
@@ -2198,7 +2165,7 @@ impl SolutionAgentStore {
                 store.push_system_note(
                     resumed,
                     acp_thread::SystemNoteLevel::Info,
-                    "Агент не отвечал — переподключил сессию (история и контекст сохранены).",
+                    reason.recovered_note(),
                     cx,
                 );
                 store.maybe_send_reconnect_continuation(

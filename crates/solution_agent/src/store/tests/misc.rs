@@ -389,8 +389,9 @@ async fn stopping_safety_net_flushes_pending_when_flush_after_cancel(cx: &mut Te
     .expect("interrupt_and_flush_pending");
 
     // Backend never answers with `Stopped` — the net is the only thing that runs.
-    cx.executor()
-        .advance_clock(crate::store::queue::STOPPING_SAFETY_NET + std::time::Duration::from_secs(1));
+    cx.executor().advance_clock(
+        crate::store::queue::STOPPING_SAFETY_NET + std::time::Duration::from_secs(1),
+    );
     cx.executor().run_until_parked();
 
     let (pending, flush_flag) = cx.update(|cx| {
@@ -1789,7 +1790,10 @@ async fn entries_removed_restamps_survivor_on_coalesce_split(cx: &mut TestAppCon
             main.seq
         })
     });
-    assert_eq!(cursor_before, 8, "coalesced entry carries the first fragment's seq");
+    assert_eq!(
+        cursor_before, 8,
+        "coalesced entry carries the first fragment's seq"
+    );
 
     // Remove only the last fragment (a2) at global index 2 → splits the group.
     cx.update(|cx| {
@@ -1922,8 +1926,8 @@ async fn interleaved_flat_entries_persist_as_coalesced_main_rows(cx: &mut TestAp
         rows[0].subagent_id, None,
         "persisted Main rows carry no subagent tag"
     );
-    let kind = crate::session_entry::kind_from_payload(&rows[0].payload)
-        .expect("row payload decodes");
+    let kind =
+        crate::session_entry::kind_from_payload(&rows[0].payload).expect("row payload decodes");
     let crate::session_entry::SessionEntryKind::AssistantMessage { chunks } = kind else {
         panic!("expected an AssistantMessage row");
     };
@@ -3509,7 +3513,10 @@ async fn errored_flushes_pending_entry_update_debounce_immediately(cx: &mut Test
             .entry_update_throttles
             .contains_key(&(session_id, 0))
     });
-    assert!(!still_throttled, "the flushed throttle slot must be cleared on Error");
+    assert!(
+        !still_throttled,
+        "the flushed throttle slot must be cleared on Error"
+    );
 
     cx.executor()
         .advance_clock(std::time::Duration::from_millis(2_500));
@@ -4042,7 +4049,10 @@ async fn native_pull_subagent_end_of_turn_closes_teammate_stream(cx: &mut TestAp
                 },
             );
             s.background_agent_order.push(bg_id.clone());
-            assert!(s.streams.contains_key(&teammate), "teammate live before Stop");
+            assert!(
+                s.streams.contains_key(&teammate),
+                "teammate live before Stop"
+            );
         });
     });
 
@@ -4050,8 +4060,12 @@ async fn native_pull_subagent_end_of_turn_closes_teammate_stream(cx: &mut TestAp
     // queue (⇒ `take_pending_for_delivery` returns `None`) and
     // `Some(agent_id) + is_end_of_turn=true` — the exact combo Task 1 adds.
     let mut async_cx = cx.to_async();
-    let sub_pull =
-        native.invoke_store_pull_for_test(&acp_session_id, Some("sub-agent-1"), true, &mut async_cx);
+    let sub_pull = native.invoke_store_pull_for_test(
+        &acp_session_id,
+        Some("sub-agent-1"),
+        true,
+        &mut async_cx,
+    );
     assert!(
         sub_pull.is_none(),
         "empty queue ⇒ nothing to deliver, got {sub_pull:?}"
@@ -4784,9 +4798,12 @@ async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
                 "label captured"
             );
             assert!(
-                session.read(cx).streams.contains_key(
-                    &crate::stream::StreamId::Teammate(SharedString::from("toolu_gc_1"))
-                ),
+                session
+                    .read(cx)
+                    .streams
+                    .contains_key(&crate::stream::StreamId::Teammate(SharedString::from(
+                        "toolu_gc_1"
+                    ))),
                 "teammate stream stranded"
             );
             seq
@@ -4808,9 +4825,11 @@ async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
         let s = session.read(cx);
         assert!(
             s.teammate_labels.is_empty()
-                && !s.streams.contains_key(&crate::stream::StreamId::Teammate(
-                    SharedString::from("toolu_gc_1")
-                )),
+                && !s
+                    .streams
+                    .contains_key(&crate::stream::StreamId::Teammate(SharedString::from(
+                        "toolu_gc_1"
+                    ))),
             "→Idle GC must close the stranded stream + reclaim its label"
         );
         assert!(
@@ -5644,10 +5663,7 @@ async fn reconnect_continues_a_wedged_running_session(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.maybe_send_reconnect_continuation(
-                session_id,
-                /* was_running */ true,
-                /* tail_unanswered_user */ false,
-                cx,
+                session_id, /* was_running */ true, /* tail_unanswered_user */ false, cx,
             )
         });
     });
@@ -5676,10 +5692,7 @@ async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.maybe_send_reconnect_continuation(
-                session_id,
-                /* was_running */ false,
-                /* tail_unanswered_user */ false,
-                cx,
+                session_id, /* was_running */ false, /* tail_unanswered_user */ false, cx,
             )
         });
     });
@@ -5764,10 +5777,7 @@ async fn reconnect_on_unanswered_user_message_points_at_it(cx: &mut TestAppConte
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.maybe_send_reconnect_continuation(
-                session_id,
-                /* was_running */ true,
-                /* tail_unanswered_user */ true,
-                cx,
+                session_id, /* was_running */ true, /* tail_unanswered_user */ true, cx,
             )
         });
     });
@@ -5777,7 +5787,8 @@ async fn reconnect_on_unanswered_user_message_points_at_it(cx: &mut TestAppConte
         let store = SolutionAgentStore::global(cx);
         store.read_with(cx, |store, cx| {
             let unanswered = last_user_text_contains(store, session_id, "НЕ считай его уже", cx);
-            let generic = last_user_text_contains(store, session_id, "продолжай работу с того места", cx);
+            let generic =
+                last_user_text_contains(store, session_id, "продолжай работу с того места", cx);
             (unanswered, generic)
         })
     });
@@ -5819,9 +5830,7 @@ fn classify_done_reasoning_park_vs_completion() {
 
 #[test]
 fn tail_unanswered_user_detection() {
-    use crate::session_entry::{
-        AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel,
-    };
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel};
     use agent_client_protocol::schema as acp;
     let ent = |kind| SessionEntry {
         created_ms: 0,
@@ -5855,7 +5864,10 @@ fn tail_unanswered_user_detection() {
     };
 
     use crate::store::tail_is_unanswered_user_message as tail;
-    assert!(!tail(&[]), "empty transcript is not an unanswered-user tail");
+    assert!(
+        !tail(&[]),
+        "empty transcript is not an unanswered-user tail"
+    );
     assert!(tail(&[ent(plain_user())]), "bare trailing user message");
     assert!(
         tail(&[ent(plain_user()), ent(system())]),
@@ -5888,9 +5900,7 @@ fn tail_unanswered_user_detection() {
 /// race to the synchronous tab-remove and strand an orphaned tab. A normal
 /// `create_session` DOES pin and DOES emit; this test asserts the contrast.
 #[gpui::test]
-async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(
-    cx: &mut TestAppContext,
-) {
+async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(cx: &mut TestAppContext) {
     let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
     let agent_id = SharedString::from("mock-agent");
 
@@ -5907,15 +5917,15 @@ async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(
         });
     });
 
-    let created = Rc::new(std::cell::RefCell::new(
-        Vec::<crate::model::SolutionSessionId>::new(),
-    ));
-    let opened = Rc::new(std::cell::RefCell::new(
-        Vec::<crate::model::SolutionSessionId>::new(),
-    ));
-    let closed = Rc::new(std::cell::RefCell::new(
-        Vec::<crate::model::SolutionSessionId>::new(),
-    ));
+    let created = Rc::new(std::cell::RefCell::new(Vec::<
+        crate::model::SolutionSessionId,
+    >::new()));
+    let opened = Rc::new(std::cell::RefCell::new(Vec::<
+        crate::model::SolutionSessionId,
+    >::new()));
+    let closed = Rc::new(std::cell::RefCell::new(Vec::<
+        crate::model::SolutionSessionId,
+    >::new()));
     let _subscription = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         let created = created.clone();
@@ -5954,12 +5964,7 @@ async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.create_ephemeral_session(
-                    solution_id,
-                    agent_id.clone(),
-                    project.clone(),
-                    cx,
-                )
+                store.create_ephemeral_session(solution_id, agent_id.clone(), project.clone(), cx)
             })
         })
         .await
@@ -6077,5 +6082,82 @@ async fn project_label_reads_member_id_not_cwd(cx: &mut TestAppContext) {
             None,
             "a dangling member_id degrades to ROOT rather than panicking"
         );
+    });
+}
+
+/// Restart used to close the session and create a blank one, which is what the
+/// "+" button is for — pressing Restart is never a request to lose the
+/// conversation. It must keep the same `SolutionSessionId` and the entries, so
+/// the tab the user was looking at survives the respawn.
+#[gpui::test]
+async fn restart_agent_keeps_the_session_and_its_history(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    let entries_before = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            store.session(session_id).unwrap().read(cx).entries.len()
+        })
+    });
+
+    let task = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.restart_agent(session_id, cx))
+    });
+    // The mock backend cannot resume, so the respawn reports failure — but the
+    // point of this test is what restart does to the session, not whether the
+    // fake agent comes back. A restart that wiped the session would show up
+    // here regardless of the resume outcome.
+    let _ = task.await;
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let session = store
+                .session(session_id)
+                .expect("restart must keep the same session id, not mint a new one");
+            let session = session.read(cx);
+            assert_eq!(
+                session.entries.len(),
+                entries_before,
+                "restart must not discard the conversation"
+            );
+        });
+    });
+}
+
+/// The two respawn entry points differ only in what the user is told. Showing
+/// "the agent stopped responding" to someone who just pressed Restart is the
+/// kind of wording that sends people hunting for a fault that isn't there.
+#[gpui::test]
+async fn restart_and_watchdog_respawn_report_differently(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    let task = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.restart_agent(session_id, cx))
+    });
+    let _ = task.await;
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let state = store.session(session_id).unwrap().read(cx).state.clone();
+            match state {
+                SessionState::Errored(msg) => {
+                    assert!(
+                        msg.contains("перезапуск"),
+                        "a user-initiated restart must report itself as a restart, got {msg:?}"
+                    );
+                    assert!(
+                        !msg.contains("переподключение"),
+                        "must not blame a reconnect the user did not ask for, got {msg:?}"
+                    );
+                }
+                other => panic!("expected Errored(restart wording), got {other:?}"),
+            }
+        });
     });
 }
