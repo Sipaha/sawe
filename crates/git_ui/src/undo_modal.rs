@@ -236,20 +236,24 @@ pub fn register(workspace: &mut Workspace) {
         };
         workspace.toggle_modal(window, cx, |window, cx| UndoModal::new(repo, window, cx));
     });
-    workspace.register_action(|workspace, action: &crate::fork_actions::CleanupBackups, _window, cx| {
-        let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
-            return;
-        };
-        let work_dir = repo.read(cx).work_directory_abs_path.clone();
-        let days = action.older_than_days;
-        cx.background_spawn(async move {
-            match git::backup::cleanup(&work_dir, days) {
-                Ok(n) => log::info!("crate::fork_actions::CleanupBackups: removed {n} backup-refs"),
-                Err(err) => log::warn!("crate::fork_actions::CleanupBackups: {err}"),
-            }
-        })
-        .detach();
-    });
+    workspace.register_action(
+        |workspace, action: &crate::fork_actions::CleanupBackups, _window, cx| {
+            let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
+                return;
+            };
+            let work_dir = repo.read(cx).work_directory_abs_path.clone();
+            let days = action.older_than_days;
+            cx.background_spawn(async move {
+                match git::backup::cleanup(&work_dir, days) {
+                    Ok(n) => {
+                        log::info!("crate::fork_actions::CleanupBackups: removed {n} backup-refs")
+                    }
+                    Err(err) => log::warn!("crate::fork_actions::CleanupBackups: {err}"),
+                }
+            })
+            .detach();
+        },
+    );
 }
 
 #[cfg(test)]

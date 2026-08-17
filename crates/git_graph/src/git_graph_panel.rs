@@ -110,7 +110,9 @@ impl GitGraphPanel {
         // double-lease-panic. Defer to the next effect cycle, once the
         // construction lease is released. (Subscription-driven refreshes already
         // run outside any Workspace update, so they don't need this.)
-        cx.defer_in(window, |this, window, cx| this.refresh_active_repo(window, cx));
+        cx.defer_in(window, |this, window, cx| {
+            this.refresh_active_repo(window, cx)
+        });
         this
     }
 

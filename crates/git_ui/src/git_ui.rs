@@ -11,14 +11,14 @@ use workspace::{Toast, notifications::NotificationId};
 mod backup_mcp;
 mod blame_ui;
 pub mod clone;
-pub mod fork_actions;
-mod panel_buttons;
 pub mod commit_context_menu;
 pub mod credentials;
+pub mod fork_actions;
 pub mod handlers;
 mod handlers_mcp;
 pub mod interactive_rebase;
 pub mod mini_graph;
+mod panel_buttons;
 pub mod pre_commit;
 pub mod providers;
 pub mod push_dialog;
@@ -160,20 +160,26 @@ pub fn init(cx: &mut App) {
         );
         // S-SAR — open a snapshot of the active repository at `sha`
         // in a new top-level workspace window.
-        workspace.register_action(|workspace, action: &crate::fork_actions::ShowAtRevision, window, cx| {
-            handlers::show_at_revision::show_at_revision_action(
-                workspace,
-                action.sha.clone(),
-                window,
-                cx,
-            );
-        });
-        workspace.register_action(|workspace, _: &crate::fork_actions::ApplyPatchFromFile, window, cx| {
-            handlers::patch::apply_patch_from_file_action(workspace, window, cx);
-        });
-        workspace.register_action(|workspace, _: &crate::fork_actions::ApplyPatchFromClipboard, window, cx| {
-            handlers::patch::apply_patch_from_clipboard_action(workspace, window, cx);
-        });
+        workspace.register_action(
+            |workspace, action: &crate::fork_actions::ShowAtRevision, window, cx| {
+                handlers::show_at_revision::show_at_revision_action(
+                    workspace,
+                    action.sha.clone(),
+                    window,
+                    cx,
+                );
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &crate::fork_actions::ApplyPatchFromFile, window, cx| {
+                handlers::patch::apply_patch_from_file_action(workspace, window, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &crate::fork_actions::ApplyPatchFromClipboard, window, cx| {
+                handlers::patch::apply_patch_from_clipboard_action(workspace, window, cx);
+            },
+        );
         workspace.register_action(
             |workspace, action: &zed_actions::CreateWorktree, window, cx| {
                 worktree_service::handle_create_worktree(workspace, action, window, None, cx);

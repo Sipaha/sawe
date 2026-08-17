@@ -794,7 +794,6 @@ impl BranchesPopup {
         }
     }
 
-
     /// Render the IDEA-style action header rows that appear between the search
     /// field and the first section node. Rows: Update Project /
     /// Update All Projects (solution-wide, ≥2 members only) / Commit / Push /
@@ -1014,7 +1013,11 @@ impl BranchesPopup {
                     .toggle_state(selected)
                     .start_slot(Icon::new(IconName::CountdownTimer).size(IconSize::Small))
                     // Indent one level so backups nest under their section header.
-                    .child(h_flex().pl(rems(1.0)).child(Label::new(label).color(Color::Muted)))
+                    .child(
+                        h_flex()
+                            .pl(rems(1.0))
+                            .child(Label::new(label).color(Color::Muted)),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.restore_backup(branch_clone.clone(), sha_clone.clone(), window, cx);
                     }))
@@ -1706,9 +1709,8 @@ mod tests {
             committer_date_relative: None,
         };
         let has_leaf = |rows: &[PopupRow], want: &str| {
-            rows.iter().any(
-                |r| matches!(r, PopupRow::Branch { entry, .. } if entry.name.as_ref() == want),
-            )
+            rows.iter()
+                .any(|r| matches!(r, PopupRow::Branch { entry, .. } if entry.name.as_ref() == want))
         };
 
         // Empty query, "remote" section expanded, `origin` group collapsed by

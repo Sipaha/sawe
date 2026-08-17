@@ -217,11 +217,7 @@ fn flatten<'a>(
         let mut tail = name.clone();
         let mut cur = child;
         while cur.files.is_empty() && cur.dirs.len() == 1 {
-            let (child_name, child_node) = cur
-                .dirs
-                .iter()
-                .next()
-                .expect("len checked to be 1");
+            let (child_name, child_node) = cur.dirs.iter().next().expect("len checked to be 1");
             display_name = format!("{display_name}/{child_name}");
             tail = format!("{tail}/{child_name}");
             cur = child_node;
