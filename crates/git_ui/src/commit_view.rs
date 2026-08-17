@@ -598,7 +598,7 @@ impl CommitView {
 
             anyhow::Ok(())
         })
-        .detach();
+        .detach_and_log_err(cx);
 
         let snapshot = repository.read(cx).snapshot();
         let remote_url = snapshot
@@ -734,7 +734,6 @@ impl CommitView {
         };
         self.open_file_at_head(&file, window, cx);
     }
-
 
     /// True if there's a Solution available to host the ephemeral AI
     /// session. Without one, [`ai_explain::explain_commit`] would
@@ -1553,15 +1552,17 @@ impl Render for CommitView {
 
         // Single-file diff mode — just the diff editor, no commit metadata.
         if self.single_file.is_some() {
-            return base.when(!self.editor.read(cx).rhs_editor().read(cx).is_empty(cx), |this| {
-                this.child(div().flex_grow(1.).child(self.editor.clone()))
-            });
+            return base.when(
+                !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
+                |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
+            );
         }
 
         base.child(self.render_metadata_panel(window, cx))
-            .when(!self.editor.read(cx).rhs_editor().read(cx).is_empty(cx), |this| {
-                this.child(div().flex_grow(1.).child(self.editor.clone()))
-            })
+            .when(
+                !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
+                |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
+            )
             .child(self.render_inline_footer(cx))
     }
 }

@@ -140,10 +140,11 @@ use gpui::{
     Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
     DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions,
-    anchored, deferred, point, prelude::*, px, uniform_list,
+    SharedString, Subscription, Task, TextStyleRefinement, UnderlineStyle, UniformListScrollHandle,
+    WeakEntity, Window, actions, anchored, deferred, point, prelude::*, px, uniform_list,
 };
 use language::line_diff;
+use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use project::{
     ProjectPath,
@@ -295,6 +296,7 @@ impl ChangedFileEntry {
         commit_sha: SharedString,
         repository: WeakEntity<Repository>,
         workspace: WeakEntity<Workspace>,
+        graph: WeakEntity<GitGraph>,
         _cx: &App,
     ) -> AnyElement {
         let file_name = self.file_name.clone();
@@ -302,6 +304,22 @@ impl ChangedFileEntry {
 
         div()
             .w_full()
+            .on_mouse_down(MouseButton::Right, {
+                let repo_path = self.repo_path.clone();
+                move |event: &MouseDownEvent, window, cx| {
+                    graph
+                        .update(cx, |graph, cx| {
+                            graph.deploy_changed_file_context_menu(
+                                repo_path.clone(),
+                                event.position,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    cx.stop_propagation();
+                }
+            })
             .child(
                 ButtonLike::new(("changed-file", ix))
                     .child(
@@ -342,6 +360,40 @@ impl ChangedFileEntry {
             )
             .into_any_element()
     }
+}
+
+/// The diff backing the commit-details sidebar, tagged with the commit it was
+/// loaded for.
+///
+/// Row indices into `graph_data` shift whenever the log is refetched — a
+/// commit landing externally pushes every existing row down by one — so the
+/// sha, not the row index, is what keeps the sidebar's header and its file
+/// list describing the same commit. When they disagreed, clicking a file
+/// asked `CommitView` for a path the displayed commit never touched, which
+/// silently opened an empty tab.
+struct SelectedCommitDiff {
+    sha: Oid,
+    /// `None` until the background `load_commit_diff` resolves.
+    loaded: Option<LoadedCommitDiff>,
+}
+
+struct LoadedCommitDiff {
+    diff: CommitDiff,
+    lines_added: usize,
+    lines_removed: usize,
+}
+
+/// Selectable text of the commit-details sidebar. `ui::Label` has no selection
+/// support, so the subject / author / date are rendered as `MarkdownElement`s.
+/// The entities are cached across frames because a `Markdown` owns the user's
+/// in-progress selection — rebuilding it every frame would wipe a selection
+/// mid-drag.
+#[derive(Clone)]
+struct CommitDetailText {
+    sha: Oid,
+    subject: Entity<Markdown>,
+    author: Entity<Markdown>,
+    date: Entity<Markdown>,
 }
 
 struct SearchState {
@@ -1132,6 +1184,39 @@ fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &
     window.paint_quad(gpui::fill(bounds, color).corner_radii(gpui::Corners::all(radius)));
 }
 
+/// Style for the selectable single-line text fields of the commit-details
+/// sidebar, matching what the equivalent [`Label`] rendered before.
+fn detail_text_style(
+    text_size: TextSize,
+    color: Color,
+    weight: Option<gpui::FontWeight>,
+    window: &Window,
+    cx: &App,
+) -> MarkdownStyle {
+    let mut base_text_style = window.text_style();
+    base_text_style.refine(&TextStyleRefinement {
+        font_size: Some(text_size.rems(cx).into()),
+        color: Some(color.color(cx)),
+        font_weight: weight,
+        ..Default::default()
+    });
+
+    MarkdownStyle {
+        base_text_style,
+        selection_background_color: cx.theme().colors().element_selection_background,
+        link: TextStyleRefinement {
+            color: Some(cx.theme().colors().link_text_hover),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(cx.theme().colors().link_text_hover),
+                wavy: false,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
     diff.files.iter().fold((0, 0), |(added, removed), file| {
         let old_text = file.old_text.as_deref().unwrap_or("");
@@ -1180,8 +1265,8 @@ pub struct GitGraph {
     /// Used by the My-commits highlight to compare against per-commit
     /// `author_email`. `None` until the background fetch resolves.
     local_user_email: Option<SharedString>,
-    selected_commit_diff: Option<CommitDiff>,
-    selected_commit_diff_stats: Option<(usize, usize)>,
+    selected_commit_diff: Option<SelectedCommitDiff>,
+    commit_detail_text: Option<CommitDetailText>,
     _commit_diff_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
@@ -1190,10 +1275,34 @@ pub struct GitGraph {
 }
 
 impl GitGraph {
+    /// Drop the loaded log (and everything derived from it) so the caller can
+    /// refetch it.
+    ///
+    /// The selection is re-anchored by sha rather than kept as a row index:
+    /// the refetched log may insert, drop or reorder commits, so the row that
+    /// was selected can end up pointing at a different commit. Keeping the
+    /// index paired the newly-arrived commit's header with the previous
+    /// commit's file list, and clicking one of those files opened an empty
+    /// tab. An explicit pending request (`select_commit_by_sha` for a commit
+    /// that isn't loaded yet) wins over the re-anchor.
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
+        if self.pending_select_sha.is_none() {
+            self.pending_select_sha = self.selected_commit_sha();
+        }
+        self.selected_entry_idx = None;
+        self.selected_commit_diff = None;
+        self.commit_detail_text = None;
+        self._commit_diff_task = None;
         self.graph_data.clear();
         cx.emit(ItemEvent::Edit);
         cx.notify();
+    }
+
+    /// Sha of the commit the details sidebar is currently describing, if any.
+    /// `None` for the synthetic local-changes row, which has no commit data.
+    fn selected_commit_sha(&self) -> Option<Oid> {
+        let data_idx = self.view_to_data_idx(self.selected_entry_idx?)?;
+        Some(self.graph_data.commits.get(data_idx)?.data.sha)
     }
 
     pub fn set_date_filter(&mut self, range: Option<filters::DateRange>, cx: &mut Context<Self>) {
@@ -1605,7 +1714,7 @@ impl GitGraph {
             hovered_entry_idx: None,
             graph_canvas_bounds: Rc::new(Cell::new(None)),
             selected_commit_diff: None,
-            selected_commit_diff_stats: None,
+            commit_detail_text: None,
             log_source,
             log_order,
             filters: filters::LogFilters::default(),
@@ -1756,14 +1865,12 @@ impl GitGraph {
                 // meaning we are not inside the initial repo loading state
                 // NOTE: this fixes an loading performance regression
                 if repository.read(cx).scan_id > 1 {
-                    self.pending_select_sha = None;
                     self.invalidate_state(cx);
                 }
             }
             RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
                 // Stash entries initial's scan id is 2, so we don't want to invalidate the graph before that
                 if repository.read(cx).scan_id > 2 {
-                    self.pending_select_sha = None;
                     self.invalidate_state(cx);
                 }
             }
@@ -2132,11 +2239,16 @@ impl GitGraph {
     }
 
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_entry_idx = None;
-        self.selected_commit_diff = None;
-        self.selected_commit_diff_stats = None;
+        self.clear_selection();
         cx.emit(ItemEvent::Edit);
         cx.notify();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected_entry_idx = None;
+        self.selected_commit_diff = None;
+        self.commit_detail_text = None;
+        self._commit_diff_task = None;
     }
 
     fn select_first(&mut self, _: &SelectFirst, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2211,13 +2323,24 @@ impl GitGraph {
         scroll_strategy: ScrollStrategy,
         cx: &mut Context<Self>,
     ) {
-        if self.selected_entry_idx == Some(idx) {
+        let target_sha = self
+            .view_to_data_idx(idx)
+            .and_then(|data_idx| self.graph_data.commits.get(data_idx))
+            .map(|commit| commit.data.sha);
+
+        // Re-selecting the same row is a no-op only while the diff we hold (or
+        // are loading) still belongs to the commit living at that row — after a
+        // refetch the same row can point at a different commit, and then the
+        // sidebar needs a reload rather than an early return.
+        if self.selected_entry_idx == Some(idx)
+            && self.selected_commit_diff.as_ref().map(|state| state.sha) == target_sha
+        {
             return;
         }
 
         self.selected_entry_idx = Some(idx);
         self.selected_commit_diff = None;
-        self.selected_commit_diff_stats = None;
+        self._commit_diff_task = None;
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
         self.table_interaction_state.update(cx, |state, cx| {
@@ -2233,31 +2356,35 @@ impl GitGraph {
             cx.notify();
             return;
         }
-        let data_idx = if self.has_local_changes_row() {
-            idx.saturating_sub(1)
-        } else {
-            idx
-        };
-
-        let Some(commit) = self.graph_data.commits.get(data_idx) else {
+        let Some(sha) = target_sha else {
             return;
         };
-
-        let sha = commit.data.sha.to_string();
 
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
 
-        let diff_receiver = repository.update(cx, |repo, _| repo.load_commit_diff(sha));
+        self.selected_commit_diff = Some(SelectedCommitDiff { sha, loaded: None });
+        let diff_receiver = repository.update(cx, |repo, _| repo.load_commit_diff(sha.to_string()));
 
         self._commit_diff_task = Some(cx.spawn(async move |this, cx| {
             if let Ok(Ok(diff)) = diff_receiver.await {
                 this.update(cx, |this, cx| {
-                    let stats = compute_diff_stats(&diff);
-                    this.selected_commit_diff = Some(diff);
-                    this.selected_commit_diff_stats = Some(stats);
-                    cx.notify();
+                    let (lines_added, lines_removed) = compute_diff_stats(&diff);
+                    // Drop a load that resolved after the selection moved on,
+                    // rather than pairing it with whatever is shown now.
+                    if let Some(state) = this
+                        .selected_commit_diff
+                        .as_mut()
+                        .filter(|state| state.sha == sha)
+                    {
+                        state.loaded = Some(LoadedCommitDiff {
+                            diff,
+                            lines_added,
+                            lines_removed,
+                        });
+                        cx.notify();
+                    }
                 })
                 .ok();
             }
@@ -2339,6 +2466,10 @@ impl GitGraph {
                 .contains_key(&repo_id)
         {
             self.repo_id = repo_id;
+            // A selection belongs to the repository it was made in — don't let
+            // `invalidate_state` re-anchor it onto the incoming one.
+            self.clear_selection();
+            self.pending_select_sha = None;
             self.invalidate_state(cx);
         }
     }
@@ -2510,6 +2641,18 @@ impl GitGraph {
             local_branches,
         };
         let menu = context_menu::build_commit_context_menu(ctx, window, cx);
+        self.show_context_menu(menu, position, window, cx);
+    }
+
+    /// Anchor `menu` at `position` and keep it alive until it dismisses,
+    /// returning focus to the graph when the menu had it.
+    fn show_context_menu(
+        &mut self,
+        menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription = cx.subscribe_in(
             &menu,
             window,
@@ -2527,6 +2670,102 @@ impl GitGraph {
         );
         self.context_menu = Some((menu, position, subscription));
         cx.notify();
+    }
+
+    /// Right-click menu for the commit-details sidebar: "Copy" acts on the
+    /// text selection the user dragged in one of the sidebar's
+    /// `MarkdownElement`s, the rest are commit-scoped copies.
+    fn deploy_commit_detail_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data_index) = self
+            .selected_entry_idx
+            .and_then(|idx| self.view_to_data_idx(idx))
+        else {
+            return;
+        };
+        let Some(commit_entry) = self.graph_data.commits.get(data_index).cloned() else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        let sha: SharedString = commit_entry.data.sha.to_string().into();
+        let subject = match repository.update(cx, |repo, cx| {
+            repo.fetch_commit_data(commit_entry.data.sha, false, cx)
+                .clone()
+        }) {
+            CommitDataState::Loaded(data) => data.subject.clone(),
+            CommitDataState::Loading(_) => SharedString::default(),
+        };
+        let permalink = repository
+            .update(cx, |repo, cx| self.get_remote(repo, window, cx))
+            .map(|remote| {
+                let parsed_remote = ParsedGitRemote {
+                    owner: remote.owner.as_ref().into(),
+                    repo: remote.repo.as_ref().into(),
+                };
+                remote
+                    .host
+                    .build_commit_permalink(
+                        &parsed_remote,
+                        BuildCommitPermalinkParams { sha: sha.as_ref() },
+                    )
+                    .to_string()
+            });
+
+        // Pin the focused element (the `Markdown` the user dragged a selection
+        // in) as the menu's action context. Without it the menu-scoped
+        // dispatch silently swallows `markdown::Copy`.
+        let focus = window.focused(cx);
+        let menu = ContextMenu::build(window, cx, move |menu, _window, _cx| {
+            let menu = menu
+                .when_some(focus, |menu, focus| menu.context(focus))
+                .action("Copy", Box::new(markdown::Copy))
+                .separator()
+                .entry("Copy SHA", None, {
+                    let sha = sha.clone();
+                    move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(sha.to_string()));
+                    }
+                });
+            let menu = if subject.is_empty() {
+                menu
+            } else {
+                menu.entry("Copy Message", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(subject.to_string()));
+                })
+            };
+            menu.when_some(permalink, |menu, url| {
+                menu.entry("Copy Web URL", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                })
+            })
+        });
+        self.show_context_menu(menu, position, window, cx);
+    }
+
+    /// Right-click menu for a row of the sidebar's changed-files list. The
+    /// rows are buttons (left-click opens the diff), so there is no text
+    /// selection to copy — the path is offered explicitly instead.
+    fn deploy_changed_file_context_menu(
+        &mut self,
+        path: RepoPath,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.as_unix_str().to_string();
+        let menu = ContextMenu::build(window, cx, move |menu, _window, _cx| {
+            menu.entry("Copy Path", None, move |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+            })
+        });
+        self.show_context_menu(menu, position, window, cx);
     }
 
     /// The "Search commits…" input box (text editor + case-sensitive / regex /
@@ -2596,18 +2835,82 @@ impl GitGraph {
             .into_any_element()
     }
 
+    /// Cached selectable text for the details sidebar, rebuilt when the
+    /// selected commit changes. The commit's data resolves asynchronously, so
+    /// the same commit is rendered as "Loading…" first and gets its real
+    /// subject / author later; `Markdown::reset` is a no-op when the source is
+    /// unchanged, which keeps an in-progress selection alive across frames.
+    fn commit_detail_text(
+        &mut self,
+        sha: Oid,
+        subject: SharedString,
+        author: SharedString,
+        date: SharedString,
+        cx: &mut App,
+    ) -> CommitDetailText {
+        if let Some(text) = self
+            .commit_detail_text
+            .as_ref()
+            .filter(|text| text.sha == sha)
+        {
+            text.subject
+                .update(cx, |markdown, cx| markdown.reset(subject, cx));
+            text.author
+                .update(cx, |markdown, cx| markdown.reset(author, cx));
+            text.date
+                .update(cx, |markdown, cx| markdown.reset(date, cx));
+            return text.clone();
+        }
+
+        let text = CommitDetailText {
+            sha,
+            subject: cx.new(|cx| Markdown::new_text(subject, cx)),
+            author: cx.new(|cx| Markdown::new_text(author, cx)),
+            date: cx.new(|cx| Markdown::new_text(date, cx)),
+        };
+        self.commit_detail_text = Some(text.clone());
+        text
+    }
+
+    /// The commit whose details the sidebar renders, paired with the diff that
+    /// belongs to *that* commit. The diff is `None` while it is still loading,
+    /// and also when the one we hold was loaded for a different commit — see
+    /// [`SelectedCommitDiff`].
+    fn commit_detail_for_render(&self) -> Option<(Rc<CommitEntry>, Option<&LoadedCommitDiff>)> {
+        let data_idx = self.view_to_data_idx(self.selected_entry_idx?)?;
+        let entry = self.graph_data.commits.get(data_idx)?.clone();
+        let loaded = self
+            .selected_commit_diff
+            .as_ref()
+            .filter(|state| state.sha == entry.data.sha)
+            .and_then(|state| state.loaded.as_ref());
+        Some((entry, loaded))
+    }
+
     fn render_commit_detail_panel(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let Some(selected_idx) = self.selected_entry_idx else {
+        let Some((commit_entry, loaded_diff)) = self.commit_detail_for_render() else {
             return Empty.into_any_element();
         };
 
-        let Some(commit_entry) = self.graph_data.commits.get(selected_idx) else {
-            return Empty.into_any_element();
-        };
+        let changed_files_count = loaded_diff.map_or(0, |loaded| loaded.diff.files.len());
+        let (total_lines_added, total_lines_removed) =
+            loaded_diff.map_or((0, 0), |loaded| (loaded.lines_added, loaded.lines_removed));
+        let sorted_file_entries: Rc<Vec<ChangedFileEntry>> = Rc::new(
+            loaded_diff
+                .map(|loaded| {
+                    let mut files: Vec<_> = loaded.diff.files.iter().collect();
+                    files.sort_by_key(|file| file.status());
+                    files
+                        .into_iter()
+                        .map(|file| ChangedFileEntry::from_commit_file(file, cx))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
 
         let Some(repository) = self.get_repository(cx) else {
             return Empty.into_any_element();
@@ -2666,28 +2969,22 @@ impl GitGraph {
                 .render(window, cx)
         };
 
-        let changed_files_count = self
-            .selected_commit_diff
-            .as_ref()
-            .map(|diff| diff.files.len())
-            .unwrap_or(0);
-
-        let (total_lines_added, total_lines_removed) =
-            self.selected_commit_diff_stats.unwrap_or((0, 0));
-
-        let sorted_file_entries: Rc<Vec<ChangedFileEntry>> = Rc::new(
-            self.selected_commit_diff
-                .as_ref()
-                .map(|diff| {
-                    let mut files: Vec<_> = diff.files.iter().collect();
-                    files.sort_by_key(|file| file.status());
-                    files
-                        .into_iter()
-                        .map(|file| ChangedFileEntry::from_commit_file(file, cx))
-                        .collect()
-                })
-                .unwrap_or_default(),
+        let detail_text = self.commit_detail_text(
+            commit_entry.data.sha,
+            commit_message,
+            author_name,
+            date_string.into(),
+            cx,
         );
+        let subject_style = detail_text_style(
+            TextSize::Default,
+            Color::Default,
+            Some(gpui::FontWeight::SEMIBOLD),
+            window,
+            cx,
+        );
+        let author_style = detail_text_style(TextSize::Small, Color::Default, None, window, cx);
+        let date_style = detail_text_style(TextSize::Small, Color::Muted, None, window, cx);
 
         v_flex()
             .min_w(px(300.))
@@ -2696,6 +2993,13 @@ impl GitGraph {
             .flex_basis(DefiniteLength::Fraction(
                 self.commit_details_split_state.read(cx).right_ratio(),
             ))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_commit_detail_context_menu(event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(
                 v_flex()
                     .relative()
@@ -2708,10 +3012,7 @@ impl GitGraph {
                             IconButton::new("close-detail", IconName::Close)
                                 .icon_size(IconSize::Small)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected_entry_idx = None;
-                                    this.selected_commit_diff = None;
-                                    this.selected_commit_diff_stats = None;
-                                    this._commit_diff_task = None;
+                                    this.clear_selection();
                                     cx.notify();
                                 })),
                         ),
@@ -2721,7 +3022,8 @@ impl GitGraph {
                     .child(
                         div()
                             .pr_5()
-                            .child(Label::new(commit_message).weight(gpui::FontWeight::SEMIBOLD)),
+                            .min_w_0()
+                            .child(MarkdownElement::new(detail_text.subject, subject_style)),
                     )
                     // Author identity line: avatar · short SHA (click to copy) · name.
                     .child(
@@ -2782,7 +3084,11 @@ impl GitGraph {
                                         .detach();
                                     })
                             })
-                            .child(Label::new(author_name).size(LabelSize::Small).truncate()),
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .child(MarkdownElement::new(detail_text.author, author_style)),
+                            ),
                     )
                     // Email · date line.
                     .child(
@@ -2844,9 +3150,9 @@ impl GitGraph {
                                 )
                             })
                             .child(
-                                Label::new(date_string)
-                                    .color(Color::Muted)
-                                    .size(LabelSize::Small),
+                                div()
+                                    .min_w_0()
+                                    .child(MarkdownElement::new(detail_text.date, date_style)),
                             ),
                     )
                     // Ref decorations.
@@ -2938,6 +3244,7 @@ impl GitGraph {
                                 let commit_sha = full_sha.clone();
                                 let repository = repository.downgrade();
                                 let workspace = self.workspace.clone();
+                                let graph = cx.weak_entity();
                                 uniform_list(
                                     "changed-files-list",
                                     entry_count,
@@ -2949,6 +3256,7 @@ impl GitGraph {
                                                     commit_sha.clone(),
                                                     repository.clone(),
                                                     workspace.clone(),
+                                                    graph.clone(),
                                                     cx,
                                                 )
                                             })
@@ -6948,5 +7256,238 @@ mod tests {
         assert!(restored.follow_renames);
         assert!(!restored.with_local_changes);
         assert!(!restored.show_inline_diff);
+    }
+
+    /// Boilerplate shared by the commit-details sidebar tests: a project on a
+    /// fake fs whose repository serves `commits`, plus a drawn `GitGraph`.
+    async fn setup_graph_with_commits<'a>(
+        fs: &Arc<FakeFs>,
+        commits: Vec<Arc<InitialGraphCommitData>>,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<Project>,
+        Entity<GitGraph>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        (project, git_graph, cx)
+    }
+
+    fn draw_graph(git_graph: &Entity<GitGraph>, cx: &mut gpui::VisualTestContext) {
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+    }
+
+    /// A commit landing from outside the editor (a background agent, a
+    /// terminal `git commit`) invalidates the loaded log and shifts every row
+    /// index down by one. The details sidebar must keep describing the commit
+    /// the user selected, header *and* file list together: when they drifted
+    /// apart, clicking a file asked `CommitView` for a path the displayed
+    /// commit never touched, which silently opened an empty tab.
+    #[gpui::test]
+    async fn test_commit_details_survive_external_commit(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        let head = Oid::from_bytes(&[1; 20]).expect("valid oid");
+        let parent = Oid::from_bytes(&[2; 20]).expect("valid oid");
+        let external = Oid::from_bytes(&[3; 20]).expect("valid oid");
+
+        let head_entry = Arc::new(InitialGraphCommitData {
+            sha: head,
+            parents: smallvec![parent],
+            ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+        });
+        let parent_entry = Arc::new(InitialGraphCommitData {
+            sha: parent,
+            parents: smallvec![],
+            ref_names: vec![],
+        });
+
+        let (project, git_graph, cx) =
+            setup_graph_with_commits(&fs, vec![head_entry.clone(), parent_entry.clone()], cx).await;
+
+        git_graph.update(cx, |graph, cx| {
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.read_with(&*cx, |graph, _| {
+            let (entry, diff) = graph
+                .commit_detail_for_render()
+                .expect("row 0 should be selected");
+            assert_eq!(entry.data.sha, head);
+            assert!(
+                diff.is_some(),
+                "the selected commit's diff should be loaded"
+            );
+        });
+
+        // An external commit lands on top of `head`, pushing it from row 0 to
+        // row 1 once the log is refetched.
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: external,
+                    parents: smallvec![head],
+                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: head,
+                    parents: smallvec![parent],
+                    ref_names: vec![],
+                }),
+                parent_entry,
+            ],
+        );
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.refs.insert("HEAD".into(), external.to_string());
+        })
+        .expect("fake git state should be writable");
+
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        draw_graph(&git_graph, cx);
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.graph_data.commits.first().map(|entry| entry.data.sha),
+                Some(external),
+                "the refetched log should start with the externally-created commit"
+            );
+
+            let (entry, diff) = graph
+                .commit_detail_for_render()
+                .expect("the selection should survive the refetch");
+            assert_eq!(
+                entry.data.sha, head,
+                "the sidebar should still describe the commit the user selected, \
+                 not whatever commit inherited its row index"
+            );
+            assert_eq!(
+                graph.selected_commit_diff.as_ref().map(|state| state.sha),
+                Some(head),
+                "the file list must be the one loaded for the displayed commit"
+            );
+            assert!(
+                diff.is_some(),
+                "the diff of the re-anchored commit should have been reloaded"
+            );
+        });
+    }
+
+    /// The sidebar's selectable text is backed by cached `Markdown` entities:
+    /// reused while the same commit is displayed (so an in-progress selection
+    /// survives the "Loading…" → loaded swap), rebuilt when the selection
+    /// moves to another commit.
+    #[gpui::test]
+    async fn test_commit_detail_text_entities_are_cached_per_commit(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let first_sha = Oid::from_bytes(&[7; 20]).expect("valid oid");
+        let second_sha = Oid::from_bytes(&[8; 20]).expect("valid oid");
+
+        let (_project, git_graph, cx) = setup_graph_with_commits(
+            &fs,
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: first_sha,
+                    parents: smallvec![second_sha],
+                    ref_names: vec!["HEAD".into()],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: second_sha,
+                    parents: smallvec![],
+                    ref_names: vec![],
+                }),
+            ],
+            cx,
+        )
+        .await;
+
+        let (loading, loaded, other) = git_graph.update(cx, |graph, cx| {
+            let loading = graph.commit_detail_text(
+                first_sha,
+                "Loading…".into(),
+                "Loading…".into(),
+                "".into(),
+                cx,
+            );
+            let loaded = graph.commit_detail_text(
+                first_sha,
+                "Fix the thing".into(),
+                "Ada".into(),
+                "today".into(),
+                cx,
+            );
+            let other = graph.commit_detail_text(
+                second_sha,
+                "Older commit".into(),
+                "Grace".into(),
+                "yesterday".into(),
+                cx,
+            );
+            (loading, loaded, other)
+        });
+
+        assert_eq!(
+            loading.subject.entity_id(),
+            loaded.subject.entity_id(),
+            "the same commit should keep its markdown entities when its data resolves"
+        );
+        loaded.subject.read_with(&*cx, |markdown, _| {
+            assert_eq!(markdown.source(), "Fix the thing");
+        });
+        assert_ne!(
+            loaded.subject.entity_id(),
+            other.subject.entity_id(),
+            "selecting another commit should rebuild the markdown entities"
+        );
+        assert_ne!(loaded.author.entity_id(), other.author.entity_id());
+        assert_ne!(loaded.date.entity_id(), other.date.entity_id());
     }
 }
