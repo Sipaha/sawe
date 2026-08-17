@@ -19,7 +19,7 @@ use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, MultiBuffer, SplittableEditor,
-    hover_markdown_style, multibuffer_context_lines,
+    multibuffer_context_lines,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, CommitDiff, RepoPath, is_binary_content};
@@ -29,16 +29,15 @@ use git::{
     parse_git_remote_url,
 };
 use gpui::{
-    AnyElement, App, AppContext as _, AsyncApp, AsyncWindowContext, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Task, WeakEntity,
-    Window, actions,
+    AnyElement, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, PromptLevel, Render,
+    ScrollHandle, Styled, Task, WeakEntity, Window, actions,
 };
 use language::{
     Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
     ReplicaId, Rope, TextBuffer,
 };
-use markdown::{Markdown, MarkdownElement};
+use markdown::Markdown;
 use multi_buffer::PathKey;
 use project::{Project, ProjectPath, WorktreeId, git_store::Repository};
 use settings::{DiffViewStyle, Settings};
@@ -49,7 +48,7 @@ use std::{
     sync::Arc,
 };
 use theme::ActiveTheme;
-use ui::{ContextMenu, DiffStat, Disclosure, Divider, Tooltip, WithScrollbar, prelude::*};
+use ui::{ContextMenu, DiffStat, Divider, Tooltip, prelude::*};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath, truncate_and_trailoff};
 use workspace::item::TabTooltipContent;
 use workspace::{
@@ -65,7 +64,6 @@ use crate::commit_view::affected_files::CommitAffectedFiles;
 use crate::commit_view::contains_panel::CommitContainsPanel;
 use crate::git_panel::GitPanel;
 use crate::git_panel_settings::GitPanelSettings;
-use settings::Settings as _;
 
 actions!(
     git,

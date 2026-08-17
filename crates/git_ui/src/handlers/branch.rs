@@ -126,13 +126,28 @@ pub fn force_delete_decision(
     work_dir: Option<&Path>,
     branch_name: &str,
 ) -> ForceDeleteDecision {
+    let forbidden_reason = work_dir.and_then(|work_dir| {
+        match protection::enforce(work_dir, branch_name, "delete_branch_force", false) {
+            Err(protection::BranchProtectionError::Forbidden { reason }) => Some(reason),
+            _ => None,
+        }
+    });
+    classify_force_delete(error, forbidden_reason, branch_name)
+}
+
+/// The classification itself, with branch protection already resolved. Split out
+/// because `protection::enforce` reads a process-global whose setters belong to
+/// `solutions`, so the `Forbidden` arm — the one that withholds a destructive
+/// affordance — is not reachable from a `git_ui` unit test otherwise.
+fn classify_force_delete(
+    error: &anyhow::Error,
+    forbidden_reason: Option<String>,
+    branch_name: &str,
+) -> ForceDeleteDecision {
     let Some(warning) = force_delete_prompt_for_branch_delete_error(error, branch_name) else {
         return ForceDeleteDecision::NotApplicable;
     };
-    if let Some(work_dir) = work_dir
-        && let Err(protection::BranchProtectionError::Forbidden { reason }) =
-            protection::enforce(work_dir, branch_name, "delete_branch_force", false)
-    {
+    if let Some(reason) = forbidden_reason {
         return ForceDeleteDecision::Forbidden {
             message: format!("Branch \"{branch_name}\" cannot be force deleted: {reason}"),
         };
@@ -194,6 +209,35 @@ mod tests {
             ForceDeleteDecision::Offer {
                 warning: "Branch \"feature\" is not fully merged. Force delete it?".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn a_protected_branch_is_not_offered_the_escape_hatch() {
+        assert_eq!(
+            classify_force_delete(
+                &unmerged_error("release/2.28"),
+                Some("release branches are protected".to_string()),
+                "release/2.28",
+            ),
+            ForceDeleteDecision::Forbidden {
+                message: "Branch \"release/2.28\" cannot be force deleted: release branches are \
+                          protected"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn protection_does_not_turn_an_unrelated_failure_into_a_force_offer() {
+        assert_eq!(
+            classify_force_delete(
+                &anyhow!("error: branch 'feature' not found."),
+                Some("protected".to_string()),
+                "feature",
+            ),
+            ForceDeleteDecision::NotApplicable,
+            "protection must not manufacture a force-delete decision out of an unrelated error"
         );
     }
 }

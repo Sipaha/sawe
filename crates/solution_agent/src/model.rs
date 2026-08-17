@@ -364,10 +364,11 @@ pub struct SolutionSession {
     /// is named `c<context_count>` so a single `.agents/<sid>/`
     /// directory groups every rotation of one logical conversation.
     pub context_count: SessionContextCount,
-    /// Project the session was created against. Cached so `restart_agent`
-    /// can re-issue `create_session` without the caller having to reach
-    /// back into a workspace window. `None` for prebuilt-session test
-    /// scaffolding that never went through `create_session`.
+    /// Project the session was created against. Cached so a respawn
+    /// (`restart_agent` / the stuck-session watchdog) can resume the session
+    /// without the caller having to reach back into a workspace window. `None`
+    /// for prebuilt-session test scaffolding that never went through
+    /// `create_session`.
     pub project: Option<Entity<project::Project>>,
     /// Subscription to the `AcpThread`'s `AcpThreadEvent` stream. Held so
     /// the callback registered by `SolutionAgentStore::subscribe_to_session`

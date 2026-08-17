@@ -26,6 +26,36 @@ use crate::{
     hover_popover::hover_at, mouse_context_menu, scroll::ScrollPixelOffset,
 };
 
+/// The secondary-modifier-plus-wheel buffer-font zoom gesture, shared by the
+/// editor's own wheel listener and by anything sitting between two editors that
+/// must not turn the same gesture into something else — the split diff's
+/// connector strip. Returns whether it consumed the event.
+pub(crate) fn handle_wheel_zoom_shortcut(
+    event: &ScrollWheelEvent,
+    editor: &gpui::Entity<Editor>,
+    cx: &mut App,
+) -> bool {
+    if !(event.modifiers.secondary()
+        && editor.read(cx).enable_mouse_wheel_zoom
+        && EditorSettings::get_global(cx).mouse_wheel_zoom)
+    {
+        return false;
+    }
+
+    let delta_y = match event.delta {
+        ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+        ScrollDelta::Lines(lines) => lines.y,
+    };
+    if delta_y > 0.0 {
+        theme_settings::increase_buffer_font_size(cx);
+    } else if delta_y < 0.0 {
+        theme_settings::decrease_buffer_font_size(cx);
+    }
+
+    cx.stop_propagation();
+    true
+}
+
 impl EditorElement {
     pub(crate) fn mouse_moved(
         editor: &mut Editor,
@@ -512,23 +542,7 @@ impl EditorElement {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     delta = delta.coalesce(event.delta);
 
-                    if event.modifiers.secondary()
-                        && editor.read(cx).enable_mouse_wheel_zoom
-                        && EditorSettings::get_global(cx).mouse_wheel_zoom
-                    {
-                        let delta_y = match event.delta {
-                            ScrollDelta::Pixels(pixels) => pixels.y.into(),
-                            ScrollDelta::Lines(lines) => lines.y,
-                        };
-
-                        if delta_y > 0.0 {
-                            theme_settings::increase_buffer_font_size(cx);
-                        } else if delta_y < 0.0 {
-                            theme_settings::decrease_buffer_font_size(cx);
-                        }
-
-                        cx.stop_propagation();
-                    } else {
+                    if !handle_wheel_zoom_shortcut(event, &editor, cx) {
                         let scroll_sensitivity = {
                             if event.modifiers.alt {
                                 fast_scroll_sensitivity

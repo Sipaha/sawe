@@ -2,7 +2,7 @@ use crate::{
     branch_picker, conflict_view,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
-    soft_wrap_icon, soft_wrap_tooltip,
+    soft_wrap_button,
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -1828,14 +1828,8 @@ impl Render for ProjectDiffToolbar {
                             })),
                     )
                     .child(
-                        IconButton::new("soft-wrap", soft_wrap_icon(is_soft_wrap_enabled))
+                        soft_wrap_button("soft-wrap", is_soft_wrap_enabled, &focus_handle)
                             .shape(ui::IconButtonShape::Square)
-                            .toggle_state(is_soft_wrap_enabled)
-                            .tooltip(Tooltip::for_action_title_in(
-                                soft_wrap_tooltip(is_soft_wrap_enabled),
-                                &ToggleSoftWrap,
-                                &focus_handle,
-                            ))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dispatch_action(&ToggleSoftWrap, window, cx)
                             })),
@@ -2060,20 +2054,11 @@ impl Render for BranchDiffToolbar {
                 ))
             })
             .child(
-                IconButton::new(
-                    "branch-diff-soft-wrap",
-                    soft_wrap_icon(is_soft_wrap_enabled),
-                )
-                .shape(ui::IconButtonShape::Square)
-                .toggle_state(is_soft_wrap_enabled)
-                .tooltip(Tooltip::for_action_title_in(
-                    soft_wrap_tooltip(is_soft_wrap_enabled),
-                    &ToggleSoftWrap,
-                    &focus_handle,
-                ))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.dispatch_action(&ToggleSoftWrap, window, cx)
-                })),
+                soft_wrap_button("branch-diff-soft-wrap", is_soft_wrap_enabled, &focus_handle)
+                    .shape(ui::IconButtonShape::Square)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&ToggleSoftWrap, window, cx)
+                    })),
             )
             .when(show_review_button, |this| {
                 let focus_handle = focus_handle.clone();

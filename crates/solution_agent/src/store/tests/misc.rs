@@ -5663,7 +5663,11 @@ async fn reconnect_continues_a_wedged_running_session(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.maybe_send_reconnect_continuation(
-                session_id, /* was_running */ true, /* tail_unanswered_user */ false, cx,
+                session_id,
+                RespawnReason::Watchdog,
+                /* was_running */ true,
+                /* tail_unanswered_user */ false,
+                cx,
             )
         });
     });
@@ -5692,7 +5696,11 @@ async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.maybe_send_reconnect_continuation(
-                session_id, /* was_running */ false, /* tail_unanswered_user */ false, cx,
+                session_id,
+                RespawnReason::Watchdog,
+                /* was_running */ false,
+                /* tail_unanswered_user */ false,
+                cx,
             )
         });
     });
@@ -5777,7 +5785,11 @@ async fn reconnect_on_unanswered_user_message_points_at_it(cx: &mut TestAppConte
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.maybe_send_reconnect_continuation(
-                session_id, /* was_running */ true, /* tail_unanswered_user */ true, cx,
+                session_id,
+                RespawnReason::Watchdog,
+                /* was_running */ true,
+                /* tail_unanswered_user */ true,
+                cx,
             )
         });
     });
@@ -6093,12 +6105,32 @@ async fn project_label_reads_member_id_not_cwd(cx: &mut TestAppContext) {
 async fn restart_agent_keeps_the_session_and_its_history(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
 
+    // A freshly created session has no entries, so an assertion against its
+    // count would be `0 == 0` and would survive a restart that wiped the
+    // conversation. Give it something to lose first.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.push_system_note(
+                session_id,
+                acp_thread::SystemNoteLevel::Info,
+                "entry the restart must not discard",
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
     let entries_before = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.read_with(cx, |store, cx| {
             store.session(session_id).unwrap().read(cx).entries.len()
         })
     });
+    assert!(
+        entries_before > 0,
+        "the fixture must carry history for this test to mean anything",
+    );
 
     let task = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -6108,7 +6140,7 @@ async fn restart_agent_keeps_the_session_and_its_history(cx: &mut TestAppContext
     // point of this test is what restart does to the session, not whether the
     // fake agent comes back. A restart that wiped the session would show up
     // here regardless of the resume outcome.
-    let _ = task.await;
+    task.await.ok();
     cx.executor().run_until_parked();
 
     cx.update(|cx| {
@@ -6138,7 +6170,7 @@ async fn restart_and_watchdog_respawn_report_differently(cx: &mut TestAppContext
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| store.restart_agent(session_id, cx))
     });
-    let _ = task.await;
+    task.await.ok();
     cx.executor().run_until_parked();
 
     cx.update(|cx| {
@@ -6157,6 +6189,42 @@ async fn restart_and_watchdog_respawn_report_differently(cx: &mut TestAppContext
                     );
                 }
                 other => panic!("expected Errored(restart wording), got {other:?}"),
+            }
+        });
+    });
+
+    // The watchdog arm needs its own session: the one above is now Errored, and
+    // the watchdog path is the half that would silently inherit the restart's
+    // wording if the two ever collapsed into one string.
+    let (watchdog_session, _watchdog_thread, _watchdog_tmp) = create_session_with_thread(cx).await;
+    let task = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.reconnect_agent(watchdog_session, cx))
+    });
+    task.await.ok();
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let state = store
+                .session(watchdog_session)
+                .unwrap()
+                .read(cx)
+                .state
+                .clone();
+            match state {
+                SessionState::Errored(msg) => {
+                    assert!(
+                        msg.contains("переподключение"),
+                        "the watchdog must report itself as a reconnect, got {msg:?}"
+                    );
+                    assert!(
+                        !msg.contains("перезапуск"),
+                        "the watchdog must not claim the user pressed Restart, got {msg:?}"
+                    );
+                }
+                other => panic!("expected Errored(reconnect wording), got {other:?}"),
             }
         });
     });

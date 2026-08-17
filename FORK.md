@@ -882,6 +882,24 @@ Accepted tradeoff: on an external commit the sidebar now closes for the duration
 
 How to apply: index-based identity in the commit graph is only valid within one `graph_data` generation. Anything that outlives a refetch — a selection, a cached diff, an in-flight task's result — must be keyed by sha, and every consumer of a view index goes through `view_to_data_idx` (the header did not, and was off by one whenever the local-changes row was present).
 
+### 65. Restart Agent respawns the subprocess and resumes the SAME session — it never mints a new one
+
+Why: Restart used to close the session and create a blank one, which is what the "+" button already does. The maintainer's words: *"для новой сессии я могу просто через + создать. Рестарт должен делать рестарт существующей с сохранением истории."* A restart that quietly throws away the conversation is the trap that prompted the change.
+
+How it works: `SolutionAgentStore::respawn_agent(session_id, reason)` is the single implementation, reached from both `restart_agent` (`RespawnReason::UserRestart`) and the stuck-session watchdog's `reconnect_agent` (`RespawnReason::Watchdog`) — the mechanics are identical, only the wording differs. It reuses the existing `resume_session` machinery (full replay via `load_session`, falling back to `--resume <acp_session_id>`) after detaching the live `acp_thread`, so `resume_session`'s "already hot" early return does not short-circuit it. The `SolutionSessionId`, the tab, the title, the entries and the pending message queue all survive; the user's own queued messages are explicitly preserved, because dropping them without asking is a bug this fork already fixed once.
+
+`RespawnReason` exists because the two paths must not lie to anyone. It carries `transient_status`, `failure_status`, `recovered_note` **and** `continuation_prompt` — the last one matters most: the continuation is read by the *model*, and telling it "your process hung" after a restart the user asked for sends it hunting for a fault that never happened. On resume failure the session is left as it was with the error surfaced (variant A); it never silently degrades into a blank session.
+
+How to apply: any new respawn entry point takes a `RespawnReason` and adds an arm to every one of its four strings — a wrong arm is invisible in tests unless both variants are driven, which is why `restart_and_watchdog_respawn_report_differently` exercises `restart_agent` *and* `reconnect_agent`. And the MCP tool docs are a contract agents read: `ResetContextParams`' description contrasts itself with `restart_agent`, so it has to be updated in the same commit as any change to what restart does.
+
+### 66. `CLAUDE_CODE_HARBOR_KITE=1` is forced for every spawned `claude`, because cross-session messaging is otherwise a per-process coin toss
+
+Why: upstream gates the *entire* cross-session messaging feature behind the remote flag `tengu_harbor_kite` (default `false`), re-asked on **every process start** — and `/clear`, `/compact` and Restart Agent each spawn a new process, because `--session-id` is a launch argument. So a session's ability to be reached by its peers was decided afresh on every respawn, and its absence is invisible: no socket is bound under `/run/user/<uid>/cc-socks/<pid>.sock`, the session silently vanishes from peers' `ListAgents`, and inbound messages are refused with an internal cause literally named `"kill-switch"`.
+
+How it works: `claude_native::command` sets the env var next to the existing `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`. It is the override upstream provides beside the flag lookup, not a reach into internals. Worst case if a future CLI renames it: the override stops applying and we are back to today's coin toss — no worse.
+
+Diagnostic note worth keeping: a session that claims "I'm headless so I don't register" is **wrong** — a headless `stream-json` session does register. Check `/run/user/<uid>/cc-socks/<pid>.sock` and the process's `environ` instead of accepting that explanation. (Those socket files are never cleaned up; a majority belonging to dead pids is normal and harmless.)
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

@@ -615,6 +615,13 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@x")
             .env("GIT_COMMITTER_NAME", "T")
             .env("GIT_COMMITTER_EMAIL", "t@x")
+            // The developer's own config must not reach this fixture: a global
+            // `commit.gpgsign`, a `core.hooksPath` or a commit template turns
+            // these commits into failures on their machine only.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .status()
             .expect("spawn git");

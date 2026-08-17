@@ -165,6 +165,13 @@ const JUDGE_SPAWN_RETRY_MS: i64 = 15_000;
 const RECONNECT_CONTINUATION_PROMPT: &str = "Твой процесс завис, поэтому редактор перезапустил его. \
      История и контекст сохранены — продолжай работу с того места, на котором остановился.";
 
+/// Continuation sent after a user-initiated Restart. Same instruction, without
+/// the claim that the process hung — nothing was wrong, the user asked for a
+/// fresh subprocess.
+const RESTART_CONTINUATION_PROMPT: &str =
+    "Редактор перезапустил твой процесс по команде пользователя. \
+     История и контекст сохранены — продолжай работу с того места, на котором остановился.";
+
 /// Continuation sent after [`SolutionAgentStore::reconnect_agent`] when the
 /// wedge happened on an UNANSWERED user message — the transcript tail is a human
 /// message with no assistant reply after it (the agent hung *before* it started
@@ -600,6 +607,16 @@ pub enum RespawnReason {
 }
 
 impl RespawnReason {
+    /// The continuation the *agent* reads. It must not claim a hang the user
+    /// caused themselves: told "your process wedged", a model goes looking for a
+    /// fault that never happened.
+    fn continuation_prompt(self) -> &'static str {
+        match self {
+            RespawnReason::Watchdog => RECONNECT_CONTINUATION_PROMPT,
+            RespawnReason::UserRestart => RESTART_CONTINUATION_PROMPT,
+        }
+    }
+
     fn transient_status(self) -> &'static str {
         match self {
             RespawnReason::Watchdog => "reconnecting…",
@@ -2170,6 +2187,7 @@ impl SolutionAgentStore {
                 );
                 store.maybe_send_reconnect_continuation(
                     resumed,
+                    reason,
                     was_running,
                     tail_unanswered_user,
                     cx,
@@ -2196,6 +2214,7 @@ impl SolutionAgentStore {
     pub(crate) fn maybe_send_reconnect_continuation(
         &mut self,
         session_id: SolutionSessionId,
+        reason: RespawnReason,
         was_running: bool,
         tail_unanswered_user: bool,
         cx: &mut Context<Self>,
@@ -2209,7 +2228,7 @@ impl SolutionAgentStore {
         let prompt = if tail_unanswered_user {
             RECONNECT_UNANSWERED_USER_PROMPT
         } else {
-            RECONNECT_CONTINUATION_PROMPT
+            reason.continuation_prompt()
         };
         self.send_message_blocks_targeted(
             session_id,

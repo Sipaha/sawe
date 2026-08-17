@@ -14,9 +14,9 @@ use solutions::SolutionStore;
 /// Wipe the conversation history of `session_id` while keeping the tab,
 /// title, and `SolutionSessionId` stable. Wired to the desktop's
 /// `/clear` slash command via `store::reset_context`. Different from
-/// `restart_agent`, which mints a fresh session id (and therefore drops
-/// the user-set title) — use this when the intent is "clear this chat"
-/// and not "this session is broken, give me a new one".
+/// `restart_agent`, which keeps the conversation and only replaces the
+/// subprocess (same session id, same history, resumed) — use this when the
+/// intent is "clear this chat" and not "the subprocess is broken, respawn it".
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ResetContextParams {
     pub session_id: String,

@@ -466,7 +466,7 @@ pub fn git_status_icon(status: FileStatus) -> impl IntoElement {
     GitStatusIcon::new(status)
 }
 
-pub(crate) fn soft_wrap_icon(is_soft_wrap_enabled: bool) -> IconName {
+fn soft_wrap_icon(is_soft_wrap_enabled: bool) -> IconName {
     if is_soft_wrap_enabled {
         IconName::TextUnwrap
     } else {
@@ -474,12 +474,29 @@ pub(crate) fn soft_wrap_icon(is_soft_wrap_enabled: bool) -> IconName {
     }
 }
 
-pub(crate) fn soft_wrap_tooltip(is_soft_wrap_enabled: bool) -> &'static str {
+fn soft_wrap_tooltip(is_soft_wrap_enabled: bool) -> &'static str {
     if is_soft_wrap_enabled {
         "Disable Soft Wrap"
     } else {
         "Enable Soft Wrap"
     }
+}
+
+/// The shared body of the soft-wrap toggle carried by all three diff toolbars.
+/// Sizing and `on_click` stay with the caller: the toolbars size their buttons
+/// differently, and each dispatches through its own `cx.listener`.
+pub(crate) fn soft_wrap_button(
+    id: &'static str,
+    is_soft_wrap_enabled: bool,
+    focus_handle: &FocusHandle,
+) -> ui::IconButton {
+    ui::IconButton::new(id, soft_wrap_icon(is_soft_wrap_enabled))
+        .toggle_state(is_soft_wrap_enabled)
+        .tooltip(ui::Tooltip::for_action_title_in(
+            soft_wrap_tooltip(is_soft_wrap_enabled),
+            &editor::actions::ToggleSoftWrap,
+            focus_handle,
+        ))
 }
 
 struct RenameBranchModal {

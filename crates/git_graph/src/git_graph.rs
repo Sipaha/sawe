@@ -1525,7 +1525,17 @@ impl GitGraph {
         if self.file_history_options.with_local_changes == on {
             return;
         }
+        // Adding or removing the synthetic local-changes row shifts every
+        // view index by one, so a selection held as an index would silently
+        // slide onto the neighbouring commit while the sidebar kept the old
+        // diff. Re-derive it from the sha the sidebar is actually describing.
+        let selected_data_idx = self
+            .selected_entry_idx
+            .and_then(|view_idx| self.view_to_data_idx(view_idx));
         self.file_history_options.with_local_changes = on;
+        if let Some(data_idx) = selected_data_idx {
+            self.selected_entry_idx = Some(self.data_to_view_idx(data_idx));
+        }
         cx.emit(ItemEvent::Edit);
         cx.notify();
     }
@@ -2368,26 +2378,34 @@ impl GitGraph {
         let diff_receiver = repository.update(cx, |repo, _| repo.load_commit_diff(sha.to_string()));
 
         self._commit_diff_task = Some(cx.spawn(async move |this, cx| {
-            if let Ok(Ok(diff)) = diff_receiver.await {
-                this.update(cx, |this, cx| {
-                    let (lines_added, lines_removed) = compute_diff_stats(&diff);
-                    // Drop a load that resolved after the selection moved on,
-                    // rather than pairing it with whatever is shown now.
-                    if let Some(state) = this
-                        .selected_commit_diff
-                        .as_mut()
-                        .filter(|state| state.sha == sha)
-                    {
-                        state.loaded = Some(LoadedCommitDiff {
-                            diff,
-                            lines_added,
-                            lines_removed,
-                        });
-                        cx.notify();
-                    }
-                })
-                .ok();
-            }
+            let diff = match diff_receiver.await {
+                Ok(Ok(diff)) => diff,
+                // Without this the sidebar's empty file list is indistinguishable
+                // from a commit that genuinely touched nothing.
+                Ok(Err(error)) => {
+                    log::warn!("loading the diff of commit {sha} failed: {error:#}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            this.update(cx, |this, cx| {
+                let (lines_added, lines_removed) = compute_diff_stats(&diff);
+                // Drop a load that resolved after the selection moved on,
+                // rather than pairing it with whatever is shown now.
+                if let Some(state) = this
+                    .selected_commit_diff
+                    .as_mut()
+                    .filter(|state| state.sha == sha)
+                {
+                    state.loaded = Some(LoadedCommitDiff {
+                        diff,
+                        lines_added,
+                        lines_removed,
+                    });
+                    cx.notify();
+                }
+            })
+            .ok();
         }));
 
         cx.emit(ItemEvent::Edit);
@@ -5100,7 +5118,7 @@ mod tests {
     use rand::prelude::*;
     use serde_json::json;
     use settings::{SettingsStore, ThemeSettingsContent};
-    use smallvec::{SmallVec, smallvec};
+    use smallvec::smallvec;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 

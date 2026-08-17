@@ -1,5 +1,5 @@
 mod header;
-mod mouse;
+pub(crate) mod mouse;
 
 #[cfg(test)]
 pub(crate) use header::StickyHeader;
@@ -3702,10 +3702,7 @@ impl EditorElement {
                 } else {
                     Pixels::ZERO
                 };
-                origin += point(
-                    gutter_offset + editor_margins.gutter.margin,
-                    Pixels::ZERO,
-                );
+                origin += point(gutter_offset + editor_margins.gutter.margin, Pixels::ZERO);
             }
 
             if !matches!(block.style, BlockStyle::Sticky) {
@@ -6530,9 +6527,14 @@ impl EditorElement {
             if block.overlaps_gutter {
                 block.element.paint(window, cx);
             } else {
-                window.with_content_mask(Some(ContentMask { bounds: mask_bounds }), |window| {
-                    block.element.paint(window, cx);
-                })
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: mask_bounds,
+                    }),
+                    |window| {
+                        block.element.paint(window, cx);
+                    },
+                )
             }
         }
     }

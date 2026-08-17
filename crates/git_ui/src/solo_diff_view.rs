@@ -1,4 +1,4 @@
-use crate::{git_panel::GitStatusEntry, git_status_icon, soft_wrap_icon, soft_wrap_tooltip};
+use crate::{git_panel::GitStatusEntry, git_status_icon, soft_wrap_button};
 use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkSecondaryStatus;
 use editor::{
@@ -26,8 +26,8 @@ use std::{
     sync::Arc,
 };
 use ui::{
-    Color, DiffStat, Divider, Icon, IconButton, IconButtonShape, IconName, Label, LabelCommon as _,
-    SharedString, Tooltip, prelude::*, vertical_divider,
+    Color, DiffStat, Divider, Icon, IconButton, IconName, Label, LabelCommon as _, SharedString,
+    Tooltip, prelude::*, vertical_divider,
 };
 use util::paths::{PathExt as _, PathStyle};
 use workspace::{
@@ -647,14 +647,8 @@ impl Render for SoloDiffStyleToolbar {
             )
             .child(vertical_divider())
             .child(
-                IconButton::new("solo-diff-soft-wrap", soft_wrap_icon(is_soft_wrap_enabled))
+                soft_wrap_button("solo-diff-soft-wrap", is_soft_wrap_enabled, &focus_handle)
                     .icon_size(IconSize::Small)
-                    .toggle_state(is_soft_wrap_enabled)
-                    .tooltip(Tooltip::for_action_title_in(
-                        soft_wrap_tooltip(is_soft_wrap_enabled),
-                        &ToggleSoftWrap,
-                        &focus_handle,
-                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.dispatch_action(&ToggleSoftWrap, window, cx)
                     })),

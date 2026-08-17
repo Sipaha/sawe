@@ -37,7 +37,8 @@ actions!(
         ZoomIn,
         /// Zoom out the image.
         ZoomOut,
-        /// Reset zoom to 100%.
+        /// Reset the zoom to the default, which is fitting the image to the
+        /// window.
         ResetZoom,
         /// Fit the image to view.
         FitToView,
@@ -249,8 +250,11 @@ impl ImageView {
         self.set_zoom(self.zoom.level / ZOOM_STEP, None, cx);
     }
 
+    /// `ResetZoom` restores the *default* view, and since fit-to-window became
+    /// the default the reset is a re-fit — not 100%, which is what
+    /// `ZoomToActualSize` is for.
     fn reset_zoom(&mut self, _: &ResetZoom, window: &mut Window, cx: &mut Context<Self>) {
-        self.zoom_to_actual_size(&ZoomToActualSize, window, cx);
+        self.fit_to_view(&FitToView, window, cx);
     }
 
     fn fit_to_view(&mut self, _: &FitToView, _window: &mut Window, cx: &mut Context<Self>) {
