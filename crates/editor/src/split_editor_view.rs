@@ -79,6 +79,12 @@ impl SplitEditorState {
         self.left_ratio = self.visible_left_ratio;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_left_ratio_for_test(&mut self, ratio: f32) {
+        self.left_ratio = ratio;
+        self.visible_left_ratio = ratio;
+    }
+
     fn on_double_click(&mut self) {
         self.left_ratio = 0.5;
         self.visible_left_ratio = 0.5;
@@ -146,6 +152,10 @@ fn render_connector_strip(
         .h_full()
         .flex_shrink_0()
         .w(CONNECTOR_STRIP_WIDTH)
+        // The ribbons are drawn by a bare `canvas()`, which installs no content
+        // mask of its own, so without this a stray path would be clipped only
+        // by the window and could paint over a pane's line numbers.
+        .overflow_hidden()
         .bg(background_color)
         // The strip is a flex sibling of the two panes, not an overlay on top
         // of them, so no editor's hitbox covers it and the wheel would do

@@ -1095,7 +1095,10 @@ pub struct Editor {
         >,
     >,
     last_bounds: Option<Bounds<Pixels>>,
-    last_position_map: Option<Rc<PositionMap>>,
+    /// The layout the element last painted, including the `EditorSnapshot` it
+    /// was computed from. Tests read this to assert on what a pane actually put
+    /// on screen, which is not the same as what a fresh snapshot would say.
+    pub(crate) last_position_map: Option<Rc<PositionMap>>,
     expect_bounds_change: Option<Bounds<Pixels>>,
     runnables: RunnableData,
     bookmark_store: Option<Entity<BookmarkStore>>,

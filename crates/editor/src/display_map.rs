@@ -1237,13 +1237,45 @@ impl DisplayMap {
     }
 
     pub fn set_font(&self, font: Font, font_size: Pixels, cx: &mut Context<Self>) -> bool {
-        self.wrap_map
-            .update(cx, |map, cx| map.set_font_with_size(font, font_size, cx))
+        let rewrapped = self
+            .wrap_map
+            .update(cx, |map, cx| map.set_font_with_size(font, font_size, cx));
+        if rewrapped {
+            self.invalidate_companion_alignment(cx);
+        }
+        rewrapped
     }
 
     pub fn set_wrap_width(&self, width: Option<Pixels>, cx: &mut Context<Self>) -> bool {
-        self.wrap_map
-            .update(cx, |map, cx| map.set_wrap_width(width, cx))
+        let rewrapped = self
+            .wrap_map
+            .update(cx, |map, cx| map.set_wrap_width(width, cx));
+        if rewrapped {
+            self.invalidate_companion_alignment(cx);
+        }
+        rewrapped
+    }
+
+    /// A split pane's alignment spacers are computed from the *companion's*
+    /// wrap rows, so rewrapping one pane changes how many rows the other pane
+    /// must pad. Rewrapping is driven from layout, and by then the companion's
+    /// element may already have laid itself out this frame against our previous
+    /// wrap width; nothing else marks it dirty, so without this the two panes
+    /// stay visibly misaligned until some unrelated redraw recomputes them.
+    fn invalidate_companion_alignment(&self, cx: &mut Context<Self>) {
+        let Some((companion_display_map, _)) = &self.companion else {
+            return;
+        };
+        let companion_display_map = companion_display_map.clone();
+        // The notify has to be deferred: rewrapping is discovered from the
+        // element's layout, and gpui drops any invalidation raised while a draw
+        // is in flight (`WindowInvalidator::invalidate_view` returns false
+        // unless `draw_phase` is `None`), so notifying inline here would be
+        // silently swallowed and no further frame would ever be drawn.
+        cx.defer(move |cx| {
+            // A dropped companion just means the split has been torn down.
+            companion_display_map.update(cx, |_, cx| cx.notify()).ok();
+        });
     }
 
     #[instrument(skip_all)]

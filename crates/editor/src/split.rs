@@ -6532,4 +6532,259 @@ mod tests {
             ]
         );
     }
+
+    /// A split pane derives its alignment spacers from the companion's wrap
+    /// rows, so changing either pane's wrap width must notify the companion at
+    /// all — otherwise nothing ever asks for the frame that reconciles them.
+    ///
+    /// Scope, because it is narrower than it looks: this drives frames through
+    /// `VisualTestContext::draw`, which does not run gpui's
+    /// `record_entities_accessed`, so the panes are never registered as live
+    /// window entities and the draw-phase gate that swallows invalidations
+    /// raised during layout never applies here. It therefore cannot tell an
+    /// inline notify (dropped in the real app) from a deferred one — that is
+    /// what `test_split_panes_repaint_after_wrap_width_change` is for.
+    #[gpui::test]
+    async fn test_split_alignment_survives_wrap_width_change(cx: &mut gpui::TestAppContext) {
+        use crate::RowExt as _;
+        use rope::Point;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let (editor, mut cx) = init_test(cx, SoftWrap::EditorWidth, DiffViewStyle::Split).await;
+
+        // One long unchanged line per excerpt: how many display rows it takes
+        // depends purely on the pane's wrap width, so whichever pane keeps it on
+        // fewer rows needs spacers to stay level with the other one.
+        let text = "aaaa bbbb cccc dddd eeee ffff";
+        let (buffer1, diff1) = buffer_with_diff(text, text, &mut cx);
+        let (buffer2, diff2) = buffer_with_diff(text, text, &mut cx);
+
+        editor.update(cx, |editor, cx| {
+            let end = Point::new(0, text.len() as u32);
+            editor.update_excerpts_for_path(
+                PathKey::sorted(0),
+                buffer1.clone(),
+                vec![Point::new(0, 0)..end],
+                0,
+                diff1.clone(),
+                cx,
+            );
+            editor.update_excerpts_for_path(
+                PathKey::sorted(1),
+                buffer2.clone(),
+                vec![Point::new(0, 0)..end],
+                0,
+                diff2.clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (rhs_editor, lhs_editor) = editor.update(cx, |editor, _| {
+            let lhs = editor.lhs.as_ref().expect("should have lhs editor");
+            (editor.rhs_editor.clone(), lhs.editor.clone())
+        });
+
+        let redraw_requested = Rc::new(Cell::new(false));
+        let _observers = cx.update(|_, cx| {
+            [&lhs_editor, &rhs_editor]
+                .into_iter()
+                .map(|pane| {
+                    let redraw_requested = redraw_requested.clone();
+                    cx.observe(pane, move |_, _| redraw_requested.set(true))
+                })
+                .collect::<Vec<_>>()
+        });
+
+        // Settle both panes at the same width: the line wraps identically on
+        // both sides, so neither side needs a spacer.
+        for _ in 0..2 {
+            let _ = editor_content_with_blocks_and_width(&rhs_editor, px(400.), &mut cx);
+            let _ = editor_content_with_blocks_and_width(&lhs_editor, px(400.), &mut cx);
+        }
+        cx.run_until_parked();
+
+        fn second_excerpt_row(snapshot: &crate::EditorSnapshot) -> crate::DisplayRow {
+            let max_row = snapshot.max_point().row();
+            snapshot
+                .blocks_in_range(crate::DisplayRow(0)..max_row.next_row())
+                .filter(|(_, block)| {
+                    matches!(block, crate::display_map::Block::BufferHeader { .. })
+                })
+                .map(|(row, _)| row)
+                .nth(1)
+                .expect("each pane should have a header for each of the two excerpts")
+        }
+
+        // Now drag the divider: the left pane narrows slightly (not enough to
+        // rewrap) while the right pane narrows enough to wrap onto three rows.
+        // Keep drawing for as long as the editor asks to be redrawn, then
+        // require that the two panes agree about where the second excerpt's
+        // unchanged line sits.
+        let mut alignment = None;
+        for _ in 0..8 {
+            redraw_requested.set(false);
+
+            let _ = editor_content_with_blocks_and_width(&lhs_editor, px(380.), &mut cx);
+            let lhs_snapshot =
+                lhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+            let _ = editor_content_with_blocks_and_width(&rhs_editor, px(200.), &mut cx);
+            let rhs_snapshot =
+                rhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+
+            alignment = Some((
+                (
+                    second_excerpt_row(&lhs_snapshot),
+                    lhs_snapshot.max_point().row(),
+                ),
+                (
+                    second_excerpt_row(&rhs_snapshot),
+                    rhs_snapshot.max_point().row(),
+                ),
+            ));
+
+            cx.run_until_parked();
+            if !redraw_requested.get() {
+                break;
+            }
+        }
+
+        let (lhs, rhs) = alignment.expect("the loop runs at least once");
+        assert_eq!(
+            lhs.0, rhs.0,
+            "the same unchanged line must sit on the same display row in both panes"
+        );
+        assert_eq!(
+            lhs.1, rhs.1,
+            "both panes must span the same number of display rows"
+        );
+    }
+
+    /// The live regression: dragging the split divider left the two panes
+    /// painting different rows for the same unchanged line, and no amount of
+    /// redrawing fixed it — only a scroll did.
+    ///
+    /// The panes lay out one after the other inside a single frame, so the one
+    /// that lays out first computes its alignment spacers against the
+    /// companion's *previous* wrap width. The companion's later layout does
+    /// repair the block map (`fresh` below is always correct), but the first
+    /// pane has already painted. The repair is therefore only visible if
+    /// another frame is drawn, and gpui deliberately drops any invalidation
+    /// raised while a draw is in flight (`WindowInvalidator::invalidate_view`
+    /// returns false unless `draw_phase` is `None`) — which is exactly when a
+    /// rewrap is discovered. Hence the deferred notify in
+    /// `DisplayMap::invalidate_companion_alignment`.
+    ///
+    /// This test drives the real `Window::draw` path (the editor is a live item
+    /// in the workspace) because that is the only path where gpui tracks the
+    /// panes as window entities and applies that draw-phase gate at all.
+    #[gpui::test]
+    async fn test_split_panes_repaint_after_wrap_width_change(cx: &mut gpui::TestAppContext) {
+        use crate::RowExt as _;
+        use gpui::size;
+        use rope::Point;
+
+        let (editor, mut cx) = init_test(cx, SoftWrap::EditorWidth, DiffViewStyle::Split).await;
+
+        // A long soft-wrapping line, a modification hunk, and a trailing
+        // unchanged line whose display row is the thing that must agree.
+        let base = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll\nold\ntail line one two three four five six seven\n";
+        let current = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll\nnew one\nnew two\ntail line one two three four five six seven\n";
+
+        for path in [PathKey::sorted(0), PathKey::sorted(1)] {
+            let (buffer, diff) = buffer_with_diff(base, current, &mut cx);
+            let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+            diff.update(cx, |diff, cx| {
+                diff.recalculate_diff_sync(&buffer_snapshot, cx)
+            });
+            cx.run_until_parked();
+            editor.update(cx, |editor, cx| {
+                editor.update_excerpts_for_path(
+                    path,
+                    buffer,
+                    vec![Point::new(0, 0)..Point::new(3, 0)],
+                    0,
+                    diff,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        }
+
+        let workspace = editor.read_with(cx, |editor, _| editor.workspace.clone());
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            })
+            .expect("workspace should be alive");
+        cx.run_until_parked();
+
+        let (rhs_editor, lhs_editor) = editor.update(cx, |editor, _| {
+            let lhs = editor.lhs.as_ref().expect("should have lhs editor");
+            (editor.rhs_editor.clone(), lhs.editor.clone())
+        });
+
+        fn second_header(snapshot: &crate::EditorSnapshot) -> Option<crate::DisplayRow> {
+            snapshot
+                .blocks_in_range(crate::DisplayRow(0)..snapshot.max_point().row().next_row())
+                .filter(|(_, block)| {
+                    matches!(block, crate::display_map::Block::BufferHeader { .. })
+                })
+                .map(|(row, _)| row)
+                .nth(1)
+        }
+
+        // What each pane last put on screen, as opposed to what a fresh
+        // snapshot would say — the two diverge precisely when this bug is live.
+        let painted = |cx: &mut gpui::VisualTestContext| {
+            let pane_row = |pane: &Entity<Editor>, cx: &mut gpui::VisualTestContext| {
+                pane.read_with(cx, |pane, _| {
+                    second_header(
+                        &pane
+                            .last_position_map
+                            .as_ref()
+                            .expect("pane should have been painted")
+                            .snapshot,
+                    )
+                    .expect("painted snapshot should contain both excerpt headers")
+                })
+            };
+            (pane_row(&lhs_editor, cx), pane_row(&rhs_editor, cx))
+        };
+
+        cx.simulate_resize(size(px(1700.), px(900.)));
+        cx.run_until_parked();
+        let (lhs_even, rhs_even) = painted(&mut cx);
+        assert_eq!(
+            lhs_even, rhs_even,
+            "panes of equal width should already agree"
+        );
+
+        // Drag the divider: both panes change width in the same frame, so the
+        // one that lays out first sees a stale companion wrap width.
+        editor.update(cx, |editor, cx| {
+            editor
+                .split_state
+                .update(cx, |state, _| state.set_left_ratio_for_test(0.75));
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let (lhs_painted, rhs_painted) = painted(&mut cx);
+        assert_eq!(
+            lhs_painted, rhs_painted,
+            "after the divider moves, both panes must paint the same unchanged \
+             line on the same display row without any intervening scroll"
+        );
+
+        let lhs_fresh = lhs_editor.update_in(cx, |editor, window, cx| {
+            second_header(&editor.snapshot(window, cx))
+        });
+        assert_eq!(
+            Some(lhs_painted),
+            lhs_fresh,
+            "the left pane must have painted its repaired layout, not a stale one"
+        );
+    }
 }
