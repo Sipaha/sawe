@@ -18,14 +18,17 @@
 
 use std::path::PathBuf;
 
+use crate::handlers::branch::{
+    FORCE_DELETE_BRANCH_ANSWER, ForceDeleteDecision, force_delete_decision,
+};
 use crate::handlers::{
     branch, checkout, cherry_pick, compare, copy, drop as drop_handler, edit_message, fixup, merge,
     patch as patch_handler, reset, revert, show_at_revision, squash, tag,
 };
 use editor::Editor;
 use gpui::{
-    App, ClipboardItem, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, WeakEntity, Window,
+    App, ClipboardItem, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel,
+    Render, SharedString, WeakEntity, Window,
 };
 use menu::{Cancel, Confirm};
 use project::git_store::Repository;
@@ -493,9 +496,9 @@ fn build_branch_ref_submenu(
         menu
     };
 
-    let repo = ctx.repository;
+    let delete_ctx = ctx;
     menu.entry("Delete", None, move |window, cx| {
-        run_delete_branch(repo.clone(), branch.clone(), window, cx);
+        run_delete_branch(delete_ctx.clone(), branch.clone(), window, cx);
     })
 }
 
@@ -537,22 +540,55 @@ fn run_checkout_branch(
     await_repo_recv(recv, "checkout was canceled", "Checkout failed", window, cx);
 }
 
-fn run_delete_branch(
-    repo: Entity<Repository>,
-    branch: SharedString,
-    window: &mut Window,
-    cx: &mut App,
-) {
+/// "Delete" on a branch decoration. A plain `git branch -d` refuses an
+/// unmerged branch; rather than dead-ending on git's stderr the warning
+/// carries a [`FORCE_DELETE_BRANCH_ANSWER`] answer that re-runs the
+/// delete with `force = true`.
+///
+/// This uses a two-answer prompt rather than a toast because the failure
+/// already surfaces as a modal here (`detach_and_prompt_err`), so adding
+/// the escape hatch to that same modal keeps one surface instead of two,
+/// and matches how the branch picker (entry A) and every other
+/// destructive git confirm in this crate is spelled.
+fn run_delete_branch(ctx: CommitContext, branch: SharedString, window: &mut Window, cx: &mut App) {
+    let repo = ctx.repository;
+    let work_dir = ctx.work_dir;
     let recv = repo.update(cx, |repo, _| {
         repo.delete_branch(false, branch.to_string(), false)
     });
-    await_repo_recv(
-        recv,
-        "delete branch was canceled",
-        "Delete branch failed",
-        window,
-        cx,
-    );
+    let task = window.spawn(cx, async move |cx| {
+        let error = match recv.await {
+            Ok(Ok(())) => return anyhow::Ok(()),
+            Ok(Err(error)) => error,
+            Err(_) => anyhow::bail!("delete branch was canceled"),
+        };
+
+        match force_delete_decision(&error, work_dir.as_deref(), &branch) {
+            ForceDeleteDecision::NotApplicable => Err(error),
+            ForceDeleteDecision::Forbidden { message } => Err(anyhow::anyhow!(message)),
+            ForceDeleteDecision::Offer { warning } => {
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &warning,
+                        None,
+                        &[FORCE_DELETE_BRANCH_ANSWER, "Cancel"],
+                        cx,
+                    )
+                })?;
+                if answer.await != Ok(0) {
+                    return Ok(());
+                }
+                repo.update(cx, |repo, _| {
+                    repo.delete_branch(false, branch.to_string(), true)
+                })
+                .await?
+            }
+        }
+    });
+    task.detach_and_prompt_err("Delete branch failed", window, cx, |e, _, _| {
+        Some(format!("{e}"))
+    });
 }
 
 fn run_checkout_tag(
@@ -968,7 +1004,10 @@ fn run_fixup_with_previous(ctx: CommitContext, window: &mut Window, cx: &mut App
 
 fn open_interactive_rebase(ctx: CommitContext, window: &mut Window, cx: &mut App) {
     let sha = ctx.sha.to_string();
-    window.dispatch_action(Box::new(crate::fork_actions::InteractiveRebaseFromHere { sha }), cx);
+    window.dispatch_action(
+        Box::new(crate::fork_actions::InteractiveRebaseFromHere { sha }),
+        cx,
+    );
 }
 
 fn open_edit_message_prompt(ctx: CommitContext, window: &mut Window, cx: &mut App) {
@@ -1188,4 +1227,151 @@ fn run_create_patch(ctx: CommitContext, range_to_head: bool, window: &mut Window
         None
     };
     patch_handler::create_patch_action(ctx.workspace, work_dir, sha, sha_to, window, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+    }
+
+    /// Fake repository holding a single branch that `git branch -d`
+    /// refuses to delete, plus the window the delete prompt is driven
+    /// from.
+    async fn init_delete_branch_test(
+        branch: &str,
+        cx: &mut TestAppContext,
+    ) -> (CommitContext, VisualTestContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".git": {},
+                "file.txt": "buffer_text".to_string()
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            path!("/dir/.git").as_ref(),
+            &[("file.txt", "test".to_string())],
+            "deadbeef",
+        );
+
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .expect("fake project should expose a repository");
+
+        repository
+            .update(cx, |repo, _| repo.create_branch(branch.to_string(), None))
+            .await
+            .expect("create_branch was canceled")
+            .expect("create_branch failed");
+        cx.run_until_parked();
+
+        fs.with_git_state(path!("/dir/.git").as_ref(), true, |state| {
+            state
+                .branches_requiring_force_delete
+                .insert(branch.to_string());
+        })
+        .expect("failed to mark test branch as requiring force delete");
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace should exist");
+
+        let ctx = CommitContext {
+            workspace: workspace.downgrade(),
+            repository,
+            sha: "deadbeef".into(),
+            subject: "".into(),
+            provider: None,
+            work_dir: Some(path!("/dir").into()),
+            member_id: None,
+            refs: vec![branch.into()],
+            head_branch: Some("main".into()),
+            local_branches: vec![branch.into()],
+        };
+
+        (
+            ctx,
+            VisualTestContext::from_window(window_handle.into(), cx),
+        )
+    }
+
+    async fn branch_names(ctx: &CommitContext, cx: &mut VisualTestContext) -> Vec<String> {
+        ctx.repository
+            .update(cx, |repo, _| repo.branches())
+            .await
+            .expect("branches was canceled")
+            .expect("branches failed")
+            .branches
+            .into_iter()
+            .map(|branch| branch.name().to_string())
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_delete_unmerged_branch_offers_delete_anyway(cx: &mut TestAppContext) {
+        let (ctx, mut cx) = init_delete_branch_test("feature-auth", cx).await;
+
+        cx.update(|window, cx| run_delete_branch(ctx.clone(), "feature-auth".into(), window, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.has_pending_prompt(),
+            "an unmerged branch delete must warn instead of dead-ending on git stderr"
+        );
+
+        cx.simulate_prompt_answer(FORCE_DELETE_BRANCH_ANSWER);
+        cx.run_until_parked();
+
+        assert!(
+            !branch_names(&ctx, &mut cx)
+                .await
+                .iter()
+                .any(|name| name == "feature-auth"),
+            "\"{FORCE_DELETE_BRANCH_ANSWER}\" must force delete the branch"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_unmerged_branch_cancel_keeps_branch(cx: &mut TestAppContext) {
+        let (ctx, mut cx) = init_delete_branch_test("feature-auth", cx).await;
+
+        cx.update(|window, cx| run_delete_branch(ctx.clone(), "feature-auth".into(), window, cx));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(
+            !cx.has_pending_prompt(),
+            "cancelling must not chain into the raw git error prompt"
+        );
+
+        assert!(
+            branch_names(&ctx, &mut cx)
+                .await
+                .iter()
+                .any(|name| name == "feature-auth"),
+            "cancelling must leave the branch in place"
+        );
+    }
 }

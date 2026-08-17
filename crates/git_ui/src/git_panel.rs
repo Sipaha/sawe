@@ -3,6 +3,7 @@ use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
+use crate::panel_buttons::{panel_button, panel_filled_button, panel_icon_button};
 use crate::pre_commit;
 use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
@@ -47,7 +48,6 @@ use language::{Buffer, File};
 use menu;
 use multi_buffer::ExcerptBoundaryInfo;
 use notifications::status_toast::StatusToast;
-use crate::panel_buttons::{panel_button, panel_filled_button, panel_icon_button};
 use panel::PanelHeader;
 use project::git_store::GitAccess;
 use project::{
@@ -1485,8 +1485,15 @@ impl GitPanel {
                 .clone();
             let repository = self.active_repository.clone()?;
 
-            SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), mode, window, cx)
-                .detach_and_notify_err(self.workspace.clone(), window, cx);
+            SoloDiffView::open_or_focus(
+                entry,
+                repository,
+                self.workspace.clone(),
+                mode,
+                window,
+                cx,
+            )
+            .detach_and_notify_err(self.workspace.clone(), window, cx);
 
             Some(())
         });
@@ -5734,8 +5741,14 @@ impl GitPanel {
         let log_order = LogOrder::DateOrder;
 
         self.commit_history_shas = Some(active_repository.update(cx, |repository, cx| {
-            let response =
-                repository.graph_data(log_source, log_order, Vec::new(), Vec::new(), 0..usize::MAX, cx);
+            let response = repository.graph_data(
+                log_source,
+                log_order,
+                Vec::new(),
+                Vec::new(),
+                0..usize::MAX,
+                cx,
+            );
             response.commits.iter().map(|commit| commit.sha).collect()
         }));
     }
@@ -8040,7 +8053,7 @@ fn rpc_error_raw_message_from_chain(error: &anyhow::Error) -> Option<&str> {
         .find_map(|cause| cause.downcast_ref::<RpcError>().map(RpcError::raw_message))
 }
 
-fn format_git_error_toast_message(error: &anyhow::Error) -> String {
+pub(crate) fn format_git_error_toast_message(error: &anyhow::Error) -> String {
     if let Some(message) = rpc_error_raw_message_from_chain(error) {
         message.trim().to_string()
     } else {

@@ -36,6 +36,9 @@ pub mod tree;
 // `context_menu` references `super::{SetUpstreamModal, RenameBranchPopupModal}`.
 pub use popup::{BranchesPopup, BranchesPopupOpen, RenameBranchPopupModal, SetUpstreamModal};
 
+use crate::handlers::branch::{
+    FORCE_DELETE_BRANCH_ANSWER, ForceDeleteDecision, force_delete_decision,
+};
 use crate::{branch_picker, git_panel::show_error_toast};
 
 actions!(
@@ -109,8 +112,8 @@ pub fn open(
 ) {
     let workspace_handle = workspace.weak_handle();
     let project = workspace.project().clone();
-    let repository = active_member_repository(&project, cx)
-        .or_else(|| project.read(cx).active_repository(cx));
+    let repository =
+        active_member_repository(&project, cx).or_else(|| project.read(cx).active_repository(cx));
 
     workspace.toggle_modal(window, cx, |window, cx| {
         BranchList::new(
@@ -707,47 +710,11 @@ enum PickerState {
     NewBranch,
 }
 
-fn delete_branch_command(is_remote: bool, branch_name: &str, force: bool) -> String {
+pub(crate) fn delete_branch_command(is_remote: bool, branch_name: &str, force: bool) -> String {
     format!(
         "branch {} {branch_name}",
         delete_branch_flag(is_remote, force)
     )
-}
-
-struct BranchDeleteForceDeletePrompt {
-    required_error_substrings: &'static [&'static str],
-    message: fn(&str) -> String,
-}
-
-impl BranchDeleteForceDeletePrompt {
-    fn matches(&self, normalized_error_message: &str) -> bool {
-        self.required_error_substrings
-            .iter()
-            .all(|substring| normalized_error_message.contains(substring))
-    }
-}
-
-const BRANCH_DELETE_FORCE_DELETE_PROMPTS: &[BranchDeleteForceDeletePrompt] =
-    &[BranchDeleteForceDeletePrompt {
-        required_error_substrings: &["not fully merged"],
-        message: unmerged_branch_force_delete_prompt,
-    }];
-
-fn unmerged_branch_force_delete_prompt(branch_name: &str) -> String {
-    format!("Branch \"{branch_name}\" is not fully merged. Force delete it?")
-}
-
-// Git only reports these cases via localized stderr, so this best-effort check
-// may miss some locales and fall back to the raw error toast.
-fn force_delete_prompt_for_branch_delete_error(
-    error: &anyhow::Error,
-    branch_name: &str,
-) -> Option<String> {
-    let normalized_error_message = error.to_string().to_lowercase();
-    BRANCH_DELETE_FORCE_DELETE_PROMPTS
-        .iter()
-        .find(|prompt| prompt.matches(&normalized_error_message))
-        .map(|prompt| (prompt.message)(branch_name))
 }
 
 struct DeleteBranchTooltip {
@@ -985,6 +952,7 @@ impl BranchListDelegate {
         };
 
         let workspace = self.workspace.clone();
+        let work_dir = repo.read(cx).work_directory_abs_path.to_path_buf();
 
         cx.spawn_in(window, async move |picker, cx| {
             let Entry::Branch { branch, .. } = &entry else {
@@ -1013,37 +981,43 @@ impl BranchListDelegate {
                         log::error!("Failed to delete branch: {error}");
                     }
 
-                    let force_delete_prompt = (!force)
-                        .then(|| force_delete_prompt_for_branch_delete_error(&error, entry.name()))
-                        .flatten();
-
-                    if let Some(prompt_message) = force_delete_prompt {
-                        let answer = cx.update(|window, cx| {
-                            window.prompt(
-                                PromptLevel::Warning,
-                                &prompt_message,
-                                None,
-                                &["Force Delete", "Cancel"],
-                                cx,
-                            )
-                        })?;
-
-                        if answer.await != Ok(0) {
-                            return Ok(());
-                        }
-
-                        let retry = repo
-                            .update(cx, |repo, _| {
-                                repo.delete_branch(is_remote, branch_name, true)
-                            })
-                            .await?;
-
-                        if let Err(error) = &retry {
-                            log::error!("Failed to force delete branch: {error}");
-                        }
-                        (retry, true)
+                    let decision = if force {
+                        ForceDeleteDecision::NotApplicable
                     } else {
-                        (Err(error), force)
+                        force_delete_decision(&error, Some(&work_dir), entry.name())
+                    };
+
+                    match decision {
+                        ForceDeleteDecision::Offer { warning } => {
+                            let answer = cx.update(|window, cx| {
+                                window.prompt(
+                                    PromptLevel::Warning,
+                                    &warning,
+                                    None,
+                                    &[FORCE_DELETE_BRANCH_ANSWER, "Cancel"],
+                                    cx,
+                                )
+                            })?;
+
+                            if answer.await != Ok(0) {
+                                return Ok(());
+                            }
+
+                            let retry = repo
+                                .update(cx, |repo, _| {
+                                    repo.delete_branch(is_remote, branch_name, true)
+                                })
+                                .await?;
+
+                            if let Err(error) = &retry {
+                                log::error!("Failed to force delete branch: {error}");
+                            }
+                            (retry, true)
+                        }
+                        ForceDeleteDecision::Forbidden { message } => {
+                            (Err(anyhow::anyhow!(message)), force)
+                        }
+                        ForceDeleteDecision::NotApplicable => (Err(error), force),
                     }
                 }
             };
@@ -2367,7 +2341,7 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.has_pending_prompt());
 
-        cx.simulate_prompt_answer("Force Delete");
+        cx.simulate_prompt_answer(FORCE_DELETE_BRANCH_ANSWER);
         cx.run_until_parked();
 
         let repo_branches = branch_list

@@ -4,8 +4,12 @@
 //! conflict-resolver routing), and S-PSH force push (`git::ForcePush` → the
 //! push preview dialog in force mode, i.e. `--force-with-lease`).
 
+use std::path::PathBuf;
+
 use git::operations::{DeleteBranchOp, OpRunner, RunOutcome};
-use gpui::{App, ClipboardItem, Entity, SharedString, WeakEntity, Window};
+use gpui::{
+    App, AsyncWindowContext, ClipboardItem, Entity, PromptLevel, SharedString, WeakEntity, Window,
+};
 use notifications::status_toast::StatusToast;
 use project::git_store::Repository;
 use ui::{ContextMenu, Icon, IconName, IconSize, prelude::*};
@@ -13,6 +17,10 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::branch_picker::favorites;
+use crate::git_panel::show_error_toast;
+use crate::handlers::branch::{
+    FORCE_DELETE_BRANCH_ANSWER, ForceDeleteDecision, force_delete_decision,
+};
 use crate::handlers::compare as compare_handlers;
 use crate::handlers::{merge as merge_handler, rebase as rebase_handler};
 use crate::project_diff::ProjectDiff;
@@ -114,8 +122,8 @@ pub fn build_branch_menu(
 
         if !ctx.is_head {
             let delete_ctx = ctx.clone();
-            menu = menu.entry("Delete", None, move |_window, cx| {
-                delete_branch(delete_ctx.clone(), cx);
+            menu = menu.entry("Delete", None, move |window, cx| {
+                delete_branch(delete_ctx.clone(), window, cx);
             });
         }
 
@@ -275,42 +283,143 @@ fn open_rename_modal(ctx: BranchContext, window: &mut Window, cx: &mut App) {
     }
 }
 
-fn delete_branch(ctx: BranchContext, cx: &mut App) {
+/// A branch delete that failed. `forced` records which git invocation
+/// produced `error`, so the toast can name the command the user would
+/// have to run by hand.
+pub(crate) struct FailedBranchDelete {
+    error: anyhow::Error,
+    forced: bool,
+}
+
+fn delete_branch(ctx: BranchContext, window: &mut Window, cx: &mut App) {
     let repo = ctx.repository.clone();
-    let work_dir = repo.read(cx).work_directory_abs_path.clone();
+    let work_dir = repo.read(cx).work_directory_abs_path.to_path_buf();
+    let workspace = ctx.workspace.clone();
     let branch = ctx.branch_name.clone();
-    let is_remote = ctx.is_remote;
-    if is_remote {
+    if ctx.is_remote {
         // Remote-branch delete still goes through the existing
         // `Repository::delete_branch` path — we don't backup-ref remote
         // refs, since the remote retains them.
-        cx.spawn(async move |cx| {
-            let recv =
-                repo.update(cx, |repo, _| repo.delete_branch(true, branch.to_string(), false));
-            recv.await??;
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        window
+            .spawn(cx, async move |cx| {
+                let result = repo
+                    .update(cx, |repo, _| {
+                        repo.delete_branch(true, branch.to_string(), false)
+                    })
+                    .await;
+                let error = match result {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => error,
+                    Err(_) => anyhow::anyhow!("delete branch was canceled"),
+                };
+                report_failed_delete(
+                    &workspace,
+                    &branch,
+                    true,
+                    FailedBranchDelete {
+                        error,
+                        forced: false,
+                    },
+                    cx,
+                );
+            })
+            .detach();
         return;
     }
 
-    // Local branch: route through `OpRunner` so we get a backup-ref
-    // before the delete. Force-delete confirmation modal is owned by
-    // S-DST; for now we attempt non-force `-d` and the caller surfaces
-    // any "not fully merged" error.
-    let work_dir_buf = work_dir.to_path_buf();
-    let branch_string = branch.to_string();
-    cx.background_spawn(async move {
-        OpRunner::run(
-            DeleteBranchOp {
-                name: branch_string,
-                force: false,
-            },
-            &work_dir_buf,
-        )
+    window
+        .spawn(cx, async move |cx| {
+            if let Err(failure) =
+                delete_local_branch_offering_force(work_dir, branch.to_string(), cx).await
+            {
+                report_failed_delete(&workspace, &branch, false, failure, cx);
+            }
+        })
+        .detach();
+}
+
+/// Delete a local branch through [`OpRunner`] (so a backup ref / undo
+/// entry is registered), and when git refuses because the branch is not
+/// fully merged, warn and offer [`FORCE_DELETE_BRANCH_ANSWER`]. The
+/// retry goes through `OpRunner` too — the forced variant is the lossy
+/// one, so it is the one that most needs the backup ref.
+pub(crate) async fn delete_local_branch_offering_force(
+    work_dir: PathBuf,
+    branch: String,
+    cx: &mut AsyncWindowContext,
+) -> Result<(), FailedBranchDelete> {
+    let error = match run_delete_branch_op(work_dir.clone(), branch.clone(), false, cx).await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    let warning = match force_delete_decision(&error, Some(&work_dir), &branch) {
+        ForceDeleteDecision::NotApplicable => {
+            return Err(FailedBranchDelete {
+                error,
+                forced: false,
+            });
+        }
+        ForceDeleteDecision::Forbidden { message } => {
+            return Err(FailedBranchDelete {
+                error: anyhow::anyhow!(message),
+                forced: true,
+            });
+        }
+        ForceDeleteDecision::Offer { warning } => warning,
+    };
+
+    let answer = cx
+        .update(|window, cx| {
+            window.prompt(
+                PromptLevel::Warning,
+                &warning,
+                None,
+                &[FORCE_DELETE_BRANCH_ANSWER, "Cancel"],
+                cx,
+            )
+        })
+        .map_err(|error| FailedBranchDelete {
+            error,
+            forced: false,
+        })?;
+    if answer.await != Ok(0) {
+        return Ok(());
+    }
+
+    run_delete_branch_op(work_dir, branch, true, cx)
+        .await
+        .map_err(|error| FailedBranchDelete {
+            error,
+            forced: true,
+        })
+}
+
+async fn run_delete_branch_op(
+    work_dir: PathBuf,
+    name: String,
+    force: bool,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<()> {
+    cx.background_spawn(async move { OpRunner::run(DeleteBranchOp { name, force }, &work_dir) })
+        .await
+}
+
+fn report_failed_delete(
+    workspace: &WeakEntity<Workspace>,
+    branch: &SharedString,
+    is_remote: bool,
+    failure: FailedBranchDelete,
+    cx: &mut AsyncWindowContext,
+) {
+    let FailedBranchDelete { error, forced } = failure;
+    log::error!("Failed to delete branch {branch}: {error}");
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    let command = super::delete_branch_command(is_remote, branch, forced);
+    cx.update(|_window, cx| show_error_toast(workspace, command, error, cx))
         .log_err();
-    })
-    .detach();
 }
 
 fn toggle_favorite(ctx: BranchContext, cx: &mut App) {
@@ -461,7 +570,7 @@ fn run_merge(ctx: BranchContext, window: &mut Window, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn classify_completed_is_done() {
@@ -492,6 +601,122 @@ mod tests {
             classify_result(&result),
             PostOp::Failed("rebase failed: nope".into())
         );
+    }
+
+    /// `OpRunner` shells out to the real `git` binary, so the Branches
+    /// popup delete path can't be driven through `FakeFs` — these tests
+    /// build a throwaway repository on disk instead.
+    #[allow(clippy::disallowed_methods)]
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@x")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@x")
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "`git {}` failed", args.join(" "));
+    }
+
+    /// Repository on `main` with an `unmerged` branch carrying a commit
+    /// that `main` does not contain, so `git branch -d unmerged` fails.
+    fn repo_with_unmerged_branch() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        git(path, &["init", "-q", "-b", "main"]);
+        std::fs::write(path.join("a.txt"), "a").expect("write a.txt");
+        git(path, &["add", "."]);
+        git(path, &["commit", "-qm", "init"]);
+        git(path, &["checkout", "-q", "-b", "unmerged"]);
+        std::fs::write(path.join("b.txt"), "b").expect("write b.txt");
+        git(path, &["add", "."]);
+        git(path, &["commit", "-qm", "unmerged work"]);
+        git(path, &["checkout", "-q", "main"]);
+        dir
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn local_branches(dir: &Path) -> Vec<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+            .output()
+            .expect("spawn git for-each-ref");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    fn start_delete(dir: &Path, branch: &str, cx: &mut gpui::VisualTestContext) {
+        let work_dir = dir.to_path_buf();
+        let branch = branch.to_string();
+        cx.update(|window, cx| {
+            window
+                .spawn(cx, async move |cx| {
+                    delete_local_branch_offering_force(work_dir, branch, cx)
+                        .await
+                        .map_err(|failure| failure.error)
+                        .log_err();
+                })
+                .detach();
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_unmerged_branch_offers_delete_anyway(cx: &mut gpui::TestAppContext) {
+        let repo = repo_with_unmerged_branch();
+        let cx = cx.add_empty_window();
+
+        start_delete(repo.path(), "unmerged", cx);
+        cx.run_until_parked();
+        assert!(
+            cx.has_pending_prompt(),
+            "an unmerged branch delete must warn instead of only logging git's stderr"
+        );
+
+        cx.simulate_prompt_answer(FORCE_DELETE_BRANCH_ANSWER);
+        cx.run_until_parked();
+
+        assert!(
+            !local_branches(repo.path()).iter().any(|b| b == "unmerged"),
+            "\"{FORCE_DELETE_BRANCH_ANSWER}\" must force delete the branch"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_unmerged_branch_cancel_keeps_branch(cx: &mut gpui::TestAppContext) {
+        let repo = repo_with_unmerged_branch();
+        let cx = cx.add_empty_window();
+
+        start_delete(repo.path(), "unmerged", cx);
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert!(
+            local_branches(repo.path()).iter().any(|b| b == "unmerged"),
+            "cancelling must leave the branch in place"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_merged_branch_needs_no_prompt(cx: &mut gpui::TestAppContext) {
+        let repo = repo_with_unmerged_branch();
+        git(repo.path(), &["branch", "merged"]);
+        let cx = cx.add_empty_window();
+
+        start_delete(repo.path(), "merged", cx);
+        cx.run_until_parked();
+
+        assert!(!cx.has_pending_prompt());
+        assert!(!local_branches(repo.path()).iter().any(|b| b == "merged"));
     }
 
     #[test]
