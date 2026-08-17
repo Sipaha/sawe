@@ -52,12 +52,125 @@ const ZOOM_STEP: f32 = 1.1;
 const SCROLL_LINE_MULTIPLIER: f32 = 20.0;
 const BASE_SQUARE_SIZE: f32 = 32.0;
 
+/// Zoom/pan state of an image view.
+///
+/// `fit_to_window` is a persistent *mode*, not a one-shot zoom: while it is set the
+/// displayed zoom is re-derived from the current container bounds on every layout, so
+/// resizing the pane keeps the image fitted. Any explicit zoom leaves the mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ZoomState {
+    level: f32,
+    pan_offset: Point<Pixels>,
+    fit_to_window: bool,
+}
+
+impl Default for ZoomState {
+    fn default() -> Self {
+        Self {
+            level: 1.0,
+            pan_offset: Point::default(),
+            fit_to_window: true,
+        }
+    }
+}
+
+impl ZoomState {
+    /// The zoom that fits `image_size` inside `container_bounds`. The same factor is
+    /// applied to both axes so the aspect ratio is preserved, and it is capped at 1.0 so
+    /// a small image is never blown up.
+    fn fit_zoom(container_bounds: Bounds<Pixels>, image_size: (u32, u32)) -> f32 {
+        let (image_width, image_height) = image_size;
+        if image_width == 0 || image_height == 0 {
+            return 1.0;
+        }
+        let container_width: f32 = container_bounds.size.width.into();
+        let container_height: f32 = container_bounds.size.height.into();
+        let scale_x = container_width / image_width as f32;
+        let scale_y = container_height / image_height as f32;
+        scale_x.min(scale_y).min(1.0).clamp(MIN_ZOOM, MAX_ZOOM)
+    }
+
+    /// The zoom to render with at `container_bounds`, re-fitting when the mode is active.
+    fn level_for_layout(
+        &self,
+        container_bounds: Bounds<Pixels>,
+        image_size: Option<(u32, u32)>,
+    ) -> f32 {
+        match image_size {
+            Some(image_size) if self.fit_to_window => Self::fit_zoom(container_bounds, image_size),
+            _ => self.level,
+        }
+    }
+
+    /// Adopts the zoom that a layout at `container_bounds` actually renders with, so the
+    /// toolbar readout and relative zoom steps start from the fitted level instead of a
+    /// stale one. Returns whether the level changed, i.e. whether observers need a notify.
+    fn adopt_layout_level(
+        &mut self,
+        container_bounds: Bounds<Pixels>,
+        image_size: Option<(u32, u32)>,
+    ) -> bool {
+        let level = self.level_for_layout(container_bounds, image_size);
+        let changed = self.level != level;
+        self.level = level;
+        changed
+    }
+
+    fn set_level(
+        &mut self,
+        new_level: f32,
+        zoom_center: Option<Point<Pixels>>,
+        container_bounds: Option<Bounds<Pixels>>,
+    ) {
+        let old_level = self.level;
+        self.level = new_level.clamp(MIN_ZOOM, MAX_ZOOM);
+        self.fit_to_window = false;
+
+        if let Some((center, bounds)) = zoom_center.zip(container_bounds) {
+            let relative_center = point(
+                center.x - bounds.origin.x - bounds.size.width / 2.0,
+                center.y - bounds.origin.y - bounds.size.height / 2.0,
+            );
+
+            let mouse_offset_from_image = relative_center - self.pan_offset;
+            let zoom_ratio = self.level / old_level;
+
+            self.pan_offset += mouse_offset_from_image * (1.0 - zoom_ratio);
+        }
+    }
+
+    fn set_actual_size(&mut self) {
+        self.level = 1.0;
+        self.pan_offset = Point::default();
+        self.fit_to_window = false;
+    }
+
+    fn enable_fit_to_window(
+        &mut self,
+        container_bounds: Option<Bounds<Pixels>>,
+        image_size: Option<(u32, u32)>,
+    ) {
+        self.fit_to_window = true;
+        self.pan_offset = Point::default();
+        if let Some((bounds, image_size)) = container_bounds.zip(image_size) {
+            self.level = Self::fit_zoom(bounds, image_size);
+        }
+    }
+
+    /// Whether the image is already shown at its true size. A non-zero pan counts as "not
+    /// actual size" because going to actual size also re-centres. Fit mode does not: a
+    /// small image fitted at 1.0 *is* displayed at its true size, so the control that
+    /// would take it there has nothing left to do.
+    fn is_at_actual_size(&self) -> bool {
+        self.level == 1.0 && self.pan_offset == Point::default()
+    }
+}
+
 pub struct ImageView {
     image_item: Entity<ImageItem>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
-    zoom_level: f32,
-    pan_offset: Point<Pixels>,
+    zoom: ZoomState,
     last_mouse_position: Option<Point<Pixels>>,
     container_bounds: Option<Bounds<Pixels>>,
     image_size: Option<(u32, u32)>,
@@ -99,8 +212,7 @@ impl ImageView {
             image_item,
             project,
             focus_handle: cx.focus_handle(),
-            zoom_level: 1.0,
-            pan_offset: Point::default(),
+            zoom: ZoomState::default(),
             last_mouse_position: None,
             container_bounds: None,
             image_size,
@@ -130,34 +242,21 @@ impl ImageView {
     }
 
     fn zoom_in(&mut self, _: &ZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_zoom(self.zoom_level * ZOOM_STEP, None, cx);
+        self.set_zoom(self.zoom.level * ZOOM_STEP, None, cx);
     }
 
     fn zoom_out(&mut self, _: &ZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
-        self.set_zoom(self.zoom_level / ZOOM_STEP, None, cx);
+        self.set_zoom(self.zoom.level / ZOOM_STEP, None, cx);
     }
 
-    fn reset_zoom(&mut self, _: &ResetZoom, _window: &mut Window, cx: &mut Context<Self>) {
-        self.zoom_level = 1.0;
-        self.pan_offset = Point::default();
-        cx.notify();
+    fn reset_zoom(&mut self, _: &ResetZoom, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_to_actual_size(&ZoomToActualSize, window, cx);
     }
 
     fn fit_to_view(&mut self, _: &FitToView, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((bounds, image_size)) = self.container_bounds.zip(self.image_size) {
-            self.zoom_level = ImageView::compute_fit_to_view_zoom(bounds, image_size);
-            self.pan_offset = Point::default();
-            cx.notify();
-        }
-    }
-
-    fn compute_fit_to_view_zoom(container_bounds: Bounds<Pixels>, image_size: (u32, u32)) -> f32 {
-        let (image_width, image_height) = image_size;
-        let container_width: f32 = container_bounds.size.width.into();
-        let container_height: f32 = container_bounds.size.height.into();
-        let scale_x = container_width / image_width as f32;
-        let scale_y = container_height / image_height as f32;
-        scale_x.min(scale_y).min(1.0)
+        self.zoom
+            .enable_fit_to_window(self.container_bounds, self.image_size);
+        cx.notify();
     }
 
     fn zoom_to_actual_size(
@@ -166,8 +265,7 @@ impl ImageView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.zoom_level = 1.0;
-        self.pan_offset = Point::default();
+        self.zoom.set_actual_size();
         cx.notify();
     }
 
@@ -189,22 +287,8 @@ impl ImageView {
         zoom_center: Option<Point<Pixels>>,
         cx: &mut Context<Self>,
     ) {
-        let old_zoom = self.zoom_level;
-        self.zoom_level = new_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-
-        if let Some((center, bounds)) = zoom_center.zip(self.container_bounds) {
-            let relative_center = point(
-                center.x - bounds.origin.x - bounds.size.width / 2.0,
-                center.y - bounds.origin.y - bounds.size.height / 2.0,
-            );
-
-            let mouse_offset_from_image = relative_center - self.pan_offset;
-
-            let zoom_ratio = self.zoom_level / old_zoom;
-
-            self.pan_offset += mouse_offset_from_image * (1.0 - zoom_ratio);
-        }
-
+        self.zoom
+            .set_level(new_zoom, zoom_center, self.container_bounds);
         cx.notify();
     }
 
@@ -224,13 +308,13 @@ impl ImageView {
             } else {
                 1.0 / (1.0 + delta.abs() * 0.01)
             };
-            self.set_zoom(self.zoom_level * zoom_factor, Some(event.position), cx);
+            self.set_zoom(self.zoom.level * zoom_factor, Some(event.position), cx);
         } else {
             let delta = match event.delta {
                 ScrollDelta::Pixels(pixels) => pixels,
                 ScrollDelta::Lines(lines) => lines.map(|d| px(d * SCROLL_LINE_MULTIPLIER)),
             };
-            self.pan_offset += delta;
+            self.zoom.pan_offset += delta;
             cx.notify();
         }
     }
@@ -266,7 +350,7 @@ impl ImageView {
         if self.is_dragging() {
             if let Some(last_pos) = self.last_mouse_position {
                 let delta = event.position - last_pos;
-                self.pan_offset += delta;
+                self.zoom.pan_offset += delta;
             }
             self.last_mouse_position = Some(event.position);
             cx.notify();
@@ -275,7 +359,7 @@ impl ImageView {
 
     fn handle_pinch(&mut self, event: &PinchEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let zoom_factor = 1.0 + event.delta;
-        self.set_zoom(self.zoom_level * zoom_factor, Some(event.position), cx);
+        self.set_zoom(self.zoom.level * zoom_factor, Some(event.position), cx);
     }
 }
 
@@ -338,22 +422,25 @@ impl Element for ImageContentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let level_changed = self.image_view.update(cx, |this, _| {
+            this.container_bounds = Some(bounds);
+            this.zoom.adopt_layout_level(bounds, this.image_size)
+        });
+        if level_changed {
+            // `Window::invalidate_view` drops any invalidation raised while a draw is in
+            // flight, so notifying from here would never reach the toolbar and its zoom
+            // readout would keep showing the pre-resize level. Deferring lands the notify
+            // once the draw is over. This must stay guarded by `level_changed`: an
+            // unconditional notify would re-render, re-prepaint and notify again forever.
+            let image_view = self.image_view.clone();
+            cx.defer(move |cx| image_view.update(cx, |_, cx| cx.notify()));
+        }
+
         let image_view = self.image_view.read(cx);
         let image = image_view.image_item.read(cx).image.clone();
 
-        let first_layout = image_view.container_bounds.is_none();
-
-        let initial_zoom_level = first_layout
-            .then(|| {
-                image_view
-                    .image_size
-                    .map(|image_size| ImageView::compute_fit_to_view_zoom(bounds, image_size))
-            })
-            .flatten();
-
-        let zoom_level = initial_zoom_level.unwrap_or(image_view.zoom_level);
-
-        let pan_offset = image_view.pan_offset;
+        let zoom_level = image_view.zoom.level;
+        let pan_offset = image_view.zoom.pan_offset;
         let border_color = cx.theme().colors().border;
 
         let is_dragging = image_view.is_dragging();
@@ -376,13 +463,6 @@ impl Element for ImageContentElement {
             left = center_x - (scaled_width / 2.0) + pan_offset.x;
             top = center_y - (scaled_height / 2.0) + pan_offset.y;
         }
-
-        self.image_view.update(cx, |this, _| {
-            this.container_bounds = Some(bounds);
-            if let Some(initial_zoom_level) = initial_zoom_level {
-                this.zoom_level = initial_zoom_level;
-            }
-        });
 
         let mut image_content = div()
             .relative()
@@ -569,8 +649,7 @@ impl Item for ImageView {
             image_item: self.image_item.clone(),
             project: self.project.clone(),
             focus_handle: cx.focus_handle(),
-            zoom_level: self.zoom_level,
-            pan_offset: self.pan_offset,
+            zoom: self.zoom,
             last_mouse_position: None,
             container_bounds: None,
             image_size: self.image_size,
@@ -768,8 +847,8 @@ impl Render for ImageViewToolbarControls {
             return div().into_any_element();
         };
 
-        let zoom_level = image_view.read(cx).zoom_level;
-        let zoom_percentage = format!("{}%", (zoom_level * 100.0).round() as i32);
+        let zoom = image_view.read(cx).zoom;
+        let zoom_percentage = format!("{}%", (zoom.level * 100.0).round() as i32);
 
         h_flex()
             .gap_1()
@@ -789,15 +868,18 @@ impl Render for ImageViewToolbarControls {
                     }),
             )
             .child(
-                Button::new("zoom-level", zoom_percentage)
+                Button::new("actual-size", zoom_percentage)
                     .label_size(LabelSize::Small)
-                    .tooltip(|_window, cx| Tooltip::for_action("Reset Zoom", &ResetZoom, cx))
+                    .disabled(zoom.is_at_actual_size())
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action("Actual Size (1:1)", &ZoomToActualSize, cx)
+                    })
                     .on_click({
                         let image_view = image_view.downgrade();
                         move |_, window, cx| {
                             if let Some(view) = image_view.upgrade() {
                                 view.update(cx, |this, cx| {
-                                    this.reset_zoom(&ResetZoom, window, cx);
+                                    this.zoom_to_actual_size(&ZoomToActualSize, window, cx);
                                 });
                             }
                         }
@@ -821,7 +903,10 @@ impl Render for ImageViewToolbarControls {
             .child(
                 IconButton::new("fit-to-view", IconName::Maximize)
                     .icon_size(IconSize::Small)
-                    .tooltip(|_window, cx| Tooltip::for_action("Fit to View", &FitToView, cx))
+                    .toggle_state(zoom.fit_to_window)
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action("Fit Zoom to Window", &FitToView, cx)
+                    })
                     .on_click({
                         let image_view = image_view.downgrade();
                         move |_, window, cx| {
@@ -865,6 +950,162 @@ impl ToolbarItemView for ImageViewToolbarControls {
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<ImageView>(cx);
     workspace::register_serializable_item::<ImageView>(cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds(width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(width), px(height)),
+        }
+    }
+
+    #[test]
+    fn fit_to_window_is_the_default_mode() {
+        let zoom = ZoomState::default();
+        assert!(zoom.fit_to_window);
+        assert_eq!(
+            zoom.level_for_layout(bounds(400., 400.), Some((800, 800))),
+            0.5
+        );
+    }
+
+    #[test]
+    fn fit_mode_refits_when_bounds_change() {
+        let mut zoom = ZoomState::default();
+        let image_size = Some((800, 800));
+
+        let first = zoom.level_for_layout(bounds(400., 400.), image_size);
+        assert_eq!(first, 0.5);
+        zoom.level = first;
+
+        // A resized pane must produce a new fit without any further user interaction.
+        assert_eq!(zoom.level_for_layout(bounds(200., 200.), image_size), 0.25);
+        assert_eq!(zoom.level_for_layout(bounds(1600., 1600.), image_size), 1.0);
+    }
+
+    #[test]
+    fn explicit_zoom_clears_fit_mode() {
+        let image_size = Some((800, 800));
+        let container = bounds(400., 400.);
+
+        let mut zoom = ZoomState::default();
+        zoom.level = zoom.level_for_layout(container, image_size);
+        zoom.set_level(zoom.level * ZOOM_STEP, None, Some(container));
+        assert!(!zoom.fit_to_window);
+        // With fit mode off, a resize no longer changes the zoom.
+        assert_eq!(
+            zoom.level_for_layout(bounds(100., 100.), image_size),
+            zoom.level
+        );
+
+        let mut zoom = ZoomState::default();
+        zoom.set_actual_size();
+        assert!(!zoom.fit_to_window);
+        assert_eq!(zoom.level, 1.0);
+
+        zoom.enable_fit_to_window(Some(container), image_size);
+        assert!(zoom.fit_to_window);
+        assert_eq!(zoom.level, 0.5);
+    }
+
+    #[test]
+    fn fit_never_upscales_and_never_distorts() {
+        let image_size = (400, 200);
+
+        // A container larger than the image on both axes must stay at 1:1.
+        assert_eq!(ZoomState::fit_zoom(bounds(4000., 4000.), image_size), 1.0);
+
+        for container in [
+            bounds(200., 1000.),
+            bounds(1000., 50.),
+            bounds(37., 991.),
+            bounds(400., 200.),
+        ] {
+            let zoom = ZoomState::fit_zoom(container, image_size);
+            assert!(zoom <= 1.0, "fit upscaled to {zoom} for {container:?}");
+            assert!(zoom >= MIN_ZOOM && zoom <= MAX_ZOOM);
+
+            // Same factor on both axes => rendered box keeps the image's aspect ratio.
+            let rendered_width = image_size.0 as f32 * zoom;
+            let rendered_height = image_size.1 as f32 * zoom;
+            let image_ratio = image_size.0 as f32 / image_size.1 as f32;
+            assert!(
+                (rendered_width / rendered_height - image_ratio).abs() < 1e-5,
+                "aspect ratio changed for {container:?}"
+            );
+            let container_width: f32 = container.size.width.into();
+            let container_height: f32 = container.size.height.into();
+            assert!(
+                rendered_width <= container_width + 1e-3
+                    && rendered_height <= container_height + 1e-3
+                    || zoom == MIN_ZOOM,
+                "fitted image overflows {container:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_zoom_is_clamped_and_tolerates_a_degenerate_image() {
+        // Would fit at 0.001 without the clamp.
+        assert_eq!(ZoomState::fit_zoom(bounds(10., 10.), (10_000, 10_000)), 0.1);
+        assert_eq!(ZoomState::fit_zoom(bounds(10., 10.), (0, 0)), 1.0);
+    }
+
+    #[test]
+    fn readout_level_tracks_the_rendered_level_in_both_directions() {
+        let image_size = Some((1600, 400));
+        let mut zoom = ZoomState::default();
+
+        // Each call stands in for one layout pass; the bool is what drives the notify that
+        // refreshes the toolbar readout.
+        assert!(zoom.adopt_layout_level(bounds(1240., 900.), image_size));
+        assert_eq!(zoom.level, 0.775);
+        // Growing the pane past the image width pins the readout at 100%.
+        assert!(zoom.adopt_layout_level(bounds(1600., 900.), image_size));
+        assert_eq!(zoom.level, 1.0);
+        // And shrinking it again brings the readout back down.
+        assert!(zoom.adopt_layout_level(bounds(800., 900.), image_size));
+        assert_eq!(zoom.level, 0.5);
+
+        // Re-laying out at unchanged bounds must report "no change", otherwise fit mode
+        // would notify on every frame and redraw forever.
+        assert!(!zoom.adopt_layout_level(bounds(800., 900.), image_size));
+
+        // Outside fit mode a layout must never move the level the user chose.
+        zoom.set_level(2.0, None, None);
+        assert!(!zoom.adopt_layout_level(bounds(100., 100.), image_size));
+        assert_eq!(zoom.level, 2.0);
+    }
+
+    #[test]
+    fn actual_size_predicate() {
+        let mut zoom = ZoomState::default();
+        // A small image fitted at 1.0 is already displayed at its true size.
+        zoom.adopt_layout_level(bounds(1000., 1000.), Some((64, 64)));
+        assert!(zoom.fit_to_window);
+        assert!(zoom.is_at_actual_size());
+
+        // A large image fitted below 1.0 is not.
+        zoom.adopt_layout_level(bounds(1000., 1000.), Some((4000, 4000)));
+        assert!(!zoom.is_at_actual_size());
+
+        zoom.set_actual_size();
+        assert!(zoom.is_at_actual_size());
+
+        zoom.pan_offset += point(px(12.), px(0.));
+        assert!(
+            !zoom.is_at_actual_size(),
+            "a panned image is not at actual size: going to actual size re-centres it"
+        );
+
+        zoom.set_actual_size();
+        zoom.set_level(2.0, None, None);
+        assert!(!zoom.is_at_actual_size());
+    }
 }
 
 mod persistence {
