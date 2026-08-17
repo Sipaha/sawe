@@ -6,6 +6,9 @@
 //! [`crate::display_map::Block::Spacer`], so corresponding hunks start on the
 //! same display row; a ribbon therefore has a flat top and a sloped bottom
 //! whenever the two blocks differ in length.
+//!
+//! The same pairing answers a second question: where in the old text a block
+//! that exists only in the new text was inserted. See [`insertion_marker_rows`].
 
 use std::ops::Range;
 
@@ -19,6 +22,7 @@ use text::Bias;
 use theme::ActiveTheme;
 use util::ResultExt as _;
 
+use crate::display_map::Block;
 use crate::{DisplayPoint, DisplayRow, Editor, EditorSnapshot, EditorStyle, RowExt as _};
 
 /// Total width of the connector strip that sits between the two gutters.
@@ -225,6 +229,70 @@ pub(crate) fn connector_rows(
     }
 
     connectors
+}
+
+/// Display rows of the "before" pane at which the companion pane holds a block
+/// of lines that this pane does not have at all — an insertion.
+///
+/// The gap between the two lines is not by itself evidence of an insertion: the
+/// panes are also padded apart when the *same* unchanged text soft-wraps onto a
+/// different number of rows in the companion, and a spacer that only balances
+/// wrap rows must not be marked. So each marker is anchored on a diff hunk that
+/// is empty on this side — nothing here, lines over there — and only then
+/// snapped up to the top of the spacer that stands in for it. A hunk that also
+/// has rows here (a replacement, balanced or not) already shows its old lines in
+/// the deleted colour and gets no marker.
+pub(crate) fn insertion_marker_rows(
+    snapshot: &EditorSnapshot,
+    display_rows: Range<DisplayRow>,
+) -> Vec<DisplayRow> {
+    let spacers = snapshot
+        .blocks_in_range(display_rows.clone())
+        .filter_map(|(row, block)| match block {
+            Block::Spacer { height, .. } => Some((row, *height)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    // A spacer sitting on the last visible row is anchored by a hunk one row
+    // further down, so look one row past the viewport for hunks.
+    let buffer_start =
+        snapshot.display_point_to_point(DisplayPoint::new(display_rows.start, 0), Bias::Left);
+    let buffer_end = snapshot.display_point_to_point(
+        DisplayPoint::new(DisplayRow(display_rows.end.0.saturating_add(1)), 0),
+        Bias::Right,
+    );
+
+    let mut rows = Vec::new();
+    for hunk in snapshot
+        .buffer_snapshot()
+        .diff_hunks_in_range(buffer_start..buffer_end)
+    {
+        if !hunk.row_range.is_empty() {
+            continue;
+        }
+
+        let anchor = snapshot
+            .point_to_display_point(MultiBufferPoint::new(hunk.row_range.start.0, 0), Bias::Left);
+        if anchor.column() != 0 {
+            // The insertion point is inside a fold; there is no row boundary to
+            // draw on.
+            continue;
+        }
+
+        // The hunk anchors on the row *below* the gap, because the spacer is
+        // placed above that row. Walk back over the spacer to reach the
+        // boundary the user is looking for: the edge of the last common line.
+        let marker_row = spacers
+            .iter()
+            .find(|(row, height)| row.0 + height == anchor.row().0)
+            .map_or(anchor.row(), |(row, _)| *row);
+        if rows.last() != Some(&marker_row) {
+            rows.push(marker_row);
+        }
+    }
+
+    rows
 }
 
 fn clamp(value: Pixels, range: &Range<Pixels>) -> Pixels {

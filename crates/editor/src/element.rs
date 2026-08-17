@@ -5289,6 +5289,41 @@ impl EditorElement {
         (0.275 * line_height).floor()
     }
 
+    /// Marks, in the "before" pane of a split diff, the boundary at which the
+    /// other pane inserted lines. The hatched spacer alone reads as a neutral
+    /// gap; this is the coloured "the new block went in here" cue.
+    ///
+    /// It spans the pane rather than just its text area, because the added
+    /// hunk it refers to also colours both parts of the other pane — the
+    /// gutter strip and the line background.
+    fn paint_insertion_markers(&self, layout: &EditorLayout, window: &mut Window, cx: &mut App) {
+        if layout.insertion_markers.is_empty() {
+            return;
+        }
+
+        const THICKNESS: Pixels = px(2.0);
+
+        let line_height = layout.position_map.line_height;
+        let scroll_top =
+            layout.position_map.scroll_position.y * ScrollPixelOffset::from(line_height);
+        let color = cx.theme().colors().version_control_added;
+        let bounds = layout.hitbox.bounds;
+
+        window.paint_layer(bounds, |window| {
+            for row in &layout.insertion_markers {
+                let y: Pixels =
+                    (row.as_f64() * ScrollPixelOffset::from(line_height) - scroll_top).into();
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left(), bounds.top() + y),
+                        size(bounds.size.width, THICKNESS),
+                    ),
+                    color,
+                ));
+            }
+        });
+    }
+
     fn diff_hunk_bounds(
         scroll_position: gpui::Point<ScrollOffset>,
         line_height: Pixels,
@@ -8571,6 +8606,15 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    let insertion_markers = if self.split_side == Some(SplitSide::Left) {
+                        crate::split_connectors::insertion_marker_rows(
+                            &snapshot,
+                            start_row..end_row,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+
                     Self::layout_word_diff_highlights(
                         &display_hunks,
                         &row_infos,
@@ -9410,6 +9454,7 @@ impl Element for EditorElement {
                         hitbox,
                         gutter_hitbox,
                         display_hunks,
+                        insertion_markers,
                         content_origin,
                         scrollbars_layout,
                         minimap,
@@ -9529,6 +9574,8 @@ impl Element for EditorElement {
                                 self.paint_spacer_blocks(layout, window, cx);
                             });
                         }
+
+                        self.paint_insertion_markers(layout, window, cx);
 
                         if layout.gutter_hitbox.size.width > Pixels::ZERO {
                             self.paint_gutter_highlights(layout, window, cx);
@@ -9659,6 +9706,7 @@ pub struct EditorLayout {
     line_elements: SmallVec<[AnyElement; 1]>,
     line_numbers: Arc<HashMap<MultiBufferRow, LineNumberLayout>>,
     display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
+    insertion_markers: Vec<DisplayRow>,
     blamed_display_rows: Option<Vec<AnyElement>>,
     inline_diagnostics: HashMap<DisplayRow, AnyElement>,
     inline_blame_layout: Option<InlineBlameLayout>,

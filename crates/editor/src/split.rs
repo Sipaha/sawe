@@ -6661,6 +6661,224 @@ mod tests {
         );
     }
 
+    /// Replaces the single excerpt with a fresh diff and reports where the
+    /// "before" pane wants an insertion marker, together with its rendered
+    /// content so a failure shows the rows the marker is being placed among.
+    #[track_caller]
+    fn lhs_insertion_markers(
+        editor: &Entity<SplittableEditor>,
+        base_text: &str,
+        current_text: &str,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<crate::DisplayRow>, String) {
+        let (lhs_editor, _) = replace_excerpt_with_diff(editor, base_text, current_text, cx);
+        let lhs_content = editor_content_with_blocks_and_width(&lhs_editor, px(3000.), cx);
+        (markers_of(&lhs_editor, cx), lhs_content)
+    }
+
+    #[track_caller]
+    fn replace_excerpt_with_diff(
+        editor: &Entity<SplittableEditor>,
+        base_text: &str,
+        current_text: &str,
+        cx: &mut VisualTestContext,
+    ) -> (Entity<Editor>, Entity<Editor>) {
+        use rope::Point;
+
+        let (buffer, diff) = buffer_with_diff(base_text, current_text, cx);
+        editor.update(cx, |editor, cx| {
+            editor.update_excerpts_for_path(
+                PathKey::sorted(0),
+                buffer.clone(),
+                vec![Point::new(0, 0)..buffer.read(cx).max_point()],
+                0,
+                diff.clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (rhs_editor, lhs_editor) = editor.update(cx, |editor, _| {
+            let lhs = editor.lhs.as_ref().expect("should have lhs editor");
+            (editor.rhs_editor.clone(), lhs.editor.clone())
+        });
+
+        // Lay both panes out so each learns the other's row count and grows the
+        // spacers that balance them.
+        let _ = editor_content_with_blocks_and_width(&rhs_editor, px(3000.), cx);
+        let _ = editor_content_with_blocks_and_width(&lhs_editor, px(3000.), cx);
+        cx.run_until_parked();
+
+        (lhs_editor, rhs_editor)
+    }
+
+    #[track_caller]
+    fn markers_of(pane: &Entity<Editor>, cx: &mut VisualTestContext) -> Vec<crate::DisplayRow> {
+        use crate::RowExt as _;
+
+        let snapshot = pane.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+        crate::split_connectors::insertion_marker_rows(
+            &snapshot,
+            crate::DisplayRow(0)..snapshot.max_point().row().next_row(),
+        )
+    }
+
+    #[track_caller]
+    fn display_row_of(
+        pane: &Entity<Editor>,
+        buffer_row: u32,
+        cx: &mut VisualTestContext,
+    ) -> crate::DisplayRow {
+        let snapshot = pane.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+        snapshot
+            .point_to_display_point(
+                multi_buffer::MultiBufferPoint::new(buffer_row, 0),
+                text::Bias::Left,
+            )
+            .row()
+    }
+
+    /// Lines that only exist on the right leave the left pane with a neutral
+    /// hatched gap; the marker is what says the gap is an insertion, and it
+    /// belongs at the top of that gap.
+    #[gpui::test]
+    async fn test_insertion_marker_marks_the_gap_in_the_before_pane(cx: &mut gpui::TestAppContext) {
+        let (editor, mut cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+
+        let (markers, lhs_content) = lhs_insertion_markers(
+            &editor,
+            "line1\nline2\nline3\nline4\n",
+            "line1\nline1.1\nline2\nline3\nline4\n",
+            &mut cx,
+        );
+
+        assert_eq!(
+            lhs_content,
+            "§ <no file>\n§ -----\nline1\n§ spacer\nline2\nline3\nline4"
+        );
+        assert_eq!(markers, vec![crate::DisplayRow(3)], "{lhs_content}");
+    }
+
+    /// A pure deletion shows its old lines in the left pane already, and a
+    /// replacement of equal length leaves no gap at all: neither may be marked.
+    #[gpui::test]
+    async fn test_no_insertion_marker_for_deletions_or_replacements(cx: &mut gpui::TestAppContext) {
+        let (editor, mut cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+
+        let (markers, lhs_content) = lhs_insertion_markers(
+            &editor,
+            "line1\nline2\nline3\nline4\n",
+            "line1\nline3\nline4\n",
+            &mut cx,
+        );
+        assert_eq!(markers, Vec::new(), "pure deletion: {lhs_content}");
+
+        let (markers, lhs_content) = lhs_insertion_markers(
+            &editor,
+            "line1\nline2\nline3\nline4\n",
+            "line1\nLINE2\nline3\nline4\n",
+            &mut cx,
+        );
+        assert_eq!(markers, Vec::new(), "balanced replace: {lhs_content}");
+
+        // Growing a replacement does open a gap, but its old line is right
+        // there in the deleted colour, so it is not an insertion point.
+        let (markers, lhs_content) = lhs_insertion_markers(
+            &editor,
+            "line1\nline2\nline3\nline4\n",
+            "line1\nLINE2a\nLINE2b\nline3\nline4\n",
+            &mut cx,
+        );
+        assert_eq!(markers, Vec::new(), "unbalanced replace: {lhs_content}");
+    }
+
+    /// The panes are also padded apart when the same unchanged text wraps onto
+    /// a different number of rows on the other side. Those spacers are not
+    /// insertions and must stay grey.
+    #[gpui::test]
+    async fn test_no_insertion_marker_for_soft_wrap_spacers(cx: &mut gpui::TestAppContext) {
+        let (editor, mut cx) = init_test(cx, SoftWrap::EditorWidth, DiffViewStyle::Split).await;
+
+        // One inserted line near the top, and one long *unchanged* line at the
+        // bottom that the narrower pane wraps onto more rows than the wider one.
+        let long_line = "aaaa bbbb cccc dddd eeee ffff";
+        let base_text = format!("aaa\nzzz\n{long_line}\n");
+        let current_text = format!("aaa\nINSERTED\nzzz\n{long_line}\n");
+
+        let (lhs_editor, rhs_editor) =
+            replace_excerpt_with_diff(&editor, &base_text, &current_text, &mut cx);
+
+        // Settle the panes at widths that make the long line wrap differently.
+        let mut lhs_content = String::new();
+        for _ in 0..4 {
+            lhs_content = editor_content_with_blocks_and_width(&lhs_editor, px(380.), &mut cx);
+            let _ = editor_content_with_blocks_and_width(&rhs_editor, px(200.), &mut cx);
+            cx.run_until_parked();
+        }
+
+        let spacer_count = {
+            use crate::RowExt as _;
+            let snapshot =
+                lhs_editor.update_in(cx, |editor, window, cx| editor.snapshot(window, cx));
+            let max_row = snapshot.max_point().row();
+            snapshot
+                .blocks_in_range(crate::DisplayRow(0)..max_row.next_row())
+                .filter(|(_, block)| matches!(block, crate::display_map::Block::Spacer { .. }))
+                .count()
+        };
+        assert!(
+            spacer_count >= 2,
+            "the wrap difference should add a spacer of its own: {lhs_content}"
+        );
+
+        let markers = markers_of(&lhs_editor, &mut cx);
+        let zzz_row = display_row_of(&lhs_editor, 1, &mut cx);
+        assert_eq!(
+            markers,
+            vec![crate::DisplayRow(zzz_row.0 - 1)],
+            "only the inserted line may be marked: {lhs_content}"
+        );
+    }
+
+    /// The first and last line are still real boundaries: the marker has to
+    /// land on the gap there too, not on the neighbouring text row.
+    #[gpui::test]
+    async fn test_insertion_marker_at_start_and_end_of_file(cx: &mut gpui::TestAppContext) {
+        let (editor, mut cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+
+        let (markers, lhs_content) = lhs_insertion_markers(
+            &editor,
+            "line1\nline2\nline3\nline4\n",
+            "line0\nline1\nline2\nline3\nline4\n",
+            &mut cx,
+        );
+        assert_eq!(
+            lhs_content,
+            "§ <no file>\n§ -----\n§ spacer\nline1\nline2\nline3\nline4"
+        );
+        assert_eq!(
+            markers,
+            vec![crate::DisplayRow(2)],
+            "insertion above the first line: {lhs_content}"
+        );
+
+        let (markers, lhs_content) = lhs_insertion_markers(
+            &editor,
+            "line1\nline2\nline3\nline4\n",
+            "line1\nline2\nline3\nline4\nline5\n",
+            &mut cx,
+        );
+        assert_eq!(
+            lhs_content,
+            "§ <no file>\n§ -----\nline1\nline2\nline3\nline4\n§ spacer"
+        );
+        assert_eq!(
+            markers,
+            vec![crate::DisplayRow(6)],
+            "insertion below the last line: {lhs_content}"
+        );
+    }
+
     /// The live regression: dragging the split divider left the two panes
     /// painting different rows for the same unchanged line, and no amount of
     /// redrawing fixed it — only a scroll did.
