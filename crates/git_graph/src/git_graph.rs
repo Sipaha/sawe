@@ -127,7 +127,7 @@ pub mod test_support {
     }
 }
 
-use collections::{BTreeMap, HashMap};
+use collections::{BTreeMap, HashMap, HashSet};
 use editor::Editor;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
@@ -139,9 +139,9 @@ use git_ui::{commit_tooltip::CommitAvatar, commit_view::CommitView, git_status_i
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
     DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollStrategy, SharedString,
-    Subscription, Task, TextStyleRefinement, UnderlineStyle, UniformListScrollHandle, WeakEntity,
-    Window, actions, anchored, deferred, point, prelude::*, px, uniform_list,
+    MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
+    SharedString, Subscription, Task, TextStyleRefinement, UnderlineStyle, UniformListScrollHandle,
+    WeakEntity, Window, actions, anchored, deferred, point, prelude::*, px, relative, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
@@ -162,7 +162,7 @@ use std::{
     ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
@@ -211,7 +211,9 @@ const DESCRIPTION_COLUMN_IDX: usize = 0;
 // one of the same width — keeps the same visual weight as the dots.
 const LINE_WIDTH: Pixels = px(2.0);
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
-const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
+/// Settle time before the detail sidebar asks git which branches contain the
+/// selected commit — see the call site in [`GitGraph::select_entry`].
+const BRANCHES_CONTAINING_DEBOUNCE: Duration = Duration::from_millis(150);
 // Extra vertical breathing room added to the UI line height when computing
 // the git graph's row height, so commit dots and lines have space around them.
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
@@ -222,26 +224,6 @@ const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 /// still search commit messages.
 fn is_hash_like(text: &str) -> bool {
     (7..=40).contains(&text.len()) && text.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-struct CopiedState {
-    copied_at: Option<Instant>,
-}
-
-impl CopiedState {
-    fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
-        Self { copied_at: None }
-    }
-
-    fn is_copied(&self) -> bool {
-        self.copied_at
-            .map(|t| t.elapsed() < COPIED_STATE_DURATION)
-            .unwrap_or(false)
-    }
-
-    fn mark_copied(&mut self) {
-        self.copied_at = Some(Instant::now());
-    }
 }
 
 struct DraggedSplitHandle;
@@ -255,7 +237,7 @@ struct ChangedFileEntry {
 }
 
 impl ChangedFileEntry {
-    fn from_commit_file(file: &CommitFile, _cx: &App) -> Self {
+    fn from_commit_file(file: &CommitFile) -> Self {
         let file_name: SharedString = file
             .path
             .file_name()
@@ -306,6 +288,18 @@ impl ChangedFileEntry {
         );
     }
 
+    /// Full repo-relative path, used for tooltips and the copy-path menu.
+    fn display_path(&self) -> SharedString {
+        if self.dir_path.is_empty() {
+            self.file_name.clone()
+        } else {
+            format!("{}/{}", self.dir_path, self.file_name).into()
+        }
+    }
+
+    /// A file row of the changed-files tree. The directory is carried by the
+    /// header row above, so the row itself only shows the file name — the
+    /// panel is narrow and IDEA's tree does the same.
     fn render(
         &self,
         ix: usize,
@@ -316,10 +310,11 @@ impl ChangedFileEntry {
         _cx: &App,
     ) -> AnyElement {
         let file_name = self.file_name.clone();
-        let dir_path = self.dir_path.clone();
+        let full_path = self.display_path();
 
         div()
             .w_full()
+            .pl_4()
             .on_mouse_down(MouseButton::Right, {
                 let repo_path = self.repo_path.clone();
                 move |event: &MouseDownEvent, window, cx| {
@@ -345,26 +340,10 @@ impl ChangedFileEntry {
                             .gap_1()
                             .overflow_hidden()
                             .child(git_status_icon(self.status))
-                            .child(
-                                Label::new(file_name.clone())
-                                    .size(LabelSize::Small)
-                                    .truncate(),
-                            )
-                            .when(!dir_path.is_empty(), |this| {
-                                this.child(
-                                    Label::new(dir_path.clone())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .truncate_start(),
-                                )
-                            }),
+                            .child(Label::new(file_name).size(LabelSize::Small).truncate()),
                     )
                     .tooltip({
-                        let meta = if dir_path.is_empty() {
-                            file_name
-                        } else {
-                            format!("{}/{}", dir_path, file_name).into()
-                        };
+                        let meta = full_path;
                         move |_, cx| Tooltip::with_meta("View Changes", None, meta.clone(), cx)
                     })
                     .on_click({
@@ -376,6 +355,221 @@ impl ChangedFileEntry {
             )
             .into_any_element()
     }
+}
+
+/// One row of the sidebar's changed-files tree. IDEA renders the commit's
+/// files grouped under their directory rather than as a flat list of
+/// `name  dir/path` pairs; a directory chain with a single child is compacted
+/// into one header (`docs/plans/completed`) instead of nesting a row per path
+/// component.
+#[derive(Clone)]
+enum ChangedFileRow {
+    Directory {
+        /// Raw directory path — the key into `collapsed_changed_dirs`. Empty
+        /// for files sitting at the repository root.
+        key: SharedString,
+        /// What the row shows: the directory path, or the repository name for
+        /// the root group.
+        label: SharedString,
+        file_count: usize,
+        collapsed: bool,
+    },
+    File(ChangedFileEntry),
+}
+
+/// Flatten a commit's changed files into directory-grouped rows. Files under a
+/// collapsed directory are dropped, but its header keeps the full count so the
+/// user can see how much is hidden.
+fn build_changed_file_rows(
+    entries: &[ChangedFileEntry],
+    root_label: &SharedString,
+    collapsed: &HashSet<SharedString>,
+) -> Vec<ChangedFileRow> {
+    let mut by_directory: BTreeMap<SharedString, Vec<&ChangedFileEntry>> = BTreeMap::new();
+    for entry in entries {
+        by_directory
+            .entry(entry.dir_path.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let mut rows = Vec::new();
+    for (directory, mut files) in by_directory {
+        files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+        let is_collapsed = collapsed.contains(&directory);
+        rows.push(ChangedFileRow::Directory {
+            key: directory.clone(),
+            label: if directory.is_empty() {
+                root_label.clone()
+            } else {
+                directory
+            },
+            file_count: files.len(),
+            collapsed: is_collapsed,
+        });
+        if !is_collapsed {
+            rows.extend(files.into_iter().cloned().map(ChangedFileRow::File));
+        }
+    }
+    rows
+}
+
+/// Header row of one directory group in the changed-files tree. Clicking it
+/// collapses / expands the group.
+fn render_changed_directory_row(
+    ix: usize,
+    key: SharedString,
+    label: SharedString,
+    file_count: usize,
+    collapsed: bool,
+    graph: WeakEntity<GitGraph>,
+) -> AnyElement {
+    let tooltip_label = label.clone();
+    ButtonLike::new(("changed-dir", ix))
+        .child(
+            h_flex()
+                .min_w_0()
+                .w_full()
+                .gap_1()
+                .overflow_hidden()
+                // A plain chevron rather than a `Disclosure`: that renders as
+                // an `IconButton`, and a nested button inside the row's own
+                // `ButtonLike` both muddies the click target and makes the row
+                // taller than a file row — `uniform_list` sizes every row from
+                // the first one, so the two must match exactly.
+                .child(
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+                )
+                .child(
+                    Icon::new(IconName::Folder)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(label).size(LabelSize::Small).truncate_start())
+                .child(
+                    Label::new(format!(
+                        "{file_count} {}",
+                        if file_count == 1 { "file" } else { "files" }
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                ),
+        )
+        .tooltip(move |_, cx| Tooltip::simple(tooltip_label.clone(), cx))
+        .on_click(move |_, _, cx| {
+            graph
+                .update(cx, |graph, cx| {
+                    graph.toggle_changed_directory(&key, cx);
+                })
+                .ok();
+        })
+        .into_any_element()
+}
+
+/// Branches containing the selected commit, tagged with the sha they were
+/// resolved for. `branches` stays `None` until `git branch --contains`
+/// returns, so the sidebar can tell "still loading" from "no branch".
+struct CommitBranches {
+    sha: Oid,
+    branches: Option<Vec<SharedString>>,
+}
+
+/// How many branch names the "In N branches" line spells out before it
+/// collapses the rest into a count. A commit on a long-lived branch of a busy
+/// repository can be contained in hundreds of them.
+const MAX_LISTED_BRANCHES: usize = 5;
+
+/// IDEA's `In 1 branch: main` / `In 12 branches: a, b, … and 7 more` line.
+/// `None` when the commit is not on any branch (the line is then omitted
+/// rather than rendered empty).
+fn format_branches_containing(branches: &[SharedString]) -> Option<String> {
+    if branches.is_empty() {
+        return None;
+    }
+    let prefix = if branches.len() == 1 {
+        "In 1 branch: ".to_string()
+    } else {
+        format!("In {} branches: ", branches.len())
+    };
+    let listed = branches
+        .iter()
+        .take(MAX_LISTED_BRANCHES)
+        .map(|branch| branch.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hidden = branches.len().saturating_sub(MAX_LISTED_BRANCHES);
+    if hidden == 0 {
+        Some(format!("{prefix}{listed}"))
+    } else {
+        Some(format!("{prefix}{listed} and {hidden} more"))
+    }
+}
+
+/// Split a raw commit message into its subject (first line) and body. The
+/// blank line git puts between them is dropped, as is trailing whitespace —
+/// otherwise the sidebar renders a run of empty lines under short messages.
+fn split_commit_message(message: &str) -> (SharedString, SharedString) {
+    let mut lines = message.lines();
+    let subject = lines.next().unwrap_or_default().trim_end().to_string();
+    let body = lines
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_matches(|c: char| c == '\n' || c == '\r')
+        .trim_end()
+        .to_string();
+    (subject.into(), body.into())
+}
+
+/// Escape the CommonMark inline markers that could turn an author name into
+/// formatting. Only the markers that can *start* an inline construct are
+/// escaped — over-escaping would show up verbatim in the text the user copies
+/// out of the sidebar, since `markdown::Copy` copies from the source.
+fn escape_markdown_inline(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+/// The markdown source of IDEA's identity line:
+/// `550e4c28 antivanov <anton.ivanov@citeck.ru> on 14 Aug 2026 at 06:24`.
+/// The email is a real `mailto:` link; the rest is plain text so the whole
+/// line stays selectable as one run.
+fn commit_identity_source(
+    short_sha: &str,
+    author_name: &str,
+    author_email: &str,
+    timestamp: Option<i64>,
+) -> SharedString {
+    let mut source = escape_markdown_inline(short_sha);
+    if !author_name.is_empty() {
+        source.push(' ');
+        source.push_str(&escape_markdown_inline(author_name));
+    }
+    if !author_email.is_empty() {
+        // The angle brackets are escaped and sit *outside* the link so the
+        // parser cannot read them as an HTML tag or a nested autolink.
+        source.push_str(&format!(
+            " \\<[{}](mailto:{})\\>",
+            escape_markdown_inline(author_email),
+            author_email
+        ));
+    }
+    if let Some(timestamp) = timestamp {
+        source.push_str(" on ");
+        source.push_str(&escape_markdown_inline(&format_detail_timestamp(timestamp)));
+    }
+    source.into()
 }
 
 /// The diff backing the commit-details sidebar, tagged with the commit it was
@@ -400,16 +594,21 @@ struct LoadedCommitDiff {
 }
 
 /// Selectable text of the commit-details sidebar. `ui::Label` has no selection
-/// support, so the subject / author / date are rendered as `MarkdownElement`s.
-/// The entities are cached across frames because a `Markdown` owns the user's
-/// in-progress selection — rebuilding it every frame would wipe a selection
-/// mid-drag.
+/// support, so the subject / body / identity line are rendered as
+/// `MarkdownElement`s. The entities are cached across frames because a
+/// `Markdown` owns the user's in-progress selection — rebuilding it every
+/// frame would wipe a selection mid-drag.
 #[derive(Clone)]
 struct CommitDetailText {
     sha: Oid,
     subject: Entity<Markdown>,
-    author: Entity<Markdown>,
-    date: Entity<Markdown>,
+    /// Everything after the subject line, verbatim. Parsed as plain text (only
+    /// bare URLs become links) so that the `#`, `*` and backticks commit
+    /// messages are full of are not swallowed as markdown syntax.
+    body: Entity<Markdown>,
+    /// `<short-sha> <author> <email> on <date> at <time>` — see
+    /// [`commit_identity_source`].
+    identity: Entity<Markdown>,
 }
 
 struct SearchState {
@@ -542,6 +741,29 @@ fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
         time::format_description::parse("[day] [month repr:short] [year] [hour]:[minute]")
             .unwrap_or_default()
     })
+}
+
+/// `on <date> at <time>` reads better with the two halves separated, so the
+/// detail sidebar spells the time out instead of reusing the log column's
+/// compact `[day] [month] [year] [hour]:[minute]`.
+fn detail_timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
+    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
+    FORMAT.get_or_init(|| {
+        time::format_description::parse("[day] [month repr:short] [year] at [hour]:[minute]")
+            .unwrap_or_default()
+    })
+}
+
+fn format_detail_timestamp(timestamp: i64) -> String {
+    let Ok(datetime) = OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return "Unknown".to_string();
+    };
+
+    let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    datetime
+        .to_offset(local_offset)
+        .format(detail_timestamp_format())
+        .unwrap_or_default()
 }
 
 fn format_timestamp(timestamp: i64) -> String {
@@ -1457,11 +1679,21 @@ pub struct GitGraph {
     /// `author_email`. `None` until the background fetch resolves.
     local_user_email: Option<SharedString>,
     selected_commit_diff: Option<SelectedCommitDiff>,
+    /// Branches that contain the selected commit, backing the sidebar's
+    /// "In N branches" line. Tagged with the sha it was loaded for, for the
+    /// same reason [`SelectedCommitDiff`] is.
+    selected_commit_branches: Option<CommitBranches>,
     commit_detail_text: Option<CommitDetailText>,
     _commit_diff_task: Option<Task<()>>,
+    _commit_branches_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
+    /// Directories the user collapsed in the sidebar's changed-files tree,
+    /// keyed by the raw directory path (`""` for the repository root). Reset
+    /// whenever the selection moves to another commit.
+    collapsed_changed_dirs: HashSet<SharedString>,
+    commit_message_scroll_handle: ScrollHandle,
     pending_select_sha: Option<Oid>,
 }
 
@@ -1482,8 +1714,11 @@ impl GitGraph {
         }
         self.selected_entry_idx = None;
         self.selected_commit_diff = None;
+        self.selected_commit_branches = None;
         self.commit_detail_text = None;
         self._commit_diff_task = None;
+        self._commit_branches_task = None;
+        self.collapsed_changed_dirs.clear();
         self.graph_data.clear();
         cx.emit(ItemEvent::Edit);
         cx.notify();
@@ -1946,7 +2181,9 @@ impl GitGraph {
             selected_entry_idx: None,
             hovered_entry_idx: None,
             selected_commit_diff: None,
+            selected_commit_branches: None,
             commit_detail_text: None,
+            _commit_branches_task: None,
             log_source,
             log_order,
             filters: filters::LogFilters::default(),
@@ -1957,6 +2194,8 @@ impl GitGraph {
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
+            collapsed_changed_dirs: HashSet::default(),
+            commit_message_scroll_handle: ScrollHandle::new(),
             pending_select_sha: None,
         };
 
@@ -2587,9 +2826,14 @@ impl GitGraph {
 
         self.selected_entry_idx = Some(idx);
         self.selected_commit_diff = None;
+        self.selected_commit_branches = None;
         self._commit_diff_task = None;
+        self._commit_branches_task = None;
+        self.collapsed_changed_dirs.clear();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
+        self.commit_message_scroll_handle
+            .set_offset(point(px(0.), px(0.)));
         self.table_interaction_state.update(cx, |state, cx| {
             state.scroll_handle.scroll_to_item(idx, scroll_strategy);
             cx.notify();
@@ -2639,6 +2883,50 @@ impl GitGraph {
                         lines_added,
                         lines_removed,
                     });
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+
+        self.selected_commit_branches = Some(CommitBranches {
+            sha,
+            branches: None,
+        });
+        self._commit_branches_task = Some(cx.spawn(async move |this, cx| {
+            // Arrow-keying down the log would otherwise queue one
+            // `git branch --contains` per row onto the repository's job queue,
+            // ahead of the diff load the sidebar actually shows first. Dropping
+            // this task on the next selection cancels the pending query.
+            cx.background_executor()
+                .timer(BRANCHES_CONTAINING_DEBOUNCE)
+                .await;
+            let Some(receiver) = this
+                .update(cx, |this, cx| {
+                    this.get_repository(cx).map(|repo| {
+                        repo.update(cx, |repo, _| repo.branches_containing(sha.to_string()))
+                    })
+                })
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            let branches = match receiver.await {
+                Ok(Ok(branches)) => branches,
+                Ok(Err(error)) => {
+                    log::warn!("listing branches containing {sha} failed: {error:#}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            this.update(cx, |this, cx| {
+                if let Some(state) = this
+                    .selected_commit_branches
+                    .as_mut()
+                    .filter(|state| state.sha == sha)
+                {
+                    state.branches = Some(branches);
                     cx.notify();
                 }
             })
@@ -2766,6 +3054,30 @@ impl GitGraph {
         if let Ok(oid) = sha.try_into() {
             inner(self, oid, cx);
         }
+    }
+
+    fn toggle_changed_directory(&mut self, key: &SharedString, cx: &mut Context<Self>) {
+        if !self.collapsed_changed_dirs.remove(key) {
+            self.collapsed_changed_dirs.insert(key.clone());
+        }
+        cx.notify();
+    }
+
+    /// A click on a commit row. Double-click deliberately does *nothing beyond
+    /// selecting*: it used to open the synthetic `CommitView` tab, which is a
+    /// pseudo-file holding the commit description — redundant now that the
+    /// detail sidebar carries the full message, and far too easy to trigger by
+    /// accident while walking the log. The commit view is still reachable
+    /// explicitly (the sidebar's "View Commit" button, `menu::Confirm`, and the
+    /// `git_graph::OpenCommitView` action).
+    fn on_row_click(
+        &mut self,
+        index: usize,
+        _click_count: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_entry(index, ScrollStrategy::Center, cx);
     }
 
     fn open_selected_commit_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2950,12 +3262,14 @@ impl GitGraph {
         };
 
         let sha: SharedString = commit_entry.data.sha.to_string().into();
-        let subject = match repository.update(cx, |repo, cx| {
+        // The whole message, not just the subject — the sidebar now shows the
+        // body too, so copying only the first line would be surprising.
+        let (message, author_email) = match repository.update(cx, |repo, cx| {
             repo.fetch_commit_data(commit_entry.data.sha, false, cx)
                 .clone()
         }) {
-            CommitDataState::Loaded(data) => data.subject.clone(),
-            CommitDataState::Loading(_) => SharedString::default(),
+            CommitDataState::Loaded(data) => (data.message.clone(), data.author_email.clone()),
+            CommitDataState::Loading(_) => (SharedString::default(), SharedString::default()),
         };
         let permalink = repository
             .update(cx, |repo, cx| self.get_remote(repo, window, cx))
@@ -2988,11 +3302,21 @@ impl GitGraph {
                         cx.write_to_clipboard(ClipboardItem::new_string(sha.to_string()));
                     }
                 });
-            let menu = if subject.is_empty() {
+            let menu = if message.is_empty() {
                 menu
             } else {
                 menu.entry("Copy Message", None, move |_, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(subject.to_string()));
+                    cx.write_to_clipboard(ClipboardItem::new_string(message.to_string()));
+                })
+            };
+            // The author line is a selectable markdown run rather than the
+            // click-to-copy buttons it used to be, so the menu carries the
+            // one-click copy the sidebar no longer shows.
+            let menu = if author_email.is_empty() {
+                menu
+            } else {
+                menu.entry("Copy Author Email", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(author_email.to_string()));
                 })
             };
             menu.when_some(permalink, |menu, url| {
@@ -3099,8 +3423,8 @@ impl GitGraph {
         &mut self,
         sha: Oid,
         subject: SharedString,
-        author: SharedString,
-        date: SharedString,
+        body: SharedString,
+        identity: SharedString,
         cx: &mut App,
     ) -> CommitDetailText {
         if let Some(text) = self
@@ -3110,18 +3434,18 @@ impl GitGraph {
         {
             text.subject
                 .update(cx, |markdown, cx| markdown.reset(subject, cx));
-            text.author
-                .update(cx, |markdown, cx| markdown.reset(author, cx));
-            text.date
-                .update(cx, |markdown, cx| markdown.reset(date, cx));
+            text.body
+                .update(cx, |markdown, cx| markdown.reset(body, cx));
+            text.identity
+                .update(cx, |markdown, cx| markdown.reset(identity, cx));
             return text.clone();
         }
 
         let text = CommitDetailText {
             sha,
             subject: cx.new(|cx| Markdown::new_text(subject, cx)),
-            author: cx.new(|cx| Markdown::new_text(author, cx)),
-            date: cx.new(|cx| Markdown::new_text(date, cx)),
+            body: cx.new(|cx| Markdown::new_text(body, cx)),
+            identity: cx.new(|cx| Markdown::new(identity, None, None, cx)),
         };
         self.commit_detail_text = Some(text.clone());
         text
@@ -3142,6 +3466,11 @@ impl GitGraph {
         Some((entry, loaded))
     }
 
+    /// The commit-details sidebar, laid out like IDEA's: the commit's changed
+    /// files as a directory tree on top, the full commit message (subject,
+    /// body, identity line, containing branches) below it. Both regions
+    /// scroll independently, and the message region is capped so a one-line
+    /// commit does not steal half the panel from the file tree.
     fn render_commit_detail_panel(
         &mut self,
         window: &mut Window,
@@ -3154,18 +3483,16 @@ impl GitGraph {
         let changed_files_count = loaded_diff.map_or(0, |loaded| loaded.diff.files.len());
         let (total_lines_added, total_lines_removed) =
             loaded_diff.map_or((0, 0), |loaded| (loaded.lines_added, loaded.lines_removed));
-        let sorted_file_entries: Rc<Vec<ChangedFileEntry>> = Rc::new(
-            loaded_diff
-                .map(|loaded| {
-                    let mut files: Vec<_> = loaded.diff.files.iter().collect();
-                    files.sort_by_key(|file| file.status());
-                    files
-                        .into_iter()
-                        .map(|file| ChangedFileEntry::from_commit_file(file, cx))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
+        let file_entries: Vec<ChangedFileEntry> = loaded_diff
+            .map(|loaded| {
+                loaded
+                    .diff
+                    .files
+                    .iter()
+                    .map(ChangedFileEntry::from_commit_file)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let Some(repository) = self.get_repository(cx) else {
             return Empty.into_any_element();
@@ -3188,6 +3515,16 @@ impl GitGraph {
             .map(|branch| SharedString::from(branch.name().to_string()));
 
         let work_dir = repository.read(cx).work_directory_abs_path.to_path_buf();
+        let repo_label: SharedString = work_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Repository".to_string())
+            .into();
+        let file_rows: Rc<Vec<ChangedFileRow>> = Rc::new(build_changed_file_rows(
+            &file_entries,
+            &repo_label,
+            &self.collapsed_changed_dirs,
+        ));
 
         let accent_colors = cx.theme().accents();
         let accent_color = accent_colors
@@ -3196,19 +3533,20 @@ impl GitGraph {
             .copied()
             .unwrap_or_else(|| accent_colors.0.first().copied().unwrap_or_default());
 
-        // todo(git graph): We should use the full commit message here
         let (author_name, author_email, commit_timestamp, commit_message) = match &data {
             CommitDataState::Loaded(data) => (
                 data.author_name.clone(),
                 data.author_email.clone(),
                 Some(data.commit_timestamp),
-                data.subject.clone(),
+                data.message.clone(),
             ),
-            CommitDataState::Loading(_) => ("Loading…".into(), "".into(), None, "Loading…".into()),
+            CommitDataState::Loading(_) => ("".into(), "".into(), None, "Loading…".into()),
         };
 
-        let date_string = commit_timestamp.map(format_timestamp).unwrap_or_default();
         let short_sha: SharedString = commit_entry.data.sha.display_short().into();
+        let (subject, body) = split_commit_message(&commit_message);
+        let identity =
+            commit_identity_source(&short_sha, &author_name, &author_email, commit_timestamp);
 
         let remote = repository.update(cx, |repo, cx| self.get_remote(repo, window, cx));
 
@@ -3216,7 +3554,7 @@ impl GitGraph {
             let author_email_for_avatar = if author_email.is_empty() {
                 None
             } else {
-                Some(author_email.clone())
+                Some(author_email)
             };
 
             CommitAvatar::new(&full_sha, author_email_for_avatar, remote.as_ref())
@@ -3224,13 +3562,15 @@ impl GitGraph {
                 .render(window, cx)
         };
 
-        let detail_text = self.commit_detail_text(
-            commit_entry.data.sha,
-            commit_message,
-            author_name,
-            date_string.into(),
-            cx,
-        );
+        let branches_line = self
+            .selected_commit_branches
+            .as_ref()
+            .filter(|state| state.sha == commit_entry.data.sha)
+            .and_then(|state| state.branches.as_deref())
+            .and_then(format_branches_containing);
+
+        let detail_text =
+            self.commit_detail_text(commit_entry.data.sha, subject, body, identity, cx);
         let subject_style = detail_text_style(
             TextSize::Default,
             Color::Default,
@@ -3238,8 +3578,9 @@ impl GitGraph {
             window,
             cx,
         );
-        let author_style = detail_text_style(TextSize::Small, Color::Default, None, window, cx);
-        let date_style = detail_text_style(TextSize::Small, Color::Muted, None, window, cx);
+        let body_style = detail_text_style(TextSize::Small, Color::Default, None, window, cx);
+        let identity_style = detail_text_style(TextSize::Small, Color::Muted, None, window, cx);
+        let has_body = !detail_text.body.read(cx).source().is_empty();
 
         v_flex()
             .min_w(px(300.))
@@ -3255,220 +3596,23 @@ impl GitGraph {
                     cx.stop_propagation();
                 }),
             )
+            // Changed-files tree, headed by the file count and the diff stat.
             .child(
                 v_flex()
                     .relative()
-                    .w_full()
-                    .px_2()
-                    .py_1p5()
-                    .gap_1p5()
-                    .child(
-                        div().absolute().top_1().right_1().child(
-                            IconButton::new("close-detail", IconName::Close)
-                                .icon_size(IconSize::Small)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.clear_selection();
-                                    cx.notify();
-                                })),
-                        ),
-                    )
-                    // Subject — pad on the right so it doesn't run under the
-                    // absolutely-positioned close button.
-                    .child(
-                        div()
-                            .pr_5()
-                            .min_w_0()
-                            .child(MarkdownElement::new(detail_text.subject, subject_style)),
-                    )
-                    // Author identity line: avatar · short SHA (click to copy) · name.
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .items_center()
-                            .child(avatar)
-                            .child({
-                                let copy_sha = full_sha.clone();
-                                let copied_state: Entity<CopiedState> =
-                                    window.use_keyed_state("sha-copy", cx, CopiedState::new);
-                                let is_copied = copied_state.read(cx).is_copied();
-
-                                let (label_text, icon, icon_color, tooltip_label) = if is_copied {
-                                    (
-                                        SharedString::from("Copied!"),
-                                        IconName::Check,
-                                        Color::Success,
-                                        "Commit SHA Copied!",
-                                    )
-                                } else {
-                                    (short_sha, IconName::Hash, Color::Muted, "Copy Commit SHA")
-                                };
-
-                                Button::new("sha-button", label_text)
-                                    .start_icon(
-                                        Icon::new(icon).size(IconSize::Small).color(icon_color),
-                                    )
-                                    .label_size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .tooltip({
-                                        let full_sha = full_sha.clone();
-                                        move |_, cx| {
-                                            Tooltip::with_meta(
-                                                tooltip_label,
-                                                None,
-                                                full_sha.clone(),
-                                                cx,
-                                            )
-                                        }
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        copied_state.update(cx, |state, _cx| {
-                                            state.mark_copied();
-                                        });
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy_sha.to_string(),
-                                        ));
-                                        let state_id = copied_state.entity_id();
-                                        cx.spawn(async move |cx| {
-                                            cx.background_executor()
-                                                .timer(COPIED_STATE_DURATION)
-                                                .await;
-                                            cx.update(|cx| {
-                                                cx.notify(state_id);
-                                            })
-                                        })
-                                        .detach();
-                                    })
-                            })
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .child(MarkdownElement::new(detail_text.author, author_style)),
-                            ),
-                    )
-                    // Email · date line.
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .flex_wrap()
-                            .when(!author_email.is_empty(), |this| {
-                                let copied_state: Entity<CopiedState> = window.use_keyed_state(
-                                    "author-email-copy",
-                                    cx,
-                                    CopiedState::new,
-                                );
-                                let is_copied = copied_state.read(cx).is_copied();
-
-                                let (icon, icon_color, tooltip_label) = if is_copied {
-                                    (IconName::Check, Color::Success, "Email Copied!")
-                                } else {
-                                    (IconName::Envelope, Color::Muted, "Copy Email")
-                                };
-
-                                let copy_email = author_email.clone();
-                                let author_email_for_tooltip = author_email.clone();
-
-                                this.child(
-                                    Button::new("author-email-copy", author_email.clone())
-                                        .start_icon(
-                                            Icon::new(icon).size(IconSize::Small).color(icon_color),
-                                        )
-                                        .label_size(LabelSize::Small)
-                                        .truncate(true)
-                                        .color(Color::Muted)
-                                        .tooltip(move |_, cx| {
-                                            Tooltip::with_meta(
-                                                tooltip_label,
-                                                None,
-                                                author_email_for_tooltip.clone(),
-                                                cx,
-                                            )
-                                        })
-                                        .on_click(move |_, _, cx| {
-                                            copied_state.update(cx, |state, _cx| {
-                                                state.mark_copied();
-                                            });
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                copy_email.to_string(),
-                                            ));
-                                            let state_id = copied_state.entity_id();
-                                            cx.spawn(async move |cx| {
-                                                cx.background_executor()
-                                                    .timer(COPIED_STATE_DURATION)
-                                                    .await;
-                                                cx.update(|cx| {
-                                                    cx.notify(state_id);
-                                                })
-                                            })
-                                            .detach();
-                                        }),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .child(MarkdownElement::new(detail_text.date, date_style)),
-                            ),
-                    )
-                    // Ref decorations.
-                    .children((!ref_names.is_empty()).then(|| {
-                        h_flex()
-                            .gap_1()
-                            .flex_wrap()
-                            .children(ref_names.iter().map(|name| {
-                                let is_head = Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                self.render_chip(
-                                    name,
-                                    accent_color,
-                                    is_head,
-                                    Some(work_dir.as_path()),
-                                )
-                            }))
-                    }))
-                    .when_some(remote.clone(), |this, remote| {
-                        let provider_name = remote.host.name();
-                        let icon = match provider_name.as_str() {
-                            "GitHub" => IconName::Github,
-                            _ => IconName::Link,
-                        };
-                        let parsed_remote = ParsedGitRemote {
-                            owner: remote.owner.as_ref().into(),
-                            repo: remote.repo.as_ref().into(),
-                        };
-                        let params = BuildCommitPermalinkParams {
-                            sha: full_sha.as_ref(),
-                        };
-                        let url = remote
-                            .host
-                            .build_commit_permalink(&parsed_remote, params)
-                            .to_string();
-
-                        this.child(
-                            Button::new("view-on-provider", format!("View on {}", provider_name))
-                                .start_icon(
-                                    Icon::new(icon).size(IconSize::Small).color(Color::Muted),
-                                )
-                                .label_size(LabelSize::Small)
-                                .truncate(true)
-                                .color(Color::Muted)
-                                .on_click(move |_, _, cx| {
-                                    cx.open_url(&url);
-                                }),
-                        )
-                    }),
-            )
-            .child(Divider::horizontal())
-            .child(
-                v_flex()
                     .min_w_0()
-                    .p_2()
                     .flex_1()
+                    .min_h_0()
+                    .p_2()
                     .gap_1()
                     .child(
                         h_flex()
                             .gap_1()
                             .w_full()
                             .justify_between()
+                            // Pad on the right so the header does not run under
+                            // the absolutely-positioned close button.
+                            .pr_5()
                             .child(
                                 Label::new(format!(
                                     "{} Changed {}",
@@ -3489,31 +3633,54 @@ impl GitGraph {
                             )),
                     )
                     .child(
+                        div().absolute().top_1().right_1().child(
+                            IconButton::new("close-detail", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.clear_selection();
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .child(
                         div()
                             .id("changed-files-container")
                             .flex_1()
                             .min_h_0()
                             .child({
-                                let entries = sorted_file_entries;
-                                let entry_count = entries.len();
+                                let rows = file_rows;
+                                let row_count = rows.len();
                                 let commit_sha = full_sha.clone();
                                 let repository = repository.downgrade();
                                 let workspace = self.workspace.clone();
                                 let graph = cx.weak_entity();
                                 uniform_list(
                                     "changed-files-list",
-                                    entry_count,
+                                    row_count,
                                     move |range, _window, cx| {
                                         range
-                                            .map(|ix| {
-                                                entries[ix].render(
+                                            .map(|ix| match &rows[ix] {
+                                                ChangedFileRow::Directory {
+                                                    key,
+                                                    label,
+                                                    file_count,
+                                                    collapsed,
+                                                } => render_changed_directory_row(
+                                                    ix,
+                                                    key.clone(),
+                                                    label.clone(),
+                                                    *file_count,
+                                                    *collapsed,
+                                                    graph.clone(),
+                                                ),
+                                                ChangedFileRow::File(entry) => entry.render(
                                                     ix,
                                                     commit_sha.clone(),
                                                     repository.clone(),
                                                     workspace.clone(),
                                                     graph.clone(),
                                                     cx,
-                                                )
+                                                ),
                                             })
                                             .collect()
                                     },
@@ -3526,15 +3693,108 @@ impl GitGraph {
                     ),
             )
             .child(Divider::horizontal())
+            // Full commit message. Capped rather than split 50/50 so a one-line
+            // commit leaves the file tree the rest of the panel; longer
+            // messages scroll inside the cap.
             .child(
-                h_flex().p_1p5().w_full().child(
-                    Button::new("view-commit", "View Commit")
-                        .full_width()
-                        .style(ButtonStyle::OutlinedGhost)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_selected_commit_view(window, cx);
-                        })),
-                ),
+                div()
+                    .id("commit-message-region")
+                    .min_w_0()
+                    .max_h(relative(0.5))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.commit_message_scroll_handle)
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .px_2()
+                            .py_1p5()
+                            .gap_1p5()
+                            .child(
+                                div().min_w_0().child(MarkdownElement::new(
+                                    detail_text.subject,
+                                    subject_style,
+                                )),
+                            )
+                            // Ref decorations pointing *at* this commit, which
+                            // IDEA shows next to the subject.
+                            .children((!ref_names.is_empty()).then(|| {
+                                h_flex().gap_1().flex_wrap().children(ref_names.iter().map(
+                                    |name| {
+                                        let is_head =
+                                            Self::is_head_ref(name.as_ref(), &head_branch_name);
+                                        self.render_chip(
+                                            name,
+                                            accent_color,
+                                            is_head,
+                                            Some(work_dir.as_path()),
+                                        )
+                                    },
+                                ))
+                            }))
+                            .children(has_body.then(|| {
+                                div()
+                                    .min_w_0()
+                                    .child(MarkdownElement::new(detail_text.body, body_style))
+                            }))
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .items_start()
+                                    .child(div().pt_0p5().child(avatar))
+                                    .child(div().min_w_0().child(MarkdownElement::new(
+                                        detail_text.identity,
+                                        identity_style,
+                                    ))),
+                            )
+                            .children(branches_line.map(|line| {
+                                Label::new(line).size(LabelSize::Small).color(Color::Muted)
+                            })),
+                    )
+                    .vertical_scrollbar_for(&self.commit_message_scroll_handle, window, cx),
+            )
+            .child(Divider::horizontal())
+            .child(
+                h_flex()
+                    .p_1p5()
+                    .gap_1()
+                    .w_full()
+                    .child(
+                        Button::new("view-commit", "View Commit")
+                            .full_width()
+                            .style(ButtonStyle::OutlinedGhost)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_selected_commit_view(window, cx);
+                            })),
+                    )
+                    .when_some(remote.clone(), |this, remote| {
+                        let provider_name = remote.host.name();
+                        let icon = match provider_name.as_str() {
+                            "GitHub" => IconName::Github,
+                            _ => IconName::Link,
+                        };
+                        let parsed_remote = ParsedGitRemote {
+                            owner: remote.owner.as_ref().into(),
+                            repo: remote.repo.as_ref().into(),
+                        };
+                        let params = BuildCommitPermalinkParams {
+                            sha: full_sha.as_ref(),
+                        };
+                        let url = remote
+                            .host
+                            .build_commit_permalink(&parsed_remote, params)
+                            .to_string();
+
+                        this.child(
+                            IconButton::new("view-on-provider", icon)
+                                .icon_size(IconSize::Small)
+                                .tooltip(move |_, cx| {
+                                    Tooltip::simple(format!("View on {provider_name}"), cx)
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cx.open_url(&url);
+                                }),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -4042,14 +4302,12 @@ impl Render for GitGraph {
                                             move |event, window, cx| {
                                                 let click_count = event.click_count();
                                                 weak.update(cx, |this, cx| {
-                                                    this.select_entry(
+                                                    this.on_row_click(
                                                         index,
-                                                        ScrollStrategy::Center,
+                                                        click_count,
+                                                        window,
                                                         cx,
                                                     );
-                                                    if click_count >= 2 {
-                                                        this.open_commit_view(index, window, cx);
-                                                    }
                                                 })
                                                 .ok();
                                             }
@@ -7567,6 +7825,23 @@ mod tests {
         Entity<GitGraph>,
         &'a mut gpui::VisualTestContext,
     ) {
+        let (project, _workspace, git_graph, cx) =
+            setup_graph_with_workspace(fs, commits, cx).await;
+        (project, git_graph, cx)
+    }
+
+    /// As [`setup_graph_with_commits`], but also hands back the workspace so a
+    /// test can assert what the graph did (or did not) open in it.
+    async fn setup_graph_with_workspace<'a>(
+        fs: &Arc<FakeFs>,
+        commits: Vec<Arc<InitialGraphCommitData>>,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<Project>,
+        Entity<workspace::Workspace>,
+        Entity<GitGraph>,
+        &'a mut gpui::VisualTestContext,
+    ) {
         fs.insert_tree(
             Path::new("/project"),
             json!({
@@ -7589,8 +7864,8 @@ mod tests {
         let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
             workspace::MultiWorkspace::test_new(project.clone(), window, cx)
         });
-        let workspace_weak =
-            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let workspace_weak = workspace.downgrade();
         let git_graph = cx.new_window_entity(|window, cx| {
             GitGraph::new(
                 repository.read(cx).id,
@@ -7603,7 +7878,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        (project, git_graph, cx)
+        (project, workspace, git_graph, cx)
     }
 
     fn draw_graph(git_graph: &Entity<GitGraph>, cx: &mut gpui::VisualTestContext) {
@@ -7885,25 +8160,20 @@ mod tests {
         .await;
 
         let (loading, loaded, other) = git_graph.update(cx, |graph, cx| {
-            let loading = graph.commit_detail_text(
-                first_sha,
-                "Loading…".into(),
-                "Loading…".into(),
-                "".into(),
-                cx,
-            );
+            let loading =
+                graph.commit_detail_text(first_sha, "Loading…".into(), "".into(), "".into(), cx);
             let loaded = graph.commit_detail_text(
                 first_sha,
                 "Fix the thing".into(),
-                "Ada".into(),
-                "today".into(),
+                "The body\nof the message".into(),
+                "abcdef1 Ada".into(),
                 cx,
             );
             let other = graph.commit_detail_text(
                 second_sha,
                 "Older commit".into(),
-                "Grace".into(),
-                "yesterday".into(),
+                "".into(),
+                "1234567 Grace".into(),
                 cx,
             );
             (loading, loaded, other)
@@ -7917,12 +8187,212 @@ mod tests {
         loaded.subject.read_with(&*cx, |markdown, _| {
             assert_eq!(markdown.source(), "Fix the thing");
         });
+        loaded.body.read_with(&*cx, |markdown, _| {
+            assert_eq!(markdown.source(), "The body\nof the message");
+        });
         assert_ne!(
             loaded.subject.entity_id(),
             other.subject.entity_id(),
             "selecting another commit should rebuild the markdown entities"
         );
-        assert_ne!(loaded.author.entity_id(), other.author.entity_id());
-        assert_ne!(loaded.date.entity_id(), other.date.entity_id());
+        assert_ne!(loaded.body.entity_id(), other.body.entity_id());
+        assert_ne!(loaded.identity.entity_id(), other.identity.entity_id());
+    }
+
+    #[test]
+    fn test_split_commit_message() {
+        let (subject, body) = split_commit_message("Just a subject");
+        assert_eq!(subject, "Just a subject");
+        assert_eq!(body, "");
+
+        let (subject, body) =
+            split_commit_message("Subject line\n\nFirst paragraph.\n\nSecond paragraph.\n\n");
+        assert_eq!(subject, "Subject line");
+        assert_eq!(
+            body, "First paragraph.\n\nSecond paragraph.",
+            "the blank line git puts after the subject and the trailing newlines are dropped, \
+             but blank lines inside the body are kept"
+        );
+
+        let (subject, body) = split_commit_message("Subject\nBody starts immediately");
+        assert_eq!(subject, "Subject");
+        assert_eq!(body, "Body starts immediately");
+
+        let (subject, body) = split_commit_message("");
+        assert_eq!(subject, "");
+        assert_eq!(body, "");
+    }
+
+    /// The identity line is the one place the sidebar parses real markdown, so
+    /// the author name has to be escaped and the email has to come out as a
+    /// `mailto:` link with the angle brackets outside it.
+    #[test]
+    fn test_commit_identity_source() {
+        assert_eq!(
+            commit_identity_source("550e4c28", "antivanov", "anton@citeck.ru", None).as_ref(),
+            "550e4c28 antivanov \\<[anton@citeck.ru](mailto:anton@citeck.ru)\\>"
+        );
+
+        assert_eq!(
+            commit_identity_source("550e4c28", "a_b*c", "", None).as_ref(),
+            "550e4c28 a\\_b\\*c",
+            "markdown inline markers in an author name must not become formatting"
+        );
+
+        assert_eq!(
+            commit_identity_source("550e4c28", "", "", None).as_ref(),
+            "550e4c28"
+        );
+
+        let with_date = commit_identity_source("550e4c28", "Ada", "ada@example.com", Some(0));
+        assert!(
+            with_date.contains(" on "),
+            "a resolved timestamp gets an `on <date> at <time>` suffix: {with_date}"
+        );
+    }
+
+    #[test]
+    fn test_format_branches_containing() {
+        assert_eq!(format_branches_containing(&[]), None);
+        assert_eq!(
+            format_branches_containing(&["main".into()]).as_deref(),
+            Some("In 1 branch: main")
+        );
+        assert_eq!(
+            format_branches_containing(&["main".into(), "dev".into()]).as_deref(),
+            Some("In 2 branches: main, dev")
+        );
+
+        let many: Vec<SharedString> = (0..8)
+            .map(|i| SharedString::from(format!("b{i}")))
+            .collect();
+        assert_eq!(
+            format_branches_containing(&many).as_deref(),
+            Some("In 8 branches: b0, b1, b2, b3, b4 and 3 more"),
+            "a commit on a busy branch must not spell out every branch name"
+        );
+    }
+
+    fn changed_file_entry(path: &str) -> ChangedFileEntry {
+        ChangedFileEntry::from_commit_file(&CommitFile {
+            path: RepoPath::new(path).expect("valid repo path"),
+            old_text: Some("old".to_string()),
+            new_text: Some("new".to_string()),
+            is_binary: false,
+        })
+    }
+
+    #[test]
+    fn test_build_changed_file_rows_groups_by_directory() {
+        let entries = vec![
+            changed_file_entry("docs/plans/b.md"),
+            changed_file_entry("README.md"),
+            changed_file_entry("docs/plans/a.md"),
+        ];
+        let root: SharedString = "my-repo".into();
+
+        let rows = build_changed_file_rows(&entries, &root, &HashSet::default());
+        let described: Vec<String> = rows.iter().map(describe_changed_file_row).collect();
+        assert_eq!(
+            described,
+            vec![
+                "dir[key=, label=my-repo, 1]".to_string(),
+                "file[README.md]".to_string(),
+                "dir[key=docs/plans, label=docs/plans, 2]".to_string(),
+                "file[a.md]".to_string(),
+                "file[b.md]".to_string(),
+            ],
+            "root-level files sit under a header named after the repository, \
+             and each directory group is sorted by file name"
+        );
+
+        let mut collapsed = HashSet::default();
+        collapsed.insert(SharedString::from("docs/plans"));
+        let rows = build_changed_file_rows(&entries, &root, &collapsed);
+        let described: Vec<String> = rows.iter().map(describe_changed_file_row).collect();
+        assert_eq!(
+            described,
+            vec![
+                "dir[key=, label=my-repo, 1]".to_string(),
+                "file[README.md]".to_string(),
+                "dir[key=docs/plans, label=docs/plans, 2]".to_string(),
+            ],
+            "a collapsed directory hides its files but keeps its count"
+        );
+    }
+
+    /// Double-clicking a commit row used to open the `CommitView` tab — a
+    /// synthetic pseudo-file whose first screen is the commit description.
+    /// It must now do nothing beyond selecting; the same view is still one
+    /// explicit `open_selected_commit_view` away, which is what the second
+    /// half of this test pins down (without it, the assertion above would
+    /// also pass if `CommitView::open` had simply stopped working).
+    #[gpui::test]
+    async fn test_double_click_selects_without_opening_the_commit_view(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let sha = Oid::from_bytes(&[9; 20]).expect("valid oid");
+
+        let (_project, workspace, git_graph, cx) = setup_graph_with_workspace(
+            &fs,
+            vec![Arc::new(InitialGraphCommitData {
+                sha,
+                parents: smallvec![],
+                ref_names: vec!["HEAD".into()],
+            })],
+            cx,
+        )
+        .await;
+
+        let commit_views = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(&*cx, |workspace, cx| {
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .filter(|item| item.downcast::<CommitView>().is_some())
+                    .count()
+            })
+        };
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(0, 2, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_graph.read_with(&*cx, |graph, _| graph.selected_entry_idx),
+            Some(0),
+            "a double click still selects the row"
+        );
+        assert_eq!(
+            commit_views(cx),
+            0,
+            "a double click must not open the commit pseudo-file"
+        );
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.open_selected_commit_view(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            commit_views(cx),
+            1,
+            "the commit view is still reachable explicitly"
+        );
+    }
+
+    fn describe_changed_file_row(row: &ChangedFileRow) -> String {
+        match row {
+            ChangedFileRow::Directory {
+                key,
+                label,
+                file_count,
+                ..
+            } => format!("dir[key={key}, label={label}, {file_count}]"),
+            ChangedFileRow::File(entry) => format!("file[{}]", entry.file_name),
+        }
     }
 }

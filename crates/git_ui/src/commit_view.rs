@@ -31,13 +31,12 @@ use git::{
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter,
     FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, PromptLevel, Render,
-    ScrollHandle, Styled, Task, WeakEntity, Window, actions,
+    Styled, Task, WeakEntity, Window, actions,
 };
 use language::{
     Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
     ReplicaId, Rope, TextBuffer,
 };
-use markdown::Markdown;
 use multi_buffer::PathKey;
 use project::{Project, ProjectPath, WorktreeId, git_store::Repository};
 use settings::{DiffViewStyle, Settings};
@@ -120,9 +119,6 @@ pub fn init(cx: &mut App) {
 pub struct CommitView {
     commit: CommitDetails,
     editor: Entity<SplittableEditor>,
-    message: Entity<Markdown>,
-    message_expanded: bool,
-    message_scroll_handle: ScrollHandle,
     stash: Option<usize>,
     multibuffer: Entity<MultiBuffer>,
     repository: Entity<Repository>,
@@ -401,15 +397,6 @@ impl CommitView {
             multibuffer
         });
 
-        let message = cx.new(|cx| {
-            Markdown::new(
-                commit.message.clone(),
-                Some(language_registry.clone()),
-                None,
-                cx,
-            )
-        });
-
         let editor = cx.new(|cx| {
             let editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
@@ -621,9 +608,6 @@ impl CommitView {
         let mut view = Self {
             commit,
             editor,
-            message,
-            message_expanded: false,
-            message_scroll_handle: ScrollHandle::new(),
             multibuffer,
             stash,
             repository: repository.clone(),
@@ -1493,21 +1477,9 @@ impl Item for CommitView {
                     editor
                 }
             });
-            let language_registry = project.read(cx).languages().clone();
-            let message = cx.new(|cx| {
-                Markdown::new(
-                    self.commit.message.clone(),
-                    Some(language_registry),
-                    None,
-                    cx,
-                )
-            });
             let affected_files = CommitAffectedFiles::new(lazy_threshold, window, cx);
             Self {
                 editor,
-                message,
-                message_expanded: self.message_expanded,
-                message_scroll_handle: ScrollHandle::new(),
                 multibuffer: self.multibuffer.clone(),
                 commit: self.commit.clone(),
                 stash: self.stash,
