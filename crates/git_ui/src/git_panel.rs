@@ -37,8 +37,8 @@ use git::{
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, DismissEvent,
-    Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent,
-    Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt, TextStyle,
+    Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyContext, MouseButton,
+    MouseDownEvent, Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt, TextStyle,
     UniformListScrollHandle, WeakEntity, actions, anchored, deferred, point, size, uniform_list,
 };
 use itertools::Itertools;
@@ -261,6 +261,17 @@ const SHOW_PRE_COMMIT_SECTION: bool = false;
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
+/// Left padding shared by every row in the changes list. Rows start with a
+/// chevron column (or an invisible spacer of the same width for files), so the
+/// padding is smaller than a plain label row would want.
+const ROW_LEFT_PADDING: f32 = 6.0;
+/// Horizontal offset of the depth-0 indent guide: half of the chevron column
+/// (`IconSize::Small` is 14px) past the row padding, so the guide runs through
+/// the middle of the chevrons of that depth.
+const INDENT_GUIDE_LEFT_OFFSET: f32 = ROW_LEFT_PADDING + 7.0;
+const SELECTED_BG_ALPHA: f32 = 0.08;
+const MARKED_BG_ALPHA: f32 = 0.12;
+const STATE_OPACITY_STEP: f32 = 0.04;
 
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -359,6 +370,15 @@ impl GitHeaderEntry {
     }
 }
 
+/// IDEA-style "3 files" / "1 file" suffix for a section header.
+fn file_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{count} files")
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum GitListEntry {
     Status(GitStatusEntry),
@@ -372,13 +392,6 @@ impl GitListEntry {
         match self {
             GitListEntry::Status(entry) => Some(entry),
             GitListEntry::TreeStatus(entry) => Some(&entry.entry),
-            _ => None,
-        }
-    }
-
-    fn directory_entry(&self) -> Option<&GitTreeDirEntry> {
-        match self {
-            GitListEntry::Directory(entry) => Some(entry),
             _ => None,
         }
     }
@@ -424,10 +437,6 @@ impl GitPanelViewMode {
 
 #[derive(Default)]
 struct TreeViewState {
-    // Maps visible index to actual entry index.
-    // Length equals the number of visible entries.
-    // This is needed because some entries (like collapsed directories) may be hidden.
-    logical_indices: Vec<usize>,
     expanded_dirs: HashMap<TreeKey, bool>,
     directory_descendants: HashMap<TreeKey, Vec<GitStatusEntry>>,
 }
@@ -685,6 +694,17 @@ pub struct GitPanel {
     add_coauthors: bool,
     generate_commit_message_task: Option<Task<Option<()>>>,
     entries: Vec<GitListEntry>,
+    /// Indices into `entries` that are currently visible, in render order.
+    /// Entries hidden by a collapsed directory or a collapsed section are
+    /// absent. Maintained for *both* view modes so that scrolling, keyboard
+    /// navigation and the uniform list all speak the same coordinate space.
+    visible_indices: Vec<usize>,
+    /// Sections whose header row is collapsed; their entries stay in
+    /// `entries` (so staging still sees them) but drop out of
+    /// `visible_indices`.
+    collapsed_sections: HashSet<Section>,
+    /// Number of file entries per section, for the header counters.
+    section_counts: HashMap<Section, usize>,
     view_mode: GitPanelViewMode,
     entries_indices: HashMap<RepoPath, usize>,
     single_staged_entry: Option<GitStatusEntry>,
@@ -915,6 +935,9 @@ impl GitPanel {
                 add_coauthors: true,
                 generate_commit_message_task: None,
                 entries: Vec::new(),
+                visible_indices: Vec::new(),
+                collapsed_sections: HashSet::default(),
+                section_counts: HashMap::default(),
                 view_mode: GitPanelViewMode::from_settings(cx),
                 entries_indices: HashMap::default(),
                 focus_handle: cx.focus_handle(),
@@ -1004,6 +1027,11 @@ impl GitPanel {
         };
 
         let mut needs_rebuild = false;
+        if let Some(section) = section
+            && self.collapsed_sections.remove(&section)
+        {
+            needs_rebuild = true;
+        }
         if let (Some(section), Some(tree_state)) = (section, self.view_mode.tree_state_mut()) {
             let mut current_dir = repo_path.parent();
             while let Some(dir) = current_dir {
@@ -1114,19 +1142,19 @@ impl GitPanel {
         }
     }
 
+    /// Position of an `entries` index inside `visible_indices`, or `None` when
+    /// the entry is currently hidden (collapsed directory or section).
+    fn visible_position(&self, entry_ix: usize) -> Option<usize> {
+        self.visible_indices.iter().position(|&ix| ix == entry_ix)
+    }
+
     fn scroll_to_selected_entry(&mut self, cx: &mut Context<Self>) {
         let Some(selected_entry) = self.selected_entry else {
             cx.notify();
             return;
         };
 
-        let visible_index = match &self.view_mode {
-            GitPanelViewMode::Flat => Some(selected_entry),
-            GitPanelViewMode::Tree(state) => state
-                .logical_indices
-                .iter()
-                .position(|&ix| ix == selected_entry),
-        };
+        let visible_index = self.visible_position(selected_entry);
 
         if let Some(visible_index) = visible_index {
             self.scroll_handle
@@ -1146,14 +1174,22 @@ impl GitPanel {
             return;
         };
 
-        if let GitListEntry::Directory(dir_entry) = entry {
-            if dir_entry.expanded {
-                self.select_next(&menu::SelectNext, window, cx);
-            } else {
-                self.toggle_directory(&dir_entry.key, window, cx);
+        match entry {
+            GitListEntry::Directory(dir_entry) => {
+                if dir_entry.expanded {
+                    self.select_next(&menu::SelectNext, window, cx);
+                } else {
+                    self.toggle_directory(&dir_entry.key, window, cx);
+                }
             }
-        } else {
-            self.select_next(&menu::SelectNext, window, cx);
+            GitListEntry::Header(header) => {
+                if self.collapsed_sections.contains(&header.header) {
+                    self.toggle_section(header.header, window, cx);
+                } else {
+                    self.select_next(&menu::SelectNext, window, cx);
+                }
+            }
+            _ => self.select_next(&menu::SelectNext, window, cx),
         }
     }
 
@@ -1167,14 +1203,22 @@ impl GitPanel {
             return;
         };
 
-        if let GitListEntry::Directory(dir_entry) = entry {
-            if dir_entry.expanded {
-                self.toggle_directory(&dir_entry.key, window, cx);
-            } else {
-                self.select_previous(&menu::SelectPrevious, window, cx);
+        match entry {
+            GitListEntry::Directory(dir_entry) => {
+                if dir_entry.expanded {
+                    self.toggle_directory(&dir_entry.key, window, cx);
+                } else {
+                    self.select_previous(&menu::SelectPrevious, window, cx);
+                }
             }
-        } else {
-            self.select_previous(&menu::SelectPrevious, window, cx);
+            GitListEntry::Header(header) => {
+                if self.collapsed_sections.contains(&header.header) {
+                    self.select_previous(&menu::SelectPrevious, window, cx);
+                } else {
+                    self.toggle_section(header.header, window, cx);
+                }
+            }
+            _ => self.select_previous(&menu::SelectPrevious, window, cx),
         }
     }
 
@@ -1184,19 +1228,16 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let first_entry = match &self.view_mode {
-            GitPanelViewMode::Flat => self
-                .entries
-                .iter()
-                .position(|entry| entry.status_entry().is_some()),
-            GitPanelViewMode::Tree(state) => {
-                let index = self.entries.iter().position(|entry| {
-                    entry.status_entry().is_some() || entry.directory_entry().is_some()
-                });
-
-                index.map(|index| state.logical_indices[index])
-            }
-        };
+        // Prefer the first selectable *content* row: the auto-selection that
+        // runs when the panel first shows entries should open a diff rather
+        // than park on a section header. Headers are still reachable with the
+        // arrow keys.
+        let first_entry = self
+            .visible_indices
+            .iter()
+            .copied()
+            .find(|&ix| !matches!(self.entries.get(ix), Some(GitListEntry::Header(..))))
+            .or_else(|| self.visible_indices.first().copied());
 
         if let Some(first_entry) = first_entry {
             self.selected_entry = Some(first_entry);
@@ -1215,63 +1256,20 @@ impl GitPanel {
             return;
         }
 
-        let item_count = self.entries.len();
-        if item_count == 0 {
-            return;
-        }
-
         let Some(selected_entry) = self.selected_entry else {
             return;
         };
-
-        let new_index = match &self.view_mode {
-            GitPanelViewMode::Flat => selected_entry.saturating_sub(1),
-            GitPanelViewMode::Tree(state) => {
-                let Some(current_logical_index) = state
-                    .logical_indices
-                    .iter()
-                    .position(|&i| i == selected_entry)
-                else {
-                    return;
-                };
-
-                state.logical_indices[current_logical_index.saturating_sub(1)]
-            }
+        let Some(position) = self.visible_position(selected_entry) else {
+            return;
+        };
+        let Some(new_index) = position
+            .checked_sub(1)
+            .and_then(|position| self.visible_indices.get(position).copied())
+        else {
+            return;
         };
 
-        if selected_entry == 0 && new_index == 0 {
-            return;
-        }
-
-        if matches!(
-            self.entries.get(new_index.saturating_sub(1)),
-            Some(GitListEntry::Header(..))
-        ) && new_index == 0
-        {
-            return;
-        }
-
-        if matches!(self.entries.get(new_index), Some(GitListEntry::Header(..))) {
-            self.selected_entry = match &self.view_mode {
-                GitPanelViewMode::Flat => Some(new_index.saturating_sub(1)),
-                GitPanelViewMode::Tree(tree_view_state) => {
-                    maybe!({
-                        let current_logical_index = tree_view_state
-                            .logical_indices
-                            .iter()
-                            .position(|&i| i == new_index)?;
-
-                        tree_view_state
-                            .logical_indices
-                            .get(current_logical_index.saturating_sub(1))
-                            .copied()
-                    })
-                }
-            };
-        } else {
-            self.selected_entry = Some(new_index);
-        }
-
+        self.selected_entry = Some(new_index);
         self.scroll_to_selected_entry(cx);
     }
 
@@ -1281,56 +1279,23 @@ impl GitPanel {
             return;
         }
 
-        let item_count = self.entries.len();
-        if item_count == 0 {
-            return;
-        }
-
         let Some(selected_entry) = self.selected_entry else {
             return;
         };
-
-        let new_index = match &self.view_mode {
-            GitPanelViewMode::Flat => {
-                if selected_entry >= item_count.saturating_sub(1) {
-                    return;
-                }
-
-                selected_entry.saturating_add(1)
-            }
-            GitPanelViewMode::Tree(state) => {
-                let Some(current_logical_index) = state
-                    .logical_indices
-                    .iter()
-                    .position(|&i| i == selected_entry)
-                else {
-                    return;
-                };
-
-                let Some(new_index) = state
-                    .logical_indices
-                    .get(current_logical_index.saturating_add(1))
-                    .copied()
-                else {
-                    return;
-                };
-
-                new_index
-            }
+        let Some(position) = self.visible_position(selected_entry) else {
+            return;
+        };
+        let Some(new_index) = self.visible_indices.get(position + 1).copied() else {
+            return;
         };
 
-        if matches!(self.entries.get(new_index), Some(GitListEntry::Header(..))) {
-            self.selected_entry = Some(new_index.saturating_add(1));
-        } else {
-            self.selected_entry = Some(new_index);
-        }
-
+        self.selected_entry = Some(new_index);
         self.scroll_to_selected_entry(cx);
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.entries.last().is_some() {
-            self.selected_entry = Some(self.entries.len() - 1);
+        if let Some(&last_entry) = self.visible_indices.last() {
+            self.selected_entry = Some(last_entry);
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -3813,6 +3778,16 @@ impl GitPanel {
         }
     }
 
+    /// Collapse / expand a `Tracked` / `Untracked` / `Conflicts` section.
+    /// The section's entries stay in `self.entries` (staging and counting keep
+    /// working) and only drop out of `visible_indices`.
+    fn toggle_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.collapsed_sections.remove(&section) {
+            self.collapsed_sections.insert(section);
+        }
+        self.update_visible_entries(window, cx);
+    }
+
     fn toggle_directory(&mut self, key: &TreeKey, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.view_mode.tree_state_mut() {
             let expanded = state.expanded_dirs.entry(key.clone()).or_insert(true);
@@ -4134,31 +4109,28 @@ impl GitPanel {
             self.single_tracked_entry = changed_entries.first().cloned();
         }
 
-        let mut push_entry =
-            |this: &mut Self,
-             entry: GitListEntry,
-             is_visible: bool,
-             logical_indices: Option<&mut Vec<usize>>| {
-                if let Some(estimate) =
-                    this.width_estimate_for_list_entry(is_tree_view, &entry, path_style)
-                {
-                    if estimate > max_width_estimate {
-                        max_width_estimate = estimate;
-                        max_width_item_index = Some(this.entries.len());
-                    }
+        let mut visible_indices = Vec::new();
+        let mut section_counts: HashMap<Section, usize> = HashMap::default();
+        let mut push_entry = |this: &mut Self, entry: GitListEntry, is_visible: bool| {
+            if let Some(estimate) =
+                this.width_estimate_for_list_entry(is_tree_view, &entry, path_style)
+            {
+                if estimate > max_width_estimate {
+                    max_width_estimate = estimate;
+                    max_width_item_index = Some(this.entries.len());
                 }
+            }
 
-                if let Some(repo_path) = entry.status_entry().map(|status| status.repo_path.clone())
-                {
-                    this.entries_indices.insert(repo_path, this.entries.len());
-                }
+            if let Some(repo_path) = entry.status_entry().map(|status| status.repo_path.clone()) {
+                this.entries_indices.insert(repo_path, this.entries.len());
+            }
 
-                if let (Some(indices), true) = (logical_indices, is_visible) {
-                    indices.push(this.entries.len());
-                }
+            if is_visible {
+                visible_indices.push(this.entries.len());
+            }
 
-                this.entries.push(entry);
-            };
+            this.entries.push(entry);
+        };
 
         macro_rules! take_section_entries {
             () => {
@@ -4170,9 +4142,10 @@ impl GitPanel {
             };
         }
 
+        let collapsed_sections = self.collapsed_sections.clone();
+
         match &mut self.view_mode {
             GitPanelViewMode::Tree(tree_state) => {
-                tree_state.logical_indices.clear();
                 tree_state.directory_descendants.clear();
 
                 // This is just to get around the borrow checker
@@ -4184,22 +4157,19 @@ impl GitPanel {
                         continue;
                     }
 
+                    section_counts.insert(section, entries.len());
+                    let section_expanded = !collapsed_sections.contains(&section);
+
                     push_entry(
                         self,
                         GitListEntry::Header(GitHeaderEntry { header: section }),
                         true,
-                        Some(&mut tree_state.logical_indices),
                     );
 
                     for (entry, is_visible) in
                         tree_state.build_tree_entries(section, entries, &mut seen_directories)
                     {
-                        push_entry(
-                            self,
-                            entry,
-                            is_visible,
-                            Some(&mut tree_state.logical_indices),
-                        );
+                        push_entry(self, entry, is_visible && section_expanded);
                     }
                 }
 
@@ -4214,22 +4184,31 @@ impl GitPanel {
                         continue;
                     }
 
+                    section_counts.insert(section, entries.len());
+                    let section_expanded = !collapsed_sections.contains(&section);
+
                     if section != Section::Tracked || !sort_by_path {
                         push_entry(
                             self,
                             GitListEntry::Header(GitHeaderEntry { header: section }),
                             true,
-                            None,
                         );
                     }
 
                     for entry in entries {
-                        push_entry(self, GitListEntry::Status(entry), true, None);
+                        // A section whose header row was suppressed (flat +
+                        // sort-by-path) can never be collapsed, so its entries
+                        // must stay visible regardless of `collapsed_sections`.
+                        let is_visible =
+                            section_expanded || (section == Section::Tracked && sort_by_path);
+                        push_entry(self, GitListEntry::Status(entry), is_visible);
                     }
                 }
             }
         }
 
+        self.visible_indices = visible_indices;
+        self.section_counts = section_counts;
         self.max_width_item_index = max_width_item_index;
 
         self.update_counts(repo);
@@ -4516,14 +4495,13 @@ impl GitPanel {
     /// Computes tree indentation depths for visible entries in the given range.
     /// Used by indent guides to render vertical connector lines in tree view.
     fn compute_visible_depths(&self, range: Range<usize>) -> SmallVec<[usize; 64]> {
-        let GitPanelViewMode::Tree(state) = &self.view_mode else {
+        if !matches!(self.view_mode, GitPanelViewMode::Tree(_)) {
             return SmallVec::new();
-        };
+        }
 
         range
             .map(|ix| {
-                state
-                    .logical_indices
+                self.visible_indices
                     .get(ix)
                     .and_then(|&entry_ix| self.entries.get(entry_ix))
                     .map_or(0, |entry| entry.depth())
@@ -4573,6 +4551,33 @@ impl GitPanel {
 
     fn item_width_estimate(path: usize, file_name: usize, depth: usize) -> usize {
         path + file_name + depth * 2
+    }
+
+    /// Toolbar switch between the directory tree and the flat file list. The
+    /// same choice is also in the overflow menu; a dedicated toggle makes it
+    /// discoverable, the way IDEA puts "Group by directory" on the toolbar.
+    fn render_view_mode_toggle(&self, cx: &Context<Self>) -> impl IntoElement {
+        let tree_view = GitPanelSettings::get_global(cx).tree_view;
+        let focus_handle = self.focus_handle.clone();
+
+        IconButton::new("git-panel-view-mode", IconName::ListTree)
+            .icon_size(IconSize::Small)
+            .toggle_state(tree_view)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(
+                    if tree_view {
+                        "Show as Flat List"
+                    } else {
+                        "Group by Directory"
+                    },
+                    &ToggleTreeView,
+                    &focus_handle,
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_tree_view(&ToggleTreeView, window, cx);
+            }))
     }
 
     fn render_ellipsis_menu(&self, id: impl Into<ElementId>) -> impl IntoElement {
@@ -4934,6 +4939,7 @@ impl GitPanel {
                 .child(
                     h_flex()
                         .gap_1()
+                        .child(self.render_view_mode_toggle(cx))
                         .child(self.render_ellipsis_menu("overflow_menu"))
                         .child(
                             Button::new("stage_unstage_all", text)
@@ -6184,10 +6190,8 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (is_tree_view, entry_count) = match &self.view_mode {
-            GitPanelViewMode::Tree(state) => (true, state.logical_indices.len()),
-            GitPanelViewMode::Flat => (false, self.entries.len()),
-        };
+        let is_tree_view = matches!(self.view_mode, GitPanelViewMode::Tree(_));
+        let entry_count = self.visible_indices.len();
         let repo = repo.downgrade();
 
         v_flex()
@@ -6213,10 +6217,11 @@ impl GitPanel {
 
                                 let mut items = Vec::with_capacity(range.end - range.start);
 
-                                for ix in range.into_iter().map(|ix| match &this.view_mode {
-                                    GitPanelViewMode::Tree(state) => state.logical_indices[ix],
-                                    GitPanelViewMode::Flat => ix,
-                                }) {
+                                let visible_indices = range
+                                    .filter_map(|ix| this.visible_indices.get(ix).copied())
+                                    .collect::<Vec<_>>();
+
+                                for ix in visible_indices {
                                     match &this.entries.get(ix) {
                                         Some(GitListEntry::Status(entry)) => {
                                             items.push(this.render_status_entry(
@@ -6276,10 +6281,7 @@ impl GitPanel {
                                         },
                                     )
                                     .with_render_fn(cx.entity(), |_, params, _, _| {
-                                        // Magic number to align the tree item is 3 here
-                                        // because we're using 12px as the left-side padding
-                                        // and 3 makes the alignment work with the bounding box of the icon
-                                        let left_offset = px(TREE_INDENT + 3_f32);
+                                        let left_offset = px(INDENT_GUIDE_LEFT_OFFSET);
                                         let indent_size = params.indent_size;
                                         let item_height = params.item_height;
 
@@ -6338,20 +6340,82 @@ impl GitPanel {
         rems(1.75)
     }
 
+    /// IDEA-style disclosure chevron for the collapsible rows (section headers
+    /// and directories). Deliberately a plain `Icon` and not `ui::Disclosure`:
+    /// the latter renders an `IconButton`, which is taller than a file row, and
+    /// `uniform_list` sizes every row from the first one — so a taller header
+    /// row would be clipped.
+    fn render_row_chevron(expanded: bool) -> AnyElement {
+        h_flex()
+            .size(IconSize::Small.rems())
+            .flex_none()
+            .justify_center()
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::Small)
+                .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
+    /// Invisible stand-in for the chevron so file rows line their checkbox,
+    /// icon and label up with the directory / header rows above them.
+    fn render_chevron_spacer() -> AnyElement {
+        h_flex()
+            .size(IconSize::Small.rems())
+            .flex_none()
+            .into_any_element()
+    }
+
+    fn row_background_colors(&self, selected: bool, marked: bool, cx: &App) -> (Hsla, Hsla, Hsla) {
+        let info_color = cx.theme().status().info;
+        let colors = cx.theme().colors();
+
+        let base_bg = match (selected, marked) {
+            (true, true) => info_color.alpha(SELECTED_BG_ALPHA + MARKED_BG_ALPHA),
+            (true, false) => info_color.alpha(SELECTED_BG_ALPHA),
+            (false, true) => info_color.alpha(MARKED_BG_ALPHA),
+            (false, false) => colors.ghost_element_background,
+        };
+
+        if selected {
+            (
+                base_bg,
+                info_color.alpha(SELECTED_BG_ALPHA + STATE_OPACITY_STEP),
+                info_color.alpha(SELECTED_BG_ALPHA + STATE_OPACITY_STEP * 2.0),
+            )
+        } else {
+            (
+                base_bg,
+                colors.ghost_element_hover,
+                colors.ghost_element_active,
+            )
+        }
+    }
+
     fn render_list_header(
         &self,
         ix: usize,
         header: &GitHeaderEntry,
         has_write_access: bool,
-        _window: &Window,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let id: ElementId = ElementId::Name(format!("header_{}", ix).into());
         let checkbox_id: ElementId = ElementId::Name(format!("header_{}_checkbox", ix).into());
+        let checkbox_wrapper_id: ElementId =
+            ElementId::Name(format!("header_{}_checkbox_wrapper", ix).into());
         let group_name: SharedString = format!("header_{}", ix).into();
         let toggle_state = self.header_state(header.header);
         let section = header.header;
-        let weak = cx.weak_entity();
+        let expanded = !self.collapsed_sections.contains(&section);
+        let count = self.section_counts.get(&section).copied().unwrap_or(0);
+        let selected = self.selected_entry == Some(ix);
+        let (base_bg, hover_bg, active_bg) = self.row_background_colors(selected, false, cx);
 
         h_flex()
             .id(id)
@@ -6359,39 +6423,68 @@ impl GitPanel {
             .group(group_name)
             .h(self.list_item_height())
             .w_full()
-            .pl_3()
+            .pl(px(ROW_LEFT_PADDING))
             .pr_1()
-            .gap_2()
-            .justify_between()
-            .hover(|s| s.bg(cx.theme().colors().ghost_element_hover))
+            .gap_1p5()
             .border_1()
             .border_r_2()
+            .when(selected && self.focus_handle.is_focused(window), |el| {
+                el.border_color(cx.theme().colors().panel_focused_border)
+            })
+            .bg(base_bg)
+            .hover(|s| s.bg(hover_bg))
+            .active(|s| s.bg(active_bg))
+            .child(Self::render_row_chevron(expanded))
             .child(
-                Label::new(header.title())
+                div()
+                    .id(checkbox_wrapper_id)
+                    .flex_none()
+                    .occlude()
+                    .cursor_pointer()
+                    .child(
+                        Checkbox::new(checkbox_id, toggle_state)
+                            .disabled(!has_write_access)
+                            .fill()
+                            .elevation(ElevationIndex::Surface)
+                            .on_click({
+                                let weak = cx.weak_entity();
+                                move |_, window, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        if !has_write_access {
+                                            return;
+                                        }
+                                        this.toggle_staged_for_entry(
+                                            &GitListEntry::Header(GitHeaderEntry {
+                                                header: section,
+                                            }),
+                                            window,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    })
+                                    .ok();
+                                }
+                            })
+                            .tooltip(move |_window, cx| {
+                                let action = if toggle_state == ToggleState::Selected {
+                                    "Unstage"
+                                } else {
+                                    "Stage"
+                                };
+                                Tooltip::simple(format!("{action} section"), cx)
+                            }),
+                    ),
+            )
+            .child(Label::new(header.title()).size(LabelSize::Small))
+            .child(
+                Label::new(file_count_label(count))
                     .color(Color::Muted)
                     .size(LabelSize::Small),
             )
-            .child(
-                Checkbox::new(checkbox_id, toggle_state)
-                    .disabled(!has_write_access)
-                    .fill()
-                    .elevation(ElevationIndex::Surface),
-            )
-            .on_click(move |_, window, cx| {
-                if !has_write_access {
-                    return;
-                }
-
-                weak.update(cx, |this, cx| {
-                    this.toggle_staged_for_entry(
-                        &GitListEntry::Header(GitHeaderEntry { header: section }),
-                        window,
-                        cx,
-                    );
-                    cx.stop_propagation();
-                })
-                .ok();
-            })
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.selected_entry = Some(ix);
+                this.toggle_section(section, window, cx);
+            }))
             .into_any_element()
     }
 
@@ -6550,6 +6643,12 @@ impl GitPanel {
             } else {
                 Color::VersionControlAdded
             }
+        } else if is_created {
+            // IDEA tints unversioned files in its Commit tool window; keep that
+            // cue even when the panel is in "status icon" mode, where every
+            // other row is plain. `version_control_added` is the theme colour
+            // this crate already resolves for created files.
+            Color::VersionControlAdded
         } else {
             Color::Default
         };
@@ -6578,30 +6677,7 @@ impl GitPanel {
 
         let handle = cx.weak_entity();
 
-        let selected_bg_alpha = 0.08;
-        let marked_bg_alpha = 0.12;
-        let state_opacity_step = 0.04;
-
-        let info_color = cx.theme().status().info;
-
-        let base_bg = match (selected, marked) {
-            (true, true) => info_color.alpha(selected_bg_alpha + marked_bg_alpha),
-            (true, false) => info_color.alpha(selected_bg_alpha),
-            (false, true) => info_color.alpha(marked_bg_alpha),
-            _ => cx.theme().colors().ghost_element_background,
-        };
-
-        let (hover_bg, active_bg) = if selected {
-            (
-                info_color.alpha(selected_bg_alpha + state_opacity_step),
-                info_color.alpha(selected_bg_alpha + state_opacity_step * 2.0),
-            )
-        } else {
-            (
-                cx.theme().colors().ghost_element_hover,
-                cx.theme().colors().ghost_element_active,
-            )
-        };
+        let (base_bg, hover_bg, active_bg) = self.row_background_colors(selected, marked, cx);
 
         let name_row = h_flex()
             .min_w_0()
@@ -6627,7 +6703,7 @@ impl GitPanel {
             })
             .map(|this| {
                 if tree_view {
-                    this.pl(px(depth as f32 * TREE_INDENT)).child(
+                    this.child(
                         self.entry_label(display_name, label_color)
                             .when(status.is_deleted(), Label::strikethrough)
                             .truncate(),
@@ -6651,7 +6727,7 @@ impl GitPanel {
             .id(id)
             .h(self.list_item_height())
             .w_full()
-            .pl_3()
+            .pl(px(ROW_LEFT_PADDING + depth as f32 * TREE_INDENT))
             .pr_1()
             .gap_1p5()
             .border_1()
@@ -6662,17 +6738,7 @@ impl GitPanel {
             .bg(base_bg)
             .hover(|s| s.bg(hover_bg))
             .active(|s| s.bg(active_bg))
-            .child(name_row)
-            .when(GitPanelSettings::get_global(cx).diff_stats, |el| {
-                el.when_some(entry.diff_stat, move |this, stat| {
-                    let id = format!("diff-stat-{}", id_for_diff_stat);
-                    this.child(ui::DiffStat::new(
-                        id,
-                        stat.added as usize,
-                        stat.deleted as usize,
-                    ))
-                })
-            })
+            .child(Self::render_chevron_spacer())
             .child(
                 div()
                     .id(checkbox_wrapper_id)
@@ -6722,6 +6788,17 @@ impl GitPanel {
                             }),
                     ),
             )
+            .child(name_row)
+            .when(GitPanelSettings::get_global(cx).diff_stats, |el| {
+                el.when_some(entry.diff_stat, move |this, stat| {
+                    let id = format!("diff-stat-{}", id_for_diff_stat);
+                    this.child(ui::DiffStat::new(
+                        id,
+                        stat.added as usize,
+                        stat.deleted as usize,
+                    ))
+                })
+            })
             .on_click({
                 cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.selected_entry = Some(ix);
@@ -6777,44 +6854,15 @@ impl GitPanel {
         let checkbox_wrapper_id: ElementId =
             ElementId::Name(format!("dir_checkbox_wrapper_{}_{}", entry.name, ix).into());
 
-        let selected_bg_alpha = 0.08;
-        let state_opacity_step = 0.04;
-
-        let info_color = cx.theme().status().info;
-        let colors = cx.theme().colors();
-
-        let (base_bg, hover_bg, active_bg) = if selected {
-            (
-                info_color.alpha(selected_bg_alpha),
-                info_color.alpha(selected_bg_alpha + state_opacity_step),
-                info_color.alpha(selected_bg_alpha + state_opacity_step * 2.0),
-            )
-        } else {
-            (
-                colors.ghost_element_background,
-                colors.ghost_element_hover,
-                colors.ghost_element_active,
-            )
-        };
+        let (base_bg, hover_bg, active_bg) = self.row_background_colors(selected, false, cx);
 
         let settings = GitPanelSettings::get_global(cx);
+        // Same lookup and the same (default) icon size the project panel uses
+        // for directories, so the two trees show identical folder glyphs.
         let folder_icon = if settings.folder_icons {
             FileIcons::get_folder_icon(entry.expanded, entry.key.path.as_std_path(), cx)
         } else {
-            FileIcons::get_chevron_icon(entry.expanded, cx)
-        };
-        let fallback_folder_icon = if settings.folder_icons {
-            if entry.expanded {
-                IconName::FolderOpen
-            } else {
-                IconName::Folder
-            }
-        } else {
-            if entry.expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            }
+            None
         };
 
         let stage_status = if let Some(repo) = &self.active_repository {
@@ -6834,21 +6882,11 @@ impl GitPanel {
 
         let name_row = h_flex()
             .min_w_0()
+            .flex_1()
             .gap_1()
-            .pl(px(entry.depth as f32 * TREE_INDENT))
-            .child(
-                folder_icon
-                    .map(|folder_icon| {
-                        Icon::from_path(folder_icon)
-                            .size(IconSize::Small)
-                            .color(Color::Muted)
-                    })
-                    .unwrap_or_else(|| {
-                        Icon::new(fallback_folder_icon)
-                            .size(IconSize::Small)
-                            .color(Color::Muted)
-                    }),
-            )
+            .when_some(folder_icon, |this, folder_icon| {
+                this.child(Icon::from_path(folder_icon).color(Color::Muted))
+            })
             .child(self.entry_label(entry.name.clone(), label_color).truncate());
 
         h_flex()
@@ -6856,10 +6894,9 @@ impl GitPanel {
             .h(self.list_item_height())
             .min_w_0()
             .w_full()
-            .pl_3()
+            .pl(px(ROW_LEFT_PADDING + entry.depth as f32 * TREE_INDENT))
             .pr_1()
             .gap_1p5()
-            .justify_between()
             .border_1()
             .border_r_2()
             .when(selected && self.focus_handle.is_focused(window), |el| {
@@ -6868,7 +6905,7 @@ impl GitPanel {
             .bg(base_bg)
             .hover(|s| s.bg(hover_bg))
             .active(|s| s.bg(active_bg))
-            .child(name_row)
+            .child(Self::render_row_chevron(entry.expanded))
             .child(
                 div()
                     .id(checkbox_wrapper_id)
@@ -6907,6 +6944,7 @@ impl GitPanel {
                             }),
                     ),
             )
+            .child(name_row)
             .on_click({
                 let key = entry.key.clone();
                 cx.listener(move |this, _event: &ClickEvent, window, cx| {
@@ -9125,7 +9163,7 @@ mod tests {
             assert_eq!(state.expanded_dirs.get(&src_key).copied(), Some(true));
 
             let selected_ix = panel.selected_entry.expect("selection should be set");
-            assert!(state.logical_indices.contains(&selected_ix));
+            assert!(panel.visible_indices.contains(&selected_ix));
 
             let selected_entry = panel
                 .entries
@@ -9243,12 +9281,10 @@ mod tests {
                 })
                 .expect("foo directory should exist in tree view");
 
-            let foo_logical_idx = state
-                .logical_indices
-                .iter()
-                .position(|&index| index == foo_idx)
+            let foo_logical_idx = panel
+                .visible_position(foo_idx)
                 .expect("foo directory should be visible");
-            let next_logical_idx = state.logical_indices[foo_logical_idx + 1];
+            let next_logical_idx = panel.visible_indices[foo_logical_idx + 1];
             assert!(matches!(
                 panel.entries.get(next_logical_idx),
                 Some(GitListEntry::Header(GitHeaderEntry {
@@ -9259,8 +9295,24 @@ mod tests {
             foo_idx
         });
 
+        // Section headers are selectable rows, so stepping off the last visible
+        // entry of the tracked section lands on the `Untracked` header first.
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_entry = Some(foo_idx);
+            panel.select_next(&menu::SelectNext, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let selected_idx = panel.selected_entry.expect("selection should be set");
+            assert!(matches!(
+                panel.entries.get(selected_idx),
+                Some(GitListEntry::Header(GitHeaderEntry {
+                    header: Section::New
+                }))
+            ));
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
             panel.select_next(&menu::SelectNext, window, cx);
         });
 
@@ -9273,6 +9325,269 @@ mod tests {
                 .expect("selected entry should be a status entry");
             assert_eq!(selected_entry.repo_path, repo_path("foobar.py"));
         });
+    }
+
+    /// Renders the currently visible rows into a compact, readable shape:
+    /// `[Header]`, `dir <name>` and file names, indented by tree depth.
+    fn visible_rows(panel: &GitPanel) -> Vec<String> {
+        panel
+            .visible_indices
+            .iter()
+            .filter_map(|&ix| panel.entries.get(ix))
+            .map(|entry| match entry {
+                GitListEntry::Header(header) => format!("[{}]", header.title()),
+                GitListEntry::Directory(dir) => {
+                    format!("{}dir {}", "  ".repeat(dir.depth), dir.name)
+                }
+                GitListEntry::Status(status) => {
+                    status.repo_path.display(PathStyle::Posix).to_string()
+                }
+                GitListEntry::TreeStatus(status) => format!(
+                    "{}{}",
+                    "  ".repeat(status.depth),
+                    status.entry.display_name(PathStyle::Posix)
+                ),
+            })
+            .collect()
+    }
+
+    /// Builds a panel over a repo with two tracked and two untracked files,
+    /// each pair split across a directory and the repo root.
+    async fn sectioned_panel(cx: &mut TestAppContext) -> (Entity<GitPanel>, VisualTestContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "src": {
+                    "lib.rs": "pub fn hello() {}",
+                    "main.rs": "fn main() {}",
+                },
+                "docs": {
+                    "readme.md": "# hi",
+                },
+                "new.txt": "new",
+            }),
+        )
+        .await;
+
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("src/lib.rs", StatusCode::Modified.worktree()),
+                ("src/main.rs", StatusCode::Modified.worktree()),
+                ("docs/readme.md", FileStatus::Untracked),
+                ("new.txt", FileStatus::Untracked),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut visual_cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        visual_cx
+            .read(|cx| {
+                project
+                    .read(cx)
+                    .worktrees(cx)
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .as_local()
+                    .unwrap()
+                    .scan_complete()
+            })
+            .await;
+        visual_cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(&mut visual_cx, GitPanel::new);
+        let handle = visual_cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        visual_cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        (panel, visual_cx)
+    }
+
+    fn set_tree_view(cx: &mut VisualTestContext, tree_view: bool) {
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().tree_view = Some(tree_view);
+                })
+            });
+        });
+        cx.executor().run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_flat_and_tree_row_construction(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (panel, mut cx) = sectioned_panel(cx).await;
+
+        // Flat mode still groups into Tracked / Untracked sections; every file
+        // is one row, with no directory rows in between.
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                visible_rows(panel),
+                vec![
+                    "[Tracked]",
+                    "src/lib.rs",
+                    "src/main.rs",
+                    "[Untracked]",
+                    "docs/readme.md",
+                    "new.txt",
+                ]
+            );
+            assert_eq!(panel.visible_indices.len(), panel.entries.len());
+        });
+
+        set_tree_view(&mut cx, true);
+
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                visible_rows(panel),
+                vec![
+                    "[Tracked]",
+                    "dir src",
+                    "  lib.rs",
+                    "  main.rs",
+                    "[Untracked]",
+                    "dir docs",
+                    "  readme.md",
+                    "new.txt",
+                ]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_section_header_counts(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (panel, mut cx) = sectioned_panel(cx).await;
+
+        // Counters count *files*, so they are the same in both view modes even
+        // though the tree mode inserts extra directory rows.
+        for tree_view in [false, true] {
+            set_tree_view(&mut cx, tree_view);
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(panel.section_counts.get(&Section::Tracked), Some(&2));
+                assert_eq!(panel.section_counts.get(&Section::New), Some(&2));
+                assert_eq!(panel.section_counts.get(&Section::Conflict), None);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_section_headers_collapse_and_expand(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (panel, mut cx) = sectioned_panel(cx).await;
+        set_tree_view(&mut cx, true);
+
+        let entry_count = panel.read_with(&cx, |panel, _| panel.entries.len());
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_section(Section::Tracked, window, cx);
+        });
+
+        // The collapsed section keeps its header (and its entries, so staging
+        // the whole section still works) — only its rows stop being visible.
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                visible_rows(panel),
+                vec![
+                    "[Tracked]",
+                    "[Untracked]",
+                    "dir docs",
+                    "  readme.md",
+                    "new.txt",
+                ]
+            );
+            assert_eq!(panel.entries.len(), entry_count);
+            assert_eq!(panel.section_counts.get(&Section::Tracked), Some(&2));
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_section(Section::New, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(visible_rows(panel), vec!["[Tracked]", "[Untracked]"]);
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_section(Section::Tracked, window, cx);
+            panel.toggle_section(Section::New, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                visible_rows(panel),
+                vec![
+                    "[Tracked]",
+                    "dir src",
+                    "  lib.rs",
+                    "  main.rs",
+                    "[Untracked]",
+                    "dir docs",
+                    "  readme.md",
+                    "new.txt",
+                ]
+            );
+            assert!(panel.collapsed_sections.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_collapsed_section_is_skipped_by_keyboard_navigation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (panel, mut cx) = sectioned_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.toggle_section(Section::Tracked, window, cx);
+            panel.select_first(&menu::SelectFirst, window, cx);
+        });
+
+        // With `Tracked` collapsed the first content row is in the next
+        // section; arrow-up from there lands on the `Untracked` header rather
+        // than on a hidden row.
+        panel.read_with(&cx, |panel, _| {
+            let selected = panel.selected_entry.expect("selection should be set");
+            assert_eq!(
+                panel
+                    .entries
+                    .get(selected)
+                    .and_then(|entry| entry.status_entry())
+                    .map(|entry| entry.repo_path.clone()),
+                Some(repo_path("docs/readme.md"))
+            );
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.select_previous(&menu::SelectPrevious, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, _| {
+            let selected = panel.selected_entry.expect("selection should be set");
+            assert!(matches!(
+                panel.entries.get(selected),
+                Some(GitListEntry::Header(GitHeaderEntry {
+                    header: Section::New
+                }))
+            ));
+        });
+    }
+
+    #[test]
+    fn test_file_count_label() {
+        assert_eq!(file_count_label(0), "0 files");
+        assert_eq!(file_count_label(1), "1 file");
+        assert_eq!(file_count_label(7), "7 files");
     }
 
     fn assert_entry_paths(entries: &[GitListEntry], expected_paths: &[Option<&str>]) {
