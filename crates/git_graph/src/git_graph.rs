@@ -184,10 +184,11 @@ use workspace::{
 // grow the row.
 const COMMIT_CIRCLE_RADIUS: Pixels = px(4.0);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
-// IDEA-style lane pitch: wide enough that a lane change reads as a diagonal
-// rather than a hairline kink, and that adjacent dots don't visually merge.
-// Anything below ~14px turns the diagonals into near-vertical slivers, since a
-// transition may only span one row vertically.
+// IDEA-style lane pitch: wide enough that a lane change reads as a curve rather
+// than a hairline kink, and that adjacent dots don't visually merge. It is also
+// the unit a transition's height is measured in (see
+// `LANE_TRANSITION_ROWS_PER_EXTRA_LANE`), so anything below ~14px turns the
+// crossings into near-vertical slivers.
 const LANE_WIDTH: Pixels = px(16.0);
 const LEFT_PADDING: Pixels = px(8.0);
 // The commit-graph column is not user-resizable (IDEA-style); it is sized to
@@ -1511,75 +1512,82 @@ fn along(from: Point<Pixels>, to: Point<Pixels>, distance: f32) -> Point<Pixels>
     )
 }
 
-/// Radius of the rounded transition between a vertical lane run and the
-/// diagonal that changes lanes. Bounded by both axes so it stays a soft corner
-/// rather than swallowing a whole lane or a whole row.
-fn lane_corner_radius(row_height: Pixels) -> Pixels {
-    (LANE_WIDTH / 2.0).min(row_height / 3.0)
+/// How much vertical room a lane change gets per lane it has to cross, beyond
+/// the first, as a fraction of a row. A transition capped at a constant number
+/// of rows degenerates into a horizontal streak as soon as the jump is wide — a
+/// fan-in of fifteen lanes crossed the entire graph inside a single row — so the
+/// room scales with the distance instead and the slope stays readable however
+/// wide the fan is.
+const LANE_TRANSITION_ROWS_PER_EXTRA_LANE: f32 = 0.5;
+/// Where the lane-change curve's control points sit, as a fraction of the
+/// transition's height. They are pulled along the *vertical* axis only: that is
+/// what makes the curve leave and arrive parallel to the lanes it joins. Any
+/// value in `(0, 1]` keeps the curve monotonic in y; a half reads as the
+/// symmetric S of the reference.
+const LANE_TRANSITION_CONTROL_FRACTION: f32 = 0.5;
+
+/// Vertical distance a lane change is allowed to take, given the horizontal
+/// distance `lane_span` it has to cover and the `available` vertical room.
+/// Scales with the row height, so a transition keeps its proportions at any UI
+/// scale, and with the number of lanes crossed, so a wide jump is given a slope
+/// instead of a streak. Always a magnitude: the caller applies the direction of
+/// travel.
+fn lane_transition_height(row_height: Pixels, lane_span: Pixels, available: Pixels) -> Pixels {
+    let lanes = (f32::from(lane_span.abs()) / f32::from(LANE_WIDTH)).max(1.0);
+    let rows = 1.0 + (lanes - 1.0) * LANE_TRANSITION_ROWS_PER_EXTRA_LANE;
+    (row_height * rows).min(available.abs())
 }
 
-/// Vertical distance a lane change is allowed to take: exactly one row, IDEA's
-/// convention. A branch leaves its lane one row before it lands in the next, so
-/// the crossing reads as a diagonal instead of a right-angle elbow, and the
-/// rows above the transition are left clear.
-fn lane_transition_height(row_height: Pixels, available: Pixels) -> Pixels {
-    row_height.min(available.abs())
+/// The two control points of the cubic that carries a line from one lane to
+/// another. Both are offset from their end along the vertical only, so the
+/// curve is tangent to the lanes at both ends and its joins with the straight
+/// runs are invisible.
+fn lane_transition_controls(
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+) -> (Point<Pixels>, Point<Pixels>) {
+    let offset = (to.y - from.y) * LANE_TRANSITION_CONTROL_FRACTION;
+    (point(from.x, from.y + offset), point(to.x, to.y - offset))
 }
 
-/// The radius a corner can actually be rounded with: never more than half of
-/// either adjacent run, so two corners sharing a short run cannot overrun each
-/// other and fold the path back on itself.
-fn clamped_corner_radius(
-    previous: Point<Pixels>,
-    corner: Point<Pixels>,
-    next: Point<Pixels>,
-    radius: Pixels,
-) -> Pixels {
-    radius
-        .min(px(distance_between(previous, corner) / 2.0))
-        .min(px(distance_between(corner, next) / 2.0))
-}
-
-/// Strokes `points` as a polyline whose *interior* corners are rounded off with
-/// a quadratic curve, so lane changes bend into their vertical runs instead of
-/// meeting them at a hard angle. The end points are left as-is: those sit on
-/// commit dots, or hand over to the next segment of the same line.
-///
-/// Each corner's radius is shrunk to at most half of either adjacent run, so two
-/// corners sharing a short run can never overrun each other and invert the path.
-fn stroke_rounded_polyline(builder: &mut PathBuilder, points: &[Point<Pixels>], radius: Pixels) {
-    let mut distinct: SmallVec<[Point<Pixels>; 4]> = SmallVec::new();
-    for &candidate in points {
-        if distinct
-            .last()
-            .is_none_or(|last| distance_between(*last, candidate) > 0.01)
-        {
-            distinct.push(candidate);
-        }
-    }
-    let Some((&first, rest)) = distinct.split_first() else {
-        return;
+/// Pulls the ends of a lane change back by the given clearances, along the
+/// curve's own direction at each end — the lane it leaves and the lane it lands
+/// in — so an edge stops short of the commit dots it runs between instead of
+/// painting over them. A transition with no vertical room to bend in has no
+/// tangent to follow and backs off along the straight line between its ends
+/// instead. Neither end can be pulled past the curve's own control point.
+fn clear_lane_transition_dots(
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    from_clearance: f32,
+    to_clearance: f32,
+) -> (Point<Pixels>, Point<Pixels>) {
+    let (control_a, control_b) = lane_transition_controls(from, to);
+    let leaves_towards = if distance_between(from, control_a) > f32::EPSILON {
+        control_a
+    } else {
+        to
     };
+    let arrives_from = if distance_between(control_b, to) > f32::EPSILON {
+        control_b
+    } else {
+        from
+    };
+    (
+        along(from, leaves_towards, from_clearance),
+        along(to, arrives_from, to_clearance),
+    )
+}
 
-    let mut pen = first;
-    builder.move_to(pen);
-    for (index, &corner) in rest.iter().enumerate() {
-        let Some(&next) = rest.get(index + 1) else {
-            builder.line_to(corner);
-            builder.move_to(corner);
-            break;
-        };
-
-        let corner_radius = clamped_corner_radius(pen, corner, next, radius);
-        let curve_start = along(corner, pen, f32::from(corner_radius));
-        let curve_end = along(corner, next, f32::from(corner_radius));
-
-        builder.line_to(curve_start);
-        builder.move_to(curve_start);
-        builder.curve_to(curve_end, corner);
-        builder.move_to(curve_end);
-        pen = curve_end;
-    }
+/// Strokes the lane change itself: one cubic from `from` to `to` that leaves
+/// and arrives vertically, spreading the bend over the whole transition. This
+/// replaces the rounded elbow that used to be drawn here — rounding a corner
+/// only softens the crease, the lane change still happens at a single joint.
+fn stroke_lane_transition(builder: &mut PathBuilder, from: Point<Pixels>, to: Point<Pixels>) {
+    let (control_a, control_b) = lane_transition_controls(from, to);
+    builder.move_to(from);
+    builder.cubic_bezier_to(to, control_a, control_b);
+    builder.move_to(to);
 }
 
 fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &mut Window) {
@@ -3884,7 +3892,6 @@ impl GitGraph {
                         builder.move_to(point(line_x, from_y));
 
                         let segments = &line.segments[start_segment_idx..];
-                        let corner_radius = lane_corner_radius(row_height);
                         // How far short of a commit dot an edge stops, so it
                         // never paints over a dot of a different colour.
                         let dot_clearance =
@@ -3925,55 +3932,49 @@ impl GitGraph {
                                         bounds,
                                     );
 
-                                    // Both kinds cross lanes over a single
-                                    // diagonal run of at most one row, with the
-                                    // joints to the vertical runs rounded off —
-                                    // IDEA's shape. The orthogonal elbow this
-                                    // replaced put a hard right angle on every
-                                    // branch and merge.
+                                    // Both kinds change lanes over a single
+                                    // cubic that leaves and arrives parallel to
+                                    // the lanes, spreading the bend across the
+                                    // whole transition. Its height comes from
+                                    // the row height and the number of lanes
+                                    // crossed, so a wide fan-in gets the room to
+                                    // stay a curve; the elbow this replaced put
+                                    // the entire lane change in one corner.
                                     let pen_end = match curve_kind {
                                         // A branch runs down its parent's lane and
                                         // only crosses into its own on the row it
                                         // is drawn at.
                                         CurveKind::Checkout => {
                                             let travel = to_row - current_row;
-                                            let step = lane_transition_height(row_height, travel)
-                                                * travel.signum();
-                                            let diagonal_start =
-                                                point(current_column, to_row - step);
-                                            let mut landing = point(to_column, to_row);
-                                            if is_last {
-                                                landing =
-                                                    along(landing, diagonal_start, dot_clearance);
-                                            }
-
-                                            let mut path: SmallVec<[Point<Pixels>; 4]> = smallvec![
-                                                point(current_column, current_row),
-                                                diagonal_start,
-                                                landing,
-                                            ];
-                                            // When the line carries on below, run a
-                                            // corner's worth past the landing point
-                                            // so the diagonal bends into the
-                                            // vertical instead of kinking. The next
-                                            // segment draws from the pen, so the two
-                                            // never double up.
-                                            let pen_end = if is_last {
-                                                landing
+                                            let height = lane_transition_height(
+                                                row_height,
+                                                to_column - current_column,
+                                                travel,
+                                            ) * travel.signum();
+                                            let curve_start =
+                                                point(current_column, to_row - height);
+                                            let landing = point(to_column, to_row);
+                                            // The curve arrives along the target
+                                            // lane, so it clears the dot by backing
+                                            // up that lane, not along a diagonal.
+                                            let (curve_start, curve_end) = if is_last {
+                                                clear_lane_transition_dots(
+                                                    curve_start,
+                                                    landing,
+                                                    0.,
+                                                    dot_clearance,
+                                                )
                                             } else {
-                                                let beyond = point(
-                                                    to_column,
-                                                    to_row + corner_radius * travel.signum(),
-                                                );
-                                                path.push(beyond);
-                                                beyond
+                                                (curve_start, landing)
                                             };
-                                            stroke_rounded_polyline(
+
+                                            builder.line_to(curve_start);
+                                            stroke_lane_transition(
                                                 &mut builder,
-                                                &path,
-                                                corner_radius,
+                                                curve_start,
+                                                curve_end,
                                             );
-                                            pen_end
+                                            curve_end
                                         }
                                         // A merge edge leaves its commit's dot for
                                         // the parent's lane, then drops down it.
@@ -3983,7 +3984,7 @@ impl GitGraph {
                                             }
 
                                             // The line entered this segment already
-                                            // clear of the dot; the diagonal has to
+                                            // clear of the dot; the curve has to
                                             // leave from the dot's centre instead,
                                             // or it starts off-axis.
                                             let origin = point(
@@ -3991,20 +3992,26 @@ impl GitGraph {
                                                 current_row - COMMIT_CIRCLE_RADIUS,
                                             );
                                             let travel = to_row - origin.y;
-                                            let step = lane_transition_height(row_height, travel)
-                                                * travel.signum();
-                                            let diagonal_end = point(to_column, origin.y + step);
-                                            let landing = point(to_column, to_row);
+                                            let height = lane_transition_height(
+                                                row_height,
+                                                to_column - origin.x,
+                                                travel,
+                                            ) * travel.signum();
+                                            let (curve_start, curve_end) =
+                                                clear_lane_transition_dots(
+                                                    origin,
+                                                    point(to_column, origin.y + height),
+                                                    dot_clearance,
+                                                    0.,
+                                                );
 
-                                            stroke_rounded_polyline(
+                                            stroke_lane_transition(
                                                 &mut builder,
-                                                &[
-                                                    along(origin, diagonal_end, dot_clearance),
-                                                    diagonal_end,
-                                                    landing,
-                                                ],
-                                                corner_radius,
+                                                curve_start,
+                                                curve_end,
                                             );
+                                            let landing = point(to_column, to_row);
+                                            builder.line_to(landing);
                                             landing
                                         }
                                     };
@@ -6000,47 +6007,20 @@ mod tests {
         // Growing the dot must not grow the row.
         assert!(COMMIT_CIRCLE_RADIUS * 2.0 < row_height);
 
-        // A lane change takes at most one row, and less when there is less room.
-        assert_eq!(lane_transition_height(row_height, px(80.)), row_height);
-        assert_eq!(lane_transition_height(row_height, px(9.)), px(9.));
-        assert_eq!(lane_transition_height(row_height, px(-9.)), px(9.));
-
-        // The corner that softens a lane change stays inside one lane and one row.
-        let corner = lane_corner_radius(row_height);
-        assert!(corner > px(0.));
-        assert!(corner <= LANE_WIDTH / 2.0);
-        assert!(corner <= row_height / 3.0);
-    }
-
-    #[test]
-    fn test_rounded_corner_radius_cannot_overrun_its_runs() {
-        let radius = px(10.);
-        let previous = point(px(0.), px(0.));
-        let corner = point(px(0.), px(100.));
-        let next = point(px(100.), px(100.));
-
-        // Long runs get the full radius.
+        // A hop into the neighbouring lane takes one row when there is room for
+        // one, and less when there is not.
         assert_eq!(
-            clamped_corner_radius(previous, corner, next, radius),
-            radius
+            lane_transition_height(row_height, LANE_WIDTH, px(80.)),
+            row_height
         );
-
-        // A short incoming run halves down to fit, and so does a short outgoing
-        // one — otherwise two corners on the same run would cross over and the
-        // stroked path would fold back on itself.
-        let near_corner = point(px(0.), px(8.));
         assert_eq!(
-            clamped_corner_radius(previous, near_corner, next, radius),
-            px(4.)
+            lane_transition_height(row_height, LANE_WIDTH, px(9.)),
+            px(9.)
         );
-        let near_next = point(px(6.), px(100.));
         assert_eq!(
-            clamped_corner_radius(previous, corner, near_next, radius),
-            px(3.)
+            lane_transition_height(row_height, LANE_WIDTH, px(-9.)),
+            px(9.)
         );
-
-        // A degenerate run rounds to nothing rather than inverting.
-        assert_eq!(clamped_corner_radius(corner, corner, next, radius), px(0.));
     }
 
     #[test]
@@ -6054,6 +6034,221 @@ mod tests {
         assert_eq!(along(from, to, 500.), to);
         // A zero-length run has no direction to walk in.
         assert_eq!(along(from, from, 5.), from);
+    }
+
+    /// A point on the cubic that [`stroke_lane_transition`] hands to the path
+    /// builder, so the tests can assert the shape the builder will rasterize.
+    fn lane_transition_point(from: Point<Pixels>, to: Point<Pixels>, t: f32) -> Point<Pixels> {
+        let (control_a, control_b) = lane_transition_controls(from, to);
+        let inverse = 1.0 - t;
+        let weights = [
+            inverse * inverse * inverse,
+            3.0 * t * inverse * inverse,
+            3.0 * t * t * inverse,
+            t * t * t,
+        ];
+        let nodes = [from, control_a, control_b, to];
+        let mut result = point(px(0.), px(0.));
+        for (node, weight) in nodes.iter().zip(weights) {
+            result.x += node.x * weight;
+            result.y += node.y * weight;
+        }
+        result
+    }
+
+    /// The steepest horizontal rate the curve reaches, in pixels sideways per
+    /// pixel down — the number that decides whether a transition reads as a
+    /// flow or as a horizontal streak.
+    fn steepest_horizontal_rate(from: Point<Pixels>, to: Point<Pixels>) -> f32 {
+        const SAMPLES: usize = 200;
+        let mut steepest: f32 = 0.;
+        let mut previous = from;
+        for step in 1..=SAMPLES {
+            let current = lane_transition_point(from, to, step as f32 / SAMPLES as f32);
+            let dx = f32::from(current.x - previous.x).abs();
+            let dy = f32::from(current.y - previous.y).abs();
+            if dy > f32::EPSILON {
+                steepest = steepest.max(dx / dy);
+            }
+            previous = current;
+        }
+        steepest
+    }
+
+    #[test]
+    fn test_lane_transition_height_follows_the_row_height_and_the_distance() {
+        let row_height = px(22.);
+        let room = px(10_000.);
+
+        // The row height is the unit the transition is measured in: at twice
+        // the line height the same lane change is twice as tall.
+        assert_eq!(
+            lane_transition_height(row_height * 2.0, LANE_WIDTH, room),
+            lane_transition_height(row_height, LANE_WIDTH, room) * 2.0
+        );
+
+        // A hop to the neighbouring lane is one row; anything shorter still gets
+        // a whole row rather than a sliver.
+        assert_eq!(
+            lane_transition_height(row_height, LANE_WIDTH, room),
+            row_height
+        );
+        assert_eq!(
+            lane_transition_height(row_height, LANE_WIDTH / 4.0, room),
+            row_height
+        );
+
+        // Every further lane buys more vertical room, so a wide jump is never
+        // squeezed into the same single row as a narrow one.
+        let one_lane = lane_transition_height(row_height, LANE_WIDTH, room);
+        let three_lanes = lane_transition_height(row_height, LANE_WIDTH * 3.0, room);
+        let fifteen_lanes = lane_transition_height(row_height, LANE_WIDTH * 15.0, room);
+        assert!(three_lanes > one_lane);
+        assert!(fifteen_lanes > three_lanes);
+        assert_eq!(fifteen_lanes, row_height * 8.0);
+
+        // Direction of the jump does not change its height.
+        assert_eq!(
+            lane_transition_height(row_height, LANE_WIDTH * -15.0, room),
+            fifteen_lanes
+        );
+
+        // But the room the segment actually has always wins: a transition never
+        // runs past the row it has to land on, in either direction.
+        assert_eq!(
+            lane_transition_height(row_height, LANE_WIDTH * 15.0, row_height),
+            row_height
+        );
+        assert_eq!(
+            lane_transition_height(row_height, LANE_WIDTH * 15.0, -row_height),
+            row_height
+        );
+    }
+
+    #[test]
+    fn test_lane_transition_controls_are_vertical_offsets() {
+        let from = point(px(100.), px(40.));
+        let to = point(px(20.), px(150.));
+        let (control_a, control_b) = lane_transition_controls(from, to);
+
+        // Both handles sit on their own lane, which is what makes the curve
+        // leave and arrive parallel to the lanes instead of kinking into them.
+        assert_eq!(control_a.x, from.x);
+        assert_eq!(control_b.x, to.x);
+
+        // And both are pulled along the transition's height, so the bend is
+        // spread over it rather than concentrated at one end.
+        let height = to.y - from.y;
+        assert_eq!(
+            control_a.y - from.y,
+            height * LANE_TRANSITION_CONTROL_FRACTION
+        );
+        assert_eq!(
+            to.y - control_b.y,
+            height * LANE_TRANSITION_CONTROL_FRACTION
+        );
+
+        // A transition that runs upwards is the same curve mirrored, not an
+        // inverted one.
+        let (up_a, up_b) = lane_transition_controls(to, from);
+        assert_eq!(up_a.x, to.x);
+        assert_eq!(up_b.x, from.x);
+        assert!(up_a.y < to.y);
+        assert!(up_b.y > from.y);
+    }
+
+    #[test]
+    fn test_lane_transition_curve_stays_inside_its_corridor() {
+        let from = point(px(100.), px(40.));
+        let to = point(px(20.), px(150.));
+
+        assert_eq!(lane_transition_point(from, to, 0.), from);
+        assert_eq!(lane_transition_point(from, to, 1.), to);
+
+        let mut previous = from;
+        for step in 1..=100 {
+            let current = lane_transition_point(from, to, step as f32 / 100.);
+            // Monotonic on both axes: the curve never doubles back over a row it
+            // has already passed, nor over a lane it has already crossed.
+            assert!(current.y >= previous.y, "y went back at step {step}");
+            assert!(current.x <= previous.x, "x went back at step {step}");
+            // And it stays within the rectangle spanned by its ends, so it can
+            // only ever paint over the lanes it actually crosses.
+            assert!(current.x >= to.x && current.x <= from.x);
+            assert!(current.y >= from.y && current.y <= to.y);
+            previous = current;
+        }
+
+        // The ends are tangent to the lanes: a step along the curve moves far
+        // less sideways than it does down.
+        let near_start = lane_transition_point(from, to, 0.02);
+        assert!(f32::from(from.x - near_start.x) < f32::from(near_start.y - from.y));
+        let near_end = lane_transition_point(from, to, 0.98);
+        assert!(f32::from(near_end.x - to.x) < f32::from(to.y - near_end.y));
+    }
+
+    #[test]
+    fn test_lane_transition_dot_clearance_follows_the_curve() {
+        let from = point(px(100.), px(40.));
+        let to = point(px(20.), px(150.));
+
+        // Each end backs off along its own lane — the direction the curve
+        // actually leaves and arrives in — and only the end that was asked for.
+        let (head, tail) = clear_lane_transition_dots(from, to, 6., 0.);
+        assert_eq!(head, point(from.x, from.y + px(6.)));
+        assert_eq!(tail, to);
+        let (head, tail) = clear_lane_transition_dots(from, to, 0., 6.);
+        assert_eq!(head, from);
+        assert_eq!(tail, point(to.x, to.y - px(6.)));
+
+        // A clearance wider than the curve's own handle stops at the handle
+        // rather than turning the transition inside out.
+        let (head, tail) = clear_lane_transition_dots(from, to, 500., 500.);
+        let (control_a, control_b) = lane_transition_controls(from, to);
+        assert_eq!(head, control_a);
+        assert_eq!(tail, control_b);
+
+        // An upward transition backs off upward.
+        let (head, _) = clear_lane_transition_dots(to, from, 6., 0.);
+        assert_eq!(head, point(to.x, to.y - px(6.)));
+
+        // A transition with no room to bend has no tangent to follow, so it
+        // backs off along itself instead of failing to clear the dot at all.
+        let flat_from = point(px(100.), px(40.));
+        let flat_to = point(px(60.), px(40.));
+        let (head, tail) = clear_lane_transition_dots(flat_from, flat_to, 6., 6.);
+        assert_eq!(head, point(flat_from.x - px(6.), flat_from.y));
+        assert_eq!(tail, point(flat_to.x + px(6.), flat_to.y));
+    }
+
+    #[test]
+    fn test_wide_lane_transitions_do_not_flatten_into_streaks() {
+        let row_height = px(22.);
+        let room = px(10_000.);
+        let lane_change = |lanes: f32| {
+            let span = LANE_WIDTH * lanes;
+            let height = lane_transition_height(row_height, span, room);
+            (point(px(0.), px(0.)), point(span, height))
+        };
+
+        let (narrow_from, narrow_to) = lane_change(1.0);
+        let narrow_rate = steepest_horizontal_rate(narrow_from, narrow_to);
+
+        let (wide_from, wide_to) = lane_change(15.0);
+        let wide_rate = steepest_horizontal_rate(wide_from, wide_to);
+
+        // A fifteen-lane fan-in is allowed to lean further than a single-lane
+        // hop, but only by a small factor — it must still read as a diagonal.
+        assert!(wide_rate > narrow_rate);
+        assert!(
+            wide_rate < narrow_rate * 2.0,
+            "wide transition leans {wide_rate} px sideways per px down"
+        );
+
+        // Capping the height at one row — what this replaced — would have made
+        // the same jump an order of magnitude flatter.
+        let capped = steepest_horizontal_rate(wide_from, point(wide_to.x, row_height));
+        assert!(capped > wide_rate * 5.0, "one-row cap leans {capped}");
     }
 
     #[test]
