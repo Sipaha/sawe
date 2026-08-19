@@ -86,7 +86,8 @@
       "undo": "editor::Undo",
       "ctrl-z": "editor::Undo",
       "redo": "editor::Redo",
-      "ctrl-y": "editor::Redo",
+      // ctrl-y is Delete Line (IntelliJ IDEA parity, see below); Redo
+      // keeps ctrl-shift-z and the dedicated `redo` key.
       "ctrl-shift-z": "editor::Redo",
       "up": "editor::MoveUp",
       "ctrl-up": "editor::LineUp",
@@ -543,7 +544,10 @@
       "ctrl-]": "editor::Indent",
       "shift-alt-up": ["editor::AddSelectionAbove", { "skip_soft_wrap": true }], // Insert Cursor Above
       "shift-alt-down": ["editor::AddSelectionBelow", { "skip_soft_wrap": true }], // Insert Cursor Below
-      "ctrl-shift-k": "editor::DeleteLine",
+      // ctrl-shift-k is reserved for git::Push (IntelliJ IDEA's Push
+      // shortcut) in the Workspace block below; Delete Line moves to
+      // IDEA's ctrl-y. Redo keeps ctrl-shift-z and the `redo` key.
+      "ctrl-y": "editor::DeleteLine",
       "alt-up": "editor::MoveLineUp",
       "alt-down": "editor::MoveLineDown",
       "ctrl-alt-shift-up": "editor::DuplicateLineUp",
@@ -638,6 +642,7 @@
       // "alt-ctrl-shift-o": ["projects::OpenRemote", { "from_existing_connection": true }],
       "alt-ctrl-shift-o": ["projects::OpenRemote", { "from_existing_connection": false }],
       "alt-ctrl-shift-b": "branches::OpenRecent",
+      "ctrl-shift-k": "git::Push",
       "ctrl-shift-`": "git::BranchesPopupOpen",
       "alt-ctrl-shift-w": "git::Worktree",
       "alt-shift-enter": "toast::RunAction",
@@ -1186,6 +1191,12 @@
     "context": "FileFinder || (FileFinder > Picker > Editor)",
     "bindings": {
       "ctrl-p": "file_finder::Toggle",
+      // Repeat of the IDEA-style "Go to File" binding cycles the search scope
+      // between the active Solution member and the whole Solution, the way
+      // IDEA's Search Everywhere reuses its own shortcut. `ctrl-p` / `ctrl-e`
+      // above deliberately keep cycling the selection instead: they are the
+      // hold-modifier quick switcher.
+      "ctrl-shift-n": "file_finder::ToggleScope",
       "ctrl-shift-a": "file_finder::ToggleSplitMenu",
       "ctrl-shift-i": "file_finder::ToggleFilterMenu",
     },
