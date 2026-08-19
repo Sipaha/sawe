@@ -21,7 +21,7 @@ use crate::{
     DisplayRow, Editor, EditorSettings, EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT,
     MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, RowExt, StickyHeaderExcerpt,
     display_map::Block,
-    element::{EditorElement, SplitSide, header_jump_data, render_buffer_header},
+    element::{EditorElement, header_jump_data, render_buffer_header},
     scroll::ScrollOffset,
     split::SplittableEditor,
     split_connectors::{CONNECTOR_STRIP_WIDTH, connector_ribbons, editor_rem_size},
@@ -246,11 +246,10 @@ impl RenderOnce for SplitEditorView {
         let lhs_editor = splittable_editor.lhs_editor().unwrap().clone();
         let rhs_editor = splittable_editor.rhs_editor().clone();
 
-        let mut lhs = EditorElement::new(&lhs_editor, self.style.clone());
-        let mut rhs = EditorElement::new(&rhs_editor, self.style.clone());
-
-        lhs.set_split_side(SplitSide::Left);
-        rhs.set_split_side(SplitSide::Right);
+        // The panes do not declare their side here: `EditorElement` reads it
+        // from the editor's own `split_side`, set by `SplittableEditor`.
+        let lhs = EditorElement::new(&lhs_editor, self.style.clone());
+        let rhs = EditorElement::new(&rhs_editor, self.style.clone());
 
         let left_ratio = self.split_state.read(cx).left_ratio();
         let right_ratio = self.split_state.read(cx).right_ratio();

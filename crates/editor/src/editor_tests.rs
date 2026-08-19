@@ -38353,6 +38353,122 @@ fn test_indicator_column_area_covers_exactly_the_icons(_cx: &mut TestAppContext)
     );
 }
 
+/// Which right-click lands where in the gutter, end to end. The handler used to
+/// exclude the whole `right_padding`, so a right-click anywhere in the fold
+/// column produced no gutter menu *and* never fell through to the text menu —
+/// a silent dead band as wide as three characters. Only the indicator column,
+/// whose run arrow and bookmark carry their own menus, may be excluded now.
+#[gpui::test]
+async fn test_gutter_right_click_regions(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("ˇaaaa\nbbbb\ncccc\n");
+    cx.run_until_parked();
+
+    let (gutter_left, dimensions) = cx.update_editor(|editor, _, _| {
+        let position_map = editor
+            .last_position_map
+            .clone()
+            .expect("the editor element must have been drawn");
+        (
+            position_map.gutter_hitbox.bounds.left(),
+            position_map.gutter_dimensions,
+        )
+    });
+    // Both columns have to exist for this test to mean anything: a singleton
+    // buffer with line numbers reserves the indicator column, and the fold
+    // column is what the old code swallowed.
+    let indicator_column = dimensions.indicator_column_area();
+    assert!(
+        !indicator_column.is_empty(),
+        "expected an indicator column in a singleton gutter, got {indicator_column:?}",
+    );
+    assert!(
+        dimensions.fold_area_start() < dimensions.width,
+        "expected a fold column inside the gutter",
+    );
+
+    let row = DisplayRow(1);
+    let row_y = cx.pixel_position_for(DisplayPoint::new(row, 0)).y;
+    let click_gutter = |cx: &mut EditorTestContext, x: Pixels| {
+        cx.simulate_mouse_down(
+            gpui::Point::new(gutter_left + x, row_y),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+    };
+
+    // Inside the indicator column: nothing. The icons there own their own
+    // right-click handlers. This goes first, while no menu has been deployed
+    // yet, so that "no menu" cannot be an artifact of a stale overlay.
+    let indicator_midpoint = (indicator_column.start + indicator_column.end) / 2.0;
+    assert!(
+        indicator_midpoint < dimensions.width,
+        "the indicator column must be inside the gutter, or this click never reaches the handler",
+    );
+    click_gutter(&mut cx, indicator_midpoint);
+    assert_eq!(
+        deployed_menu_source(&mut cx),
+        None,
+        "the indicator column is left to the runnable/bookmark icons",
+    );
+
+    // Inside the fold column: the generic gutter menu, anchored to the start of
+    // the clicked row, and the selection is left alone.
+    click_gutter(&mut cx, dimensions.fold_area_start() + px(1.));
+    assert_eq!(
+        deployed_menu_source(&mut cx),
+        Some(Point::new(1, 0)),
+        "a right-click in the fold column deploys the gutter menu",
+    );
+    cx.assert_editor_state("ˇaaaa\nbbbb\ncccc\n");
+    dismiss_deployed_menu(&mut cx);
+
+    // Past the gutter: the text menu, anchored at the clicked column, which
+    // also moves the cursor there.
+    let text_position = cx.pixel_position_for(DisplayPoint::new(row, 2));
+    cx.simulate_mouse_down(
+        text_position,
+        gpui::MouseButton::Right,
+        gpui::Modifiers::none(),
+    );
+    assert_eq!(
+        deployed_menu_source(&mut cx),
+        Some(Point::new(1, 2)),
+        "a right-click past the gutter deploys the text menu",
+    );
+    cx.assert_editor_state("aaaa\nbbˇbb\ncccc\n");
+}
+
+/// The buffer point the currently deployed mouse menu is anchored to, or `None`
+/// when no menu is up. The gutter menu always anchors to column zero of the
+/// clicked row, the text menu to the clicked column, which is what tells the
+/// two apart.
+fn deployed_menu_source(cx: &mut EditorTestContext) -> Option<Point> {
+    cx.update_editor(|editor, _, cx| {
+        let menu = editor.mouse_context_menu.as_ref()?;
+        match &menu.position {
+            crate::mouse_context_menu::MenuPosition::PinnedToEditor { source, .. } => {
+                Some(source.to_point(&editor.buffer.read(cx).snapshot(cx)))
+            }
+            crate::mouse_context_menu::MenuPosition::PinnedToScreen(_) => {
+                panic!("mouse menus are pinned to the editor")
+            }
+        }
+    })
+}
+
+/// Closes the deployed menu *and* repaints. The open menu is an overlay that
+/// blocks the mouse, so a frame still holding it swallows every later synthetic
+/// click and the editor's own hitboxes never register as hovered again.
+fn dismiss_deployed_menu(cx: &mut EditorTestContext) {
+    cx.update_editor(|editor, _, cx| {
+        editor.mouse_context_menu.take();
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
 /// The mixed-language fallback must still be resolved *at the excerpt's
 /// location*, not from the global defaults: a project sets language-agnostic
 /// keys in its own settings file too, and those have to keep applying when no

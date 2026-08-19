@@ -495,7 +495,7 @@ impl EditorElement {
         window.on_mouse_event({
             let position_map = layout.position_map.clone();
             let editor = self.editor.clone();
-            let split_side = self.split_side;
+            let split_side = layout.position_map.snapshot.split_side;
 
             move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {

@@ -9,6 +9,13 @@ impl GutterDimensions {
     }
 
     /// The left edge of the fold area, relative to the gutter's left edge.
+    ///
+    /// The `mirrored` branch is only exercised with `indicator_column_width ==
+    /// 0`: production sets `mirrored: true` for split-diff panes only, and a
+    /// split pane is never `is_singleton`, which is what gates reserving an
+    /// indicator column at all. If that invariant is ever loosened, the
+    /// mirrored ordering of the indicator and fold columns becomes reachable
+    /// and needs a test of its own.
     pub fn fold_area_start(&self) -> Pixels {
         if self.mirrored {
             self.indicator_column_width

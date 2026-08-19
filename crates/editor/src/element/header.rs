@@ -123,8 +123,8 @@ impl EditorElement {
         rows
     }
 
-    pub(super) fn should_show_buffer_headers(&self) -> bool {
-        self.split_side.is_none()
+    pub(super) fn should_show_buffer_headers(snapshot: &EditorSnapshot) -> bool {
+        snapshot.split_side.is_none()
     }
 
     pub(super) fn layout_sticky_buffer_header(

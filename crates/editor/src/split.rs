@@ -7130,6 +7130,80 @@ mod tests {
         );
     }
 
+    /// Which side a pane is on belongs to the *editor*, not to whoever happens
+    /// to build the element. `Editor`'s own `Render` impl constructs a bare
+    /// `EditorElement::new` and has no opportunity to declare a side, yet the
+    /// left pane's gutter still has to land against the divider. While the
+    /// element carried its own manually-set copy of `split_side`, this path
+    /// drew a correctly *sized* gutter on the wrong edge.
+    #[gpui::test]
+    async fn test_split_pane_element_derives_its_side_from_the_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (editor, cx) = init_singleton_test(cx, "one\ntwo\nthree\n", "one\nTWO\nthree\n").await;
+
+        let (rhs_editor, lhs_editor) = editor.update(cx, |editor, _| {
+            let lhs = editor.lhs.as_ref().expect("should have split");
+            (editor.rhs_editor.clone(), lhs.editor.clone())
+        });
+
+        // This draws each pane through `Render for Editor`, not through
+        // `SplitEditorView` — no setter is called on either element.
+        let _ = editor_content_with_blocks_and_width(&rhs_editor, px(600.), cx);
+        let _ = editor_content_with_blocks_and_width(&lhs_editor, px(600.), cx);
+        cx.run_until_parked();
+
+        let drawn_pane = |pane: &Entity<Editor>, cx: &mut VisualTestContext| {
+            pane.read_with(cx, |editor, _| {
+                let position_map = editor
+                    .last_position_map
+                    .clone()
+                    .expect("the pane must have been drawn");
+                (
+                    editor.last_bounds.expect("the pane must have been drawn"),
+                    position_map.gutter_hitbox.bounds,
+                    position_map.text_hitbox.bounds,
+                )
+            })
+        };
+        // The gutter origin is the pane's right edge minus the gutter width, so
+        // the two ends agree only to within float rounding.
+        let same = |a: Pixels, b: Pixels| (a - b).abs() < px(0.01);
+
+        let (bounds, gutter, text) = drawn_pane(&lhs_editor, cx);
+        assert!(
+            gutter.size.width > px(0.),
+            "the left pane must have been laid out with a gutter"
+        );
+        assert!(
+            same(gutter.right(), bounds.right()),
+            "the left pane's gutter must be right-aligned against the divider: \
+             gutter ends at {:?}, pane at {:?}",
+            gutter.right(),
+            bounds.right()
+        );
+        assert!(
+            same(text.left(), bounds.left()),
+            "and its text must lie to the left of that gutter, got {:?} vs {:?}",
+            text.left(),
+            bounds.left()
+        );
+
+        let (bounds, gutter, text) = drawn_pane(&rhs_editor, cx);
+        assert!(
+            same(gutter.left(), bounds.left()),
+            "the right pane's gutter stays on its own left edge, got {:?} vs {:?}",
+            gutter.left(),
+            bounds.left()
+        );
+        assert!(
+            same(text.left(), gutter.right()),
+            "and its text follows the gutter, got {:?} vs {:?}",
+            text.left(),
+            gutter.right()
+        );
+    }
+
     /// Breakpoints and bookmarks are meaningless while reviewing a diff, and
     /// leaving them on is what filled the gutter context menu with entries the
     /// pane cannot act on. The right pane opted out from the start; the left

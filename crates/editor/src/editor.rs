@@ -1299,6 +1299,12 @@ impl GutterDimensions {
     /// runnable and bookmark icons. Empty when no indicator column is reserved,
     /// which is the usual case — only a singleton gutter with line numbers has
     /// one.
+    ///
+    /// The `mirrored` branch therefore only ever returns an empty range today:
+    /// `mirrored` is set for split-diff panes, and those are never
+    /// `is_singleton`, so they force `indicator_column_width == 0`. The
+    /// nonzero-width mirrored layout is unreachable and untested — loosening
+    /// that invariant means covering it here and in `fold_area_start`.
     pub fn indicator_column_area(&self) -> Range<Pixels> {
         let start = if self.mirrored {
             Pixels::ZERO
@@ -1785,6 +1791,7 @@ impl Editor {
         clone.needs_initial_data_update = self.enable_lsp_data;
         clone.enable_runnables = self.enable_runnables;
         clone.show_runnables = self.show_runnables;
+        clone.split_side = self.split_side;
         clone.enable_code_lens = self.enable_code_lens;
         clone
     }

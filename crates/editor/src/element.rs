@@ -190,7 +190,6 @@ struct RenderBlocksOutput {
 pub struct EditorElement {
     editor: Entity<Editor>,
     style: EditorStyle,
-    split_side: Option<SplitSide>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,16 +201,16 @@ pub enum SplitSide {
 impl EditorElement {
     pub(crate) const SCROLLBAR_WIDTH: Pixels = ui::EDITOR_SCROLLBAR_WIDTH;
 
+    /// Which pane of a split diff this element draws is deliberately not an
+    /// argument: it is read from [`EditorSnapshot`], the same value
+    /// [`EditorSnapshot::gutter_dimensions`] composes the gutter from. A caller
+    /// that forgot to declare the side would otherwise get a correctly sized
+    /// gutter drawn against the wrong edge.
     pub fn new(editor: &Entity<Editor>, style: EditorStyle) -> Self {
         Self {
             editor: editor.clone(),
             style,
-            split_side: None,
         }
-    }
-
-    pub fn set_split_side(&mut self, side: SplitSide) {
-        self.split_side = Some(side);
     }
 
     fn register_actions(&self, window: &mut Window, cx: &mut App) {
@@ -1799,7 +1798,7 @@ impl EditorElement {
         cx: &mut App,
     ) -> Option<AnyElement> {
         // Don't show code actions in split diff view
-        if self.split_side.is_some() {
+        if snapshot.split_side.is_some() {
             return None;
         }
 
@@ -2399,7 +2398,7 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<AnyElement> {
-        if self.split_side == Some(SplitSide::Left) {
+        if gutter.snapshot.split_side == Some(SplitSide::Left) {
             return Vec::new();
         }
 
@@ -2427,7 +2426,7 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        if self.split_side == Some(SplitSide::Left) {
+        if gutter.snapshot.split_side == Some(SplitSide::Left) {
             return None;
         }
 
@@ -2453,7 +2452,7 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<AnyElement> {
-        if self.split_side == Some(SplitSide::Left) {
+        if gutter.snapshot.split_side == Some(SplitSide::Left) {
             return Vec::new();
         }
 
@@ -2531,7 +2530,7 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<AnyElement> {
-        if self.split_side == Some(SplitSide::Left) {
+        if gutter.snapshot.split_side == Some(SplitSide::Left) {
             return Vec::new();
         }
 
@@ -2807,7 +2806,7 @@ impl EditorElement {
         // chevron would land on the line numbers.
         let include_fold_statuses = EditorSettings::get_global(cx).gutter.folds
             && snapshot.mode.is_full()
-            && self.split_side.is_none()
+            && snapshot.split_side.is_none()
             && self.editor.read(cx).buffer_kind(cx) == ItemBufferKind::Singleton;
         if include_fold_statuses {
             row_infos
@@ -3216,7 +3215,7 @@ impl EditorElement {
             } => {
                 let mut result = v_flex().id(block_id).w_full().pr(editor_margins.right);
 
-                if self.should_show_buffer_headers() {
+                if Self::should_show_buffer_headers(snapshot) {
                     let selected = selected_buffer_ids.contains(&first_excerpt.buffer_id());
                     let jump_data = header::header_jump_data(
                         snapshot,
@@ -3264,7 +3263,7 @@ impl EditorElement {
             Block::BufferHeader { excerpt, height } => {
                 let mut result = v_flex().id(block_id).w_full();
 
-                if self.should_show_buffer_headers() {
+                if Self::should_show_buffer_headers(snapshot) {
                     let jump_data = header::header_jump_data(
                         snapshot,
                         block_row_start,
@@ -5026,7 +5025,8 @@ impl EditorElement {
                 // The gutter meets the text on its right edge, except in the
                 // left pane of a split diff, where the gutter is right-aligned
                 // against the divider and the text lies to its left.
-                let border_x = if self.split_side == Some(SplitSide::Left) {
+                let split_side = layout.position_map.snapshot.split_side;
+                let border_x = if split_side == Some(SplitSide::Left) {
                     gutter_bounds.left()
                 } else {
                     gutter_bounds.right() - px(1.)
@@ -5184,7 +5184,6 @@ impl EditorElement {
     fn paint_gutter_diff_hunks(
         &self,
         layout: &mut EditorLayout,
-        split_side: Option<SplitSide>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -5192,6 +5191,7 @@ impl EditorElement {
             return;
         }
 
+        let split_side = layout.position_map.snapshot.split_side;
         let line_height = layout.position_map.line_height;
         window.paint_layer(layout.gutter_hitbox.bounds, |window| {
             for (hunk, hitbox) in &layout.display_hunks {
@@ -5477,7 +5477,7 @@ impl EditorElement {
                 )
             });
         if show_git_gutter {
-            self.paint_gutter_diff_hunks(layout, self.split_side, window, cx)
+            self.paint_gutter_diff_hunks(layout, window, cx)
         }
 
         let highlight_width = 0.275 * layout.position_map.line_height;
@@ -8127,7 +8127,7 @@ impl Element for EditorElement {
                     });
 
                     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-                    let gutter_right_aligned = self.split_side == Some(SplitSide::Left);
+                    let gutter_right_aligned = snapshot.split_side == Some(SplitSide::Left);
                     let gutter_hitbox = window.insert_hitbox(
                         gutter_bounds(bounds, gutter_dimensions, gutter_right_aligned),
                         HitboxBehavior::Normal,
@@ -8551,7 +8551,7 @@ impl Element for EditorElement {
                     // Breakpoints and their hover preview take the place of the
                     // line number, so those rows must not paint one.
                     let mut rows_without_line_number: HashSet<DisplayRow> = HashSet::default();
-                    if self.split_side != Some(SplitSide::Left) {
+                    if snapshot.split_side != Some(SplitSide::Left) {
                         if show_breakpoints {
                             rows_without_line_number.extend(
                                 breakpoint_rows
@@ -8621,7 +8621,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
-                    let insertion_markers = if self.split_side == Some(SplitSide::Left) {
+                    let insertion_markers = if snapshot.split_side == Some(SplitSide::Left) {
                         crate::split_connectors::insertion_marker_rows(
                             &snapshot,
                             start_row..end_row,
@@ -8828,7 +8828,7 @@ impl Element for EditorElement {
                         }
                     }
 
-                    let sticky_buffer_header = if self.should_show_buffer_headers() {
+                    let sticky_buffer_header = if Self::should_show_buffer_headers(&snapshot) {
                         sticky_header_excerpt.map(|sticky_header_excerpt| {
                             window.with_element_namespace("blocks", |window| {
                                 self.layout_sticky_buffer_header(
