@@ -207,6 +207,10 @@ pub struct DeploySearch {
     pub whole_word: Option<bool>,
     #[serde(default)]
     pub include_ignored: Option<bool>,
+    /// Force a brand-new search tab instead of reusing a `ProjectSearchView` already open in the
+    /// active pane. Drives find_in_path's "Open results in new tab" checkbox.
+    #[serde(default)]
+    pub new_tab: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Default)]
@@ -5137,16 +5141,18 @@ mod tests {
         // Core assertion: the active pane shows its buttons despite having no
         // keyboard focus. Fails against the old `has_focus`-only gate.
         assert!(
-            second_pane
-                .update_in(cx, |pane, window, cx| should_show_tab_bar_buttons(pane, window, cx)),
+            second_pane.update_in(cx, |pane, window, cx| should_show_tab_bar_buttons(
+                pane, window, cx
+            )),
             "active pane must show tab-bar buttons even without keyboard focus"
         );
 
         // The non-active, unfocused pane stays hidden (matches upstream's
         // single-set behavior in a split).
         assert!(
-            !first_pane
-                .update_in(cx, |pane, window, cx| should_show_tab_bar_buttons(pane, window, cx)),
+            !first_pane.update_in(cx, |pane, window, cx| should_show_tab_bar_buttons(
+                pane, window, cx
+            )),
             "non-active unfocused pane must not show tab-bar buttons"
         );
     }

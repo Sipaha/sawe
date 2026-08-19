@@ -209,10 +209,7 @@ async fn test_replace_next_replaces_only_selected_match(cx: &mut TestAppContext)
     // is always that group's Header) — see `test_selection_lands_on_first_match_...`.
     let selected_path = find_in_path.read_with(cx, |find_in_path, _cx| {
         assert_eq!(find_in_path.results.total_matches(), 2);
-        let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
-        else {
-            panic!("selected_row should be a Match row after streaming results in");
-        };
+        let group_index = find_in_path.results.rows[find_in_path.selected_row].group_index;
         find_in_path.results.groups[group_index].path.clone()
     });
 
@@ -234,9 +231,15 @@ async fn test_replace_next_replaces_only_selected_match(cx: &mut TestAppContext)
 
     let (replaced_text, untouched_text) =
         if selected_path.as_ref() == std::path::Path::new("root/a.txt") {
-            (buffer_a.read_with(cx, |b, _| b.text()), buffer_b.read_with(cx, |b, _| b.text()))
+            (
+                buffer_a.read_with(cx, |b, _| b.text()),
+                buffer_b.read_with(cx, |b, _| b.text()),
+            )
         } else {
-            (buffer_b.read_with(cx, |b, _| b.text()), buffer_a.read_with(cx, |b, _| b.text()))
+            (
+                buffer_b.read_with(cx, |b, _| b.text()),
+                buffer_a.read_with(cx, |b, _| b.text()),
+            )
         };
     assert_eq!(
         replaced_text, "bar\n",
@@ -504,12 +507,25 @@ async fn test_matchlist_groups_and_flattens(cx: &mut TestAppContext) {
 
     assert_eq!(list.file_count(), 2);
     assert_eq!(list.total_matches(), 3);
-    assert_eq!(list.rows.len(), 5);
-    assert!(matches!(list.rows[0], Row::Header(0)));
-    assert!(matches!(list.rows[1], Row::Match(0, 0)));
-    assert!(matches!(list.rows[2], Row::Match(0, 1)));
-    assert!(matches!(list.rows[3], Row::Header(1)));
-    assert!(matches!(list.rows[4], Row::Match(1, 0)));
+    // The row list is flat: one row per match, in group order, with no file-header rows.
+    assert_eq!(list.rows.len(), 3);
+    assert_eq!(
+        list.rows,
+        vec![
+            Row {
+                group_index: 0,
+                match_index: 0
+            },
+            Row {
+                group_index: 0,
+                match_index: 1
+            },
+            Row {
+                group_index: 1,
+                match_index: 0
+            },
+        ]
+    );
 }
 
 #[gpui::test]
@@ -598,7 +614,7 @@ async fn test_spawn_search_streams_grouped_results(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_selection_lands_on_first_match_and_select_next_skips_header(cx: &mut TestAppContext) {
+async fn test_selection_lands_on_first_match_and_select_next_advances(cx: &mut TestAppContext) {
     let _app_state = init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
@@ -644,18 +660,10 @@ async fn test_selection_lands_on_first_match_and_select_next_skips_header(cx: &m
 
     let first_selected_row = find_in_path.read_with(cx, |find_in_path, _cx| {
         assert_eq!(find_in_path.results.file_count(), 2);
-        // `rebuild_rows` always emits `Header(0)` first, so the earliest possible `Match` row
-        // (whichever group streamed in first) is row 1.
+        assert_eq!(find_in_path.results.rows.len(), 3);
         assert_eq!(
-            find_in_path.selected_row, 1,
-            "selection should reset onto the first Match row (row 0 is always a Header)"
-        );
-        assert!(
-            matches!(
-                find_in_path.results.rows.get(find_in_path.selected_row),
-                Some(Row::Match(_, _))
-            ),
-            "selected_row should land on a Match row, not a Header, after streaming results in"
+            find_in_path.selected_row, 0,
+            "selection should reset onto the first row of the flat result list"
         );
         find_in_path.selected_row
     });
@@ -665,16 +673,18 @@ async fn test_selection_lands_on_first_match_and_select_next_skips_header(cx: &m
     cx.dispatch_action(menu::SelectNext);
 
     find_in_path.read_with(cx, |find_in_path, _cx| {
-        assert!(
-            find_in_path.selected_row > first_selected_row,
-            "SelectNext should move the selection forward"
+        assert_eq!(
+            find_in_path.selected_row,
+            first_selected_row + 1,
+            "SelectNext should move the selection forward one row"
         );
         assert!(
-            matches!(
-                find_in_path.results.rows.get(find_in_path.selected_row),
-                Some(Row::Match(_, _))
-            ),
-            "SelectNext should land on a Match row, skipping any intervening Header row"
+            find_in_path
+                .results
+                .rows
+                .get(find_in_path.selected_row)
+                .is_some(),
+            "SelectNext should stay within the result list"
         );
     });
 }
@@ -733,10 +743,7 @@ async fn test_selecting_match_builds_and_reuses_preview_editor(cx: &mut TestAppC
 
     let (first_selected_buffer_id, first_preview_editor_id) =
         find_in_path.read_with(cx, |find_in_path, _cx| {
-            let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
-            else {
-                panic!("selected_row should be a Match row after SelectNext");
-            };
+            let group_index = find_in_path.results.rows[find_in_path.selected_row].group_index;
             let buffer_id = find_in_path.results.groups[group_index].buffer.entity_id();
             let (preview_buffer_id, preview_editor) = find_in_path
                 .preview_editor
@@ -754,10 +761,7 @@ async fn test_selecting_match_builds_and_reuses_preview_editor(cx: &mut TestAppC
     // editor entity rather than rebuilding it.
     cx.dispatch_action(menu::SelectNext);
     find_in_path.read_with(cx, |find_in_path, _cx| {
-        let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
-        else {
-            panic!("selected_row should be a Match row after a second SelectNext");
-        };
+        let group_index = find_in_path.results.rows[find_in_path.selected_row].group_index;
         let buffer_id = find_in_path.results.groups[group_index].buffer.entity_id();
         let (preview_buffer_id, preview_editor) = find_in_path
             .preview_editor
@@ -777,10 +781,7 @@ async fn test_selecting_match_builds_and_reuses_preview_editor(cx: &mut TestAppC
     // against the new buffer.
     cx.dispatch_action(menu::SelectLast);
     find_in_path.read_with(cx, |find_in_path, _cx| {
-        let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
-        else {
-            panic!("selected_row should be a Match row after SelectLast");
-        };
+        let group_index = find_in_path.results.rows[find_in_path.selected_row].group_index;
         let buffer_id = find_in_path.results.groups[group_index].buffer.entity_id();
         let (preview_buffer_id, preview_editor) = find_in_path
             .preview_editor
@@ -862,7 +863,7 @@ async fn test_streaming_batch_without_selection_change_does_not_redirty_preview(
 
     // Simulate a later streaming batch that grows `results.rows` without moving
     // `selected_row` — this is exactly what `clamp_selection` does when the current selection is
-    // already a valid `Row::Match`, the case the fix targets.
+    // already in range, the case the fix targets.
     find_in_path.update(cx, |find_in_path, _cx| {
         let changed = find_in_path.clamp_selection();
         assert!(
@@ -926,8 +927,25 @@ async fn test_set_scope_directory_restricts_results(cx: &mut TestAppContext) {
     find_in_path.read_with(cx, |find_in_path, _cx| {
         assert_eq!(
             find_in_path.results.file_count(),
+            1,
+            "Scope::Project (the default) should restrict to the active member's worktree"
+        );
+    });
+
+    // Widening back to the whole Solution is what the `In Solution` scope tab does.
+    cx.update(|_window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.set_scope(Scope::Solution, cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
             2,
-            "Scope::Solution (the default) should search both worktrees"
+            "Scope::Solution should search both worktrees"
         );
     });
 
@@ -1005,9 +1023,7 @@ async fn test_set_scope_project_falls_back_to_first_worktree(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-async fn test_build_query_empty_or_unresolved_directory_scope_yields_none(
-    cx: &mut TestAppContext,
-) {
+async fn test_build_query_empty_or_unresolved_directory_scope_yields_none(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/alpha", json!({ "x.rs": "token\n" })).await;
@@ -1093,8 +1109,25 @@ async fn test_set_scope_empty_directory_shows_no_results(cx: &mut TestAppContext
     find_in_path.read_with(cx, |find_in_path, _cx| {
         assert_eq!(
             find_in_path.results.file_count(),
+            1,
+            "Scope::Project (the default) should restrict to the active member's worktree"
+        );
+    });
+
+    // Widening back to the whole Solution is what the `In Solution` scope tab does.
+    cx.update(|_window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.set_scope(Scope::Solution, cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
             2,
-            "Scope::Solution (the default) should search both worktrees"
+            "Scope::Solution should search both worktrees"
         );
     });
 
@@ -1428,12 +1461,7 @@ async fn test_confirm_opens_selected_match_and_dismisses(cx: &mut TestAppContext
     cx.run_until_parked();
 
     let matched_buffer = find_in_path.read_with(cx, |find_in_path, _cx| {
-        let Row::Match(group_index, _) = find_in_path.results.rows[find_in_path.selected_row]
-        else {
-            panic!(
-                "streaming results should auto-select the first Match row before Confirm is tested"
-            );
-        };
+        let group_index = find_in_path.results.rows[find_in_path.selected_row].group_index;
         find_in_path.results.groups[group_index].buffer.clone()
     });
 
@@ -1557,6 +1585,215 @@ async fn test_open_in_find_window_deploys_project_search_and_dismisses(cx: &mut 
                 .find_map(|item| item.downcast::<crate::project_search::ProjectSearchView>())
                 .is_some(),
             "Open in Find Window should deploy a ProjectSearchView tab"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_default_scope_is_the_active_project(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/alpha", json!({ "x.rs": "token\n" })).await;
+    fs.insert_tree("/beta", json!({ "x.rs": "token\n" })).await;
+    let project = Project::test(fs, ["/alpha".as_ref(), "/beta".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.scope,
+            Scope::Project,
+            "a freshly opened modal should default to the active member project, not the Solution"
+        );
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(
+            find_in_path.results.file_count(),
+            1,
+            "the default search must not spill into the Solution's other member projects"
+        );
+        assert_eq!(
+            find_in_path.results.groups[0].path.as_ref(),
+            std::path::Path::new("alpha/x.rs"),
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_file_mask_narrows_rather_than_widens_project_scope(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/alpha",
+        json!({
+            "keep.rs": "token\n",
+            "drop.txt": "token\n",
+            "nested": { "deep.rs": "token\n" },
+        }),
+    )
+    .await;
+    fs.insert_tree("/beta", json!({ "other.rs": "token\n" }))
+        .await;
+    let project = Project::test(fs, ["/alpha".as_ref(), "/beta".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+            find_in_path.included_files_editor.update(cx, |editor, cx| {
+                editor.set_text("*.rs", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        let mut paths: Vec<_> = find_in_path
+            .results
+            .groups
+            .iter()
+            .map(|group| group.path.to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        // The scope glob ("alpha/**") and the mask ("*.rs") have to be ANDed. Concatenating them
+        // into one `PathMatcher` would OR them, so "alpha/**" alone would re-admit drop.txt.
+        assert_eq!(
+            paths,
+            vec![
+                "alpha/keep.rs".to_string(),
+                "alpha/nested/deep.rs".to_string()
+            ],
+            "the file mask must narrow the project scope at every depth, never widen it"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_mouse_down_outside_the_modal_dismisses_it(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "a.txt": "hello\n" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    cx.run_until_parked();
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_modal::<FindInPath>(cx).is_some(),
+            "Toggle should open the FindInPath modal"
+        );
+    });
+
+    // The modal is centred and inset from the top, so the window's top-left corner is always
+    // outside its bounds. `on_mouse_down_out` compares raw bounds in the capture phase, so this
+    // passes regardless of which element owns the topmost hitbox at that point — that is exactly
+    // the property the fix adds over `ModalLayer`'s hitbox-dependent overlay dismissal.
+    cx.simulate_mouse_down(
+        gpui::point(gpui::px(1.), gpui::px(1.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace.active_modal::<FindInPath>(cx).is_none(),
+            "a mouse-down outside the modal's bounds should dismiss it"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_unchecking_file_mask_clears_it(cx: &mut TestAppContext) {
+    let _app_state = init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({ "match.rs": "token\n", "match.txt": "token\n" }),
+    )
+    .await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    cx.dispatch_action(Toggle::default());
+    let find_in_path = workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_modal::<FindInPath>(cx)
+            .expect("Toggle should open the FindInPath modal")
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.query_editor.update(cx, |editor, cx| {
+                editor.set_text("token", window, cx);
+            });
+            find_in_path.set_file_mask_enabled(true, window, cx);
+            find_in_path.included_files_editor.update(cx, |editor, cx| {
+                editor.set_text("*.rs", window, cx);
+            });
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert_eq!(find_in_path.results.file_count(), 1);
+    });
+
+    cx.update(|window, cx| {
+        find_in_path.update(cx, |find_in_path, cx| {
+            find_in_path.set_file_mask_enabled(false, window, cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    find_in_path.read_with(cx, |find_in_path, _cx| {
+        assert!(
+            !find_in_path.file_mask_enabled,
+            "unchecking File mask should hide the input"
+        );
+        assert_eq!(
+            find_in_path.results.file_count(),
+            2,
+            "hiding the File mask must also clear it — an invisible glob silently filtering \
+             results is worse than no filter at all"
         );
     });
 }

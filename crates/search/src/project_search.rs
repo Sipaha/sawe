@@ -1146,11 +1146,15 @@ impl ProjectSearchView {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let existing = workspace
-            .active_pane()
-            .read(cx)
-            .items()
-            .find_map(|item| item.downcast::<ProjectSearchView>());
+        let existing = if action.new_tab {
+            None
+        } else {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<ProjectSearchView>())
+        };
 
         Self::existing_or_new_search(workspace, existing, action, window, cx);
     }

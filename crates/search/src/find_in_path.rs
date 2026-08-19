@@ -6,9 +6,9 @@ use editor::{
 use futures::StreamExt as _;
 use gpui::{
     AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, IntoElement, ParentElement, Render, ScrollStrategy,
-    StatefulInteractiveElement, Styled, Subscription, Task, TaskExt as _, UniformListScrollHandle,
-    WeakEntity, Window, actions, uniform_list,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
+    Render, ScrollStrategy, StatefulInteractiveElement, Styled, Subscription, Task, TaskExt as _,
+    UniformListScrollHandle, WeakEntity, Window, actions, uniform_list,
 };
 use language::{Anchor, Buffer, BufferSnapshot, Point};
 use project::{
@@ -25,7 +25,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use ui::{ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, prelude::*};
+use ui::{
+    Checkbox, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, ToggleState, Tooltip,
+    prelude::*,
+};
 use util::paths::PathMatcher;
 use workspace::{
     ModalView, Workspace,
@@ -137,21 +140,43 @@ fn include_patterns_for_scope(
     match scope {
         Scope::Solution => Vec::new(),
         Scope::Project => {
-            let owned_root = match member_root {
-                Some(root) => Some(root.to_path_buf()),
-                None => project
+            let first_worktree_glob = || {
+                project
                     .visible_worktrees(cx)
                     .next()
-                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf()),
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .as_deref()
+                    .and_then(root_glob)
             };
-            owned_root
-                .as_deref()
+            // `Scope::Project` is the default scope, so an unresolvable `member_root` (a Solution
+            // member that sits outside every visible worktree) must not fall through to an empty
+            // include list — that means "match everything", silently widening every default search
+            // to the whole Solution. Fall back to the first visible worktree instead.
+            member_root
                 .and_then(root_glob)
+                .or_else(first_worktree_glob)
                 .into_iter()
                 .collect()
         }
         Scope::Directory(dir) => root_glob(dir).into_iter().collect(),
     }
+}
+
+/// File name of a result path, for the right-aligned `File.kt 12` location label and the preview
+/// header. Falls back to the whole path when it has no final component (which `Project::search`
+/// results never do in practice, but `Arc<Path>` doesn't promise it).
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Directory part of a result path, shown next to the file name in the preview header. Empty for
+/// a file sitting directly at a worktree root.
+fn dir_of(path: &Path) -> String {
+    path.parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Split a comma-separated glob list into individual pattern strings, respecting `{...}` brace groups.
@@ -184,6 +209,38 @@ fn split_glob_patterns(text: &str) -> Vec<&str> {
     patterns
 }
 
+/// Combine the scope's include globs with the user's "File mask" globs.
+///
+/// `SearchQuery` accepts a single include `PathMatcher`, and a `PathMatcher` ORs its patterns
+/// together — so concatenating the two lists would let the scope glob (`alpha/**`) match every file
+/// the mask was meant to filter out, silently disabling the mask. Scope and mask have to be ANDed,
+/// which for globs means re-rooting each mask pattern under the scope's directory prefix. Both
+/// `<prefix>/<mask>` and `<prefix>/**/<mask>` are emitted so a bare `*.rs` mask keeps matching at
+/// every depth, exactly as it does with no scope restriction.
+fn combine_scope_and_mask(scope_patterns: &[String], mask_patterns: &[String]) -> Vec<String> {
+    if mask_patterns.is_empty() {
+        return scope_patterns.to_vec();
+    }
+    if scope_patterns.is_empty() {
+        return mask_patterns.to_vec();
+    }
+    let mut combined = Vec::with_capacity(scope_patterns.len() * mask_patterns.len() * 2);
+    for scope in scope_patterns {
+        // `include_patterns_for_scope` only ever emits `**` or `<dir>/**`, so stripping the
+        // trailing `**` leaves either an empty string or a `<dir>/` prefix.
+        let prefix = scope.strip_suffix("**").unwrap_or(scope.as_str());
+        for mask in mask_patterns {
+            if prefix.is_empty() {
+                combined.push(mask.clone());
+            } else {
+                combined.push(format!("{prefix}{mask}"));
+                combined.push(format!("{prefix}**/{mask}"));
+            }
+        }
+    }
+    combined
+}
+
 fn parse_glob_patterns(text: &str) -> Vec<String> {
     split_glob_patterns(text)
         .into_iter()
@@ -195,8 +252,9 @@ fn parse_glob_patterns(text: &str) -> Vec<String> {
 
 /// Build a `SearchQuery` from raw editor text plus a `Scope` restriction.
 ///
-/// `scope`'s include patterns are merged in front of `include_text`'s user-typed patterns so an
-/// empty `Scope::Solution` leaves the user's own include filter untouched. Returns `None` when the
+/// `scope`'s include patterns are ANDed with `include_text`'s user-typed patterns by
+/// `combine_scope_and_mask`, so an empty `Scope::Solution` leaves the user's own include filter
+/// untouched and a narrower scope never widens it. Returns `None` when the
 /// query text is empty, when either glob list fails to parse, or when `scope` is `Directory` but
 /// resolves to no include patterns (empty/whitespace path, or a path outside every visible
 /// worktree) — an empty include list otherwise means "match everything", which would silently
@@ -221,8 +279,8 @@ fn build_query(
     if matches!(scope, Scope::Directory(_)) && scope_patterns.is_empty() {
         return None;
     }
-    let mut include_patterns = scope_patterns;
-    include_patterns.extend(parse_glob_patterns(include_text));
+    let include_patterns =
+        combine_scope_and_mask(&scope_patterns, &parse_glob_patterns(include_text));
     let included_files = PathMatcher::new(&include_patterns, path_style).ok()?;
 
     let exclude_patterns = parse_glob_patterns(exclude_text);
@@ -274,11 +332,16 @@ pub struct FileGroup {
     pub matches: Vec<MatchRow>,
 }
 
-/// One row of the flattened (group header / match) result list, as consumed by the results view.
+/// One row of the flattened result list: `groups[group_index].matches[match_index]`.
+///
+/// The list is flat (one row per match, each row carrying its own file name and line number)
+/// rather than grouped under per-file header rows — it mirrors IntelliJ's "Find in Files" result
+/// list, and it keeps every row selectable, so `clamp_selection`/`move_selection` never have to
+/// skip over non-selectable rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Row {
-    Header(usize),
-    Match(usize, usize),
+pub struct Row {
+    pub group_index: usize,
+    pub match_index: usize,
 }
 
 /// Compute the line + trimmed snippet preview for each range in `ranges`.
@@ -352,13 +415,15 @@ impl MatchList {
         self.push_matches(buffer, path, rows);
     }
 
-    /// Flatten `groups` into `rows` (one `Header` per group followed by its `Match` rows).
+    /// Flatten `groups` into `rows`, one row per match, in group order.
     pub fn rebuild_rows(&mut self) {
         self.rows.clear();
         for (group_index, group) in self.groups.iter().enumerate() {
-            self.rows.push(Row::Header(group_index));
             for match_index in 0..group.matches.len() {
-                self.rows.push(Row::Match(group_index, match_index));
+                self.rows.push(Row {
+                    group_index,
+                    match_index,
+                });
             }
         }
     }
@@ -402,6 +467,15 @@ pub struct FindInPath {
     /// `replace_next`/`replace_all` via `build_replace_query`.
     replace_editor: Entity<Editor>,
     search_options: SearchOptions,
+    /// Whether the "File mask" input is revealed, mirroring IntelliJ's title-row checkbox. The
+    /// mask text itself lives in `included_files_editor` and keeps filtering while hidden only if
+    /// the user re-hides a non-empty mask — unchecking clears it (see `set_file_mask_enabled`).
+    file_mask_enabled: bool,
+    /// Whether the extra "Exclude" filter row is revealed (the funnel icon in the title row).
+    filters_enabled: bool,
+    /// "Open results in new tab" — when set, `open_in_find_window` forces a brand-new
+    /// `ProjectSearchView` tab instead of reusing the one already open in the active pane.
+    open_in_new_tab: bool,
     scope: Scope,
     member_root: Option<PathBuf>,
     results: MatchList,
@@ -506,7 +580,14 @@ impl FindInPath {
                 search_options: SearchOptions::from_settings(
                     &EditorSettings::get_global(cx).search,
                 ),
-                scope: Scope::Solution,
+                file_mask_enabled: false,
+                filters_enabled: false,
+                open_in_new_tab: false,
+                // Default to the active member project, not the whole Solution: a Solution can
+                // mount a dozen unrelated repositories, and "find in files" almost always means
+                // "in the project I am looking at". `member_root` (resolved above) picks the
+                // active member; the scope tab row widens it back to the Solution on demand.
+                scope: Scope::Project,
                 member_root,
                 results: MatchList::default(),
                 status: SearchStatus::Idle,
@@ -678,7 +759,7 @@ impl FindInPath {
     }
 
     /// Replace only the currently selected match — a no-op if `selected_row` doesn't resolve to
-    /// a `Row::Match` (empty results, or the row is a `Header`). Uses the same transient-editor
+    /// a row (empty results). Uses the same transient-editor
     /// approach as `replace_all`, scoped to the one match. Replaces the selected match's text,
     /// then re-runs the search (via `update_search`), which resets the selection onto the first
     /// surviving match.
@@ -686,15 +767,13 @@ impl FindInPath {
         let Some(query) = self.build_replace_query(cx) else {
             return;
         };
-        let Some(Row::Match(group_index, match_index)) =
-            self.results.rows.get(self.selected_row).copied()
-        else {
+        let Some(row) = self.results.rows.get(self.selected_row).copied() else {
             return;
         };
-        let Some(group) = self.results.groups.get(group_index) else {
+        let Some(group) = self.results.groups.get(row.group_index) else {
             return;
         };
-        let Some(match_row) = group.matches.get(match_index) else {
+        let Some(match_row) = group.matches.get(row.match_index) else {
             return;
         };
         let buffer = group.buffer.clone();
@@ -707,7 +786,13 @@ impl FindInPath {
             let Some(multibuffer_range) = snapshot.anchor_range_in_buffer(range) else {
                 return false;
             };
-            editor.replace(&multibuffer_range, &query, SearchToken::default(), window, cx);
+            editor.replace(
+                &multibuffer_range,
+                &query,
+                SearchToken::default(),
+                window,
+                cx,
+            );
             true
         });
         // See `replace_all`'s doc comment: `BufferStore` only tracks open buffers weakly, so the
@@ -832,12 +917,14 @@ impl FindInPath {
                 let update_result = this.update(cx, |this, cx| {
                     this.results.rebuild_rows();
                     this.status = SearchStatus::Searching;
-                    // Only mark the preview dirty when this batch actually moved the selection
-                    // (e.g. the first batch landing on the first match). A later batch that
-                    // `clamp_selection` leaves untouched must not re-trigger `update_preview` —
-                    // that would snap the preview's scroll back to center on every streamed
-                    // batch, fighting a user who has manually scrolled the preview pane.
-                    if this.clamp_selection() {
+                    // Only mark the preview dirty when this batch actually moved the selection,
+                    // or when nothing is previewed yet — the flat result list starts out selecting
+                    // row 0, so the very first batch never *moves* the selection and would
+                    // otherwise leave the preview pane empty. A later batch that `clamp_selection`
+                    // leaves untouched must not re-trigger `update_preview` — that would snap the
+                    // preview's scroll back to center on every streamed batch, fighting a user who
+                    // has manually scrolled the preview pane.
+                    if this.clamp_selection() || this.previewed_match.is_none() {
                         this.preview_dirty = true;
                     }
                     cx.notify();
@@ -862,51 +949,30 @@ impl FindInPath {
         cx.notify();
     }
 
-    /// Index of the first `Row::Match` in `rows`, or `None` if `rows` has no matches (e.g. it's
-    /// empty, or every group somehow ended up with zero matches).
-    fn first_match_row(rows: &[Row]) -> Option<usize> {
-        rows.iter().position(|row| matches!(row, Row::Match(_, _)))
-    }
-
-    fn last_match_row(rows: &[Row]) -> Option<usize> {
-        rows.iter().rposition(|row| matches!(row, Row::Match(_, _)))
-    }
-
     /// Called after every `rebuild_rows()` (streaming search grows `rows` batch by batch) so
-    /// `selected_row` always lands on a `Row::Match`, never a `Row::Header` or an index past the
-    /// end. Leaves an already-valid `Match` selection untouched, so incoming batches don't yank
-    /// the highlight away from a row the user is looking at. Returns whether `selected_row`
-    /// actually changed, so callers (the streaming batch handler) can tell a genuine
-    /// first-match-lands-in-view transition from a no-op reclamp.
+    /// `selected_row` never points past the end. Leaves an already-valid selection untouched, so
+    /// incoming batches don't yank the highlight away from a row the user is looking at. Returns
+    /// whether `selected_row` actually changed, so callers (the streaming batch handler) can tell
+    /// a genuine first-match-lands-in-view transition from a no-op reclamp.
     fn clamp_selection(&mut self) -> bool {
         let previous = self.selected_row;
         let rows = &self.results.rows;
-        if rows.is_empty() {
+        if self.selected_row >= rows.len() {
             self.selected_row = 0;
-        } else if self.selected_row >= rows.len()
-            || !matches!(rows[self.selected_row], Row::Match(_, _))
-        {
-            self.selected_row = Self::first_match_row(rows).unwrap_or(0);
         }
         self.selected_row != previous
     }
 
-    /// Move `selected_row` to the next/previous `Row::Match`, skipping over `Row::Header` rows,
-    /// clamping (not wrapping) at the ends. Scrolls the list to keep the new selection visible.
+    /// Move `selected_row` one row up/down, clamping (not wrapping) at the ends. Scrolls the list
+    /// to keep the new selection visible.
     fn move_selection(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
         let rows = &self.results.rows;
         if rows.is_empty() {
             return;
         }
-        let mut ix = self.selected_row.min(rows.len() - 1) as isize;
-        loop {
-            ix += direction;
-            if ix < 0 || ix >= rows.len() as isize {
-                return;
-            }
-            if matches!(rows[ix as usize], Row::Match(_, _)) {
-                break;
-            }
+        let ix = self.selected_row.min(rows.len() - 1) as isize + direction;
+        if ix < 0 || ix >= rows.len() as isize {
+            return;
         }
         self.selected_row = ix as usize;
         self.list_scroll_handle
@@ -929,8 +995,8 @@ impl FindInPath {
     }
 
     fn select_first(&mut self, _: &menu::SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = Self::first_match_row(&self.results.rows) {
-            self.selected_row = ix;
+        if !self.results.rows.is_empty() {
+            self.selected_row = 0;
             self.list_scroll_handle
                 .scroll_to_item(self.selected_row, ScrollStrategy::Center);
             self.update_preview(window, cx);
@@ -939,7 +1005,7 @@ impl FindInPath {
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = Self::last_match_row(&self.results.rows) {
+        if let Some(ix) = self.results.rows.len().checked_sub(1) {
             self.selected_row = ix;
             self.list_scroll_handle
                 .scroll_to_item(self.selected_row, ScrollStrategy::Center);
@@ -949,7 +1015,7 @@ impl FindInPath {
     }
 
     /// Open the selected match in the workspace's active pane and dismiss the modal. A no-op if
-    /// `selected_row` doesn't resolve to a `Row::Match` (empty results, or the row is a Header) or
+    /// `selected_row` doesn't resolve to a row (empty results) or
     /// if `self.workspace` no longer resolves (its window closed out from under the modal).
     ///
     /// Reuses `workspace.open_path` — the same path a normal file-open goes through, so this opens
@@ -959,15 +1025,13 @@ impl FindInPath {
     /// it; a no-op if the opened item isn't an `Editor` over a singleton buffer (shouldn't happen
     /// for a plain text file, but `open_path` return types aren't specific to `Editor`).
     fn open_selected(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Row::Match(group_index, match_index)) =
-            self.results.rows.get(self.selected_row).copied()
-        else {
+        let Some(row) = self.results.rows.get(self.selected_row).copied() else {
             return;
         };
-        let Some(group) = self.results.groups.get(group_index) else {
+        let Some(group) = self.results.groups.get(row.group_index) else {
             return;
         };
-        let Some(match_row) = group.matches.get(match_index) else {
+        let Some(match_row) = group.matches.get(row.match_index) else {
             return;
         };
         let buffer = group.buffer.clone();
@@ -1022,32 +1086,31 @@ impl FindInPath {
             included_files: (!included_files.is_empty()).then_some(included_files),
             excluded_files: (!excluded_files.is_empty()).then_some(excluded_files),
             replace_enabled: self.replace_enabled,
+            new_tab: self.open_in_new_tab,
         };
         window.dispatch_action(Box::new(action), cx);
         cx.emit(DismissEvent);
     }
 
-    /// Resolve `selected_row` to a `Row::Match` and (re)build/refresh the read-only preview
+    /// Resolve `selected_row` to a match and (re)build/refresh the read-only preview
     /// editor: a fresh `Editor::for_buffer` when the selection just moved to a different file,
     /// otherwise the existing preview editor is reused and just re-highlighted/re-scrolled. A
-    /// selection that isn't (or is no longer) a `Row::Match` — empty results, or a `Row::Header`
-    /// — leaves any existing preview in place rather than tearing it down, so a stray
-    /// `clamp_selection` mid-stream doesn't flash the pane empty.
+    /// selection that no longer resolves to a match — empty results, or an index that outran a
+    /// shrinking result set — leaves any existing preview in place rather than tearing it down, so
+    /// a stray `clamp_selection` mid-stream doesn't flash the pane empty.
     ///
     /// Early-returns before touching the editor at all when the resolved match is identical to
     /// `previewed_match` — otherwise every call (including ones triggered by a streaming batch
     /// that didn't move the selection) would re-highlight and re-autoscroll the preview, snapping
     /// a user's manual scroll back to center.
     fn update_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Row::Match(group_index, match_index)) =
-            self.results.rows.get(self.selected_row).copied()
-        else {
+        let Some(row) = self.results.rows.get(self.selected_row).copied() else {
             return;
         };
-        let Some(group) = self.results.groups.get(group_index) else {
+        let Some(group) = self.results.groups.get(row.group_index) else {
             return;
         };
-        let Some(match_row) = group.matches.get(match_index) else {
+        let Some(match_row) = group.matches.get(row.match_index) else {
             return;
         };
         let buffer = group.buffer.clone();
@@ -1083,7 +1146,7 @@ impl FindInPath {
             };
             editor.highlight_background(
                 HighlightKey::FindInPathPreview,
-                &[multibuffer_range.clone()],
+                std::slice::from_ref(&multibuffer_range),
                 |_, theme| theme.colors().search_match_background,
                 cx,
             );
@@ -1112,64 +1175,50 @@ impl FindInPath {
         let Some(row) = self.results.rows.get(ix).copied() else {
             return div().into_any_element();
         };
-        match row {
-            Row::Header(group_index) => {
-                let Some(group) = self.results.groups.get(group_index) else {
-                    return div().into_any_element();
-                };
-                h_flex()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .child(
-                        Label::new(group.path.to_string_lossy().into_owned())
-                            .size(LabelSize::Small)
-                            .color(Color::Default),
-                    )
-                    .child(
-                        Label::new(group.matches.len().to_string())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element()
-            }
-            Row::Match(group_index, match_index) => {
-                let Some(group) = self.results.groups.get(group_index) else {
-                    return div().into_any_element();
-                };
-                let Some(match_row) = group.matches.get(match_index) else {
-                    return div().into_any_element();
-                };
-                let selected = ix == self.selected_row;
-                h_flex()
-                    .id(("find-in-path-row", ix))
-                    .w_full()
-                    .pl_6()
-                    .pr_2()
-                    .py_0p5()
-                    .gap_2()
-                    .cursor_pointer()
-                    .when(selected, |this| {
-                        this.bg(cx.theme().colors().element_selected)
-                    })
-                    .child(
-                        Label::new((match_row.line + 1).to_string())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(match_row.snippet.clone()).size(LabelSize::Small))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        this.selected_row = ix;
-                        this.update_preview(window, cx);
-                        cx.notify();
-                        if event.click_count() >= 2 {
-                            this.open_selected(&menu::Confirm, window, cx);
-                        }
-                    }))
-                    .into_any_element()
-            }
-        }
+        let Some(group) = self.results.groups.get(row.group_index) else {
+            return div().into_any_element();
+        };
+        let Some(match_row) = group.matches.get(row.match_index) else {
+            return div().into_any_element();
+        };
+        let selected = ix == self.selected_row;
+        let location = format!("{} {}", file_name_of(&group.path), match_row.line + 1);
+        h_flex()
+            .id(("find-in-path-row", ix))
+            .w_full()
+            .px_2()
+            .py_0p5()
+            .gap_4()
+            .justify_between()
+            .cursor_pointer()
+            .when(selected, |this| {
+                this.bg(cx.theme().colors().element_selected)
+            })
+            // The snippet is the row's primary content and must absorb the leftover width so the
+            // location label stays flush right; `min_w_0` lets it shrink (and truncate) instead of
+            // pushing the location off the row.
+            .child(
+                div().flex_1().min_w_0().overflow_hidden().child(
+                    Label::new(match_row.snippet.clone())
+                        .size(LabelSize::Small)
+                        .single_line(),
+                ),
+            )
+            .child(
+                Label::new(location)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .single_line(),
+            )
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.selected_row = ix;
+                this.update_preview(window, cx);
+                cx.notify();
+                if event.click_count() >= 2 {
+                    this.open_selected(&menu::Confirm, window, cx);
+                }
+            }))
+            .into_any_element()
     }
 
     /// Segmented "In Solution / In Project / Directory" scope control, mirroring the
@@ -1215,8 +1264,7 @@ impl FindInPath {
         )
     }
 
-    /// The left pane of the results split: the flattened `MatchList` row list, one file-header
-    /// row per group followed by its indented match rows.
+    /// The results pane: the flattened `MatchList`, one selectable row per match.
     fn render_results(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let row_count = self.results.rows.len();
         uniform_list(
@@ -1230,6 +1278,250 @@ impl FindInPath {
         )
         .track_scroll(&self.list_scroll_handle)
         .size_full()
+    }
+
+    /// Reveal/hide the "File mask" input. Hiding also clears the mask: leaving a stale glob
+    /// silently filtering results while its input is invisible is the worst of both worlds.
+    fn set_file_mask_enabled(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_mask_enabled = enabled;
+        if enabled {
+            self.included_files_editor
+                .focus_handle(cx)
+                .focus(window, cx);
+        } else {
+            // `set_text` emits `Edited`, which re-runs the search through the same subscription
+            // user typing goes through — no explicit `update_search` needed here.
+            self.included_files_editor.update(cx, |editor, cx| {
+                editor.set_text("", window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Reveal/hide the extra "Exclude" filter row, clearing it on hide for the same reason
+    /// `set_file_mask_enabled` clears the mask.
+    fn set_filters_enabled(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.filters_enabled = enabled;
+        if !enabled {
+            self.excluded_files_editor.update(cx, |editor, cx| {
+                editor.set_text("", window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Title row: "Find in Files", the live match count, the File-mask checkbox (plus its input
+    /// once checked) and the filter toggle — mirroring IntelliJ's Find in Files header.
+    fn render_title_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .justify_between()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(Label::new("Find in Files").weight(FontWeight::SEMIBOLD))
+                    .child(
+                        Label::new(self.status_label())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Checkbox::new("find-in-path-file-mask", self.file_mask_enabled.into())
+                            .label("File mask:")
+                            .on_click(cx.listener(|this, state: &ToggleState, window, cx| {
+                                this.set_file_mask_enabled(
+                                    *state == ToggleState::Selected,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .when(self.file_mask_enabled, |this| {
+                        this.child(
+                            search_bar::input_base_styles(cx.theme().colors().border, |d| d)
+                                .w_48()
+                                .child(search_bar::render_text_input(
+                                    &self.included_files_editor,
+                                    None,
+                                    cx,
+                                )),
+                        )
+                    })
+                    .child(
+                        IconButton::new("find-in-path-filters", IconName::ListFilter)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(self.filters_enabled)
+                            .tooltip(Tooltip::text("Toggle Exclude Filter"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let enabled = this.filters_enabled;
+                                this.set_filters_enabled(!enabled, window, cx);
+                            })),
+                    ),
+            )
+    }
+
+    /// The search field: one bordered input holding a leading magnifier, the query editor, a clear
+    /// button and the inline Cc / W / .* option toggles — IntelliJ puts all of these inside the
+    /// field rather than beside it.
+    fn render_query_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_query = !self.query_editor.read(cx).is_empty(cx);
+        h_flex().w_full().px_3().pb_2().child(
+            search_bar::input_base_styles(cx.theme().colors().border, |d| d)
+                .w_full()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::MagnifyingGlass)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(search_bar::render_text_input(&self.query_editor, None, cx)),
+                )
+                .when(has_query, |this| {
+                    this.child(
+                        IconButton::new("find-in-path-clear", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Clear Search"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.query_editor.update(cx, |editor, cx| {
+                                    editor.set_text("", window, cx);
+                                });
+                                this.query_editor.focus_handle(cx).focus(window, cx);
+                            })),
+                    )
+                })
+                .child(SearchOption::CaseSensitive.as_button(
+                    self.search_options,
+                    SearchSource::Buffer,
+                    self.focus_handle.clone(),
+                ))
+                .child(SearchOption::WholeWord.as_button(
+                    self.search_options,
+                    SearchSource::Buffer,
+                    self.focus_handle.clone(),
+                ))
+                .child(SearchOption::Regex.as_button(
+                    self.search_options,
+                    SearchSource::Buffer,
+                    self.focus_handle.clone(),
+                )),
+        )
+    }
+
+    /// A labelled single-line input row (Replace / Exclude / Directory) under the query field.
+    fn render_labelled_input(
+        &self,
+        label: &'static str,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .px_3()
+            .pb_2()
+            .gap_2()
+            .child(
+                div()
+                    .w_16()
+                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .child(
+                search_bar::input_base_styles(cx.theme().colors().border, |d| d)
+                    .flex_1()
+                    .child(search_bar::render_text_input(editor, None, cx)),
+            )
+    }
+
+    /// Preview pane: a header naming the selected match's file (name + directory, IntelliJ-style)
+    /// above the read-only editor scrolled to the match.
+    fn render_preview(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some((_, editor)) = self.preview_editor.as_ref() else {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new("Select a match")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        };
+        let selected_path = self
+            .results
+            .rows
+            .get(self.selected_row)
+            .and_then(|row| self.results.groups.get(row.group_index))
+            .map(|group| group.path.clone());
+
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .bg(cx.theme().colors().title_bar_background)
+                    .children(selected_path.map(|path| {
+                        h_flex()
+                            .gap_2()
+                            .min_w_0()
+                            .child(Label::new(file_name_of(&path)).size(LabelSize::Small))
+                            .child(
+                                Label::new(dir_of(&path))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                    })),
+            )
+            .child(div().flex_1().min_h_0().child(editor.clone()))
+            .into_any_element()
+    }
+
+    /// Bottom bar: the "Open results in new tab" toggle plus the Open in Find Window button and
+    /// its keybinding hint, matching IntelliJ's footer.
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .flex_none()
+            .px_3()
+            .py_2()
+            .justify_between()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Checkbox::new("find-in-path-new-tab", self.open_in_new_tab.into())
+                    .label("Open results in new tab")
+                    .on_click(cx.listener(|this, state: &ToggleState, _window, cx| {
+                        this.open_in_new_tab = *state == ToggleState::Selected;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("find-in-path-open-in-find-window", "Open in Find Window")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.open_in_find_window(window, cx);
+                    })),
+            )
     }
 }
 
@@ -1276,6 +1568,17 @@ impl Render for FindInPath {
             .border_1()
             .border_color(cx.theme().colors().border)
             .rounded_lg()
+            // `ModalLayer` already dismisses on a click on its full-window overlay, but that path
+            // only fires when the overlay's hitbox is the topmost one under the pointer. Deferred
+            // draws (dock/sidebar resize handles, popovers) are prepainted *after* the modal
+            // layer, so an occluding deferred element that stops propagation on mouse-down sits
+            // above the overlay and swallows the dismiss — which is why clicks landing over the
+            // right dock could leave the modal open. `on_mouse_down_out` runs in the capture phase
+            // and only compares the event position against this element's own bounds, so it is
+            // immune to hitbox ordering entirely.
+            .on_mouse_down_out(cx.listener(|_, _, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
             .on_action(cx.listener(Self::toggle_case_sensitive))
             .on_action(cx.listener(Self::toggle_whole_word))
             .on_action(cx.listener(Self::toggle_regex))
@@ -1289,192 +1592,92 @@ impl Render for FindInPath {
             .on_action(cx.listener(|_, _: &menu::Cancel, _window, cx| {
                 cx.emit(DismissEvent);
             }))
-            .child(
-                v_flex()
-                    .p_2()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                search_bar::input_base_styles(cx.theme().colors().border, |d| d)
-                                    .flex_1()
-                                    .child(search_bar::render_text_input(
-                                        &self.query_editor,
-                                        None,
-                                        cx,
-                                    )),
-                            )
-                            .child(SearchOption::CaseSensitive.as_button(
-                                self.search_options,
-                                SearchSource::Buffer,
-                                self.focus_handle.clone(),
-                            ))
-                            .child(SearchOption::WholeWord.as_button(
-                                self.search_options,
-                                SearchSource::Buffer,
-                                self.focus_handle.clone(),
-                            ))
-                            .child(SearchOption::Regex.as_button(
-                                self.search_options,
-                                SearchSource::Buffer,
-                                self.focus_handle.clone(),
-                            )),
-                    )
-                    .when(self.replace_enabled, |this| {
-                        let focus_handle = self.replace_editor.read(cx).focus_handle(cx);
-                        this.child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    search_bar::input_base_styles(
-                                        cx.theme().colors().border,
-                                        |d| d,
-                                    )
-                                    .flex_1()
-                                    .child(search_bar::render_text_input(
-                                        &self.replace_editor,
-                                        None,
-                                        cx,
-                                    )),
-                                )
-                                .child(search_bar::render_action_button(
-                                    "find-in-path-replace-button",
-                                    IconName::ReplaceNext,
+            .child(self.render_title_row(cx))
+            .child(self.render_query_row(cx))
+            .when(self.replace_enabled, |this| {
+                let focus_handle = self.replace_editor.read(cx).focus_handle(cx);
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .px_3()
+                        .pb_2()
+                        .gap_2()
+                        .child(
+                            div().w_16().child(
+                                Label::new("Replace")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .child(
+                            search_bar::input_base_styles(cx.theme().colors().border, |d| d)
+                                .flex_1()
+                                .child(search_bar::render_text_input(
+                                    &self.replace_editor,
                                     None,
-                                    "Replace",
-                                    &ReplaceNext,
-                                    focus_handle.clone(),
-                                ))
-                                .child(search_bar::render_action_button(
-                                    "find-in-path-replace-button",
-                                    IconName::ReplaceAll,
-                                    None,
-                                    "Replace All",
-                                    &ReplaceAll,
-                                    focus_handle,
+                                    cx,
                                 )),
                         )
-                    })
-                    .child(self.render_scope_tabs(cx))
-                    .child(
-                        // File mask / Exclude are secondary filters — keep them
-                        // compact and left-aligned (IDEA-style) rather than
-                        // stretching them across the full width; the query field
-                        // above is the one that should be wide.
-                        h_flex()
-                            .gap_4()
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Label::new("File mask")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        search_bar::input_base_styles(
-                                            cx.theme().colors().border,
-                                            |d| d,
-                                        )
-                                        .w_64()
-                                        .child(search_bar::render_text_input(
-                                            &self.included_files_editor,
-                                            None,
-                                            cx,
-                                        )),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Label::new("Exclude")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        search_bar::input_base_styles(
-                                            cx.theme().colors().border,
-                                            |d| d,
-                                        )
-                                        .w_64()
-                                        .child(search_bar::render_text_input(
-                                            &self.excluded_files_editor,
-                                            None,
-                                            cx,
-                                        )),
-                                    ),
-                            ),
-                    )
-                    .when(matches!(self.scope, Scope::Directory(_)), |this| {
-                        this.child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Label::new("Directory")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                                .child(
-                                    search_bar::input_base_styles(
-                                        cx.theme().colors().border,
-                                        |d| d,
-                                    )
-                                    .flex_1()
-                                    .child(search_bar::render_text_input(
-                                        &self.directory_editor,
-                                        None,
-                                        cx,
-                                    )),
-                                ),
-                        )
-                    }),
-            )
+                        .child(search_bar::render_action_button(
+                            "find-in-path-replace-button",
+                            IconName::ReplaceNext,
+                            None,
+                            "Replace",
+                            &ReplaceNext,
+                            focus_handle.clone(),
+                        ))
+                        .child(search_bar::render_action_button(
+                            "find-in-path-replace-all-button",
+                            IconName::ReplaceAll,
+                            None,
+                            "Replace All",
+                            &ReplaceAll,
+                            focus_handle,
+                        )),
+                )
+            })
+            .when(self.filters_enabled, |this| {
+                this.child(self.render_labelled_input(
+                    "Exclude",
+                    &self.excluded_files_editor.clone(),
+                    cx,
+                ))
+            })
             .child(
                 h_flex()
+                    .w_full()
+                    .px_3()
+                    .pb_2()
+                    .child(self.render_scope_tabs(cx)),
+            )
+            .when(matches!(self.scope, Scope::Directory(_)), |this| {
+                this.child(self.render_labelled_input(
+                    "Directory",
+                    &self.directory_editor.clone(),
+                    cx,
+                ))
+            })
+            // Results above, preview below (IntelliJ stacks them vertically). The results pane
+            // takes a definite fraction of the modal's pixel height so the preview — which is the
+            // taller half in the reference — gets the rest via `flex_1`.
+            .child(
+                div()
+                    .w_full()
+                    .h(relative(0.35))
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(self.render_results(cx)),
+            )
+            .child(
+                div()
+                    .w_full()
                     .flex_1()
                     .min_h_0()
                     .border_t_1()
                     .border_color(cx.theme().colors().border)
-                    .child(
-                        div()
-                            .w(relative(0.4))
-                            .h_full()
-                            .border_r_1()
-                            .border_color(cx.theme().colors().border)
-                            .child(self.render_results(cx)),
-                    )
-                    // Live read-only preview of the selected match, scrolled/highlighted by
-                    // `update_preview`. Falls back to a placeholder until a match is selected.
-                    .child(if let Some((_, editor)) = self.preview_editor.as_ref() {
-                        div().flex_1().h_full().child(editor.clone())
-                    } else {
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Label::new("Select a match")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                    }),
+                    .child(self.render_preview(cx)),
             )
-            .child(
-                h_flex()
-                    .p_1()
-                    .justify_between()
-                    .child(self.status_label())
-                    .child(
-                        Button::new("find-in-path-open-in-find-window", "Open in Find Window")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.open_in_find_window(window, cx);
-                            })),
-                    ),
-            )
+            .child(self.render_footer(cx))
     }
 }
