@@ -81,6 +81,8 @@ pub enum Color {
     VersionControlIgnored,
     /// A version control color used to indicate modified files or content in version control.
     VersionControlModified,
+    /// A version control color used to indicate files that are untracked by version control.
+    VersionControlUntracked,
     /// A color used to indicate a warning condition.
     Warning,
 }
@@ -112,6 +114,7 @@ impl Color {
             Color::VersionControlDeleted => cx.theme().colors().version_control_deleted,
             Color::VersionControlIgnored => cx.theme().colors().version_control_ignored,
             Color::VersionControlModified => cx.theme().colors().version_control_modified,
+            Color::VersionControlUntracked => cx.theme().colors().version_control_untracked,
             Color::Warning => cx.theme().status().warning,
             Color::Custom(color) => *color,
         }

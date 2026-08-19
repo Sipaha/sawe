@@ -6634,7 +6634,7 @@ impl GitPanel {
             if has_conflict {
                 Color::VersionControlConflict
             } else if is_created {
-                Color::VersionControlAdded
+                Color::VersionControlUntracked
             } else if is_modified {
                 Color::VersionControlModified
             } else if is_deleted {
@@ -6646,9 +6646,11 @@ impl GitPanel {
         } else if is_created {
             // IDEA tints unversioned files in its Commit tool window; keep that
             // cue even when the panel is in "status icon" mode, where every
-            // other row is plain. `version_control_added` is the theme colour
-            // this crate already resolves for created files.
-            Color::VersionControlAdded
+            // other row is plain. `is_created` is exactly the predicate behind
+            // the "Untracked" section header, so it gets the dedicated
+            // untracked tint; `version_control_added` would collide with the
+            // green this panel already spends on "added to the index".
+            Color::VersionControlUntracked
         } else {
             Color::Default
         };

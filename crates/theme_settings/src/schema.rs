@@ -779,6 +779,10 @@ pub fn theme_colors_refinement(
             .as_ref()
             .and_then(|color| try_parse_color(color).ok())
             .or(status_colors.ignored),
+        version_control_untracked: this
+            .version_control_untracked
+            .as_ref()
+            .and_then(|color| try_parse_color(color).ok()),
         version_control_word_added: this
             .version_control_word_added
             .as_ref()

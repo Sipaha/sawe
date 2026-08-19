@@ -1025,6 +1025,10 @@ pub struct ThemeColorsContent {
     #[serde(rename = "version_control.ignored")]
     pub version_control_ignored: Option<String>,
 
+    /// Untracked (unversioned) version control color.
+    #[serde(rename = "version_control.untracked")]
+    pub version_control_untracked: Option<String>,
+
     /// Color for added words in word diffs.
     #[serde(rename = "version_control.word_added")]
     pub version_control_word_added: Option<String>,

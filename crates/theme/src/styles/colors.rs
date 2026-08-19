@@ -331,6 +331,8 @@ pub struct ThemeColors {
     pub version_control_conflict: Hsla,
     /// Represents an ignored entry in version control systems.
     pub version_control_ignored: Hsla,
+    /// Represents an untracked (unversioned) entry in version control systems.
+    pub version_control_untracked: Hsla,
     /// Represents an added word in a word diff.
     pub version_control_word_added: Hsla,
     /// Represents a deleted word in a word diff.
@@ -455,6 +457,7 @@ pub enum ThemeColorField {
     VersionControlRenamed,
     VersionControlConflict,
     VersionControlIgnored,
+    VersionControlUntracked,
 }
 
 impl ThemeColors {
@@ -581,6 +584,7 @@ impl ThemeColors {
             ThemeColorField::VersionControlRenamed => self.version_control_renamed,
             ThemeColorField::VersionControlConflict => self.version_control_conflict,
             ThemeColorField::VersionControlIgnored => self.version_control_ignored,
+            ThemeColorField::VersionControlUntracked => self.version_control_untracked,
         }
     }
 

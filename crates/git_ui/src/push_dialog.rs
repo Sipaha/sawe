@@ -991,8 +991,14 @@ impl PushDialog {
             div()
                 .py_4()
                 .child(
+                    // Pushing is not gated on having commits ahead: with `tags`
+                    // on, `git push --tags` still has work to do. Saying
+                    // "Nothing to push." there would contradict the Push button
+                    // sitting right below it, enabled and about to push a tag.
                     Label::new(if self.refreshing {
                         "Loading…"
+                    } else if self.push_tags {
+                        "No commits to push — tags will still be pushed."
                     } else {
                         "Nothing to push."
                     })
