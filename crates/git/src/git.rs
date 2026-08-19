@@ -3,6 +3,7 @@ pub mod blame;
 pub mod commit;
 mod hosting_provider;
 pub mod operations;
+pub mod push_rejection;
 mod remote;
 pub mod repo_lock;
 pub mod repository;

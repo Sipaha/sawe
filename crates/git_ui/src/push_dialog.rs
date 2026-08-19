@@ -15,23 +15,27 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context as _, Result, anyhow};
+use askpass::AskPassDelegate;
 use editor::Editor;
+use git::push_rejection::PushRejection;
 use git::repository::{Remote, RemoteCommandOutput};
 use gpui::{
-    AppContext, ClickEvent, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, ParentElement, Render, SharedString, Styled, Task, WeakEntity, Window, div,
+    AppContext, ClickEvent, ClipboardItem, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, ParentElement, Render, SharedString, Styled, Task, WeakEntity,
+    Window, div,
 };
 use menu::Cancel;
 use project::git_store::Repository;
 use ui::{
-    App, Button, Checkbox, Clickable, Color, Context, Headline, HeadlineSize, Icon, IconName,
-    IconSize, IntoElement, Label, LabelCommon, LabelSize, ToggleState, Tooltip, h_flex, prelude::*,
-    rems, v_flex,
+    App, Button, ButtonStyle, Checkbox, Clickable, Color, Context, Headline, HeadlineSize, Icon,
+    IconName, IconSize, IntoElement, Label, LabelCommon, LabelSize, TintColor, ToggleState,
+    Tooltip, h_flex, prelude::*, rems, v_flex,
 };
 use util::ResultExt as _;
 use util::command::new_command;
 use workspace::{ModalView, Workspace};
 
+use crate::askpass_modal::AskPassModal;
 use crate::mini_graph::{MiniCommit, MiniGraph};
 use crate::remote_output::{RemoteAction, format_output};
 
@@ -82,7 +86,51 @@ pub struct PushDialog {
     force_locked_reason: Option<SharedString>,
     pushing: bool,
     refreshing: bool,
+    /// Last failed push or remediation, kept so the dialog can render
+    /// git's own words. Before this existed the error was only
+    /// `log::warn!`-ed and the button silently flipped back to "Push",
+    /// which read as "nothing happened".
+    failure: Option<PushFailure>,
+    /// Transient success line for a remediation ("Pull succeeded — press
+    /// Push to retry"). Cleared as soon as another push starts.
+    notice: Option<SharedString>,
+    /// Label of the remediation currently running. `Some` disables the
+    /// remediation row: two concurrent git commands in one work tree
+    /// would fight over `index.lock`.
+    remediation: Option<SharedString>,
     focus_handle: FocusHandle,
+}
+
+/// A failed push (or a failed remediation), kept verbatim.
+#[derive(Debug, Clone)]
+struct PushFailure {
+    kind: PushRejection,
+    /// git's own output plus the `anyhow` context chain, unmodified.
+    /// Never paraphrased — the whole point is that the user can read
+    /// what git actually said.
+    detail: SharedString,
+}
+
+impl PushFailure {
+    fn from_error(err: &anyhow::Error) -> Self {
+        // `{:#}` keeps the whole context chain on one line, so the
+        // "running `git push`" / "pull --rebase before push" context that
+        // `run_push_cli` attaches survives into the UI.
+        let detail = format!("{err:#}");
+        Self {
+            kind: PushRejection::classify(&detail),
+            detail: SharedString::from(detail),
+        }
+    }
+
+    /// A remediation failure is never a *push* rejection, so it keeps the
+    /// verbatim text but never offers another round of pull buttons.
+    fn from_remediation_error(operation: &str, message: String) -> Self {
+        Self {
+            kind: PushRejection::Unknown,
+            detail: SharedString::from(format!("{operation} failed: {message}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +206,9 @@ impl PushDialog {
                 force_locked_reason: protection,
                 pushing: false,
                 refreshing: false,
+                failure: None,
+                notice: None,
+                remediation: None,
                 focus_handle: cx.focus_handle(),
             };
             dialog.refresh_preview(window, cx);
@@ -283,9 +334,11 @@ impl PushDialog {
     }
 
     fn confirm_push(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.pushing {
+        if self.pushing || self.remediation.is_some() {
             return;
         }
+        self.failure = None;
+        self.notice = None;
         let work_dir = self.work_dir.clone();
         let branch = self.branch.to_string();
         let remote = self.remote.to_string();
@@ -373,7 +426,15 @@ impl PushDialog {
                         cx.emit(DismissEvent);
                     }
                     Err(err) => {
-                        log::warn!("PushDialog: push failed: {err}");
+                        // Keep the dialog open and show git's verbatim
+                        // message; a rejected push is the one case where
+                        // the user most needs to read what the remote said.
+                        // A rejected push does not update `refs/remotes/**`,
+                        // so re-deriving the preview here would show the same
+                        // stale ahead/behind counts; the refresh happens after
+                        // a remediation pull instead.
+                        log::warn!("PushDialog: push failed: {err:#}");
+                        this.failure = Some(PushFailure::from_error(&err));
                         cx.notify();
                     }
                 }
@@ -381,6 +442,142 @@ impl PushDialog {
             .ok();
         })
         .detach();
+    }
+
+    /// Askpass bridge for the remediation pulls. Mirrors
+    /// `GitPanel::askpass_delegate` — a pull over https/ssh can prompt for
+    /// credentials, and without this the git subprocess would block forever
+    /// on a terminal that does not exist.
+    fn askpass_delegate(
+        &self,
+        operation: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AskPassDelegate {
+        let workspace = self.workspace.clone();
+        let operation = operation.into();
+        let window = window.window_handle();
+        AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.toggle_modal(window, cx, |window, cx| {
+                                AskPassModal::new(operation.clone(), prompt.into(), tx, window, cx)
+                            });
+                        })
+                        .ok();
+                })
+                .ok();
+        })
+    }
+
+    /// Remediation for a non-fast-forward rejection: integrate the remote
+    /// commits, then let the user press Push again. Goes through
+    /// `Repository::pull` (the same typed API the git panel uses) rather
+    /// than shelling out, so askpass, the job queue and the git store's
+    /// own refresh all behave exactly as they do for a panel pull.
+    fn run_pull(&mut self, rebase: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pushing || self.remediation.is_some() {
+            return;
+        }
+        let remote = self.remote.to_string();
+        if remote.is_empty() {
+            self.failure = Some(PushFailure::from_remediation_error(
+                "pull",
+                "no remote is configured for this branch".to_string(),
+            ));
+            cx.notify();
+            return;
+        }
+        let label: SharedString = if rebase {
+            "Pulling (rebase)…".into()
+        } else {
+            "Pulling (merge)…".into()
+        };
+        let operation = if rebase {
+            "pull --rebase".to_string()
+        } else {
+            "pull".to_string()
+        };
+        let askpass = self.askpass_delegate(format!("git {operation} {remote}"), window, cx);
+        // `git pull` needs an explicit refspec when the local branch has no
+        // upstream yet; mirrors `GitPanel::pull`.
+        let branch_arg = self.repository.read(cx).branch.as_ref().and_then(|branch| {
+            branch
+                .upstream
+                .is_none()
+                .then(|| SharedString::from(branch.name().to_string()))
+        });
+        let pull = self.repository.update(cx, |repository, cx| {
+            repository.pull(branch_arg, SharedString::from(remote), rebase, askpass, cx)
+        });
+        self.remediation = Some(label);
+        self.notice = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome = pull.await;
+            this.update(cx, |this, cx| {
+                this.remediation = None;
+                match outcome {
+                    Ok(Ok(output)) => {
+                        log::info!(
+                            "PushDialog: {operation} succeeded — {}",
+                            output.stderr.trim_end()
+                        );
+                        this.failure = None;
+                        this.notice = Some(SharedString::from(format!(
+                            "`git {operation}` succeeded. Press Push to retry."
+                        )));
+                        // The pull moved both HEAD and `refs/remotes/**`, so
+                        // the ahead/behind preview must be rebuilt before the
+                        // user looks at it again.
+                        this.refresh_no_window(cx);
+                    }
+                    Ok(Err(err)) => {
+                        log::warn!("PushDialog: {operation} failed: {err:#}");
+                        this.failure = Some(PushFailure::from_remediation_error(
+                            &operation,
+                            format!("{err:#}"),
+                        ));
+                    }
+                    Err(_) => {
+                        log::warn!("PushDialog: {operation} was dropped by the git store");
+                        this.failure = Some(PushFailure::from_remediation_error(
+                            &operation,
+                            "the git store dropped the job before it completed".to_string(),
+                        ));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Remediation of last resort: re-run the push with
+    /// `--force-with-lease`. Reuses `confirm_push` rather than calling
+    /// `run_force_with_lease` directly so the S-SOL-PRT branch-protection
+    /// check at the press boundary still applies. Never offers a bare
+    /// `--force`; the lease is what makes this recoverable.
+    fn run_force_push_with_lease(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pushing || self.remediation.is_some() {
+            return;
+        }
+        if self.force_locked_reason.is_some() {
+            return;
+        }
+        self.force_mode = ForceMode::WithLease;
+        self.confirm_push(window, cx);
+    }
+
+    fn copy_failure(&mut self, cx: &mut Context<Self>) {
+        let Some(failure) = self.failure.as_ref() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(failure.detail.to_string()));
     }
 
     fn run_squash_with_previous(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -592,6 +789,7 @@ impl Render for PushDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header().into_any_element();
         let body = self.render_body(cx).into_any_element();
+        let status = self.render_status(cx);
         let footer = self.render_footer(cx).into_any_element();
         v_flex()
             .key_context("PushDialog")
@@ -604,6 +802,7 @@ impl Render for PushDialog {
             .gap_2()
             .child(header)
             .child(body)
+            .when_some(status, |this, status| this.child(status))
             .child(footer)
     }
 }
@@ -643,6 +842,144 @@ impl PushDialog {
                     .child(self.remote_branch_editor.clone()),
             )
             .when_some(create_hint, |this, hint| this.child(hint))
+    }
+
+    /// Renders the outcome of the last push / remediation. Git's own text
+    /// is reproduced verbatim in a scrollable monospace block; the
+    /// classification is only used to choose which remediation buttons to
+    /// offer, never to replace the message.
+    fn render_status(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if let Some(remediation) = self.remediation.clone() {
+            return Some(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::ArrowCircle)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(remediation)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(notice) = self.notice.clone() {
+            return Some(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Check)
+                            .size(IconSize::Small)
+                            .color(Color::Success),
+                    )
+                    .child(
+                        Label::new(notice)
+                            .size(LabelSize::Small)
+                            .color(Color::Success),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let failure = self.failure.as_ref()?;
+
+        let mut detail = v_flex().gap_0p5();
+        for line in failure.detail.lines() {
+            detail = detail.child(
+                Label::new(SharedString::from(line.to_string()))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .buffer_font(cx),
+            );
+        }
+
+        let mut block = v_flex()
+            .gap_1p5()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().status().error_border)
+            .bg(cx.theme().status().error_background)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::XCircle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Error),
+                            )
+                            .child(
+                                Label::new(failure.kind.headline())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Error),
+                            ),
+                    )
+                    .child(
+                        Button::new("push-dialog-copy-error", "Copy")
+                            .label_size(LabelSize::XSmall)
+                            .tooltip(Tooltip::text("Copy git's output to the clipboard"))
+                            .on_click(cx.listener(|this, _, _window, cx| this.copy_failure(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("push-dialog-error-detail")
+                    .max_h(rems(8.))
+                    .overflow_y_scroll()
+                    .child(detail),
+            );
+
+        if failure.kind.is_diverged() {
+            let force_locked = self.force_locked_reason.clone();
+            let mut force_button =
+                Button::new("push-dialog-remediate-force-lease", "Force push with lease")
+                    .style(ButtonStyle::Tinted(TintColor::Error))
+                    .disabled(force_locked.is_some())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.run_force_push_with_lease(window, cx)
+                    }));
+            force_button = match force_locked {
+                Some(reason) => force_button.tooltip(Tooltip::text(reason)),
+                None => force_button.tooltip(Tooltip::text(
+                    "Overwrites the remote branch, but only if it still points at the commit \
+                     you last fetched. Discards the remote-only commits listed above.",
+                )),
+            };
+
+            block = block.child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("push-dialog-remediate-pull-rebase", "Pull with rebase")
+                            .tooltip(Tooltip::text(
+                                "git pull --rebase — replays your commits on top of the remote.",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.run_pull(true, window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("push-dialog-remediate-pull-merge", "Pull (merge)")
+                            .tooltip(Tooltip::text(
+                                "git pull — merges the remote commits into your branch.",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.run_pull(false, window, cx)),
+                            ),
+                    )
+                    .child(force_button),
+            );
+        }
+
+        Some(block.into_any_element())
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1563,5 +1900,148 @@ mod tests {
             .await
             .expect("commit_remote_refs");
         assert!(refs.iter().any(|r| r == "origin/main"));
+    }
+
+    /// Reproduces the reported bug: someone else pushed first, so our push
+    /// is rejected. Asserts git's own words survive into the error that the
+    /// dialog renders, and that the failure classifies as recoverable by a
+    /// pull (which is what gates the remediation buttons).
+    async fn diverge_remote(local: &Path, remote: &Path) -> Result<()> {
+        let other = local
+            .parent()
+            .context("parent of local exists")?
+            .join("other-pusher");
+        std::fs::create_dir_all(&other)?;
+        run_git_void(&other, &["clone", remote.to_str().unwrap_or_default(), "."]).await?;
+        run_git_void(&other, &["config", "user.email", "test@example.com"]).await?;
+        run_git_void(&other, &["config", "user.name", "Test"]).await?;
+        std::fs::write(other.join("from-other.txt"), "hi")?;
+        run_git_void(&other, &["add", "from-other.txt"]).await?;
+        run_git_void(&other, &["commit", "-m", "from other"]).await?;
+        run_git_void(&other, &["push", "origin", "main"]).await?;
+
+        std::fs::write(local.join("local-only.txt"), "x")?;
+        run_git_void(local, &["add", "local-only.txt"]).await?;
+        run_git_void(local, &["commit", "-m", "local commit"]).await?;
+        Ok(())
+    }
+
+    fn plain_push() -> PushInvocation {
+        PushInvocation {
+            force_mode: ForceMode::None,
+            tags: false,
+            no_verify: false,
+            set_upstream: false,
+            pull_rebase_first: false,
+        }
+    }
+
+    #[gpui::test]
+    async fn rejected_push_surfaces_git_message_verbatim(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (_tmp, local, remote) = boot_repo().await.unwrap_or_else(|e| panic!("boot: {e}"));
+        diverge_remote(&local, &remote)
+            .await
+            .unwrap_or_else(|e| panic!("diverge: {e}"));
+
+        let err = run_push_cli(&local, "main", "origin", "main", &plain_push())
+            .await
+            .expect_err("push to a diverged remote must fail");
+        let failure = PushFailure::from_error(&err);
+
+        assert!(
+            failure.detail.contains("[rejected]"),
+            "git's rejection line must reach the UI verbatim, got: {}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains("non-fast-forward") || failure.detail.contains("fetch first"),
+            "git's reason must reach the UI verbatim, got: {}",
+            failure.detail
+        );
+        assert_eq!(failure.kind, PushRejection::NonFastForward);
+        assert!(
+            failure.kind.is_diverged(),
+            "a non-fast-forward rejection must offer the pull remediations"
+        );
+    }
+
+    #[gpui::test]
+    async fn pull_rebase_resolves_the_rejection(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (_tmp, local, remote) = boot_repo().await.unwrap_or_else(|e| panic!("boot: {e}"));
+        diverge_remote(&local, &remote)
+            .await
+            .unwrap_or_else(|e| panic!("diverge: {e}"));
+        run_push_cli(&local, "main", "origin", "main", &plain_push())
+            .await
+            .expect_err("push to a diverged remote must fail");
+
+        let opts = PushInvocation {
+            pull_rebase_first: true,
+            ..plain_push()
+        };
+        run_push_cli(&local, "main", "origin", "main", &opts)
+            .await
+            .unwrap_or_else(|e| panic!("push after rebase should succeed: {e:#}"));
+
+        let log = run_git(&local, &["log", "--oneline", "origin/main"])
+            .await
+            .expect("log origin/main");
+        assert!(log.contains("local commit"), "log was: {log}");
+        assert!(log.contains("from other"), "log was: {log}");
+    }
+
+    #[gpui::test]
+    async fn force_with_lease_resolves_the_rejection(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (_tmp, local, remote) = boot_repo().await.unwrap_or_else(|e| panic!("boot: {e}"));
+        diverge_remote(&local, &remote)
+            .await
+            .unwrap_or_else(|e| panic!("diverge: {e}"));
+        run_push_cli(&local, "main", "origin", "main", &plain_push())
+            .await
+            .expect_err("push to a diverged remote must fail");
+
+        // The lease is only valid once we know where the remote actually is;
+        // before a fetch git reports `(stale info)` rather than overwriting.
+        let stale = run_push_cli(
+            &local,
+            "main",
+            "origin",
+            "main",
+            &PushInvocation {
+                force_mode: ForceMode::WithLease,
+                ..plain_push()
+            },
+        )
+        .await
+        .expect_err("force-with-lease before a fetch must be refused");
+        assert_eq!(
+            PushFailure::from_error(&stale).kind,
+            PushRejection::StaleInfo
+        );
+
+        run_git_void(&local, &["fetch", "origin"])
+            .await
+            .expect("fetch");
+        run_push_cli(
+            &local,
+            "main",
+            "origin",
+            "main",
+            &PushInvocation {
+                force_mode: ForceMode::WithLease,
+                ..plain_push()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("force-with-lease after fetch should succeed: {e:#}"));
+
+        let log = run_git(&local, &["log", "--oneline", "origin/main"])
+            .await
+            .expect("log origin/main");
+        assert!(log.contains("local commit"), "log was: {log}");
+        assert!(!log.contains("from other"), "log was: {log}");
     }
 }
