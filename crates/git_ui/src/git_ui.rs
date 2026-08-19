@@ -915,7 +915,7 @@ mod remote_button {
             "Fetch",
             0,
             0,
-            Some(IconName::ArrowCircle),
+            Some(IconName::ArrowDownLeft),
             keybinding_target.clone(),
             move |_, window, cx| {
                 window.dispatch_action(Box::new(git::Fetch), cx);
