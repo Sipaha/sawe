@@ -13,16 +13,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
-use askpass::AskPassDelegate;
 use editor::Editor;
 use git::push_rejection::PushRejection;
 use git::repository::{Remote, RemoteCommandOutput};
 use gpui::{
-    AppContext, ClickEvent, ClipboardItem, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, ParentElement, Render, SharedString, Styled, Task, WeakEntity,
-    Window, div,
+    AnyElement, AppContext, ClickEvent, ClipboardItem, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, ParentElement, Render, SharedString, Styled, Task,
+    WeakEntity, Window, div,
 };
 use menu::Cancel;
 use project::git_store::Repository;
@@ -35,11 +35,21 @@ use util::ResultExt as _;
 use util::command::new_command;
 use workspace::{ModalView, Workspace};
 
-use crate::askpass_modal::AskPassModal;
+use crate::handlers::askpass::askpass_delegate;
+use crate::handlers::branch::split_remote_ref;
 use crate::mini_graph::{MiniCommit, MiniGraph};
 use crate::remote_output::{RemoteAction, format_output};
 
 /// Force-push posture chosen in the dialog footer.
+///
+/// The dialog only ever produces `None` or `WithLease`. `Force` (a bare
+/// `--force`) is no longer offered and never reaches git as `--force`:
+/// every runner in the tree upgrades it to `WithLease`, `solution_git`'s
+/// argument builder included. The variant survives purely as a legacy
+/// *wire* input — it is how an MCP caller that still spells
+/// `force_mode: "force"` can be recognised, so the result text can say
+/// the request was upgraded instead of silently reporting something the
+/// caller did not ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForceMode {
     None,
@@ -84,6 +94,11 @@ pub struct PushDialog {
     no_verify: bool,
     pull_rebase_first: bool,
     force_locked_reason: Option<SharedString>,
+    /// A `RequiresConfirmation` force-push waiting on the user. `Some`
+    /// replaces the whole dialog body with the confirmation, so the
+    /// toggles and commit rows behind it are unreachable while it is up;
+    /// it also keeps a second press from starting a second push.
+    force_confirm: Option<ForcePushConfirm>,
     pushing: bool,
     refreshing: bool,
     /// Last failed push or remediation, kept so the dialog can render
@@ -204,6 +219,7 @@ impl PushDialog {
                 no_verify: false,
                 pull_rebase_first: false,
                 force_locked_reason: protection,
+                force_confirm: None,
                 pushing: false,
                 refreshing: false,
                 failure: None,
@@ -293,6 +309,13 @@ impl PushDialog {
     }
 
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        // Escape backs out of the force-push confirmation before it
+        // closes the dialog: only the destructive control is ever gated,
+        // never the way out of it.
+        if self.force_confirm.is_some() {
+            self.cancel_force_push_confirm(cx);
+            return;
+        }
         cx.emit(DismissEvent);
     }
 
@@ -303,17 +326,6 @@ impl PushDialog {
         self.force_mode = match self.force_mode {
             ForceMode::WithLease => ForceMode::None,
             _ => ForceMode::WithLease,
-        };
-        cx.notify();
-    }
-
-    fn toggle_force(&mut self, cx: &mut Context<Self>) {
-        if self.force_locked_reason.is_some() {
-            return;
-        }
-        self.force_mode = match self.force_mode {
-            ForceMode::Force => ForceMode::None,
-            _ => ForceMode::Force,
         };
         cx.notify();
     }
@@ -333,8 +345,12 @@ impl PushDialog {
         cx.notify();
     }
 
+    /// The Push button's press boundary. Everything that has to be
+    /// decided *now* rather than at dialog-open time happens here: the
+    /// remote / remote-branch text the user may have edited since, and
+    /// the S-SOL-PRT branch-protection gate.
     fn confirm_push(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.pushing || self.remediation.is_some() {
+        if self.pushing || self.remediation.is_some() || self.force_confirm.is_some() {
             return;
         }
         self.failure = None;
@@ -352,23 +368,59 @@ impl PushDialog {
             log::warn!("PushDialog: remote/remote_branch empty, refusing to push");
             return;
         }
-        // S-SOL-PRT — refuse force-push if the policy says `Forbidden`.
-        // The dialog's `force_locked_reason` already disabled the
-        // toggle in this case, but a stale snapshot or a settings
-        // change between dialog-open and push-confirm could still let
-        // the toggle stay on; double-check at the press boundary.
+        // S-SOL-PRT — consult the policy again here. The dialog's
+        // `force_locked_reason` already disabled the toggle for
+        // `Forbidden`, but a stale snapshot or a settings change between
+        // dialog-open and press could still let the toggle stay on, and
+        // `RequiresConfirmation` is only ever asked at this boundary —
+        // dialog-open deliberately leaves that tier's toggle enabled.
         if !matches!(self.force_mode, ForceMode::None) {
-            let op = "force_push";
-            if let solutions::branch_protection::Decision::Forbidden { reason } =
-                solutions::branch_protection::check(&work_dir, &branch, op)
-            {
-                log::warn!("PushDialog: force-push refused by branch protection: {reason}");
-                self.force_locked_reason = Some(SharedString::from(reason));
-                self.force_mode = ForceMode::None;
-                cx.notify();
-                return;
+            let decision = solutions::branch_protection::check(&work_dir, &branch, "force_push");
+            match force_push_gate(&decision, self.force_mode, &branch, &remote, &remote_branch) {
+                ForcePushGate::Proceed => {}
+                ForcePushGate::Locked { reason } => {
+                    log::warn!("PushDialog: force-push refused by branch protection: {reason}");
+                    self.force_locked_reason = Some(reason);
+                    self.force_mode = ForceMode::None;
+                    cx.notify();
+                    return;
+                }
+                ForcePushGate::Confirm {
+                    title,
+                    detail,
+                    confirm_label,
+                } => {
+                    log::info!("PushDialog: force-push requires confirmation ({decision:?})");
+                    self.open_force_push_confirm(
+                        title,
+                        detail,
+                        confirm_label,
+                        work_dir,
+                        branch,
+                        remote,
+                        remote_branch,
+                        cx,
+                    );
+                    return;
+                }
             }
         }
+        self.start_push(work_dir, branch, remote, remote_branch, cx);
+    }
+
+    /// Runs the push the user already agreed to. Split out of
+    /// [`Self::confirm_push`] so the branch-protection confirmation can
+    /// re-enter it from the prompt's completion, pushing exactly the
+    /// target that was gated rather than re-reading fields that may have
+    /// moved.
+    fn start_push(
+        &mut self,
+        work_dir: PathBuf,
+        branch: String,
+        remote: String,
+        remote_branch: String,
+        cx: &mut Context<Self>,
+    ) {
         let opts = PushInvocation {
             force_mode: self.force_mode,
             tags: self.push_tags,
@@ -444,32 +496,163 @@ impl PushDialog {
         .detach();
     }
 
-    /// Askpass bridge for the remediation pulls. Mirrors
-    /// `GitPanel::askpass_delegate` — a pull over https/ssh can prompt for
-    /// credentials, and without this the git subprocess would block forever
-    /// on a terminal that does not exist.
-    fn askpass_delegate(
-        &self,
-        operation: impl Into<SharedString>,
-        window: &mut Window,
+    /// Put the S-SOL-PRT confirmation up in place of the dialog body and
+    /// start reading what the force-push would destroy. The countdown and
+    /// the git query are tasks owned by the confirmation state, so
+    /// cancelling it drops both.
+    #[allow(clippy::too_many_arguments)]
+    fn open_force_push_confirm(
+        &mut self,
+        title: String,
+        detail: String,
+        confirm_label: String,
+        work_dir: PathBuf,
+        branch: String,
+        remote: String,
+        remote_branch: String,
         cx: &mut Context<Self>,
-    ) -> AskPassDelegate {
-        let workspace = self.workspace.clone();
-        let operation = operation.into();
-        let window = window.window_handle();
-        AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
-            window
-                .update(cx, |_, window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.toggle_modal(window, cx, |window, cx| {
-                                AskPassModal::new(operation.clone(), prompt.into(), tx, window, cx)
-                            });
-                        })
-                        .ok();
-                })
-                .ok();
+    ) {
+        let load = cx.spawn({
+            let work_dir = work_dir.clone();
+            let branch = branch.clone();
+            let remote = remote.clone();
+            let remote_branch = remote_branch.clone();
+            async move |this, cx| {
+                let overwritten = cx
+                    .background_spawn(async move {
+                        overwritten_commits(&work_dir, &branch, &remote, &remote_branch).await
+                    })
+                    .await;
+                this.update(cx, |this, cx| this.resolve_overwritten(overwritten, cx))
+                    .ok();
+            }
+        });
+        self.force_confirm = Some(ForcePushConfirm {
+            title: SharedString::from(title),
+            detail: SharedString::from(detail),
+            confirm_label: SharedString::from(confirm_label),
+            work_dir,
+            branch,
+            remote,
+            remote_branch,
+            state: ForcePushConfirmState::Pending,
+            _load: load,
+        });
+        cx.notify();
+    }
+
+    /// Turn the overwrite list into the confirmation's final state. This
+    /// is where the force push is allowed or refused: an empty list makes
+    /// it pointless and an unreadable one makes it blind, and neither is
+    /// something a countdown or a warning label should be asked to
+    /// protect the user from.
+    fn resolve_overwritten(&mut self, overwritten: OverwrittenCommits, cx: &mut Context<Self>) {
+        let Some(confirm) = self.force_confirm.as_ref() else {
+            return;
+        };
+        // One press, one read, one answer: a resolution that arrives
+        // after the confirmation has already settled is stale by
+        // definition, and must not restart a countdown the user is part
+        // way through — or, worse, reopen a push that was refused.
+        if !matches!(confirm.state, ForcePushConfirmState::Pending) {
+            return;
+        }
+        let state = match overwritten {
+            OverwrittenCommits::Unknown { why } => {
+                log::warn!(
+                    "PushDialog: refusing force-push to {}/{}: {why}",
+                    confirm.remote,
+                    confirm.remote_branch
+                );
+                ForcePushConfirmState::Refused(ForcePushRefusal::Undeterminable { why })
+            }
+            OverwrittenCommits::Known(commits) if commits.is_empty() => {
+                log::info!(
+                    "PushDialog: refusing force-push to {}/{}: nothing to overwrite",
+                    confirm.remote,
+                    confirm.remote_branch
+                );
+                ForcePushConfirmState::Refused(ForcePushRefusal::NothingToOverwrite)
+            }
+            OverwrittenCommits::Known(commits) => ForcePushConfirmState::Offered {
+                commits,
+                countdown: FORCE_PUSH_CONFIRM_DELAY_SECS,
+                _countdown: Self::spawn_confirm_countdown(cx),
+            },
+        };
+        if let Some(confirm) = self.force_confirm.as_mut() {
+            confirm.state = state;
+        }
+        cx.notify();
+    }
+
+    /// Ticks the reflex-click window down once a second. Only ever
+    /// started for an offered push, so a refusal never counts down to
+    /// something the user cannot have.
+    fn spawn_confirm_countdown(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            for _ in 0..FORCE_PUSH_CONFIRM_DELAY_SECS {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let still_counting = this
+                    .update(cx, |this, cx| {
+                        let Some(ForcePushConfirmState::Offered { countdown, .. }) = this
+                            .force_confirm
+                            .as_mut()
+                            .map(|confirm| &mut confirm.state)
+                        else {
+                            return false;
+                        };
+                        *countdown = countdown.saturating_sub(1);
+                        // The countdown lives in the retained scene, so
+                        // this notify — raised from a task, never from a
+                        // draw phase, where it would be discarded — is
+                        // the only thing that repaints the label.
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !still_counting {
+                    return;
+                }
+            }
         })
+    }
+
+    /// Back out of a pending force-push confirmation. Dropping the state
+    /// cancels its countdown and its git query along with it.
+    fn cancel_force_push_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.force_confirm.take().is_some() {
+            log::info!("PushDialog: force-push declined at the branch-protection confirmation");
+            cx.notify();
+        }
+    }
+
+    /// The confirmation's destructive button. Pushes exactly the target
+    /// that was gated, and only once the confirmation has armed.
+    fn confirm_force_push(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .force_confirm
+            .as_ref()
+            .is_some_and(ForcePushConfirm::is_armed)
+        {
+            return;
+        }
+        let Some(confirm) = self.force_confirm.take() else {
+            return;
+        };
+        log::info!(
+            "PushDialog: force-push confirmed for {}:{} on {}",
+            confirm.branch,
+            confirm.remote_branch,
+            confirm.remote
+        );
+        self.start_push(
+            confirm.work_dir,
+            confirm.branch,
+            confirm.remote,
+            confirm.remote_branch,
+            cx,
+        );
     }
 
     /// Remediation for a non-fast-forward rejection: integrate the remote
@@ -500,7 +683,12 @@ impl PushDialog {
         } else {
             "pull".to_string()
         };
-        let askpass = self.askpass_delegate(format!("git {operation} {remote}"), window, cx);
+        let askpass = askpass_delegate(
+            self.workspace.clone(),
+            format!("git {operation} {remote}"),
+            window,
+            cx,
+        );
         // `git pull` needs an explicit refspec when the local branch has no
         // upstream yet; mirrors `GitPanel::pull`.
         let branch_arg = self.repository.read(cx).branch.as_ref().and_then(|branch| {
@@ -563,7 +751,7 @@ impl PushDialog {
     /// check at the press boundary still applies. Never offers a bare
     /// `--force`; the lease is what makes this recoverable.
     fn run_force_push_with_lease(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pushing || self.remediation.is_some() {
+        if self.pushing || self.remediation.is_some() || self.force_confirm.is_some() {
             return;
         }
         if self.force_locked_reason.is_some() {
@@ -787,6 +975,12 @@ struct PushInvocation {
 
 impl Render for PushDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The confirmation takes the dialog over rather than layering on
+        // top of it: while it is up, none of the toggles or commit rows
+        // behind it may be reachable.
+        if self.force_confirm.is_some() {
+            return self.render_force_push_confirm(cx);
+        }
         let header = self.render_header().into_any_element();
         let body = self.render_body(cx).into_any_element();
         let status = self.render_status(cx);
@@ -804,10 +998,131 @@ impl Render for PushDialog {
             .child(body)
             .when_some(status, |this, status| this.child(status))
             .child(footer)
+            .into_any_element()
     }
 }
 
 impl PushDialog {
+    /// The bespoke force-push confirmation: what is about to be run, the
+    /// server-side commits it would overwrite, and — only when there are
+    /// any — a confirm button that stays dead for
+    /// [`FORCE_PUSH_CONFIRM_DELAY_SECS`] so a reflex click aimed at
+    /// "Push" cannot land on it. When the push is refused there is no
+    /// confirm button at all, dead or otherwise.
+    fn render_force_push_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(confirm) = self.force_confirm.as_ref() else {
+            return div().into_any_element();
+        };
+        let tracking = format!("{}/{}", confirm.remote, confirm.remote_branch);
+
+        let mut body = v_flex().gap_1();
+        let mut confirm_button = None;
+        match &confirm.state {
+            ForcePushConfirmState::Pending => {
+                body = body.child(
+                    Label::new(format!("Reading what {tracking} holds…"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                );
+            }
+            ForcePushConfirmState::Refused(refusal) => {
+                let (headline, advice) =
+                    refusal_lines(refusal, &confirm.branch, &tracking, &confirm.remote);
+                body = body
+                    .child(
+                        Label::new(headline)
+                            .size(LabelSize::Small)
+                            .color(Color::Error),
+                    )
+                    .child(
+                        Label::new(advice)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    );
+            }
+            ForcePushConfirmState::Offered {
+                commits, countdown, ..
+            } => {
+                let plural = if commits.len() == 1 { "" } else { "s" };
+                body = body.child(
+                    Label::new(format!(
+                        "{} commit{plural} on {tracking} will be overwritten:",
+                        commits.len()
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Error),
+                );
+                let mut rows = v_flex()
+                    .id("push-dialog-force-confirm-overwritten")
+                    .max_h(rems(12.))
+                    .overflow_y_scroll();
+                for (ix, commit) in commits.iter().take(MAX_OVERWRITTEN_ROWS).enumerate() {
+                    rows = rows.child(render_overwritten_row(ix, commit));
+                }
+                body = body.child(rows);
+                if commits.len() > MAX_OVERWRITTEN_ROWS {
+                    body = body.child(
+                        Label::new(format!(
+                            "…and {} more.",
+                            commits.len() - MAX_OVERWRITTEN_ROWS
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    );
+                }
+                let label: SharedString = if *countdown > 0 {
+                    format!("{} ({countdown})", confirm.confirm_label).into()
+                } else {
+                    confirm.confirm_label.clone()
+                };
+                confirm_button = Some(
+                    Button::new("push-dialog-force-confirm", label)
+                        .style(ButtonStyle::Tinted(TintColor::Error))
+                        .disabled(*countdown > 0)
+                        .on_click(cx.listener(|this, _, _window, cx| this.confirm_force_push(cx))),
+                );
+            }
+        }
+
+        v_flex()
+            .key_context("PushDialog")
+            .on_action(cx.listener(Self::cancel))
+            .track_focus(&self.focus_handle)
+            .elevation_3(cx)
+            .w(rems(64.))
+            .max_h(rems(40.))
+            .p_3()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::Small)
+                            .color(Color::Error),
+                    )
+                    .child(Headline::new(confirm.title.clone()).size(HeadlineSize::Small)),
+            )
+            .child(
+                Label::new(confirm.detail.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(body)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        Button::new("push-dialog-force-confirm-cancel", "Cancel").on_click(
+                            cx.listener(|this, _, _window, cx| this.cancel_force_push_confirm(cx)),
+                        ),
+                    )
+                    .when_some(confirm_button, |this, button| this.child(button)),
+            )
+            .into_any_element()
+    }
+
     fn render_header(&self) -> impl IntoElement {
         let branch = self.branch.clone();
         let remote = if self.remote.is_empty() {
@@ -1153,15 +1468,13 @@ impl PushDialog {
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let force_locked = self.force_locked_reason.clone();
-        let force_lease_state = if matches!(self.force_mode, ForceMode::WithLease) {
-            ToggleState::Selected
-        } else {
+        // Any force posture is `--force-with-lease` here: the dialog no
+        // longer offers a bare `--force`, and `run_push_cli` upgrades the
+        // legacy variant to the leased form.
+        let force_lease_state = if matches!(self.force_mode, ForceMode::None) {
             ToggleState::Unselected
-        };
-        let force_state = if matches!(self.force_mode, ForceMode::Force) {
-            ToggleState::Selected
         } else {
-            ToggleState::Unselected
+            ToggleState::Selected
         };
         let tags_state = if self.push_tags {
             ToggleState::Selected
@@ -1178,29 +1491,25 @@ impl PushDialog {
             .label("force-with-lease")
             .disabled(force_locked.is_some())
             .on_click(cx.listener(|this, _, _, cx| this.toggle_force_with_lease(cx)));
-        let force_lease_box = if let Some(reason) = force_locked.clone() {
-            force_lease_box.tooltip(Tooltip::text(reason))
-        } else {
-            force_lease_box
-        };
-
-        let force_box = Checkbox::new("push-dialog-force", force_state)
-            .label("force")
-            .disabled(force_locked.is_some())
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_force(cx)));
-        let force_box = if let Some(reason) = force_locked {
-            force_box.tooltip(Tooltip::text(reason))
-        } else {
-            force_box.tooltip(Tooltip::text(SharedString::from(
-                "Plain --force overwrites without atomic check.",
-            )))
+        // The toggle stays live even when the push will end up refused:
+        // the only pre-press evidence available is `preview.behind`,
+        // which is `--no-merges`-filtered and goes stale on a failed
+        // refresh, so disabling on it would silently block a legitimate
+        // force-push (a remote ahead only by a merge commit). The refusal
+        // belongs at the press boundary, where the state is read fresh —
+        // the tooltip is what makes that discoverable beforehand.
+        let force_lease_box = match force_locked {
+            Some(reason) => force_lease_box.tooltip(Tooltip::text(reason)),
+            None => force_lease_box.tooltip(Tooltip::text(SharedString::from(
+                "Checked against the remote when you press Push, and refused unless the \
+                 remote really holds commits this branch does not.",
+            ))),
         };
 
         let mut footer = v_flex().gap_2().child(
             h_flex()
                 .gap_3()
                 .child(force_lease_box)
-                .child(force_box)
                 .child(
                     Checkbox::new("push-dialog-tags", tags_state)
                         .label("tags")
@@ -1237,6 +1546,10 @@ impl PushDialog {
             );
         }
         let pushing = self.pushing;
+        // Pressing again while the branch-protection prompt is up would
+        // do nothing (`confirm_push` bails), but the button must not
+        // look live either — and it is not "Pushing…" yet.
+        let push_disabled = pushing || self.force_confirm.is_some();
         footer = footer.child(
             h_flex()
                 .gap_2()
@@ -1250,7 +1563,7 @@ impl PushDialog {
                         "push-dialog-push",
                         if pushing { "Pushing…" } else { "Push" },
                     )
-                    .disabled(pushing)
+                    .disabled(push_disabled)
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_push(window, cx))),
                 ),
         );
@@ -1359,13 +1672,16 @@ impl Render for RewordPromptModal {
 // =====================================================================
 
 fn check_branch_protection(work_dir: &Path, branch: &str, op_name: &str) -> Option<SharedString> {
-    // Real S-SOL-PRT lookup. Maps `Forbidden` to a locked-with-reason
-    // string the dialog renders next to the disabled force-push toggle.
-    // `RequiresConfirmation` does NOT lock the toggle here — confirming
-    // a force-push happens via the dialog's own "type the branch name"
-    // modal flow (deferred polish; the toggle is enabled and the actual
-    // push goes through the same handler-level check). `Allowed`
-    // returns `None`.
+    // Real S-SOL-PRT lookup, run once when the dialog opens. Maps
+    // `Forbidden` to a locked-with-reason string the dialog renders next
+    // to the disabled force-push toggle. `RequiresConfirmation` does NOT
+    // lock the toggle: that tier is answered at the press boundary in
+    // `confirm_push`, which re-runs the check and puts up a
+    // `PromptLevel::Critical` confirmation naming the branch, the remote
+    // and the exact git command (see `force_push_gate`). Deciding it
+    // here instead would ask before the user has committed to pushing,
+    // and would go stale the moment the policy changed while the dialog
+    // sat open. `Allowed` returns `None`.
     match solutions::branch_protection::check(work_dir, branch, op_name) {
         solutions::branch_protection::Decision::Forbidden { reason } => {
             Some(SharedString::from(reason))
@@ -1373,6 +1689,312 @@ fn check_branch_protection(work_dir: &Path, branch: &str, op_name: &str) -> Opti
         solutions::branch_protection::Decision::RequiresConfirmation { .. }
         | solutions::branch_protection::Decision::Allowed => None,
     }
+}
+
+/// What the S-SOL-PRT policy says about the force-push the user just
+/// pressed Push on. Kept as a pure function over the [`Decision`] so the
+/// tier→UI mapping is testable: the live policy snapshot lives in a
+/// process-global cache owned by `solutions` that a `git_ui` test can
+/// neither install nor isolate from its neighbours.
+///
+/// [`Decision`]: solutions::branch_protection::Decision
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForcePushGate {
+    /// Nothing to add — run the push.
+    Proceed,
+    /// `Forbidden`: lock the force toggle with this reason, push nothing.
+    Locked { reason: SharedString },
+    /// `RequiresConfirmation`: ask first, push only if the user agrees.
+    Confirm {
+        title: String,
+        detail: String,
+        confirm_label: String,
+    },
+}
+
+/// The half of a policy reason that is safe to show in a two-button
+/// prompt. `solutions::branch_protection` writes its
+/// `RequiresConfirmation` reasons for the MCP `confirmed: true` payload
+/// flow, and ends the protected-branch ones with "confirm … by typing
+/// the branch name" — an instruction for a type-the-name modal this fork
+/// deliberately does not have. Keep the diagnosis, drop the stale
+/// instruction; anything else is passed through whole.
+fn policy_reason_headline(reason: &str) -> &str {
+    match reason.split_once(" — ") {
+        Some((head, tail)) if tail.contains("typing the branch name") => head.trim_end(),
+        _ => reason,
+    }
+}
+
+fn force_push_gate(
+    decision: &solutions::branch_protection::Decision,
+    force_mode: ForceMode,
+    branch: &str,
+    remote: &str,
+    remote_branch: &str,
+) -> ForcePushGate {
+    use solutions::branch_protection::Decision;
+
+    let force_flag = match force_mode {
+        // Not a force push, so this gate has no say: a plain push is
+        // `Allowed` by policy and must stay friction-free.
+        ForceMode::None => return ForcePushGate::Proceed,
+        // Both force postures run the leased form now — see `run_push_cli`.
+        ForceMode::WithLease | ForceMode::Force => "--force-with-lease",
+    };
+    let reason = match decision {
+        Decision::Allowed => return ForcePushGate::Proceed,
+        Decision::Forbidden { reason } => {
+            return ForcePushGate::Locked {
+                reason: SharedString::from(reason.clone()),
+            };
+        }
+        Decision::RequiresConfirmation { reason } => policy_reason_headline(reason),
+    };
+    ForcePushGate::Confirm {
+        title: format!("Force-push “{branch}” to “{remote}”?"),
+        detail: format!(
+            "Branch protection: {reason}. Runs git push {force_flag} {remote} \
+             {branch}:{remote_branch}, which overwrites {remote}/{remote_branch} with your \
+             local history for everyone using this remote; commits that exist only there \
+             cannot be restored from here."
+        ),
+        confirm_label: format!("Force-push to {remote}"),
+    }
+}
+
+/// Seconds the confirmation's destructive button stays dead after it
+/// appears. The dialog's Push button sits where this one does, so
+/// without the delay a double-click on Push lands the second press on
+/// "Force-push" — the exact accident the confirmation exists to stop.
+const FORCE_PUSH_CONFIRM_DELAY_SECS: u8 = 5;
+
+/// Rows rendered before the list is elided. A force-push that drops
+/// hundreds of server-side commits is answered by the count, not by
+/// scrolling all of them.
+const MAX_OVERWRITTEN_ROWS: usize = 25;
+
+/// Live state of the force-push confirmation. Owns its countdown and its
+/// git query, so dropping it (Cancel / Escape) cancels both.
+struct ForcePushConfirm {
+    title: SharedString,
+    detail: SharedString,
+    confirm_label: SharedString,
+    /// The gated push target, captured at the press boundary so what
+    /// finally runs is what the user was shown — not whatever the
+    /// remote-branch editor says by the time they answer.
+    work_dir: PathBuf,
+    branch: String,
+    remote: String,
+    remote_branch: String,
+    state: ForcePushConfirmState,
+    _load: Task<()>,
+}
+
+/// Where a confirmation is in its life: reading the remote, offering the
+/// push, or refusing it outright.
+enum ForcePushConfirmState {
+    /// Reading what `<remote>/<remote_branch>` holds. No confirm control
+    /// exists yet and no countdown runs — there is nothing to count down
+    /// to until we know whether the push is offerable at all.
+    Pending,
+    /// The remote holds work this branch does not: the only state in
+    /// which force-pushing means anything, and so the only one with a
+    /// countdown and a confirm button.
+    Offered {
+        commits: Vec<MiniCommit>,
+        /// Seconds left before the confirm button arms.
+        countdown: u8,
+        _countdown: Task<()>,
+    },
+    /// Refused. The confirm control is not merely disabled, it is absent.
+    Refused(ForcePushRefusal),
+}
+
+/// Why a force push was refused outright. Both cases are decided from
+/// the overwrite list read at the press boundary, so neither can be
+/// slipped past by a dialog that has sat open while the world moved.
+enum ForcePushRefusal {
+    /// The remote holds nothing this branch is missing. Forcing would do
+    /// exactly what an ordinary push does, so the flag can only matter
+    /// if this reading is wrong — i.e. it can only do harm.
+    NothingToOverwrite,
+    /// What the server holds could not be read. Refusing beats warning:
+    /// a confirmation the user cannot make an informed answer to is not
+    /// a safeguard, it is a rubber stamp.
+    Undeterminable { why: SharedString },
+}
+
+impl ForcePushConfirm {
+    /// The destructive button arms only in [`ForcePushConfirmState::Offered`],
+    /// and only once the reflex-click window has passed.
+    fn is_armed(&self) -> bool {
+        matches!(
+            self.state,
+            ForcePushConfirmState::Offered { countdown: 0, .. }
+        )
+    }
+}
+
+/// The two lines a refusal shows: what is wrong, and what to do instead.
+/// Split out of the render so the wording is unit-testable and so the
+/// two cases cannot drift into saying the same thing.
+fn refusal_lines(
+    refusal: &ForcePushRefusal,
+    branch: &str,
+    tracking: &str,
+    remote: &str,
+) -> (String, String) {
+    match refusal {
+        ForcePushRefusal::NothingToOverwrite => (
+            format!("Nothing on {tracking} to overwrite — a force push here is pointless."),
+            format!(
+                "“{branch}” already contains everything {tracking} holds, so forcing can only \
+                 differ from an ordinary push if this reading is wrong. Turn force-with-lease \
+                 off and press Push; if nothing is ahead either, there is nothing to push."
+            ),
+        ),
+        ForcePushRefusal::Undeterminable { why } => (
+            format!("Cannot tell what {tracking} would lose: {why}."),
+            format!(
+                "Refusing to force-push blind — this dialog will not overwrite history it \
+                 could not read. Fetch {remote}, then press Push again."
+            ),
+        ),
+    }
+}
+
+/// What `<remote>/<remote_branch>` holds that the local branch does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OverwrittenCommits {
+    /// Read successfully. Empty means the remote-tracking ref holds
+    /// nothing the local branch is missing, as of the last fetch.
+    Known(Vec<MiniCommit>),
+    /// Could not be determined. Refused rather than warned about: an
+    /// empty list would read as "nothing will be lost", and a warning the
+    /// user cannot check is not a safeguard.
+    Unknown { why: SharedString },
+}
+
+/// The commits a force-push would drop on the server: reachable from
+/// `<remote>/<remote_branch>` but not from `branch`.
+///
+/// Deliberately re-derived instead of read off [`PushPreview::behind`]:
+/// the preview's ranges are built with `--no-merges` (right for "what am
+/// I about to send", wrong for "what am I about to destroy" — a merge
+/// commit lost is still work lost), and a preview refresh that failed
+/// leaves the previous, possibly empty, vec in place.
+async fn overwritten_commits(
+    work_dir: &Path,
+    branch: &str,
+    remote: &str,
+    remote_branch: &str,
+) -> OverwrittenCommits {
+    let tracking = format!("{remote}/{remote_branch}");
+    // No tracking ref is ambiguous — a brand-new remote branch looks
+    // exactly like one this clone has never fetched — so it counts as
+    // undeterminable, not as "nothing there". `--force-with-lease`
+    // refuses on the same evidence.
+    if let Err(err) = run_git_void(work_dir, &["rev-parse", "--verify", "--quiet", &tracking]).await
+    {
+        log::info!("PushDialog: no {tracking} ref to compare against: {err:#}");
+        return OverwrittenCommits::Unknown {
+            why: SharedString::from(format!(
+                "this clone has no {tracking} ref, so what the server holds cannot be read \
+                 from here — fetch {remote} first"
+            )),
+        };
+    }
+    match list_commits_in_range(work_dir, &format!("{branch}..{tracking}"), false).await {
+        Ok(commits) => OverwrittenCommits::Known(commits),
+        Err(err) => {
+            log::warn!("PushDialog: listing {branch}..{tracking} failed: {err:#}");
+            OverwrittenCommits::Unknown {
+                why: SharedString::from(format!("git log {branch}..{tracking} failed: {err:#}")),
+            }
+        }
+    }
+}
+
+/// One overwritten-commit row. Same shape as the dialog's own commit
+/// rows (`mini_graph::render_row`) — subject on top, metadata muted
+/// underneath — plus the author, since "who loses this work" is the
+/// question this list exists to answer.
+fn render_overwritten_row(ix: usize, commit: &MiniCommit) -> AnyElement {
+    v_flex()
+        .id(SharedString::from(format!(
+            "push-dialog-overwritten-row-{ix}"
+        )))
+        .px_2()
+        .py_1()
+        .gap_0p5()
+        .child(
+            Label::new(commit.subject.clone())
+                .size(LabelSize::Small)
+                .truncate(),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Label::new(commit.short_sha())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(crate::mini_graph::format_relative(
+                        commit.committer_date_unix,
+                    ))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(
+                    Label::new(commit.author_email.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The repository's configured remote names, newest-git-first order
+/// preserved. An empty vec means `git remote` itself failed — callers
+/// must not read that as "this repository has no remotes".
+async fn configured_remotes(work_dir: &Path) -> Vec<SharedString> {
+    run_git(work_dir, &["remote"])
+        .await
+        .map(|output| {
+            output
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| SharedString::from(name.to_string()))
+                .collect()
+        })
+        .unwrap_or_else(|error| {
+            log::warn!("push preview: `git remote` failed, falling back to a first-slash split of the upstream: {error:#}");
+            Vec::new()
+        })
+}
+
+/// Split `<branch>@{upstream}` output into `(remote, remote branch)`.
+///
+/// A remote name may contain a `/` (`git remote add team/fork …` is
+/// legal), so the boundary is resolved against the configured remotes by
+/// [`split_remote_ref`] — the crate's one rule for this. The first-slash
+/// split is kept **only** for the case where the remote list could not
+/// be read at all: it is a guess, but it is a strictly better guess than
+/// giving up on the upstream entirely.
+fn split_upstream(upstream: &str, configured_remotes: &[SharedString]) -> Option<(String, String)> {
+    if let Some((remote, remote_branch)) = split_remote_ref(upstream, configured_remotes) {
+        return Some((remote.to_string(), remote_branch.to_string()));
+    }
+    if !configured_remotes.is_empty() {
+        return None;
+    }
+    upstream
+        .split_once('/')
+        .map(|(remote, remote_branch)| (remote.to_string(), remote_branch.to_string()))
 }
 
 /// Build a `PushPreview` for the given branch by invoking git directly.
@@ -1397,12 +2019,13 @@ pub async fn build_preview(
     .ok()
     .map(|s| s.trim().to_string());
 
+    let configured_remotes = configured_remotes(work_dir).await;
+
     let (remote, remote_branch_default, will_create) = match upstream {
         Some(upstream_str) if !upstream_str.is_empty() => {
-            if let Some((remote, rb)) = upstream_str.split_once('/') {
-                (remote.to_string(), rb.to_string(), false)
-            } else {
-                ("origin".into(), branch.to_string(), false)
+            match split_upstream(&upstream_str, &configured_remotes) {
+                Some((remote, rb)) => (remote, rb, false),
+                None => ("origin".into(), branch.to_string(), false),
             }
         }
         _ => ("origin".into(), branch.to_string(), true),
@@ -1442,16 +2065,25 @@ pub async fn build_preview(
 }
 
 async fn list_commits(work_dir: &Path, range: &str) -> Result<Vec<MiniCommit>> {
-    let raw = run_git(
-        work_dir,
-        &[
-            "log",
-            "--no-merges",
-            "--pretty=format:%H%x09%s%x09%ae%x09%ct",
-            range,
-        ],
-    )
-    .await?;
+    list_commits_in_range(work_dir, range, true).await
+}
+
+/// `git log <range>` as [`MiniCommit`]s. `skip_merges` is what the push
+/// preview wants ("what am I about to send") but never what the
+/// force-push confirmation wants ("what am I about to destroy") — a
+/// merge commit that only exists on the server is still work lost.
+async fn list_commits_in_range(
+    work_dir: &Path,
+    range: &str,
+    skip_merges: bool,
+) -> Result<Vec<MiniCommit>> {
+    let mut args = vec!["log"];
+    if skip_merges {
+        args.push("--no-merges");
+    }
+    args.push("--pretty=format:%H%x09%s%x09%ae%x09%ct");
+    args.push(range);
+    let raw = run_git(work_dir, &args).await?;
     let mut out = Vec::new();
     for line in raw.lines() {
         let mut cols = line.splitn(4, '\t');
@@ -1551,8 +2183,13 @@ async fn run_push_cli(
     }
     match opts.force_mode {
         ForceMode::None => {}
-        ForceMode::WithLease => args.push("--force-with-lease".into()),
-        ForceMode::Force => args.push("--force".into()),
+        // A bare `--force` is not offered here any more, and the legacy
+        // variant is upgraded rather than rejected: `--force-with-lease`
+        // does everything `--force` does *except* silently overwrite a
+        // remote that moved since the last fetch, which is the only
+        // difference and the whole accident. A caller that hits the
+        // lease's "stale info" refusal has lost nothing and can fetch.
+        ForceMode::WithLease | ForceMode::Force => args.push("--force-with-lease".into()),
     }
     args.push(remote.into());
     args.push(format!("{branch}:{remote_branch}"));
@@ -1619,7 +2256,8 @@ pub async fn run_force_with_lease(
 }
 
 /// Invocation used by `editor.git.push` and `editor.git.push_force` —
-/// just plain `git push` with the named flags. `force` adds `--force`.
+/// just plain `git push` with the named flags. `force` adds
+/// `--force-with-lease`, never a bare `--force`.
 pub async fn run_plain_push(
     work_dir: &Path,
     branch: &str,
@@ -1641,7 +2279,11 @@ pub async fn run_plain_push(
         args.push("--set-upstream".into());
     }
     if force {
-        args.push("--force".into());
+        // Upgraded, not honoured verbatim: see `run_push_cli`. The wire
+        // tool that sets this flag (`editor.git.push_force`) documents
+        // the upgrade, so a subagent can't reintroduce the bare flag by
+        // going around the dialog.
+        args.push("--force-with-lease".into());
     }
     args.push(remote.into());
     args.push(format!("{branch}:{remote_branch}"));
@@ -1697,7 +2339,13 @@ async fn run_git_void(work_dir: &Path, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::SettingsStore;
     use tempfile::TempDir;
+    use util::path;
+    use workspace::MultiWorkspace;
 
     /// Boots a tiny temp repo with a remote so the preview-builder has
     /// real `<remote>..<branch>` ranges to count.
@@ -1726,6 +2374,98 @@ mod tests {
         .await?;
         run_git_void(&local, &["push", "-u", "origin", "main"]).await?;
         Ok((tmp, local, remote))
+    }
+
+    /// Same shape as [`boot_repo`], but the remote is named
+    /// `team/fork` — legal in git, and exactly the case a first-slash
+    /// split gets wrong (it would name a remote called `team`).
+    async fn boot_repo_with_slashed_remote() -> Result<(TempDir, PathBuf)> {
+        let tmp = TempDir::new()?;
+        let local = tmp.path().join("local");
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&local)?;
+        std::fs::create_dir_all(&remote)?;
+        run_git_void(&remote, &["init", "--bare", "-b", "main"]).await?;
+        run_git_void(&local, &["init", "-b", "main"]).await?;
+        run_git_void(&local, &["config", "user.email", "test@example.com"]).await?;
+        run_git_void(&local, &["config", "user.name", "Test"]).await?;
+        std::fs::write(local.join("README"), "hello")?;
+        run_git_void(&local, &["add", "README"]).await?;
+        run_git_void(&local, &["commit", "-m", "init"]).await?;
+        run_git_void(
+            &local,
+            &[
+                "remote",
+                "add",
+                "team/fork",
+                remote.to_str().unwrap_or_default(),
+            ],
+        )
+        .await?;
+        run_git_void(&local, &["push", "-u", "team/fork", "main"]).await?;
+        Ok((tmp, local))
+    }
+
+    #[gpui::test]
+    async fn preview_resolves_a_slash_bearing_remote(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (_tmp, local) = boot_repo_with_slashed_remote()
+            .await
+            .unwrap_or_else(|e| panic!("boot: {e}"));
+
+        let preview = build_preview(&local, "main", "")
+            .await
+            .unwrap_or_else(|e| panic!("preview: {e}"));
+
+        assert_eq!(
+            preview.remote, "team/fork",
+            "splitting the upstream on the first slash names a remote (“team”) that does not exist"
+        );
+        assert_eq!(preview.remote_branch, "main");
+        assert!(!preview.will_create_remote_branch);
+        assert_eq!(preview.ahead.len(), 0);
+        assert_eq!(preview.behind.len(), 0);
+    }
+
+    fn remote_names(names: &[&str]) -> Vec<SharedString> {
+        names
+            .iter()
+            .map(|name| SharedString::from(name.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn split_upstream_resolves_against_the_configured_remotes() {
+        assert_eq!(
+            split_upstream("team/fork/main", &remote_names(&["origin", "team/fork"])),
+            Some(("team/fork".to_string(), "main".to_string()))
+        );
+        assert_eq!(
+            split_upstream("origin/feature/FOO-1", &remote_names(&["origin"])),
+            Some(("origin".to_string(), "feature/FOO-1".to_string()))
+        );
+    }
+
+    /// An upstream no configured remote claims is not silently split at
+    /// the first slash — that is how a preview ends up comparing against
+    /// a ref that cannot exist.
+    #[test]
+    fn split_upstream_refuses_an_unclaimed_upstream() {
+        assert_eq!(
+            split_upstream("team/fork/main", &remote_names(&["origin"])),
+            None
+        );
+    }
+
+    /// The one case the first-slash guess survives: `git remote` itself
+    /// failed, so there is no list to match against and a guess beats
+    /// discarding the upstream.
+    #[test]
+    fn split_upstream_falls_back_to_the_first_slash_without_a_remote_list() {
+        assert_eq!(
+            split_upstream("origin/main", &[]),
+            Some(("origin".to_string(), "main".to_string()))
+        );
     }
 
     #[gpui::test]
@@ -2049,5 +2789,723 @@ mod tests {
             .expect("log origin/main");
         assert!(log.contains("local commit"), "log was: {log}");
         assert!(!log.contains("from other"), "log was: {log}");
+    }
+
+    // =================================================================
+    //  S-SOL-PRT — the force-push confirmation.
+    // =================================================================
+
+    fn requires_confirmation(reason: &str) -> solutions::branch_protection::Decision {
+        solutions::branch_protection::Decision::RequiresConfirmation {
+            reason: reason.to_string(),
+        }
+    }
+
+    /// A plain push is `Allowed` by policy and must stay friction-free —
+    /// the gate has nothing to say about it even when the branch is one
+    /// the policy guards.
+    #[test]
+    fn a_plain_push_is_never_gated() {
+        assert_eq!(
+            force_push_gate(
+                &requires_confirmation(
+                    "'main' is protected — confirm force-push by typing the branch name"
+                ),
+                ForceMode::None,
+                "main",
+                "origin",
+                "main",
+            ),
+            ForcePushGate::Proceed
+        );
+    }
+
+    #[test]
+    fn an_allowed_force_push_is_never_gated() {
+        assert_eq!(
+            force_push_gate(
+                &solutions::branch_protection::Decision::Allowed,
+                ForceMode::WithLease,
+                "main",
+                "origin",
+                "main",
+            ),
+            ForcePushGate::Proceed
+        );
+    }
+
+    /// `Forbidden` keeps doing exactly what it did before the
+    /// confirmation existed: lock the toggle with the policy's reason and
+    /// push nothing. It must never be downgraded into a question.
+    #[test]
+    fn a_forbidden_force_push_locks_instead_of_asking() {
+        let gate = force_push_gate(
+            &solutions::branch_protection::Decision::Forbidden {
+                reason: "force-push to protected branch 'main' is forbidden".to_string(),
+            },
+            ForceMode::WithLease,
+            "main",
+            "origin",
+            "main",
+        );
+        assert_eq!(
+            gate,
+            ForcePushGate::Locked {
+                reason: SharedString::from("force-push to protected branch 'main' is forbidden"),
+            }
+        );
+    }
+
+    #[test]
+    fn a_confirmable_force_push_names_the_branch_remote_and_command() {
+        let gate = force_push_gate(
+            &requires_confirmation("force-push to 'wip' rewrites remote history"),
+            ForceMode::WithLease,
+            "wip",
+            "origin",
+            "wip-remote",
+        );
+        let ForcePushGate::Confirm {
+            title,
+            detail,
+            confirm_label,
+        } = gate
+        else {
+            panic!("the middle tier must ask, got: {gate:?}");
+        };
+        assert_eq!(title, "Force-push “wip” to “origin”?");
+        assert_eq!(confirm_label, "Force-push to origin");
+        assert!(
+            detail.contains("git push --force-with-lease origin wip:wip-remote"),
+            "the confirmation must name the exact command, got: {detail}"
+        );
+        assert!(
+            detail.contains("force-push to 'wip' rewrites remote history"),
+            "the policy's own reason must survive into the prompt, got: {detail}"
+        );
+    }
+
+    /// The legacy bare-`--force` posture is upgraded, so it must never
+    /// advertise a flag the runner will not use.
+    #[test]
+    fn a_legacy_force_posture_is_described_as_leased() {
+        let gate = force_push_gate(
+            &requires_confirmation("force-push to 'wip' rewrites remote history"),
+            ForceMode::Force,
+            "wip",
+            "origin",
+            "wip",
+        );
+        let ForcePushGate::Confirm { detail, .. } = gate else {
+            panic!("the middle tier must ask, got: {gate:?}");
+        };
+        assert!(detail.contains("--force-with-lease"), "got: {detail}");
+        assert!(
+            !detail.contains("git push --force "),
+            "a bare --force must not be advertised: {detail}"
+        );
+    }
+
+    /// The policy writes its reasons for the MCP `confirmed: true` flow
+    /// and ends the protected-branch ones with an instruction for a
+    /// type-the-name modal this fork does not have. Showing that verbatim
+    /// next to two buttons would tell the user to do something
+    /// impossible.
+    #[test]
+    fn the_confirmation_drops_the_type_the_name_instruction() {
+        assert_eq!(
+            policy_reason_headline(
+                "'main' is protected — confirm force-push by typing the branch name"
+            ),
+            "'main' is protected"
+        );
+        assert_eq!(
+            policy_reason_headline("force-push to 'wip' rewrites remote history"),
+            "force-push to 'wip' rewrites remote history"
+        );
+        assert_eq!(
+            policy_reason_headline("'main' is protected — ask the release owner"),
+            "'main' is protected — ask the release owner",
+            "an unrecognised tail is information, not boilerplate: keep it"
+        );
+    }
+
+    fn confirm_with(state: ForcePushConfirmState) -> ForcePushConfirm {
+        ForcePushConfirm {
+            title: "Force-push “main” to “origin”?".into(),
+            detail: "".into(),
+            confirm_label: "Force-push to origin".into(),
+            work_dir: PathBuf::from("/dir"),
+            branch: "main".into(),
+            remote: "origin".into(),
+            remote_branch: "main".into(),
+            state,
+            _load: Task::ready(()),
+        }
+    }
+
+    fn offered(countdown: u8) -> ForcePushConfirmState {
+        ForcePushConfirmState::Offered {
+            commits: vec![MiniCommit {
+                sha: "deadbeefcafe".into(),
+                subject: "server work".into(),
+                author_email: "them@example.com".into(),
+                committer_date_unix: 1_700_000_000,
+            }],
+            countdown,
+            _countdown: Task::ready(()),
+        }
+    }
+
+    /// Updated from the earlier version of this test, which let an
+    /// undeterminable list arm the button once the countdown ran out.
+    /// Neither refusal state is armable at all now.
+    #[test]
+    fn the_confirm_control_arms_only_for_an_offered_push() {
+        assert!(
+            !confirm_with(offered(1)).is_armed(),
+            "the reflex-click window must gate the button"
+        );
+        assert!(confirm_with(offered(0)).is_armed());
+        assert!(
+            !confirm_with(ForcePushConfirmState::Pending).is_armed(),
+            "confirming before the overwrite list resolves is confirming blind"
+        );
+        assert!(
+            !confirm_with(ForcePushConfirmState::Refused(
+                ForcePushRefusal::NothingToOverwrite
+            ))
+            .is_armed(),
+            "a force push that overwrites nothing must be unreachable, not merely slow"
+        );
+        assert!(
+            !confirm_with(ForcePushConfirmState::Refused(
+                ForcePushRefusal::Undeterminable {
+                    why: "no tracking ref".into()
+                }
+            ))
+            .is_armed(),
+            "a force push we cannot describe must be unreachable, not merely warned about"
+        );
+    }
+
+    /// The two refusals must not read alike: one says "you do not need
+    /// this", the other says "we could not look".
+    #[test]
+    fn the_two_refusals_say_different_things() {
+        let (pointless_head, pointless_advice) = refusal_lines(
+            &ForcePushRefusal::NothingToOverwrite,
+            "main",
+            "origin/main",
+            "origin",
+        );
+        assert!(
+            pointless_head.contains("origin/main") && pointless_head.contains("pointless"),
+            "got: {pointless_head}"
+        );
+        assert!(
+            pointless_advice.contains("force-with-lease") && pointless_advice.contains("Push"),
+            "the empty case must point at the ordinary push: {pointless_advice}"
+        );
+        assert!(
+            pointless_advice.contains("nothing to push"),
+            "and at the case where there is nothing to send at all: {pointless_advice}"
+        );
+
+        let (blind_head, blind_advice) = refusal_lines(
+            &ForcePushRefusal::Undeterminable {
+                why: "this clone has no origin/main ref".into(),
+            },
+            "main",
+            "origin/main",
+            "origin",
+        );
+        assert!(
+            blind_head.contains("Cannot tell") && blind_head.contains("no origin/main ref"),
+            "got: {blind_head}"
+        );
+        assert!(
+            blind_advice.contains("Fetch origin"),
+            "the unknown case must send the user to fetch: {blind_advice}"
+        );
+        assert_ne!(pointless_head, blind_head);
+        assert_ne!(pointless_advice, blind_advice);
+    }
+
+    fn init_ui_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+    }
+
+    /// A dialog on a fake project, built field-by-field rather than
+    /// through [`PushDialog::open`]: the press boundary is what is under
+    /// test, and `open`'s async preview refresh would drag a real `git`
+    /// invocation into every assertion.
+    async fn init_push_dialog(
+        force_mode: ForceMode,
+        cx: &mut TestAppContext,
+    ) -> (Entity<PushDialog>, VisualTestContext) {
+        init_ui_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                ".git": {},
+                "file.txt": "hello".to_string()
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .expect("fake project should expose a repository");
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace should exist");
+
+        let dialog = window_handle
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    let editor = cx.new(|cx| {
+                        let mut editor = Editor::single_line(window, cx);
+                        editor.set_text("main", window, cx);
+                        editor
+                    });
+                    PushDialog {
+                        workspace: workspace.downgrade(),
+                        repository: repository.clone(),
+                        work_dir: PathBuf::from(path!("/dir")),
+                        branch: "main".into(),
+                        remote: "origin".into(),
+                        remote_branch_editor: editor,
+                        preview: PushPreview::default(),
+                        selected_commit: None,
+                        selected_files: Vec::new(),
+                        force_mode,
+                        push_tags: false,
+                        no_verify: false,
+                        pull_rebase_first: false,
+                        force_locked_reason: None,
+                        force_confirm: None,
+                        pushing: false,
+                        refreshing: false,
+                        failure: None,
+                        notice: None,
+                        remediation: None,
+                        focus_handle: cx.focus_handle(),
+                    }
+                })
+            })
+            .expect("window should be open");
+
+        (
+            dialog,
+            VisualTestContext::from_window(window_handle.into(), cx),
+        )
+    }
+
+    #[gpui::test]
+    async fn pressing_push_on_a_force_push_opens_the_confirmation(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dialog, mut cx) = init_push_dialog(ForceMode::WithLease, cx).await;
+
+        dialog.update_in(&mut cx, |dialog, window, cx| {
+            dialog.confirm_push(window, cx)
+        });
+
+        dialog.update(&mut cx, |dialog, _| {
+            let confirm = dialog
+                .force_confirm
+                .as_ref()
+                .expect("a force push must be confirmed before it runs");
+            assert!(
+                confirm.title.contains("main") && confirm.title.contains("origin"),
+                "the confirmation must name the branch and the remote, got: {}",
+                confirm.title
+            );
+            assert!(
+                confirm
+                    .detail
+                    .contains("git push --force-with-lease origin main:main"),
+                "got: {}",
+                confirm.detail
+            );
+            assert!(
+                !dialog.pushing,
+                "nothing may be pushed until the user answers"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_plain_push_opens_no_confirmation(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dialog, mut cx) = init_push_dialog(ForceMode::None, cx).await;
+
+        dialog.update_in(&mut cx, |dialog, window, cx| {
+            dialog.confirm_push(window, cx)
+        });
+
+        dialog.update(&mut cx, |dialog, _| {
+            assert!(
+                dialog.force_confirm.is_none(),
+                "a plain push must stay friction-free"
+            );
+            assert!(dialog.pushing, "it should have gone straight to the push");
+        });
+    }
+
+    #[gpui::test]
+    async fn cancelling_the_confirmation_aborts_the_push(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dialog, mut cx) = init_push_dialog(ForceMode::WithLease, cx).await;
+
+        dialog.update_in(&mut cx, |dialog, window, cx| {
+            dialog.confirm_push(window, cx)
+        });
+        dialog.update_in(&mut cx, |dialog, window, cx| {
+            // Escape, the same path the Cancel button takes.
+            dialog.cancel(&Cancel, window, cx)
+        });
+
+        dialog.update(&mut cx, |dialog, _| {
+            assert!(dialog.force_confirm.is_none(), "the confirmation is gone");
+            assert!(!dialog.pushing, "cancelling must not push");
+        });
+        cx.run_until_parked();
+        dialog.update(&mut cx, |dialog, _| {
+            assert!(
+                !dialog.pushing,
+                "and it must not push once the timers drain either"
+            );
+        });
+    }
+
+    fn server_commit(subject: &str) -> MiniCommit {
+        MiniCommit {
+            sha: "0badc0ffee11".into(),
+            subject: subject.into(),
+            author_email: "them@example.com".into(),
+            committer_date_unix: 1_700_000_000,
+        }
+    }
+
+    /// The confirm control sits where the Push button was, so a
+    /// double-click on Push would otherwise land its second press on the
+    /// force-push. The countdown is the guard.
+    ///
+    /// Drives the overwrite list in by hand rather than waiting on the
+    /// real `git` read `open_force_push_confirm` starts: this is the
+    /// state machine's test, and `resolve_overwritten` is the same entry
+    /// point the load task uses.
+    #[gpui::test]
+    async fn the_confirm_control_stays_dead_for_the_countdown(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dialog, mut cx) = init_push_dialog(ForceMode::WithLease, cx).await;
+
+        dialog.update_in(&mut cx, |dialog, window, cx| {
+            dialog.confirm_push(window, cx)
+        });
+        dialog.update(&mut cx, |dialog, _| {
+            let confirm = dialog.force_confirm.as_ref().expect("confirmation is up");
+            assert!(
+                matches!(confirm.state, ForcePushConfirmState::Pending),
+                "it must not offer anything before it knows what is at stake"
+            );
+            assert!(!confirm.is_armed());
+        });
+
+        dialog.update(&mut cx, |dialog, cx| {
+            dialog.resolve_overwritten(
+                OverwrittenCommits::Known(vec![server_commit("server work")]),
+                cx,
+            )
+        });
+        dialog.update(&mut cx, |dialog, _| {
+            let confirm = dialog.force_confirm.as_ref().expect("confirmation is up");
+            let ForcePushConfirmState::Offered { countdown, .. } = confirm.state else {
+                panic!("a non-empty overwrite list must offer the push");
+            };
+            assert_eq!(countdown, FORCE_PUSH_CONFIRM_DELAY_SECS);
+            assert!(!confirm.is_armed(), "it must not arm on arrival");
+        });
+
+        // The reflex click.
+        dialog.update(&mut cx, |dialog, cx| dialog.confirm_force_push(cx));
+        dialog.update(&mut cx, |dialog, _| {
+            assert!(
+                dialog.force_confirm.is_some(),
+                "an early press must not dismiss the confirmation"
+            );
+            assert!(!dialog.pushing, "and it must not start the push");
+        });
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        dialog.update(&mut cx, |dialog, _| {
+            assert_eq!(
+                dialog.force_confirm.as_ref().and_then(|c| match c.state {
+                    ForcePushConfirmState::Offered { countdown, .. } => Some(countdown),
+                    _ => None,
+                }),
+                Some(FORCE_PUSH_CONFIRM_DELAY_SECS - 1),
+                "the countdown must tick on the executor clock"
+            );
+        });
+
+        cx.executor()
+            .advance_clock(Duration::from_secs(FORCE_PUSH_CONFIRM_DELAY_SECS as u64));
+        cx.run_until_parked();
+        dialog.update(&mut cx, |dialog, _| {
+            let confirm = dialog.force_confirm.as_ref().expect("still up");
+            assert!(confirm.is_armed(), "the wait must end and the button arm");
+        });
+    }
+
+    /// Nothing on the remote to overwrite: the force push is pointless,
+    /// so it is refused outright rather than offered after a wait.
+    #[gpui::test]
+    async fn an_empty_overwrite_list_refuses_the_force_push(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dialog, mut cx) = init_push_dialog(ForceMode::WithLease, cx).await;
+
+        dialog.update_in(&mut cx, |dialog, window, cx| {
+            dialog.confirm_push(window, cx)
+        });
+        dialog.update(&mut cx, |dialog, cx| {
+            dialog.resolve_overwritten(OverwrittenCommits::Known(Vec::new()), cx)
+        });
+
+        dialog.update(&mut cx, |dialog, _| {
+            let confirm = dialog.force_confirm.as_ref().expect("confirmation is up");
+            assert!(
+                matches!(
+                    confirm.state,
+                    ForcePushConfirmState::Refused(ForcePushRefusal::NothingToOverwrite)
+                ),
+                "an empty overwrite list must refuse, not offer"
+            );
+            assert!(!confirm.is_armed());
+        });
+
+        // No countdown may be running: waiting cannot turn a refusal into
+        // an offer.
+        cx.executor().advance_clock(Duration::from_secs(
+            FORCE_PUSH_CONFIRM_DELAY_SECS as u64 * 4,
+        ));
+        cx.run_until_parked();
+        dialog.update(&mut cx, |dialog, cx| {
+            let confirm = dialog.force_confirm.as_ref().expect("still up");
+            assert!(!confirm.is_armed(), "no wait may arm a refusal");
+            dialog.confirm_force_push(cx);
+        });
+        dialog.update(&mut cx, |dialog, _| {
+            assert!(!dialog.pushing, "a refused force push must never run");
+            assert!(
+                dialog.force_confirm.is_some(),
+                "and must not silently close"
+            );
+        });
+    }
+
+    /// The list could not be read: refused outright — a confirmation the
+    /// user cannot answer informedly is not a safeguard.
+    #[gpui::test]
+    async fn an_undeterminable_overwrite_list_refuses_the_force_push(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dialog, mut cx) = init_push_dialog(ForceMode::WithLease, cx).await;
+
+        dialog.update_in(&mut cx, |dialog, window, cx| {
+            dialog.confirm_push(window, cx)
+        });
+        dialog.update(&mut cx, |dialog, cx| {
+            dialog.resolve_overwritten(
+                OverwrittenCommits::Unknown {
+                    why: "this clone has no origin/main ref".into(),
+                },
+                cx,
+            )
+        });
+
+        dialog.update(&mut cx, |dialog, _| {
+            let confirm = dialog.force_confirm.as_ref().expect("confirmation is up");
+            let ForcePushConfirmState::Refused(ForcePushRefusal::Undeterminable { why }) =
+                &confirm.state
+            else {
+                panic!("an unreadable overwrite list must refuse, not offer");
+            };
+            assert!(why.contains("origin/main"), "got: {why}");
+            assert!(!confirm.is_armed());
+        });
+
+        cx.executor().advance_clock(Duration::from_secs(
+            FORCE_PUSH_CONFIRM_DELAY_SECS as u64 * 4,
+        ));
+        cx.run_until_parked();
+        dialog.update(&mut cx, |dialog, cx| {
+            assert!(
+                !dialog.force_confirm.as_ref().expect("still up").is_armed(),
+                "no wait may arm a refusal"
+            );
+            dialog.confirm_force_push(cx);
+        });
+        dialog.update(&mut cx, |dialog, _| {
+            assert!(!dialog.pushing, "a blind force push must never run");
+        });
+    }
+
+    /// The list the confirmation shows is the server-side work a force
+    /// push drops — and unlike the dialog's ahead/behind preview it must
+    /// include merge commits, which `--no-merges` hides.
+    #[gpui::test]
+    async fn overwritten_commits_lists_server_side_work_including_merges(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (_tmp, local, remote) = boot_repo().await.unwrap_or_else(|e| panic!("boot: {e}"));
+        let other = local
+            .parent()
+            .expect("parent of local exists")
+            .join("other-merger");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        run_git_void(&other, &["clone", remote.to_str().unwrap_or_default(), "."])
+            .await
+            .expect("clone");
+        run_git_void(&other, &["config", "user.email", "test@example.com"])
+            .await
+            .expect("config email");
+        run_git_void(&other, &["config", "user.name", "Test"])
+            .await
+            .expect("config name");
+        run_git_void(&other, &["checkout", "-b", "side"])
+            .await
+            .expect("checkout side");
+        std::fs::write(other.join("side.txt"), "s").expect("write side");
+        run_git_void(&other, &["add", "side.txt"])
+            .await
+            .expect("add");
+        run_git_void(&other, &["commit", "-m", "side work"])
+            .await
+            .expect("commit side");
+        run_git_void(&other, &["checkout", "main"])
+            .await
+            .expect("checkout main");
+        run_git_void(&other, &["merge", "--no-ff", "side", "-m", "Merge side"])
+            .await
+            .expect("merge");
+        run_git_void(&other, &["push", "origin", "main"])
+            .await
+            .expect("push");
+
+        // Our own commit, so the local branch is not simply behind.
+        std::fs::write(local.join("local.txt"), "x").expect("write local");
+        run_git_void(&local, &["add", "local.txt"])
+            .await
+            .expect("add");
+        run_git_void(&local, &["commit", "-m", "local commit"])
+            .await
+            .expect("commit");
+        run_git_void(&local, &["fetch", "origin"])
+            .await
+            .expect("fetch");
+
+        let OverwrittenCommits::Known(commits) =
+            overwritten_commits(&local, "main", "origin", "main").await
+        else {
+            panic!("a readable tracking ref must produce a list");
+        };
+        let subjects: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
+        assert!(
+            subjects.contains(&"side work"),
+            "the commits only on the server must be listed, got: {subjects:?}"
+        );
+        assert!(
+            subjects.contains(&"Merge side"),
+            "a merge commit lost is still work lost, got: {subjects:?}"
+        );
+        assert!(
+            !subjects.contains(&"local commit"),
+            "our own commits are not what the push overwrites, got: {subjects:?}"
+        );
+        assert!(
+            commits.iter().all(|c| !c.author_email.is_empty()
+                && c.committer_date_unix > 0
+                && !c.subject.is_empty()),
+            "each row needs a subject, a date and an author: {commits:?}"
+        );
+
+        // This is exactly why the list is re-derived rather than read off
+        // the preview: the preview drops merges.
+        let preview = build_preview(&local, "main", "")
+            .await
+            .unwrap_or_else(|e| panic!("preview: {e}"));
+        let behind: Vec<&str> = preview.behind.iter().map(|c| c.subject.as_str()).collect();
+        assert!(
+            !behind.contains(&"Merge side"),
+            "guard: if the preview ever starts including merges this test is moot"
+        );
+        for subject in &behind {
+            assert!(
+                subjects.contains(subject),
+                "the overwrite list must be a superset of the behind set, missing {subject}"
+            );
+        }
+    }
+
+    /// A tracking ref this clone has never fetched is indistinguishable
+    /// from a brand-new remote branch, so it must read as "cannot tell",
+    /// never as an empty (reassuring) list.
+    #[gpui::test]
+    async fn overwritten_commits_treats_an_unreadable_ref_as_dangerous(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (_tmp, local, _remote) = boot_repo().await.unwrap_or_else(|e| panic!("boot: {e}"));
+
+        let outcome = overwritten_commits(&local, "main", "origin", "never-fetched").await;
+        let OverwrittenCommits::Unknown { why } = outcome else {
+            panic!("an unreadable ref must not resolve to a list: {outcome:?}");
+        };
+        assert!(
+            why.contains("origin/never-fetched") && why.contains("fetch"),
+            "the reason must say what could not be read and what to do: {why}"
+        );
+    }
+
+    /// The bare `--force` is gone from this crate: a caller that still
+    /// asks for it gets the leased form, which refuses rather than
+    /// silently overwriting a remote that moved.
+    #[gpui::test]
+    async fn a_legacy_force_request_still_runs_with_a_lease(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (_tmp, local, remote) = boot_repo().await.unwrap_or_else(|e| panic!("boot: {e}"));
+        diverge_remote(&local, &remote)
+            .await
+            .unwrap_or_else(|e| panic!("diverge: {e}"));
+
+        let err = run_push_cli(
+            &local,
+            "main",
+            "origin",
+            "main",
+            &PushInvocation {
+                force_mode: ForceMode::Force,
+                ..plain_push()
+            },
+        )
+        .await
+        .expect_err("a bare --force would have overwritten the remote here");
+        assert_eq!(
+            PushFailure::from_error(&err).kind,
+            PushRejection::StaleInfo,
+            "the lease must be what refuses it: {err:#}"
+        );
     }
 }

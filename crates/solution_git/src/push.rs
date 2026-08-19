@@ -15,10 +15,15 @@
 //!
 //! ## Force-push handling
 //!
-//! `ForceMode::Force` rows render the toggle in red as an extra visual
-//! cue. The MCP `solution.git.push_all` tool requires `confirmed: true`
-//! whenever any member's resolved force mode is `Force` — same gate as
-//! S-DST destructive ops.
+//! No path here can emit a bare `--force`. The dialog offers a single
+//! `force-with-lease` toggle, and `ForceMode::Force` survives only as a
+//! legacy *input*: a `force_mode: "force"` request over the wire is
+//! upgraded to `--force-with-lease` (and the tool's result text says
+//! so) rather than rejected, so existing callers keep working while
+//! losing the one behaviour that motivated the ban — silently
+//! overwriting a remote that moved since the last fetch. The MCP
+//! `solution.git.push_all` tool still requires `confirmed: true` for a
+//! legacy `force` request, same gate as S-DST destructive ops.
 
 use anyhow::{Result, anyhow};
 use git_ui::mini_graph::MiniCommit;
@@ -348,18 +353,8 @@ impl SolutionPushDialog {
     fn toggle_section_force_with_lease(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(section) = self.sections.get_mut(ix) {
             section.force_mode = match section.force_mode {
-                ForceMode::WithLease => ForceMode::None,
-                _ => ForceMode::WithLease,
-            };
-            cx.notify();
-        }
-    }
-
-    fn toggle_section_force(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(section) = self.sections.get_mut(ix) {
-            section.force_mode = match section.force_mode {
-                ForceMode::Force => ForceMode::None,
-                _ => ForceMode::Force,
+                ForceMode::None => ForceMode::WithLease,
+                _ => ForceMode::None,
             };
             cx.notify();
         }
@@ -380,12 +375,12 @@ impl SolutionPushDialog {
     }
 
     fn cycle_apply_force(&mut self, cx: &mut Context<Self>) {
-        // None → WithLease → Force → None.
+        // per-member → force-with-lease → off → per-member. There is no
+        // bare-force rung any more.
         self.apply_to_all.force_mode = match self.apply_to_all.force_mode {
             None => Some(ForceMode::WithLease),
-            Some(ForceMode::WithLease) => Some(ForceMode::Force),
-            Some(ForceMode::Force) => None,
-            Some(ForceMode::None) => Some(ForceMode::WithLease),
+            Some(ForceMode::WithLease) | Some(ForceMode::Force) => Some(ForceMode::None),
+            Some(ForceMode::None) => None,
         };
         cx.notify();
     }
@@ -524,12 +519,15 @@ impl SolutionPushDialog {
         let force_label: SharedString = match self.apply_to_all.force_mode {
             None => "force: per-member".into(),
             Some(ForceMode::None) => "force: off (apply)".into(),
-            Some(ForceMode::WithLease) => "force-with-lease (apply to all)".into(),
-            Some(ForceMode::Force) => "FORCE (apply to all)".into(),
+            // A legacy `Force` override can only arrive from a restored
+            // state blob; it runs as a lease, so it must not claim
+            // otherwise in the label.
+            Some(ForceMode::WithLease) | Some(ForceMode::Force) => {
+                "force-with-lease (apply to all)".into()
+            }
         };
         let force_color = match self.apply_to_all.force_mode {
-            Some(ForceMode::Force) => Color::Error,
-            Some(ForceMode::WithLease) => Color::Warning,
+            Some(ForceMode::WithLease) | Some(ForceMode::Force) => Color::Warning,
             _ => Color::Muted,
         };
         let tags_label: SharedString = match self.apply_to_all.push_tags {
@@ -722,16 +720,12 @@ impl SolutionPushDialog {
                 .into_any_element()
         };
 
-        let force_lease_state = if matches!(section.force_mode, ForceMode::WithLease) {
-            ToggleState::Selected
-        } else {
-            ToggleState::Unselected
-        };
-        let force_state = if matches!(section.force_mode, ForceMode::Force) {
-            ToggleState::Selected
-        } else {
-            ToggleState::Unselected
-        };
+        let force_lease_state =
+            if matches!(section.force_mode, ForceMode::WithLease | ForceMode::Force) {
+                ToggleState::Selected
+            } else {
+                ToggleState::Unselected
+            };
         let tags_state = if section.push_tags {
             ToggleState::Selected
         } else {
@@ -761,30 +755,11 @@ impl SolutionPushDialog {
                 "Overridden by Apply-to-all",
             )));
         }
-        let mut force_plain_box =
-            Checkbox::new(SharedString::from(format!("force-{id_str}")), force_state)
-                .label("force")
-                .disabled(force_locked)
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_section_force(ix, cx)));
-        if force_locked {
-            force_plain_box = force_plain_box.tooltip(Tooltip::text(SharedString::from(
-                "Overridden by Apply-to-all",
-            )));
-        }
-        let force_plain_box = if matches!(section.force_mode, ForceMode::Force) {
-            force_plain_box.tooltip(Tooltip::text(SharedString::from(
-                "Plain --force overwrites without atomic check.",
-            )))
-        } else {
-            force_plain_box
-        };
-
         let toggles_row = h_flex()
             .gap_3()
             .px_3()
             .py_2()
             .child(force_box)
-            .child(force_plain_box)
             .child(
                 Checkbox::new(SharedString::from(format!("tags-{id_str}")), tags_state)
                     .label("tags")
@@ -971,13 +946,17 @@ impl MemberPushPlan {
         }
         match self.force_mode {
             ForceMode::None => {}
-            ForceMode::WithLease => match &self.expected_remote_sha {
+            // `Force` is upgraded, not honoured verbatim — the lease
+            // does everything a bare `--force` does except silently
+            // overwrite a remote that moved since the last fetch, which
+            // is the entire accident the flag is banned for. Mirrors
+            // `git_ui::push_dialog::run_push_cli`.
+            ForceMode::WithLease | ForceMode::Force => match &self.expected_remote_sha {
                 Some(sha) => {
                     args.push(format!("--force-with-lease={}:{}", self.remote_branch, sha))
                 }
                 None => args.push("--force-with-lease".into()),
             },
-            ForceMode::Force => args.push("--force".into()),
         }
         args.push(self.remote.clone());
         args.push(format!("{}:{}", self.branch, self.remote_branch));
@@ -1035,7 +1014,9 @@ async fn execute_plans(plans: Vec<MemberPushPlan>, parallel: bool) -> Vec<Member
 
 async fn execute_one(plan: MemberPushPlan) -> MemberPushOutcome {
     let res = match plan.force_mode {
-        ForceMode::WithLease => {
+        // Both force postures take the leased runner — see `build_argv`
+        // for why `Force` is upgraded rather than refused.
+        ForceMode::WithLease | ForceMode::Force => {
             git_ui::push_dialog::run_force_with_lease(
                 &plan.work_dir,
                 &plan.branch,
@@ -1045,19 +1026,6 @@ async fn execute_one(plan: MemberPushPlan) -> MemberPushOutcome {
                 plan.set_upstream,
                 plan.push_tags,
                 plan.no_verify,
-            )
-            .await
-        }
-        ForceMode::Force => {
-            run_plain_push(
-                &plan.work_dir,
-                &plan.branch,
-                &plan.remote,
-                &plan.remote_branch,
-                plan.set_upstream,
-                plan.push_tags,
-                plan.no_verify,
-                true,
             )
             .await
         }
@@ -1147,7 +1115,8 @@ pub fn register(workspace: &mut Workspace) {
 }
 
 // =====================================================================
-//  MCP tool — solution.git.push_all (Write tier; force ⇒ confirmed).
+//  MCP tool — solution.git.push_all (Write tier; legacy force ⇒
+//  confirmed, and always upgraded to --force-with-lease).
 // =====================================================================
 
 pub mod mcp {
@@ -1164,7 +1133,11 @@ pub mod mcp {
     #[serde(default, deny_unknown_fields)]
     pub struct PerMemberPushOptions {
         pub skip: Option<bool>,
-        /// One of `"none" | "with_lease" | "force"`. Defaults to `"none"`.
+        /// One of `"none" | "with_lease" | "force"`. Defaults to
+        /// `"none"`. `"force"` is accepted for wire compatibility but is
+        /// **upgraded** to `--force-with-lease`: a bare `--force` is
+        /// never run. The tool's result text names the upgrade, and the
+        /// legacy spelling additionally requires `confirmed: true`.
         pub force_mode: Option<String>,
         pub push_tags: Option<bool>,
         pub no_verify: Option<bool>,
@@ -1172,6 +1145,11 @@ pub mod mcp {
     }
 
     /// Input parameters for the push all tool.
+    ///
+    /// No force posture here reaches git as a bare `--force`; the legacy
+    /// `force_mode: "force"` spelling is upgraded to
+    /// `--force-with-lease`, so a remote that moved since the last fetch
+    /// is refused instead of silently overwritten.
     #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
     #[serde(default, deny_unknown_fields)]
     pub struct PushAllInput {
@@ -1180,7 +1158,10 @@ pub mod mcp {
         /// Default: true.
         pub parallel: Option<bool>,
         pub solution_id: Option<i64>,
-        /// Required when any resolved per-member force mode is `force`.
+        /// Required when any resolved per-member force mode is the
+        /// legacy `"force"`. Kept as a gate even though the request now
+        /// runs with a lease: dropping it would silently loosen an
+        /// existing wire contract.
         pub confirmed: Option<bool>,
     }
 
@@ -1198,6 +1179,12 @@ pub mod mcp {
         pub outcomes: Vec<PushAllResultEntry>,
     }
 
+    /// `"force"` maps to [`ForceMode::Force`], which is a *request
+    /// marker*, not an argv shape: every runner upgrades it to
+    /// `--force-with-lease` (see `MemberPushPlan::build_argv`). Parsing
+    /// it to `WithLease` right here would be simpler but would erase the
+    /// fact that the caller asked for the legacy posture, and the result
+    /// text has to be able to tell them it was upgraded.
     fn parse_force(s: &str) -> Result<ForceMode> {
         match s {
             "none" => Ok(ForceMode::None),
@@ -1285,6 +1272,9 @@ pub mod mcp {
         futures::future::join_all(futs).await
     }
 
+    /// Solution-wide push. Force postures run `--force-with-lease`
+    /// only; the legacy `force_mode: "force"` input is upgraded rather
+    /// than rejected and the upgrade is stated in the result text.
     #[derive(Clone)]
     pub struct PushAllTool;
 
@@ -1301,12 +1291,13 @@ pub mod mcp {
             let per_member = input.per_member_options.unwrap_or_default();
             let initial_plans: Vec<MemberPushPlan> =
                 cx.update(|cx| build_plans(input.members.as_deref(), &per_member, cx))?;
-            let any_force = initial_plans
+            let legacy_force = initial_plans
                 .iter()
                 .any(|p| matches!(p.force_mode, ForceMode::Force));
-            if any_force && !input.confirmed.unwrap_or(false) {
+            if legacy_force && !input.confirmed.unwrap_or(false) {
                 return Err(anyhow!(
-                    "solution.git.push_all with force=true requires confirmed=true"
+                    "solution.git.push_all with force_mode=\"force\" requires confirmed=true \
+                     (the push itself runs as --force-with-lease)"
                 ));
             }
             if initial_plans.is_empty() {
@@ -1356,12 +1347,17 @@ pub mod mcp {
                 })
                 .collect();
             let summary = format!(
-                "{} pushed, {} failed",
+                "{} pushed, {} failed{}",
                 entries
                     .iter()
                     .filter(|e| e.status == "pushed" || e.status == "up_to_date")
                     .count(),
                 entries.iter().filter(|e| e.status == "failed").count(),
+                if legacy_force {
+                    " (force_mode=\"force\" upgraded to --force-with-lease)"
+                } else {
+                    ""
+                },
             );
             Ok(ToolResponse {
                 content: vec![ToolResponseContent::Text { text: summary }],
@@ -1382,6 +1378,25 @@ pub mod mcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+    use util::command::new_command;
+
+    /// Run `git` in `dir` and return trimmed stdout, failing loudly —
+    /// test fixtures must not silently half-build a repository.
+    async fn git(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+        let mut command = new_command("git");
+        command.current_dir(dir);
+        command.args(args);
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let output = command.output().await?;
+        let stdout = String::from_utf8(output.stdout)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8(output.stderr).unwrap_or_default();
+            return Err(anyhow!("git {args:?} failed: {}", stderr.trim_end()));
+        }
+        Ok(stdout.trim().to_string())
+    }
 
     fn skeleton(id: &str, branch: &str, remote: &str, remote_branch: &str) -> MemberPushSection {
         let mut s = MemberPushSection::skeleton(id.into(), PathBuf::from(format!("/tmp/{id}")));
@@ -1426,6 +1441,8 @@ mod tests {
         a.force_mode = ForceMode::None;
         let mut b = skeleton("b", "main", "origin", "main");
         b.force_mode = ForceMode::WithLease;
+        // A legacy `Force` override still overrides the per-member
+        // posture — it just can no longer produce a bare `--force`.
         let apply = ApplyAllOptions {
             force_mode: Some(ForceMode::Force),
             ..Default::default()
@@ -1434,8 +1451,57 @@ mod tests {
         let plan_b = build_per_member_command(&b, &apply).expect("b");
         assert_eq!(plan_a.force_mode, ForceMode::Force);
         assert_eq!(plan_b.force_mode, ForceMode::Force);
-        assert!(plan_a.build_argv().iter().any(|s| s == "--force"));
-        assert!(plan_b.build_argv().iter().any(|s| s == "--force"));
+        for plan in [&plan_a, &plan_b] {
+            let argv = plan.build_argv();
+            assert!(
+                !argv.iter().any(|s| s == "--force"),
+                "bare --force escaped into {argv:?}"
+            );
+            assert!(argv.iter().any(|s| s == "--force-with-lease"), "{argv:?}");
+        }
+    }
+
+    /// Every reachable force posture, pinned and unpinned, must produce
+    /// a leased flag — this is the guard that keeps a bare `--force`
+    /// from being reintroduced by a future match arm.
+    #[test]
+    fn no_force_mode_can_build_a_bare_force_argv() {
+        for mode in [ForceMode::None, ForceMode::WithLease, ForceMode::Force] {
+            for sha in [None, Some("deadbeef".to_string())] {
+                let mut section = skeleton("a", "feature", "origin", "feature");
+                section.force_mode = mode;
+                let mut plan =
+                    build_per_member_command(&section, &ApplyAllOptions::default()).expect("plan");
+                plan.expected_remote_sha = sha.clone();
+                let argv = plan.build_argv();
+                assert!(
+                    !argv.iter().any(|s| s == "--force"),
+                    "{mode:?} with sha {sha:?} built {argv:?}"
+                );
+                if !matches!(mode, ForceMode::None) {
+                    assert!(
+                        argv.iter().any(|s| s.starts_with("--force-with-lease")),
+                        "{mode:?} with sha {sha:?} built {argv:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_force_upgrades_the_legacy_spelling_to_a_lease() {
+        // The wire word stays accepted (compatibility) and keeps its own
+        // variant so the tool can report the upgrade — but the argv it
+        // produces is leased.
+        let mut section = skeleton("a", "main", "origin", "main");
+        section.force_mode = ForceMode::Force;
+        let argv = build_per_member_command(&section, &ApplyAllOptions::default())
+            .expect("plan")
+            .build_argv();
+        assert_eq!(
+            argv,
+            vec!["push", "--force-with-lease", "origin", "main:main",]
+        );
     }
 
     #[test]
@@ -1472,6 +1538,128 @@ mod tests {
         let argv = plan.build_argv();
         assert!(!argv.iter().any(|s| s == "--force"));
         assert!(!argv.iter().any(|s| s.starts_with("--force-with-lease")));
+    }
+
+    /// End-to-end proof that the legacy `Force` posture is genuinely
+    /// leased: `other` publishes a commit that `local` has never
+    /// fetched, so `local`'s remote-tracking ref is stale. A bare
+    /// `--force` would have replaced the remote tip and destroyed that
+    /// commit; `--force-with-lease` must refuse and leave it in place.
+    /// The second half re-runs after a fetch to show the upgrade still
+    /// pushes when the lease holds — it is an upgrade, not a mute.
+    #[gpui::test]
+    async fn legacy_force_mode_runs_with_a_lease_against_a_diverged_remote(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let local = tmp.path().join("local");
+        let other = tmp.path().join("other");
+        for dir in [&remote, &local, &other] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        let remote_str = remote.to_str().expect("utf-8 tempdir path").to_string();
+
+        git(&remote, &["init", "--bare", "-b", "main"])
+            .await
+            .expect("init bare");
+        git(&local, &["init", "-b", "main"]).await.expect("init");
+        git(&local, &["config", "user.email", "test@example.com"])
+            .await
+            .expect("email");
+        git(&local, &["config", "user.name", "Test"])
+            .await
+            .expect("name");
+        std::fs::write(local.join("README"), "hello").expect("write README");
+        git(&local, &["add", "README"]).await.expect("add");
+        git(&local, &["commit", "-m", "init"])
+            .await
+            .expect("commit");
+        git(&local, &["remote", "add", "origin", &remote_str])
+            .await
+            .expect("remote add");
+        git(&local, &["push", "-u", "origin", "main"])
+            .await
+            .expect("push");
+
+        // A second clone publishes work that `local` never sees.
+        git(&other, &["clone", &remote_str, "."])
+            .await
+            .expect("clone");
+        git(&other, &["config", "user.email", "other@example.com"])
+            .await
+            .expect("email");
+        git(&other, &["config", "user.name", "Other"])
+            .await
+            .expect("name");
+        std::fs::write(other.join("theirs.txt"), "theirs").expect("write theirs");
+        git(&other, &["add", "theirs.txt"]).await.expect("add");
+        git(&other, &["commit", "-m", "their work"])
+            .await
+            .expect("commit");
+        git(&other, &["push", "origin", "main"])
+            .await
+            .expect("push");
+        let their_sha = git(&other, &["rev-parse", "HEAD"])
+            .await
+            .expect("their sha");
+
+        // `local` rewrites its own tip without fetching first.
+        std::fs::write(local.join("README"), "rewritten").expect("rewrite README");
+        git(&local, &["add", "README"]).await.expect("add");
+        git(&local, &["commit", "--amend", "-m", "rewritten init"])
+            .await
+            .expect("amend");
+
+        let plan = MemberPushPlan {
+            member_id: "local".into(),
+            work_dir: local.clone(),
+            branch: "main".into(),
+            remote: "origin".into(),
+            remote_branch: "main".into(),
+            force_mode: ForceMode::Force,
+            push_tags: false,
+            no_verify: false,
+            set_upstream: false,
+            expected_remote_sha: None,
+        };
+        let outcome = execute_one(plan.clone()).await;
+        assert_eq!(
+            outcome.status,
+            PushOutcomeStatus::Failed,
+            "a leased force must refuse a remote that moved: {outcome:?}"
+        );
+        let error = outcome.error.unwrap_or_default();
+        assert!(
+            error.contains("stale info") || error.contains("rejected"),
+            "expected a lease refusal, got: {error}"
+        );
+        assert_eq!(
+            git(&remote, &["rev-parse", "refs/heads/main"])
+                .await
+                .expect("remote tip"),
+            their_sha,
+            "the other clone's commit was overwritten — a bare --force ran"
+        );
+
+        // Fetch, and the same legacy posture now pushes: upgraded, not
+        // disabled.
+        git(&local, &["fetch", "origin"]).await.expect("fetch");
+        let outcome = execute_one(plan).await;
+        assert_eq!(
+            outcome.status,
+            PushOutcomeStatus::Pushed,
+            "leased force should succeed once the lease holds: {outcome:?}"
+        );
+        assert_eq!(
+            git(&remote, &["rev-parse", "refs/heads/main"])
+                .await
+                .expect("remote tip"),
+            git(&local, &["rev-parse", "HEAD"])
+                .await
+                .expect("local tip"),
+        );
     }
 
     /// Mock-push-outcome consolidation: ensure parallel and sequential

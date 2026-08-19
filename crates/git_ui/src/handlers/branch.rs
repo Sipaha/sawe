@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use gpui::{App, Entity, Task};
+use gpui::{App, Entity, SharedString, Task};
 use project::git_store::Repository;
 
 use crate::git_panel::format_git_error_toast_message;
@@ -155,9 +155,84 @@ fn classify_force_delete(
     ForceDeleteDecision::Offer { warning }
 }
 
+/// Split a remote-tracking ref into `(remote, branch)` against the
+/// repository's configured remotes. The **longest** matching remote name
+/// wins: `git remote add team/fork …` is legal, so splitting on the
+/// first `/` can name a remote that doesn't exist.
+///
+/// `None` means the ref is not claimed by any configured remote — the
+/// caller decides whether that is a hard stop (the commit menu withholds
+/// every server-side action) or a cue to fall back to a guess.
+///
+/// This is the crate's one remote/branch boundary rule. `%D`
+/// decorations, `<branch>@{upstream}` output and `refs/remotes/…` paths
+/// all reach it; strip any `refs/remotes/` prefix before calling.
+pub fn split_remote_ref(
+    name: &str,
+    remotes: &[SharedString],
+) -> Option<(SharedString, SharedString)> {
+    remotes
+        .iter()
+        .filter_map(|remote| {
+            let branch = name.strip_prefix(remote.as_ref())?.strip_prefix('/')?;
+            if branch.is_empty() {
+                return None;
+            }
+            Some((remote.clone(), SharedString::from(branch.to_string())))
+        })
+        .max_by_key(|(remote, _)| remote.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remotes(names: &[&str]) -> Vec<SharedString> {
+        names
+            .iter()
+            .map(|name| SharedString::from(name.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn splits_a_plain_remote_ref() {
+        assert_eq!(
+            split_remote_ref("origin/main", &remotes(&["origin"])),
+            Some(("origin".into(), "main".into()))
+        );
+    }
+
+    /// The reason this rule exists: `git remote add team/fork …` is
+    /// legal, and splitting on the first `/` names a remote that does
+    /// not exist.
+    #[test]
+    fn the_longest_matching_remote_wins() {
+        assert_eq!(
+            split_remote_ref("team/fork/main", &remotes(&["team", "team/fork"])),
+            Some(("team/fork".into(), "main".into()))
+        );
+    }
+
+    /// A GitFlow branch name keeps its slashes — only the remote half is
+    /// consumed.
+    #[test]
+    fn a_slash_bearing_branch_name_survives_the_split() {
+        assert_eq!(
+            split_remote_ref("origin/feature/FOO-1", &remotes(&["origin"])),
+            Some(("origin".into(), "feature/FOO-1".into()))
+        );
+    }
+
+    #[test]
+    fn a_ref_no_configured_remote_claims_does_not_split() {
+        assert_eq!(
+            split_remote_ref("upstream/main", &remotes(&["origin"])),
+            None
+        );
+        assert_eq!(split_remote_ref("main", &remotes(&["origin"])), None);
+        assert_eq!(split_remote_ref("origin/", &remotes(&["origin"])), None);
+        assert_eq!(split_remote_ref("origin/main", &[]), None);
+    }
 
     fn unmerged_error(branch: &str) -> anyhow::Error {
         anyhow!(

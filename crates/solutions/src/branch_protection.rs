@@ -26,6 +26,13 @@ use crate::settings::{BranchProtectionMember, BranchProtectionSettings};
 /// `RequiresConfirmation` means show a confirmation modal (or, for
 /// subagents, require an explicit `confirmed: true` payload field);
 /// `Forbidden` means refuse the operation outright.
+///
+/// A `reason` is rendered verbatim into a plain two-button prompt, so it
+/// must never instruct the user to perform a gesture this fork does not
+/// have. The reasons here used to end with "by typing the branch name",
+/// left over from a type-the-name modal that was never built; the UI had
+/// to trim that tail back off at render time. Describe *why* the
+/// operation is gated, and at most ask to confirm it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allowed,
@@ -133,9 +140,7 @@ fn decide(protected: bool, member: &BranchProtectionMember, op: &str, branch: &s
                 };
             }
             Decision::RequiresConfirmation {
-                reason: format!(
-                    "'{branch}' is protected — confirm force-push by typing the branch name"
-                ),
+                reason: format!("'{branch}' is protected — confirm the force-push"),
             }
         }
         "reset" | "reset_hard" => {
@@ -148,9 +153,7 @@ fn decide(protected: bool, member: &BranchProtectionMember, op: &str, branch: &s
                 };
             }
             Decision::RequiresConfirmation {
-                reason: format!(
-                    "'{branch}' is protected — confirm reset by typing the branch name"
-                ),
+                reason: format!("'{branch}' is protected — confirm the reset"),
             }
         }
         "drop" | "drop_commit" => {
@@ -165,7 +168,7 @@ fn decide(protected: bool, member: &BranchProtectionMember, op: &str, branch: &s
                 };
             }
             Decision::RequiresConfirmation {
-                reason: format!("'{branch}' is protected — confirm drop by typing the branch name"),
+                reason: format!("'{branch}' is protected — confirm the commit drop"),
             }
         }
         "delete_branch" | "delete_branch_force" => {
@@ -191,7 +194,7 @@ fn decide(protected: bool, member: &BranchProtectionMember, op: &str, branch: &s
         | "rename_branch" => {
             if protected {
                 return Decision::RequiresConfirmation {
-                    reason: format!("'{branch}' is protected — confirm by typing the branch name"),
+                    reason: format!("'{branch}' is protected — confirm '{op}'"),
                 };
             }
             Decision::Allowed
@@ -202,9 +205,7 @@ fn decide(protected: bool, member: &BranchProtectionMember, op: &str, branch: &s
         _ => {
             if protected {
                 Decision::RequiresConfirmation {
-                    reason: format!(
-                        "'{branch}' is protected — confirm '{op}' by typing the branch name"
-                    ),
+                    reason: format!("'{branch}' is protected — confirm '{op}'"),
                 }
             } else {
                 Decision::Allowed
@@ -445,6 +446,40 @@ mod tests {
             check_with_snapshot(&snap, Path::new("/x"), "main", "merge"),
             Decision::RequiresConfirmation { .. }
         ));
+    }
+
+    /// The reasons feed a plain confirm/cancel prompt: no flow in this
+    /// fork can accept a typed branch name, so a reason that asks for
+    /// one is an instruction the user cannot follow.
+    #[test]
+    fn confirmation_reasons_never_ask_to_type_the_branch_name() {
+        let snap = snapshot(default_settings());
+        for op in [
+            "force_push",
+            "push_force",
+            "reset",
+            "reset_hard",
+            "drop",
+            "drop_commit",
+            "merge",
+            "cherry_pick",
+            "rebase",
+            "rename_branch",
+            "some_unclassified_op",
+        ] {
+            let decision = check_with_snapshot(&snap, Path::new("/x"), "main", op);
+            let Decision::RequiresConfirmation { reason } = decision else {
+                panic!("expected RequiresConfirmation for `{op}`");
+            };
+            assert!(
+                !reason.contains("typing"),
+                "reason for `{op}` still asks the user to type something: {reason}"
+            );
+            assert!(
+                reason.contains("main"),
+                "reason for `{op}` dropped the branch it is about: {reason}"
+            );
+        }
     }
 
     #[test]

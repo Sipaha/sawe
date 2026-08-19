@@ -24,6 +24,7 @@ use workspace::{
 };
 
 use crate::git_panel::show_error_toast;
+use crate::handlers::branch::split_remote_ref;
 use zed_actions::{
     CreateWorktree, NewWorktreeBranchTarget, OpenWorktreeInNewWindow, SwitchWorktree,
 };
@@ -102,6 +103,13 @@ impl WorktreePicker {
             repository.update(cx, |repository, _| repository.default_branch(true))
         });
 
+        // The default branch comes back as `<remote>/<branch>`, and a
+        // remote name may itself contain a `/` — so the split needs the
+        // configured remote list, not the first slash.
+        let remotes_request = repository.clone().map(|repository| {
+            repository.update(cx, |repository, _| repository.get_remotes(None, false))
+        });
+
         let initial_matches = vec![WorktreeEntry::CreateFromCurrentBranch];
 
         let delegate = WorktreePickerDelegate {
@@ -163,10 +171,22 @@ impl WorktreePicker {
                     None => None,
                 };
 
+                let configured_remotes: Vec<SharedString> = match remotes_request {
+                    Some(req) => req
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|remote| remote.name)
+                        .collect(),
+                    None => Vec::new(),
+                };
+
                 picker_handle.update_in(cx, |picker, window, cx| {
                     picker.delegate.all_worktrees = all_worktrees;
-                    picker.delegate.default_branch =
-                        default_branch.and_then(|branch| RemoteBranchName::parse(&branch));
+                    picker.delegate.default_branch = default_branch
+                        .and_then(|branch| RemoteBranchName::parse(&branch, &configured_remotes));
                     picker.delegate.refresh_project_worktree_paths(window, cx);
                     picker.refresh(window, cx);
                 })?;
@@ -288,15 +308,30 @@ struct RemoteBranchName {
 }
 
 impl RemoteBranchName {
-    fn parse(name: &str) -> Option<Self> {
+    /// Split a remote-tracking ref into its remote and branch halves.
+    ///
+    /// The boundary is resolved against `configured_remotes` by
+    /// [`split_remote_ref`], not by the first `/`: a remote may be named
+    /// `team/fork`, in which case first-slash splitting names a remote
+    /// that does not exist and the worktree is then created from a
+    /// branch target git cannot resolve. The first-slash split survives
+    /// only for the case where the remote list could not be read at all.
+    fn parse(name: &str, configured_remotes: &[SharedString]) -> Option<Self> {
         let name = name.strip_prefix("refs/remotes/").unwrap_or(name);
-        let (remote_name, branch_name) = name.split_once('/')?;
+        let (remote_name, branch_name) = match split_remote_ref(name, configured_remotes) {
+            Some((remote_name, branch_name)) => (remote_name.to_string(), branch_name.to_string()),
+            None if configured_remotes.is_empty() => {
+                let (remote_name, branch_name) = name.split_once('/')?;
+                (remote_name.to_string(), branch_name.to_string())
+            }
+            None => return None,
+        };
         if remote_name.is_empty() || branch_name.is_empty() {
             return None;
         }
         Some(Self {
-            remote_name: remote_name.to_string(),
-            branch_name: branch_name.to_string(),
+            remote_name,
+            branch_name,
         })
     }
 
@@ -1630,6 +1665,55 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use workspace::MultiWorkspace;
+
+    fn remote_names(names: &[&str]) -> Vec<SharedString> {
+        names
+            .iter()
+            .map(|name| SharedString::from(name.to_string()))
+            .collect()
+    }
+
+    /// A remote may be named `team/fork`, so the default branch
+    /// `team/fork/main` must not be read as remote `team`, branch
+    /// `fork/main` — the worktree would then be created from a branch
+    /// target git cannot resolve.
+    #[test]
+    fn remote_branch_name_splits_against_the_configured_remotes() {
+        let parsed =
+            RemoteBranchName::parse("team/fork/main", &remote_names(&["origin", "team/fork"]))
+                .expect("a ref claimed by a configured remote parses");
+        assert_eq!(parsed.remote_name, "team/fork");
+        assert_eq!(parsed.branch_name, "main");
+    }
+
+    #[test]
+    fn remote_branch_name_strips_the_refs_remotes_prefix() {
+        let parsed = RemoteBranchName::parse(
+            "refs/remotes/origin/feature/FOO-1",
+            &remote_names(&["origin"]),
+        )
+        .expect("a fully-qualified ref parses");
+        assert_eq!(parsed.remote_name, "origin");
+        assert_eq!(parsed.branch_name, "feature/FOO-1");
+    }
+
+    #[test]
+    fn remote_branch_name_refuses_a_ref_no_configured_remote_claims() {
+        assert!(
+            RemoteBranchName::parse("team/fork/main", &remote_names(&["origin"])).is_none(),
+            "guessing “team” here names a remote that does not exist"
+        );
+    }
+
+    /// With no remote list at all (the request failed), the first-slash
+    /// guess is still better than losing the default branch entirely.
+    #[test]
+    fn remote_branch_name_falls_back_to_the_first_slash_without_a_remote_list() {
+        let parsed = RemoteBranchName::parse("origin/main", &[])
+            .expect("without a remote list the first slash is the only signal");
+        assert_eq!(parsed.remote_name, "origin");
+        assert_eq!(parsed.branch_name, "main");
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {

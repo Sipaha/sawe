@@ -27,8 +27,8 @@ use git::repository::{FetchOptions, Remote};
 
 use util::ResultExt as _;
 
-use crate::askpass_modal::AskPassModal;
 use crate::git_panel::{open_output, show_error_toast};
+use crate::handlers::askpass::askpass_delegate;
 use crate::worktree_names;
 
 /// Whether a worktree operation is creating a new one or switching to an
@@ -288,27 +288,6 @@ fn remote_branch_to_fetch(branch_target: &NewWorktreeBranchTarget) -> Option<(&s
             None
         }
     }
-}
-
-fn create_worktree_askpass_delegate(
-    workspace: WeakEntity<Workspace>,
-    operation: impl Into<SharedString>,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) -> AskPassDelegate {
-    let operation = operation.into();
-    let window = window.window_handle();
-    AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
-        window
-            .update(cx, |_, window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    workspace.toggle_modal(window, cx, |window, cx| {
-                        AskPassModal::new(operation.clone(), prompt.into(), tx, window, cx)
-                    });
-                })
-            })
-            .ok();
-    })
 }
 
 async fn fetch_remote_for_worktree_base(
@@ -729,7 +708,7 @@ fn create_worktree_workspace_inner(
                 git_repos
                     .iter()
                     .map(|_| {
-                        create_worktree_askpass_delegate(
+                        askpass_delegate(
                             workspace_handle.clone(),
                             format!("git fetch {remote_name}"),
                             window,

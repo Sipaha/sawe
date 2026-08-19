@@ -1,5 +1,8 @@
-//! S-PSH MCP tools — preview / push / push --force-with-lease /
-//! push --force.
+//! S-PSH MCP tools — preview / push / push --force-with-lease.
+//!
+//! `editor.git.push_force` survives under its old name for wire
+//! compatibility, but every force path here now runs
+//! `--force-with-lease`: the bare flag is gone from this crate.
 //!
 //! Mirror of `handlers_mcp.rs` for the push surface. The preview tool is
 //! `ReadOnly` (subagents may dry-run a push), `push` and
@@ -262,8 +265,12 @@ impl McpServerTool for PushForceWithLeaseTool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
-/// Input for `editor.git.push_force`. Plain `--force`, no atomic check —
-/// classed `Destructive` because it can overwrite a collaborator's work.
+/// Input for `editor.git.push_force`. Kept for wire compatibility, but
+/// it no longer runs a bare `--force`: the request is upgraded to
+/// `--force-with-lease` (see `run_plain_push`), so a remote that moved
+/// since the last fetch is refused instead of silently overwritten.
+/// Still classed `Destructive` — it can overwrite a collaborator's work
+/// whenever the lease does hold.
 pub struct PushForceInput {
     pub set_upstream: bool,
     pub tags: bool,
@@ -301,7 +308,7 @@ impl McpServerTool for PushForceTool {
         )
         .await?;
         let summary = format!(
-            "force-pushed {} to {}/{} (no atomic check)",
+            "force-pushed {} to {}/{} (upgraded to --force-with-lease)",
             branch, preview.remote, preview.remote_branch
         );
         Ok(ToolResponse {

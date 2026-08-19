@@ -8,6 +8,7 @@
 //! merge / rebase) are out of scope here — they land via the S-DST work
 //! along with backup-ref creation and the `OpRunner` framework.
 
+pub mod askpass;
 pub mod branch;
 pub mod checkout;
 pub mod cherry_pick;

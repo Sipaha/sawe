@@ -1,8 +1,8 @@
-use crate::askpass_modal::AskPassModal;
 use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
+use crate::handlers::askpass::askpass_delegate;
 use crate::pre_commit;
 use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
@@ -13,7 +13,6 @@ use crate::{
 };
 use agent_settings::AgentSettings;
 use anyhow::Context as _;
-use askpass::AskPassDelegate;
 use collections::{BTreeMap, HashMap, HashSet};
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorElement, EditorMode, MultiBuffer, MultiBufferOffset, SizingBehavior};
@@ -1146,6 +1145,30 @@ impl GitPanel {
     /// the entry is currently hidden (collapsed directory or section).
     fn visible_position(&self, entry_ix: usize) -> Option<usize> {
         self.visible_indices.iter().position(|&ix| ix == entry_ix)
+    }
+
+    /// Move the selection back onto a visible row after a collapse hid the row
+    /// it pointed at. Every arrow-key handler early-returns when
+    /// `visible_position` is `None`, so a selection stranded inside a collapsed
+    /// section or directory freezes navigation entirely, with no panic and
+    /// nothing on screen to explain it. The nearest preceding visible row is
+    /// the header or directory that just swallowed the selection.
+    fn clamp_selection_to_visible(&mut self, cx: &mut Context<Self>) {
+        let Some(selected_entry) = self.selected_entry else {
+            return;
+        };
+        if self.visible_position(selected_entry).is_some() {
+            return;
+        }
+
+        self.selected_entry = self
+            .visible_indices
+            .iter()
+            .rev()
+            .find(|&&ix| ix < selected_entry)
+            .copied()
+            .or_else(|| self.visible_indices.first().copied());
+        self.scroll_to_selected_entry(cx);
     }
 
     fn scroll_to_selected_entry(&mut self, cx: &mut Context<Self>) {
@@ -2437,7 +2460,7 @@ impl GitPanel {
         self.ensure_pre_commit_config_loaded(cx);
         let pre_commit_runner = self.build_pre_commit_runner(&active_repository, cx);
 
-        let askpass = self.askpass_delegate("git commit", window, cx);
+        let askpass = askpass_delegate(self.workspace.clone(), "git commit", window, cx);
         let commit_message = self.custom_or_suggested_commit_message(window, cx);
 
         let Some(mut message) = commit_message else {
@@ -3167,7 +3190,7 @@ impl GitPanel {
             return;
         };
         telemetry::event!("Git Fetched");
-        let askpass = self.askpass_delegate("git fetch", window, cx);
+        let askpass = askpass_delegate(self.workspace.clone(), "git fetch", window, cx);
         let this = cx.weak_entity();
 
         let fetch_options = if is_fetch_all {
@@ -3329,7 +3352,12 @@ impl GitPanel {
             };
 
             let askpass = this.update_in(cx, |this, window, cx| {
-                this.askpass_delegate(format!("git pull {}", remote.name), window, cx)
+                askpass_delegate(
+                    this.workspace.clone(),
+                    format!("git pull {}", remote.name),
+                    window,
+                    cx,
+                )
             })?;
 
             let branch_name = branch
@@ -3414,7 +3442,12 @@ impl GitPanel {
             };
 
             let askpass_delegate = this.update_in(cx, |this, window, cx| {
-                this.askpass_delegate(format!("git push {}", remote.name), window, cx)
+                askpass_delegate(
+                    this.workspace.clone(),
+                    format!("git push {}", remote.name),
+                    window,
+                    cx,
+                )
             })?;
 
             let push = repo.update(cx, |repo, cx| {
@@ -3540,28 +3573,6 @@ impl GitPanel {
                 panel.show_error_toast("create pull request", err, cx);
             });
         }
-    }
-
-    fn askpass_delegate(
-        &self,
-        operation: impl Into<SharedString>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AskPassDelegate {
-        let workspace = self.workspace.clone();
-        let operation = operation.into();
-        let window = window.window_handle();
-        AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
-            window
-                .update(cx, |_, window, cx| {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.toggle_modal(window, cx, |window, cx| {
-                            AskPassModal::new(operation.clone(), prompt.into(), tx, window, cx)
-                        });
-                    })
-                })
-                .ok();
-        })
     }
 
     fn can_push_and_pull(&self, cx: &App) -> bool {
@@ -3786,6 +3797,7 @@ impl GitPanel {
             self.collapsed_sections.insert(section);
         }
         self.update_visible_entries(window, cx);
+        self.clamp_selection_to_visible(cx);
     }
 
     fn toggle_directory(&mut self, key: &TreeKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -3793,6 +3805,7 @@ impl GitPanel {
             let expanded = state.expanded_dirs.entry(key.clone()).or_insert(true);
             *expanded = !*expanded;
             self.update_visible_entries(window, cx);
+            self.clamp_selection_to_visible(cx);
         } else {
             util::debug_panic!("Attempted to toggle directory in flat Git Panel state");
         }
@@ -9583,6 +9596,116 @@ mod tests {
                 }))
             ));
         });
+    }
+
+    /// The selection can sit on a row that a collapse is about to hide — the
+    /// current call sites all happen to pre-point it at the toggled row, but
+    /// that is a convention, not something the toggle enforces. A stranded
+    /// selection makes `visible_position` return `None` forever, which silently
+    /// freezes every arrow key instead of failing loudly.
+    #[gpui::test]
+    async fn test_collapsing_a_section_relocates_a_hidden_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (panel, mut cx) = sectioned_panel(cx).await;
+
+        let main_rs = panel.read_with(&cx, |panel, _| {
+            entry_index_for_path(panel, "src/main.rs").expect("src/main.rs should be a row")
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_entry = Some(main_rs);
+            panel.toggle_section(Section::Tracked, window, cx);
+        });
+
+        // The row is gone, so the selection lands on the header that swallowed
+        // it rather than on a hidden index.
+        panel.read_with(&cx, |panel, _| {
+            let selected = panel.selected_entry.expect("selection should be set");
+            assert!(matches!(
+                panel.entries.get(selected),
+                Some(GitListEntry::Header(GitHeaderEntry {
+                    header: Section::Tracked
+                }))
+            ));
+            assert!(panel.visible_position(selected).is_some());
+        });
+
+        // …and navigation still moves.
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.select_next(&menu::SelectNext, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, _| {
+            let selected = panel.selected_entry.expect("selection should be set");
+            assert!(matches!(
+                panel.entries.get(selected),
+                Some(GitListEntry::Header(GitHeaderEntry {
+                    header: Section::New
+                }))
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_collapsing_a_directory_relocates_a_hidden_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (panel, mut cx) = sectioned_panel(cx).await;
+        set_tree_view(&mut cx, true);
+
+        let (src_key, main_rs) = panel.read_with(&cx, |panel, _| {
+            let src_key = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(dir) if dir.key.path == repo_path("src") => {
+                        Some(dir.key.clone())
+                    }
+                    _ => None,
+                })
+                .expect("src directory should be a row");
+            let main_rs =
+                entry_index_for_path(panel, "src/main.rs").expect("src/main.rs should be a row");
+            (src_key, main_rs)
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_entry = Some(main_rs);
+            panel.toggle_directory(&src_key, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, _| {
+            let selected = panel.selected_entry.expect("selection should be set");
+            assert!(matches!(
+                panel.entries.get(selected),
+                Some(GitListEntry::Directory(dir)) if dir.key == src_key
+            ));
+            assert!(panel.visible_position(selected).is_some());
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.select_next(&menu::SelectNext, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, _| {
+            let selected = panel.selected_entry.expect("selection should be set");
+            assert!(matches!(
+                panel.entries.get(selected),
+                Some(GitListEntry::Header(GitHeaderEntry {
+                    header: Section::New
+                }))
+            ));
+        });
+    }
+
+    /// Index into `entries` of the row for `path`, whether it is a flat or a
+    /// tree status row.
+    fn entry_index_for_path(panel: &GitPanel, path: &str) -> Option<usize> {
+        let path = repo_path(path);
+        panel.entries.iter().position(|entry| {
+            entry
+                .status_entry()
+                .is_some_and(|status| status.repo_path == path)
+        })
     }
 
     #[test]
