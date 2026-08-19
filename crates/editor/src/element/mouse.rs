@@ -793,10 +793,19 @@ impl EditorElement {
         cx: &mut Context<Editor>,
     ) {
         if position_map.gutter_hitbox.is_hovered(window) {
-            let gutter_right_padding = editor.gutter_dimensions.right_padding;
             let hitbox = &position_map.gutter_hitbox;
+            let dimensions = &position_map.gutter_dimensions;
 
-            if event.position.x <= hitbox.bounds.right() - gutter_right_padding
+            // The runnable/bookmark icons carry their own right-click handlers,
+            // so their column is the one place the generic gutter menu must not
+            // deploy. Everything else — the fold column above all, which is
+            // three characters wide in a singleton editor and used to swallow
+            // right-clicks silently — belongs to the gutter menu.
+            let over_indicator_column = dimensions
+                .indicator_column_area()
+                .contains(&(event.position.x - hitbox.bounds.left()));
+
+            if !over_indicator_column
                 // Don't show the gutter_context_menu in collab notes
                 && editor.project.is_some()
             {

@@ -1593,6 +1593,7 @@ impl EditorElement {
         &self,
         line_height: Pixels,
         gutter_hitbox: &Hitbox,
+        content_area_start: Pixels,
         display_rows: Range<DisplayRow>,
         snapshot: &EditorSnapshot,
         scroll_position: gpui::Point<ScrollOffset>,
@@ -1612,6 +1613,7 @@ impl EditorElement {
                         scroll_position,
                         line_height,
                         gutter_hitbox.bounds,
+                        content_area_start,
                         hunk,
                         snapshot,
                     );
@@ -2142,6 +2144,7 @@ impl EditorElement {
         start_row: DisplayRow,
         line_height: Pixels,
         gutter_hitbox: &Hitbox,
+        content_area_start: Pixels,
         max_width: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
@@ -2164,7 +2167,7 @@ impl EditorElement {
         } else {
             AvailableSpace::MaxContent
         };
-        let start_x = em_width;
+        let start_x = content_area_start + em_width;
 
         let mut last_used_color: Option<(Hsla, Oid)> = None;
         let blame_renderer = cx.global::<GlobalBlameRenderer>().0.clone();
@@ -2656,7 +2659,7 @@ impl EditorElement {
                     .into_any_element();
 
                 let position = point(
-                    git_gutter_width + px(1.),
+                    gutter_dimensions.content_area_start() + git_gutter_width + px(1.),
                     line_height
                         * (DisplayRow(start_row.0 + ix as u32).as_f64() - scroll_position.y) as f32
                         + px(1.),
@@ -2745,9 +2748,7 @@ impl EditorElement {
                     gutter.scroll_position.y * ScrollPixelOffset::from(gutter.line_height);
                 let line_origin = gutter.hitbox.origin
                     + point(
-                        gutter.hitbox.size.width
-                            - shaped_line.width
-                            - gutter.dimensions.right_padding,
+                        gutter.dimensions.line_number_area().end - shaped_line.width,
                         ix as f32 * gutter.line_height
                             - Pixels::from(
                                 scroll_top % ScrollPixelOffset::from(gutter.line_height),
@@ -2800,8 +2801,13 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<Option<AnyElement>> {
+        // A split diff's left pane is a synthesized multi-buffer and can never
+        // fold, so the right pane must not either: the fold column is not
+        // reserved in a split gutter (`EditorSnapshot::gutter_dimensions`) and a
+        // chevron would land on the line numbers.
         let include_fold_statuses = EditorSettings::get_global(cx).gutter.folds
             && snapshot.mode.is_full()
+            && self.split_side.is_none()
             && self.editor.read(cx).buffer_kind(cx) == ItemBufferKind::Singleton;
         if include_fold_statuses {
             row_infos
@@ -5195,6 +5201,7 @@ impl EditorElement {
                             layout.position_map.scroll_position,
                             line_height,
                             layout.gutter_hitbox.bounds,
+                            layout.position_map.gutter_dimensions.content_area_start(),
                             hunk,
                             &layout.position_map.snapshot,
                         );
@@ -5325,11 +5332,16 @@ impl EditorElement {
         scroll_position: gpui::Point<ScrollOffset>,
         line_height: Pixels,
         gutter_bounds: Bounds<Pixels>,
+        content_area_start: Pixels,
         hunk: &DisplayDiffHunk,
         snapshot: &EditorSnapshot,
     ) -> Bounds<Pixels> {
         let scroll_top = scroll_position.y * ScrollPixelOffset::from(line_height);
         let gutter_strip_width = Self::gutter_strip_width(line_height);
+        let gutter_bounds = Bounds {
+            origin: gutter_bounds.origin + point(content_area_start, px(0.)),
+            size: gutter_bounds.size,
+        };
 
         match hunk {
             DisplayDiffHunk::Folded { display_row, .. } => {
@@ -6746,7 +6758,7 @@ impl Gutter<'_> {
         let git_gutter_width = EditorElement::gutter_strip_width(self.line_height)
             + self.dimensions.git_blame_entries_width.unwrap_or_default();
 
-        let left_column_x = git_gutter_width + px(2.);
+        let left_column_x = self.dimensions.content_area_start() + git_gutter_width + px(2.);
         let centered_in =
             |start: Pixels, width: Pixels| start + (width - indicator_size.width) / 2.;
         let x = match column {
@@ -8601,6 +8613,7 @@ impl Element for EditorElement {
                     let display_hunks = self.layout_gutter_diff_hunks(
                         line_height,
                         &gutter_hitbox,
+                        gutter_dimensions.content_area_start(),
                         start_row..end_row,
                         &snapshot,
                         scroll_position,
@@ -9034,6 +9047,7 @@ impl Element for EditorElement {
                         start_row,
                         line_height,
                         &gutter_hitbox,
+                        gutter_dimensions.content_area_start(),
                         gutter_dimensions.git_blame_entries_width,
                         window,
                         cx,
@@ -10863,6 +10877,7 @@ mod tests {
             left_padding: Pixels::ZERO,
             right_padding: Pixels::ZERO,
             indicator_column_width: Pixels::ZERO,
+            mirrored: false,
             width: px(30.0),
             margin: Pixels::ZERO,
             git_blame_entries_width: None,

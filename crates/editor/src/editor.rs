@@ -151,7 +151,7 @@ use edit_prediction_types::{
     EditPredictionGranularity, SuggestionDisplayType,
 };
 use editor_settings::{GoToDefinitionFallback, Minimap as MinimapSettings};
-use element::{LineWithInvisibles, PositionMap, layout_line};
+use element::{LineWithInvisibles, PositionMap, SplitSide, layout_line};
 use futures::{
     FutureExt,
     future::{self, Shared},
@@ -990,6 +990,10 @@ pub struct Editor {
     show_runnables: Option<bool>,
     show_bookmarks: Option<bool>,
     show_breakpoints: Option<bool>,
+    /// Which pane of a split diff this editor is, when it is one. Owned by
+    /// `SplittableEditor`, and read by `EditorSnapshot::gutter_dimensions` so
+    /// the two panes compose identical gutters.
+    split_side: Option<SplitSide>,
     show_diff_review_button: bool,
     show_wrap_guides: Option<bool>,
     show_indent_guides: Option<bool>,
@@ -1215,6 +1219,7 @@ pub struct EditorSnapshot {
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
     show_bookmarks: Option<bool>,
+    split_side: Option<SplitSide>,
     git_blame_gutter_max_author_length: Option<usize>,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_display_snapshot: Option<DisplaySnapshot>,
@@ -1243,7 +1248,11 @@ pub struct NavigationOverlayLabel {
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct GutterDimensions {
+    /// Padding on the gutter's *content* edge, holding the git hunk strip, the
+    /// blame column and the expand-excerpt buttons.
     pub left_padding: Pixels,
+    /// Padding on the gutter's *indicator* edge, holding the runnable/bookmark
+    /// column followed by the fold column.
     pub right_padding: Pixels,
     /// The leading part of `right_padding` that holds runnable and bookmark
     /// indicators. The fold toggles get the remainder, so the two never overlap.
@@ -1251,6 +1260,12 @@ pub struct GutterDimensions {
     pub width: Pixels,
     pub margin: Pixels,
     pub git_blame_entries_width: Option<Pixels>,
+    /// When set, the two paddings swap sides: `right_padding` is laid out at
+    /// the gutter's left edge and `left_padding` at its right. The right pane
+    /// of a split diff is painted this way so that, read outward from the
+    /// divider, both panes are the same: a narrow pad, the line numbers, then
+    /// the hunk strip against the code. See `EditorSnapshot::gutter_dimensions`.
+    pub mirrored: bool,
 }
 
 impl GutterDimensions {
@@ -1272,7 +1287,36 @@ impl GutterDimensions {
     /// The horizontal span, relative to the gutter's left edge, in which line
     /// numbers are drawn. Empty when line numbers are hidden.
     pub fn line_number_area(&self) -> Range<Pixels> {
-        self.left_padding..(self.width - self.right_padding).max(self.left_padding)
+        let (start, end) = if self.mirrored {
+            (self.right_padding, self.width - self.left_padding)
+        } else {
+            (self.left_padding, self.width - self.right_padding)
+        };
+        start..end.max(start)
+    }
+
+    /// The horizontal span, relative to the gutter's left edge, that holds the
+    /// runnable and bookmark icons. Empty when no indicator column is reserved,
+    /// which is the usual case — only a singleton gutter with line numbers has
+    /// one.
+    pub fn indicator_column_area(&self) -> Range<Pixels> {
+        let start = if self.mirrored {
+            Pixels::ZERO
+        } else {
+            (self.width - self.right_padding).max(Pixels::ZERO)
+        };
+        start..start + self.indicator_column_width
+    }
+
+    /// The offset, relative to the gutter's left edge, at which the gutter's
+    /// content column starts — the git hunk strip, the blame column and the
+    /// expand-excerpt buttons all measure from here.
+    pub fn content_area_start(&self) -> Pixels {
+        if self.mirrored {
+            (self.width - self.left_padding).max(Pixels::ZERO)
+        } else {
+            Pixels::ZERO
+        }
     }
 }
 
@@ -1740,6 +1784,7 @@ impl Editor {
         clone.enable_lsp_data = self.enable_lsp_data;
         clone.needs_initial_data_update = self.enable_lsp_data;
         clone.enable_runnables = self.enable_runnables;
+        clone.show_runnables = self.show_runnables;
         clone.enable_code_lens = self.enable_code_lens;
         clone
     }
@@ -2205,6 +2250,7 @@ impl Editor {
             show_runnables: None,
             show_bookmarks: None,
             show_breakpoints: None,
+            split_side: None,
             show_diff_review_button: false,
             show_wrap_guides: None,
             show_indent_guides,
@@ -2906,6 +2952,7 @@ impl Editor {
             show_runnables: self.show_runnables,
             show_bookmarks: self.show_bookmarks,
             show_breakpoints: self.show_breakpoints,
+            split_side: self.split_side,
             git_blame_gutter_max_author_length,
             scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
             display_snapshot,
@@ -10811,6 +10858,21 @@ impl Editor {
 
     fn disable_runnables(&mut self) {
         self.enable_runnables = false;
+        // Also drop the gutter reservation: `show_runnables` is what
+        // `gutter_dimensions` sizes the indicator column from, so leaving it at
+        // the global default reserved three characters for an arrow this editor
+        // can never render.
+        self.show_runnables = Some(false);
+    }
+
+    /// Records which pane of a split diff this editor is. `SplittableEditor`
+    /// owns the value; `EditorSnapshot::gutter_dimensions` reads it so both
+    /// panes reserve the same gutter columns.
+    pub(crate) fn set_split_side(&mut self, side: Option<SplitSide>, cx: &mut Context<Self>) {
+        if self.split_side != side {
+            self.split_side = side;
+            cx.notify();
+        }
     }
 
     pub fn disable_code_lens(&mut self, cx: &mut Context<Self>) {
@@ -11470,7 +11532,14 @@ impl EditorSnapshot {
                         ch_advance * max_char_count
                     });
 
-            let is_singleton = self.buffer_snapshot().is_singleton();
+            // A split diff's two panes must reserve identical columns or they
+            // come out different widths. The left pane is always a synthesized
+            // multi-buffer of base text, while the right pane is whatever the
+            // consumer handed us — a singleton for a solo file diff — so left
+            // alone they compose different gutters. Fold toggles are suppressed
+            // in split panes for the same reason (`layout_crease_toggles`), so
+            // dropping the singleton fold/indicator columns loses nothing.
+            let is_singleton = self.buffer_snapshot().is_singleton() && self.split_side.is_none();
 
             let left_padding = git_blame_entries_width.unwrap_or(Pixels::ZERO)
                 + if !is_singleton {
@@ -11530,6 +11599,12 @@ impl EditorSnapshot {
                 width: line_gutter_width + left_padding + right_padding,
                 margin: GutterDimensions::default_gutter_margin(font_id, font_size, cx),
                 git_blame_entries_width,
+                // The left pane's gutter is right-aligned against the divider
+                // (#57), which already puts its content padding next to the
+                // code. Mirroring the right pane's gutter is what makes the two
+                // read as reflections rather than as two copies pointing the
+                // same way.
+                mirrored: self.split_side == Some(SplitSide::Right),
             }
         } else if self.offset_content {
             GutterDimensions::default_with_margin(font_id, font_size, cx)

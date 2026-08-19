@@ -719,6 +719,12 @@ impl SplittableEditor {
             editor.disable_diagnostics(cx);
             editor.disable_mouse_wheel_zoom();
             editor.set_minimap_visibility(crate::MinimapVisibility::Disabled, window, cx);
+            // Same reasoning as the right pane in `Self::new`: breakpoints and
+            // bookmarks are meaningless in a review surface, and left on they
+            // fill the gutter context menu with dead entries.
+            editor.set_show_breakpoints(false, cx);
+            editor.set_show_bookmarks(false, cx);
+            editor.set_split_side(Some(SplitSide::Left), cx);
             editor
         });
 
@@ -845,6 +851,7 @@ impl SplittableEditor {
 
         self.rhs_editor.update(cx, |editor, cx| {
             editor.set_delegate_expand_excerpts(true);
+            editor.set_split_side(Some(SplitSide::Right), cx);
             editor.buffer().update(cx, |rhs_multibuffer, cx| {
                 rhs_multibuffer.set_show_deleted_hunks(false, cx);
                 rhs_multibuffer.set_use_extended_diff_range(true, cx);
@@ -1166,6 +1173,7 @@ impl SplittableEditor {
 
             rhs.set_on_local_selections_changed(None);
             rhs.set_delegate_expand_excerpts(false);
+            rhs.set_split_side(None, cx);
             rhs.buffer().update(cx, |buffer, cx| {
                 buffer.set_show_deleted_hunks(true, cx);
                 buffer.set_use_extended_diff_range(false, cx);
@@ -2394,6 +2402,57 @@ mod tests {
             });
             editor
         });
+        (editor, cx)
+    }
+
+    /// A split diff whose right pane is a genuine singleton buffer — the shape
+    /// the git panel's solo file diff builds, and the one where the two panes
+    /// used to compose different gutters.
+    async fn init_singleton_test<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        base_text: &str,
+        current_text: &str,
+    ) -> (Entity<SplittableEditor>, &'a mut VisualTestContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.diff_view_style = Some(DiffViewStyle::Split);
+                });
+            });
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            crate::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs as Arc<dyn fs::Fs>, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let (buffer, diff) = buffer_with_diff(base_text, current_text, cx);
+        let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+        diff.update(cx, |diff, cx| {
+            diff.recalculate_diff_sync(&buffer_snapshot, cx);
+        });
+        let rhs_multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::singleton(buffer.clone(), cx);
+            multibuffer.add_diff(diff, cx);
+            multibuffer.set_all_diff_hunks_expanded(cx);
+            multibuffer
+        });
+        let editor = cx.new_window_entity(|window, cx| {
+            SplittableEditor::new(
+                DiffViewStyle::Split,
+                rhs_multibuffer.clone(),
+                project.clone(),
+                workspace,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| editor.split(window, cx));
+        cx.run_until_parked();
         (editor, cx)
     }
 
@@ -7004,5 +7063,111 @@ mod tests {
             lhs_fresh,
             "the left pane must have painted its repaired layout, not a stale one"
         );
+    }
+
+    /// The two panes meet at the divider, so any column one of them reserves
+    /// and the other does not shows up as a width difference and as a ragged
+    /// centre strip. The right pane can be a singleton buffer (the git panel's
+    /// solo file diff) while the left pane is always a synthesized multi-buffer
+    /// of base text, and the singleton gutter reserves an indicator column and
+    /// a wider fold column that the multi-buffer one does not.
+    #[gpui::test]
+    async fn test_split_panes_reserve_identical_gutters(cx: &mut gpui::TestAppContext) {
+        let (editor, cx) = init_singleton_test(cx, "one\ntwo\nthree\n", "one\nTWO\nthree\n").await;
+
+        let (rhs_editor, lhs_editor) = editor.update(cx, |editor, _| {
+            let lhs = editor.lhs.as_ref().expect("should have split");
+            (editor.rhs_editor.clone(), lhs.editor.clone())
+        });
+
+        // `Editor::gutter_dimensions` is written during prepaint, so both panes
+        // have to be laid out before they can be compared.
+        let _ = editor_content_with_blocks_and_width(&rhs_editor, px(600.), cx);
+        let _ = editor_content_with_blocks_and_width(&lhs_editor, px(600.), cx);
+        cx.run_until_parked();
+
+        let lhs = lhs_editor.read_with(cx, |editor, _| editor.gutter_dimensions);
+        let rhs = rhs_editor.read_with(cx, |editor, _| editor.gutter_dimensions);
+
+        assert!(lhs.width > px(0.), "the left pane must have been laid out");
+        assert_eq!(
+            lhs.width, rhs.width,
+            "the two panes must reserve the same gutter width, got {lhs:?} vs {rhs:?}"
+        );
+        assert_eq!(lhs.left_padding, rhs.left_padding);
+        assert_eq!(lhs.right_padding, rhs.right_padding);
+        assert_eq!(lhs.indicator_column_width, rhs.indicator_column_width);
+        assert_eq!(
+            lhs.indicator_column_width,
+            px(0.),
+            "a diff pane renders no runnables or bookmarks, so it reserves no \
+             indicator column"
+        );
+
+        // The left pane's gutter is right-aligned against the divider (#57) and
+        // the right pane's is mirrored, so the gap each one puts against the
+        // divider is measured from the opposite edge.
+        assert!(!lhs.mirrored);
+        assert!(rhs.mirrored);
+        // The two are the same subtraction taken from opposite ends, so they
+        // agree only to within float rounding.
+        let same = |a: Pixels, b: Pixels| (a - b).abs() < px(0.01);
+
+        let lhs_gap_at_divider = lhs.width - lhs.line_number_area().end;
+        let rhs_gap_at_divider = rhs.line_number_area().start;
+        assert!(
+            same(lhs_gap_at_divider, rhs_gap_at_divider),
+            "the centre strip must be symmetric: {lhs_gap_at_divider:?} on the \
+             left of the divider vs {rhs_gap_at_divider:?} on the right"
+        );
+
+        let lhs_gap_at_text = lhs.line_number_area().start;
+        let rhs_gap_at_text = rhs.width - rhs.line_number_area().end;
+        assert!(
+            same(lhs_gap_at_text, rhs_gap_at_text),
+            "and so must the space between the numbers and the code: \
+             {lhs_gap_at_text:?} vs {rhs_gap_at_text:?}"
+        );
+    }
+
+    /// Breakpoints and bookmarks are meaningless while reviewing a diff, and
+    /// leaving them on is what filled the gutter context menu with entries the
+    /// pane cannot act on. The right pane opted out from the start; the left
+    /// pane did not.
+    #[gpui::test]
+    async fn test_split_panes_offer_no_breakpoint_or_bookmark_entries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (editor, cx) = init_singleton_test(cx, "one\ntwo\nthree\n", "one\nTWO\nthree\n").await;
+
+        let (rhs_editor, lhs_editor) = editor.update(cx, |editor, _| {
+            let lhs = editor.lhs.as_ref().expect("should have split");
+            (editor.rhs_editor.clone(), lhs.editor.clone())
+        });
+
+        for (name, pane) in [("left", &lhs_editor), ("right", &rhs_editor)] {
+            let (breakpoints, bookmarks, runnables) = pane.read_with(cx, |editor, _| {
+                (
+                    editor.show_breakpoints,
+                    editor.show_bookmarks,
+                    editor.show_runnables,
+                )
+            });
+            assert_eq!(
+                breakpoints,
+                Some(false),
+                "{name} pane must not offer breakpoints"
+            );
+            assert_eq!(
+                bookmarks,
+                Some(false),
+                "{name} pane must not offer bookmarks"
+            );
+            assert_eq!(
+                runnables,
+                Some(false),
+                "{name} pane has runnables disabled, so it must not reserve their column"
+            );
+        }
     }
 }

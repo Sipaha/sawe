@@ -10,7 +10,11 @@ impl GutterDimensions {
 
     /// The left edge of the fold area, relative to the gutter's left edge.
     pub fn fold_area_start(&self) -> Pixels {
-        self.width - self.right_padding + self.indicator_column_width
+        if self.mirrored {
+            self.indicator_column_width
+        } else {
+            self.width - self.right_padding + self.indicator_column_width
+        }
     }
 }
 

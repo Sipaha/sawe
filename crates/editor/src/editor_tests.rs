@@ -38208,6 +38208,7 @@ fn test_gutter_columns_tile_without_overlap(_cx: &mut TestAppContext) {
             width,
             margin,
             git_blame_entries_width: None,
+            mirrored: false,
         };
 
         let numbers = dimensions.line_number_area();
@@ -38259,12 +38260,96 @@ fn test_line_number_area_never_inverts(_cx: &mut TestAppContext) {
         width: px(100.),
         margin: px(0.),
         git_blame_entries_width: None,
+        mirrored: false,
     };
 
     let numbers = dimensions.line_number_area();
     assert!(
         numbers.start <= numbers.end,
         "expected an empty range rather than an inverted one, got {numbers:?}",
+    );
+}
+
+/// A mirrored gutter is the same four spans read right-to-left: the content
+/// column (git strip, blame, expand-excerpt buttons) moves to the gutter's
+/// right edge and the indicator/fold padding to its left. The right pane of a
+/// split diff is painted this way so that both panes put the same narrow pad
+/// against the divider.
+#[gpui::test]
+fn test_mirrored_gutter_columns_are_the_reflection(_cx: &mut TestAppContext) {
+    let upright = GutterDimensions {
+        left_padding: px(36.),
+        right_padding: px(9.),
+        indicator_column_width: px(0.),
+        width: px(72.),
+        margin: px(4.),
+        git_blame_entries_width: None,
+        mirrored: false,
+    };
+    let mirrored = GutterDimensions {
+        mirrored: true,
+        ..upright
+    };
+
+    assert_eq!(upright.content_area_start(), px(0.));
+    assert_eq!(mirrored.content_area_start(), px(36.));
+
+    assert_eq!(upright.line_number_area(), px(36.)..px(63.));
+    assert_eq!(mirrored.line_number_area(), px(9.)..px(36.));
+
+    // Same width of number area on both, just measured from the other edge.
+    let span = |range: std::ops::Range<Pixels>| range.end - range.start;
+    assert_eq!(
+        span(upright.line_number_area()),
+        span(mirrored.line_number_area()),
+    );
+
+    // The gap between the gutter's *outer* edge and the numbers is the content
+    // padding on both, and the gap on the *inner* edge is the fold padding on
+    // both — that reflection is the whole point.
+    assert_eq!(
+        upright.width - upright.line_number_area().end,
+        mirrored.line_number_area().start,
+    );
+    assert_eq!(
+        upright.line_number_area().start,
+        mirrored.width - mirrored.line_number_area().end,
+    );
+
+    // No indicator column is reserved here, so the span that the gutter's
+    // right-click handler must leave to the runnable/bookmark icons is empty on
+    // both — an inverted range there would silently swallow right-clicks again.
+    assert!(upright.indicator_column_area().is_empty());
+    assert!(mirrored.indicator_column_area().is_empty());
+
+    assert_eq!(mirrored.fold_area_start(), px(0.));
+}
+
+/// The indicator column is the one span of an upright gutter that the generic
+/// right-click handler must not claim, because the run arrow and the bookmark
+/// carry their own menus.
+#[gpui::test]
+fn test_indicator_column_area_covers_exactly_the_icons(_cx: &mut TestAppContext) {
+    let dimensions = GutterDimensions {
+        left_padding: px(18.),
+        right_padding: px(54.),
+        indicator_column_width: px(27.),
+        width: px(99.),
+        margin: px(4.),
+        git_blame_entries_width: None,
+        mirrored: false,
+    };
+
+    assert_eq!(dimensions.indicator_column_area(), px(45.)..px(72.));
+    assert_eq!(
+        dimensions.indicator_column_area().end,
+        dimensions.fold_area_start(),
+        "the fold column picks up exactly where the indicator column stops"
+    );
+    assert_eq!(
+        dimensions.indicator_column_area().start,
+        dimensions.line_number_area().end,
+        "and the indicator column starts where the numbers stop"
     );
 }
 

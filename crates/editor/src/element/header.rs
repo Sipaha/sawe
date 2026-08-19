@@ -48,7 +48,7 @@ pub(super) struct StickyHeaders {
     pub(super) lines: Vec<StickyHeaderLine>,
     gutter_background: Hsla,
     content_background: Hsla,
-    gutter_right_padding: Pixels,
+    line_number_area_end: Pixels,
 }
 
 pub(super) struct StickyHeaderLine {
@@ -298,7 +298,7 @@ impl EditorElement {
             lines,
             gutter_background: cx.theme().colors().editor_gutter_background,
             content_background: self.style.background,
-            gutter_right_padding: gutter_dimensions.right_padding,
+            line_number_area_end: gutter_dimensions.line_number_area().end,
         })
     }
 
@@ -440,7 +440,7 @@ impl StickyHeaders {
 
                     line.paint(
                         layout,
-                        self.gutter_right_padding,
+                        self.line_number_area_end,
                         line.available_text_width,
                         layout.content_origin,
                         line_height,
@@ -502,7 +502,7 @@ impl StickyHeaderLine {
     fn paint(
         &mut self,
         layout: &EditorLayout,
-        gutter_right_padding: Pixels,
+        line_number_area_end: Pixels,
         available_text_width: Pixels,
         content_origin: gpui::Point<Pixels>,
         line_height: Pixels,
@@ -537,9 +537,8 @@ impl StickyHeaderLine {
 
         if let Some(line_number) = &self.line_number {
             let gutter_origin = layout.gutter_hitbox.origin + point(Pixels::ZERO, self.offset);
-            let gutter_width = layout.gutter_hitbox.size.width;
             let origin = point(
-                gutter_origin.x + gutter_width - gutter_right_padding - line_number.width,
+                gutter_origin.x + line_number_area_end - line_number.width,
                 gutter_origin.y,
             );
             line_number
