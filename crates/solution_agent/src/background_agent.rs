@@ -222,11 +222,7 @@ impl BackgroundAgent {
                 agent_relative_time(snap.mtime, now),
                 snap.stop_reason.is_some(),
             ),
-            None => (
-                "Starting…".to_string(),
-                "no output yet".to_string(),
-                false,
-            ),
+            None => ("Starting…".to_string(), "no output yet".to_string(), false),
         };
         let state_label = if self.killed {
             "killed"
@@ -237,12 +233,7 @@ impl BackgroundAgent {
         } else {
             "running"
         };
-        let header = format!(
-            "Agent {} · {} · {}",
-            self.id.short(),
-            state_label,
-            observed
-        );
+        let header = format!("Agent {} · {} · {}", self.id.short(), state_label, observed);
         let body = if self.killed {
             format!(
                 "{activity}\n\nKilled: the parent claude process was restarted \
@@ -802,7 +793,10 @@ mod tests {
              output_file: /tmp/claude-1000/-home-x/b618b048/tasks/a874596024f50661f.output\n\
              ````";
         let parsed = managed_agent_announcement(None, Some(content));
-        assert!(parsed.is_some(), "must parse the announcement out of content");
+        assert!(
+            parsed.is_some(),
+            "must parse the announcement out of content"
+        );
         let (id, path) = parsed.unwrap();
         assert_eq!(id, "a874596024f50661f");
         assert_eq!(
@@ -944,7 +938,10 @@ mod tests {
     fn parse_jsonl_snapshot_usage_limit_wall_is_flagged() {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm (Asia/Novosibirsk)"}]}}"#;
         let snap = parse_jsonl_snapshot(line);
-        assert!(snap.usage_limited, "the session-limit wall must be recognised");
+        assert!(
+            snap.usage_limited,
+            "the session-limit wall must be recognised"
+        );
         assert!(
             snap.stop_reason.is_none(),
             "the wall carries no terminal stop_reason — usage_limited is the signal"
@@ -978,7 +975,10 @@ mod tests {
         ));
         assert!(agent.hit_usage_limit());
         assert!(!agent.is_messageable(), "a walled agent is not live work");
-        assert!(agent.renders_stream(), "but its tab stays visible with the reason");
+        assert!(
+            agent.renders_stream(),
+            "but its tab stays visible with the reason"
+        );
         assert_eq!(
             agent.stream_state(),
             crate::stream::StreamState::Done {

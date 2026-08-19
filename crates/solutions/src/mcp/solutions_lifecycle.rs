@@ -490,7 +490,9 @@ impl McpServerTool for RenameSolutionTool {
         let id = crate::SolutionId(solution_id);
         let root = cx.update(|cx| -> Result<String> {
             let store = SolutionStore::global(cx);
-            store.update(cx, |store, cx| store.rename_solution(id, &input.new_name, cx))?;
+            store.update(cx, |store, cx| {
+                store.rename_solution(id, &input.new_name, cx)
+            })?;
             let root = store
                 .read(cx)
                 .find_solution(id)
@@ -1004,4 +1006,3 @@ impl McpServerTool for FindForPathTool {
         })
     }
 }
-

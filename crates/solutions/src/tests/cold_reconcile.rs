@@ -64,8 +64,14 @@ fn cold_reconcile_rewrites_all_three_databases_and_merges_the_bucket() {
     let old_member_text = old_member.to_string_lossy().into_owned();
     let new_root_text = new_root.to_string_lossy().into_owned();
     let new_member_text = new_member.to_string_lossy().into_owned();
-    let old_source_text = old_member.join("src/main.rs").to_string_lossy().into_owned();
-    let new_source_text = new_member.join("src/main.rs").to_string_lossy().into_owned();
+    let old_source_text = old_member
+        .join("src/main.rs")
+        .to_string_lossy()
+        .into_owned();
+    let new_source_text = new_member
+        .join("src/main.rs")
+        .to_string_lossy()
+        .into_owned();
 
     let app = Connection::open_memory(Some("cold_reconcile_app"));
     create_app_schema(&app);
@@ -77,11 +83,10 @@ fn cold_reconcile_rewrites_all_three_databases_and_merges_the_bucket() {
     app.exec_bound::<String>("INSERT INTO solution_members VALUES (1, 1, 'sawe', ?, 0, NULL)")
         .expect("prepare members insert")(old_member_text.clone())
     .expect("insert member");
-    app.exec_bound::<(String, String)>("INSERT INTO workspaces VALUES (42, ?1, '0', ?2, '0', NULL)")
-        .expect("prepare workspace insert")((
-        old_member_text.clone(),
-        old_member_text.clone(),
-    ))
+    app.exec_bound::<(String, String)>(
+        "INSERT INTO workspaces VALUES (42, ?1, '0', ?2, '0', NULL)",
+    )
+    .expect("prepare workspace insert")((old_member_text.clone(), old_member_text.clone()))
     .expect("insert workspace");
     app.exec_bound::<String>("INSERT INTO console_panel_state VALUES (42, 0, ?)")
         .expect("prepare console insert")(old_member_text.clone())
@@ -149,7 +154,10 @@ fn cold_reconcile_rewrites_all_three_databases_and_merges_the_bucket() {
     apply_one_with_connections(&app, Some(&agent), Some(projects.path()), &rewrite)
         .expect("reconcile");
 
-    assert_eq!(text(&app, "SELECT root FROM solutions"), vec![new_root_text]);
+    assert_eq!(
+        text(&app, "SELECT root FROM solutions"),
+        vec![new_root_text]
+    );
     assert_eq!(
         text(&app, "SELECT local_path FROM solution_members"),
         vec![new_member_text.clone()]
@@ -179,7 +187,10 @@ fn cold_reconcile_rewrites_all_three_databases_and_merges_the_bucket() {
         vec![new_member_text.clone()]
     );
     assert_eq!(
-        text(&app, "SELECT CAST(working_directory AS TEXT) FROM terminals"),
+        text(
+            &app,
+            "SELECT CAST(working_directory AS TEXT) FROM terminals"
+        ),
         vec![new_member_text.clone()]
     );
     assert_eq!(
@@ -241,8 +252,10 @@ fn cold_reconcile_keeps_the_workspace_id_even_when_a_row_squats_on_the_target() 
 
     let app = Connection::open_memory(Some("cold_reconcile_workspace_identity"));
     create_app_schema(&app);
-    app.exec_bound::<(String, String)>("INSERT INTO workspaces VALUES (42, ?1, '0', ?2, '0', NULL)")
-        .expect("prepare workspace insert")((
+    app.exec_bound::<(String, String)>(
+        "INSERT INTO workspaces VALUES (42, ?1, '0', ?2, '0', NULL)",
+    )
+    .expect("prepare workspace insert")((
         old_root.to_string_lossy().into_owned(),
         old_root.to_string_lossy().into_owned(),
     ))
@@ -314,7 +327,14 @@ fn cold_reconcile_repairs_relocated_agent_worktrees() {
         .join("old-project")
         .join("wt-1");
     git(
-        &["worktree", "add", "-q", "-b", "wt-1", &tree.to_string_lossy()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt-1",
+            &tree.to_string_lossy(),
+        ],
         &old_member,
     );
 

@@ -309,7 +309,6 @@ pub enum EditPredictionDataCollectionChoice {
     No,
 }
 
-
 /// The mode in which edit predictions should be displayed.
 #[derive(
     Copy,

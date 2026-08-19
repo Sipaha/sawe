@@ -4,7 +4,7 @@
 //! methods; `self`/fields stay owned by the struct.
 
 use agent_client_protocol::schema as acp;
-use gpui::{App, Context, FollowMode, Focusable, SharedString, TaskExt as _, Window};
+use gpui::{App, Context, Focusable, FollowMode, SharedString, TaskExt as _, Window};
 
 use super::{SolutionSessionView, retain_images_with_live_placeholder};
 use crate::model::SessionState;

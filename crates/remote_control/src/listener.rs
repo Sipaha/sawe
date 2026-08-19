@@ -1059,67 +1059,67 @@ where
                                 }
                             }
                         } else {
-                        // Chunked-upload frame: 16-byte header
-                        // (u64 upload_id BE | u64 offset BE) + raw payload.
-                        // See `docs/plans/2026-05-19-chunked-upload-binary-frames.md`.
-                        // Anything < 16 bytes is malformed — log and
-                        // drop rather than erroring on the WS, since a
-                        // legit client never sends shorter frames and
-                        // an attacker shouldn't get useful feedback.
-                        if bytes.len() < 16 {
-                            log::warn!(
-                                target: "remote_control",
-                                "client {client_name:?} sent {n}-byte binary frame (< 16); dropping",
-                                n = bytes.len(),
+                            // Chunked-upload frame: 16-byte header
+                            // (u64 upload_id BE | u64 offset BE) + raw payload.
+                            // See `docs/plans/2026-05-19-chunked-upload-binary-frames.md`.
+                            // Anything < 16 bytes is malformed — log and
+                            // drop rather than erroring on the WS, since a
+                            // legit client never sends shorter frames and
+                            // an attacker shouldn't get useful feedback.
+                            if bytes.len() < 16 {
+                                log::warn!(
+                                    target: "remote_control",
+                                    "client {client_name:?} sent {n}-byte binary frame (< 16); dropping",
+                                    n = bytes.len(),
+                                );
+                                continue;
+                            }
+                            // Diagnostic — debug-level breadcrumb so a live
+                            // log tail can confirm chunks ARE reaching the
+                            // server. Per-chunk, so it stays at debug to
+                            // avoid flooding info on large uploads. The
+                            // header parse below is duplicated by the
+                            // handler; that's fine, this is a debug aid not
+                            // a hot path.
+                            let upload_id_log =
+                                u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+                            let offset_log =
+                                u64::from_be_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
+                            log::debug!(
+                                target: "remote_control::upload",
+                                "binary frame from {client_name:?}: upload_id={upload_id_log} offset={offset_log} payload_bytes={}",
+                                bytes.len() - 16,
                             );
-                            continue;
-                        }
-                        // Diagnostic — debug-level breadcrumb so a live
-                        // log tail can confirm chunks ARE reaching the
-                        // server. Per-chunk, so it stays at debug to
-                        // avoid flooding info on large uploads. The
-                        // header parse below is duplicated by the
-                        // handler; that's fine, this is a debug aid not
-                        // a hot path.
-                        let upload_id_log =
-                            u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
-                        let offset_log =
-                            u64::from_be_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
-                        log::debug!(
-                            target: "remote_control::upload",
-                            "binary frame from {client_name:?}: upload_id={upload_id_log} offset={offset_log} payload_bytes={}",
-                            bytes.len() - 16,
-                        );
-                        // Delegate parsing + dispatch to the upper-layer
-                        // handler registered via
-                        // `remote_control::set_binary_frame_handler`.
-                        // Keeps `remote_control` free of the
-                        // `solution_agent` dep (which would pull a
-                        // second rustls CryptoProvider via its
-                        // transitive `agent_servers` / `claude-acp`
-                        // graph and break the post-auth handshake).
-                        match crate::binary_frame_handler() {
-                            Some(handler) => {
-                                if let Err(err) = handler(&bytes) {
+                            // Delegate parsing + dispatch to the upper-layer
+                            // handler registered via
+                            // `remote_control::set_binary_frame_handler`.
+                            // Keeps `remote_control` free of the
+                            // `solution_agent` dep (which would pull a
+                            // second rustls CryptoProvider via its
+                            // transitive `agent_servers` / `claude-acp`
+                            // graph and break the post-auth handshake).
+                            match crate::binary_frame_handler() {
+                                Some(handler) => {
+                                    if let Err(err) = handler(&bytes) {
+                                        log::warn!(
+                                            target: "remote_control::upload",
+                                            "binary frame handler rejected upload_id={upload_id_log} offset={offset_log} (client={client_name:?}): {err}",
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            target: "remote_control::upload",
+                                            "binary frame written: upload_id={upload_id_log} offset={offset_log}",
+                                        );
+                                    }
+                                }
+                                None => {
                                     log::warn!(
                                         target: "remote_control::upload",
-                                        "binary frame handler rejected upload_id={upload_id_log} offset={offset_log} (client={client_name:?}): {err}",
-                                    );
-                                } else {
-                                    log::debug!(
-                                        target: "remote_control::upload",
-                                        "binary frame written: upload_id={upload_id_log} offset={offset_log}",
+                                        "NO binary frame handler installed; dropping {n}-byte frame (client={client_name:?})",
+                                        n = bytes.len(),
                                     );
                                 }
                             }
-                            None => {
-                                log::warn!(
-                                    target: "remote_control::upload",
-                                    "NO binary frame handler installed; dropping {n}-byte frame (client={client_name:?})",
-                                    n = bytes.len(),
-                                );
-                            }
-                        }
                             None
                         }
                     }
@@ -1301,8 +1301,7 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    const HMAC_HEX: &str =
-        "abababababababababababababababababababababababababababababababab";
+    const HMAC_HEX: &str = "abababababababababababababababababababababababababababababababab";
 
     #[test]
     fn handshake_negotiates_compression_when_client_advertises_deflate() {

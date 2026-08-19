@@ -430,7 +430,8 @@ fn migrate_identity_fn(
     legacy_solution_ids: &[(String, i64)],
     members: &[(i64, i64, String)],
 ) -> Result<IdentityMigrationReport> {
-    let sessions = connection.select::<(String, String, Option<String>, Option<i64>)>(indoc! {"
+    let sessions =
+        connection.select::<(String, String, Option<String>, Option<i64>)>(indoc! {"
         SELECT id, solution_id, cwd, member_id FROM solution_sessions
     "})?()?;
 
@@ -455,8 +456,9 @@ fn migrate_identity_fn(
         let numeric_solution: i64 = match solution_id.parse::<i64>() {
             Ok(numeric) => numeric,
             Err(_) => {
-                let Some((_, new_id)) =
-                    legacy_solution_ids.iter().find(|(old, _)| old == solution_id)
+                let Some((_, new_id)) = legacy_solution_ids
+                    .iter()
+                    .find(|(old, _)| old == solution_id)
                 else {
                     if !unmapped.contains(solution_id) {
                         unmapped.push(solution_id.clone());
@@ -505,7 +507,11 @@ pub(crate) fn apply_idempotent_add_column(connection: &Connection, column_def: &
 /// Generalized form of [apply_idempotent_add_column] that targets an arbitrary
 /// `table`. `table` is always an internal constant (never user input), so
 /// inlining it into the DDL carries no injection risk.
-pub(crate) fn apply_idempotent_add_column_to(connection: &Connection, table: &str, column_def: &str) {
+pub(crate) fn apply_idempotent_add_column_to(
+    connection: &Connection,
+    table: &str,
+    column_def: &str,
+) {
     // Pre-check via `PRAGMA table_info`. The sqlez wrapper surfaces
     // duplicate-column errors as opaque "Prepare call failed for
     // query: …" without the underlying SQLite text, so the old

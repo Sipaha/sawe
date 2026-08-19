@@ -95,9 +95,7 @@ mod tests {
                 members: vec![SolutionMember {
                     id: MemberId(1),
                     name: "ecos-base".into(),
-                    local_path: PathBuf::from(
-                        "/home/user/sawe/solutions/ecos-platform/ecos-base",
-                    ),
+                    local_path: PathBuf::from("/home/user/sawe/solutions/ecos-platform/ecos-base"),
                     origin_catalog_id: Some(CatalogId(1)),
                 }],
                 last_opened_at: None,

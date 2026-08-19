@@ -75,13 +75,7 @@ pub trait AgentServer: Send {
         None
     }
 
-    fn set_default_model(
-        &self,
-        _model_id: Option<AgentModelId>,
-        _fs: Arc<dyn Fs>,
-        _cx: &mut App,
-    ) {
-    }
+    fn set_default_model(&self, _model_id: Option<AgentModelId>, _fs: Arc<dyn Fs>, _cx: &mut App) {}
 
     fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<AgentModelId> {
         HashSet::default()

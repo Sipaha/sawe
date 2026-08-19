@@ -190,10 +190,7 @@ impl SolutionGitAggregator {
         let store = self.store.upgrade()?;
         let store = store.read(cx);
         if let Some(id) = solution_id {
-            return store
-                .find_solution(solutions::SolutionId(id))
-                .ok()
-                .cloned();
+            return store.find_solution(solutions::SolutionId(id)).ok().cloned();
         }
         let mut best: Option<&Solution> = None;
         for sol in store.solutions() {

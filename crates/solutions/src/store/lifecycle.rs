@@ -19,11 +19,7 @@ impl SolutionStore {
             .config
             .solutions
             .iter()
-            .filter_map(|s| {
-                s.root
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-            })
+            .filter_map(|s| s.root.file_name().map(|f| f.to_string_lossy().into_owned()))
             .collect();
         let folder = unique_slug(name, &taken);
         let root = root_base.join(&folder);

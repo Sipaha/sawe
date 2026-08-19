@@ -257,14 +257,12 @@ impl Render for WelcomeWindow {
                                     .items_center()
                                     .child(Vector::square(VectorName::SpkLogo, rems_from_px(45.)))
                                     .child(
-                                        v_flex()
-                                            .child(Headline::new("Welcome to Sawe"))
-                                            .child(
-                                                Label::new("The editor for what's next")
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted)
-                                                    .italic(),
-                                            ),
+                                        v_flex().child(Headline::new("Welcome to Sawe")).child(
+                                            Label::new("The editor for what's next")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .italic(),
+                                        ),
                                     ),
                             )
                             .child(self.render_configure_menu(cx)),

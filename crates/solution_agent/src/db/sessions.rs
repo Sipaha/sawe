@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use agent_client_protocol::schema as acp;
-use anyhow::anyhow;
 use anyhow::Result;
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use gpui::{SharedString, Task};
 use indoc::indoc;
@@ -337,7 +337,11 @@ pub(crate) fn insert_or_update_metadata(
     Ok(())
 }
 
-pub(crate) fn update_blob(connection: &Connection, id: SolutionSessionId, blob: &[u8]) -> Result<()> {
+pub(crate) fn update_blob(
+    connection: &Connection,
+    id: SolutionSessionId,
+    blob: &[u8],
+) -> Result<()> {
     let mut update = connection.exec_bound::<(Vec<u8>, String)>(indoc! {"
         UPDATE solution_sessions SET acp_thread_blob = ?1 WHERE id = ?2
     "})?;
@@ -345,7 +349,10 @@ pub(crate) fn update_blob(connection: &Connection, id: SolutionSessionId, blob: 
     Ok(())
 }
 
-pub(crate) fn select_blob(connection: &Connection, id: SolutionSessionId) -> Result<Option<Vec<u8>>> {
+pub(crate) fn select_blob(
+    connection: &Connection,
+    id: SolutionSessionId,
+) -> Result<Option<Vec<u8>>> {
     let mut select = connection.select_bound::<String, Option<Vec<u8>>>(indoc! {"
         SELECT acp_thread_blob FROM solution_sessions WHERE id = ? LIMIT 1
     "})?;
@@ -412,7 +419,11 @@ pub(crate) fn select_epoch(connection: &Connection, session_id: &str) -> Result<
     Ok(rows.into_iter().next().flatten())
 }
 
-pub(crate) fn update_change_seq(connection: &Connection, session_id: &str, change_seq: i64) -> Result<()> {
+pub(crate) fn update_change_seq(
+    connection: &Connection,
+    session_id: &str,
+    change_seq: i64,
+) -> Result<()> {
     // `max(COALESCE(...), ?1)` keeps the durable value monotonic regardless of
     // the order detached background writes land in: a lower write can never
     // overwrite a higher one. This protects the Task 5.1b invariant (durable

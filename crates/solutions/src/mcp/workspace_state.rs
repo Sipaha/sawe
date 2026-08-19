@@ -330,7 +330,10 @@ impl McpServerTool for DispatchActionTool {
 /// `project_files::workspaces_for_solution` whenever you need the Solution's
 /// own `Workspace`, and reserve this for genuinely window-level operations
 /// (screenshot, action dispatch, visual dump).
-pub(crate) fn find_window_for_solution(solution_id: i64, cx: &App) -> Option<gpui::AnyWindowHandle> {
+pub(crate) fn find_window_for_solution(
+    solution_id: i64,
+    cx: &App,
+) -> Option<gpui::AnyWindowHandle> {
     crate::mcp::project_files::workspaces_for_solution(solution_id, cx)
         .first()
         .map(|(handle, _)| *handle)

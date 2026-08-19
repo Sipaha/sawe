@@ -161,7 +161,11 @@ impl SolutionAgentStore {
     /// `finish_judge`/`finish_auditor` reaps it — so a `VerdictRecord` can record
     /// what the supervisor's own review turn cost (the verdict tool itself has no
     /// token figure to pass). `None` when the session is gone or has no usage yet.
-    fn ephemeral_session_tokens(&self, judge_id: Option<SolutionSessionId>, cx: &App) -> Option<u64> {
+    fn ephemeral_session_tokens(
+        &self,
+        judge_id: Option<SolutionSessionId>,
+        cx: &App,
+    ) -> Option<u64> {
         let session = self.session(judge_id?)?;
         let session = session.read(cx);
         session
@@ -282,12 +286,7 @@ impl SolutionAgentStore {
                     _ => None,
                 }
             };
-            (
-                s.solution_id,
-                s.agent_id.clone(),
-                project,
-                context_usage,
-            )
+            (s.solution_id, s.agent_id.clone(), project, context_usage)
         };
         let Some(project) = project else {
             log::debug!("{kind}({id}): session has no cached project (prebuilt/cold); skipped");
@@ -599,7 +598,16 @@ impl SolutionAgentStore {
             .map(|handle| crate::supervisor::verdict_nonce_matches(&handle.nonce, nonce));
         match matched {
             Some(true) => {
-                self.apply_verdict(id, action, reasoning, message, question, None, wait_seconds, cx);
+                self.apply_verdict(
+                    id,
+                    action,
+                    reasoning,
+                    message,
+                    question,
+                    None,
+                    wait_seconds,
+                    cx,
+                );
                 VerdictAuth::Applied
             }
             Some(false) => VerdictAuth::Unauthorized,
@@ -1168,7 +1176,11 @@ impl SolutionAgentStore {
     /// close) so an in-session toggle isn't clobbered. Anchors `watch_started_ms
     /// = now` like the startup load so a pre-close idle session isn't judged the
     /// instant it reopens.
-    pub(super) fn reload_supervisor_state_for(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+    pub(super) fn reload_supervisor_state_for(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
         if self.supervisor_states.contains_key(&id) {
             return;
         }
@@ -1303,11 +1315,7 @@ impl SolutionAgentStore {
     /// reset the thread. NOT invoked on an observer-issued `compact` verdict
     /// (that path keeps `user_intent.md`). See
     /// [`crate::supervisor::wipe_supervisor_memory`].
-    pub(crate) fn wipe_supervisor_memory(
-        &mut self,
-        id: SolutionSessionId,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn wipe_supervisor_memory(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
         if let Some(root) = self.solution_root_for(id, cx) {
             let dir = crate::supervisor::supervisor_dir(&root, id);
             crate::supervisor::wipe_supervisor_memory(&dir);
@@ -1442,8 +1450,7 @@ impl SolutionAgentStore {
                 return;
             };
             let waiting = matches!(state.status, SupervisorStatus::WaitingUser);
-            let done_hold =
-                matches!(state.status, SupervisorStatus::Held) && state.held_by_done;
+            let done_hold = matches!(state.status, SupervisorStatus::Held) && state.held_by_done;
             if !waiting && !done_hold {
                 return;
             }
@@ -1795,10 +1802,11 @@ impl SolutionAgentStore {
                     {
                         let since = tc.status_started_at.unwrap_or(s.last_activity_at);
                         let tool_secs = now.signed_duration_since(since).num_seconds();
-                        let pty_running =
-                            tc.terminals().any(|term| term.read(cx).is_process_running(cx));
-                        let shows_liveness = pty_running
-                            || silent_secs < TOOL_OUTPUT_SILENCE_SECS as i64;
+                        let pty_running = tc
+                            .terminals()
+                            .any(|term| term.read(cx).is_process_running(cx));
+                        let shows_liveness =
+                            pty_running || silent_secs < TOOL_OUTPUT_SILENCE_SECS as i64;
                         Some((tool_secs, shows_liveness))
                     }
                     _ => None,
@@ -1899,8 +1907,7 @@ impl SolutionAgentStore {
                     // one in the same worktree.
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     if let Some(last_ms) = self.last_auto_reconnect_ms.get(&id)
-                        && now_ms.saturating_sub(*last_ms)
-                            < (RECONNECT_COOLDOWN_SECS as i64) * 1000
+                        && now_ms.saturating_sub(*last_ms) < (RECONNECT_COOLDOWN_SECS as i64) * 1000
                     {
                         log::warn!(
                             target: "solution_agent::store",
@@ -2006,12 +2013,10 @@ impl SolutionAgentStore {
                         // judge bumps it on every thinking/text/tool event — and
                         // extend while it progresses, up to a hard cap that still
                         // catches a runaway (infinite-thinking) judge.
-                        let judge_silent_ms = judge_id
-                            .and_then(|jid| self.session(jid))
-                            .map(|js| {
-                                now_ms.saturating_sub(
-                                    js.read(cx).last_activity_at.timestamp_millis(),
-                                )
+                        let judge_silent_ms =
+                            judge_id.and_then(|jid| self.session(jid)).map(|js| {
+                                now_ms
+                                    .saturating_sub(js.read(cx).last_activity_at.timestamp_millis())
                             });
                         let judge_alive = judge_silent_ms.is_some_and(|ms| {
                             ms < (crate::supervisor::JUDGE_LIVENESS_SILENCE_SECS as i64) * 1000
@@ -2029,9 +2034,9 @@ impl SolutionAgentStore {
                         // reset-time resume) instead of a transient failure that
                         // spirals to a false `Stopped(ProviderError)` (finding #3).
                         // Otherwise it's a genuine timeout.
-                        let message = self
-                            .judge_wall_message(id, cx)
-                            .unwrap_or_else(|| "judge timed out / ended without verdict".to_string());
+                        let message = self.judge_wall_message(id, cx).unwrap_or_else(|| {
+                            "judge timed out / ended without verdict".to_string()
+                        });
                         self.on_judge_failed(id, message, cx);
                     } else {
                         // PHANTOM `Judging` (finding #2): the fire set `Judging` +
@@ -2227,5 +2232,4 @@ impl SolutionAgentStore {
             }
         }
     }
-
 }

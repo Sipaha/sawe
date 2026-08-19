@@ -79,7 +79,10 @@ impl McpServerTool for AddMemberTool {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
         let solution_id = crate::mcp::resolve_solution_id(input.solution_id)?.0;
-        anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
+        anyhow::ensure!(
+            input.catalog_id > 0,
+            "invalid_params: catalog_id is required"
+        );
 
         let sol_id = crate::SolutionId(solution_id);
         let cat_id = crate::CatalogId(input.catalog_id);
@@ -130,10 +133,7 @@ impl McpServerTool for AddMemberTool {
 
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
-                text: format!(
-                    "queued add_member: {}/{}",
-                    solution_id, input.catalog_id
-                ),
+                text: format!("queued add_member: {}/{}", solution_id, input.catalog_id),
             }],
             structured_content: AddMemberResult { operation_id },
         })
@@ -238,7 +238,9 @@ impl<'de> Deserialize<'de> for RemoveMemberParams {
             member_id: i64,
         }
         Ok(Self {
-            member_id: Option::<Inner>::deserialize(de)?.unwrap_or_default().member_id,
+            member_id: Option::<Inner>::deserialize(de)?
+                .unwrap_or_default()
+                .member_id,
         })
     }
 }
@@ -331,11 +333,8 @@ impl McpServerTool for ReorderMembersTool {
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
             let sol_id = crate::SolutionId(input.solution_id);
-            let order: Vec<crate::MemberId> = input
-                .member_ids
-                .into_iter()
-                .map(crate::MemberId)
-                .collect();
+            let order: Vec<crate::MemberId> =
+                input.member_ids.into_iter().map(crate::MemberId).collect();
             store.update(cx, |s, cx| s.reorder_members(sol_id, order, cx))?;
             Ok(())
         })?;
@@ -434,4 +433,3 @@ impl McpServerTool for SetActiveMemberTool {
         })
     }
 }
-

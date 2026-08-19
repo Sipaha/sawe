@@ -372,7 +372,10 @@ mod tests {
 
     #[test]
     fn pill_tooltip_prefers_full_command() {
-        let out = pill_tooltip_text(SharedString::from("cd /very/long/path && make"), SharedString::from("abc·cd …"));
+        let out = pill_tooltip_text(
+            SharedString::from("cd /very/long/path && make"),
+            SharedString::from("abc·cd …"),
+        );
         assert_eq!(out.as_ref(), "cd /very/long/path && make");
     }
 

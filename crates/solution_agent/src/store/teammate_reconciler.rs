@@ -38,7 +38,10 @@ pub(crate) fn claude_project_dir_for(cwd: &std::path::Path) -> Option<PathBuf> {
     )
 }
 
-pub(crate) fn background_agent_dir_for(cwd: &std::path::Path, acp_session_id: &str) -> Option<PathBuf> {
+pub(crate) fn background_agent_dir_for(
+    cwd: &std::path::Path,
+    acp_session_id: &str,
+) -> Option<PathBuf> {
     Some(
         claude_project_dir_for(cwd)?
             .join(acp_session_id)
@@ -52,7 +55,10 @@ pub(crate) fn background_agent_dir_for(cwd: &std::path::Path, acp_session_id: &s
 /// user message a background shell emits on completion) to this file. Uses
 /// the same cwd encoding as [`background_agent_dir_for`]. `None` under the
 /// same conditions (empty cwd / unresolvable home).
-pub(crate) fn parent_session_jsonl_for(cwd: &std::path::Path, acp_session_id: &str) -> Option<PathBuf> {
+pub(crate) fn parent_session_jsonl_for(
+    cwd: &std::path::Path,
+    acp_session_id: &str,
+) -> Option<PathBuf> {
     Some(claude_project_dir_for(cwd)?.join(format!("{acp_session_id}.jsonl")))
 }
 
@@ -291,10 +297,7 @@ impl SolutionAgentStore {
                     // `is_messageable`/supervisor gating, but no longer drives a
                     // stream close — the subagent `Stop` hook is the sole close
                     // authority (`close_teammate_on_stop`).
-                    let was_terminal = ba
-                        .latest
-                        .as_ref()
-                        .is_some_and(|s| s.stop_reason.is_some());
+                    let was_terminal = ba.latest.as_ref().is_some_and(|s| s.stop_reason.is_some());
                     let now_terminal = snap.stop_reason.is_some();
                     ba.latest = Some(snap);
                     ba.latest_seq = next_seq.unwrap_or(ba.latest_seq);
@@ -1160,8 +1163,7 @@ impl SolutionAgentStore {
                             let age = match ba.latest.as_ref() {
                                 Some(snap) => now.duration_since(snap.mtime).unwrap_or_default(),
                                 None => {
-                                    let registered: std::time::SystemTime =
-                                        ba.registered_at.into();
+                                    let registered: std::time::SystemTime = ba.registered_at.into();
                                     now.duration_since(registered).unwrap_or_default()
                                 }
                             };
@@ -1291,9 +1293,11 @@ impl SolutionAgentStore {
         };
         // Cheap read-side guard: the vast majority of sessions have no teammate
         // pills, and `update` is not free.
-        let has_teammate = session.read(cx).streams.keys().any(|id| {
-            matches!(id, crate::stream::StreamId::Teammate(_))
-        });
+        let has_teammate = session
+            .read(cx)
+            .streams
+            .keys()
+            .any(|id| matches!(id, crate::stream::StreamId::Teammate(_)));
         if !has_teammate {
             return;
         }
@@ -1566,8 +1570,7 @@ impl SolutionAgentStore {
         let expiry = std::time::Duration::from_secs(
             MANAGED_AGENT_STALE_TIMEOUT_SECS + MANAGED_AGENT_DEAD_LINGER_SECS,
         );
-        let live_parent_cap =
-            std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
+        let live_parent_cap = std::time::Duration::from_secs(BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();

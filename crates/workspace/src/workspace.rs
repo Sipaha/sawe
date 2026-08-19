@@ -9039,12 +9039,10 @@ impl Render for Workspace {
                                             );
                                             match position {
                                                 DockPosition::Left => {
-                                                    workspace
-                                                        .resize_left_dock(target, window, cx);
+                                                    workspace.resize_left_dock(target, window, cx);
                                                 }
                                                 DockPosition::Right => {
-                                                    workspace
-                                                        .resize_right_dock(target, window, cx);
+                                                    workspace.resize_right_dock(target, window, cx);
                                                 }
                                                 DockPosition::Bottom => {
                                                     workspace
@@ -11345,7 +11343,10 @@ mod tests {
 
         let right_pointer = point(px(700.), px(400.));
         let right_size = dock_resize_target_size(DockPosition::Right, bounds, right_pointer);
-        assert_eq!(bounds.right() - DOCK_STRIP_WIDTH - right_size, right_pointer.x);
+        assert_eq!(
+            bounds.right() - DOCK_STRIP_WIDTH - right_size,
+            right_pointer.x
+        );
 
         // The bottom dock has no strip beneath it, so its handle is measured
         // straight from `bounds.bottom()`.

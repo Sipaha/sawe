@@ -294,8 +294,7 @@ fn load_shell_from_passwd() -> Result<()> {
 /// marker is, return that (the freshly-rebuilt binary at the same location).
 pub fn current_exe_resolved() -> anyhow::Result<PathBuf> {
     use anyhow::Context as _;
-    let exe =
-        std::env::current_exe().context("Failed to determine current executable path.")?;
+    let exe = std::env::current_exe().context("Failed to determine current executable path.")?;
     Ok(resolve_deleted_exe(exe, |path| path.is_file()))
 }
 

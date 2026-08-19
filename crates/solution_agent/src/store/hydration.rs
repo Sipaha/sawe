@@ -1177,10 +1177,8 @@ impl SolutionAgentStore {
             // Fetch the ordered tab-strip list so we can stamp
             // `tab_order` on freshly-hydrated sessions. Sessions not
             // in this list get `tab_order = None` (closed/hidden tab).
-            let tabbed_ids: Vec<SolutionSessionId> = db
-                .list_open_tabs(solution_id)
-                .await
-                .unwrap_or_default();
+            let tabbed_ids: Vec<SolutionSessionId> =
+                db.list_open_tabs(solution_id).await.unwrap_or_default();
             let tab_order_map: std::collections::HashMap<SolutionSessionId, i64> = tabbed_ids
                 .iter()
                 .enumerate()
@@ -1465,10 +1463,8 @@ impl SolutionAgentStore {
             if open_ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let tabbed_ids: Vec<SolutionSessionId> = db
-                .list_open_tabs(solution_id)
-                .await
-                .unwrap_or_default();
+            let tabbed_ids: Vec<SolutionSessionId> =
+                db.list_open_tabs(solution_id).await.unwrap_or_default();
             let tab_order_map: std::collections::HashMap<SolutionSessionId, i64> = tabbed_ids
                 .iter()
                 .enumerate()

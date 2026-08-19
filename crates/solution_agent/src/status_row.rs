@@ -202,9 +202,7 @@ pub(crate) fn render_status_row(
                 let label = match in_progress_tool(s) {
                     Some((tool, since_ms)) => {
                         let secs = since_ms
-                            .map(|ms| {
-                                (chrono::Utc::now().timestamp_millis() - ms).max(0) / 1000
-                            })
+                            .map(|ms| (chrono::Utc::now().timestamp_millis() - ms).max(0) / 1000)
                             .unwrap_or(0) as u64;
                         if secs >= 1 {
                             format!("Running {tool} · {}", format_elapsed(secs))

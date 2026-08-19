@@ -123,8 +123,7 @@ fn new_chat_model_options_from_latest_session(cx: &mut TestAppContext) {
             assert!(selected.is_none());
 
             let id = SolutionSessionId::new();
-            let session =
-                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+            let session = insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
             session.update(cx, |s, _| {
                 s.cached_models = vec![
                     claude_native::ModelInfo {
@@ -185,8 +184,7 @@ fn session_models_falls_back_to_global_agent_cache(cx: &mut TestAppContext) {
 
             // A brand-new session with an empty per-session list.
             let fresh_id = SolutionSessionId::new();
-            let fresh =
-                insert_cold_session(fresh_id, sol, agent.clone(), None, None, store, cx);
+            let fresh = insert_cold_session(fresh_id, sol, agent.clone(), None, None, store, cx);
             assert!(
                 fresh.read(cx).cached_models.is_empty(),
                 "precondition: fresh session has no per-session model list"

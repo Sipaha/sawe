@@ -196,7 +196,10 @@ async fn rename_solution_and_member_over_mcp_survives_a_restart(cx: &mut TestApp
         .pointer("/result/structuredContent/solution")
         .cloned()
         .unwrap_or_else(|| panic!("solutions.get returned: {resp}"));
-    assert_eq!(solution.get("name").and_then(Value::as_str), Some("New Solution"));
+    assert_eq!(
+        solution.get("name").and_then(Value::as_str),
+        Some("New Solution")
+    );
     assert_eq!(
         solution.get("root").and_then(Value::as_str),
         Some(new_root.to_string_lossy().as_ref()),

@@ -121,9 +121,8 @@ pub fn move_dir_with_compat_link(source: &Path, target: &Path) -> Result<()> {
     if let Err(err) = symlink_dir(target, source) {
         // Roll the move back so the caller's DB stays consistent with disk.
         std::fs::rename(target, source).ok();
-        return Err(err).with_context(|| {
-            format!("linking {} back to {}", source.display(), target.display())
-        });
+        return Err(err)
+            .with_context(|| format!("linking {} back to {}", source.display(), target.display()));
     }
     Ok(())
 }
@@ -182,8 +181,8 @@ mod tests {
             folder: "citeck-forge".into(),
             owner: "Citeck Forge".into(),
         }];
-        let err =
-            ensure_folder_available(dir.path(), "Citeck-Forge", None, &taken).expect_err("collides");
+        let err = ensure_folder_available(dir.path(), "Citeck-Forge", None, &taken)
+            .expect_err("collides");
         assert_eq!(
             err,
             FolderNameError::TakenBySolution {

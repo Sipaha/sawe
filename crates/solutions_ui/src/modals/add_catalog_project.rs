@@ -124,7 +124,8 @@ impl AddCatalogProjectModal {
             let task = store.update(cx, |s, cx| {
                 s.add_member(solution_id, catalog_id, cache_root, cx)
             });
-            cx.spawn(async move |_, _| task.await).detach_and_log_err(cx);
+            cx.spawn(async move |_, _| task.await)
+                .detach_and_log_err(cx);
         }
         cx.emit(DismissEvent);
     }

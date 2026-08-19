@@ -33,8 +33,8 @@ pub(crate) mod status_row;
 pub mod store;
 pub mod stream;
 pub mod supervisor;
-pub(crate) mod teammate_watchers;
 pub mod supervisor_instruction_modal;
+pub(crate) mod teammate_watchers;
 pub mod upload;
 
 pub use claude_native::ModelInfo;
@@ -44,10 +44,10 @@ pub use metrics_emitter::MetricsEmitter;
 pub mod test_support;
 
 pub use background_agent::{BackgroundAgent, BackgroundAgentId, BackgroundAgentSnapshot};
-pub use db::{IdentityMigrationReport, SolutionAgentDb};
 pub use background_shell::{
     BackgroundShell, BackgroundShellId, BackgroundShellSnapshot, ShellRuntimeState,
 };
+pub use db::{IdentityMigrationReport, SolutionAgentDb};
 pub use model::{
     AgentServerId, SessionState, SolutionSession, SolutionSessionId, SolutionSessionMetadata,
 };

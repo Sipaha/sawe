@@ -842,7 +842,10 @@ async fn background_shell_completion_resets_silence_clock(cx: &mut TestAppContex
         "a completed background command must reset the silence clock"
     );
     assert!(
-        chrono::Utc::now().signed_duration_since(after).num_seconds() < 60,
+        chrono::Utc::now()
+            .signed_duration_since(after)
+            .num_seconds()
+            < 60,
         "last_activity must be bumped to ~now on completion, not left stale"
     );
 }
@@ -1287,9 +1290,15 @@ async fn background_agent_terminal_transition_resets_silence_clock(cx: &mut Test
             .read(cx)
             .last_activity_at
     });
-    assert!(after > stale, "terminal transition must reset the silence clock");
     assert!(
-        chrono::Utc::now().signed_duration_since(after).num_seconds() < 60,
+        after > stale,
+        "terminal transition must reset the silence clock"
+    );
+    assert!(
+        chrono::Utc::now()
+            .signed_duration_since(after)
+            .num_seconds()
+            < 60,
         "last_activity must be bumped to ~now, not left stale"
     );
 }
@@ -1511,7 +1520,10 @@ async fn subagent_stop_hook_closes_teammate_stream(cx: &mut TestAppContext) {
                 },
             );
             s.background_agent_order.push(bg_id.clone());
-            assert!(s.streams.contains_key(&teammate), "teammate live before Stop");
+            assert!(
+                s.streams.contains_key(&teammate),
+                "teammate live before Stop"
+            );
         });
     });
 
@@ -1523,10 +1535,19 @@ async fn subagent_stop_hook_closes_teammate_stream(cx: &mut TestAppContext) {
     });
 
     cx.update(|cx| {
-        let session = SolutionAgentStore::global(cx).read(cx).session(session_id).unwrap();
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
         session.read_with(cx, |s, _| {
-            assert!(!s.streams.contains_key(&teammate), "Stop hook closes the teammate");
-            assert!(s.closed_streams.contains_key(&teammate), "close reason recorded");
+            assert!(
+                !s.streams.contains_key(&teammate),
+                "Stop hook closes the teammate"
+            );
+            assert!(
+                s.closed_streams.contains_key(&teammate),
+                "close reason recorded"
+            );
         });
     });
 }
@@ -1557,7 +1578,10 @@ async fn subagent_stop_before_registration_buffers_then_closes(cx: &mut TestAppC
                 }],
                 cx,
             );
-            assert!(s.streams.contains_key(&teammate), "teammate live before Stop");
+            assert!(
+                s.streams.contains_key(&teammate),
+                "teammate live before Stop"
+            );
         });
     });
 
@@ -1569,7 +1593,10 @@ async fn subagent_stop_before_registration_buffers_then_closes(cx: &mut TestAppC
         });
         let session = s.read(cx).session(session_id).unwrap();
         session.read_with(cx, |s, _| {
-            assert!(s.pending_stop.contains(&bg_id), "stop buffered until registration");
+            assert!(
+                s.pending_stop.contains(&bg_id),
+                "stop buffered until registration"
+            );
             assert!(
                 s.streams.contains_key(&teammate),
                 "teammate still live — nothing closed yet"
@@ -1622,7 +1649,10 @@ async fn subagent_stop_before_registration_buffers_then_closes(cx: &mut TestAppC
     cx.executor().run_until_parked();
 
     cx.update(|cx| {
-        let session = SolutionAgentStore::global(cx).read(cx).session(session_id).unwrap();
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
         session.read_with(cx, |s, _| {
             assert!(
                 s.background_agents.contains_key(&bg_id),
@@ -1632,7 +1662,10 @@ async fn subagent_stop_before_registration_buffers_then_closes(cx: &mut TestAppC
                 !s.streams.contains_key(&teammate),
                 "drained stop closes the teammate on real registration"
             );
-            assert!(s.closed_streams.contains_key(&teammate), "close reason recorded");
+            assert!(
+                s.closed_streams.contains_key(&teammate),
+                "close reason recorded"
+            );
         });
     });
 }
@@ -2044,26 +2077,27 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
                 ],
                 cx,
             );
-            let register = |s: &mut crate::model::SolutionSession,
-                            bg: &str,
-                            parent: &str,
-                            snap: crate::background_agent::BackgroundAgentSnapshot| {
-                let bg_id = crate::background_agent::BackgroundAgentId::new(bg.to_string());
-                s.background_agents.insert(
-                    bg_id.clone(),
-                    crate::background_agent::BackgroundAgent {
-                        id: bg_id.clone(),
-                        jsonl_path: "/nonexistent".into(),
-                        registered_at: chrono::Utc::now(),
-                        latest: Some(snap),
-                        last_offset: 0,
-                        parent_tool_use_id: Some(SharedString::from(parent.to_string())),
-                        latest_seq: 0,
-                        killed: false,
-                    },
-                );
-                s.background_agent_order.push(bg_id);
-            };
+            let register =
+                |s: &mut crate::model::SolutionSession,
+                 bg: &str,
+                 parent: &str,
+                 snap: crate::background_agent::BackgroundAgentSnapshot| {
+                    let bg_id = crate::background_agent::BackgroundAgentId::new(bg.to_string());
+                    s.background_agents.insert(
+                        bg_id.clone(),
+                        crate::background_agent::BackgroundAgent {
+                            id: bg_id.clone(),
+                            jsonl_path: "/nonexistent".into(),
+                            registered_at: chrono::Utc::now(),
+                            latest: Some(snap),
+                            last_offset: 0,
+                            parent_tool_use_id: Some(SharedString::from(parent.to_string())),
+                            latest_seq: 0,
+                            killed: false,
+                        },
+                    );
+                    s.background_agent_order.push(bg_id);
+                };
             register(
                 s,
                 "bg_live",
@@ -2140,9 +2174,7 @@ async fn reconcile_keeps_live_async_agent_and_closes_stale_one(cx: &mut TestAppC
 /// (the →Idle GC excludes async parents). A stale registration (>120s) must be
 /// reconciled closed; a fresh one (<120s, still might snapshot) must survive.
 #[gpui::test]
-async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(
-    cx: &mut TestAppContext,
-) {
+async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(cx: &mut TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
     orphan_session(cx, session_id);
     let stale_toolu = "toolu_async_nosnap_stale";
@@ -2165,27 +2197,28 @@ async fn reconcile_closes_snapshotless_stale_async_agent_but_keeps_fresh(
                 ],
                 cx,
             );
-            let register = |s: &mut crate::model::SolutionSession,
-                            bg: &str,
-                            parent: &str,
-                            registered_at: chrono::DateTime<chrono::Utc>| {
-                let bg_id = crate::background_agent::BackgroundAgentId::new(bg.to_string());
-                s.background_agents.insert(
-                    bg_id.clone(),
-                    crate::background_agent::BackgroundAgent {
-                        id: bg_id.clone(),
-                        jsonl_path: "/nonexistent".into(),
-                        registered_at,
-                        // No parseable JSONL snapshot yet.
-                        latest: None,
-                        last_offset: 0,
-                        parent_tool_use_id: Some(SharedString::from(parent.to_string())),
-                        latest_seq: 0,
-                        killed: false,
-                    },
-                );
-                s.background_agent_order.push(bg_id);
-            };
+            let register =
+                |s: &mut crate::model::SolutionSession,
+                 bg: &str,
+                 parent: &str,
+                 registered_at: chrono::DateTime<chrono::Utc>| {
+                    let bg_id = crate::background_agent::BackgroundAgentId::new(bg.to_string());
+                    s.background_agents.insert(
+                        bg_id.clone(),
+                        crate::background_agent::BackgroundAgent {
+                            id: bg_id.clone(),
+                            jsonl_path: "/nonexistent".into(),
+                            registered_at,
+                            // No parseable JSONL snapshot yet.
+                            latest: None,
+                            last_offset: 0,
+                            parent_tool_use_id: Some(SharedString::from(parent.to_string())),
+                            latest_seq: 0,
+                            killed: false,
+                        },
+                    );
+                    s.background_agent_order.push(bg_id);
+                };
             // Registered > MANAGED_AGENT_STALE_TIMEOUT_SECS (120s) ago.
             register(
                 s,
@@ -3032,7 +3065,8 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
     let cwd = PathBuf::from(&unique);
     let acp_id = "ses-scan-xyz";
 
-    let jsonl = crate::store::parent_session_jsonl_for(&cwd, acp_id).expect("home_dir resolves in test");
+    let jsonl =
+        crate::store::parent_session_jsonl_for(&cwd, acp_id).expect("home_dir resolves in test");
     let project_dir = jsonl.parent().expect("jsonl has parent").to_path_buf();
     let _cleanup = CleanupDir(project_dir.clone());
     std::fs::create_dir_all(&project_dir).expect("create project dir");
@@ -3266,9 +3300,10 @@ async fn dropping_the_thread_kills_background_agents(cx: &mut TestAppContext) {
              watchdog stays suppressed forever after a reconnect"
         );
         assert!(
-            s.background_agents
-                .values()
-                .all(|a| a.latest.as_ref().is_none_or(|snap| snap.stop_reason.is_none())),
+            s.background_agents.values().all(|a| a
+                .latest
+                .as_ref()
+                .is_none_or(|snap| snap.stop_reason.is_none())),
             "killed is NOT a stop_reason completion — the agent never finished"
         );
         // Task 4: kill closes the teammate stream IMMEDIATELY — no lingering
@@ -3325,7 +3360,10 @@ async fn killed_agent_closes_teammate_stream_immediately(cx: &mut TestAppContext
             s.background_agent_order.push(bg_id);
             s.rebuild_streams();
             assert_eq!(
-                s.streams.get(&teammate).expect("live teammate stream").state,
+                s.streams
+                    .get(&teammate)
+                    .expect("live teammate stream")
+                    .state,
                 crate::stream::StreamState::Live,
                 "a running background agent's tab is Live while its subprocess is up"
             );
@@ -3368,9 +3406,7 @@ async fn killed_agent_is_reaped_despite_a_live_parent(cx: &mut TestAppContext) {
             // killed_id: past STALE+DEAD_LINGER (420s) — reaped regardless of
             // parent liveness. running_id: fresh, well under the generous
             // live-parent lost-hook backstop — still shielded.
-            for (id, killed, mtime_age_secs) in
-                [(&killed_id, true, 500), (&running_id, false, 5)]
-            {
+            for (id, killed, mtime_age_secs) in [(&killed_id, true, 500), (&running_id, false, 5)] {
                 s.background_agents.insert(
                     id.clone(),
                     crate::background_agent::BackgroundAgent {

@@ -417,8 +417,7 @@ mod tests {
         let b = mock_config_scoped("b", ConfigScope::Project { worktree: w_b });
         let g = mock_config_scoped("g", ConfigScope::Global);
 
-        let out =
-            filter_configs_for_active_worktree(&[a.clone(), b.clone(), g.clone()], Some(w_a));
+        let out = filter_configs_for_active_worktree(&[a.clone(), b.clone(), g.clone()], Some(w_a));
         assert!(out.iter().any(|c| c.id == a.id));
         assert!(out.iter().any(|c| c.id == g.id));
         assert!(!out.iter().any(|c| c.id == b.id));
@@ -492,7 +491,9 @@ mod tests {
         let project = Project::test(app_state.fs.clone(), [], cx).await;
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
-        let controller = workspace.update(cx, |workspace, cx| cx.new(|cx| RunController::new(workspace, cx)));
+        let controller = workspace.update(cx, |workspace, cx| {
+            cx.new(|cx| RunController::new(workspace, cx))
+        });
 
         let id_a = RunConfigId::from_raw("mock:a");
         let id_b = RunConfigId::from_raw("mock:b");

@@ -331,7 +331,10 @@ mod tests {
 
     #[test]
     fn dot_color_for_str_is_stable() {
-        assert_eq!(dot_color_for_str("ecos-base"), dot_color_for_str("ecos-base"));
+        assert_eq!(
+            dot_color_for_str("ecos-base"),
+            dot_color_for_str("ecos-base")
+        );
     }
 
     #[test]

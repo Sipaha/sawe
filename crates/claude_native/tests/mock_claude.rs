@@ -5,9 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use acp_thread::{
-    AcpThread, AgentConnection as _, AgentThreadEntry, ToolCall, ToolCallStatus,
-};
+use acp_thread::{AcpThread, AgentConnection as _, AgentThreadEntry, ToolCall, ToolCallStatus};
 use agent_client_protocol::schema as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
 use claude_native::command::{ClaudeCommandSpec, SessionArg};

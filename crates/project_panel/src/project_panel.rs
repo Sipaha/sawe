@@ -61,9 +61,9 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     Color, ContextMenu, ContextMenuEntry, DecoratedIcon, Icon, IconDecoration, IconDecorationKind,
-    IndentGuideColors, IndentGuideLayout, Indicator, Label, LabelSize, ListItem,
-    ListItemSpacing, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate,
-    Tooltip, WithScrollbar, prelude::*, v_flex,
+    IndentGuideColors, IndentGuideLayout, Indicator, Label, LabelSize, ListItem, ListItemSpacing,
+    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    v_flex,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -822,18 +822,17 @@ impl ProjectPanel {
             // Absent outside a Solution context (unit tests never install the
             // `SolutionStore` global) — degrade gracefully instead of panicking,
             // mirroring the `try_global` reads in `active_solution`.
-            let store_subscription =
-                solutions::SolutionStore::try_global(cx).map(|store| {
-                    cx.subscribe_in(&store, window, |this, _store, event, window, cx| {
-                        if matches!(
-                            event,
-                            solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
-                        ) {
-                            this.update_visible_entries(None, false, false, window, cx);
-                            cx.notify();
-                        }
-                    })
-                });
+            let store_subscription = solutions::SolutionStore::try_global(cx).map(|store| {
+                cx.subscribe_in(&store, window, |this, _store, event, window, cx| {
+                    if matches!(
+                        event,
+                        solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
+                    ) {
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
+                })
+            });
 
             let mut this = Self {
                 project: project.clone(),
@@ -7591,7 +7590,6 @@ impl ProjectPanel {
         });
     }
 }
-
 
 impl Focusable for ProjectPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

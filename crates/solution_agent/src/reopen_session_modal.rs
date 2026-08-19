@@ -157,9 +157,7 @@ impl Render for ReopenSessionModal {
                                     ),
                             ),
                     )
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.reopen(id, solution_id, cx)),
-                    ),
+                    .on_click(cx.listener(move |this, _, _, cx| this.reopen(id, solution_id, cx))),
             );
         }
         container = container.child(list);

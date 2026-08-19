@@ -179,7 +179,11 @@ mod tests {
         let mut s = Stream::main();
         s.push_coalesced(assistant("Three "));
         s.push_coalesced(assistant("scouts"));
-        assert_eq!(s.entries.len(), 1, "same-source assistant messages must merge");
+        assert_eq!(
+            s.entries.len(),
+            1,
+            "same-source assistant messages must merge"
+        );
         let SessionEntryKind::AssistantMessage { chunks } = &s.entries[0].kind else {
             panic!("expected AssistantMessage");
         };
@@ -195,7 +199,11 @@ mod tests {
         second.mod_seq = 4;
         s.push_coalesced(first);
         s.push_coalesced(second);
-        assert_eq!(s.entries.len(), 1, "same-source assistant messages must merge");
+        assert_eq!(
+            s.entries.len(),
+            1,
+            "same-source assistant messages must merge"
+        );
         assert_eq!(
             s.entries[0].mod_seq, 4,
             "a coalesce-merge must advance the frozen first-fragment mod_seq to the incoming max"
@@ -296,6 +304,11 @@ mod tests {
         let flat = vec![assistant_tagged("only sub", Some("T1"))];
         let streams = demux(&flat);
         assert!(streams[&StreamId::Main].entries.is_empty());
-        assert_eq!(streams[&StreamId::Teammate(SharedString::from("T1"))].entries.len(), 1);
+        assert_eq!(
+            streams[&StreamId::Teammate(SharedString::from("T1"))]
+                .entries
+                .len(),
+            1
+        );
     }
 }

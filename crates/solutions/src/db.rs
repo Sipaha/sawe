@@ -218,13 +218,12 @@ impl SolutionsDb {
         default_branch: Option<String>,
     ) -> anyhow::Result<i64> {
         self.write(move |connection| {
-            connection
-                .select_row_bound::<(String, String, Option<String>), i64>(sql!(
-                    INSERT INTO catalog_projects (name, remote_url, default_branch)
-                    VALUES (?1, ?2, ?3)
-                    RETURNING id
-                ))?((name, remote_url, default_branch))?
-                .context("insert_catalog_project: RETURNING id produced no row")
+            connection.select_row_bound::<(String, String, Option<String>), i64>(sql!(
+                INSERT INTO catalog_projects (name, remote_url, default_branch)
+                VALUES (?1, ?2, ?3)
+                RETURNING id
+            ))?((name, remote_url, default_branch))?
+            .context("insert_catalog_project: RETURNING id produced no row")
         })
         .await
     }
@@ -271,13 +270,12 @@ impl SolutionsDb {
         last_opened_at: Option<i64>,
     ) -> anyhow::Result<i64> {
         self.write(move |connection| {
-            connection
-                .select_row_bound::<(String, String, Option<i64>), i64>(sql!(
-                    INSERT INTO solutions (name, root, last_opened_at)
-                    VALUES (?1, ?2, ?3)
-                    RETURNING id
-                ))?((name, root, last_opened_at))?
-                .context("insert_solution: RETURNING id produced no row")
+            connection.select_row_bound::<(String, String, Option<i64>), i64>(sql!(
+                INSERT INTO solutions (name, root, last_opened_at)
+                VALUES (?1, ?2, ?3)
+                RETURNING id
+            ))?((name, root, last_opened_at))?
+            .context("insert_solution: RETURNING id produced no row")
         })
         .await
     }
@@ -325,14 +323,13 @@ impl SolutionsDb {
         origin_catalog_id: Option<i64>,
     ) -> anyhow::Result<i64> {
         self.write(move |connection| {
-            connection
-                .select_row_bound::<(i64, String, String, i32, Option<i64>), i64>(sql!(
-                    INSERT INTO solution_members
-                        (solution_id, name, local_path, position, origin_catalog_id)
-                    VALUES (?1, ?2, ?3, ?4, ?5)
-                    RETURNING id
-                ))?((solution_id, name, local_path, position, origin_catalog_id))?
-                .context("insert_solution_member: RETURNING id produced no row")
+            connection.select_row_bound::<(i64, String, String, i32, Option<i64>), i64>(sql!(
+                INSERT INTO solution_members
+                    (solution_id, name, local_path, position, origin_catalog_id)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                RETURNING id
+            ))?((solution_id, name, local_path, position, origin_catalog_id))?
+            .context("insert_solution_member: RETURNING id produced no row")
         })
         .await
     }
@@ -478,7 +475,6 @@ impl SolutionsDb {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -719,7 +715,9 @@ mod tests {
         assert_eq!(rows[0].8, Some(cat));
         assert_eq!(rows[1].8, None);
 
-        db.delete_solution_member(m1).await.expect("delete member 1");
+        db.delete_solution_member(m1)
+            .await
+            .expect("delete member 1");
         let rows = db
             .load_all_solutions_with_members()
             .await

@@ -45,8 +45,8 @@ impl RenameMemberModal {
             return;
         };
         let id = self.id;
-        let result =
-            SolutionStore::global(cx).update(cx, |store, cx| store.rename_member(id, &new_name, cx));
+        let result = SolutionStore::global(cx)
+            .update(cx, |store, cx| store.rename_member(id, &new_name, cx));
         match result {
             Ok(()) => {
                 self.error = None;

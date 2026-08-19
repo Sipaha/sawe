@@ -130,8 +130,11 @@ async fn renaming_a_solution_moves_the_folder_under_a_live_worktree(cx: &mut Tes
         std::fs::read(member_path.join("src/main.rs")).expect("read through the link"),
         b"fn main() {}"
     );
-    std::fs::write(member_path.join("src/main.rs"), b"fn main() { /* edited */ }")
-        .expect("write through the link");
+    std::fs::write(
+        member_path.join("src/main.rs"),
+        b"fn main() { /* edited */ }",
+    )
+    .expect("write through the link");
     assert_eq!(
         std::fs::read(new_member_path.join("src/main.rs")).expect("read the moved file"),
         b"fn main() { /* edited */ }"

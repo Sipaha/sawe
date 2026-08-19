@@ -89,7 +89,10 @@ pub(crate) fn select_attachment_paths_for_solution(
     stmt(solution_id.to_string())
 }
 
-pub(crate) fn delete_attachments_for_session_fn(connection: &Connection, session_id: &str) -> Result<()> {
+pub(crate) fn delete_attachments_for_session_fn(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<()> {
     let mut stmt = connection.exec_bound::<String>(indoc! {"
         DELETE FROM solution_session_attachment WHERE session_id = ?
     "})?;

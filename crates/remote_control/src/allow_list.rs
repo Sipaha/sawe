@@ -35,9 +35,7 @@ pub fn translate(method: &str) -> Option<&'static str> {
         "remote.solution_agent.list_agents" => Some("solution_agent.list_agents"),
         "remote.solution_agent.list_sessions" => Some("solution_agent.list_sessions"),
         "remote.solution_agent.get_session" => Some("solution_agent.get_session"),
-        "remote.solution_agent.get_session_changes" => {
-            Some("solution_agent.get_session_changes")
-        }
+        "remote.solution_agent.get_session_changes" => Some("solution_agent.get_session_changes"),
         "remote.solution_agent.get_session_entry" => Some("solution_agent.get_session_entry"),
         "remote.solution_agent.create_session" => Some("solution_agent.create_session"),
         "remote.solution_agent.delete_session" => Some("solution_agent.delete_session"),
@@ -56,9 +54,7 @@ pub fn translate(method: &str) -> Option<&'static str> {
         "remote.solution_agent.set_supervisor_prompt" => {
             Some("solution_agent.set_supervisor_prompt")
         }
-        "remote.solution_agent.get_supervisor_state" => {
-            Some("solution_agent.get_supervisor_state")
-        }
+        "remote.solution_agent.get_supervisor_state" => Some("solution_agent.get_supervisor_state"),
         "remote.solution_agent.upload_init" => Some("solution_agent.upload_init"),
         "remote.solution_agent.upload_status" => Some("solution_agent.upload_status"),
         "remote.solution_agent.upload_finish" => Some("solution_agent.upload_finish"),

@@ -38,7 +38,12 @@ impl SolutionStore {
         // The picker shows the NAME as the row's primary label, so two rows
         // reading `citeck-ci` are indistinguishable at a glance no matter how
         // their URLs differ.
-        if let Some(clash) = self.config.catalog.iter().find(|c| same_name(&c.name, name)) {
+        if let Some(clash) = self
+            .config
+            .catalog
+            .iter()
+            .find(|c| same_name(&c.name, name))
+        {
             bail!(
                 "duplicate_name: catalog already has a project named \"{}\" ({}) — pick a \
                  different name",
@@ -305,7 +310,9 @@ impl SolutionStore {
         }
         let repointed = planned.len();
         self.config.catalog.retain(|c| c.id != from);
-        log::info!("solutions: merged catalog {from} into {into} ({repointed} member(s) repointed)");
+        log::info!(
+            "solutions: merged catalog {from} into {into} ({repointed} member(s) repointed)"
+        );
         cx.emit(SolutionStoreEvent::Changed);
         cx.notify();
         Ok(repointed)
@@ -392,7 +399,6 @@ impl SolutionStore {
         gpui::block_on(db.delete_catalog_project(id.0))
     }
 }
-
 
 /// Do two remote URLs name the same repository? Compared on a normalized form
 /// (case-folded, trailing `/` and `.git` stripped) so `…/foo.git` and `…/foo`

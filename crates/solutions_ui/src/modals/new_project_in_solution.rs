@@ -122,8 +122,7 @@ mod tests {
             settings::init(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
-        let _modal = cx.add_window(|window, cx| {
-            NewProjectInSolutionModal::new(SolutionId(1), window, cx)
-        });
+        let _modal =
+            cx.add_window(|window, cx| NewProjectInSolutionModal::new(SolutionId(1), window, cx));
     }
 }

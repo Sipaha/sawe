@@ -69,8 +69,8 @@ pub fn install(cx: &mut App) {
 
     coordinator.update(cx, |this, cx| {
         if let Some(store) = SolutionStore::try_global(cx) {
-            this.subscriptions.push(
-                cx.subscribe(&store, |_this, store, event, cx| match event {
+            this.subscriptions
+                .push(cx.subscribe(&store, |_this, store, event, cx| match event {
                     SolutionStoreEvent::Changed => {
                         editor_mcp::emit_notification(cx, "solution_changed", json!({}));
                     }
@@ -161,8 +161,7 @@ pub fn install(cx: &mut App) {
                     // `Changed` already drives the `solution_changed` remote
                     // notification, so nothing to fan out here.
                     SolutionStoreEvent::PathsMoved { .. } => {}
-                }),
-            );
+                }));
         }
     });
 

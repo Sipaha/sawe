@@ -586,7 +586,9 @@ pub fn open_solution_socket(cx: &mut App, solution_id: i64, root: PathBuf) {
     let async_cx = cx.to_async();
     let server_task = McpServer::new(&async_cx);
     cx.spawn(async move |cx| {
-        let server = server_task.await.context("creating per-solution MCP server")?;
+        let server = server_task
+            .await
+            .context("creating per-solution MCP server")?;
         server.install_tools(template);
         server.set_bound_solution(solution_id);
 
@@ -599,7 +601,11 @@ pub fn open_solution_socket(cx: &mut App, solution_id: i64, root: PathBuf) {
             std::fs::remove_file(&socket).log_err();
             #[cfg(unix)]
             std::os::unix::fs::symlink(&actual_socket, &socket).with_context(|| {
-                format!("linking {} to {}", actual_socket.display(), socket.display())
+                format!(
+                    "linking {} to {}",
+                    actual_socket.display(),
+                    socket.display()
+                )
             })?;
         }
 

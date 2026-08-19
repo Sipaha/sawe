@@ -3748,8 +3748,9 @@ pub fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::
         .and_then(|worktree| {
             editor_mcp::solution_socket_for_path(cx, worktree.read(cx).abs_path().as_ref())
         });
-    let mut servers: Vec<acp::McpServer> =
-        sawe_mcp_bridge_server(solution_socket).into_iter().collect();
+    let mut servers: Vec<acp::McpServer> = sawe_mcp_bridge_server(solution_socket)
+        .into_iter()
+        .collect();
     servers.extend(
         context_server_store
             .configured_server_ids()
@@ -3802,10 +3803,7 @@ pub fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::
 /// [`mcp_servers_for_project`] so a session's MCP scope and its claude settings
 /// layer always resolve to the same Solution. `None` for a standalone project
 /// (no Solution) and in tests (no `ActiveServer`).
-pub fn solution_scope_for_project(
-    project: &Entity<Project>,
-    cx: &App,
-) -> Option<(i64, PathBuf)> {
+pub fn solution_scope_for_project(project: &Entity<Project>, cx: &App) -> Option<(i64, PathBuf)> {
     let worktree = project.read(cx).visible_worktrees(cx).next()?;
     let abs_path = worktree.read(cx).abs_path();
     editor_mcp::solution_scope_for_path(cx, abs_path.as_ref())
@@ -3965,11 +3963,7 @@ impl acp_thread::AgentModelSelector for AcpModelSelector {
         Task::ready(Ok(acp_thread::AgentModelList::Flat(self.models.clone())))
     }
 
-    fn select_model(
-        &self,
-        model_id: acp_thread::AgentModelId,
-        _cx: &mut App,
-    ) -> Task<Result<()>> {
+    fn select_model(&self, model_id: acp_thread::AgentModelId, _cx: &mut App) -> Task<Result<()>> {
         if !self.models.iter().any(|model| model.id == model_id) {
             return Task::ready(Err(anyhow!("unknown Claude model `{}`", model_id)));
         }

@@ -264,11 +264,15 @@ pub enum ControlRequestOut {
     /// Switch the session's model mid-conversation. Mirrors the SDK's
     /// `setModel()`; applied by `claude` on the next turn. Wire:
     /// `{"subtype":"set_model","model":"<value>"}`.
-    SetModel { model: String },
+    SetModel {
+        model: String,
+    },
     /// Apply runtime flag settings (effort level / ultracode). Mirrors the
     /// SDK's `applyFlagSettings`; applied by `claude` on the next turn. Wire:
     /// `{"subtype":"apply_flag_settings","settings":{...}}`.
-    ApplyFlagSettings { settings: serde_json::Value },
+    ApplyFlagSettings {
+        settings: serde_json::Value,
+    },
 }
 
 impl InputMessage {
@@ -496,7 +500,9 @@ mod tests {
     fn set_model_control_request_wire_shape() {
         let msg = InputMessage::ControlRequest {
             request_id: "r1".into(),
-            request: ControlRequestOut::SetModel { model: "sonnet".into() },
+            request: ControlRequestOut::SetModel {
+                model: "sonnet".into(),
+            },
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "control_request");

@@ -122,10 +122,8 @@ fn next_selection_after_change_snaps_to_main_when_current_stream_removed() {
     let id_a = SharedString::from("toolu_a");
     // `id_a`'s stream is gone; only `toolu_b` still has a live teammate stream.
     let streams = streams_with_teammates(&["toolu_b"]);
-    let next = SolutionSessionView::next_selection_after_change(
-        &StreamId::Teammate(id_a),
-        &streams,
-    );
+    let next =
+        SolutionSessionView::next_selection_after_change(&StreamId::Teammate(id_a), &streams);
     assert_eq!(
         next,
         StreamId::Main,
@@ -137,10 +135,8 @@ fn next_selection_after_change_snaps_to_main_when_current_stream_removed() {
 fn next_selection_after_change_falls_back_to_main_when_all_gone() {
     let id_a = SharedString::from("toolu_a");
     let streams = streams_with_teammates(&[]);
-    let next = SolutionSessionView::next_selection_after_change(
-        &StreamId::Teammate(id_a),
-        &streams,
-    );
+    let next =
+        SolutionSessionView::next_selection_after_change(&StreamId::Teammate(id_a), &streams);
     assert_eq!(
         next,
         StreamId::Main,
@@ -188,10 +184,7 @@ fn next_selection_after_change_snaps_stale_shell_to_main() {
     // `next_selection_after_change`, which then snaps the selection to Main.
     let stale = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
     let streams = streams_with_teammates(&["toolu_a"]); // no shell stream present
-    let next = SolutionSessionView::next_selection_after_change(
-        &StreamId::Shell(stale),
-        &streams,
-    );
+    let next = SolutionSessionView::next_selection_after_change(&StreamId::Shell(stale), &streams);
     assert_eq!(next, StreamId::Main);
 }
 
@@ -200,10 +193,8 @@ fn next_selection_after_change_keeps_live_shell() {
     // The selected shell's `StreamId::Shell` is still present (Running) → kept.
     let id = crate::background_shell::BackgroundShellId::new("bvb4ful1z");
     let streams = with_shell_stream(streams_with_teammates(&[]), "bvb4ful1z");
-    let next = SolutionSessionView::next_selection_after_change(
-        &StreamId::Shell(id.clone()),
-        &streams,
-    );
+    let next =
+        SolutionSessionView::next_selection_after_change(&StreamId::Shell(id.clone()), &streams);
     assert_eq!(next, StreamId::Shell(id));
 }
 
@@ -310,8 +301,7 @@ async fn render_sizes_list_state_to_selected_stream_not_flat_entries(
         }
     }
 
-    let (solution_id, _tmp, project) =
-        crate::store::tests::setup_solution_and_project(cx).await;
+    let (solution_id, _tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
     let agent_id = SharedString::from("mock-agent");
     cx.update(|cx| {
         theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -361,7 +351,13 @@ async fn render_sizes_list_state_to_selected_stream_not_flat_entries(
     });
 
     let view_window = cx.add_window(|window, cx| {
-        SolutionSessionView::for_test(session_id, session.clone(), workspace_weak.clone(), window, cx)
+        SolutionSessionView::for_test(
+            session_id,
+            session.clone(),
+            workspace_weak.clone(),
+            window,
+            cx,
+        )
     });
     let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
     vcx.run_until_parked();

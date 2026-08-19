@@ -37,12 +37,7 @@ pub struct RemoveInput {
     pub worktree_path: PathBuf,
 }
 
-pub fn main(
-    mode: &str,
-    base: &Path,
-    stdin: &mut impl Read,
-    stdout: &mut impl Write,
-) -> Result<()> {
+pub fn main(mode: &str, base: &Path, stdin: &mut impl Read, stdout: &mut impl Write) -> Result<()> {
     let mut raw = String::new();
     stdin
         .read_to_string(&mut raw)
@@ -53,8 +48,7 @@ pub fn main(
                 .with_context(|| format!("parsing the WorktreeCreate payload: {raw}"))?;
             let dir = create(base, &input)?;
             // Stdout is the return channel: the path, one line, nothing else.
-            writeln!(stdout, "{}", dir.display())
-                .context("writing the worktree path to stdout")?;
+            writeln!(stdout, "{}", dir.display()).context("writing the worktree path to stdout")?;
             Ok(())
         }
         "remove" => {
@@ -81,7 +75,8 @@ pub fn create(base: &Path, input: &CreateInput) -> Result<PathBuf> {
         return Ok(dir);
     }
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
 
     // Match claude's own default branch naming (`worktree-<value>`) when the
@@ -92,7 +87,11 @@ pub fn create(base: &Path, input: &CreateInput) -> Result<PathBuf> {
         .unwrap_or_else(|| format!("worktree-{}", input.name));
     let dir_arg = dir.to_string_lossy().into_owned();
     let branch_ref = format!("refs/heads/{branch}");
-    let branch_exists = git(&repo_root, &["rev-parse", "--verify", "--quiet", &branch_ref]).is_ok();
+    let branch_exists = git(
+        &repo_root,
+        &["rev-parse", "--verify", "--quiet", &branch_ref],
+    )
+    .is_ok();
     let args: Vec<&str> = if branch_exists {
         vec!["worktree", "add", &dir_arg, &branch]
     } else {
@@ -273,7 +272,10 @@ mod tests {
             },
         )
         .expect_err("must refuse");
-        assert!(err.to_string().contains("unsafe worktree name"), "got: {err}");
+        assert!(
+            err.to_string().contains("unsafe worktree name"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -303,7 +305,10 @@ mod tests {
             },
         )
         .expect("no-op");
-        assert!(legacy.is_dir(), "a foreign worktree path must be left alone");
+        assert!(
+            legacy.is_dir(),
+            "a foreign worktree path must be left alone"
+        );
 
         remove(
             &base,

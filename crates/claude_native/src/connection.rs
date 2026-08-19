@@ -51,9 +51,8 @@ use crate::watchdog::{AnalyzerContext, ClaudeAnalyzer, Watchdog};
 /// (the agent has produced a complete message). Returns the formatted
 /// agent-facing text, or `None` when nothing is queued for that addressee.
 /// Type-erased so `claude_native` needs no dependency on `solution_agent`.
-pub type HookPull = std::rc::Rc<
-    dyn Fn(&acp::SessionId, Option<&str>, bool, &mut gpui::AsyncApp) -> Option<String>,
->;
+pub type HookPull =
+    std::rc::Rc<dyn Fn(&acp::SessionId, Option<&str>, bool, &mut gpui::AsyncApp) -> Option<String>>;
 
 /// Stable id for the `PostToolUse` hook callback registered in `initialize`.
 const HOOK_CALLBACK_POST_TOOL_USE: &str = "pti";
@@ -550,7 +549,11 @@ fn parse_available_models(payload: &serde_json::Value) -> Vec<ModelInfo> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(ModelInfo { value, display_name, description })
+            Some(ModelInfo {
+                value,
+                display_name,
+                description,
+            })
         })
         .collect()
 }
@@ -2283,9 +2286,15 @@ mod tests {
     #[test]
     fn final_text_block_suffix_cases() {
         // Not streamed → emit the whole final block (recovery path).
-        assert_eq!(final_text_block_suffix(false, "", "full reply"), Some("full reply"));
+        assert_eq!(
+            final_text_block_suffix(false, "", "full reply"),
+            Some("full reply")
+        );
         // Streamed the complete text → duplicate, emit nothing.
-        assert_eq!(final_text_block_suffix(true, "full reply", "full reply"), None);
+        assert_eq!(
+            final_text_block_suffix(true, "full reply", "full reply"),
+            None
+        );
         // Streamed a SHORT prefix (truncated stream) → emit only the suffix.
         assert_eq!(
             final_text_block_suffix(true, "Тел", "Телефон подключён"),
@@ -2314,7 +2323,10 @@ mod tests {
         let hooks = build_default_hooks();
         let sub = hooks.get("SubagentStop").expect("SubagentStop registered");
         assert_eq!(sub.len(), 1);
-        assert_eq!(sub[0].hook_callback_ids, vec![HOOK_CALLBACK_SUBAGENT_STOP.to_string()]);
+        assert_eq!(
+            sub[0].hook_callback_ids,
+            vec![HOOK_CALLBACK_SUBAGENT_STOP.to_string()]
+        );
     }
 
     #[test]
@@ -2369,10 +2381,17 @@ mod tests {
     fn hook_response_subagent_stop_sets_event_name_and_does_not_block() {
         // A SubagentStop response must name the event correctly but must NOT
         // carry decision:block — a finished sub-agent is not forced to continue.
-        let response = build_hook_response("hk3", HOOK_CALLBACK_SUBAGENT_STOP, Some("FOLLOWUP".to_string()));
+        let response = build_hook_response(
+            "hk3",
+            HOOK_CALLBACK_SUBAGENT_STOP,
+            Some("FOLLOWUP".to_string()),
+        );
         let inner = &response["response"];
         assert_eq!(inner["hookSpecificOutput"]["hookEventName"], "SubagentStop");
-        assert!(inner.get("decision").is_none(), "sub-agent stop must not block");
+        assert!(
+            inner.get("decision").is_none(),
+            "sub-agent stop must not block"
+        );
         assert!(inner.get("reason").is_none());
     }
 

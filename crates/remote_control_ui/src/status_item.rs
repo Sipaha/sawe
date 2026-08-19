@@ -1,7 +1,7 @@
+use gpui::App;
 use gpui::{Render, Subscription, WeakEntity};
 use remote_control::{RemoteControlStore, RemoteControlStoreEvent};
 use ui::{Button, ButtonStyle, Color, Icon, IconName, IconSize, LabelSize, prelude::*};
-use gpui::App;
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
 use crate::modal::RemoteControlModal;

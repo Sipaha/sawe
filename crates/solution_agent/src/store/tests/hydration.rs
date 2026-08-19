@@ -80,9 +80,8 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -367,9 +366,8 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -631,9 +629,8 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -753,9 +750,8 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -884,9 +880,8 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
         .expect("tab order");
 
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.restore_open_tabs(solution_id, cx)
-        })
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
     })
     .await
     .expect("restore");
@@ -989,9 +984,8 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -1034,9 +1028,8 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     });
     let ordered2 = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("restore 2");
@@ -1141,9 +1134,8 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     // First restore — MIGRATE branch: recovers desired_model from blob.
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("first restore");
@@ -1171,10 +1163,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         .await
         .expect("load rows after migrate");
     assert_eq!(rows.len(), 1, "migration must have written 1 row");
-    let metas = db
-        .list_for_solution(solution_id)
-        .await
-        .expect("list metas");
+    let metas = db.list_for_solution(solution_id).await.expect("list metas");
     let db_meta = metas.iter().find(|m| m.id == id_a).expect("meta in db");
     assert_eq!(
         db_meta.desired_model.as_deref(),
@@ -1193,9 +1182,8 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     // Second restore — ROWS branch: no blob deserialization, reads columns only.
     let ordered2 = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("second restore");
@@ -1280,9 +1268,8 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.restore_open_tabs(solution_id, cx)
-            })
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -1348,8 +1335,7 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         })
         .collect();
     assert!(
-        migrated_text.contains("user said hello")
-            && migrated_text.contains("assistant replied hi"),
+        migrated_text.contains("user said hello") && migrated_text.contains("assistant replied hi"),
         "coalesced migration row must preserve both legacy summaries, got: {migrated_text:?}"
     );
     // Blob must be PRESERVED (Task 5 owns blob removal + model/effort backfill).
@@ -1369,9 +1355,7 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
 /// row) is present, so the first persist re-writes the WHOLE Main stream at
 /// Main-local indices and `delete_entries_from(Main.len)` trims the leftovers.
 #[gpui::test]
-async fn legacy_teammate_tagged_rows_realign_to_main_local_on_cold_load(
-    cx: &mut TestAppContext,
-) {
+async fn legacy_teammate_tagged_rows_realign_to_main_local_on_cold_load(cx: &mut TestAppContext) {
     use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
 
@@ -1495,8 +1479,8 @@ async fn legacy_teammate_tagged_rows_realign_to_main_local_on_cold_load(
     }
     let texts: Vec<String> = rows
         .iter()
-        .map(|r| {
-            match crate::session_entry::kind_from_payload(&r.payload).expect("decode") {
+        .map(
+            |r| match crate::session_entry::kind_from_payload(&r.payload).expect("decode") {
                 SessionEntryKind::AssistantMessage { chunks } => chunks
                     .iter()
                     .filter_map(|c| match c {
@@ -1506,8 +1490,8 @@ async fn legacy_teammate_tagged_rows_realign_to_main_local_on_cold_load(
                     .collect(),
                 SessionEntryKind::UserMessage { content_md, .. } => content_md,
                 _ => String::new(),
-            }
-        })
+            },
+        )
         .collect();
     assert_eq!(
         texts,

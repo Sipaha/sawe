@@ -151,11 +151,9 @@ impl StreamIdDto {
             StreamIdDto::Teammate { toolu } => {
                 crate::stream::StreamId::Teammate(SharedString::from(toolu.clone()))
             }
-            StreamIdDto::Shell { id } => {
-                crate::stream::StreamId::Shell(crate::background_shell::BackgroundShellId::new(
-                    id.clone(),
-                ))
-            }
+            StreamIdDto::Shell { id } => crate::stream::StreamId::Shell(
+                crate::background_shell::BackgroundShellId::new(id.clone()),
+            ),
         }
     }
 }
@@ -550,7 +548,11 @@ pub struct QueuedBundleSummary {
 /// are skipped (noise), so this counts text turns, not raw entries.
 pub(crate) const USER_ANCHORED_TRAIL_ASSISTANT: usize = 5;
 
-pub(crate) fn apply_user_anchored_filter(kept: &mut Vec<EntrySummary>, lead: usize, since_ms: Option<i64>) {
+pub(crate) fn apply_user_anchored_filter(
+    kept: &mut Vec<EntrySummary>,
+    lead: usize,
+    since_ms: Option<i64>,
+) {
     if kept.is_empty() {
         return;
     }

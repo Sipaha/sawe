@@ -726,7 +726,10 @@ mod tests {
         assert!(text.contains("```\nhello\nworld\n\n```"), "output: {text}");
         // Command is now its OWN fenced block, not an inline `code` span.
         assert!(text.contains("```\necho hi\n```"), "command block: {text}");
-        assert!(!text.contains("`echo hi`"), "command must not be inline: {text}");
+        assert!(
+            !text.contains("`echo hi`"),
+            "command must not be inline: {text}"
+        );
         // Metadata line carries id + output path.
         assert!(
             text.contains("id: bvb4ful1z · out: /tmp/claude/tasks/bvb4ful1z.output"),

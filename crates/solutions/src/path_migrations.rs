@@ -178,7 +178,8 @@ fn moved_repo_paths(connection: &Connection, rewrite: &PathRewrite) -> Result<Ve
             .select::<String>(&format!(
                 "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
             ))
-            .with_context(|| format!("preparing repo-path select on {table}"))?()
+            .with_context(|| format!("preparing repo-path select on {table}"))?(
+        )
         .with_context(|| format!("selecting repo paths from {table}"))?;
         new_paths.extend(rows.into_iter().map(PathBuf::from));
     }
@@ -327,7 +328,8 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
 fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let names: Vec<String> = connection
         .select::<String>(&format!("SELECT name FROM pragma_table_info('{table}')"))
-        .with_context(|| format!("preparing column probe on {table}"))?()
+        .with_context(|| format!("preparing column probe on {table}"))?(
+    )
     .with_context(|| format!("probing columns of {table}"))?;
     Ok(names.iter().any(|name| name == column))
 }
@@ -353,7 +355,8 @@ fn rewrite_keyed_text_column(
         .select::<(i64, String)>(&format!(
             "SELECT {key_column}, {path_column} FROM {table} WHERE {path_column} IS NOT NULL"
         ))
-        .with_context(|| format!("preparing select on {table}"))?()
+        .with_context(|| format!("preparing select on {table}"))?(
+    )
     .with_context(|| format!("selecting from {table}"))?;
 
     let mut update = connection
@@ -450,7 +453,8 @@ fn rewrite_console_panel_state(connection: &Connection, rewrite: &PathRewrite) -
         .select::<(i64, i64, String)>(
             "SELECT workspace_id, tab_index, cwd FROM console_panel_state WHERE cwd IS NOT NULL",
         )
-        .context("preparing select on console_panel_state")?()
+        .context("preparing select on console_panel_state")?(
+    )
     .context("selecting from console_panel_state")?;
 
     let mut update = connection
@@ -460,8 +464,7 @@ fn rewrite_console_panel_state(connection: &Connection, rewrite: &PathRewrite) -
         .context("preparing update on console_panel_state")?;
     for (workspace_id, tab_index, cwd) in rows {
         if let Some(rewritten) = rewrite.apply_str(&cwd) {
-            update((rewritten, workspace_id, tab_index))
-                .context("updating console_panel_state")?;
+            update((rewritten, workspace_id, tab_index)).context("updating console_panel_state")?;
         }
     }
     Ok(())
@@ -532,8 +535,8 @@ fn rewrite_workspaces(connection: &Connection, rewrite: &PathRewrite) -> Result<
         }
 
         if let Some((new_paths, new_order)) = rewritten {
-            for conflicting in select_conflict(new_paths.clone())
-                .context("selecting conflicting workspace")?
+            for conflicting in
+                select_conflict(new_paths.clone()).context("selecting conflicting workspace")?
             {
                 if conflicting != workspace_id {
                     delete_conflict(conflicting).context("deleting conflicting workspace")?;
@@ -575,15 +578,13 @@ fn rewrite_path_list(
     let mut changed = false;
     let rewritten: Vec<PathBuf> = list
         .ordered_paths()
-        .map(
-            |path| match rewrite.apply_str(&path.to_string_lossy()) {
-                Some(new) => {
-                    changed = true;
-                    PathBuf::from(new)
-                }
-                None => path.clone(),
-            },
-        )
+        .map(|path| match rewrite.apply_str(&path.to_string_lossy()) {
+            Some(new) => {
+                changed = true;
+                PathBuf::from(new)
+            }
+            None => path.clone(),
+        })
         .collect();
     if !changed {
         return None;
@@ -625,8 +626,11 @@ fn delete_stale_toolchains(connection: &Connection, rewrite: &PathRewrite) -> Re
 pub fn rewrite_agent_db(connection: &Connection, rewrite: &PathRewrite) -> Result<()> {
     if has_column(connection, "solution_sessions", "cwd")? {
         let sessions: Vec<(String, String)> = connection
-            .select::<(String, String)>("SELECT id, cwd FROM solution_sessions WHERE cwd IS NOT NULL")
-            .context("preparing select on solution_sessions")?()
+            .select::<(String, String)>(
+                "SELECT id, cwd FROM solution_sessions WHERE cwd IS NOT NULL",
+            )
+            .context("preparing select on solution_sessions")?(
+        )
         .context("selecting from solution_sessions")?;
         let mut update_session = connection
             .exec_bound::<(String, String)>("UPDATE solution_sessions SET cwd = ?1 WHERE id = ?2")
@@ -649,7 +653,8 @@ pub fn rewrite_agent_db(connection: &Connection, rewrite: &PathRewrite) -> Resul
                  FROM solution_session_background_agent
                  WHERE jsonl_path IS NOT NULL",
             )
-            .context("preparing select on solution_session_background_agent")?()
+            .context("preparing select on solution_session_background_agent")?(
+        )
         .context("selecting from solution_session_background_agent")?;
         let mut update_agent = connection
             .exec_bound::<(String, String, String)>(
@@ -676,7 +681,8 @@ pub fn rewrite_agent_db(connection: &Connection, rewrite: &PathRewrite) -> Resul
                  FROM solution_session_attachment
                  WHERE path IS NOT NULL",
             )
-            .context("preparing select on solution_session_attachment")?()
+            .context("preparing select on solution_session_attachment")?(
+        )
         .context("selecting from solution_session_attachment")?;
         let mut delete_attachment = connection
             .exec_bound::<(String, String)>(
@@ -870,7 +876,10 @@ fn owning_repo(tree: &Path, rewrite: &PathRewrite) -> Option<PathBuf> {
         .apply_str(pointer)
         .unwrap_or_else(|| pointer.to_string());
     // <repo>/.git/worktrees/<name> → <repo>
-    Path::new(&pointer).ancestors().nth(3).map(Path::to_path_buf)
+    Path::new(&pointer)
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
 }
 
 pub struct ReconcileContext {
@@ -1739,7 +1748,10 @@ mod tests {
             vec!["/base/new/member/inbox/a.png"]
         );
         assert_eq!(
-            counts(&connection, "SELECT COUNT(*) FROM solution_session_attachment"),
+            counts(
+                &connection,
+                "SELECT COUNT(*) FROM solution_session_attachment"
+            ),
             vec![2],
             "delete+reinsert must not duplicate the row"
         );
@@ -1902,8 +1914,7 @@ mod tests {
         let new_member = new_root.join("member");
         let new_tree = new_member.join(".claude").join("worktrees").join("agent-1");
 
-        repair_git_worktrees(&[(new_member.clone(), new_root.clone())], &rewrite)
-            .expect("repair");
+        repair_git_worktrees(&[(new_member.clone(), new_root.clone())], &rewrite).expect("repair");
 
         assert_worktree_is_healthy(&new_tree);
         // Idempotent — a second pass on an already-healthy tree is harmless.
@@ -2234,7 +2245,10 @@ mod tests {
         rewrite_app_db(&connection, &rewrite()).expect("rewrite");
 
         assert_eq!(shelf_names(&connection, "/base/new/member"), vec!["wip"]);
-        assert_eq!(shelf_names(&connection, "/base/old/member"), Vec::<String>::new());
+        assert_eq!(
+            shelf_names(&connection, "/base/old/member"),
+            Vec::<String>::new()
+        );
         assert_eq!(shelf_names(&connection, "/base/new"), vec!["root-wip"]);
         assert_eq!(favorites(&connection, "/base/new/member"), vec!["main"]);
         assert_eq!(

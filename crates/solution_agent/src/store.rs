@@ -18,22 +18,22 @@ use util::ResultExt;
 use crate::adapter::AdapterRegistry;
 use crate::db::SolutionAgentDb;
 use crate::metrics_emitter::MetricsEmitter;
-use crate::model_catalog::ModelCatalog;
 use crate::model::{
     AgentServerId, SessionContextCount, SessionState, SolutionSession, SolutionSessionId,
     SolutionSessionMetadata,
 };
+use crate::model_catalog::ModelCatalog;
 use crate::notifier;
 use crate::pool::SubprocessPool;
 use crate::teammate_watchers::TeammateWatchers;
 
-mod connection_pool;
-mod queue;
-mod hydration;
-mod teardown;
 mod acp_event;
+mod connection_pool;
+mod hydration;
+mod queue;
 mod supervisor_engine;
 mod teammate_reconciler;
+mod teardown;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
@@ -119,9 +119,7 @@ const TOOL_OUTPUT_SILENCE_SECS: u64 = 15 * 60;
 /// Pure so the decision is unit-testable without a live thread.
 fn turn_is_wedged(active_tool: Option<(i64, bool)>, background_alive: bool) -> bool {
     match active_tool {
-        Some((tool_secs, shows_liveness)) => {
-            tool_secs >= TOOL_STUCK_SECS as i64 && !shows_liveness
-        }
+        Some((tool_secs, shows_liveness)) => tool_secs >= TOOL_STUCK_SECS as i64 && !shows_liveness,
         None => !background_alive,
     }
 }
@@ -168,8 +166,7 @@ const RECONNECT_CONTINUATION_PROMPT: &str = "Твой процесс завис,
 /// Continuation sent after a user-initiated Restart. Same instruction, without
 /// the claim that the process hung — nothing was wrong, the user asked for a
 /// fresh subprocess.
-const RESTART_CONTINUATION_PROMPT: &str =
-    "Редактор перезапустил твой процесс по команде пользователя. \
+const RESTART_CONTINUATION_PROMPT: &str = "Редактор перезапустил твой процесс по команде пользователя. \
      История и контекст сохранены — продолжай работу с того места, на котором остановился.";
 
 /// Continuation sent after [`SolutionAgentStore::reconnect_agent`] when the
@@ -626,10 +623,10 @@ impl RespawnReason {
 
     fn failure_status(self) -> &'static str {
         match self {
-            RespawnReason::Watchdog => "переподключение не удалось — перезапустите агента (Restart)",
-            RespawnReason::UserRestart => {
-                "перезапуск не удался — история цела, попробуйте ещё раз"
+            RespawnReason::Watchdog => {
+                "переподключение не удалось — перезапустите агента (Restart)"
             }
+            RespawnReason::UserRestart => "перезапуск не удался — история цела, попробуйте ещё раз",
         }
     }
 
@@ -638,9 +635,7 @@ impl RespawnReason {
             RespawnReason::Watchdog => {
                 "Агент не отвечал — переподключил сессию (история и контекст сохранены)."
             }
-            RespawnReason::UserRestart => {
-                "Агент перезапущен (история и контекст сохранены)."
-            }
+            RespawnReason::UserRestart => "Агент перезапущен (история и контекст сохранены).",
         }
     }
 }
@@ -803,7 +798,16 @@ impl SolutionAgentStore {
         // member binding is the same choice, just recorded as a fact.
         let member_id = SolutionStore::try_global(cx)
             .and_then(|store| store.read(cx).active_member(solution_id));
-        self.create_session_with_cwd(solution_id, agent_id, project, None, member_id, None, None, cx)
+        self.create_session_with_cwd(
+            solution_id,
+            agent_id,
+            project,
+            None,
+            member_id,
+            None,
+            None,
+            cx,
+        )
     }
 
     /// Create a hidden one-shot session for an internal AI helper (commit-message
@@ -2868,12 +2872,13 @@ impl SolutionAgentStore {
         let (root, member_id) = SolutionStore::try_global(cx)
             .and_then(|store| {
                 store.read_with(cx, |s, _| {
-                    s.solutions().iter().find(|sol| sol.id == solution_id).map(
-                        |sol| match sol.members.first() {
+                    s.solutions()
+                        .iter()
+                        .find(|sol| sol.id == solution_id)
+                        .map(|sol| match sol.members.first() {
                             Some(member) => (member.local_path.clone(), Some(member.id)),
                             None => (sol.root.clone(), None),
-                        },
-                    )
+                        })
                 })
             })
             .unwrap_or_default();
@@ -3229,7 +3234,10 @@ impl SolutionAgentStore {
                     weak.update(cx, |store, cx| {
                         let session_id = store.session_id_for_acp(acp_sid, cx)?;
                         let delivered = store.take_pending_for_delivery(
-                            session_id, agent_id, is_end_of_turn, cx,
+                            session_id,
+                            agent_id,
+                            is_end_of_turn,
+                            cx,
                         );
                         // Authoritative teammate completion: a subagent `Stop`
                         // (end-of-turn + its own agent_id) with nothing left to
@@ -3467,9 +3475,8 @@ impl SolutionAgentStore {
                     {
                         continue;
                     }
-                    changed |= crate::store::hydration::normalize_stranded_tool_status(
-                        &mut entry.kind,
-                    );
+                    changed |=
+                        crate::store::hydration::normalize_stranded_tool_status(&mut entry.kind);
                 }
                 s.entries = entries;
                 if changed {
@@ -3503,9 +3510,13 @@ impl SolutionAgentStore {
         // done/ask notification when the work actually concludes.
         let (has_pending_messages, has_live_background_work, is_supervisor_ephemeral) = {
             let s = session.read(cx);
-            let has_live_background_work = s.background_shells.values().any(|sh| {
-                matches!(sh.state, crate::background_shell::ShellRuntimeState::Running)
-            }) || s.background_agents.values().any(|a| a.is_messageable());
+            let has_live_background_work =
+                s.background_shells.values().any(|sh| {
+                    matches!(
+                        sh.state,
+                        crate::background_shell::ShellRuntimeState::Running
+                    )
+                }) || s.background_agents.values().any(|a| a.is_messageable());
             (
                 !s.pending_messages.is_empty(),
                 has_live_background_work,
@@ -3925,12 +3936,14 @@ mod subagent_view_tests {
         // streams on, so it must NOT auto-close here. The gate is
         // `!tool_name_is_agent(tool_name)`.
         assert!(!tool_name_is_agent(Some("Task")), "Task → auto-close");
-        assert!(tool_name_is_agent(Some("Agent")), "Agent → do NOT auto-close");
+        assert!(
+            tool_name_is_agent(Some("Agent")),
+            "Agent → do NOT auto-close"
+        );
         assert!(
             tool_name_is_agent(Some("agent")),
             "case-insensitive: agent → do NOT auto-close"
         );
         assert!(!tool_name_is_agent(None), "unknown tool → auto-close path");
     }
-
 }

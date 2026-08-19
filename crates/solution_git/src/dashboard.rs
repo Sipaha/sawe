@@ -657,8 +657,8 @@ fn active_solution(cx: &App) -> Option<Solution> {
 /// repos when several Solutions are open — see `.rules` § two-tier sockets.
 fn target_solution(cx: &App, solution_id: Option<i64>) -> Result<Solution> {
     if let Some(id) = solution_id {
-        let store = SolutionStore::try_global(cx)
-            .ok_or_else(|| anyhow!("no SolutionStore global"))?;
+        let store =
+            SolutionStore::try_global(cx).ok_or_else(|| anyhow!("no SolutionStore global"))?;
         let store = store.read(cx);
         return store
             .find_solution(solutions::SolutionId(id))
@@ -805,7 +805,8 @@ impl McpServerTool for BatchFetchTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
-        let pairs = cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
+        let pairs =
+            cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
         let mut tasks = Vec::new();
         for (id, path) in pairs {
             tasks.push(cx.background_spawn(async move {
@@ -847,7 +848,8 @@ impl McpServerTool for BatchPullTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> Result<ToolResponse<Self::Output>> {
-        let pairs = cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
+        let pairs =
+            cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
         let skip_dirty = input.skip_dirty.unwrap_or(true);
         let mut tasks = Vec::new();
         for (id, path) in pairs {
@@ -924,7 +926,8 @@ impl McpServerTool for CheckoutPatternTool {
         if input.pattern.trim().is_empty() {
             return Err(anyhow!("`pattern` is required and must be non-empty"));
         }
-        let pairs = cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
+        let pairs =
+            cx.update(|cx| resolve_targets(cx, input.solution_id, input.members.as_deref()))?;
         let pattern = Arc::new(input.pattern);
 
         let mut classify_tasks = Vec::new();

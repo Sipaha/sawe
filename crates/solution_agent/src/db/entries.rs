@@ -91,7 +91,10 @@ pub(crate) fn insert_or_update_entry(
     Ok(())
 }
 
-pub(crate) fn select_entries_for_session(connection: &Connection, session_id: &str) -> Result<Vec<EntryRow>> {
+pub(crate) fn select_entries_for_session(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<EntryRow>> {
     let mut stmt =
         connection.select_bound::<String, (i64, i64, i64, Option<String>, Vec<u8>)>(indoc! {"
         SELECT idx, mod_seq, created_ms, subagent_id, payload
@@ -114,7 +117,11 @@ pub(crate) fn select_entries_for_session(connection: &Connection, session_id: &s
         .collect())
 }
 
-pub(crate) fn delete_entries_from_idx(connection: &Connection, session_id: &str, from_idx: i64) -> Result<()> {
+pub(crate) fn delete_entries_from_idx(
+    connection: &Connection,
+    session_id: &str,
+    from_idx: i64,
+) -> Result<()> {
     let mut stmt = connection.exec_bound::<(String, i64)>(indoc! {"
         DELETE FROM solution_session_entries
         WHERE session_id = ? AND idx >= ?
@@ -123,7 +130,10 @@ pub(crate) fn delete_entries_from_idx(connection: &Connection, session_id: &str,
     Ok(())
 }
 
-pub(crate) fn delete_all_entries_for_session(connection: &Connection, session_id: &str) -> Result<()> {
+pub(crate) fn delete_all_entries_for_session(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<()> {
     let mut stmt = connection.exec_bound::<String>(indoc! {"
         DELETE FROM solution_session_entries
         WHERE session_id = ?

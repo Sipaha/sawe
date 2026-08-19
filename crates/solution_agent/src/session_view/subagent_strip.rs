@@ -545,8 +545,8 @@ mod tests {
         let grandchild = snap("d", Some("b"), "delta", 4);
         let parent_id = parent.id;
         let snaps = vec![parent, child2, child1, grandchild];
-        let rows = compute_strip_rows(parent_id, &SolutionId(1), &snaps)
-            .expect("strip rows present");
+        let rows =
+            compute_strip_rows(parent_id, &SolutionId(1), &snaps).expect("strip rows present");
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
         assert_eq!(labels, vec!["alpha", "beta", "delta", "gamma"]);
         let indents: Vec<u32> = rows.iter().map(|r| r.indent_level).collect();
@@ -564,8 +564,8 @@ mod tests {
             let cid = format!("c{i:02}");
             snaps.push(snap(&cid, Some("a"), &format!("kid{i}"), 10 + i as i64));
         }
-        let rows = compute_strip_rows(parent_id, &SolutionId(1), &snaps)
-            .expect("strip rows present");
+        let rows =
+            compute_strip_rows(parent_id, &SolutionId(1), &snaps).expect("strip rows present");
         assert_eq!(rows.len(), MAX_STRIP_ROWS);
         let last = rows.last().expect("last row");
         assert!(matches!(last.kind, StripRowKind::Overflow));
@@ -586,12 +586,8 @@ mod tests {
         let mut other = snap("c", Some("a"), "outsider", 3);
         other.solution_id = SolutionId(8);
         let child_id = child.id;
-        let rows = compute_strip_rows(
-            child_id,
-            &SolutionId(1),
-            &[parent, child, other],
-        )
-        .expect("strip rows present");
+        let rows = compute_strip_rows(child_id, &SolutionId(1), &[parent, child, other])
+            .expect("strip rows present");
         assert_eq!(rows.len(), 2, "outsider should not appear in the strip");
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
         assert_eq!(labels, vec!["alpha", "beta"]);
@@ -633,11 +629,7 @@ mod tests {
     fn judge_snapshot_present_would_produce_two_rows_demonstrating_pre_fix_leak() {
         let supervised = snap("aa", None, "Supervised", 1);
         let judge = snap("bb", Some("aa"), "Judge", 2);
-        let rows = compute_strip_rows(
-            supervised.id,
-            &SolutionId(1),
-            &[supervised, judge],
-        );
+        let rows = compute_strip_rows(supervised.id, &SolutionId(1), &[supervised, judge]);
         assert!(
             rows.is_some(),
             "without filtering, a judge child produces strip rows"

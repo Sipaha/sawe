@@ -193,7 +193,10 @@ async fn migration_imports_old_json_once(cx: &mut TestAppContext) {
     assert!(bak.exists());
 
     crate::migrate::run_one_time_migration(&db, &json_path).expect("second run is a no-op");
-    let cat = db.load_all_catalog_projects().await.expect("reload catalog");
+    let cat = db
+        .load_all_catalog_projects()
+        .await
+        .expect("reload catalog");
     assert_eq!(cat.len(), 1);
 }
 

@@ -125,7 +125,11 @@ fn real_solutions_db_migrates_without_losing_rows() {
         "solutions db after:  {} solution(s), {} member(s), {} active, {} catalog",
         r.1, r.3, r.5, r.7
     );
-    assert_eq!((r.0, r.1), (solutions_before, solutions_before), "solutions");
+    assert_eq!(
+        (r.0, r.1),
+        (solutions_before, solutions_before),
+        "solutions"
+    );
     assert_eq!((r.2, r.3), (members_before, members_before), "members");
     assert_eq!(
         (r.4, r.5),
@@ -155,7 +159,11 @@ fn real_solutions_db_migrates_without_losing_rows() {
         )
         .expect("prepare active check")()
     .expect("active check");
-    assert_eq!(dangling_active, vec![0], "no active_member without a member");
+    assert_eq!(
+        dangling_active,
+        vec![0],
+        "no active_member without a member"
+    );
 
     let legacy = count(&connection, "solution_legacy_ids");
     assert_eq!(
@@ -213,8 +221,14 @@ async fn real_agent_db_migrates_without_losing_sessions(cx: &mut gpui::TestAppCo
         "agent db after:  {sessions_after} session(s), {entries_after} entrie(s), \
          {attachments_after} attachment(s)"
     );
-    assert_eq!(sessions_after, sessions_before, "no session row may be lost");
-    assert_eq!(entries_after, entries_before, "no transcript entry may be lost");
+    assert_eq!(
+        sessions_after, sessions_before,
+        "no session row may be lost"
+    );
+    assert_eq!(
+        entries_after, entries_before,
+        "no transcript entry may be lost"
+    );
     assert_eq!(
         attachments_after, attachments_before,
         "no attachment row may be lost"
@@ -256,10 +270,7 @@ async fn real_agent_db_migrates_without_losing_sessions(cx: &mut gpui::TestAppCo
         bound, report.member_ids_backfilled,
         "member_id backfill count must match the rows actually bound"
     );
-    let unmapped_sessions = rows
-        .iter()
-        .filter(|r| r.1.parse::<i64>().is_err())
-        .count() as i64;
+    let unmapped_sessions = rows.iter().filter(|r| r.1.parse::<i64>().is_err()).count() as i64;
     assert_eq!(
         report.sessions_remapped + unmapped_sessions,
         sessions_before,
@@ -272,6 +283,9 @@ async fn real_agent_db_migrates_without_losing_sessions(cx: &mut gpui::TestAppCo
         .await
         .expect("second agent identity migration");
     assert_eq!(second.sessions_remapped, 0, "remap must be idempotent");
-    assert_eq!(second.member_ids_backfilled, 0, "backfill must be idempotent");
+    assert_eq!(
+        second.member_ids_backfilled, 0,
+        "backfill must be idempotent"
+    );
     assert_eq!(second.sessions_total, sessions_before);
 }

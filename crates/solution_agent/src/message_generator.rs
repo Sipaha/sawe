@@ -90,12 +90,7 @@ pub async fn run_ephemeral_task(
     let create_session_task = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            store.create_ephemeral_session(
-                solution.id,
-                agent_id.clone(),
-                project.clone(),
-                cx,
-            )
+            store.create_ephemeral_session(solution.id, agent_id.clone(), project.clone(), cx)
         })
     });
 

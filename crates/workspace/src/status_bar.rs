@@ -160,13 +160,11 @@ impl StatusBar {
     ) -> impl IntoElement {
         // SPK fork: sidebar is disabled (see `zed::zed::initialize_workspace`),
         // so the status-bar toggle that normally re-opens it is hidden.
-        h_flex()
-            .gap_1()
-            .min_w_0()
-            .overflow_x_hidden()
-            .children(self.left_items.iter().enumerate().map(|(index, item)| {
+        h_flex().gap_1().min_w_0().overflow_x_hidden().children(
+            self.left_items.iter().enumerate().map(|(index, item)| {
                 render_hideable_item("status-bar-left", index, item.as_ref(), cx)
-            }))
+            }),
+        )
     }
 
     fn render_right_tools(

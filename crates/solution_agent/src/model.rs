@@ -957,10 +957,7 @@ impl SolutionSession {
     /// Remove and return whether a `Stop` was buffered for this agent (arrived
     /// before its registration). The registration site closes the teammate
     /// stream when this returns `true`.
-    pub fn take_pending_stop(
-        &mut self,
-        id: &crate::background_agent::BackgroundAgentId,
-    ) -> bool {
+    pub fn take_pending_stop(&mut self, id: &crate::background_agent::BackgroundAgentId) -> bool {
         self.pending_stop.remove(id)
     }
 

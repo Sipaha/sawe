@@ -242,7 +242,10 @@ impl McpServerTool for RemoveCatalogProjectTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
+        anyhow::ensure!(
+            input.catalog_id > 0,
+            "invalid_params: catalog_id is required"
+        );
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
             let id = crate::CatalogId(input.catalog_id);
@@ -390,7 +393,10 @@ impl McpServerTool for EditCatalogProjectTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
+        anyhow::ensure!(
+            input.catalog_id > 0,
+            "invalid_params: catalog_id is required"
+        );
         let catalog_id = input.catalog_id;
         cx.update(|cx| -> Result<()> {
             let store = SolutionStore::global(cx);
@@ -552,7 +558,10 @@ impl McpServerTool for RefreshCacheTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(input.catalog_id > 0, "invalid_params: catalog_id is required");
+        anyhow::ensure!(
+            input.catalog_id > 0,
+            "invalid_params: catalog_id is required"
+        );
         let remote_url = cx.update(|cx| -> Result<String> {
             let store = SolutionStore::global(cx);
             let url = store.read_with(cx, |s, _| {
@@ -608,4 +617,3 @@ impl McpServerTool for RefreshCacheTool {
         })
     }
 }
-

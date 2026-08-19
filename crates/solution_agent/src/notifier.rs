@@ -193,7 +193,16 @@ mod tests {
         };
         let next = SessionState::Idle;
         assert_eq!(
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, false, false),
+            decide_notification(
+                SolutionSessionId::new(),
+                &prev,
+                &next,
+                now,
+                false,
+                false,
+                false,
+                false
+            ),
             None
         );
     }
@@ -207,8 +216,16 @@ mod tests {
             notified: false,
         };
         let next = SessionState::Idle;
-        let decision =
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, false, false);
+        let decision = decide_notification(
+            SolutionSessionId::new(),
+            &prev,
+            &next,
+            now,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(decision, Some(d) if d.kind == NotifyKind::Completed));
     }
 
@@ -222,7 +239,16 @@ mod tests {
         };
         let next = SessionState::Idle;
         assert_eq!(
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, true, false, false, false),
+            decide_notification(
+                SolutionSessionId::new(),
+                &prev,
+                &next,
+                now,
+                true,
+                false,
+                false,
+                false
+            ),
             None
         );
     }
@@ -236,8 +262,16 @@ mod tests {
             notified: false,
         };
         let next = SessionState::Errored("boom".into());
-        let decision =
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, false, false);
+        let decision = decide_notification(
+            SolutionSessionId::new(),
+            &prev,
+            &next,
+            now,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(decision, Some(d) if d.kind == NotifyKind::Errored));
     }
 
@@ -255,7 +289,16 @@ mod tests {
         // the user wants one notification at the end of all their
         // follow-ups, not per-turn.
         assert_eq!(
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, true, false, false),
+            decide_notification(
+                SolutionSessionId::new(),
+                &prev,
+                &next,
+                now,
+                false,
+                true,
+                false,
+                false
+            ),
             None
         );
     }
@@ -272,8 +315,16 @@ mod tests {
         // AwaitingInput parks the session and DOESN'T drain the queue
         // automatically — the user must approve a tool call. Notify
         // even with pending messages.
-        let decision =
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, true, false, false);
+        let decision = decide_notification(
+            SolutionSessionId::new(),
+            &prev,
+            &next,
+            now,
+            false,
+            true,
+            false,
+            false,
+        );
         assert!(matches!(decision, Some(d) if d.kind == NotifyKind::AwaitingInput));
     }
 
@@ -289,7 +340,16 @@ mod tests {
         // The agent went idle OVER a still-running background command it
         // launched — it will resume on its own, so this isn't "done".
         assert_eq!(
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, true, false),
+            decide_notification(
+                SolutionSessionId::new(),
+                &prev,
+                &next,
+                now,
+                false,
+                false,
+                true,
+                false
+            ),
             None
         );
     }
@@ -307,7 +367,16 @@ mod tests {
         // and likely nudge onward; its own done/ask notification is the real
         // end-of-work signal, so the per-turn Completed is premature.
         assert_eq!(
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, false, true),
+            decide_notification(
+                SolutionSessionId::new(),
+                &prev,
+                &next,
+                now,
+                false,
+                false,
+                false,
+                true
+            ),
             None
         );
     }
@@ -322,8 +391,16 @@ mod tests {
         };
         let next = SessionState::Errored("boom".into());
         // A break needs the user regardless of background work / supervisor.
-        let decision =
-            decide_notification(SolutionSessionId::new(), &prev, &next, now, false, false, true, true);
+        let decision = decide_notification(
+            SolutionSessionId::new(),
+            &prev,
+            &next,
+            now,
+            false,
+            false,
+            true,
+            true,
+        );
         assert!(matches!(decision, Some(d) if d.kind == NotifyKind::Errored));
     }
 }

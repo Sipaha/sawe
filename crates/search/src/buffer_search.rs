@@ -162,10 +162,7 @@ impl Render for BufferSearchBar {
                                             .update(cx, |editor, cx| {
                                                 let rhs = editor.rhs_editor().clone();
                                                 rhs.focus_handle(cx).focus(window, cx);
-                                                window.dispatch_action(
-                                                    GoToHunk.boxed_clone(),
-                                                    cx,
-                                                );
+                                                window.dispatch_action(GoToHunk.boxed_clone(), cx);
                                             })
                                             .ok();
                                     }

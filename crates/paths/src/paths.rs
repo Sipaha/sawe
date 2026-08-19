@@ -38,20 +38,12 @@ fn use_dev_suffix() -> bool {
 
 /// Kebab-case directory name (Linux / generic). See `use_dev_suffix`.
 pub fn dir_name_kebab() -> &'static str {
-    if use_dev_suffix() {
-        "sawe-dev"
-    } else {
-        "sawe"
-    }
+    if use_dev_suffix() { "sawe-dev" } else { "sawe" }
 }
 
 /// PascalCase directory name (macOS / Windows). See `use_dev_suffix`.
 pub fn dir_name_pascal() -> &'static str {
-    if use_dev_suffix() {
-        "Sawe-Dev"
-    } else {
-        "Sawe"
-    }
+    if use_dev_suffix() { "Sawe-Dev" } else { "Sawe" }
 }
 
 /// A custom data directory override, set only by `set_custom_data_dir`.

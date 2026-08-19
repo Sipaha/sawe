@@ -167,7 +167,8 @@ fn stats_excludes_dropped_records() {
     let s = verdict_stats(&recs);
     assert_eq!(s.total, 2, "dropped verdict excluded from total");
     assert_eq!(
-        s.by_action[VerdictAction::Continue as usize], 1,
+        s.by_action[VerdictAction::Continue as usize],
+        1,
         "only the acted Continue counts"
     );
     assert_eq!(s.by_action[VerdictAction::Compact as usize], 1);
@@ -317,9 +318,7 @@ fn usage_limit_detects_both_subscription_limits() {
     ));
     // The session-limit message must classify as Quota (was Transient).
     assert!(matches!(
-        classify_judge_error(
-            "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
-        ),
+        classify_judge_error("You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"),
         JudgeFailure::Quota
     ));
 }
@@ -411,7 +410,9 @@ fn parse_reset_recent_past_resumes_now_not_tomorrow() {
     // watchdog only notices ~5 min after the wall printed). The limit reset
     // moments ago; rolling to tomorrow would over-park ~24 h (finding #6).
     // 8:20pm Novosibirsk (UTC+7) == 13:20 UTC; now = 13:25 UTC (== 8:25pm).
-    let now = chrono::Utc.with_ymd_and_hms(2026, 6, 29, 13, 25, 0).unwrap();
+    let now = chrono::Utc
+        .with_ymd_and_hms(2026, 6, 29, 13, 25, 0)
+        .unwrap();
     let got = parse_usage_limit_reset_ms(
         "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)",
         now.timestamp_millis(),

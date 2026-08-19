@@ -28,7 +28,12 @@ impl AddProjectPicker {
         let catalog_entries = store.read_with(cx, |s, _| {
             let already_member: collections::HashSet<CatalogId> = s
                 .find_solution(solution_id)
-                .map(|sol| sol.members.iter().filter_map(|m| m.origin_catalog_id).collect())
+                .map(|sol| {
+                    sol.members
+                        .iter()
+                        .filter_map(|m| m.origin_catalog_id)
+                        .collect()
+                })
                 .unwrap_or_default();
             s.catalog()
                 .iter()

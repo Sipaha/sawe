@@ -107,9 +107,8 @@ impl SolutionStore {
         let sol = match self.config.solutions.iter().find(|s| s.id == solution_id) {
             Some(s) => s.clone(),
             None => {
-                return cx.background_spawn(async move {
-                    bail!("solution not found: {solution_id}")
-                });
+                return cx
+                    .background_spawn(async move { bail!("solution not found: {solution_id}") });
             }
         };
         let cat = match self.config.catalog.iter().find(|c| c.id == catalog_id) {
@@ -276,15 +275,15 @@ impl SolutionStore {
                                 // stores with no DB fall back to the shared
                                 // in-memory counter.
                                 let member_id = match store.db.as_ref() {
-                                    Some(db) => MemberId(gpui::block_on(
-                                        db.insert_solution_member(
+                                    Some(db) => {
+                                        MemberId(gpui::block_on(db.insert_solution_member(
                                             solution_id.0,
                                             folder.clone(),
                                             target.to_string_lossy().into_owned(),
                                             position,
                                             Some(catalog_id.0),
-                                        ),
-                                    )?),
+                                        ))?)
+                                    }
                                     None => MemberId(store.next_id_without_db()),
                                 };
                                 let member = SolutionMember {

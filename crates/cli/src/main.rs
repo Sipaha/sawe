@@ -880,11 +880,7 @@ mod linux {
 
                 // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
                 // ./zed is for the target directory in development builds.
-                let possible_locations = [
-                    "../libexec/sawe-bin",
-                    "../lib/sawe/sawe-bin",
-                    "./zed",
-                ];
+                let possible_locations = ["../libexec/sawe-bin", "../lib/sawe/sawe-bin", "./zed"];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -1221,11 +1217,7 @@ mod windows {
 
                 // ../sawe.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
                 // directory in development builds.
-                let possible_locations = [
-                    "../sawe.exe",
-                    "../lib/sawe/sawe-bin.exe",
-                    "./zed.exe",
-                ];
+                let possible_locations = ["../sawe.exe", "../lib/sawe/sawe-bin.exe", "./zed.exe"];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))

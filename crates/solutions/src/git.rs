@@ -62,14 +62,23 @@ pub async fn clone_from_remote(
         .arg("--progress")
         .arg(remote_url)
         .arg(target);
-    drain_command(&mut cmd, on_progress, &format!("git clone --bare {remote_url}")).await?;
+    drain_command(
+        &mut cmd,
+        on_progress,
+        &format!("git clone --bare {remote_url}"),
+    )
+    .await?;
     // `git clone --bare` leaves NO fetch refspec, so a later `refresh_cache`
     // (`git fetch --all`) would no-op on branches. Set the heads refspec
     // explicitly so refreshes keep every branch current (tags follow the
     // fetched commits automatically).
     run_git(
         target,
-        &["config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"],
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/heads/*",
+        ],
         |_| {},
     )
     .await

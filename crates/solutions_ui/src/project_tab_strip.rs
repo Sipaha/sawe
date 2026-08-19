@@ -23,7 +23,9 @@
 use gpui::{
     Entity, IntoElement, ParentElement, Render, Styled, Subscription, WeakEntity, Window, div, px,
 };
-use solutions::{MemberId, Solution, SolutionId, SolutionMember, SolutionStore, SolutionStoreEvent};
+use solutions::{
+    MemberId, Solution, SolutionId, SolutionMember, SolutionStore, SolutionStoreEvent,
+};
 use ui::{ContextMenu, IconButton, IconName, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{MultiWorkspace, Workspace};
@@ -90,8 +92,7 @@ impl Render for ProjectTabStrip {
 
         let store = SolutionStore::global(cx);
         let active_workspace = mw.read(cx).workspace().clone();
-        let active_solution_id =
-            solution_id_for_workspace(&active_workspace, store.read(cx), cx);
+        let active_solution_id = solution_id_for_workspace(&active_workspace, store.read(cx), cx);
 
         let Some(solution_id) = active_solution_id else {
             // No active solution in this window — nothing to render.
@@ -137,7 +138,12 @@ impl Render for ProjectTabStrip {
         let landed: Vec<solutions::CatalogId> = store
             .read(cx)
             .find_solution(solution_id)
-            .map(|sol| sol.members.iter().filter_map(|m| m.origin_catalog_id).collect())
+            .map(|sol| {
+                sol.members
+                    .iter()
+                    .filter_map(|m| m.origin_catalog_id)
+                    .collect()
+            })
             .unwrap_or_default();
         let pending_tabs = store
             .read(cx)
@@ -186,16 +192,20 @@ impl Render for ProjectTabStrip {
                 .trigger(more_button)
                 .menu(move |window, cx| {
                     let overflow_entries = overflow_entries.clone();
-                    Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-                        for (solution_id, member_id, name) in overflow_entries {
-                            menu = menu.entry(name.clone(), None, move |_window, cx| {
-                                SolutionStore::global(cx).update(cx, |store, cx| {
-                                    store.set_active_member(solution_id, member_id, cx);
+                    Some(ContextMenu::build(
+                        window,
+                        cx,
+                        move |mut menu, _window, _cx| {
+                            for (solution_id, member_id, name) in overflow_entries {
+                                menu = menu.entry(name.clone(), None, move |_window, cx| {
+                                    SolutionStore::global(cx).update(cx, |store, cx| {
+                                        store.set_active_member(solution_id, member_id, cx);
+                                    });
                                 });
-                            });
-                        }
-                        menu
-                    }))
+                            }
+                            menu
+                        },
+                    ))
                 })
         });
 

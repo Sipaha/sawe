@@ -38,16 +38,15 @@ impl ProjectToolbar {
         let mut subscriptions = Vec::new();
         // Re-render when the active repository or its branch changes so the
         // relocated branch widget stays current.
-        subscriptions.push(cx.subscribe(
-            &git_store,
-            move |_, _, event, cx| match event {
+        subscriptions.push(
+            cx.subscribe(&git_store, move |_, _, event, cx| match event {
                 project::git_store::GitStoreEvent::ActiveRepositoryChanged(_)
                 | project::git_store::GitStoreEvent::RepositoryUpdated(_, _, true) => {
                     cx.notify();
                 }
                 _ => {}
-            },
-        ));
+            }),
+        );
         if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
             subscriptions.push(cx.observe(&workspace_entity, |_, _, cx| cx.notify()));
         }
@@ -141,10 +140,7 @@ impl ProjectToolbar {
         // `ahead` (unpushed) count moved to the dedicated Push button.
         let (name, behind) = match &snapshot.branch {
             Some(branch) => {
-                let behind = branch
-                    .tracking_status()
-                    .map(|s| s.behind)
-                    .unwrap_or(0);
+                let behind = branch.tracking_status().map(|s| s.behind).unwrap_or(0);
                 (SharedString::from(branch.name().to_string()), behind)
             }
             None => {
@@ -292,8 +288,14 @@ impl Render for ProjectToolbar {
             .child(
                 h_flex()
                     .gap_1()
-                    .children(self.render_update_button(cx).map(IntoElement::into_any_element))
-                    .children(self.render_push_button(cx).map(IntoElement::into_any_element))
+                    .children(
+                        self.render_update_button(cx)
+                            .map(IntoElement::into_any_element),
+                    )
+                    .children(
+                        self.render_push_button(cx)
+                            .map(IntoElement::into_any_element),
+                    )
                     .children(
                         self.render_branch_widget(cx)
                             .map(IntoElement::into_any_element),

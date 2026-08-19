@@ -35,7 +35,9 @@ pub fn init(cx: &mut App) {
         // every notification we sent, regardless of which per-dispatch proxy
         // sent it (the signal is on the shared portal object).
         let Ok(proxy) = NotificationProxy::new().await else {
-            log::warn!("notification_focus: could not open the notification portal; clicks won't focus");
+            log::warn!(
+                "notification_focus: could not open the notification portal; clicks won't focus"
+            );
             return;
         };
         let Ok(mut actions) = proxy.receive_action_invoked().await else {

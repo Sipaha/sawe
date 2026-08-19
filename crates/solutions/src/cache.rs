@@ -157,7 +157,13 @@ mod tests {
         // ensure_cache reused it (rather than wiping + re-cloning).
         std::fs::create_dir_all(pre.parent().expect("cache root parent")).expect("mkdir root");
         smol::block_on(crate::git::test_support::run(
-            &["clone", "--mirror", "--quiet", &url, pre.to_str().expect("path str")],
+            &[
+                "clone",
+                "--mirror",
+                "--quiet",
+                &url,
+                pre.to_str().expect("path str"),
+            ],
             None,
         ));
         std::fs::write(pre.join("SENTINEL"), "x").expect("write sentinel");
@@ -165,7 +171,10 @@ mod tests {
         let path =
             smol::block_on(ensure_cache(&cache_root, &url, |_| {})).expect("returns existing");
         assert_eq!(path, pre);
-        assert!(pre.join("SENTINEL").exists(), "cache was re-cloned, not reused");
+        assert!(
+            pre.join("SENTINEL").exists(),
+            "cache was re-cloned, not reused"
+        );
     }
 
     #[test]
@@ -232,6 +241,9 @@ mod tests {
             smol::block_on(ensure_cache(&cache_root, &url, |_| {})).expect("re-clones as mirror");
         assert_eq!(path, pre);
         assert!(!pre.join("SENTINEL").exists(), "stale cache was not wiped");
-        assert!(is_usable_mirror(&pre), "re-cloned cache is not a bare mirror");
+        assert!(
+            is_usable_mirror(&pre),
+            "re-cloned cache is not a bare mirror"
+        );
     }
 }

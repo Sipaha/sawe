@@ -53,7 +53,8 @@ async fn scoped_socket_injects_and_overrides_the_solution_id(cx: &mut TestAppCon
         });
     });
 
-    cx.update(|cx| editor_mcp::start_server(cx)).expect("start_server");
+    cx.update(|cx| editor_mcp::start_server(cx))
+        .expect("start_server");
 
     let global_socket = runtime_dir.path().join("mcp.sock");
     wait_for(cx, &global_socket).await;

@@ -504,8 +504,11 @@ async fn acted_verdict_records_judge_tokens(cx: &mut TestAppContext) {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.set_supervision_enabled(supervised_id, true, cx);
-            store.supervisor_states.get_mut(&supervised_id).unwrap().status =
-                crate::supervisor::SupervisorStatus::Judging;
+            store
+                .supervisor_states
+                .get_mut(&supervised_id)
+                .unwrap()
+                .status = crate::supervisor::SupervisorStatus::Judging;
             // Idle so the verdict is ACTED (not dropped by the send-time gate).
             store.session(supervised_id).unwrap().update(cx, |s, _| {
                 s.state = SessionState::Idle;
@@ -552,7 +555,9 @@ async fn acted_verdict_records_judge_tokens(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.read_with(cx, |store, cx| {
-            let root = store.solution_root_for_app(supervised_id, cx).expect("root");
+            let root = store
+                .solution_root_for_app(supervised_id, cx)
+                .expect("root");
             let dir = crate::supervisor::supervisor_dir(&root, supervised_id);
             let recs = crate::supervisor::read_verdicts(&dir);
             assert_eq!(recs.len(), 1);
@@ -595,8 +600,15 @@ async fn judge_past_timeout_but_streaming_is_not_killed(cx: &mut TestAppContext)
             };
             // A judge session that streamed just now → still alive.
             let judge_id = crate::model::SolutionSessionId::new();
-            let judge =
-                crate::store::tests::insert_cold_session(judge_id, solution_id, agent_id, None, None, store, cx);
+            let judge = crate::store::tests::insert_cold_session(
+                judge_id,
+                solution_id,
+                agent_id,
+                None,
+                None,
+                store,
+                cx,
+            );
             judge.update(cx, |j, _| j.last_activity_at = chrono::Utc::now());
             store.judge_sessions.insert(
                 supervised_id,
@@ -648,8 +660,15 @@ async fn judge_past_timeout_and_silent_is_killed(cx: &mut TestAppContext) {
             };
             // A judge session silent well past the liveness window → dead.
             let judge_id = crate::model::SolutionSessionId::new();
-            let judge =
-                crate::store::tests::insert_cold_session(judge_id, solution_id, agent_id, None, None, store, cx);
+            let judge = crate::store::tests::insert_cold_session(
+                judge_id,
+                solution_id,
+                agent_id,
+                None,
+                None,
+                store,
+                cx,
+            );
             judge.update(cx, |j, _| {
                 j.last_activity_at = chrono::Utc::now()
                     - chrono::Duration::seconds(
@@ -1106,9 +1125,15 @@ fn turn_wedged_decision_gates_on_tool_liveness() {
     assert!(!turn_is_wedged(Some((60, false)), false));
     assert!(!turn_is_wedged(Some((60, true)), false));
     // Past the backstop but STILL streaming output (live build) → NOT wedged.
-    assert!(!turn_is_wedged(Some((TOOL_STUCK_SECS as i64 + 1, true)), false));
+    assert!(!turn_is_wedged(
+        Some((TOOL_STUCK_SECS as i64 + 1, true)),
+        false
+    ));
     // Past the backstop AND no liveness (truly hung command) → wedged.
-    assert!(turn_is_wedged(Some((TOOL_STUCK_SECS as i64 + 1, false)), false));
+    assert!(turn_is_wedged(
+        Some((TOOL_STUCK_SECS as i64 + 1, false)),
+        false
+    ));
     // Exactly at the backstop with no liveness → wedged (the bound is `>=`).
     assert!(turn_is_wedged(Some((TOOL_STUCK_SECS as i64, false)), false));
     // At the backstop but live → not wedged.
@@ -1773,7 +1798,10 @@ async fn apply_continue_nudges_and_increments(cx: &mut gpui::TestAppContext) {
     let dir = crate::supervisor::supervisor_dir(&root, id);
     let recs = crate::supervisor::read_verdicts(&dir);
     assert_eq!(recs.len(), 1);
-    assert!(!recs[0].dropped, "an acted verdict must NOT be marked dropped");
+    assert!(
+        !recs[0].dropped,
+        "an acted verdict must NOT be marked dropped"
+    );
     assert_eq!(
         crate::supervisor::verdict_stats(&recs).total,
         1,
@@ -2062,7 +2090,13 @@ async fn late_audit_escalate_respects_manual_stop(cx: &mut gpui::TestAppContext)
             st.status = SupervisorStatus::Held;
             st.held_by_done = false;
         }
-        store.apply_audit_verdict(id, /* ok */ false, /* escalate */ true, "loop?".into(), cx);
+        store.apply_audit_verdict(
+            id,
+            /* ok */ false,
+            /* escalate */ true,
+            "loop?".into(),
+            cx,
+        );
     });
     assert_eq!(
         store
@@ -2114,8 +2148,14 @@ async fn late_audit_escalate_respects_manual_stop(cx: &mut gpui::TestAppContext)
         let recs = crate::supervisor::read_verdicts(&dir);
         assert_eq!(recs.len(), 3, "all three audit verdicts are logged");
         assert!(recs[0].dropped, "the Held-gated escalate is marked dropped");
-        assert!(recs[1].dropped, "the Disabled-gated escalate is marked dropped");
-        assert!(!recs[2].dropped, "the Watching escalate is acted, not dropped");
+        assert!(
+            recs[1].dropped,
+            "the Disabled-gated escalate is marked dropped"
+        );
+        assert!(
+            !recs[2].dropped,
+            "the Watching escalate is acted, not dropped"
+        );
         assert_eq!(
             crate::supervisor::verdict_stats(&recs).total,
             1,
@@ -2163,7 +2203,9 @@ async fn continue_verdict_dropped_when_agent_already_running(cx: &mut gpui::Test
     // The verdict is dropped: the continue counter never advanced (the drop
     // returns before the Continue arm), and no nudge was queued behind the
     // live turn.
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
         st.consecutive_continues, 0,
         "a verdict delivered while the agent is Running must be dropped, not acted on"
@@ -2171,7 +2213,10 @@ async fn continue_verdict_dropped_when_agent_already_running(cx: &mut gpui::Test
     let queued = store.read_with(cx, |store, cx| {
         store.session(id).unwrap().read(cx).pending_messages.len()
     });
-    assert_eq!(queued, 0, "no spurious supervisor nudge queued behind the live turn");
+    assert_eq!(
+        queued, 0,
+        "no spurious supervisor nudge queued behind the live turn"
+    );
     // And the drop must return the supervisor to `Watching` — NOT leave it
     // pinned in `Judging` with no live judge, which the stuck-watchdog would
     // later mistake for a crashed judge and charge a bogus backoff (audit #1).
@@ -2204,7 +2249,9 @@ async fn pending_nudge_dropped_when_paused_before_flush(cx: &mut gpui::TestAppCo
         store.tick_supervisor(cx);
     });
 
-    let st = store.read_with(cx, |store, _| store.supervisor_state(id)).unwrap();
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert!(
         st.pending_nudge.is_none(),
         "a parked nudge must be dropped once the session is paused (Held), not delivered"
@@ -2217,7 +2264,10 @@ async fn pending_nudge_dropped_when_paused_before_flush(cx: &mut gpui::TestAppCo
     let queued = store.read_with(cx, |store, cx| {
         store.session(id).unwrap().read(cx).pending_messages.len()
     });
-    assert_eq!(queued, 0, "the stale nudge must not be delivered/queued after a Stop");
+    assert_eq!(
+        queued, 0,
+        "the stale nudge must not be delivered/queued after a Stop"
+    );
 }
 
 #[gpui::test]

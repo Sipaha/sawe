@@ -282,12 +282,8 @@ impl SolutionAgentStore {
         let Some(store) = SolutionStore::try_global(cx) else {
             return;
         };
-        let alive: std::collections::HashSet<SolutionId> = store
-            .read(cx)
-            .solutions()
-            .iter()
-            .map(|s| s.id)
-            .collect();
+        let alive: std::collections::HashSet<SolutionId> =
+            store.read(cx).solutions().iter().map(|s| s.id).collect();
         let orphan_ids: Vec<SolutionId> = self
             .by_solution
             .keys()

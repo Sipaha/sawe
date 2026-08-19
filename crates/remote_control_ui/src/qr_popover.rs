@@ -152,9 +152,8 @@ fn build_url(
         .map_err(|err| anyhow::anyhow!("stored secret is not valid base64: {err}"))?;
     let url_safe_secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw_secret);
     let encoded_name = urlencoding::encode(client_name);
-    let mut url = format!(
-        "sawe-remote://{address}:{port}?secret={url_safe_secret}&client={encoded_name}"
-    );
+    let mut url =
+        format!("sawe-remote://{address}:{port}?secret={url_safe_secret}&client={encoded_name}");
     if let Some(fp) = server_fingerprint {
         let fp_url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(fp);
         url.push_str("&server_fp=");

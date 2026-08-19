@@ -773,10 +773,8 @@ impl McpServerTool for DragAtTool {
                     );
                     for step in 1..=steps {
                         let t = step as f32 / steps as f32;
-                        let position = Point::new(
-                            from.x + (to.x - from.x) * t,
-                            from.y + (to.y - from.y) * t,
-                        );
+                        let position =
+                            Point::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
                         window.dispatch_event(
                             PlatformInput::MouseMove(MouseMoveEvent {
                                 position,

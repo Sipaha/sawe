@@ -661,7 +661,9 @@ mod tests {
         });
 
         let repointed = store
-            .update(cx, |s, cx| s.merge_catalog_project(duplicate, canonical, cx))
+            .update(cx, |s, cx| {
+                s.merge_catalog_project(duplicate, canonical, cx)
+            })
             .expect("merge");
         assert_eq!(repointed, 1);
 
@@ -688,14 +690,15 @@ mod tests {
             path_before,
             "the checked-out clone must not be moved or re-cloned"
         );
-        assert!(!catalog_ids.contains(&duplicate), "duplicate row must be gone");
+        assert!(
+            !catalog_ids.contains(&duplicate),
+            "duplicate row must be gone"
+        );
         assert!(catalog_ids.contains(&canonical));
     }
 
     #[gpui::test]
-    async fn merge_catalog_refuses_unrelated_entries_and_shared_solutions(
-        cx: &mut TestAppContext,
-    ) {
+    async fn merge_catalog_refuses_unrelated_entries_and_shared_solutions(cx: &mut TestAppContext) {
         let dir = tempdir().expect("tempdir");
         let cfg_path = dir.path().join("solutions.json");
         let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
@@ -761,7 +764,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("c.json"), cx));
         let sol_id = store
-            .update(cx, |s, cx| s.create_solution("Sol", dir.path().to_path_buf(), cx))
+            .update(cx, |s, cx| {
+                s.create_solution("Sol", dir.path().to_path_buf(), cx)
+            })
             .expect("create");
         let (a, b) = store.update(cx, |s, _| {
             (
@@ -784,7 +789,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("c.json"), cx));
         let sol_id = store
-            .update(cx, |s, cx| s.create_solution("Sol", dir.path().to_path_buf(), cx))
+            .update(cx, |s, cx| {
+                s.create_solution("Sol", dir.path().to_path_buf(), cx)
+            })
             .expect("create");
         let only = store.update(cx, |s, _| {
             s.test_add_member_with_path(sol_id, "only", dir.path().join("only"))
@@ -936,8 +943,9 @@ mod tests {
     async fn remove_catalog_project_cascade_errors_for_unknown_id(cx: &mut TestAppContext) {
         let dir = tempdir().expect("tempdir");
         let store = cx.update(|cx| SolutionStore::for_test(dir.path().join("solutions.json"), cx));
-        let result =
-            store.update(cx, |s, cx| s.remove_catalog_project_cascade(CatalogId(999), cx));
+        let result = store.update(cx, |s, cx| {
+            s.remove_catalog_project_cascade(CatalogId(999), cx)
+        });
         assert!(result.is_err());
     }
 

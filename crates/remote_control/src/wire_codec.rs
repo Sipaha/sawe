@@ -161,7 +161,9 @@ pub(crate) fn decompress(frame: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire_dict::{WIRE_DICT_PROTO_V1, WIRE_DICT_PROTO_V1_ADLER32, WIRE_DICT_PROTO_V1_BYTES};
+    use crate::wire_dict::{
+        WIRE_DICT_PROTO_V1, WIRE_DICT_PROTO_V1_ADLER32, WIRE_DICT_PROTO_V1_BYTES,
+    };
 
     fn sample() -> String {
         let body = "lorem ipsum dolor sit amet ".repeat(40);
@@ -192,7 +194,12 @@ mod tests {
     fn compresses_repetitive_payload_under_half() {
         let s = sample();
         let frame = compress(s.as_bytes(), WIRE_DICT_PROTO_V1).unwrap();
-        assert!(frame.len() < s.len() / 2, "got {} of {}", frame.len(), s.len());
+        assert!(
+            frame.len() < s.len() / 2,
+            "got {} of {}",
+            frame.len(),
+            s.len()
+        );
     }
 
     #[test]
@@ -249,8 +256,7 @@ mod tests {
         // Golden frame produced by the Kotlin codec (WireCompressionInteropTest):
         // `compress("{...idle...}", WIRE_DICT_PROTO_V1)`. Proves the mobile→server
         // direction round-trips byte-for-byte.
-        let golden_text =
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessions\":[],\"total_count\":0,\
+        let golden_text = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessions\":[],\"total_count\":0,\
              \"state\":{\"kind\":\"idle\"}}}";
         let frame = hex_to_bytes(
             "73706b7a01010000005978f9262169dcc36e8ba10e926ea4a08ad5410d2c031d8c60027949a9b6b61600fcda1d2f",

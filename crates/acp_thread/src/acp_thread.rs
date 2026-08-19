@@ -6324,11 +6324,17 @@ mod tests {
             let a = thread.subagent_token_usage("toolu_a").unwrap();
             assert_eq!(a.used_tokens, 1_000);
             assert_eq!(a.max_tokens, 200_000);
-            assert_eq!(thread.subagent_token_usage("toolu_b").unwrap().used_tokens, 5_000);
+            assert_eq!(
+                thread.subagent_token_usage("toolu_b").unwrap().used_tokens,
+                5_000
+            );
 
             // A later update for the same subagent replaces (not accumulates).
             thread.update_subagent_token_usage("toolu_a".into(), 1_500, 200_000, cx);
-            assert_eq!(thread.subagent_token_usage("toolu_a").unwrap().used_tokens, 1_500);
+            assert_eq!(
+                thread.subagent_token_usage("toolu_a").unwrap().used_tokens,
+                1_500
+            );
 
             // Subagent usage must stay out of the parent meter.
             assert!(thread.token_usage().is_none());
@@ -7531,9 +7537,7 @@ mod tests {
 
         thread.update(cx, |thread, cx| {
             for update in [
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    "и это мо".into(),
-                )),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("и это мо".into())),
                 acp::SessionUpdate::AgentMessageChunk(chunk_with_subagent("teammate", "T1")),
                 acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("я регрессия".into())),
             ] {
@@ -7556,7 +7560,10 @@ mod tests {
                 1,
                 "the parent's sentence must stay in ONE message, not be split by the teammate"
             );
-            assert_eq!(parents[0].to_markdown(cx), "## Assistant\n\nи это моя регрессия\n\n");
+            assert_eq!(
+                parents[0].to_markdown(cx),
+                "## Assistant\n\nи это моя регрессия\n\n"
+            );
         });
     }
 
