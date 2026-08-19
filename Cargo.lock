@@ -6787,6 +6787,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "solutions",
  "theme",
  "theme_settings",
  "ui",
@@ -18070,6 +18071,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "workspace_events",
 ]
 
 [[package]]

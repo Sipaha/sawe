@@ -5127,3 +5127,270 @@ async fn test_exact_filename_with_directory_token(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// Stand up an in-memory Solution whose members live under the store-generated
+/// solution root, mark the first member active, and install the store as the
+/// global the file finder reads. Returns the absolute path of every member, in
+/// the order they were named.
+fn install_test_solution(
+    name: &str,
+    member_names: &[&str],
+    cx: &mut TestAppContext,
+) -> Vec<PathBuf> {
+    cx.update(|cx| {
+        let store = solutions::SolutionStore::for_test(PathBuf::from("/solutions.json"), cx);
+        let member_paths = store.update(cx, |store, cx| {
+            let solution_id = store.create_for_test_minimal(name, cx);
+            let root = store
+                .solutions()
+                .iter()
+                .find(|solution| solution.id == solution_id)
+                .expect("solution was just created")
+                .root
+                .clone();
+            let member_paths = member_names
+                .iter()
+                .map(|member_name| {
+                    let path = root.join(member_name);
+                    store.test_add_member_with_path(solution_id, member_name, path.clone());
+                    path
+                })
+                .collect::<Vec<_>>();
+            // Production seeds the first member as active the instant a solution
+            // gains one (`seed_active_member_if_unset`); mirror that here.
+            let first_member = store
+                .solutions()
+                .iter()
+                .find(|solution| solution.id == solution_id)
+                .and_then(|solution| solution.members.first())
+                .expect("members were just added")
+                .id;
+            store.set_active_member(solution_id, first_member, cx);
+            member_paths
+        });
+        solutions::install_global_for_test(store, cx);
+        member_paths
+    })
+}
+
+async fn build_two_member_solution_picker(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<Picker<FileFinderDelegate>>,
+    Entity<Workspace>,
+    &mut VisualTestContext,
+) {
+    let app_state = init_test(cx);
+    let members = install_test_solution("scopedfinder", &["alpha", "beta"], cx);
+    let (alpha, beta) = (members[0].clone(), members[1].clone());
+
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            &alpha,
+            json!({
+                "shared.rs": "",
+                "alpha_only.rs": "",
+            }),
+        )
+        .await;
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            &beta,
+            json!({
+                "shared.rs": "",
+                "beta_only.rs": "",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [alpha.as_path(), beta.as_path()], cx).await;
+
+    build_find_picker(project, cx)
+}
+
+#[gpui::test]
+async fn test_file_finder_scopes_to_active_solution_member(cx: &mut TestAppContext) {
+    let (picker, _workspace, cx) = build_two_member_solution_picker(cx).await;
+
+    picker.update_in(cx, |picker, window, cx| {
+        assert_eq!(
+            picker.delegate.scope,
+            FileFinderScope::ActiveProject,
+            "A freshly opened finder must start scoped to the active member"
+        );
+        assert!(
+            picker.delegate.active_member_worktree.is_some(),
+            "A two-member Solution must resolve a scope target"
+        );
+        picker.update_matches("shared".to_string(), window, cx)
+    });
+    cx.run_until_parked();
+
+    picker.update(cx, |picker, _| {
+        let matches = collect_search_matches(picker).search_paths_only();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|path| path.as_unix_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["alpha/shared.rs".to_string()],
+            "Only the active member's copy of the file may be offered"
+        );
+    });
+
+    // A file that exists only in the inactive member must not be reachable at all.
+    picker.update_in(cx, |picker, window, cx| {
+        picker.update_matches("beta_only".to_string(), window, cx)
+    });
+    cx.run_until_parked();
+
+    picker.update(cx, |picker, _| {
+        assert!(
+            collect_search_matches(picker)
+                .search_paths_only()
+                .is_empty(),
+            "Files of an inactive member must not be searched"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_repeat_binding_toggles_file_finder_scope(cx: &mut TestAppContext) {
+    let (picker, _workspace, cx) = build_two_member_solution_picker(cx).await;
+
+    cx.simulate_input("shared");
+    cx.run_until_parked();
+
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            collect_search_matches(picker).search_paths_only().len(),
+            1,
+            "Scoped search sees only the active member"
+        );
+    });
+
+    cx.dispatch_action(ToggleScope);
+    cx.run_until_parked();
+
+    picker.update(cx, |picker, cx| {
+        assert_eq!(picker.delegate.scope, FileFinderScope::Everywhere);
+        assert_eq!(
+            picker.query(cx),
+            "shared",
+            "The typed query must survive a scope flip"
+        );
+        let mut matches = collect_search_matches(picker)
+            .search_paths_only()
+            .iter()
+            .map(|path| path.as_unix_str().to_string())
+            .collect::<Vec<_>>();
+        matches.sort();
+        assert_eq!(
+            matches,
+            vec!["alpha/shared.rs".to_string(), "beta/shared.rs".to_string()],
+            "Widening the scope must reach every member of the Solution"
+        );
+        let selected = picker
+            .delegate
+            .matches
+            .get(picker.delegate.selected_index)
+            .expect("a match is selected");
+        let selected_path = match selected {
+            Match::Search(path_match) => path_match.0.path_prefix.join(&path_match.0.path),
+            _ => panic!("expected the selection to still be a search match"),
+        };
+        assert_eq!(
+            selected_path.as_unix_str(),
+            "alpha/shared.rs",
+            "The match selected before the flip must stay selected after it"
+        );
+    });
+
+    cx.dispatch_action(ToggleScope);
+    cx.run_until_parked();
+
+    picker.update(cx, |picker, cx| {
+        assert_eq!(
+            picker.delegate.scope,
+            FileFinderScope::ActiveProject,
+            "The scope cycles back, IDEA-style"
+        );
+        assert_eq!(picker.query(cx), "shared");
+        assert_eq!(collect_search_matches(picker).search_paths_only().len(), 1);
+    });
+}
+
+#[gpui::test]
+async fn test_file_finder_scope_resets_on_reopen(cx: &mut TestAppContext) {
+    let (picker, workspace, cx) = build_two_member_solution_picker(cx).await;
+
+    cx.dispatch_action(ToggleScope);
+    cx.run_until_parked();
+    picker.update(cx, |picker, _| {
+        assert_eq!(picker.delegate.scope, FileFinderScope::Everywhere);
+    });
+
+    cx.dispatch_action(Cancel);
+    let picker = open_file_picker(&workspace, cx);
+
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            picker.delegate.scope,
+            FileFinderScope::ActiveProject,
+            "The scope is a per-invocation refinement, not a sticky preference"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_scope_toggle_falls_back_to_cycling_without_a_solution(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            "/test",
+            json!({
+                "00.txt": "",
+                "01.txt": "",
+                "02.txt": "",
+                "03.txt": "",
+            }),
+        )
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), ["/test".as_ref()], cx).await;
+    let (picker, _workspace, cx) = build_find_picker(project, cx);
+
+    picker.update_in(cx, |picker, window, cx| {
+        assert!(
+            picker.delegate.active_member_worktree.is_none(),
+            "A plain single-project window has nothing to scope to"
+        );
+        picker.update_matches(".txt".to_string(), window, cx)
+    });
+    cx.run_until_parked();
+
+    picker.update(cx, |picker, _| {
+        assert_eq!(picker.delegate.selected_index, 0);
+    });
+
+    // Without a scope to flip, the keystroke keeps doing what a repeat of the
+    // finder binding has always done.
+    cx.dispatch_action(ToggleScope);
+    cx.dispatch_action(ToggleScope);
+    cx.run_until_parked();
+
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            picker.delegate.scope,
+            FileFinderScope::ActiveProject,
+            "Scope must stay put when there is nothing to scope to"
+        );
+        assert_eq!(picker.delegate.selected_index, 2);
+    });
+}

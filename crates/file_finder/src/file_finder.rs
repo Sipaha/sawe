@@ -65,9 +65,45 @@ actions!(
         ToggleSplitMenu,
         /// Opens the selected file in the editor without dismissing the file finder,
         /// so additional files can be opened in sequence.
-        OpenWithoutDismiss
+        OpenWithoutDismiss,
+        /// Cycles the file finder between searching only the active Solution member
+        /// and searching every member of the Solution.
+        ToggleScope
     ]
 );
+
+/// Which slice of the window's Solution the finder searches.
+///
+/// A Sawe window hosts an entire Solution, and every member project is mounted as
+/// a worktree of the same `project::Project`, so an unrestricted fuzzy search
+/// spans all of them at once. That is rarely what is wanted: most of the time the
+/// file being looked for is in the project currently being worked on. IntelliJ
+/// solves this with the scope selector in Search Everywhere, which starts at
+/// `Project Files` and widens on demand — this mirrors it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileFinderScope {
+    /// Only the worktree of the Solution's active member.
+    #[default]
+    ActiveProject,
+    /// Every visible worktree, i.e. the whole Solution.
+    Everywhere,
+}
+
+impl FileFinderScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ActiveProject => "In Project",
+            Self::Everywhere => "Everywhere",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::ActiveProject => Self::Everywhere,
+            Self::Everywhere => Self::ActiveProject,
+        }
+    }
+}
 
 impl ModalView for FileFinder {
     fn on_before_dismiss(
@@ -313,6 +349,30 @@ impl FileFinder {
         });
     }
 
+    /// Repeat of the scope binding while the finder is open: widen to the whole
+    /// Solution, then narrow back, IntelliJ-style. When the window has nothing to
+    /// scope to (no Solution, one member, no active member) the keystroke falls
+    /// back to what a repeat of the finder binding has always done — cycling the
+    /// selection — so the binding stays a strict superset of the old behaviour.
+    fn handle_toggle_scope(
+        &mut self,
+        _: &ToggleScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker.update(cx, |picker, cx| {
+            if picker.delegate.toggle_scope(cx) {
+                // Re-runs `update_matches` with the query still in the editor, so
+                // the typed text survives the flip; an unchanged query also makes
+                // `set_search_matches` re-locate the previously selected match
+                // rather than jumping back to the top.
+                picker.refresh(window, cx);
+            } else {
+                picker.cycle_selection(window, cx);
+            }
+        });
+    }
+
     fn go_to_file_split_left(
         &mut self,
         _: &pane::SplitLeft,
@@ -428,6 +488,7 @@ impl Render for FileFinder {
             .on_action(cx.listener(Self::handle_filter_toggle_menu))
             .on_action(cx.listener(Self::handle_split_toggle_menu))
             .on_action(cx.listener(Self::handle_toggle_ignored))
+            .on_action(cx.listener(Self::handle_toggle_scope))
             .on_action(cx.listener(Self::go_to_file_split_left))
             .on_action(cx.listener(Self::go_to_file_split_right))
             .on_action(cx.listener(Self::go_to_file_split_up))
@@ -459,6 +520,18 @@ pub struct FileFinderDelegate {
     focus_handle: FocusHandle,
     include_ignored: Option<bool>,
     include_ignored_refresh: Task<()>,
+    scope: FileFinderScope,
+    /// Worktree backing the Solution's active member, resolved once when the
+    /// finder opens. `None` means there is nothing to scope to — no Solution, a
+    /// single-member one, or no active member — and then the scope is inert and
+    /// its control is not rendered.
+    ///
+    /// Resolved once rather than re-read per keystroke on purpose: the finder is
+    /// a short-lived modal, and switching the active member underneath it tears
+    /// down and rebuilds the window's item layout anyway
+    /// (`solutions_ui::member_layout`), so a mid-search change of the scope
+    /// target would only ever surprise the user.
+    active_member_worktree: Option<WorktreeId>,
 }
 
 /// Use a custom ordering for file finder: the regular one
@@ -998,6 +1071,7 @@ impl FileFinderDelegate {
         cx: &mut Context<FileFinder>,
     ) -> Self {
         Self::subscribe_to_updates(&project, window, cx);
+        let active_member_worktree = Self::resolve_active_member_worktree(&project, cx);
         let channel_store = if FileFinderSettings::get_global(cx).include_channels {
             ChannelStore::try_global(cx)
         } else {
@@ -1025,7 +1099,70 @@ impl FileFinderDelegate {
             focus_handle: cx.focus_handle(),
             include_ignored: FileFinderSettings::get_global(cx).include_ignored,
             include_ignored_refresh: Task::ready(()),
+            // Deliberately not persisted between invocations: the scope is a
+            // refinement of one search, not a preference. A sticky "Everywhere"
+            // would silently change what the binding does days later with no
+            // visible cause — IntelliJ resets its scope selector on every fresh
+            // open for the same reason.
+            scope: FileFinderScope::default(),
+            active_member_worktree,
         }
+    }
+
+    /// Resolve the Solution's active member to one of the project's worktrees,
+    /// following the `project -> solution_for_path -> active_member_worktree`
+    /// chain that the other member-scoped surfaces use (project panel, git
+    /// panel, run-config strip).
+    fn resolve_active_member_worktree(project: &Entity<Project>, cx: &App) -> Option<WorktreeId> {
+        let store = solutions::SolutionStore::try_global(cx)?;
+        let store = store.read(cx);
+        let solution = project
+            .read(cx)
+            .worktrees(cx)
+            .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))?;
+        // A Solution with fewer than two members has nothing to scope away, and
+        // offering a toggle that cannot change the result set is pure noise.
+        if solution.members.len() < 2 {
+            return None;
+        }
+        store
+            .active_member_worktree(solution, project, cx)
+            .map(|(_, worktree_id)| worktree_id)
+    }
+
+    /// The worktree the current scope restricts to, or `None` when the search is
+    /// unrestricted (scope widened to `Everywhere`, or nothing to scope to).
+    fn scoped_worktree(&self) -> Option<WorktreeId> {
+        match self.scope {
+            FileFinderScope::ActiveProject => self.active_member_worktree,
+            FileFinderScope::Everywhere => None,
+        }
+    }
+
+    /// `currently_opened_path`, but only while it survives the current scope. A
+    /// buffer open in another member must neither appear in a scoped result list
+    /// nor steer the ordering of one.
+    fn currently_opened_in_scope(&self) -> Option<&FoundPath> {
+        let scoped_worktree = self.scoped_worktree();
+        self.currently_opened_path.as_ref().filter(|found_path| {
+            scoped_worktree.is_none_or(|worktree_id| found_path.project.worktree_id == worktree_id)
+        })
+    }
+
+    /// Flip the scope, keeping the typed query. Returns `false` when there is no
+    /// scope to flip, so the caller can fall back to the binding's previous
+    /// behaviour instead of swallowing the keystroke.
+    fn toggle_scope(&mut self, cx: &mut Context<Picker<Self>>) -> bool {
+        if self.active_member_worktree.is_none() {
+            return false;
+        }
+        self.scope = self.scope.toggled();
+        // The empty-query branch of `update_matches` short-circuits unless a
+        // search has run or this is the finder's first update, so the history
+        // list would keep the old scope's entries without this nudge.
+        self.first_update = true;
+        cx.notify();
+        true
     }
 
     fn subscribe_to_updates(
@@ -1053,13 +1190,16 @@ impl FileFinderDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
         let relative_to = self
-            .currently_opened_path
-            .as_ref()
+            .currently_opened_in_scope()
             .map(|found_path| Arc::clone(&found_path.project.path));
+        let scoped_worktree = self.scoped_worktree();
         let worktree_store = self.project.read(cx).worktree_store();
         let worktrees = worktree_store
             .read(cx)
             .visible_worktrees_and_single_files(cx)
+            .filter(|worktree| {
+                scoped_worktree.is_none_or(|worktree_id| worktree.read(cx).id() == worktree_id)
+            })
             .collect::<Vec<_>>();
         let include_root_name = !should_hide_root_in_entry_path(&worktree_store, cx);
         let candidate_sets = worktrees
@@ -1129,11 +1269,16 @@ impl FileFinderDelegate {
             };
 
             let path_style = self.project.read(cx).path_style(cx);
+            let scoped_worktree = self.scoped_worktree();
+            let currently_opened = self.currently_opened_in_scope().cloned();
             self.matches.push_new_matches(
                 self.project.read(cx).worktree_store(),
                 cx,
-                &self.history_items,
-                self.currently_opened_path.as_ref(),
+                self.history_items.iter().filter(|history_item| {
+                    scoped_worktree
+                        .is_none_or(|worktree_id| history_item.project.worktree_id == worktree_id)
+                }),
+                currently_opened.as_ref(),
                 Some(&query),
                 matches.into_iter(),
                 extend_old_matches,
@@ -1193,7 +1338,7 @@ impl FileFinderDelegate {
                     for channel_match in channel_matches {
                         match self
                             .matches
-                            .position(&channel_match, self.currently_opened_path.as_ref())
+                            .position(&channel_match, self.currently_opened_in_scope())
                         {
                             Ok(_duplicate) => {}
                             Err(ix) => self.matches.matches.insert(ix, channel_match),
@@ -1209,6 +1354,14 @@ impl FileFinderDelegate {
                     .read(cx)
                     .visible_worktrees(cx)
                     .filter(|worktree| !worktree.read(cx).is_single_file())
+                    // The "create new file" affordance has to land in the same
+                    // slice of the Solution the search covered, otherwise a
+                    // scoped search offers to create the file in some other
+                    // member project.
+                    .filter(|worktree| {
+                        scoped_worktree
+                            .is_none_or(|worktree_id| worktree.read(cx).id() == worktree_id)
+                    })
                     .collect::<Vec<_>>();
                 let worktree_count = available_worktree.len();
                 let mut expect_worktree = available_worktree.first().cloned();
@@ -1223,7 +1376,7 @@ impl FileFinderDelegate {
                     }
                 }
 
-                if let Some(FoundPath { ref project, .. }) = self.currently_opened_path {
+                if let Some(FoundPath { project, .. }) = self.currently_opened_in_scope() {
                     let worktree_id = project.worktree_id;
                     let focused_file_in_available_worktree = available_worktree
                         .iter()
@@ -1252,7 +1405,7 @@ impl FileFinderDelegate {
                 || self.calculate_selected_index(cx),
                 |m| {
                     self.matches
-                        .position(&m, self.currently_opened_path.as_ref())
+                        .position(&m, self.currently_opened_in_scope())
                         .unwrap_or(0)
                 },
             );
@@ -1514,7 +1667,7 @@ impl FileFinderDelegate {
     fn calculate_selected_index(&self, cx: &mut Context<Picker<Self>>) -> usize {
         if FileFinderSettings::get_global(cx).skip_focus_for_active_in_search
             && let Some(Match::History { path, .. }) = self.matches.get(0)
-            && Some(path) == self.currently_opened_path.as_ref()
+            && Some(path) == self.currently_opened_in_scope()
         {
             let elements_after_first = self.matches.len() - 1;
             if elements_after_first > 0 {
@@ -1787,18 +1940,22 @@ impl PickerDelegate for FileFinderDelegate {
                     ..Matches::default()
                 };
                 let path_style = self.project.read(cx).path_style(cx);
+                let scoped_worktree = self.scoped_worktree();
+                let currently_opened = self.currently_opened_in_scope().cloned();
 
                 self.matches.push_new_matches(
                     project.worktree_store(),
                     cx,
                     self.history_items.iter().filter(|history_item| {
-                        project
+                        scoped_worktree.is_none_or(|worktree_id| {
+                            history_item.project.worktree_id == worktree_id
+                        }) && (project
                             .worktree_for_id(history_item.project.worktree_id, cx)
                             .is_some()
                             || project.is_local()
-                            || project.is_via_remote_server()
+                            || project.is_via_remote_server())
                     }),
-                    self.currently_opened_path.as_ref(),
+                    currently_opened.as_ref(),
                     None,
                     None.into_iter(),
                     false,
@@ -1928,6 +2085,8 @@ impl PickerDelegate for FileFinderDelegate {
             !worktree_store.read(cx).initial_scan_completed()
         };
 
+        let focus_handle = self.focus_handle.clone();
+
         h_flex()
             .flex_none()
             .h_9()
@@ -1936,19 +2095,45 @@ impl PickerDelegate for FileFinderDelegate {
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
             .child(editor.render(window, cx))
-            .when(is_project_scan_running && has_search_query, |this| {
-                this.child(
-                    h_flex()
-                        .id("project-scan-indicator")
-                        .tooltip(Tooltip::text("Project Scan in Progress…"))
-                        .child(
-                            Icon::new(IconName::LoadCircle)
-                                .color(Color::Accent)
-                                .size(IconSize::Small)
-                                .with_rotate_animation(2),
-                        ),
-                )
-            })
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .when(is_project_scan_running && has_search_query, |this| {
+                        this.child(
+                            h_flex()
+                                .id("project-scan-indicator")
+                                .tooltip(Tooltip::text("Project Scan in Progress…"))
+                                .child(
+                                    Icon::new(IconName::LoadCircle)
+                                        .color(Color::Accent)
+                                        .size(IconSize::Small)
+                                        .with_rotate_animation(2),
+                                ),
+                        )
+                    })
+                    // Only rendered when the scope can actually restrict the
+                    // search, i.e. a multi-member Solution with an active member.
+                    .when(self.active_member_worktree.is_some(), |this| {
+                        this.child(
+                            Button::new("file-finder-scope", self.scope.label())
+                                .label_size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .end_icon(Icon::new(IconName::ChevronUpDown))
+                                .tooltip(move |_window, cx| {
+                                    Tooltip::for_action_in(
+                                        "Toggle Search Scope",
+                                        &ToggleScope,
+                                        &focus_handle,
+                                        cx,
+                                    )
+                                })
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(ToggleScope.boxed_clone(), cx)
+                                }),
+                        )
+                    }),
+            )
     }
 
     fn render_footer(&self, _: &mut Window, cx: &mut Context<Picker<Self>>) -> Option<AnyElement> {
