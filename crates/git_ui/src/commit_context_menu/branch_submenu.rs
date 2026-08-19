@@ -358,8 +358,9 @@ impl SubmenuRow {
 ///   API takes no refspec. "Checkout and Update" is the wired
 ///   equivalent.
 /// - **Push…** (local) → `Repository::push` on that branch behind a
-///   confirm. Unavailable when neither an upstream nor a single
-///   unambiguous remote resolves the destination.
+///   confirm. Unavailable when its upstream names no configured remote,
+///   and when it tracks nothing while the repository has anything other
+///   than exactly one remote.
 /// - **Tracked Branch '\<upstream\>'** (local) → this same submenu for
 ///   the upstream ref. Omitted — as in IDEA — when nothing is tracked.
 /// - **Pull into '\<head\>' Using Rebase / Using Merge** (remote) →
@@ -560,40 +561,57 @@ pub(super) fn plan_push_row(
     upstream: Option<&RemoteBranchRef>,
     remotes: &[SharedString],
 ) -> SubmenuRow {
-    let destination = match upstream.and_then(|upstream| upstream.split.clone()) {
-        Some((remote, remote_branch)) => Some((remote, remote_branch, false)),
-        // No upstream yet: only auto-resolve when the repository leaves
-        // no room for doubt, i.e. it has exactly one remote. That is a
-        // `--set-upstream` push, like IDEA's first push of a branch.
-        None => match remotes {
-            [only_remote] => Some((only_remote.clone(), branch.clone(), true)),
-            _ => None,
-        },
-    };
-    match destination {
-        Some((remote, remote_branch, set_upstream)) => SubmenuRow::enabled(
-            BranchAction::Push {
-                remote,
-                remote_branch,
-                set_upstream,
-            },
-            "Push…",
-        ),
-        None => SubmenuRow::unavailable(
+    let unavailable = |reason: String| {
+        SubmenuRow::unavailable(
             BranchAction::Push {
                 remote: SharedString::default(),
                 remote_branch: branch.clone(),
                 set_upstream: false,
             },
             "Push…",
-            format!(
-                "“{branch}” tracks no upstream and this repository has {} remotes, so the \
-                 destination is ambiguous. Check the branch out and use the Push dialog, which \
-                 resolves it interactively.",
-                remotes.len()
-            ),
-        ),
-    }
+            reason,
+        )
+    };
+    let (remote, remote_branch, set_upstream) = match upstream {
+        Some(upstream) => match upstream.split.clone() {
+            Some((remote, remote_branch)) => (remote, remote_branch, false),
+            // An upstream *is* configured, it just doesn't resolve
+            // against any configured remote. Falling through to the
+            // single-remote guess below would push to a remote this
+            // branch does not track and, with `--set-upstream`, silently
+            // re-point its tracking config — while the confirmation
+            // claims the branch has no upstream yet.
+            None => {
+                return unavailable(format!(
+                    "“{}” is not one of this repository's configured remotes, so there is no \
+                     remote to push to.",
+                    upstream.full
+                ));
+            }
+        },
+        // No upstream at all: only auto-resolve when the repository
+        // leaves no room for doubt, i.e. it has exactly one remote. That
+        // is a `--set-upstream` push, like IDEA's first push of a branch.
+        None => match remotes {
+            [only_remote] => (only_remote.clone(), branch.clone(), true),
+            _ => {
+                return unavailable(format!(
+                    "“{branch}” tracks no upstream and this repository has {} remotes, so the \
+                     destination is ambiguous. Check the branch out and use the Push dialog, \
+                     which resolves it interactively.",
+                    remotes.len()
+                ));
+            }
+        },
+    };
+    SubmenuRow::enabled(
+        BranchAction::Push {
+            remote,
+            remote_branch,
+            set_upstream,
+        },
+        "Push…",
+    )
 }
 
 pub(super) fn plan_pull_rows(branch: &RemoteBranchRef, head: &SharedString) -> Vec<SubmenuRow> {
@@ -1012,6 +1030,83 @@ mod tests {
             },
             "Push…",
         )));
+    }
+
+    /// "no upstream at all" and "an upstream that names no configured
+    /// remote" are different states, and only the first one may take the
+    /// single-remote `--set-upstream` shortcut. Pushing the second one to
+    /// the lone remote would both target a remote the branch does not
+    /// track and re-point its tracking config, behind a confirmation that
+    /// asserts the branch has no upstream.
+    #[test]
+    fn test_unresolvable_upstream_does_not_take_the_single_remote_fallback() {
+        let row = plan_push_row(
+            &"release".into(),
+            Some(&remote_ref("gone/release", None)),
+            &strings(&["origin"]),
+        );
+        assert_eq!(
+            row,
+            SubmenuRow::unavailable(
+                BranchAction::Push {
+                    remote: SharedString::default(),
+                    remote_branch: "release".into(),
+                    set_upstream: false,
+                },
+                "Push…",
+                "“gone/release” is not one of this repository's configured remotes, so there is \
+                 no remote to push to.",
+            )
+        );
+    }
+
+    /// The same unresolvable upstream with several remotes: still
+    /// unavailable, and still for the upstream's reason rather than the
+    /// ambiguity one — the branch's problem is that its upstream names
+    /// nothing, not that the menu can't pick between remotes.
+    #[test]
+    fn test_unresolvable_upstream_reports_the_upstream_reason_not_ambiguity() {
+        let rows = plan_branch_submenu(
+            &BranchRef::Local("release".into()),
+            Some(&"master222".into()),
+            &[local_info("release", Some("gone/release"), 0)],
+            &strings(&["origin", "upstream"]),
+            None,
+        );
+        let reason = rows
+            .iter()
+            .find_map(|row| match row {
+                SubmenuRow::Row {
+                    label, unavailable, ..
+                } if label.as_ref() == "Push…" => unavailable.clone(),
+                _ => None,
+            })
+            .expect("Push… must be present and unavailable");
+        assert!(
+            reason.contains("is not one of this repository's configured remotes"),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    /// A branch with no upstream at all keeps the ambiguity wording when
+    /// the repository has more than one remote.
+    #[test]
+    fn test_untracked_branch_with_several_remotes_is_ambiguous() {
+        let row = plan_push_row(&"scratch".into(), None, &strings(&["origin", "upstream"]));
+        assert_eq!(
+            row,
+            SubmenuRow::unavailable(
+                BranchAction::Push {
+                    remote: SharedString::default(),
+                    remote_branch: "scratch".into(),
+                    set_upstream: false,
+                },
+                "Push…",
+                "“scratch” tracks no upstream and this repository has 2 remotes, so the \
+                 destination is ambiguous. Check the branch out and use the Push dialog, which \
+                 resolves it interactively.",
+            )
+        );
     }
 
     /// "Checkout and Update" runs `git pull <remote> <ref>`, whose

@@ -471,9 +471,12 @@ pub(super) fn run_show_diff_with_working_tree(
 /// carries a [`FORCE_DELETE_BRANCH_ANSWER`] answer that re-runs the
 /// delete with `force = true`.
 ///
-/// With `is_remote` the delete becomes `git branch -dr <remote>/<branch>`
-/// — it removes this clone's remote-tracking ref, never anything on the
-/// server (that is [`run_delete_remote_branch`]).
+/// Local branches only: `plan_delete_row` routes a remote-tracking
+/// decoration to [`BranchAction::DeleteOnRemote`], so this never has to
+/// spell `git branch -dr`. (The tracking ref is pruned by
+/// [`run_delete_remote_branch`] right after the server-side delete
+/// succeeds, which is the only moment this menu has a reason to touch
+/// it.)
 ///
 /// This uses a two-answer prompt rather than a toast because the failure
 /// already surfaces as a modal here (`detach_and_prompt_err`), so adding
@@ -483,14 +486,13 @@ pub(super) fn run_show_diff_with_working_tree(
 pub(super) fn run_delete_branch(
     ctx: CommitContext,
     branch: SharedString,
-    is_remote: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
     let repo = ctx.repository;
     let work_dir = ctx.work_dir;
     let recv = repo.update(cx, |repo, _| {
-        repo.delete_branch(is_remote, branch.to_string(), false)
+        repo.delete_branch(false, branch.to_string(), false)
     });
     let task = window.spawn(cx, async move |cx| {
         let error = match recv.await {
@@ -516,7 +518,7 @@ pub(super) fn run_delete_branch(
                     return Ok(());
                 }
                 repo.update(cx, |repo, _| {
-                    repo.delete_branch(is_remote, branch.to_string(), true)
+                    repo.delete_branch(false, branch.to_string(), true)
                 })
                 .await?
             }
@@ -628,7 +630,10 @@ pub(super) fn run_delete_remote_branch(
                             "deleted {branch} on {remote}, but the tracking ref remains: {error}"
                         )
                     }
-                    Err(_) => {}
+                    Err(_) => log::warn!(
+                        "deleted {branch} on {remote}, but the tracking-ref prune was dropped \
+                         before it ran; the ref remains"
+                    ),
                 }
                 workspace
                     .update(cx, |workspace, cx| {
@@ -718,7 +723,10 @@ pub(super) fn offer_remote_tag_delete(
                     cx.spawn(async move |_| match recv.await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => log::error!("delete remote tag failed: {error}"),
-                        Err(_) => {}
+                        Err(_) => log::warn!(
+                            "delete remote tag was dropped before it ran; the tag may still \
+                             exist on origin"
+                        ),
                     })
                     .detach();
                 }),
@@ -1095,9 +1103,7 @@ mod tests {
     async fn test_delete_unmerged_branch_offers_delete_anyway(cx: &mut TestAppContext) {
         let (ctx, mut cx) = init_delete_branch_test("feature-auth", cx).await;
 
-        cx.update(|window, cx| {
-            run_delete_branch(ctx.clone(), "feature-auth".into(), false, window, cx)
-        });
+        cx.update(|window, cx| run_delete_branch(ctx.clone(), "feature-auth".into(), window, cx));
         cx.run_until_parked();
         assert!(
             cx.has_pending_prompt(),
@@ -1120,9 +1126,7 @@ mod tests {
     async fn test_delete_unmerged_branch_cancel_keeps_branch(cx: &mut TestAppContext) {
         let (ctx, mut cx) = init_delete_branch_test("feature-auth", cx).await;
 
-        cx.update(|window, cx| {
-            run_delete_branch(ctx.clone(), "feature-auth".into(), false, window, cx)
-        });
+        cx.update(|window, cx| run_delete_branch(ctx.clone(), "feature-auth".into(), window, cx));
         cx.run_until_parked();
         assert!(cx.has_pending_prompt());
 

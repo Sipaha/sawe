@@ -606,7 +606,7 @@ fn render_branch_action(
             open_rename_branch_modal(ctx.clone(), name.clone(), window, cx)
         }),
         BranchAction::Delete => menu.entry(label, None, move |window, cx| {
-            run_delete_branch(ctx.clone(), name.clone(), false, window, cx);
+            run_delete_branch(ctx.clone(), name.clone(), window, cx);
         }),
         BranchAction::DeleteOnRemote { remote, branch } => menu.item(
             ui::ContextMenuEntry::new(label)
