@@ -31,11 +31,7 @@ fn close_session_removes_from_indices(cx: &mut TestAppContext) {
                 s
             });
             store.sessions.insert(id, entity);
-            store
-                .by_solution
-                .entry(SolutionId(1))
-                .or_default()
-                .push(id);
+            store.by_solution.entry(SolutionId(1)).or_default().push(id);
 
             assert_eq!(store.sessions_for(&SolutionId(1)).len(), 1);
             store.close_session(id, cx).expect("close_session");
@@ -69,8 +65,12 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
             store
                 .supervisor_states
                 .insert(id, crate::supervisor::SupervisorState::new(id));
-            store.teammate_watchers.arm_agent_watcher(id, Task::ready(()));
-            store.teammate_watchers.arm_shell_watcher(id, Task::ready(()));
+            store
+                .teammate_watchers
+                .arm_agent_watcher(id, Task::ready(()));
+            store
+                .teammate_watchers
+                .arm_shell_watcher(id, Task::ready(()));
             store.backoff_timers.insert(id, Task::ready(()));
             store.teammate_watchers.set_scan_offset(id, 0);
             store
@@ -435,6 +435,83 @@ async fn close_session_is_soft_keeps_archive_dir_and_supervisor_row(cx: &mut gpu
     );
 }
 
+/// Regression guard for "closing a Solution wiped its AI chat tabs".
+///
+/// Closing a Solution's window is a COLD close: `cold_close_solution` evicts
+/// the sessions from memory and releases the pooled subprocess, but it must
+/// leave BOTH restore predicates intact — `closed_at IS NULL`
+/// (`select_open_session_ids`) and `tab_order IS NOT NULL`
+/// (`select_open_tabs`). The desktop title-bar "Close" used to loop
+/// `close_session` (the permanent per-tab archive) instead, which stamped
+/// `closed_at` AND cascaded `SessionClosed` -> `ChatProvider` ->
+/// `ConsolePanel::persist` -> `persist_tab_order`, NULLing `tab_order` too, so
+/// reopening the Solution showed an empty AI tab strip.
+#[gpui::test]
+async fn cold_close_solution_keeps_sessions_restorable(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (db, sol) = store.update(cx, |store, cx| {
+        (
+            store.persistence().expect("persistence"),
+            store.session(id).expect("session").read(cx).solution_id,
+        )
+    });
+
+    // `apply_tab_orders` UPDATEs an existing row, so the metadata row has to
+    // exist before the session can be pinned into the strip.
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id,
+        solution_id: sol,
+        agent_id: SharedString::from("claude-acp"),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-cold"),
+        title: SharedString::from("Cold"),
+        created_at: Utc::now(),
+        last_activity_at: Utc::now(),
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+        member_id: None,
+    })
+    .await
+    .unwrap();
+    store.update(cx, |store, cx| store.persist_tab_order(sol, vec![id], cx));
+    cx.run_until_parked();
+    assert_eq!(
+        db.list_open_tabs(sol).await.unwrap(),
+        vec![id],
+        "precondition: the session must be pinned into the strip before the close"
+    );
+
+    store.update(cx, |store, cx| store.cold_close_solution(&sol, cx));
+    cx.run_until_parked();
+
+    assert!(
+        store.update(cx, |store, _| store.session(id).is_none()),
+        "cold close must evict the session from memory (a live entity means the \
+         eviction, and with it the pool release, silently stopped running)"
+    );
+    assert!(
+        db.closed_at(id).await.unwrap().is_none(),
+        "cold close must NOT stamp closed_at — that is the permanent per-tab \
+         archive and it makes select_open_session_ids skip the row on reopen"
+    );
+    assert_eq!(
+        db.list_open_tabs(sol).await.unwrap(),
+        vec![id],
+        "cold close must NOT clear tab_order — select_open_tabs is what rebuilds \
+         the AI tab strip when the Solution is reopened"
+    );
+    assert!(
+        db.list_open_session_ids(sol).await.unwrap().contains(&id),
+        "cold-closed session must still be hydratable by hydrate_all_for_solution"
+    );
+}
+
 /// `gc_orphan_members` purges only sessions whose `cwd` is no longer under any
 /// alive member path (nor the solution root). Sessions under a member dir, or
 /// at the solution root, survive.
@@ -480,8 +557,7 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
             (at_root, root.clone()),
             (orphan, root.join("removed-member")),
         ] {
-            let session =
-                insert_cold_session(sid, sol, agent.clone(), None, None, store, cx);
+            let session = insert_cold_session(sid, sol, agent.clone(), None, None, store, cx);
             session.update(cx, |s, _| s.cwd = cwd);
         }
         store.gc_orphan_members(cx);
@@ -508,10 +584,7 @@ async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppConte
     // the root) + a persistence DB.
     let (store, seeded, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
     let sol = store.read_with(cx, |s, cx| {
-        s.session(seeded)
-            .expect("seeded")
-            .read(cx)
-            .solution_id
+        s.session(seeded).expect("seeded").read(cx).solution_id
     });
     let db = store
         .read_with(cx, |s, _| s.persistence())
@@ -549,9 +622,7 @@ async fn reap_stale_closed_sessions_purges_old_closed_only(cx: &mut TestAppConte
     .await
     .unwrap();
 
-    store.update(cx, |store, cx| {
-        store.reap_stale_closed_sessions(sol, cx)
-    });
+    store.update(cx, |store, cx| store.reap_stale_closed_sessions(sol, cx));
     cx.run_until_parked();
 
     let ids: Vec<SolutionSessionId> = db
@@ -584,8 +655,12 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
             store
                 .supervisor_states
                 .insert(id, crate::supervisor::SupervisorState::new(id));
-            store.teammate_watchers.arm_agent_watcher(id, Task::ready(()));
-            store.teammate_watchers.arm_shell_watcher(id, Task::ready(()));
+            store
+                .teammate_watchers
+                .arm_agent_watcher(id, Task::ready(()));
+            store
+                .teammate_watchers
+                .arm_shell_watcher(id, Task::ready(()));
             store.backoff_timers.insert(id, Task::ready(()));
             store.teammate_watchers.set_scan_offset(id, 0);
             store.judge_sessions.insert(
@@ -750,7 +825,9 @@ async fn rename_solution_folder_move_keeps_open_sessions(cx: &mut gpui::TestAppC
         let solution_store = SolutionStore::for_test(cfg_path, cx);
         solutions::install_global_for_test(solution_store.clone(), cx);
         let sol = solution_store
-            .update(cx, |s, cx| s.create_solution("Sol", solutions_root.clone(), cx))
+            .update(cx, |s, cx| {
+                s.create_solution("Sol", solutions_root.clone(), cx)
+            })
             .expect("create_solution");
         let root = solution_store.read(cx).solutions()[0].root.clone();
         let member_path = root.join("member");
@@ -821,7 +898,9 @@ async fn rename_member_folder_move_keeps_open_sessions(cx: &mut gpui::TestAppCon
         let solution_store = SolutionStore::for_test(cfg_path, cx);
         solutions::install_global_for_test(solution_store.clone(), cx);
         let sol = solution_store
-            .update(cx, |s, cx| s.create_solution("Sol", solutions_root.clone(), cx))
+            .update(cx, |s, cx| {
+                s.create_solution("Sol", solutions_root.clone(), cx)
+            })
             .expect("create_solution");
         let root = solution_store.read(cx).solutions()[0].root.clone();
         let member_path = root.join("member");
@@ -857,9 +936,8 @@ async fn rename_member_folder_move_keeps_open_sessions(cx: &mut gpui::TestAppCon
         .expect("rename_member");
     cx.run_until_parked();
 
-    let new_member_path = solution_store.read_with(cx, |s, _| {
-        s.solutions()[0].members[0].local_path.clone()
-    });
+    let new_member_path =
+        solution_store.read_with(cx, |s, _| s.solutions()[0].members[0].local_path.clone());
     store.update(cx, |store, cx| {
         let session = store.session(session_id);
         assert!(

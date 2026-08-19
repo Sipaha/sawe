@@ -23,6 +23,7 @@ mod snapshot;
 
 pub use coordinator::WorkspaceEventCoordinator;
 pub use dto::*;
+pub use lifecycle::close_solution_runtime;
 pub use list::ListSolutionsTool;
 
 /// Install the coordinator + register MCP tools. Idempotent.

@@ -69,24 +69,43 @@ pub(crate) fn open_solution_impl(cx: &mut App, id: SolutionId) -> Result<u64> {
     Ok(WorkspaceEventCoordinator::global(cx).current_seq())
 }
 
-pub(crate) fn close_solution_impl(cx: &mut App, id: SolutionId) -> Result<u64> {
-    let store =
-        SolutionStore::try_global(cx).ok_or_else(|| anyhow!("SolutionStore not initialised"))?;
-    let coord = WorkspaceEventCoordinator::global(cx);
-
-    let was_open = store.read(cx).is_open(id);
-    if !was_open {
-        return Ok(coord.current_seq());
+/// The one seam every "close this solution's window" path funnels through —
+/// the `workspace.close_solution` MCP tool below and the desktop title-bar tab
+/// strip (`solutions_ui::close_solution`) alike.
+///
+/// This is a COLD close and must stay one: it terminates the solution's agent
+/// threads + terminals, then flips the open flag. `mark_closed` emits
+/// `SolutionStoreEvent::Closed`, which `SolutionAgentStore` maps to
+/// `cold_close_solution` — sessions are evicted from memory and the pooled
+/// `claude` subprocess is released, but `closed_at`/`tab_order` are left
+/// untouched in the DB so reopening the solution restores the whole AI strip.
+/// Never loop `SolutionAgentStore::close_session` here: that is the permanent
+/// per-tab archive and it destroys exactly the state a reopen needs.
+///
+/// Returns `true` when the solution was open (i.e. the close actually ran).
+/// Idempotent: closing an already-closed solution is a no-op.
+pub fn close_solution_runtime(id: SolutionId, cx: &mut App) -> bool {
+    let Some(store) = SolutionStore::try_global(cx) else {
+        return false;
+    };
+    if !store.read(cx).is_open(id) {
+        return false;
     }
 
     // Terminate the solution's agent threads + terminals first. Sessions stay
     // on disk (tab_order, transcripts preserved). Only running runtime state
-    // is killed.
+    // is killed. This must precede `mark_closed`: the cancel walks
+    // `sessions_for(id)`, which `cold_close_solution` is about to empty.
     crate::shutdown::shutdown_solution_runtime(id, cx);
 
     // mark_closed itself emits the sequenced workspace.solution_closed event.
     store.update(cx, |s, cx| s.mark_closed(id, cx));
+    true
+}
 
+pub(crate) fn close_solution_impl(cx: &mut App, id: SolutionId) -> Result<u64> {
+    SolutionStore::try_global(cx).ok_or_else(|| anyhow!("SolutionStore not initialised"))?;
+    close_solution_runtime(id, cx);
     Ok(WorkspaceEventCoordinator::global(cx).current_seq())
 }
 
@@ -203,9 +222,7 @@ pub(crate) fn close_session_impl(cx: &mut App, session_id_str: &str) -> Result<u
     // persist_tab_order now emits workspace.session_closed internally
     // via WorkspaceEventCoordinator::emit_sequenced (F5). No manual
     // emit here — doing so would double-fire the notification.
-    agent.update(cx, |a, cx| {
-        a.persist_tab_order(solution_id, new_order, cx)
-    });
+    agent.update(cx, |a, cx| a.persist_tab_order(solution_id, new_order, cx));
 
     // Return the seq that persist_tab_order just reserved.
     Ok(WorkspaceEventCoordinator::global(cx).current_seq())

@@ -2,8 +2,8 @@
 //! modals, status-bar widget, welcome integration.
 
 mod actions;
-pub mod add_project_picker;
 mod add_member_picker;
+pub mod add_project_picker;
 pub mod delete_confirm_modal;
 mod empty_solution_page;
 mod member_layout;
@@ -48,7 +48,8 @@ pub fn init(cx: &mut App) {
     cx.observe_new(modals::register).detach();
     cx.observe_new(register_tab_actions).detach();
     cx.observe_new(register_member_sync_observer).detach();
-    cx.observe_new(member_layout::register_member_layout_controller).detach();
+    cx.observe_new(member_layout::register_member_layout_controller)
+        .detach();
     cx.observe_new(register_solution_delete_observer).detach();
     cx.observe_new(register_solution_close_observer).detach();
     welcome::init(cx);
@@ -460,22 +461,35 @@ fn close_solution(
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    use solution_agent::store::SolutionAgentStore;
     use util::ResultExt as _;
     use workspace::MultiWorkspace;
 
-    if let Some(agent_store) = SolutionAgentStore::try_global(cx) {
-        agent_store.update(cx, |store, cx| {
-            let session_ids: Vec<_> = store
-                .sessions_for(&sol_id)
-                .into_iter()
-                .map(|session| session.read(cx).id)
-                .collect();
-            for id in session_ids {
-                store.close_session(id, cx).log_err();
-            }
-        });
-    }
+    // Flip the solution closed UP FRONT, through the same seam the
+    // `workspace.close_solution` MCP tool uses, so the desktop and the wire
+    // paths cannot drift apart again. `close_solution_runtime` cancels the
+    // in-flight agent turns and then calls `SolutionStore::mark_closed`, whose
+    // `SolutionStoreEvent::Closed` `SolutionAgentStore` maps to
+    // `cold_close_solution`: the sessions are evicted from memory and the
+    // pooled `claude` subprocess(es) are released, but `closed_at` stays NULL
+    // and `tab_order` is untouched, so reopening restores the whole AI strip.
+    //
+    // This replaces a loop over `SolutionAgentStore::close_session`, which is
+    // the PERMANENT per-tab archive: it stamped `closed_at` and cascaded
+    // `SessionClosed` -> `ChatProvider` -> `close_chat_tab_by_session_id` ->
+    // `ConsolePanel::persist`, which also NULLed `tab_order`. Both restore
+    // predicates (`select_open_tabs`, `select_open_session_ids`) then failed
+    // and the reopened solution showed an empty AI tab strip.
+    //
+    // Ordering is load-bearing: it must run BEFORE the workspace teardown
+    // below, because `cold_close_solution` flushes each transcript and
+    // releases the pool off `by_solution`, which only holds the sessions while
+    // they are still hydrated. Doing it here also covers the case the trailing
+    // `mark_closed` call used to exist for — a window hosting several
+    // solutions that closes only one of them never drops, so the
+    // `MultiWorkspace` release observer in `solutions::event_sources` would
+    // never fire and the mobile client would keep showing a stale row.
+    workspace_events::close_solution_runtime(sol_id, cx);
+
     // Workspace iteration must run AFTER the action handler's
     // `workspace.update(...)` frame finishes — otherwise iterating
     // `mw.workspaces()` and reading each Workspace panics on the
@@ -510,22 +524,6 @@ fn close_solution(
                 })
                 .log_err();
         }
-        // Drive `mark_closed` from here too. The MultiWorkspace release
-        // observer in `solutions::event_sources` only fires when the
-        // entire window drops (every solution in it closed), so a
-        // multi-solution window that closes ONE of N solutions never
-        // fired `mark_closed` for that solution — the mobile client
-        // missed the `workspace.solution_closed` notification and showed
-        // a stale row. Calling it here covers the "still other
-        // solutions in the window" case; `mark_closed` is idempotent on
-        // an already-closed id, so the subsequent release-observer fire
-        // on the eventual window drop is a safe no-op.
-        cx.update(|_, cx| {
-            if let Some(store) = solutions::SolutionStore::try_global(cx) {
-                store.update(cx, |s, cx| s.mark_closed(sol_id, cx));
-            }
-        })
-        .log_err();
     })
     .detach();
 }
@@ -536,7 +534,12 @@ fn close_solution(
 /// or the solution has no members. The selection is now solution-wide
 /// (shared across project_panel and git_panel), so `_panel_kind` is
 /// retained only to keep the action payload stable for existing keymaps.
-fn cycle_project_in_panel(workspace: &Workspace, _panel_kind: &str, dir: isize, cx: &mut gpui::App) {
+fn cycle_project_in_panel(
+    workspace: &Workspace,
+    _panel_kind: &str,
+    dir: isize,
+    cx: &mut gpui::App,
+) {
     let Some(sol_id) = crate::window_helpers::active_solution_in_workspace(workspace, cx) else {
         return;
     };

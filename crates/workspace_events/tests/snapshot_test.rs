@@ -571,3 +571,76 @@ async fn close_solution_cancels_open_agent_threads(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// Regression guard for "closing a Solution wiped its AI chat tabs".
+///
+/// `close_solution_runtime` is the single seam the `workspace.close_solution`
+/// MCP tool AND the desktop title-bar tab strip share. It must never surface a
+/// `SolutionAgentStoreEvent::SessionClosed`: that event is the PERMANENT
+/// per-tab archive signal, and `ConsolePanel` reacts to it by closing the chat
+/// tab and re-persisting the strip — which NULLs `tab_order` on top of the
+/// `closed_at` stamp, so the reopened Solution comes back with an empty AI tab
+/// strip. A cold close evicts the sessions silently instead.
+///
+/// (The DB half — `closed_at` stays NULL and `tab_order` survives — is asserted
+/// in `solution_agent`'s `cold_close_solution_keeps_sessions_restorable`, where
+/// the store is backed by a real `SolutionAgentDb`.)
+#[gpui::test]
+async fn close_solution_does_not_archive_its_sessions(cx: &mut TestAppContext) {
+    let runtime_dir = tempdir().expect("tempdir");
+    let (sol_id, sess_id) = setup_with_open_solution_and_one_session(cx, &runtime_dir);
+
+    cx.update(|cx| workspace_events::open_session_for_test(cx, &sess_id));
+
+    let archived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    cx.update(|cx| {
+        let agent = solution_agent::store::SolutionAgentStore::global(cx);
+        let archived = archived.clone();
+        cx.subscribe(&agent, move |_agent, event, _cx| {
+            if matches!(
+                event,
+                solution_agent::store::SolutionAgentStoreEvent::SessionClosed(_)
+            ) {
+                archived.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+        .detach();
+    });
+
+    // Drive the shared seam directly — this is exactly what
+    // `solutions_ui::close_solution` calls from the title-bar tab strip.
+    let ran = cx.update(|cx| workspace_events::close_solution_runtime(sol_id.clone(), cx));
+    assert!(
+        ran,
+        "close_solution_runtime must report that it closed an open solution"
+    );
+    cx.run_until_parked();
+
+    assert!(
+        !archived.load(std::sync::atomic::Ordering::SeqCst),
+        "a solution close must NOT emit SessionClosed — that is the permanent \
+         per-tab archive cascade that wipes tab_order"
+    );
+    cx.update(|cx| {
+        assert!(
+            !solutions::SolutionStore::global(cx)
+                .read(cx)
+                .is_open(sol_id),
+            "solution must still be marked closed"
+        );
+        assert!(
+            solution_agent::store::SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(sess_id)
+                .is_none(),
+            "cold close must still evict the session (and release the pool)"
+        );
+    });
+
+    // Idempotent: a second close is a no-op.
+    let ran_again = cx.update(|cx| workspace_events::close_solution_runtime(sol_id, cx));
+    assert!(
+        !ran_again,
+        "closing an already-closed solution must be a no-op"
+    );
+}

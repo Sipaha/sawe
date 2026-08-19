@@ -10,8 +10,8 @@ use gpui::{
 use project::Project;
 use settings::Settings as _;
 use solution_agent::SolutionSessionId;
-use solution_agent::model::SessionState;
 use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
+use solution_agent::model::SessionState;
 use solution_agent::rename_session_modal::RenameSessionModal;
 use solution_agent::reopen_session_modal::{ReopenSessionModal, ReopenableSession};
 use solution_agent::session_view::SolutionSessionView;
@@ -144,6 +144,25 @@ fn effective_active_index(in_scope: &[bool], active_index: Option<usize>) -> Opt
         return Some(ix);
     }
     in_scope.iter().position(|&visible| visible)
+}
+
+/// Whether the end-of-restore reconciliation (`ConsolePanel::persist`) may run.
+///
+/// That reconciliation is destructive in both directions: it DELETEs+INSERTs
+/// the whole `console_panel_state` row set for the workspace and re-derives
+/// every session's `tab_order` from the tabs that actually made it into the
+/// strip (`persist_tab_order` NULLs `tab_order` on every session of the
+/// solution that is absent from the strip). Running it after a PARTIAL restore
+/// therefore promotes a transient failure — a session that had not hydrated
+/// yet, a solution the workspace could not resolve, a window that went away
+/// mid-restore — into permanent data loss: the very next boot has no rows left
+/// to restore from. One bad boot would make the tab set unrecoverable.
+///
+/// So reconcile only when every persisted row came back. A lossy restore keeps
+/// the DB exactly as it was; the next successful boot (or the next real tab
+/// mutation, which persists the user's actual intent) reconciles instead.
+fn restore_may_reconcile(rows_persisted: usize, tabs_restored: usize) -> bool {
+    tabs_restored >= rows_persisted
 }
 
 pub enum ConsoleTab {
@@ -282,7 +301,10 @@ impl ConsolePanel {
         // mirroring how Project Panel / Git Panel follow the active member.
         let member_change_sub = SolutionStore::try_global(cx).map(|store| {
             cx.subscribe(&store, |this, _store, event, cx| {
-                if matches!(event, solutions::SolutionStoreEvent::ActiveMemberChanged { .. }) {
+                if matches!(
+                    event,
+                    solutions::SolutionStoreEvent::ActiveMemberChanged { .. }
+                ) {
                     this.on_active_member_changed(cx);
                 }
             })
@@ -400,6 +422,12 @@ impl ConsolePanel {
                 .read_with(cx, |ws, cx| active_solution_id_for_workspace(ws, cx))
                 .ok()
                 .flatten();
+            if solution_id.is_none() {
+                log::warn!(
+                    "ConsolePanel restore: workspace has chat tabs but no active solution; \
+                     skipping session hydration — chat rows will not restore this boot"
+                );
+            }
             if let Some(solution_id) = solution_id {
                 // The active chat tab (active==1) is the one the user will see
                 // first; prioritise loading its transcript so it doesn't flash
@@ -425,6 +453,8 @@ impl ConsolePanel {
             });
 
         let mut active_index: Option<usize> = None;
+        let rows_persisted = rows.len();
+        let mut tabs_restored = 0usize;
 
         for (tab_index, kind, item_id, cwd, active) in rows {
             let spawned = match kind.as_str() {
@@ -532,6 +562,7 @@ impl ConsolePanel {
                     cx.notify();
                     new_index
                 });
+                tabs_restored += 1;
                 if active {
                     active_index = Some(new_index);
                 }
@@ -555,7 +586,18 @@ impl ConsolePanel {
             // user added a tab in a previous run (only ConsolePanel persisted
             // the new tab; tab_order stayed pointing at the previous set).
             // Calling persist here at end of restore harmonises them.
-            panel.persist(cx);
+            //
+            // ...but ONLY when the restore was complete — see
+            // `restore_may_reconcile`.
+            if restore_may_reconcile(rows_persisted, tabs_restored) {
+                panel.persist(cx);
+            } else {
+                log::warn!(
+                    "ConsolePanel restore: only {tabs_restored}/{rows_persisted} persisted tab(s) \
+                     came back; skipping the end-of-restore reconciliation so the missing rows \
+                     stay recoverable on the next boot"
+                );
+            }
         });
 
         Ok(())
@@ -810,11 +852,9 @@ impl ConsolePanel {
                 .child(
                     IconButton::new(("console-close", ix), IconName::Close)
                         .icon_size(IconSize::Small)
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.close_tab_at(ix, window, cx)
-                            }),
-                        ),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_tab_at(ix, window, cx)
+                        })),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1083,8 +1123,7 @@ impl ConsolePanel {
             && let Some(ix) = self.active_index
             && let Some(tab) = self.tabs.get(ix)
         {
-            self.active_by_member
-                .insert(prev, Self::tab_key(tab));
+            self.active_by_member.insert(prev, Self::tab_key(tab));
         }
 
         let member_path = self.active_member_path(cx);
@@ -1093,9 +1132,8 @@ impl ConsolePanel {
         let remembered = member_path
             .as_ref()
             .and_then(|path| self.active_by_member.get(path).copied());
-        let remembered_ix = remembered.and_then(|key| {
-            self.tabs.iter().position(|tab| Self::tab_key(tab) == key)
-        });
+        let remembered_ix =
+            remembered.and_then(|key| self.tabs.iter().position(|tab| Self::tab_key(tab) == key));
 
         self.active_index = match remembered_ix {
             Some(ix) if flags.get(ix).copied().unwrap_or(false) => Some(ix),
@@ -1152,13 +1190,18 @@ impl ConsolePanel {
         if center_pane_has_focus && active_center_item_is_terminal {
             let working_directory = terminal_view::default_working_directory(workspace, cx);
             let local = action.local;
-            terminal_view::terminal_panel::TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
-                if local {
-                    project.create_local_terminal(cx)
-                } else {
-                    project.create_terminal_shell(working_directory, cx)
-                }
-            })
+            terminal_view::terminal_panel::TerminalPanel::add_center_terminal(
+                workspace,
+                window,
+                cx,
+                move |project, cx| {
+                    if local {
+                        project.create_local_terminal(cx)
+                    } else {
+                        project.create_terminal_shell(working_directory, cx)
+                    }
+                },
+            )
             .detach_and_log_err(cx);
             return;
         }
@@ -1327,9 +1370,12 @@ impl ConsolePanel {
             RevealTarget::Center => self
                 .workspace
                 .update(cx, |workspace, cx| {
-                    terminal_view::terminal_panel::TerminalPanel::add_center_terminal(workspace, window, cx, |project, cx| {
-                        project.create_terminal_task(spawn_task, cx)
-                    })
+                    terminal_view::terminal_panel::TerminalPanel::add_center_terminal(
+                        workspace,
+                        window,
+                        cx,
+                        |project, cx| project.create_terminal_task(spawn_task, cx),
+                    )
                 })
                 .unwrap_or_else(|e| Task::ready(Err(e))),
             RevealTarget::Dock => self.add_terminal_task(spawn_task, reveal, window, cx),
@@ -1745,9 +1791,7 @@ impl ConsolePanel {
         // first, each carrying the token total + last-activity time the rows
         // display.
         let store = SolutionAgentStore::global(cx);
-        let closed = store.update(cx, |store, cx| {
-            store.list_closed_sessions(solution_id, cx)
-        });
+        let closed = store.update(cx, |store, cx| store.list_closed_sessions(solution_id, cx));
         cx.spawn_in(window, async move |_this, cx| {
             let metas = closed.await.log_err().unwrap_or_default();
             let sessions: Vec<ReopenableSession> =
@@ -1947,10 +1991,7 @@ impl ConsolePanel {
                     // build. Its synchronous close/remove already ran and
                     // found no tab — pushing one now would strand a ghost
                     // tab that nothing removes. Drop ours instead.
-                    let still_exists = this
-                        .chat_provider
-                        .read(cx)
-                        .session_exists(id, cx);
+                    let still_exists = this.chat_provider.read(cx).session_exists(id, cx);
                     if !still_exists {
                         return;
                     }
@@ -2127,10 +2168,33 @@ mod tests {
         // No stored active → first in-scope tab.
         assert_eq!(effective_active_index(&[false, false, true], None), Some(2));
         // Nothing in scope → no active tab.
-        assert_eq!(effective_active_index(&[false, false, false], Some(1)), None);
+        assert_eq!(
+            effective_active_index(&[false, false, false], Some(1)),
+            None
+        );
         assert_eq!(effective_active_index(&[], None), None);
         // Stale index past the end → fall back to first in-scope.
         assert_eq!(effective_active_index(&[true, false], Some(9)), Some(0));
+    }
+
+    /// The end-of-restore reconciliation may only run on a COMPLETE restore.
+    /// A lossy one must leave `console_panel_state` / `tab_order` untouched,
+    /// otherwise a single bad boot (session not hydrated, no active solution,
+    /// window gone mid-restore) permanently commits the loss.
+    #[test]
+    fn restore_reconciles_only_when_nothing_was_lost() {
+        // Every persisted row came back → reconcile.
+        assert!(restore_may_reconcile(3, 3));
+        // Nothing persisted, nothing restored → vacuously complete.
+        assert!(restore_may_reconcile(0, 0));
+
+        // A skipped row (dead session / invalid item_id / failed spawn) or an
+        // aborted loop (window went away) → do NOT commit the loss.
+        assert!(!restore_may_reconcile(3, 2));
+        assert!(!restore_may_reconcile(1, 0));
+        // The pathological case the bug reproduced: chat tabs persisted, none
+        // restored because their sessions were archived out from under us.
+        assert!(!restore_may_reconcile(5, 0));
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -2528,5 +2592,4 @@ mod tests {
             })
             .unwrap();
     }
-
 }
