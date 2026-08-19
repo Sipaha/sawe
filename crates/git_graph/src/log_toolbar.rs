@@ -23,6 +23,7 @@ use ui::{Divider, ListItem, ListItemSpacing, PopoverMenu, TintColor, Tooltip, pr
 
 use crate::GitGraph;
 use crate::GraphMode;
+use crate::Refresh;
 use crate::file_history::FileHistoryOptions;
 use crate::filters::DateRange;
 use branch_popover::BranchFilterPopover;
@@ -251,6 +252,7 @@ impl LogToolbar {
         let path_chip = self.render_path_chip();
         let date_chip = self.render_date_chip();
         let toggles = self.render_toggles();
+        let refresh = self.render_refresh_button();
         h_flex()
             .w_full()
             .px_2()
@@ -268,6 +270,26 @@ impl LogToolbar {
             .child(date_chip)
             .child(div().px_1().child(Divider::vertical()))
             .child(toggles)
+            .child(div().px_1().child(Divider::vertical()))
+            .child(refresh)
+    }
+
+    /// Manual reload of the log. Unlike the neighbouring controls this is not
+    /// a toggle, so it keeps the subtle style unconditionally and sits behind
+    /// its own divider at the end of the row.
+    fn render_refresh_button(&self) -> impl IntoElement {
+        let weak = self.weak_graph.clone();
+        IconButton::new("git-graph-refresh", IconName::RotateCw)
+            .icon_size(IconSize::Small)
+            .style(ButtonStyle::Subtle)
+            .tooltip(move |_window, cx| Tooltip::for_action("Refresh log", &Refresh, cx))
+            .on_click(move |_, _, cx| {
+                if let Some(graph) = weak.upgrade() {
+                    graph.update(cx, |graph, cx| {
+                        graph.refresh(cx);
+                    });
+                }
+            })
     }
 
     fn render_toggles(&self) -> impl IntoElement {

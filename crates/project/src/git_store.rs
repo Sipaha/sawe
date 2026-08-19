@@ -5862,6 +5862,18 @@ impl Repository {
         )
     }
 
+    /// Drop every cached `git log` result for this repository so the next
+    /// [`Repository::graph_data`] call re-runs the log instead of serving the
+    /// snapshot taken when the entry was first populated.
+    ///
+    /// The cache is normally evicted by the events that imply the log moved
+    /// (`HeadChanged`, `BranchListChanged`, `TagListChanged`). A user-driven
+    /// refresh has no such event behind it — the commits may have arrived from
+    /// outside this process — so the graph view calls this directly.
+    pub fn clear_graph_data_cache(&mut self) {
+        self.initial_graph_data.clear();
+    }
+
     pub fn get_graph_data(
         &self,
         log_source: LogSource,

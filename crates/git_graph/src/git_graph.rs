@@ -139,9 +139,9 @@ use git_ui::{commit_tooltip::CommitAvatar, commit_view::CommitView, git_status_i
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
     DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Subscription, Task, TextStyleRefinement, UnderlineStyle, UniformListScrollHandle,
-    WeakEntity, Window, actions, anchored, deferred, point, prelude::*, px, uniform_list,
+    MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollStrategy, SharedString,
+    Subscription, Task, TextStyleRefinement, UnderlineStyle, UniformListScrollHandle, WeakEntity,
+    Window, actions, anchored, deferred, point, prelude::*, px, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
@@ -159,7 +159,6 @@ use search::{
 };
 use smallvec::{SmallVec, smallvec};
 use std::{
-    cell::Cell,
     ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
@@ -169,7 +168,7 @@ use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     ButtonLike, Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
-    HeaderResizeInfo, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
+    HeaderResizeInfo, RedistributableColumnsState, Table, TableInteractionState,
     TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
     prelude::*, render_redistributable_columns_resize_handles, render_table_header,
     table_row::TableRow,
@@ -179,21 +178,38 @@ use workspace::{
     item::{Item, ItemEvent, TabTooltipContent},
 };
 
-const COMMIT_CIRCLE_RADIUS: Pixels = px(3.0);
+// Dot geometry follows IDEA's proportions: the dot's diameter is half the lane
+// pitch, so dots read as solid markers with a clear gap between neighbouring
+// lanes. It stays well under the row height (~22px), so growing it does not
+// grow the row.
+const COMMIT_CIRCLE_RADIUS: Pixels = px(4.0);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
-// Tight IDEA-style lane spacing: pack several branch lanes into a narrow column
-// so the graph stays compact and the description sits close to it, instead of a
-// wide graph column shoving the message text far to the right.
-const LANE_WIDTH: Pixels = px(10.0);
+// IDEA-style lane pitch: wide enough that a lane change reads as a diagonal
+// rather than a hairline kink, and that adjacent dots don't visually merge.
+// Anything below ~14px turns the diagonals into near-vertical slivers, since a
+// transition may only span one row vertically.
+const LANE_WIDTH: Pixels = px(16.0);
 const LEFT_PADDING: Pixels = px(8.0);
-// The commit-graph column has a fixed (non-user-resizable) width, IDEA-style:
-// sized to the number of lanes in the loaded history, but always at least
-// `MIN_GRAPH_LANES` (so even a linear history reserves sensible space) and
-// never more than `MAX_GRAPH_LANES` (so a busy history's lanes don't crowd
-// out the message column — overflow lanes are clipped).
+// The commit-graph column is not user-resizable (IDEA-style); it is sized to
+// the number of lanes in the loaded history, but never narrower than
+// `MIN_GRAPH_LANES` so a linear history still reserves sensible space. The same
+// floor applies per row (`graph_row_extent`), so a linear stretch reserves the
+// full four lanes of indent instead of shifting the subject text around as the
+// lane count flickers.
 const MIN_GRAPH_LANES: usize = 4;
-const MAX_GRAPH_LANES: usize = 12;
-const LINE_WIDTH: Pixels = px(1.5);
+// Upper bound on the graph's share of the region it shares with the commit
+// subject (the Description column). A hard lane cap clipped the DAG on any
+// history wider than the cap, so the bound is viewport-relative instead: the
+// graph grows with the real lane count and only stops once it would leave the
+// subject text less than 60% of its column. On a 900px Description column
+// that is ~35 lanes, far past any history a human reads.
+const MAX_GRAPH_WIDTH_FRACTION: f32 = 0.4;
+/// Index of the Description column, which the commit graph is drawn over.
+const DESCRIPTION_COLUMN_IDX: usize = 0;
+// Edges are drawn slightly heavier than before so a diagonal run — which is
+// anti-aliased across two axes and therefore reads lighter than an axis-aligned
+// one of the same width — keeps the same visual weight as the dots.
+const LINE_WIDTH: Pixels = px(2.0);
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
 // Extra vertical breathing room added to the UI line height when computing
@@ -463,6 +479,9 @@ actions!(
         /// instead of just commit messages (`--grep`). Slow on large
         /// histories.
         ToggleSearchInDiffs,
+        /// Re-runs `git log` for the current filters, picking up commits that
+        /// landed outside the editor.
+        Refresh,
     ]
 );
 
@@ -808,7 +827,14 @@ struct GraphData {
     accent_colors_count: usize,
     commits: Vec<Rc<CommitEntry>>,
     max_commit_count: AllCommitCount,
+    /// Widest row's occupancy over all loaded commits — the width the graph
+    /// column has to reserve. Monotonically non-decreasing; reset by `clear`.
     max_lanes: usize,
+    /// Number of lane columns occupied *at each row* — the commit's own lane,
+    /// every lane still live across that row, and every lane that terminates
+    /// on it. Parallel to `commits`. This is what indents each row's subject
+    /// text, so it must be the row's own occupancy, not the running maximum.
+    max_column_at_row: Vec<u16>,
     lines: Vec<Rc<CommitLine>>,
     active_commit_lines: HashMap<CommitLineKey, usize>,
     active_commit_lines_by_parent: HashMap<Oid, SmallVec<[usize; 1]>>,
@@ -825,6 +851,7 @@ impl GraphData {
             commits: Vec::default(),
             max_commit_count: AllCommitCount::NotLoaded,
             max_lanes: 0,
+            max_column_at_row: Vec::default(),
             lines: Vec::default(),
             active_commit_lines: HashMap::default(),
             active_commit_lines_by_parent: HashMap::default(),
@@ -842,6 +869,18 @@ impl GraphData {
         self.next_color = BranchColor(0);
         self.max_commit_count = AllCommitCount::NotLoaded;
         self.max_lanes = 0;
+        self.max_column_at_row.clear();
+    }
+
+    /// Lane columns occupied at `row`, floored at 1 so a row that somehow has
+    /// no recorded occupancy still indents past its own commit dot.
+    fn columns_at_row(&self, row: usize) -> usize {
+        self.max_column_at_row
+            .get(row)
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+            .into()
     }
 
     fn first_empty_lane_idx(&mut self) -> ActiveLaneIdx {
@@ -865,10 +904,15 @@ impl GraphData {
 
     fn add_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
         self.commits.reserve(commits.len());
+        self.max_column_at_row.reserve(commits.len());
         self.lines.reserve(commits.len() / 2);
 
         for commit in commits.iter() {
             let commit_row = self.commits.len();
+            // Lanes that end on this row still draw into it, so they count
+            // towards its occupancy even though they are `Empty` by the time
+            // the row's width is computed below.
+            let mut terminated_columns = 0usize;
 
             let commit_lane = self
                 .parent_to_lanes
@@ -881,6 +925,7 @@ impl GraphData {
 
             if let Some(lanes) = self.parent_to_lanes.remove(&commit.sha) {
                 for lane_column in lanes {
+                    terminated_columns = terminated_columns.max(lane_column + 1);
                     let state = &mut self.lane_states[lane_column];
 
                     if let LaneState::Active {
@@ -963,7 +1008,22 @@ impl GraphData {
                     }
                 });
 
-            self.max_lanes = self.max_lanes.max(self.lane_states.len());
+            // `lane_states` never shrinks — a freed lane stays in the vector as
+            // `Empty` so its index can be reused — so its length overstates how
+            // far right the row actually reaches. Measure the last *occupied*
+            // slot instead.
+            let live_columns = self
+                .lane_states
+                .iter()
+                .rposition(|lane| !lane.is_empty())
+                .map_or(0, |last| last + 1);
+            let occupied_columns = live_columns
+                .max(terminated_columns)
+                .max(commit_lane + 1)
+                .min(u16::MAX as usize);
+
+            self.max_lanes = self.max_lanes.max(occupied_columns);
+            self.max_column_at_row.push(occupied_columns as u16);
 
             self.commits.push(Rc::new(CommitEntry {
                 data: commit.clone(),
@@ -1159,6 +1219,47 @@ fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
     bounds.origin.x + LEFT_PADDING + lane * LANE_WIDTH + LANE_WIDTH / 2.0
 }
 
+/// Horizontal distance from the left edge of the graph area to the right edge
+/// of the rightmost of `columns` occupied lanes: the leading padding plus one
+/// `LANE_WIDTH` slot per column (a lane's dot is centred in its own slot, so
+/// the last slot ends exactly `LANE_WIDTH / 2` past the last dot's centre).
+///
+/// This is what the commit subject is indented by on a given row — IDEA-style,
+/// the text starts right after that row's own lanes, so a narrow stretch of
+/// history pulls the text back left instead of every row being indented by the
+/// widest row in the log.
+///
+/// `columns` is floored at [`MIN_GRAPH_LANES`] so the per-row indent can never
+/// undercut the column width, which has the same floor: on a linear stretch the
+/// subject would otherwise slam against the left edge and then jitter sideways
+/// on every 1↔2 lane change. Above the floor the indent tracks the row's real
+/// occupancy again.
+fn graph_row_extent(columns: usize) -> Pixels {
+    LEFT_PADDING + LANE_WIDTH * columns.max(MIN_GRAPH_LANES) as f32
+}
+
+/// Width of the whole commit-graph column: the extent of the widest row plus a
+/// trailing padding, floored at `MIN_GRAPH_LANES` and capped at
+/// `MAX_GRAPH_WIDTH_FRACTION` of `available` (the width of the region the graph
+/// shares with the commit subject).
+///
+/// `available == 0` means "not measured yet" (the column state caches the
+/// container width during prepaint, so the very first frame has none) — the
+/// natural width is used then, uncapped.
+///
+/// The floor wins over the cap: in a pane too narrow for even
+/// `MIN_GRAPH_LANES`, a graph squeezed to a couple of pixels is worse than one
+/// that overruns its share.
+fn graph_column_width_for(lanes: usize, available: Pixels) -> Pixels {
+    // `graph_row_extent` already applies the `MIN_GRAPH_LANES` floor.
+    let natural = graph_row_extent(lanes) + LEFT_PADDING;
+    if available <= px(0.) {
+        return natural;
+    }
+    let floor = graph_row_extent(MIN_GRAPH_LANES) + LEFT_PADDING;
+    natural.min((available * MAX_GRAPH_WIDTH_FRACTION).max(floor))
+}
+
 fn to_row_center(
     to_row: usize,
     row_height: Pixels,
@@ -1166,6 +1267,97 @@ fn to_row_center(
     bounds: Bounds<Pixels>,
 ) -> Pixels {
     bounds.origin.y + to_row as f32 * row_height + row_height / 2.0 - scroll_offset
+}
+
+fn distance_between(from: Point<Pixels>, to: Point<Pixels>) -> f32 {
+    let dx = f32::from(to.x - from.x);
+    let dy = f32::from(to.y - from.y);
+    dx.hypot(dy)
+}
+
+/// The point `distance` pixels from `from` along the way to `to`, clamped to the
+/// segment.
+fn along(from: Point<Pixels>, to: Point<Pixels>, distance: f32) -> Point<Pixels> {
+    let length = distance_between(from, to);
+    if length <= f32::EPSILON {
+        return from;
+    }
+    let fraction = (distance / length).clamp(0., 1.);
+    point(
+        from.x + (to.x - from.x) * fraction,
+        from.y + (to.y - from.y) * fraction,
+    )
+}
+
+/// Radius of the rounded transition between a vertical lane run and the
+/// diagonal that changes lanes. Bounded by both axes so it stays a soft corner
+/// rather than swallowing a whole lane or a whole row.
+fn lane_corner_radius(row_height: Pixels) -> Pixels {
+    (LANE_WIDTH / 2.0).min(row_height / 3.0)
+}
+
+/// Vertical distance a lane change is allowed to take: exactly one row, IDEA's
+/// convention. A branch leaves its lane one row before it lands in the next, so
+/// the crossing reads as a diagonal instead of a right-angle elbow, and the
+/// rows above the transition are left clear.
+fn lane_transition_height(row_height: Pixels, available: Pixels) -> Pixels {
+    row_height.min(available.abs())
+}
+
+/// The radius a corner can actually be rounded with: never more than half of
+/// either adjacent run, so two corners sharing a short run cannot overrun each
+/// other and fold the path back on itself.
+fn clamped_corner_radius(
+    previous: Point<Pixels>,
+    corner: Point<Pixels>,
+    next: Point<Pixels>,
+    radius: Pixels,
+) -> Pixels {
+    radius
+        .min(px(distance_between(previous, corner) / 2.0))
+        .min(px(distance_between(corner, next) / 2.0))
+}
+
+/// Strokes `points` as a polyline whose *interior* corners are rounded off with
+/// a quadratic curve, so lane changes bend into their vertical runs instead of
+/// meeting them at a hard angle. The end points are left as-is: those sit on
+/// commit dots, or hand over to the next segment of the same line.
+///
+/// Each corner's radius is shrunk to at most half of either adjacent run, so two
+/// corners sharing a short run can never overrun each other and invert the path.
+fn stroke_rounded_polyline(builder: &mut PathBuilder, points: &[Point<Pixels>], radius: Pixels) {
+    let mut distinct: SmallVec<[Point<Pixels>; 4]> = SmallVec::new();
+    for &candidate in points {
+        if distinct
+            .last()
+            .is_none_or(|last| distance_between(*last, candidate) > 0.01)
+        {
+            distinct.push(candidate);
+        }
+    }
+    let Some((&first, rest)) = distinct.split_first() else {
+        return;
+    };
+
+    let mut pen = first;
+    builder.move_to(pen);
+    for (index, &corner) in rest.iter().enumerate() {
+        let Some(&next) = rest.get(index + 1) else {
+            builder.line_to(corner);
+            builder.move_to(corner);
+            break;
+        };
+
+        let corner_radius = clamped_corner_radius(pen, corner, next, radius);
+        let curve_start = along(corner, pen, f32::from(corner_radius));
+        let curve_end = along(corner, next, f32::from(corner_radius));
+
+        builder.line_to(curve_start);
+        builder.move_to(curve_start);
+        builder.curve_to(curve_end, corner);
+        builder.move_to(curve_end);
+        pen = curve_end;
+    }
 }
 
 fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &mut Window) {
@@ -1244,7 +1436,6 @@ pub struct GitGraph {
     column_widths: Entity<RedistributableColumnsState>,
     selected_entry_idx: Option<usize>,
     hovered_entry_idx: Option<usize>,
-    graph_canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     log_source: LogSource,
     log_order: LogOrder,
     /// Chip-based log filters (Branch / User / Date / Path / Query). S-FLT
@@ -1303,6 +1494,30 @@ impl GitGraph {
     fn selected_commit_sha(&self) -> Option<Oid> {
         let data_idx = self.view_to_data_idx(self.selected_entry_idx?)?;
         Some(self.graph_data.commits.get(data_idx)?.data.sha)
+    }
+
+    /// Re-run `git log` for the current filters, keeping the selection
+    /// anchored by sha (see [`GitGraph::invalidate_state`]).
+    ///
+    /// The repository memoises each log result keyed by its filter args and
+    /// only evicts that entry for moves it can observe (head, branch list,
+    /// tag list). Commits that arrive some other way — a fetch or rebase run
+    /// in a terminal, a worktree edited by another process — stay invisible
+    /// until the entry is dropped, so an explicit refresh has to evict it
+    /// before asking for the data again.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // "Highlight new commits since last refresh" is anchored on the head
+        // of the log as it was last seen. Re-anchor on the commit currently at
+        // the top *before* the reload throws it away, so anything the reload
+        // brings in above it is decorated as new.
+        if self.highlights.new_since_refresh {
+            self.highlights.last_seen_sha = self.graph_data.commits.first().map(|c| c.data.sha);
+        }
+        if let Some(repository) = self.get_repository(cx) {
+            repository.update(cx, |repository, _| repository.clear_graph_data_cache());
+        }
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
     }
 
     pub fn set_date_filter(&mut self, range: Option<filters::DateRange>, cx: &mut Context<Self>) {
@@ -1594,15 +1809,23 @@ impl GitGraph {
         (raw * scale).round() / scale
     }
 
-    /// Fixed width of the commit-graph column: `clamp(loaded lanes, MIN, MAX)`
-    /// lanes' worth, plus the left/right padding the canvas reserves. Not
-    /// user-resizable (IDEA-style); lanes past `MAX_GRAPH_LANES` are clipped.
-    fn graph_column_width(&self) -> Pixels {
-        let lanes = self
-            .graph_data
-            .max_lanes
-            .clamp(MIN_GRAPH_LANES, MAX_GRAPH_LANES);
-        (LANE_WIDTH * lanes as f32) + LEFT_PADDING * 2.0
+    /// Width of the commit-graph column: enough for the widest loaded row, so
+    /// the DAG is never clipped, bounded by the share of the Description column
+    /// the graph may take (see `graph_column_width_for`).
+    ///
+    /// The Description column's width comes from the column state, which caches
+    /// it during prepaint — so it lags one frame behind a resize. That is safe
+    /// here: the value only feeds the graph's own width, which does not feed
+    /// back into the container width, and any resize that changes it also
+    /// triggers the redraw that picks the new value up. Notifying from the
+    /// draw phase to force the issue would be dropped anyway.
+    fn graph_column_width(&self, window: &Window, cx: &App) -> Pixels {
+        let available = self
+            .column_widths
+            .read(cx)
+            .preview_column_width(DESCRIPTION_COLUMN_IDX, window)
+            .unwrap_or(px(0.));
+        graph_column_width_for(self.graph_data.max_lanes, available)
     }
 
     fn table_column_width_config(&self, _window: &Window, cx: &App) -> ColumnWidthConfig {
@@ -1722,7 +1945,6 @@ impl GitGraph {
             column_widths,
             selected_entry_idx: None,
             hovered_entry_idx: None,
-            graph_canvas_bounds: Rc::new(Cell::new(None)),
             selected_commit_diff: None,
             commit_detail_text: None,
             log_source,
@@ -2002,6 +2224,10 @@ impl GitGraph {
         let work_dir = self.current_work_dir(cx);
 
         let row_height = Self::row_height(window, cx);
+        // The graph is painted over the left edge of the Description column, so
+        // every subject has to be indented past the lanes on its own row.
+        let shows_graph = !matches!(self.log_source, LogSource::Path(_));
+        let graph_width = self.graph_column_width(window, cx);
         // The synthetic "local changes" row, when active, occupies row 0 in
         // the view but has no backing commit. Real commit indices shift by
         // 1 — `data_idx = view_idx.checked_sub(1)`.
@@ -2234,11 +2460,22 @@ impl GitGraph {
                     .child(subject_label)
                     .into_any_element();
 
+                // IDEA-style per-row indent: the subject starts right after
+                // *this* row's own lanes, so a narrow stretch of history pulls
+                // the text back left instead of every row being indented by the
+                // widest row in the log.
+                let subject_indent = if shows_graph {
+                    graph_row_extent(self.graph_data.columns_at_row(idx)).min(graph_width)
+                } else {
+                    px(0.)
+                };
+
                 vec![
-                    div()
+                    h_flex()
                         .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
                         .overflow_hidden()
                         .tooltip(Tooltip::text(subject))
+                        .child(div().flex_none().w(subject_indent))
                         .child(description_cell)
                         .into_any_element(),
                     column_label(formatted_time.into()),
@@ -3321,7 +3558,7 @@ impl GitGraph {
         let first_visible_row = (scroll_offset_y / row_height).floor() as usize;
         let vertical_scroll_offset = scroll_offset_y - (first_visible_row as f32 * row_height);
 
-        let graph_width = self.graph_column_width();
+        let graph_width = self.graph_column_width(window, cx);
         let last_visible_row =
             first_visible_row + (viewport_height / row_height).ceil() as usize + 1;
 
@@ -3341,47 +3578,17 @@ impl GitGraph {
 
         let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
-        let hovered_entry_idx = self.hovered_entry_idx;
-        let selected_entry_idx = self.selected_entry_idx;
-        let is_focused = self.focus_handle.is_focused(window);
-        let graph_canvas_bounds = self.graph_canvas_bounds.clone();
-
         gpui::canvas(
             move |_bounds, _window, _cx| {},
             move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
-                graph_canvas_bounds.set(Some(bounds));
-
                 window.paint_layer(bounds, |window| {
                     let accent_colors = cx.theme().accents();
 
-                    let hover_bg = cx.theme().colors().element_hover.opacity(0.6);
-                    let selected_bg = if is_focused {
-                        cx.theme().colors().element_selected
-                    } else {
-                        cx.theme().colors().element_hover
-                    };
-
-                    for visible_row_idx in 0..rows.len() {
-                        let absolute_row_idx = first_visible_row + visible_row_idx;
-                        let is_hovered = hovered_entry_idx == Some(absolute_row_idx);
-                        let is_selected = selected_entry_idx == Some(absolute_row_idx);
-
-                        if is_hovered || is_selected {
-                            let row_y = bounds.origin.y + visible_row_idx as f32 * row_height
-                                - vertical_scroll_offset;
-
-                            let row_bounds = Bounds::new(
-                                point(bounds.origin.x, row_y),
-                                gpui::Size {
-                                    width: bounds.size.width,
-                                    height: row_height,
-                                },
-                            );
-
-                            let bg_color = if is_selected { selected_bg } else { hover_bg };
-                            window.paint_quad(gpui::fill(row_bounds, bg_color));
-                        }
-                    }
+                    // No row background is painted here: it belongs to the
+                    // table row underneath, which now spans the graph too.
+                    // Painting it here as well would double-blend the
+                    // translucent hover colour and leave a seam at the graph's
+                    // edge.
 
                     for (row_idx, row) in rows.into_iter().enumerate() {
                         let row_color = accent_colors.color_for_index(row.color_idx as u32);
@@ -3417,8 +3624,11 @@ impl GitGraph {
                         builder.move_to(point(line_x, from_y));
 
                         let segments = &line.segments[start_segment_idx..];
-                        let desired_curve_height = row_height / 3.0;
-                        let desired_curve_width = LANE_WIDTH / 3.0;
+                        let corner_radius = lane_corner_radius(row_height);
+                        // How far short of a commit dot an edge stops, so it
+                        // never paints over a dot of a different colour.
+                        let dot_clearance =
+                            f32::from(COMMIT_CIRCLE_RADIUS + COMMIT_CIRCLE_STROKE_WIDTH);
 
                         for (segment_idx, segment) in segments.iter().enumerate() {
                             let is_last = segment_idx + 1 == segments.len();
@@ -3446,7 +3656,7 @@ impl GitGraph {
                                     on_row,
                                     curve_kind,
                                 } => {
-                                    let mut to_column = lane_center_x(bounds, *to_column as f32);
+                                    let to_column = lane_center_x(bounds, *to_column as f32);
 
                                     let mut to_row = to_row_center(
                                         *on_row - first_visible_row,
@@ -3455,87 +3665,92 @@ impl GitGraph {
                                         bounds,
                                     );
 
-                                    // This means that this branch was a checkout
-                                    let going_right = to_column > current_column;
-                                    let column_shift = if going_right {
-                                        COMMIT_CIRCLE_RADIUS + COMMIT_CIRCLE_STROKE_WIDTH
-                                    } else {
-                                        -COMMIT_CIRCLE_RADIUS - COMMIT_CIRCLE_STROKE_WIDTH
-                                    };
-
-                                    match curve_kind {
+                                    // Both kinds cross lanes over a single
+                                    // diagonal run of at most one row, with the
+                                    // joints to the vertical runs rounded off —
+                                    // IDEA's shape. The orthogonal elbow this
+                                    // replaced put a hard right angle on every
+                                    // branch and merge.
+                                    let pen_end = match curve_kind {
+                                        // A branch runs down its parent's lane and
+                                        // only crosses into its own on the row it
+                                        // is drawn at.
                                         CurveKind::Checkout => {
+                                            let travel = to_row - current_row;
+                                            let step = lane_transition_height(row_height, travel)
+                                                * travel.signum();
+                                            let diagonal_start =
+                                                point(current_column, to_row - step);
+                                            let mut landing = point(to_column, to_row);
                                             if is_last {
-                                                to_column -= column_shift;
+                                                landing =
+                                                    along(landing, diagonal_start, dot_clearance);
                                             }
 
-                                            let available_curve_width =
-                                                (to_column - current_column).abs();
-                                            let available_curve_height =
-                                                (to_row - current_row).abs();
-                                            let curve_width =
-                                                desired_curve_width.min(available_curve_width);
-                                            let curve_height =
-                                                desired_curve_height.min(available_curve_height);
-                                            let signed_curve_width = if going_right {
-                                                curve_width
+                                            let mut path: SmallVec<[Point<Pixels>; 4]> = smallvec![
+                                                point(current_column, current_row),
+                                                diagonal_start,
+                                                landing,
+                                            ];
+                                            // When the line carries on below, run a
+                                            // corner's worth past the landing point
+                                            // so the diagonal bends into the
+                                            // vertical instead of kinking. The next
+                                            // segment draws from the pen, so the two
+                                            // never double up.
+                                            let pen_end = if is_last {
+                                                landing
                                             } else {
-                                                -curve_width
+                                                let beyond = point(
+                                                    to_column,
+                                                    to_row + corner_radius * travel.signum(),
+                                                );
+                                                path.push(beyond);
+                                                beyond
                                             };
-                                            let curve_start =
-                                                point(current_column, to_row - curve_height);
-                                            let curve_end =
-                                                point(current_column + signed_curve_width, to_row);
-                                            let curve_control = point(current_column, to_row);
-
-                                            builder.move_to(point(current_column, current_row));
-                                            builder.line_to(curve_start);
-                                            builder.move_to(curve_start);
-                                            builder.curve_to(curve_end, curve_control);
-                                            builder.move_to(curve_end);
-                                            builder.line_to(point(to_column, to_row));
+                                            stroke_rounded_polyline(
+                                                &mut builder,
+                                                &path,
+                                                corner_radius,
+                                            );
+                                            pen_end
                                         }
+                                        // A merge edge leaves its commit's dot for
+                                        // the parent's lane, then drops down it.
                                         CurveKind::Merge => {
                                             if is_last {
                                                 to_row -= COMMIT_CIRCLE_RADIUS;
                                             }
 
-                                            let merge_start = point(
-                                                current_column + column_shift,
+                                            // The line entered this segment already
+                                            // clear of the dot; the diagonal has to
+                                            // leave from the dot's centre instead,
+                                            // or it starts off-axis.
+                                            let origin = point(
+                                                current_column,
                                                 current_row - COMMIT_CIRCLE_RADIUS,
                                             );
-                                            let available_curve_width =
-                                                (to_column - merge_start.x).abs();
-                                            let available_curve_height =
-                                                (to_row - merge_start.y).abs();
-                                            let curve_width =
-                                                desired_curve_width.min(available_curve_width);
-                                            let curve_height =
-                                                desired_curve_height.min(available_curve_height);
-                                            let signed_curve_width = if going_right {
-                                                curve_width
-                                            } else {
-                                                -curve_width
-                                            };
-                                            let curve_start = point(
-                                                to_column - signed_curve_width,
-                                                merge_start.y,
-                                            );
-                                            let curve_end =
-                                                point(to_column, merge_start.y + curve_height);
-                                            let curve_control = point(to_column, merge_start.y);
+                                            let travel = to_row - origin.y;
+                                            let step = lane_transition_height(row_height, travel)
+                                                * travel.signum();
+                                            let diagonal_end = point(to_column, origin.y + step);
+                                            let landing = point(to_column, to_row);
 
-                                            builder.move_to(merge_start);
-                                            builder.line_to(curve_start);
-                                            builder.move_to(curve_start);
-                                            builder.curve_to(curve_end, curve_control);
-                                            builder.move_to(curve_end);
-                                            builder.line_to(point(to_column, to_row));
+                                            stroke_rounded_polyline(
+                                                &mut builder,
+                                                &[
+                                                    along(origin, diagonal_end, dot_clearance),
+                                                    diagonal_end,
+                                                    landing,
+                                                ],
+                                                corner_radius,
+                                            );
+                                            landing
                                         }
-                                    }
-                                    current_row = to_row;
-                                    current_column = to_column;
-                                    builder.move_to(point(current_column, current_row));
+                                    };
+                                    current_row = pen_end.y;
+                                    current_column = pen_end.x;
+                                    builder.move_to(pen_end);
                                 }
                             }
                         }
@@ -3562,92 +3777,6 @@ impl GitGraph {
         )
         .w(graph_width)
         .h_full()
-    }
-
-    fn row_at_position(
-        &self,
-        position_y: Pixels,
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> Option<usize> {
-        let canvas_bounds = self.graph_canvas_bounds.get()?;
-        let table_state = self.table_interaction_state.read(cx);
-        let scroll_offset_y = -table_state.scroll_offset().y;
-
-        let local_y = position_y - canvas_bounds.origin.y;
-
-        if local_y >= px(0.) && local_y < canvas_bounds.size.height {
-            let absolute_y = local_y + scroll_offset_y;
-            let row_height = Self::row_height(window, cx);
-            let absolute_row = (absolute_y / row_height).floor() as usize;
-
-            if absolute_row < self.graph_data.commits.len() {
-                return Some(absolute_row);
-            }
-        }
-
-        None
-    }
-
-    fn handle_graph_mouse_move(
-        &mut self,
-        event: &gpui::MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(row) = self.row_at_position(event.position.y, window, cx) {
-            if self.hovered_entry_idx != Some(row) {
-                self.hovered_entry_idx = Some(row);
-                cx.notify();
-            }
-        } else if self.hovered_entry_idx.is_some() {
-            self.hovered_entry_idx = None;
-            cx.notify();
-        }
-    }
-
-    fn handle_graph_click(
-        &mut self,
-        event: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(row) = self.row_at_position(event.position().y, window, cx) {
-            self.select_entry(row, ScrollStrategy::Nearest, cx);
-            if event.click_count() >= 2 {
-                self.open_commit_view(row, window, cx);
-            }
-        }
-    }
-
-    fn handle_graph_scroll(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let line_height = window.line_height();
-        let delta = event.delta.pixel_delta(line_height);
-
-        let table_state = self.table_interaction_state.read(cx);
-        let current_offset = table_state.scroll_offset();
-
-        let viewport_height = table_state.scroll_handle.viewport().size.height;
-
-        let commit_count = match self.graph_data.max_commit_count {
-            AllCommitCount::Loaded(count) => count,
-            AllCommitCount::NotLoaded => self.graph_data.commits.len(),
-        };
-        let content_height = Self::row_height(window, cx) * commit_count;
-        let max_vertical_scroll = (viewport_height - content_height).min(px(0.));
-
-        let new_y = (current_offset.y + delta.y).clamp(max_vertical_scroll, px(0.));
-        let new_offset = Point::new(current_offset.x, new_y);
-
-        if new_offset != current_offset {
-            table_state.set_scroll_offset(new_offset);
-            cx.notify();
-        }
     }
 
     fn render_commit_view_resize_handle(
@@ -3787,8 +3916,15 @@ impl Render for GitGraph {
                 true,
             );
             let table_width_config = self.table_column_width_config(window, cx);
-            // Fixed width for the (non-resizable) commit-graph column.
-            let graph_width = self.graph_column_width();
+            // Width of the (non-resizable) commit-graph region. The graph is
+            // painted *over* the left edge of the Description column rather
+            // than living in a column of its own: only then can each row's
+            // subject start at that row's own graph extent (IDEA-style) instead
+            // of every row being pushed behind the widest row in the log.
+            let graph_width = self.graph_column_width(window, cx);
+            // Where the widest row's subject starts, so the "Description"
+            // caption lines up with the leftmost subject text in the table.
+            let widest_row_indent = graph_row_extent(self.graph_data.max_lanes).min(graph_width);
 
             h_flex()
                 .size_full()
@@ -3803,26 +3939,28 @@ impl Render for GitGraph {
                             h_flex()
                                 .w_full()
                                 .items_stretch()
-                                .when(!is_file_history, |this| {
-                                    this.child(
-                                        div()
-                                            .flex_none()
-                                            .w(graph_width)
-                                            .overflow_hidden()
-                                            .border_b_1()
-                                            .border_color(cx.theme().colors().border)
-                                            .px_1()
-                                            .py_0p5()
-                                            .child(
-                                                Label::new("Graph").color(Color::Muted).truncate(),
-                                            ),
-                                    )
-                                })
-                                .child(div().flex_1().min_w_0().child(render_table_header(
+                                .child(div().w_full().child(render_table_header(
                                     TableRow::from_vec(
                                         vec![
-                                                Label::new("Description")
-                                                    .color(Color::Muted)
+                                                h_flex()
+                                                    .when(!is_file_history, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .flex_none()
+                                                                .w(widest_row_indent)
+                                                                .overflow_hidden()
+                                                                .child(
+                                                                    Label::new("Graph")
+                                                                        .color(Color::Muted)
+                                                                        .truncate(),
+                                                                ),
+                                                        )
+                                                    })
+                                                    .child(
+                                                        Label::new("Description")
+                                                            .color(Color::Muted)
+                                                            .truncate(),
+                                                    )
                                                     .into_any_element(),
                                                 Label::new("Date")
                                                     .color(Color::Muted)
@@ -3846,24 +3984,20 @@ impl Render for GitGraph {
                             let weak_self = cx.weak_entity();
                             let focus_handle = self.focus_handle.clone();
 
+                            // No `id`, no listeners: the overlay must not
+                            // register a hitbox, or it would swallow hover,
+                            // clicks and ref-chip presses on the table rows it
+                            // covers. All row interaction (including the
+                            // context menu, which the old graph column never
+                            // had) comes from the table underneath.
                             let graph_canvas = div()
-                                .id("graph-canvas")
-                                .size_full()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .h_full()
+                                .w(graph_width)
                                 .overflow_hidden()
-                                .child(
-                                    div()
-                                        .size_full()
-                                        .child(self.render_graph_canvas(window, cx)),
-                                )
-                                .on_scroll_wheel(cx.listener(Self::handle_graph_scroll))
-                                .on_mouse_move(cx.listener(Self::handle_graph_mouse_move))
-                                .on_click(cx.listener(Self::handle_graph_click))
-                                .on_hover(cx.listener(|this, &is_hovered: &bool, _, cx| {
-                                    if !is_hovered && this.hovered_entry_idx.is_some() {
-                                        this.hovered_entry_idx = None;
-                                        cx.notify();
-                                    }
-                                }));
+                                .child(self.render_graph_canvas(window, cx));
 
                             let commits_table = Table::new(3)
                                 .interactable(&self.table_interaction_state)
@@ -3951,19 +4085,10 @@ impl Render for GitGraph {
                                 );
 
                             h_flex()
+                                .relative()
                                 .flex_1()
                                 .w_full()
                                 .items_stretch()
-                                .when(!is_file_history, |this| {
-                                    this.child(
-                                        div()
-                                            .flex_none()
-                                            .w(graph_width)
-                                            .h_full()
-                                            .overflow_hidden()
-                                            .child(graph_canvas),
-                                    )
-                                })
                                 .child(bind_redistributable_columns(
                                     div()
                                         .relative()
@@ -3979,6 +4104,10 @@ impl Render for GitGraph {
                                         )),
                                     self.column_widths.clone(),
                                 ))
+                                // Last child, so the DAG paints on top of the
+                                // table's row background instead of being
+                                // covered by it on the hovered/selected row.
+                                .when(!is_file_history, |this| this.child(graph_canvas))
                         }),
                 )
                 .on_drag_move::<DraggedSplitHandle>(cx.listener(|this, event, window, cx| {
@@ -4025,6 +4154,9 @@ impl Render for GitGraph {
                 this.search_state.regex = !this.search_state.regex;
                 this.update_query_filter(cx);
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &Refresh, _window, cx| {
+                this.refresh(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSearchInDiffs, _window, cx| {
                 this.search_state.search_in_diffs = !this.search_state.search_in_diffs;
@@ -5530,6 +5662,230 @@ mod tests {
     }
 
     #[test]
+    fn test_graph_column_width_is_capped_by_viewport_not_lane_count() {
+        let floor = graph_row_extent(MIN_GRAPH_LANES) + LEFT_PADDING;
+
+        // A linear history still reserves the minimum column.
+        assert_eq!(graph_column_width_for(0, px(1000.)), floor);
+        assert_eq!(graph_column_width_for(1, px(1000.)), floor);
+
+        // Past the old hard-coded 12-lane cap the column keeps growing, so the
+        // DAG is no longer silently clipped.
+        assert_eq!(
+            graph_column_width_for(20, px(1000.)),
+            graph_row_extent(20) + LEFT_PADDING
+        );
+        assert!(graph_column_width_for(20, px(1000.)) > graph_column_width_for(12, px(1000.)));
+
+        // A pathological history is bounded by the viewport instead: 40% of the
+        // Description column, leaving the subject text the rest.
+        assert_eq!(graph_column_width_for(100, px(500.)), px(200.));
+
+        // Unmeasured container (first frame) means no cap at all.
+        assert_eq!(
+            graph_column_width_for(100, px(0.)),
+            graph_row_extent(100) + LEFT_PADDING
+        );
+
+        // In a pane too narrow for even the minimum lanes the floor wins over
+        // the fraction — a two-pixel graph is worse than one that overruns.
+        assert_eq!(graph_column_width_for(8, px(100.)), floor);
+    }
+
+    #[test]
+    fn test_graph_row_extent_floors_at_min_lanes() {
+        // Anything at or below the floor reserves the same four lanes, so the
+        // subject text on a linear stretch cannot slam into the graph and cannot
+        // jitter as the lane count flickers between one and two.
+        let floor = graph_row_extent(MIN_GRAPH_LANES);
+        assert_eq!(graph_row_extent(0), floor);
+        assert_eq!(graph_row_extent(1), floor);
+        assert_eq!(graph_row_extent(MIN_GRAPH_LANES - 1), floor);
+        assert_eq!(floor, LEFT_PADDING + LANE_WIDTH * MIN_GRAPH_LANES as f32);
+
+        // Above the floor the indent tracks the row's real occupancy again, one
+        // lane at a time.
+        assert_eq!(
+            graph_row_extent(MIN_GRAPH_LANES + 1) - floor,
+            LANE_WIDTH,
+            "each lane past the floor adds exactly one lane of indent"
+        );
+        assert_eq!(graph_row_extent(9) - graph_row_extent(8), LANE_WIDTH);
+
+        // The per-row indent never exceeds the column the graph is painted in,
+        // which carries the same floor.
+        assert_eq!(
+            graph_column_width_for(1, px(1000.)),
+            graph_row_extent(1) + LEFT_PADDING
+        );
+    }
+
+    #[test]
+    fn test_lane_geometry_reads_like_the_reference() {
+        // Lanes are spaced far enough apart that a lane change spans a visible
+        // diagonal rather than a hairline kink.
+        assert!(LANE_WIDTH >= px(14.));
+
+        // Dots fill half the lane pitch, leaving a clear gap between the dots of
+        // neighbouring lanes.
+        assert_eq!(COMMIT_CIRCLE_RADIUS * 4.0, LANE_WIDTH);
+
+        let bounds = Bounds::new(point(px(0.), px(0.)), gpui::Size::new(px(200.), px(200.)));
+        assert_eq!(
+            lane_center_x(bounds, 1.) - lane_center_x(bounds, 0.),
+            LANE_WIDTH
+        );
+        // The first lane's dot clears the left padding.
+        assert!(lane_center_x(bounds, 0.) - COMMIT_CIRCLE_RADIUS >= LEFT_PADDING);
+
+        let row_height = px(22.);
+        // Growing the dot must not grow the row.
+        assert!(COMMIT_CIRCLE_RADIUS * 2.0 < row_height);
+
+        // A lane change takes at most one row, and less when there is less room.
+        assert_eq!(lane_transition_height(row_height, px(80.)), row_height);
+        assert_eq!(lane_transition_height(row_height, px(9.)), px(9.));
+        assert_eq!(lane_transition_height(row_height, px(-9.)), px(9.));
+
+        // The corner that softens a lane change stays inside one lane and one row.
+        let corner = lane_corner_radius(row_height);
+        assert!(corner > px(0.));
+        assert!(corner <= LANE_WIDTH / 2.0);
+        assert!(corner <= row_height / 3.0);
+    }
+
+    #[test]
+    fn test_rounded_corner_radius_cannot_overrun_its_runs() {
+        let radius = px(10.);
+        let previous = point(px(0.), px(0.));
+        let corner = point(px(0.), px(100.));
+        let next = point(px(100.), px(100.));
+
+        // Long runs get the full radius.
+        assert_eq!(
+            clamped_corner_radius(previous, corner, next, radius),
+            radius
+        );
+
+        // A short incoming run halves down to fit, and so does a short outgoing
+        // one — otherwise two corners on the same run would cross over and the
+        // stroked path would fold back on itself.
+        let near_corner = point(px(0.), px(8.));
+        assert_eq!(
+            clamped_corner_radius(previous, near_corner, next, radius),
+            px(4.)
+        );
+        let near_next = point(px(6.), px(100.));
+        assert_eq!(
+            clamped_corner_radius(previous, corner, near_next, radius),
+            px(3.)
+        );
+
+        // A degenerate run rounds to nothing rather than inverting.
+        assert_eq!(clamped_corner_radius(corner, corner, next, radius), px(0.));
+    }
+
+    #[test]
+    fn test_along_walks_towards_the_target() {
+        let from = point(px(0.), px(0.));
+        let to = point(px(30.), px(40.));
+
+        // Half of a 3-4-5 diagonal.
+        assert_eq!(along(from, to, 25.), point(px(15.), px(20.)));
+        // Overshooting clamps to the target instead of running past it.
+        assert_eq!(along(from, to, 500.), to);
+        // A zero-length run has no direction to walk in.
+        assert_eq!(along(from, from, 5.), from);
+    }
+
+    #[test]
+    fn test_graph_per_row_occupancy() {
+        let mut rng = StdRng::seed_from_u64(7);
+
+        // A linear head, a branch that forks and re-merges, then a linear tail:
+        //   row 0  oid1          (1 lane)
+        //   row 1  oid2  fork    (2 lanes)
+        //   row 2  oid3          (2 lanes)
+        //   row 3  oid4          (2 lanes)
+        //   row 4  oid5  merge   (2 lanes — the second lane ends *on* this row)
+        //   row 5  oid6          (1 lane)
+        let oid1 = Oid::random(&mut rng);
+        let oid2 = Oid::random(&mut rng);
+        let oid3 = Oid::random(&mut rng);
+        let oid4 = Oid::random(&mut rng);
+        let oid5 = Oid::random(&mut rng);
+        let oid6 = Oid::random(&mut rng);
+
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: oid1,
+                parents: smallvec![oid2],
+                ref_names: vec!["HEAD".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid2,
+                parents: smallvec![oid3, oid4],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid3,
+                parents: smallvec![oid5],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid4,
+                parents: smallvec![oid5],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid5,
+                parents: smallvec![oid6],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid6,
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        let mut graph_data = GraphData::new(8);
+        graph_data.add_commits(&commits);
+
+        if let Err(error) = verify_all_invariants(&graph_data, &commits) {
+            panic!(
+                "Graph invariant violation for fork/merge commits:\n{}",
+                error
+            );
+        }
+
+        assert_eq!(graph_data.max_lanes, 2);
+        assert_eq!(graph_data.max_column_at_row, vec![1, 2, 2, 2, 2, 1]);
+
+        // This history never exceeds the `MIN_GRAPH_LANES` floor, so every row
+        // indents its subject by the same reserved four lanes: the text neither
+        // hugs the left edge on the linear rows nor jitters sideways as the fork
+        // opens and closes.
+        for row in 0..commits.len() {
+            assert_eq!(
+                graph_row_extent(graph_data.columns_at_row(row)),
+                graph_row_extent(MIN_GRAPH_LANES),
+                "row {row} should indent by the reserved minimum"
+            );
+        }
+
+        // A row index past the loaded commits still indents past a commit dot.
+        assert_eq!(graph_data.columns_at_row(999), 1);
+
+        // Loading the same batch again on a cleared graph must not leave the
+        // per-row vector stale or double-length.
+        graph_data.clear();
+        assert!(graph_data.max_column_at_row.is_empty());
+        graph_data.add_commits(&commits);
+        assert_eq!(graph_data.max_column_at_row.len(), commits.len());
+    }
+
+    #[test]
     fn test_git_graph_linear_commits() {
         let mut rng = StdRng::seed_from_u64(42);
 
@@ -6992,82 +7348,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_git_graph_row_at_position_rounding(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            Path::new("/project"),
-            serde_json::json!({
-                ".git": {},
-                "file.txt": "content",
-            }),
-        )
-        .await;
-
-        let mut rng = StdRng::seed_from_u64(42);
-        let commits = generate_random_commit_dag(&mut rng, 10, false);
-        fs.set_graph_commits(Path::new("/project/.git"), commits.clone());
-
-        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
-        cx.run_until_parked();
-
-        let repository = project.read_with(cx, |project, cx| {
-            project
-                .active_repository(cx)
-                .expect("should have a repository")
-        });
-
-        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
-            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
-        });
-
-        let workspace_weak =
-            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
-
-        let git_graph = cx.new_window_entity(|window, cx| {
-            GitGraph::new(
-                repository.read(cx).id,
-                project.read(cx).git_store().clone(),
-                workspace_weak,
-                None,
-                window,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-
-        git_graph.update_in(cx, |graph, window, cx| {
-            assert!(
-                graph.graph_data.commits.len() >= 10,
-                "graph should load dummy commits"
-            );
-
-            let row_height = GitGraph::row_height(window, cx);
-            let origin_y = px(100.0);
-            graph.graph_canvas_bounds.set(Some(Bounds {
-                origin: point(px(0.0), origin_y),
-                size: gpui::size(px(100.0), row_height * 50.0),
-            }));
-
-            // Scroll down by half a row so the row under a position near the
-            // top of the canvas is row 1 rather than row 0.
-            let scroll_offset = row_height * 0.75;
-            graph.table_interaction_state.update(cx, |state, _| {
-                state.set_scroll_offset(point(px(0.0), -scroll_offset))
-            });
-            let pos_y = origin_y + row_height * 0.5;
-            let absolute_calc_row = graph.row_at_position(pos_y, window, cx);
-
-            assert_eq!(
-                absolute_calc_row,
-                Some(1),
-                "Row calculation should yield absolute row exactly"
-            );
-        });
-    }
-
-    #[gpui::test]
     async fn test_row_height_matches_uniform_list_item_height(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -7333,6 +7613,143 @@ mod tests {
             |_, _| git_graph.clone().into_any_element(),
         );
         cx.run_until_parked();
+    }
+
+    /// The toolbar's refresh button has to evict the repository's memoised
+    /// `git log` result, not just drop the view's copy of it: the cache is
+    /// keyed by filter args and is only evicted by head/branch/tag events, so
+    /// a commit that arrives without one (a fetch into a bare ref, an amend in
+    /// a terminal that the watcher misses) would otherwise be re-served from
+    /// the stale snapshot and the button would look like a no-op.
+    #[gpui::test]
+    async fn test_refresh_reloads_log_without_a_head_event(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        let head = Oid::from_bytes(&[1; 20]).expect("valid oid");
+        let parent = Oid::from_bytes(&[2; 20]).expect("valid oid");
+        let external = Oid::from_bytes(&[3; 20]).expect("valid oid");
+
+        let head_entry = Arc::new(InitialGraphCommitData {
+            sha: head,
+            parents: smallvec![parent],
+            ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+        });
+        let parent_entry = Arc::new(InitialGraphCommitData {
+            sha: parent,
+            parents: smallvec![],
+            ref_names: vec![],
+        });
+
+        let (_project, git_graph, cx) =
+            setup_graph_with_commits(&fs, vec![head_entry.clone(), parent_entry.clone()], cx).await;
+        draw_graph(&git_graph, cx);
+
+        // A new commit lands on disk. No ref is rewritten, so nothing emits
+        // `HeadChanged` and the cached log keeps its pre-commit contents.
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: external,
+                    parents: smallvec![head],
+                    ref_names: vec![],
+                }),
+                head_entry,
+                parent_entry,
+            ],
+        );
+        cx.run_until_parked();
+        draw_graph(&git_graph, cx);
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.graph_data.commits.first().map(|entry| entry.data.sha),
+                Some(head),
+                "without an explicit refresh the cached log should still be served"
+            );
+        });
+
+        git_graph.update(cx, |graph, cx| graph.refresh(cx));
+        cx.run_until_parked();
+        draw_graph(&git_graph, cx);
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.graph_data.commits.first().map(|entry| entry.data.sha),
+                Some(external),
+                "refresh should re-run the log and surface the new commit"
+            );
+            assert_eq!(graph.graph_data.commits.len(), 3);
+        });
+    }
+
+    /// Refreshing re-anchors the "new since last refresh" highlight on the
+    /// commit that was at the top *before* the reload, so the commits the
+    /// reload pulls in are the ones decorated as new. Anchoring after the
+    /// reload (or not at all) leaves the highlight pointing at a commit that
+    /// is still row 0, and nothing is ever marked new.
+    #[gpui::test]
+    async fn test_refresh_reanchors_new_since_refresh(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        let head = Oid::from_bytes(&[1; 20]).expect("valid oid");
+        let parent = Oid::from_bytes(&[2; 20]).expect("valid oid");
+        let external = Oid::from_bytes(&[3; 20]).expect("valid oid");
+
+        let head_entry = Arc::new(InitialGraphCommitData {
+            sha: head,
+            parents: smallvec![parent],
+            ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+        });
+        let parent_entry = Arc::new(InitialGraphCommitData {
+            sha: parent,
+            parents: smallvec![],
+            ref_names: vec![],
+        });
+
+        let (_project, git_graph, cx) =
+            setup_graph_with_commits(&fs, vec![head_entry.clone(), parent_entry.clone()], cx).await;
+        draw_graph(&git_graph, cx);
+
+        git_graph.update(cx, |graph, cx| graph.set_new_since_refresh(true, cx));
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.highlights.last_seen_sha, Some(head));
+        });
+
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: external,
+                    parents: smallvec![head],
+                    ref_names: vec![],
+                }),
+                head_entry,
+                parent_entry,
+            ],
+        );
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, cx| graph.refresh(cx));
+        cx.run_until_parked();
+        draw_graph(&git_graph, cx);
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.highlights.last_seen_sha,
+                Some(head),
+                "the anchor should stay on the commit that headed the log before the reload"
+            );
+            assert_eq!(
+                graph.graph_data.commits.first().map(|entry| entry.data.sha),
+                Some(external),
+                "the newly-arrived commit should now sit above the anchor"
+            );
+        });
     }
 
     /// A commit landing from outside the editor (a background agent, a
