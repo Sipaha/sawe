@@ -6474,21 +6474,46 @@ impl ProjectPanel {
         }
     }
 
-    /// Compact toolbar pinned above the entry list. Hosts the
-    /// "Select Opened File" button (IDEA-style "find current file in
-    /// the tree" affordance). The bound action `pane::RevealInProjectPanel`
-    /// also lives on the keymap (`ctrl-shift-e` on Linux), but a
+    /// Compact toolbar pinned above the entry list. Hosts the "New
+    /// File" button on the left and the "Select Opened File" button
+    /// (IDEA-style "find current file in the tree" affordance) on the
+    /// right. Both bound actions (`project_panel::NewFile`,
+    /// `pane::RevealInProjectPanel`) also live on the keymap, but a
     /// visible button is the discoverable path most users will reach
     /// for first.
     fn render_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
+        let is_read_only = self.project.read(cx).is_read_only(cx);
         h_flex()
             .id("project-panel-toolbar")
             .flex_none()
+            .w_full()
             .h_7()
             .px_2()
             .gap_1()
+            .justify_between()
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
+            // The left slot stays in the tree even when empty so that
+            // `justify_between` keeps the right-hand button pinned to
+            // the right edge.
+            .child(h_flex().when(!is_read_only, |this| {
+                this.child(
+                    IconButton::new("project-panel-new-file", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        // `project_panel::NewFile` is bound in the `ProjectPanel`
+                        // key context, so the keystroke only resolves against the
+                        // panel's own focus handle.
+                        .tooltip(Tooltip::for_action_title_in(
+                            "New File",
+                            &NewFile,
+                            &self.focus_handle,
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_file(&NewFile, window, cx);
+                        })),
+                )
+            }))
             .child(
                 IconButton::new("project-panel-select-opened-file", IconName::Crosshair)
                     .icon_size(IconSize::Small)
