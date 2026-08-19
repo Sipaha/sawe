@@ -535,6 +535,8 @@ fn deploy_blame_entry_context_menu(
         refs: Vec::new(),
         head_branch: None,
         local_branches: Vec::new(),
+        remote_branches: Vec::new(),
+        remotes: Vec::new(),
     };
     let context_menu = build_commit_context_menu(ctx, window, cx);
 

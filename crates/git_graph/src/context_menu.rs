@@ -6,4 +6,4 @@
 //! This shim preserves the existing call sites (`context_menu::CommitContext`,
 //! `context_menu::build_commit_context_menu`).
 
-pub use git_ui::commit_context_menu::{CommitContext, build_commit_context_menu};
+pub use git_ui::commit_context_menu::{CommitContext, LocalBranchInfo, build_commit_context_menu};

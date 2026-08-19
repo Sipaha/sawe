@@ -499,14 +499,14 @@ pub(crate) fn soft_wrap_button(
         ))
 }
 
-struct RenameBranchModal {
+pub(crate) struct RenameBranchModal {
     current_branch: SharedString,
     editor: Entity<Editor>,
     repo: Entity<Repository>,
 }
 
 impl RenameBranchModal {
-    fn new(
+    pub(crate) fn new(
         current_branch: String,
         repo: Entity<Repository>,
         window: &mut Window,

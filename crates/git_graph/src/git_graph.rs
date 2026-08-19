@@ -1686,6 +1686,14 @@ pub struct GitGraph {
     /// Used by the My-commits highlight to compare against per-commit
     /// `author_email`. `None` until the background fetch resolves.
     local_user_email: Option<SharedString>,
+    /// Configured remote names (`origin`, `upstream`, …), captured at
+    /// view init. The commit context menu splits a `%D` remote-tracking
+    /// token against this list instead of on the first `/`, since a
+    /// remote name may itself contain one. Empty until the background
+    /// fetch resolves, and not refreshed afterwards: a remote added
+    /// mid-session just means the menu withholds the server-side
+    /// actions for its refs until the view is reopened.
+    remote_names: Vec<SharedString>,
     selected_commit_diff: Option<SelectedCommitDiff>,
     /// Branches that contain the selected commit, backing the sidebar's
     /// "In N branches" line. Tagged with the sha it was loaded for, for the
@@ -2199,6 +2207,7 @@ impl GitGraph {
             view_options: view_options::ViewOptions::default(),
             file_history_options: file_history::FileHistoryOptions::default(),
             local_user_email: None,
+            remote_names: Vec::new(),
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
@@ -2209,7 +2218,32 @@ impl GitGraph {
 
         this.fetch_initial_graph_data(cx);
         this.fetch_local_user_email(cx);
+        this.fetch_remote_names(cx);
         this
+    }
+
+    fn fetch_remote_names(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let remotes = match repository
+                .update(cx, |repo, _| repo.get_remotes(None, false))
+                .await
+            {
+                Ok(Ok(remotes)) => remotes,
+                Ok(Err(error)) => {
+                    log::warn!("git graph: failed to list remotes: {error}");
+                    return anyhow::Ok(());
+                }
+                Err(_) => return anyhow::Ok(()),
+            };
+            this.update(cx, |this, _cx| {
+                this.remote_names = remotes.into_iter().map(|remote| remote.name).collect();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn fetch_local_user_email(&mut self, cx: &mut Context<Self>) {
@@ -3184,19 +3218,34 @@ impl GitGraph {
                 .as_ref()
                 .to_path_buf(),
         );
-        let (head_branch, local_branches) = {
+        let (head_branch, local_branches, remote_branches) = {
             let repo = repository.read(cx);
             let head_branch = repo
                 .branch
                 .as_ref()
                 .map(|b| SharedString::from(b.name().to_string()));
-            let local_branches = repo
-                .branch_list
-                .iter()
-                .filter(|b| !b.is_remote())
-                .map(|b| SharedString::from(b.name().to_string()))
-                .collect::<Vec<_>>();
-            (head_branch, local_branches)
+            let mut local_branches = Vec::new();
+            let mut remote_branches = Vec::new();
+            for branch in repo.branch_list.iter() {
+                let name = SharedString::from(branch.name().to_string());
+                if branch.is_remote() {
+                    remote_branches.push(name);
+                    continue;
+                }
+                // `ahead` is what tells the commit menu whether checking
+                // out the upstream would strand local commits.
+                let upstream = branch.upstream.as_ref();
+                local_branches.push(context_menu::LocalBranchInfo {
+                    name,
+                    upstream: upstream
+                        .and_then(|upstream| upstream.stripped_ref_name())
+                        .map(|ref_name| SharedString::from(ref_name.to_string())),
+                    ahead: upstream
+                        .and_then(|upstream| upstream.tracking.status())
+                        .map_or(0, |status| status.ahead),
+                });
+            }
+            (head_branch, local_branches, remote_branches)
         };
 
         let ctx = context_menu::CommitContext {
@@ -3214,6 +3263,8 @@ impl GitGraph {
             refs,
             head_branch,
             local_branches,
+            remote_branches,
+            remotes: self.remote_names.clone(),
         };
         let menu = context_menu::build_commit_context_menu(ctx, window, cx);
         self.show_context_menu(menu, position, window, cx);
