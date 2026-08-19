@@ -191,7 +191,7 @@ async fn list_solutions_with_open_true_returns_only_open(cx: &mut TestAppContext
 
         let open_id = store.update(cx, |s, cx| s.create_for_test_minimal("open-one", cx));
         store.update(cx, |s, cx| s.create_for_test_minimal("closed-one", cx));
-        store.update(cx, |s, cx| s.mark_open(open_id.clone(), cx));
+        store.update(cx, |s, cx| s.mark_open(open_id, cx));
         open_id
     });
     cx.run_until_parked();
@@ -278,7 +278,7 @@ fn setup_with_open_solution_and_one_session(
         workspace_events::init(cx);
 
         let sol_id = store.update(cx, |s, cx| s.create_for_test_minimal("a", cx));
-        store.update(cx, |s, cx| s.mark_open(sol_id.clone(), cx));
+        store.update(cx, |s, cx| s.mark_open(sol_id, cx));
 
         let agent = solution_agent::store::SolutionAgentStore::global(cx);
         let sess_id = agent.update(cx, |a, cx| {
@@ -370,7 +370,7 @@ async fn open_solution_for_already_open_is_noop(cx: &mut TestAppContext) {
     let sol_id = cx.update(|cx| {
         let store = setup_lifecycle_test(work_dir.path(), cx);
         let id = store.update(cx, |s, cx| s.create_for_test_minimal("a", cx));
-        store.update(cx, |s, cx| s.mark_open(id.clone(), cx));
+        store.update(cx, |s, cx| s.mark_open(id, cx));
         id
     });
 
@@ -407,7 +407,7 @@ async fn close_solution_marks_closed_and_advances_seq(cx: &mut TestAppContext) {
     let sol_id = cx.update(|cx| {
         let store = setup_lifecycle_test(work_dir.path(), cx);
         let id = store.update(cx, |s, cx| s.create_for_test_minimal("a", cx));
-        store.update(cx, |s, cx| s.mark_open(id.clone(), cx));
+        store.update(cx, |s, cx| s.mark_open(id, cx));
         id
     });
 
@@ -609,7 +609,7 @@ async fn close_solution_does_not_archive_its_sessions(cx: &mut TestAppContext) {
 
     // Drive the shared seam directly — this is exactly what
     // `solutions_ui::close_solution` calls from the title-bar tab strip.
-    let ran = cx.update(|cx| workspace_events::close_solution_runtime(sol_id.clone(), cx));
+    let ran = cx.update(|cx| workspace_events::close_solution_runtime(sol_id, cx));
     assert!(
         ran,
         "close_solution_runtime must report that it closed an open solution"
