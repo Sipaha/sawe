@@ -3,7 +3,8 @@ use std::cmp;
 use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, Context, DragMoveEvent, Element, Entity,
-    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length, ParentElement,
+    Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length,
+    ParentElement,
     Pixels, StatefulInteractiveElement, Styled, TextStyleRefinement, Window, deferred, div,
     linear_color_stop, linear_gradient, point, px, size,
 };
@@ -30,6 +31,18 @@ use crate::{
 #[derive(Debug, Clone)]
 struct DraggedSplitHandle;
 
+/// Where the user last put the split divider. Every diff gets its own
+/// `SplitEditorState`, so without this, stepping to the next file in a commit
+/// silently throws away the position the user just chose — they move the
+/// divider to read the "after" side, click another file, and it snaps back to
+/// the middle. Process-wide rather than per-view precisely because the point is
+/// to survive the view.
+struct LastSplitRatio(f32);
+
+impl Global for LastSplitRatio {}
+
+const DEFAULT_SPLIT_RATIO: f32 = 0.5;
+
 pub struct SplitEditorState {
     left_ratio: f32,
     visible_left_ratio: f32,
@@ -37,10 +50,13 @@ pub struct SplitEditorState {
 }
 
 impl SplitEditorState {
-    pub fn new(_cx: &mut App) -> Self {
+    pub fn new(cx: &mut App) -> Self {
+        let ratio = cx
+            .try_global::<LastSplitRatio>()
+            .map_or(DEFAULT_SPLIT_RATIO, |remembered| remembered.0);
         Self {
-            left_ratio: 0.5,
-            visible_left_ratio: 0.5,
+            left_ratio: ratio,
+            visible_left_ratio: ratio,
             cached_width: px(0.),
         }
     }
@@ -75,8 +91,9 @@ impl SplitEditorState {
         self.visible_left_ratio = new_ratio.clamp(min_ratio, max_ratio);
     }
 
-    fn commit_ratio(&mut self) {
+    fn commit_ratio(&mut self, cx: &mut App) {
         self.left_ratio = self.visible_left_ratio;
+        cx.set_global(LastSplitRatio(self.left_ratio));
     }
 
     #[cfg(test)]
@@ -85,9 +102,10 @@ impl SplitEditorState {
         self.visible_left_ratio = ratio;
     }
 
-    fn on_double_click(&mut self) {
-        self.left_ratio = 0.5;
-        self.visible_left_ratio = 0.5;
+    fn on_double_click(&mut self, cx: &mut App) {
+        self.left_ratio = DEFAULT_SPLIT_RATIO;
+        self.visible_left_ratio = DEFAULT_SPLIT_RATIO;
+        cx.set_global(LastSplitRatio(DEFAULT_SPLIT_RATIO));
     }
 }
 
@@ -223,8 +241,8 @@ fn render_connector_strip(
                 .block_mouse_except_scroll()
                 .on_click(move |event, _, cx| {
                     if event.click_count() >= 2 {
-                        state_for_click.update(cx, |state, _| {
-                            state.on_double_click();
+                        state_for_click.update(cx, |state, cx| {
+                            state.on_double_click(cx);
                         });
                     }
                     cx.stop_propagation();
@@ -301,8 +319,8 @@ impl RenderOnce for SplitEditorView {
                     })
                     .on_drop::<DraggedSplitHandle>(move |_, _, cx| {
                         state_for_drop
-                            .update(cx, |state, _| {
-                                state.commit_ratio();
+                            .update(cx, |state, cx| {
+                                state.commit_ratio(cx);
                             })
                             .ok();
                     })
@@ -737,5 +755,35 @@ impl SplitBufferHeadersElement {
         }
 
         headers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Each file's diff builds its own `SplitEditorState`, so the divider
+    /// position has to live outside the view or stepping through a commit's
+    /// files throws away the position the user just set.
+    #[gpui::test]
+    fn test_split_ratio_survives_a_new_split_editor(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let first = cx.new(|cx| SplitEditorState::new(cx));
+            assert_eq!(first.read(cx).left_ratio(), DEFAULT_SPLIT_RATIO);
+
+            first.update(cx, |state, cx| {
+                state.visible_left_ratio = 0.25;
+                state.commit_ratio(cx);
+            });
+
+            let second = cx.new(|cx| SplitEditorState::new(cx));
+            assert_eq!(second.read(cx).left_ratio(), 0.25);
+
+            second.update(cx, |state, cx| state.on_double_click(cx));
+
+            let third = cx.new(|cx| SplitEditorState::new(cx));
+            assert_eq!(third.read(cx).left_ratio(), DEFAULT_SPLIT_RATIO);
+        });
     }
 }
