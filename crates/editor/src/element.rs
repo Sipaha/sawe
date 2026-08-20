@@ -5378,12 +5378,22 @@ impl EditorElement {
 
         // Shared with the connector ribbons: the ramp that leaves this rule has
         // to span exactly the band the rule occupies.
-        use crate::split_connectors::INSERTION_MARKER_THICKNESS as THICKNESS;
+        use crate::split_connectors::{
+            INSERTION_MARKER_THICKNESS as THICKNESS, RIBBON_FILL_OPACITY,
+        };
 
         let line_height = layout.position_map.line_height;
         let scroll_top =
             layout.position_map.scroll_position.y * ScrollPixelOffset::from(line_height);
-        let color = cx.theme().colors().version_control_added;
+        // The rule stands in for a block this pane does not have, and the block
+        // it stands in for is the ribbon leaving it — so it is painted at the
+        // ribbon's strength, not the gutter strip's. At full opacity it read as
+        // a brighter, unrelated element sitting next to a muted one.
+        let color = cx
+            .theme()
+            .colors()
+            .version_control_added
+            .opacity(RIBBON_FILL_OPACITY);
         let bounds = layout.hitbox.bounds;
 
         window.paint_layer(bounds, |window| {

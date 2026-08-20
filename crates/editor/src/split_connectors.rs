@@ -40,7 +40,7 @@ const OFFSCREEN_CLAMP_SCREENS: f32 = 3.0;
 
 /// Ribbons are a background hint, not content: solid enough to trace a block
 /// from one pane to the other, faint enough not to compete with the text.
-const RIBBON_FILL_OPACITY: f32 = 0.3;
+pub(crate) const RIBBON_FILL_OPACITY: f32 = 0.3;
 
 /// Thickness of the rule that [`insertion_marker_rows`] produces in the "before"
 /// pane, painted by `EditorElement::paint_insertion_markers`. It hangs *below*
