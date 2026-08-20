@@ -3518,16 +3518,20 @@ impl GitGraph {
 
         let detail_text =
             self.commit_detail_text(commit_entry.data.sha, subject, body, identity, cx);
-        // Small, not Default: every other label in this panel is
-        // `LabelSize::Small`, so a 14px subject read as oversized next to them.
+        // The message matches the log rows beside it — `TextSize::Default`,
+        // the size `Label` renders a commit subject at in the table. It used to
+        // render at the window's 16px UI size (see `detail_text_style`), which
+        // is what made it look oversized; the answer is the row size, not the
+        // panel's small metadata size. The identity line stays small: it is
+        // metadata about the commit, not the commit.
         let subject_style = detail_text_style(
-            TextSize::Small,
+            TextSize::Default,
             Color::Default,
             Some(gpui::FontWeight::SEMIBOLD),
             window,
             cx,
         );
-        let body_style = detail_text_style(TextSize::Small, Color::Default, None, window, cx);
+        let body_style = detail_text_style(TextSize::Default, Color::Default, None, window, cx);
         let identity_style = detail_text_style(TextSize::Small, Color::Muted, None, window, cx);
         let has_body = !detail_text.body.read(cx).source().is_empty();
         let detail_split_ratio = self.commit_detail_split_state.read(cx).ratio();
@@ -3721,15 +3725,27 @@ impl GitGraph {
                                         .min_w_0()
                                         .child(MarkdownElement::new(detail_text.body, body_style))
                                 }))
+                                // `flex_1` on the text, not just `min_w_0`: in a
+                                // ROW flex a child's width comes from its own
+                                // content and `min_w_0` lets it shrink to
+                                // nothing, so after the panel is resized the
+                                // markdown could be handed a one-character
+                                // width and wrap the whole identity line
+                                // vertically. A column flex stretches its
+                                // children, which is why the subject above is
+                                // fine with `min_w_0` alone.
                                 .child(
                                     h_flex()
+                                        .w_full()
                                         .gap_1p5()
                                         .items_start()
-                                        .child(div().pt_0p5().child(avatar))
-                                        .child(div().min_w_0().child(MarkdownElement::new(
-                                            detail_text.identity,
-                                            identity_style,
-                                        ))),
+                                        .child(div().flex_shrink_0().pt_0p5().child(avatar))
+                                        .child(
+                                            div().flex_1().min_w_0().child(MarkdownElement::new(
+                                                detail_text.identity,
+                                                identity_style,
+                                            )),
+                                        ),
                                 )
                                 .children(branches_line.map(|line| {
                                     Label::new(line).size(LabelSize::Small).color(Color::Muted)
