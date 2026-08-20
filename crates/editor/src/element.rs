@@ -2433,7 +2433,7 @@ impl EditorElement {
         self.editor.update(cx, |editor, cx| {
             gutter.layout_item_skipping_folds(
                 row,
-                GutterIndicatorColumn::LineNumber,
+                GutterIndicatorColumn::CodeEdge,
                 |cx, window| {
                     editor
                         .render_gutter_hover_button(position, row, window, cx)
@@ -2462,7 +2462,7 @@ impl EditorElement {
                 .filter_map(|(row, (text_anchor, bp, state))| {
                     gutter.layout_item_skipping_folds(
                         *row,
-                        GutterIndicatorColumn::LineNumber,
+                        GutterIndicatorColumn::CodeEdge,
                         |cx, _| {
                             editor
                                 .render_breakpoint(*text_anchor, *row, &bp, *state, cx)
@@ -2607,10 +2607,7 @@ impl EditorElement {
             .ilog10()
             + 1;
 
-        let git_gutter_width = Self::gutter_strip_width(line_height)
-            + gutter_dimensions
-                .git_blame_entries_width
-                .unwrap_or_default();
+        let git_gutter_width = Self::git_column_width(&gutter_dimensions, line_height);
         let available_width = gutter_dimensions.left_padding - git_gutter_width;
 
         buffer_rows
@@ -5218,8 +5215,24 @@ impl EditorElement {
                         ..
                     } => hitbox.as_ref().map(|hunk_hitbox| {
                         let color = match split_side {
-                            Some(SplitSide::Left) => cx.theme().colors().version_control_deleted,
-                            Some(SplitSide::Right) => cx.theme().colors().version_control_added,
+                            // `status.kind` cannot be read directly in a split
+                            // pane: the left pane runs an *inverted* diff
+                            // (`SplittableEditor::sync_lhs_for_paths` calls
+                            // `add_inverted_diff`), so each pane reports the
+                            // lines it lacks as `Deleted` and the lines it holds
+                            // alone as `Added` — mirror images of each other.
+                            // All the colour has to convey is which pane owns
+                            // the lines: a hunk with rows of its own is this
+                            // pane's own content, an empty one stands in for a
+                            // block that exists solely in the companion. So the
+                            // "after" pane paints its own rows green and a
+                            // deletion's empty marker red, and the "before"
+                            // pane the other way round.
+                            Some(side) => Self::split_hunk_color(
+                                side,
+                                !display_row_range.is_empty(),
+                                cx.theme().colors(),
+                            ),
                             None => match status.kind {
                                 DiffHunkStatusKind::Added => {
                                     cx.theme().colors().version_control_added
@@ -5289,8 +5302,66 @@ impl EditorElement {
         });
     }
 
+    /// The colour of a split pane's gutter hunk marker.
+    ///
+    /// `has_rows_of_its_own` distinguishes a hunk this pane actually holds
+    /// lines for from the empty-range hunk that stands in for a block only the
+    /// companion has. The "before" pane's own lines are the removed ones and
+    /// its empty markers point at insertions; the "after" pane is the exact
+    /// mirror, so its empty markers are deletions and must not be green.
+    fn split_hunk_color(
+        side: SplitSide,
+        has_rows_of_its_own: bool,
+        colors: &theme::ThemeColors,
+    ) -> Hsla {
+        if has_rows_of_its_own == (side == SplitSide::Left) {
+            colors.version_control_deleted
+        } else {
+            colors.version_control_added
+        }
+    }
+
     fn gutter_strip_width(line_height: Pixels) -> Pixels {
         (0.275 * line_height).floor()
+    }
+
+    /// How far the rounded marker that stands in for a deletion with no lines
+    /// of its own reaches to *either* side of the hunk strip's leading edge.
+    /// It is the widest thing painted in the gutter's content column.
+    fn deleted_hunk_marker_reach(line_height: Pixels) -> Pixels {
+        (0.35 * line_height).floor()
+    }
+
+    /// Clearance between the line-number column and the git hunk strip.
+    ///
+    /// An upright gutter needs none: its content column starts at the gutter's
+    /// outer edge, so the strip already has `left_padding - strip_width` of
+    /// empty gutter between it and the numbers. A **mirrored** gutter — the
+    /// right pane of a split diff (`GutterDimensions::mirrored`) — puts that
+    /// column immediately *after* the numbers, and line numbers are
+    /// right-aligned on `line_number_area().end`, which is exactly
+    /// `content_area_start()`. Without an inset the strip is therefore painted
+    /// against the last digit and reads as part of the number column rather
+    /// than as a marker, and the wider deletion marker overlaps the digits
+    /// outright.
+    ///
+    /// One marker reach of clearance is the smallest value that keeps *every*
+    /// marker out of the number column, so it is what the gap is defined as.
+    fn hunk_strip_inset(mirrored: bool, line_height: Pixels) -> Pixels {
+        if mirrored {
+            Self::deleted_hunk_marker_reach(line_height)
+        } else {
+            Pixels::ZERO
+        }
+    }
+
+    /// Width of the git column: the hunk strip, its clearance from the line
+    /// numbers, and the blame text that shares the column with it. Everything
+    /// else stacked into the gutter's content column starts after this.
+    fn git_column_width(gutter_dimensions: &GutterDimensions, line_height: Pixels) -> Pixels {
+        Self::hunk_strip_inset(gutter_dimensions.mirrored, line_height)
+            + Self::gutter_strip_width(line_height)
+            + gutter_dimensions.git_blame_entries_width.unwrap_or_default()
     }
 
     /// Marks, in the "before" pane of a split diff, the boundary at which the
@@ -5305,7 +5376,9 @@ impl EditorElement {
             return;
         }
 
-        const THICKNESS: Pixels = px(2.0);
+        // Shared with the connector ribbons: the ramp that leaves this rule has
+        // to span exactly the band the rule occupies.
+        use crate::split_connectors::INSERTION_MARKER_THICKNESS as THICKNESS;
 
         let line_height = layout.position_map.line_height;
         let scroll_top =
@@ -5338,8 +5411,13 @@ impl EditorElement {
     ) -> Bounds<Pixels> {
         let scroll_top = scroll_position.y * ScrollPixelOffset::from(line_height);
         let gutter_strip_width = Self::gutter_strip_width(line_height);
+        // `GutterDimensions::mirrored` is set for exactly the right pane of a
+        // split diff (`EditorSnapshot::gutter_dimensions`); the dimensions
+        // themselves are not threaded down here.
+        let strip_inset =
+            Self::hunk_strip_inset(snapshot.split_side == Some(SplitSide::Right), line_height);
         let gutter_bounds = Bounds {
-            origin: gutter_bounds.origin + point(content_area_start, px(0.)),
+            origin: gutter_bounds.origin + point(content_area_start + strip_inset, px(0.)),
             size: gutter_bounds.size,
         };
 
@@ -5367,7 +5445,7 @@ impl EditorElement {
                             .into();
                     let end_y = start_y + line_height;
 
-                    let width = (0.35 * line_height).floor();
+                    let width = Self::deleted_hunk_marker_reach(line_height);
                     let highlight_origin = gutter_bounds.origin + point(px(0.), start_y);
                     let highlight_size = size(width, end_y - start_y);
                     Bounds::new(highlight_origin, highlight_size)
@@ -6673,11 +6751,57 @@ struct Gutter<'a> {
 enum GutterIndicatorColumn {
     /// The dedicated column between the git strip and the line numbers.
     Left,
-    /// Over the line-number cell itself; the row's number is hidden so the
-    /// indicator takes its place, the way IntelliJ draws breakpoints.
-    LineNumber,
     /// The icon column right of the line numbers, shared with fold toggles.
     Icon,
+    /// Flush against the gutter's code-facing edge — right-aligned on
+    /// [`GutterDimensions::indicator_code_edge`], which is as far towards the
+    /// text as an indicator can go without landing on the crease chevrons
+    /// (upright) or the git hunk strip (mirrored). Breakpoints are drawn here,
+    /// the way JetBrains IDEs place them; like [`GutterIndicatorColumn::Icon`]
+    /// it may overlap the runnable/bookmark column, which is safe because
+    /// `EditorElement` renders at most one of the three on any given row.
+    CodeEdge,
+}
+
+impl GutterIndicatorColumn {
+    /// Where an indicator of `indicator_width` is drawn, relative to the
+    /// gutter's left edge. Split out of [`Gutter::prepaint_button`] so the
+    /// column geometry can be asserted without a window.
+    fn x(
+        self,
+        dimensions: &GutterDimensions,
+        line_height: Pixels,
+        indicator_width: Pixels,
+    ) -> Pixels {
+        let left_column_x = dimensions.content_area_start()
+            + EditorElement::git_column_width(dimensions, line_height)
+            + px(2.);
+        let centered_in = |start: Pixels, width: Pixels| start + (width - indicator_width) / 2.;
+
+        match self {
+            GutterIndicatorColumn::Left => left_column_x,
+            GutterIndicatorColumn::Icon => {
+                let width = dimensions.indicator_column_width;
+                if width <= Pixels::ZERO {
+                    left_column_x
+                } else {
+                    centered_in(dimensions.width - dimensions.right_padding, width)
+                }
+            }
+            GutterIndicatorColumn::CodeEdge => {
+                // The numbers' own start is the floor: an indicator wider than
+                // the columns it is allowed to use must eat into the number
+                // cell (whose digits are suppressed on this row anyway) rather
+                // than back over the git strip or the expand-excerpt buttons.
+                let span = dimensions.line_number_area().start..dimensions.indicator_code_edge();
+                if span.is_empty() {
+                    left_column_x
+                } else {
+                    (span.end - indicator_width).max(span.start)
+                }
+            }
+        }
+    }
 }
 
 impl Gutter<'_> {
@@ -6755,31 +6879,7 @@ impl Gutter<'_> {
             AvailableSpace::Definite(self.line_height),
         );
         let indicator_size = button.layout_as_root(available_space, window, cx);
-        let git_gutter_width = EditorElement::gutter_strip_width(self.line_height)
-            + self.dimensions.git_blame_entries_width.unwrap_or_default();
-
-        let left_column_x = self.dimensions.content_area_start() + git_gutter_width + px(2.);
-        let centered_in =
-            |start: Pixels, width: Pixels| start + (width - indicator_size.width) / 2.;
-        let x = match column {
-            GutterIndicatorColumn::Left => left_column_x,
-            GutterIndicatorColumn::LineNumber => {
-                let area = self.dimensions.line_number_area();
-                if area.is_empty() {
-                    left_column_x
-                } else {
-                    centered_in(area.start, area.end - area.start)
-                }
-            }
-            GutterIndicatorColumn::Icon => {
-                let width = self.dimensions.indicator_column_width;
-                if width <= Pixels::ZERO {
-                    left_column_x
-                } else {
-                    centered_in(self.dimensions.width - self.dimensions.right_padding, width)
-                }
-            }
-        };
+        let x = column.x(self.dimensions, self.line_height, indicator_size.width);
 
         let mut y = Pixels::from(
             (row.as_f64() - self.scroll_position.y) * ScrollPixelOffset::from(self.line_height),
@@ -9208,10 +9308,7 @@ impl Element for EditorElement {
                         );
                     }
 
-                    let git_gutter_width = Self::gutter_strip_width(line_height)
-                        + gutter_dimensions
-                            .git_blame_entries_width
-                            .unwrap_or_default();
+                    let git_gutter_width = Self::git_column_width(&gutter_dimensions, line_height);
                     let available_width = gutter_dimensions.left_padding - git_gutter_width;
 
                     let max_line_number_length = self
@@ -10824,6 +10921,170 @@ mod tests {
 
     const PRIMARY_NAVIGATION_OVERLAY_KEY: NavigationOverlayKey =
         NavigationOverlayKey::unique::<PrimaryNavigationOverlay>();
+
+    /// The breakpoint glyph is pushed flush against the gutter's code-facing
+    /// edge instead of floating centred over the line-number cell, the way
+    /// JetBrains IDEs place it. "Flush" has to stop short of whatever column
+    /// owns the gutter's outer edge, so the assertions below pin the glyph's
+    /// span against all three of its neighbours.
+    #[test]
+    fn code_edge_indicators_sit_against_the_gutters_code_facing_edge() {
+        let line_height = px(20.);
+        let glyph = px(16.);
+        let ch = px(8.);
+
+        // A singleton gutter with line numbers, runnables and folds, which is
+        // the default: two characters of content padding, four of line
+        // numbers, then the three-character icon column and the
+        // three-character fold column.
+        let upright = GutterDimensions {
+            left_padding: 2. * ch,
+            right_padding: 6. * ch,
+            indicator_column_width: 3. * ch,
+            width: 12. * ch,
+            margin: Pixels::ZERO,
+            git_blame_entries_width: None,
+            mirrored: false,
+        };
+        assert_eq!(upright.line_number_area(), px(16.)..px(48.));
+        assert_eq!(upright.indicator_code_edge(), px(72.));
+
+        let x = GutterIndicatorColumn::CodeEdge.x(&upright, line_height, glyph);
+        assert_eq!(x, px(56.), "right-aligned on the code edge, not centred");
+        assert_eq!(
+            x + glyph,
+            upright.fold_area_start(),
+            "the glyph ends exactly where the crease chevrons begin",
+        );
+        assert!(
+            x >= upright.line_number_area().end,
+            "the glyph must clear the line-number cell entirely",
+        );
+        assert!(
+            x >= EditorElement::git_column_width(&upright, line_height),
+            "the glyph must clear the git hunk strip",
+        );
+        // This is the change itself: the glyph used to be centred in the
+        // line-number area, at 16 + (32 - 16) / 2 = 24.
+        assert!(x > px(24.), "the glyph moved towards the code, not away");
+        assert!(
+            x > GutterIndicatorColumn::Left.x(&upright, line_height, glyph),
+            "and it is nowhere near the gutter's left-hand indicator column",
+        );
+
+        // A mirrored gutter — a split diff's right pane — has no fold column
+        // between the numbers and the code; the git strip owns the outer edge,
+        // so that is what the glyph stops against instead.
+        let mirrored = GutterDimensions {
+            left_padding: 4. * ch,
+            right_padding: ch,
+            indicator_column_width: Pixels::ZERO,
+            width: 9. * ch,
+            margin: Pixels::ZERO,
+            git_blame_entries_width: None,
+            mirrored: true,
+        };
+        assert_eq!(mirrored.line_number_area(), px(8.)..px(40.));
+        assert_eq!(mirrored.indicator_code_edge(), mirrored.content_area_start());
+
+        let x = GutterIndicatorColumn::CodeEdge.x(&mirrored, line_height, glyph);
+        assert_eq!(x, px(24.));
+        assert_eq!(
+            x + glyph,
+            mirrored.content_area_start(),
+            "the glyph ends where the git column begins",
+        );
+        assert!(
+            x + glyph
+                <= mirrored.content_area_start()
+                    + EditorElement::hunk_strip_inset(true, line_height),
+            "the glyph must stay out of the hunk strip's clearance",
+        );
+        assert!(
+            x >= mirrored.fold_area_start() + mirrored.fold_area_width(),
+            "a mirrored gutter keeps its fold column on the far side; the glyph \
+             must not back into it",
+        );
+    }
+
+    /// A split pane's gutter hunk marker is coloured by which pane owns the
+    /// lines, never by the hunk's own `status.kind`: the left pane runs an
+    /// inverted diff, so both panes label the lines they lack `Deleted`. The
+    /// case that used to be wrong is the last one — a pure deletion has no rows
+    /// in the "after" pane, and the marker standing in for it was painted with
+    /// the added colour, so a deletion showed up green on the right.
+    #[test]
+    fn split_hunk_colors_follow_the_pane_that_owns_the_lines() {
+        let colors = theme::ThemeColors::dark();
+        let added = colors.version_control_added;
+        let deleted = colors.version_control_deleted;
+        assert_ne!(added, deleted, "the fixture must be able to tell them apart");
+
+        assert_eq!(
+            EditorElement::split_hunk_color(SplitSide::Left, true, &colors),
+            deleted,
+            "the before pane's own lines are the ones that went away",
+        );
+        assert_eq!(
+            EditorElement::split_hunk_color(SplitSide::Left, false, &colors),
+            added,
+            "an empty hunk in the before pane marks where the companion inserted",
+        );
+        assert_eq!(
+            EditorElement::split_hunk_color(SplitSide::Right, true, &colors),
+            added,
+            "the after pane's own lines are the ones that arrived",
+        );
+        assert_eq!(
+            EditorElement::split_hunk_color(SplitSide::Right, false, &colors),
+            deleted,
+            "an empty hunk in the after pane is a deletion and must not be green",
+        );
+    }
+
+    /// A mirrored gutter — the right pane of a split diff — lays its content
+    /// column out immediately after the line numbers, which are right-aligned
+    /// on `line_number_area().end == content_area_start()`. Everything the git
+    /// column paints therefore has to be pushed clear of that boundary, or it
+    /// is drawn against the last digit and reads as part of the number column.
+    #[test]
+    fn mirrored_gutter_keeps_the_git_column_clear_of_the_line_numbers() {
+        let line_height = px(20.);
+        let strip = EditorElement::gutter_strip_width(line_height);
+        let reach = EditorElement::deleted_hunk_marker_reach(line_height);
+        assert_eq!((strip, reach), (px(5.), px(7.)));
+
+        // An upright gutter starts its content column on the gutter's outer
+        // edge and has `left_padding - strip` of clear space on the far side,
+        // so it wants no inset at all.
+        assert_eq!(
+            EditorElement::hunk_strip_inset(false, line_height),
+            Pixels::ZERO
+        );
+
+        // Offsets below are relative to `content_area_start()`.
+        let inset = EditorElement::hunk_strip_inset(true, line_height);
+        assert!(inset > Pixels::ZERO, "the strip must not touch the digits");
+
+        // The deletion marker is centred on the strip's leading edge and
+        // reaches `reach` to either side of it, so it is the constraint.
+        assert!(
+            inset - reach >= Pixels::ZERO,
+            "deletion marker at {:?} would overlap the line numbers",
+            inset - reach
+        );
+
+        let mirrored = GutterDimensions {
+            mirrored: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            EditorElement::git_column_width(&mirrored, line_height),
+            inset + strip,
+            "blame, expand toggles and the left indicator column all stack \
+             after the strip, so they have to clear the inset too"
+        );
+    }
 
     fn navigation_overlay(
         label_text: &'static str,

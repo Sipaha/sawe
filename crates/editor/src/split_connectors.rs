@@ -42,6 +42,13 @@ const OFFSCREEN_CLAMP_SCREENS: f32 = 3.0;
 /// from one pane to the other, faint enough not to compete with the text.
 const RIBBON_FILL_OPACITY: f32 = 0.3;
 
+/// Thickness of the rule that [`insertion_marker_rows`] produces in the "before"
+/// pane, painted by `EditorElement::paint_insertion_markers`. It hangs *below*
+/// the row boundary — the quad spans `y ..= y + INSERTION_MARKER_THICKNESS` —
+/// which is why [`ribbon_edges`] extends the ribbon's collapsed side downwards
+/// rather than centring it on the boundary.
+pub(crate) const INSERTION_MARKER_THICKNESS: Pixels = px(2.0);
+
 struct Ribbon {
     left_top: Pixels,
     left_bottom: Pixels,
@@ -120,30 +127,12 @@ fn layout_ribbons(
 
     let mut ribbons = Vec::new();
     for connector in connectors {
-        let left_top = row_y(
-            bounds.top(),
-            connector.left.start,
-            lhs_scroll_top,
-            line_height,
-        );
-        let left_bottom = row_y(
-            bounds.top(),
-            connector.left.end,
-            lhs_scroll_top,
-            line_height,
-        );
-        let right_top = row_y(
-            bounds.top(),
-            connector.right.start,
-            rhs_scroll_top,
-            line_height,
-        );
-        let right_bottom = row_y(
-            bounds.top(),
-            connector.right.end,
-            rhs_scroll_top,
-            line_height,
-        );
+        let RibbonEdges {
+            left_top,
+            left_bottom,
+            right_top,
+            right_bottom,
+        } = ribbon_edges(&connector, bounds.top(), lhs_scroll_top, rhs_scroll_top, line_height);
 
         if left_top.min(right_top) > bounds.bottom() || left_bottom.max(right_bottom) < bounds.top()
         {
@@ -229,6 +218,52 @@ pub(crate) fn connector_rows(
     }
 
     connectors
+}
+
+/// Where a ribbon meets each pane, in strip-local pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RibbonEdges {
+    pub(crate) left_top: Pixels,
+    pub(crate) left_bottom: Pixels,
+    pub(crate) right_top: Pixels,
+    pub(crate) right_bottom: Pixels,
+}
+
+/// Resolves a connector's rows to the y coordinates at which its ribbon leaves
+/// each pane. `top` is the top of the connector strip, which the panes share.
+///
+/// The collapsed side of a pure insertion needs care. Its two rows are equal,
+/// so the ribbon would taper to a *point* on that side — but the pane there
+/// does not draw a point, it draws the insertion marker: a rule
+/// [`INSERTION_MARKER_THICKNESS`] tall hanging below the boundary. A ribbon
+/// that converges to the rule's top edge leaves the rule's whole thickness
+/// sticking out below the join, which is the notch the ramp shows today. So
+/// the collapsed edge is given the rule's own extent instead, and ribbon and
+/// rule meet flush.
+pub(crate) fn ribbon_edges(
+    connector: &ConnectorRows,
+    top: Pixels,
+    lhs_scroll_top: f64,
+    rhs_scroll_top: f64,
+    line_height: Pixels,
+) -> RibbonEdges {
+    let mut edges = RibbonEdges {
+        left_top: row_y(top, connector.left.start, lhs_scroll_top, line_height),
+        left_bottom: row_y(top, connector.left.end, lhs_scroll_top, line_height),
+        right_top: row_y(top, connector.right.start, rhs_scroll_top, line_height),
+        right_bottom: row_y(top, connector.right.end, rhs_scroll_top, line_height),
+    };
+
+    // Only the "before" pane draws the marker, and only for a hunk that is
+    // empty *there* while the companion has lines — the same condition
+    // `insertion_marker_rows` selects on. A connector that collapsed on both
+    // sides has no ribbon at all and must keep both edges degenerate, or
+    // `paint_ribbon` stops recognising it.
+    if connector.left.start == connector.left.end && connector.right.start != connector.right.end {
+        edges.left_bottom = edges.left_top + INSERTION_MARKER_THICKNESS;
+    }
+
+    edges
 }
 
 /// Display rows of the "before" pane at which the companion pane holds a block
@@ -427,5 +462,100 @@ pub(crate) fn editor_rem_size(style: &EditorStyle) -> Option<Pixels> {
             Some(pixels * (1. + default_font_size_delta))
         }
         AbsoluteLength::Rems(rems) => Some(rems.to_pixels(ui::BASE_REM_SIZE_IN_PX.into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LINE_HEIGHT: Pixels = px(20.);
+
+    fn connector(left: Range<u32>, right: Range<u32>, status: DiffHunkStatusKind) -> ConnectorRows {
+        ConnectorRows {
+            left: DisplayRow(left.start)..DisplayRow(left.end),
+            right: DisplayRow(right.start)..DisplayRow(right.end),
+            status,
+        }
+    }
+
+    #[test]
+    fn ribbon_edges_resolve_each_pane_against_its_own_scroll() {
+        let edges = ribbon_edges(
+            &connector(2..4, 2..7, DiffHunkStatusKind::Modified),
+            px(10.),
+            1.0,
+            0.5,
+            LINE_HEIGHT,
+        );
+
+        assert_eq!(
+            edges,
+            RibbonEdges {
+                left_top: px(30.),
+                left_bottom: px(70.),
+                right_top: px(40.),
+                right_bottom: px(140.),
+            }
+        );
+    }
+
+    /// The "before" pane paints an insertion as a rule of
+    /// `INSERTION_MARKER_THICKNESS`, hanging below the boundary row. The ramp
+    /// has to leave that pane over the rule's whole thickness, or the rule's
+    /// lower edge juts out of the join.
+    #[test]
+    fn ribbon_edges_span_the_insertion_marker_on_the_collapsed_side() {
+        let edges = ribbon_edges(
+            &connector(5..5, 5..8, DiffHunkStatusKind::Added),
+            Pixels::ZERO,
+            0.0,
+            0.0,
+            LINE_HEIGHT,
+        );
+
+        assert_eq!(edges.left_top, px(100.), "the rule's top edge");
+        assert_eq!(
+            edges.left_bottom,
+            px(100.) + INSERTION_MARKER_THICKNESS,
+            "the rule's bottom edge"
+        );
+        assert_eq!(edges.right_top, px(100.));
+        assert_eq!(edges.right_bottom, px(160.));
+    }
+
+    /// The "after" pane draws no such rule for a deletion — the block simply
+    /// is not there — so that side stays a point.
+    #[test]
+    fn ribbon_edges_leave_the_after_pane_degenerate_for_a_deletion() {
+        let edges = ribbon_edges(
+            &connector(5..8, 5..5, DiffHunkStatusKind::Deleted),
+            Pixels::ZERO,
+            0.0,
+            0.0,
+            LINE_HEIGHT,
+        );
+
+        assert_eq!(edges.left_top, px(100.));
+        assert_eq!(edges.left_bottom, px(160.));
+        assert_eq!(edges.right_top, edges.right_bottom);
+        assert_eq!(edges.right_top, px(100.));
+    }
+
+    /// `paint_ribbon` recognises a hunk with nothing on either side by both
+    /// edges being degenerate, and skips it. Padding one of them would paint a
+    /// sliver instead.
+    #[test]
+    fn ribbon_edges_keep_a_doubly_collapsed_connector_degenerate() {
+        let edges = ribbon_edges(
+            &connector(5..5, 5..5, DiffHunkStatusKind::Modified),
+            Pixels::ZERO,
+            0.0,
+            0.0,
+            LINE_HEIGHT,
+        );
+
+        assert_eq!(edges.left_top, edges.left_bottom);
+        assert_eq!(edges.right_top, edges.right_bottom);
     }
 }

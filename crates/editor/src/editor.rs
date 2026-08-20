@@ -1324,6 +1324,32 @@ impl GutterDimensions {
             Pixels::ZERO
         }
     }
+
+    /// The offset, relative to the gutter's left edge, at which the code-facing
+    /// side of the gutter stops being available to an indicator that wants to
+    /// sit as close to the text as it can.
+    ///
+    /// Upright, that is `fold_area_start`: everything from there to the gutter's
+    /// edge belongs to the crease chevrons. The indicator column just in front
+    /// of it is *not* excluded — it holds runnables and bookmarks, and
+    /// `EditorElement` already keeps those mutually exclusive with breakpoints
+    /// row by row, so a breakpoint may borrow it.
+    ///
+    /// Mirrored — the right pane of a split diff — has no fold column between
+    /// the numbers and the code at all; the git hunk strip, the blame column and
+    /// the expand-excerpt buttons own everything from `content_area_start` on,
+    /// so that is the limit instead. Nothing paints in that branch today: split
+    /// panes turn breakpoints and bookmarks off, so the only column that asks
+    /// for this edge never renders there. It is kept correct rather than
+    /// `unreachable!` because the hover-arming span in `element::mouse` reads it
+    /// on every pane.
+    pub fn indicator_code_edge(&self) -> Pixels {
+        if self.mirrored {
+            self.content_area_start()
+        } else {
+            self.fold_area_start()
+        }
+    }
 }
 
 struct CharacterDimensions {

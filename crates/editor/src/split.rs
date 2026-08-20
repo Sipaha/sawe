@@ -692,12 +692,24 @@ impl SplittableEditor {
             return;
         }
 
-        let is_rhs_singleton = self.rhs_multibuffer.read(cx).is_singleton();
+        // The two panes only line up if they reserve the same block rows, and a
+        // buffer header is `FILE_HEADER_HEIGHT` (two) rows tall. Whether the
+        // right pane draws one is a property of the multibuffer the consumer
+        // handed us — `MultiBufferSnapshot::show_headers` — and *not* of it
+        // being a singleton. `MultiBuffer::without_headers` is used for
+        // non-singleton multibuffers too (a single-file commit diff, an agent's
+        // edit review), and keying off `is_singleton` gave every one of those a
+        // header-bearing left pane against a header-less right one: the whole
+        // left pane, gutter and text together, painted two rows low, and the
+        // connector ribbons ramped across the difference because they believed
+        // it. Mirroring `show_headers` subsumes the singleton case, which is
+        // header-less by construction.
+        let rhs_shows_headers = self.rhs_multibuffer.read(cx).snapshot(cx).show_headers();
         let lhs_multibuffer = cx.new(|cx| {
-            let mut multibuffer = if is_rhs_singleton {
-                MultiBuffer::without_headers(Capability::ReadOnly)
-            } else {
+            let mut multibuffer = if rhs_shows_headers {
                 MultiBuffer::new(Capability::ReadOnly)
+            } else {
+                MultiBuffer::without_headers(Capability::ReadOnly)
             };
             multibuffer.set_all_diff_hunks_expanded(cx);
             multibuffer
@@ -2359,6 +2371,19 @@ mod tests {
         soft_wrap: SoftWrap,
         style: DiffViewStyle,
     ) -> (Entity<SplittableEditor>, &mut VisualTestContext) {
+        init_test_with_headers(cx, soft_wrap, style, true).await
+    }
+
+    /// `rhs_shows_headers` picks which `MultiBuffer` constructor the right pane
+    /// gets. `false` is a *non-singleton* headerless multibuffer — the shape a
+    /// single-file commit diff and an agent edit review build, and the one that
+    /// used to leave the left pane two rows lower than the right.
+    async fn init_test_with_headers(
+        cx: &mut gpui::TestAppContext,
+        soft_wrap: SoftWrap,
+        style: DiffViewStyle,
+        rhs_shows_headers: bool,
+    ) -> (Entity<SplittableEditor>, &mut VisualTestContext) {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
@@ -2384,7 +2409,11 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let rhs_multibuffer = cx.new(|cx| {
-            let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+            let mut multibuffer = if rhs_shows_headers {
+                MultiBuffer::new(Capability::ReadWrite)
+            } else {
+                MultiBuffer::without_headers(Capability::ReadWrite)
+            };
             multibuffer.set_all_diff_hunks_expanded(cx);
             multibuffer
         });
@@ -2811,6 +2840,121 @@ mod tests {
                 cx,
             );
         });
+    }
+
+    /// A right pane may suppress buffer headers without being a singleton: the
+    /// single-file commit diff (`git_ui::commit_view`) and an agent's edit
+    /// review both build `MultiBuffer::without_headers` over real path
+    /// excerpts. `SplittableEditor::split` used to decide the left pane's own
+    /// header setting from `rhs.is_singleton()` rather than from
+    /// `rhs.show_headers()`, so those cases got a left pane built with
+    /// `MultiBuffer::new` — headers on — and a `Block::BufferHeader` of
+    /// `FILE_HEADER_HEIGHT` (two) rows that the right pane did not have. Every
+    /// line in the left pane, gutter and text alike, then painted
+    /// `2 * line_height` low, and the connector ribbons ramped across the gap
+    /// because they believed it.
+    #[gpui::test]
+    async fn test_headerless_right_pane_does_not_offset_the_left_pane(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::display_map::{Block, DisplayRow, DisplaySnapshot};
+        use rope::Point;
+        use text::Bias;
+        use unindent::Unindent as _;
+
+        let (editor, mut cx) =
+            init_test_with_headers(cx, SoftWrap::EditorWidth, DiffViewStyle::Split, false).await;
+
+        // The maintainer's repro: exactly one line differs.
+        let base_text = "
+            <project>
+              <properties>
+                <revision>3.29.0</revision>
+              </properties>
+            </project>
+        "
+        .unindent();
+        let current_text = base_text.replace("3.29.0", "3.29.1");
+
+        let (buffer, diff) = buffer_with_diff(&base_text, &current_text, &mut cx);
+
+        editor.update(cx, |editor, cx| {
+            editor.update_excerpts_for_path(
+                PathKey::sorted(0),
+                buffer.clone(),
+                vec![Point::new(0, 0)..buffer.read(cx).max_point()],
+                0,
+                diff.clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (lhs_snapshot, rhs_snapshot) = editor.update(cx, |editor, cx| {
+            let lhs = editor.lhs.as_ref().expect("should have split");
+            (
+                lhs.editor.update(cx, |editor, cx| editor.display_snapshot(cx)),
+                editor
+                    .rhs_editor
+                    .update(cx, |editor, cx| editor.display_snapshot(cx)),
+            )
+        });
+
+        fn header_block_rows(snapshot: &DisplaySnapshot) -> Vec<DisplayRow> {
+            snapshot
+                .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
+                .filter(|(_, block)| {
+                    matches!(
+                        block,
+                        Block::BufferHeader { .. } | Block::ExcerptBoundary { .. }
+                    )
+                })
+                .map(|(row, _)| row)
+                .collect()
+        }
+
+        assert_eq!(
+            header_block_rows(&lhs_snapshot),
+            Vec::<DisplayRow>::new(),
+            "the left pane must not invent a buffer header the right pane lacks",
+        );
+        assert_eq!(
+            header_block_rows(&lhs_snapshot),
+            header_block_rows(&rhs_snapshot),
+            "both panes reserve the same block rows",
+        );
+        assert_eq!(
+            lhs_snapshot.max_point().row(),
+            rhs_snapshot.max_point().row(),
+            "both panes span the same number of display rows",
+        );
+
+        // The panes share one scroll anchor, so a row's y is decided entirely
+        // by its display row: `split_connectors::row_y` is
+        // `top + (row - scroll_top) * line_height`, and `scroll_top` is 0 here.
+        const LINE_HEIGHT: Pixels = px(23.);
+        let y_of = |snapshot: &DisplaySnapshot, buffer_row: u32| {
+            let display_row = snapshot
+                .point_to_display_point(Point::new(buffer_row, 0), Bias::Left)
+                .row();
+            LINE_HEIGHT * display_row.0 as f32
+        };
+
+        assert_eq!(
+            (y_of(&lhs_snapshot, 0), y_of(&rhs_snapshot, 0)),
+            (px(0.), px(0.)),
+            "both panes put their first line of text at the top of the viewport",
+        );
+        // `<revision>` is buffer row 2 on both sides — a one-line modification
+        // changes no line counts — so both panes owe it the same y.
+        assert_eq!(
+            (y_of(&lhs_snapshot, 2), y_of(&rhs_snapshot, 2)),
+            (px(46.), px(46.)),
+            "the changed line must sit on the same y in both panes; before the \
+             fix the left pane put it at 46 + 2 * 23 = 92",
+        );
+
+        editor.update(cx, |editor, cx| editor.check_invariants(true, cx));
     }
 
     #[gpui::test]

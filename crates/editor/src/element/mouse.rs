@@ -206,11 +206,20 @@ impl EditorElement {
             indicator.is_active && start_row == valid_point.row()
         });
 
-        // The preview dot lands on the line number itself, so only offer it
-        // while the pointer is over that cell rather than anywhere in the row.
+        // The preview dot lands in the gutter's number/indicator span rather
+        // than anywhere in the row, so only offer it while the pointer is over
+        // that span. It runs past the last digit to
+        // `GutterDimensions::indicator_code_edge`, where the dot is actually
+        // drawn — stopping at the numbers would mean pointing straight at the
+        // dot armed nothing.
         let line_number_area = position_map.gutter_dimensions.line_number_area();
+        let arming_span = line_number_area.start
+            ..position_map
+                .gutter_dimensions
+                .indicator_code_edge()
+                .max(line_number_area.end);
         let over_line_number_cell = line_number_area.is_empty()
-            || line_number_area.contains(&(event.position.x - gutter_hitbox.origin.x));
+            || arming_span.contains(&(event.position.x - gutter_hitbox.origin.x));
 
         let gutter_hover_button = if gutter_hovered
             && over_line_number_cell
