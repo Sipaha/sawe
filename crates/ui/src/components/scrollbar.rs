@@ -157,11 +157,8 @@ impl WithScrollbar for Stateful<Div> {
     where
         T: ScrollableHandle,
     {
-        render_scrollbar(
-            get_scrollbar_state(config, std::panic::Location::caller(), window, cx),
-            self,
-            cx,
-        )
+        let scrollbar = get_scrollbar_state(config, std::panic::Location::caller(), window, cx);
+        render_scrollbar(scrollbar, self, cx)
     }
 }
 
@@ -194,34 +191,52 @@ impl WithScrollbar for Div {
 fn render_scrollbar<T>(
     scrollbar: Entity<ScrollbarStateWrapper<T>>,
     div: Stateful<Div>,
-    cx: &App,
+    cx: &mut App,
 ) -> Stateful<Div>
 where
     T: ScrollableHandle,
 {
-    let state = &scrollbar.read(cx).0;
+    let state = scrollbar.read(cx).0.clone();
 
-    div.when_some(state.read(cx).handle_to_track(), |this, handle| {
-        this.track_scroll(handle).when_some(
-            state.read(cx).visible_axes(),
-            |this, axes| match axes {
-                ScrollAxes::Horizontal => this.overflow_x_scroll(),
-                ScrollAxes::Vertical => this.overflow_y_scroll(),
-                ScrollAxes::Both => this.overflow_scroll(),
-            },
+    let mut div = div
+        .when_some(state.read(cx).handle_to_track(), |this, handle| {
+            this.track_scroll(handle).when_some(
+                state.read(cx).visible_axes(),
+                |this, axes| match axes {
+                    ScrollAxes::Horizontal => this.overflow_x_scroll(),
+                    ScrollAxes::Vertical => this.overflow_y_scroll(),
+                    ScrollAxes::Both => this.overflow_scroll(),
+                },
+            )
+        })
+        .when_some(
+            state
+                .read(cx)
+                .space_to_reserve_for(ScrollbarAxis::Horizontal),
+            |this, space| this.pb(space),
         )
-    })
-    .when_some(
-        state
-            .read(cx)
-            .space_to_reserve_for(ScrollbarAxis::Horizontal),
-        |this, space| this.pb(space),
-    )
-    .when_some(
-        state.read(cx).space_to_reserve_for(ScrollbarAxis::Vertical),
-        |this, space| this.pr(space),
-    )
-    .child(state.clone())
+        .when_some(
+            state.read(cx).space_to_reserve_for(ScrollbarAxis::Vertical),
+            |this, space| this.pr(space),
+        );
+
+    // The scrollbar is attached as a child of `div`. If `div` is itself the
+    // element that scrolls the handle we are drawing, gpui prepaints us inside
+    // `with_element_offset(scroll_offset)` along with the content, so our own
+    // laid-out bounds slide up by the scroll offset (`Div::prepaint`); the
+    // track has to be anchored to the viewport instead. When `div` merely
+    // *contains* the scroller (a `uniform_list` or a `list`, which own their
+    // own viewport and may sit at a different origin than `div`), no such
+    // translation happens and our bounds are already right.
+    let nested_in_scroll_container = div
+        .interactivity()
+        .tracked_scroll_handle()
+        .is_some_and(|tracked| state.read(cx).tracks_scroll_handle(tracked));
+    state.update(cx, |state, _cx| {
+        state.nested_in_scroll_container = nested_in_scroll_container;
+    });
+
+    div.child(state.clone())
 }
 
 impl<T: ScrollableHandle> UniformListDecoration for ScrollbarStateWrapper<T> {
@@ -629,6 +644,9 @@ struct ScrollbarState<T: ScrollableHandle = ScrollHandle> {
     show_state: VisibilityState,
     style: ScrollbarStyle,
     mouse_in_parent: bool,
+    /// Set every render by [`render_scrollbar`]: whether this scrollbar is laid
+    /// out inside the scrolled coordinate space of the handle it draws.
+    nested_in_scroll_container: bool,
     last_prepaint_state: Option<ScrollbarPrepaintState>,
     _auto_hide_task: Option<Task<()>>,
 }
@@ -656,6 +674,7 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
             style: config.style.unwrap_or_default(),
             show_state: VisibilityState::from_behavior(show_behavior),
             mouse_in_parent: true,
+            nested_in_scroll_container: false,
             last_prepaint_state: None,
             _auto_hide_task: None,
         }
@@ -750,6 +769,24 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
 
     fn scroll_handle(&self) -> &T {
         &self.scroll_handle
+    }
+
+    /// Whether the handle we draw is the very handle `other` drives.
+    fn tracks_scroll_handle(&self, other: &ScrollHandle) -> bool {
+        (self.scroll_handle() as &dyn Any)
+            .downcast_ref::<ScrollHandle>()
+            .is_some_and(|own| own == other)
+    }
+
+    /// The rectangle the track should hug: the viewport of the scrolled
+    /// element, which is recorded before its children are prepainted and is
+    /// therefore free of the scroll translation applied to those children.
+    fn track_anchor(&self, own_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        if self.nested_in_scroll_container {
+            self.scroll_handle().viewport()
+        } else {
+            own_bounds
+        }
     }
 
     fn set_offset(&mut self, offset: Point<Pixels>, cx: &mut Context<Self>) {
@@ -1141,6 +1178,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let bounds = self.state.read(cx).track_anchor(bounds);
         let prepaint_state =
             self.state
                 .read(cx)
@@ -1308,7 +1346,8 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
             return;
         };
 
-        let bounds = Bounds::new(self.origin + origin, size);
+        let anchor = self.state.read(cx).track_anchor(Bounds { origin, size });
+        let bounds = Bounds::new(self.origin + anchor.origin, anchor.size);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let colors = cx.theme().colors();
 
@@ -1557,5 +1596,393 @@ impl<T: ScrollableHandle> IntoElement for ScrollbarElement<T> {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AnyWindowHandle, TestAppContext, div, point, uniform_list};
+    use std::{cell::RefCell, rc::Rc};
+
+    type CapturedState = Rc<RefCell<Option<Entity<ScrollbarStateWrapper<ScrollHandle>>>>>;
+
+    const CONTENT_ROWS: usize = 40;
+    const ROW_HEIGHT: Pixels = px(20.);
+
+    /// Mirrors the flex skeleton of the git graph's commit detail panel: a
+    /// column split between a file tree that grows and a message region that
+    /// sizes to its content, capped at half the panel, scrolling inside that
+    /// cap with a scrollbar attached to the scrolling element itself.
+    struct DetailPanelProbe {
+        handle: ScrollHandle,
+        panel_height: Pixels,
+        captured: CapturedState,
+    }
+
+    impl Render for DetailPanelProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let message_region = div()
+                .id("commit-message-region")
+                .min_w(px(0.))
+                .max_h(relative(0.5))
+                .overflow_y_scroll()
+                .track_scroll(&self.handle)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .children((0..CONTENT_ROWS).map(|_| div().h(ROW_HEIGHT).w_full())),
+                );
+
+            let scrollbar = get_scrollbar_state(
+                Scrollbars::always_visible(ScrollAxes::Vertical)
+                    .tracked_scroll_handle(&self.handle)
+                    .id("commit-message-scrollbar"),
+                std::panic::Location::caller(),
+                window,
+                cx,
+            );
+            *self.captured.borrow_mut() = Some(scrollbar.clone());
+
+            div()
+                .flex()
+                .flex_col()
+                .w(px(300.))
+                .h(self.panel_height)
+                .child(div().flex_1().min_h(px(0.)))
+                .child(div().h(px(1.)))
+                .child(render_scrollbar(scrollbar, message_region, cx))
+        }
+    }
+
+    /// The other half of the same panel: a plain wrapper `div` that does not
+    /// scroll anything itself, holding a `uniform_list` that owns its viewport.
+    struct UniformListProbe {
+        handle: UniformListScrollHandle,
+        captured: Rc<RefCell<Option<Entity<ScrollbarStateWrapper<UniformListScrollHandle>>>>>,
+    }
+
+    impl Render for UniformListProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let list = div()
+                .id("changed-files-container")
+                .flex_1()
+                .min_h(px(0.))
+                .child(
+                    uniform_list("changed-files-list", CONTENT_ROWS, |range, _window, _cx| {
+                        range.map(|_| div().h(ROW_HEIGHT).w_full()).collect()
+                    })
+                    .size_full()
+                    .track_scroll(&self.handle),
+                );
+
+            let scrollbar = get_scrollbar_state(
+                Scrollbars::always_visible(ScrollAxes::Vertical)
+                    .tracked_scroll_handle(&self.handle)
+                    .id("changed-files-scrollbar"),
+                std::panic::Location::caller(),
+                window,
+                cx,
+            );
+            *self.captured.borrow_mut() = Some(scrollbar.clone());
+
+            div()
+                .flex()
+                .flex_col()
+                .w(px(300.))
+                .h(px(400.))
+                .child(render_scrollbar(scrollbar, list, cx))
+        }
+    }
+
+    fn draw(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .expect("window is open");
+    }
+
+    fn vertical_thumb<T: ScrollableHandle>(
+        cx: &TestAppContext,
+        state: &Entity<ScrollbarStateWrapper<T>>,
+    ) -> (Bounds<Pixels>, Bounds<Pixels>) {
+        cx.read(|cx| {
+            let state = state.read(cx).0.read(cx);
+            let layout = state
+                .last_prepaint_state
+                .as_ref()
+                .expect("scrollbar prepainted")
+                .thumbs
+                .iter()
+                .find(|thumb| thumb.axis == ScrollbarAxis::Vertical)
+                .expect("a vertical thumb");
+            (layout.track_bounds, layout.thumb_bounds)
+        })
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| theme::init(theme::LoadThemes::JustBase, cx));
+    }
+
+    #[gpui::test]
+    fn scrollbar_track_stays_on_the_viewport_while_the_content_scrolls(cx: &mut TestAppContext) {
+        init_test(cx);
+        let handle = ScrollHandle::new();
+        let captured = CapturedState::default();
+        let window = cx.add_window({
+            let handle = handle.clone();
+            let captured = captured.clone();
+            move |_, _| DetailPanelProbe {
+                handle,
+                panel_height: px(400.),
+                captured,
+            }
+        });
+        let window: AnyWindowHandle = window.into();
+        draw(cx, window);
+
+        let state = captured.borrow().clone().expect("scrollbar was rendered");
+        assert!(
+            cx.read(|cx| state.read(cx).0.read(cx).nested_in_scroll_container),
+            "the scrollbar is a child of the element that scrolls its handle"
+        );
+
+        // 40 rows of 20px inside a region capped at half of a 400px panel:
+        // viewport 200px, content 800px, so the extent is 600px.
+        let viewport = handle.bounds();
+        assert_eq!(viewport.size.height, px(200.));
+        assert_eq!(handle.max_offset().y, px(600.));
+
+        // thumb = viewport * viewport / content = 200 * 200 / 800 = 50px, mapped
+        // onto a track inset by SCROLLBAR_PADDING on each end: 50/200 * 192 = 48px.
+        // Its top travels (S / 600) * (200 - 50) / 200 * 192 down the track.
+        for (offset, expected_thumb_top) in [
+            (px(0.), px(0.)),
+            (px(-200.), px(48.)),
+            (px(-600.), px(144.)),
+        ] {
+            handle.set_offset(point(px(0.), offset));
+            draw(cx, window);
+
+            let (track, thumb) = vertical_thumb(cx, &state);
+            assert_eq!(
+                track.origin.y,
+                viewport.origin.y + SCROLLBAR_PADDING,
+                "track must hug the viewport at offset {offset:?}, not slide with the content"
+            );
+            assert_eq!(track.size.height, viewport.size.height - 2. * SCROLLBAR_PADDING);
+            assert_eq!(
+                thumb.size.height,
+                px(48.),
+                "thumb size must not depend on the scroll offset"
+            );
+            assert_eq!(thumb.origin.y, track.origin.y + expected_thumb_top);
+            assert!(
+                thumb.origin.y >= viewport.origin.y && thumb.bottom() <= viewport.bottom(),
+                "thumb {thumb:?} escaped the viewport {viewport:?} at offset {offset:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn scroll_extent_and_thumb_track_a_parent_resize(cx: &mut TestAppContext) {
+        init_test(cx);
+        let handle = ScrollHandle::new();
+        let captured = CapturedState::default();
+        let window = cx.add_window({
+            let handle = handle.clone();
+            let captured = captured.clone();
+            move |_, _| DetailPanelProbe {
+                handle,
+                panel_height: px(400.),
+                captured,
+            }
+        });
+        let window_handle: AnyWindowHandle = window.into();
+        draw(cx, window_handle);
+        let state = captured.borrow().clone().expect("scrollbar was rendered");
+
+        handle.set_offset(point(px(0.), px(-600.)));
+        draw(cx, window_handle);
+        assert_eq!(handle.max_offset().y, px(600.));
+
+        // Halve the panel: the cap halves with it, so the viewport shrinks to
+        // 100px and the extent has to grow from 600px to 700px for the last row
+        // to stay reachable.
+        window
+            .update(cx, |probe, _, cx| {
+                probe.panel_height = px(200.);
+                cx.notify();
+            })
+            .expect("window is open");
+        draw(cx, window_handle);
+
+        let viewport = handle.bounds();
+        assert_eq!(viewport.size.height, px(100.));
+        assert_eq!(
+            handle.max_offset().y,
+            px(700.),
+            "extent must be re-derived from the new viewport height"
+        );
+
+        handle.set_offset(point(px(0.), -handle.max_offset().y));
+        draw(cx, window_handle);
+        assert_eq!(
+            handle.offset().y,
+            px(-700.),
+            "the end of the content must remain reachable after the resize"
+        );
+
+        let (track, thumb) = vertical_thumb(cx, &state);
+        assert_eq!(track.origin.y, viewport.origin.y + SCROLLBAR_PADDING);
+        assert!(
+            thumb.origin.y >= viewport.origin.y && thumb.bottom() <= viewport.bottom(),
+            "thumb {thumb:?} escaped the resized viewport {viewport:?}"
+        );
+        assert_eq!(
+            thumb.bottom(),
+            track.bottom(),
+            "at the end of the content the thumb must sit at the end of the track"
+        );
+    }
+
+
+    /// Probe: the real panel nests the capped region under `h_full()` +
+    /// `flex_basis(relative(..))` ancestors rather than a fixed height. If any
+    /// link were height-indefinite, `max_h(relative(0.5))` would resolve to
+    /// "none" and the region would size to its full content instead of
+    /// scrolling.
+    struct NestedPanelProbe {
+        handle: ScrollHandle,
+        window_height: Pixels,
+    }
+
+    impl Render for NestedPanelProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let message_region = div()
+                .id("commit-message-region")
+                .min_w(px(0.))
+                .max_h(relative(0.5))
+                .overflow_y_scroll()
+                .track_scroll(&self.handle)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .children((0..CONTENT_ROWS).map(|_| div().h(ROW_HEIGHT).w_full())),
+                );
+            let scrollbar = get_scrollbar_state(
+                Scrollbars::always_visible(ScrollAxes::Vertical)
+                    .tracked_scroll_handle(&self.handle)
+                    .id("nested-scrollbar"),
+                std::panic::Location::caller(),
+                window,
+                cx,
+            );
+            div()
+                .flex()
+                .flex_row()
+                .w(px(900.))
+                .h(self.window_height)
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(300.))
+                        .h_full()
+                        .flex_basis(relative(0.4))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_h(px(0.))
+                                .child(div().flex_1().min_h(px(0.)))
+                                .child(div().h(px(1.)))
+                                .child(render_scrollbar(scrollbar, message_region, cx)),
+                        ),
+                )
+        }
+    }
+
+    /// The maintainer reported the extent going stale after a dock or divider
+    /// resize. It does not: the relative cap re-resolves through the panel's
+    /// `h_full()` / `flex_basis(relative(..))` ancestors on every layout, and
+    /// the extent grows to match the smaller viewport.
+    #[gpui::test]
+    fn relative_height_cap_re_resolves_when_the_panel_is_resized(cx: &mut TestAppContext) {
+        init_test(cx);
+        let handle = ScrollHandle::new();
+        let window = cx.add_window({
+            let handle = handle.clone();
+            move |_, _| NestedPanelProbe {
+                handle,
+                window_height: px(600.),
+            }
+        });
+        let any_window: AnyWindowHandle = window.into();
+        draw(cx, any_window);
+
+        // Content is 800px; the region is capped at half of the 600px split.
+        assert_eq!(handle.bounds().size.height, px(300.));
+        assert_eq!(handle.max_offset().y, px(500.));
+
+        window
+            .update(cx, |probe, _, cx| {
+                probe.window_height = px(300.);
+                cx.notify();
+            })
+            .expect("window is open");
+        draw(cx, any_window);
+
+        assert_eq!(handle.bounds().size.height, px(150.));
+        assert_eq!(
+            handle.max_offset().y,
+            px(650.),
+            "the extent must grow by exactly the height the viewport lost"
+        );
+
+        handle.set_offset(point(px(0.), -handle.max_offset().y));
+        draw(cx, any_window);
+        assert_eq!(
+            handle.offset().y,
+            px(-650.),
+            "the end of the content stays reachable after the resize"
+        );
+    }
+
+    #[gpui::test]
+    fn scrollbar_over_a_uniform_list_is_not_treated_as_nested(cx: &mut TestAppContext) {
+        init_test(cx);
+        let handle = UniformListScrollHandle::new();
+        let captured = Rc::new(RefCell::new(None));
+        let window = cx.add_window({
+            let handle = handle.clone();
+            let captured = captured.clone();
+            move |_, _| UniformListProbe { handle, captured }
+        });
+        let window: AnyWindowHandle = window.into();
+        draw(cx, window);
+
+        let state = captured.borrow().clone().expect("scrollbar was rendered");
+        assert!(
+            !cx.read(|cx| state.read(cx).0.read(cx).nested_in_scroll_container),
+            "the wrapper div does not scroll the list's handle, so the scrollbar \
+             is laid out outside the scrolled coordinate space"
+        );
+
+        let viewport = handle.viewport();
+        for offset in [px(0.), px(-200.), px(-600.)] {
+            handle.set_offset(point(px(0.), offset));
+            draw(cx, window);
+            let (track, thumb) = vertical_thumb(cx, &state);
+            assert_eq!(track.origin.y, viewport.origin.y + SCROLLBAR_PADDING);
+            assert!(
+                thumb.origin.y >= viewport.origin.y && thumb.bottom() <= viewport.bottom(),
+                "thumb {thumb:?} escaped the viewport {viewport:?} at offset {offset:?}"
+            );
+        }
     }
 }

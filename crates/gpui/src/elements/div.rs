@@ -1886,6 +1886,17 @@ pub struct Interactivity {
 }
 
 impl Interactivity {
+    /// The scroll handle this element was told to drive via
+    /// [`InteractiveElement::track_scroll`], if any.
+    ///
+    /// Decorations that are attached as children of a scrolling element need
+    /// this to tell whether they are inside the scrolled coordinate space: a
+    /// scroll container translates *all* of its children by the scroll offset,
+    /// including absolutely positioned ones.
+    pub fn tracked_scroll_handle(&self) -> Option<&ScrollHandle> {
+        self.tracked_scroll_handle.as_ref()
+    }
+
     /// Layout this element according to this interactivity state's configured styles
     pub fn request_layout(
         &mut self,
@@ -3680,6 +3691,16 @@ impl Default for ScrollHandle {
         Self::new()
     }
 }
+
+/// Two handles are equal when they are clones of one another, i.e. when they
+/// drive the same scroll state.
+impl PartialEq for ScrollHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ScrollHandle {}
 
 impl ScrollHandle {
     /// Construct a new scroll handle.
