@@ -58,6 +58,7 @@ pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
+mod rollback_modal;
 pub mod repository_selector;
 pub mod shelf;
 pub mod solo_diff_view;

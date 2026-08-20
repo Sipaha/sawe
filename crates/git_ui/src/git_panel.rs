@@ -6,6 +6,7 @@ use crate::handlers::askpass::askpass_delegate;
 use crate::pre_commit;
 use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
+use crate::rollback_modal::RollbackModal;
 use crate::solo_diff_view::{SoloDiffOpen, SoloDiffView};
 use crate::{branch_picker, picker_prompt, render_remote_button};
 use crate::{git_panel_settings::GitPanelSettings, git_status_icon};
@@ -72,7 +73,7 @@ use ui::{
     TintColor, Tooltip, WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
-use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
+use util::{ResultExt, TryFutureExt, maybe, rel_path::RelPath};
 use workspace::SERIALIZATION_THROTTLE_TIME;
 use workspace::{
     Item, Workspace,
@@ -120,6 +121,9 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Opens the selected file itself in an editor tab (IDEA's "Jump to
+        /// Source"), as opposed to `menu::Confirm`, which opens its diff.
+        JumpToSource,
     ]
 );
 
@@ -185,6 +189,90 @@ struct GitMenuState {
     tree_view: bool,
 }
 
+/// The user-visible name of "throw away the local changes to these files".
+/// IDEA calls it Rollback, and the trailing ellipsis is the standard signal
+/// that the entry opens a dialog (`RollbackModal`) rather than acting at once.
+pub(crate) const ROLLBACK_TITLE: &str = "Rollback...";
+
+/// One row of the per-file context menu in the Changes list. The menu is built
+/// as data first so its shape is assertable in a unit test without a window;
+/// `GitPanel::deploy_entry_context_menu` is the only place that turns it into a
+/// real [`ContextMenu`].
+pub(crate) enum EntryMenuItem {
+    Separator,
+    Action {
+        label: &'static str,
+        action: Box<dyn Action>,
+        disabled: bool,
+    },
+}
+
+impl EntryMenuItem {
+    #[cfg(test)]
+    fn label(&self) -> Option<&'static str> {
+        match self {
+            EntryMenuItem::Separator => None,
+            EntryMenuItem::Action { label, .. } => Some(label),
+        }
+    }
+}
+
+/// The per-file context menu of the Changes list, laid out the way IDEA lays
+/// out its Local Changes row menu: staging, rollback, ignore rules, then the
+/// two ways of looking at the file (its diff, its source), then history.
+fn entry_context_menu_items(entry: &GitStatusEntry) -> Vec<EntryMenuItem> {
+    let is_created = entry.status.is_created();
+    let stage_title = if entry.status.staging().is_fully_staged() {
+        "Unstage File"
+    } else {
+        "Stage File"
+    };
+    let mut items = vec![
+        EntryMenuItem::Action {
+            label: stage_title,
+            action: ToggleStaged.boxed_clone(),
+            disabled: false,
+        },
+        EntryMenuItem::Action {
+            label: ROLLBACK_TITLE,
+            action: git::RestoreFile::default().boxed_clone(),
+            disabled: false,
+        },
+        EntryMenuItem::Separator,
+        EntryMenuItem::Action {
+            label: "Add to .gitignore",
+            action: git::AddToGitignore.boxed_clone(),
+            disabled: !is_created,
+        },
+        EntryMenuItem::Action {
+            label: "Add to .git/info/exclude",
+            action: git::AddToGitInfoExclude.boxed_clone(),
+            disabled: !is_created,
+        },
+        EntryMenuItem::Separator,
+        EntryMenuItem::Action {
+            label: "Open Diff",
+            action: menu::Confirm.boxed_clone(),
+            disabled: false,
+        },
+        EntryMenuItem::Action {
+            label: "Jump to Source",
+            action: JumpToSource.boxed_clone(),
+            // A deleted file has no working-tree copy left to open.
+            disabled: entry.status.is_deleted(),
+        },
+    ];
+    if !is_created {
+        items.push(EntryMenuItem::Separator);
+        items.push(EntryMenuItem::Action {
+            label: "View File History",
+            action: Box::new(git::FileHistory),
+            disabled: false,
+        });
+    }
+    items
+}
+
 fn git_panel_context_menu(
     focus_handle: FocusHandle,
     state: GitMenuState,
@@ -217,7 +305,7 @@ fn git_panel_context_menu(
             .separator()
             .action_disabled_when(
                 !state.has_tracked_changes,
-                "Discard Tracked Changes",
+                "Rollback Tracked Changes...",
                 RestoreTrackedFiles.boxed_clone(),
             )
             .action_disabled_when(
@@ -346,14 +434,14 @@ enum GitPanelTab {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
-enum Section {
+pub(crate) enum Section {
     Conflict,
     Tracked,
     New,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-struct GitHeaderEntry {
+pub(crate) struct GitHeaderEntry {
     header: Section,
 }
 
@@ -381,7 +469,7 @@ impl GitHeaderEntry {
 }
 
 /// IDEA-style "3 files" / "1 file" suffix for a section header.
-fn file_count_label(count: usize) -> String {
+pub(crate) fn file_count_label(count: usize) -> String {
     if count == 1 {
         "1 file".to_string()
     } else {
@@ -390,7 +478,7 @@ fn file_count_label(count: usize) -> String {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-enum GitListEntry {
+pub(crate) enum GitListEntry {
     Status(GitStatusEntry),
     TreeStatus(GitTreeStatusEntry),
     Directory(GitTreeDirEntry),
@@ -398,7 +486,7 @@ enum GitListEntry {
 }
 
 impl GitListEntry {
-    fn status_entry(&self) -> Option<&GitStatusEntry> {
+    pub(crate) fn status_entry(&self) -> Option<&GitStatusEntry> {
         match self {
             GitListEntry::Status(entry) => Some(entry),
             GitListEntry::TreeStatus(entry) => Some(&entry.entry),
@@ -407,7 +495,7 @@ impl GitListEntry {
     }
 
     /// Returns the tree indentation depth for this entry.
-    fn depth(&self) -> usize {
+    pub(crate) fn depth(&self) -> usize {
         match self {
             GitListEntry::Directory(dir) => dir.depth,
             GitListEntry::TreeStatus(status) => status.depth,
@@ -446,13 +534,13 @@ impl GitPanelViewMode {
 }
 
 #[derive(Default)]
-struct TreeViewState {
-    expanded_dirs: HashMap<TreeKey, bool>,
-    directory_descendants: HashMap<TreeKey, Vec<GitStatusEntry>>,
+pub(crate) struct TreeViewState {
+    pub(crate) expanded_dirs: HashMap<TreeKey, bool>,
+    pub(crate) directory_descendants: HashMap<TreeKey, Vec<GitStatusEntry>>,
 }
 
 impl TreeViewState {
-    fn build_tree_entries(
+    pub(crate) fn build_tree_entries(
         &mut self,
         section: Section,
         mut entries: Vec<GitStatusEntry>,
@@ -580,24 +668,24 @@ impl TreeViewState {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-struct GitTreeStatusEntry {
-    entry: GitStatusEntry,
-    depth: usize,
+pub(crate) struct GitTreeStatusEntry {
+    pub(crate) entry: GitStatusEntry,
+    pub(crate) depth: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-struct TreeKey {
-    section: Section,
-    path: RepoPath,
+pub(crate) struct TreeKey {
+    pub(crate) section: Section,
+    pub(crate) path: RepoPath,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-struct GitTreeDirEntry {
-    key: TreeKey,
-    name: SharedString,
-    depth: usize,
+pub(crate) struct GitTreeDirEntry {
+    pub(crate) key: TreeKey,
+    pub(crate) name: SharedString,
+    pub(crate) depth: usize,
     // staged_state: ToggleState,
-    expanded: bool,
+    pub(crate) expanded: bool,
 }
 
 #[derive(Default)]
@@ -1425,48 +1513,143 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path_style = self.project.read(cx).path_style(cx);
         maybe!({
             let list_entry = self.entries.get(self.selected_entry?)?.clone();
             let entry = list_entry.status_entry()?.to_owned();
-            let skip_prompt = action.skip_prompt || entry.status.is_created();
 
-            let prompt = if skip_prompt {
-                Task::ready(Ok(0))
-            } else {
-                let prompt = window.prompt(
-                    PromptLevel::Warning,
-                    &format!(
-                        "Are you sure you want to discard changes to {}?",
-                        MarkdownInlineCode(
-                            entry
-                                .repo_path
-                                .file_name()
-                                .unwrap_or(entry.repo_path.display(path_style).as_ref())
-                        ),
-                    ),
-                    None,
-                    &["Discard Changes", "Cancel"],
-                    cx,
-                );
-                cx.background_spawn(prompt)
-            };
+            // `skip_prompt` is the "I already know what I'm doing" path used by
+            // callers that have confirmed elsewhere; everything else goes
+            // through the Rollback Changes modal, which *is* the confirmation.
+            if action.skip_prompt {
+                self.revert_entry(&entry, window, cx);
+                return Some(());
+            }
 
-            let this = cx.weak_entity();
-            window
-                .spawn(cx, async move |cx| {
-                    if prompt.await? != 0 {
-                        return anyhow::Ok(());
-                    }
-
-                    this.update_in(cx, |this, window, cx| {
-                        this.revert_entry(&entry, window, cx);
-                    })?;
-
-                    Ok(())
-                })
-                .detach();
+            self.open_rollback_modal(vec![entry], window, cx);
             Some(())
+        });
+    }
+
+    /// Put IDEA's Rollback Changes dialog up for `entries`. The modal owns the
+    /// confirmation, the per-file selection and the "delete local copies of
+    /// added files" choice, and calls back into [`Self::perform_rollback`].
+    pub(crate) fn open_rollback_modal(
+        &mut self,
+        entries: Vec<GitStatusEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let repository_name = self
+            .active_repository
+            .as_ref()
+            .map(|repo| repo.read(cx).display_name())
+            .unwrap_or_else(|| SharedString::from("Repository"));
+        let panel = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    RollbackModal::new(panel, repository_name, entries, window, cx)
+                });
+            })
+            .log_err();
+    }
+
+    /// Roll back exactly `entries` — the set the [`RollbackModal`] had checked.
+    /// Each case maps to a specific git operation:
+    ///
+    /// * **tracked file** (modified / deleted): `git reset -- <path>` first if
+    ///   anything about it is staged, then `git checkout HEAD -- <path>`.
+    /// * **added file, `delete_added_local_copies == false`**: `git reset --
+    ///   <path>` and nothing else, leaving the file on disk as untracked. Git
+    ///   has no previous version of an added file to restore, so "roll back but
+    ///   keep my file" can only mean un-adding it. An already-untracked file
+    ///   has nothing staged and is therefore left completely alone.
+    /// * **added file, `delete_added_local_copies == true`**: the same `git
+    ///   reset -- <path>`, plus a move of the working-tree copy to the trash
+    ///   (the `git clean -f` equivalent, made recoverable).
+    pub(crate) fn perform_rollback(
+        &mut self,
+        entries: Vec<GitStatusEntry>,
+        delete_added_local_copies: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (created, tracked): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| entry.status.is_created());
+
+        if !tracked.is_empty() {
+            let staged = tracked
+                .iter()
+                .filter(|entry| entry.status.staging().has_staged())
+                .cloned()
+                .collect::<Vec<_>>();
+            if !staged.is_empty() {
+                self.change_file_stage(false, staged, cx);
+            }
+            self.perform_checkout(tracked, window, cx);
+        }
+
+        if created.is_empty() {
+            return;
+        }
+
+        if delete_added_local_copies {
+            self.trash_created_entries(created, window, cx);
+        } else {
+            let staged = created
+                .into_iter()
+                .filter(|entry| !entry.status.staging().is_fully_unstaged())
+                .collect::<Vec<_>>();
+            if !staged.is_empty() {
+                self.change_file_stage(false, staged, cx);
+            }
+        }
+    }
+
+    /// Drop `to_delete` from the index and move the working-tree copies to the
+    /// trash. Every entry here must be a created/untracked file: git has no
+    /// committed version of one, so removing the local copy is the only thing a
+    /// rollback *can* do to it.
+    fn trash_created_entries(
+        &mut self,
+        to_delete: Vec<GitStatusEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        let Some(active_repo) = self.active_repository.clone() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let tasks = workspace.update(cx, |workspace, cx| {
+                to_delete
+                    .iter()
+                    .filter_map(|entry| {
+                        workspace.project().update(cx, |project, cx| {
+                            let project_path = active_repo
+                                .read(cx)
+                                .repo_path_to_project_path(&entry.repo_path, cx)?;
+                            project.delete_file(project_path, true, cx)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })?;
+            let to_unstage = to_delete
+                .into_iter()
+                .filter(|entry| !entry.status.staging().is_fully_unstaged())
+                .collect();
+            this.update(cx, |this, cx| this.change_file_stage(false, to_unstage, cx))?;
+            for task in tasks {
+                task.await?;
+            }
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to trash files", window, cx, |e, _, _| {
+            Some(format!("{e}"))
         });
     }
 
@@ -1681,49 +1864,13 @@ impl GitPanel {
             .filter(|status_entry| !status_entry.status.is_created())
             .collect::<Vec<_>>();
 
-        match entries.len() {
-            0 => return,
-            1 => return self.revert_entry(&entries[0], window, cx),
-            _ => {}
-        }
-        let mut details = entries
-            .iter()
-            .filter_map(|entry| entry.repo_path.as_ref().file_name())
-            .map(|filename| filename.to_string())
-            .take(5)
-            .join("\n");
-        if entries.len() > 5 {
-            details.push_str(&format!("\nand {} more…", entries.len() - 5))
-        }
-
-        #[derive(strum::EnumIter, strum::VariantNames)]
-        #[strum(serialize_all = "title_case")]
-        enum RestoreCancel {
-            RestoreTrackedFiles,
-            Cancel,
-        }
-        let prompt = prompt(
-            "Discard changes to these files?",
-            Some(&details),
-            window,
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(RestoreCancel::RestoreTrackedFiles) = prompt.await {
-                this.update_in(cx, |this, window, cx| {
-                    this.perform_checkout(entries, window, cx);
-                })
-                .ok();
-            }
-        })
-        .detach();
+        // Same dialog as the per-file rollback: the modal is the confirmation,
+        // and it lets the user drop files out of the set before committing to
+        // it.
+        self.open_rollback_modal(entries, window, cx);
     }
 
     fn clean_all(&mut self, _: &TrashUntrackedFiles, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = self.workspace.clone();
-        let Some(active_repo) = self.active_repository.clone() else {
-            return;
-        };
         let to_delete = self
             .entries
             .iter()
@@ -1761,28 +1908,9 @@ impl GitPanel {
                 TrashCancel::Trash => {}
                 TrashCancel::Cancel => return Ok(()),
             }
-            let tasks = workspace.update(cx, |workspace, cx| {
-                to_delete
-                    .iter()
-                    .filter_map(|entry| {
-                        workspace.project().update(cx, |project, cx| {
-                            let project_path = active_repo
-                                .read(cx)
-                                .repo_path_to_project_path(&entry.repo_path, cx)?;
-                            project.delete_file(project_path, true, cx)
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })?;
-            let to_unstage = to_delete
-                .into_iter()
-                .filter(|entry| !entry.status.staging().is_fully_unstaged())
-                .collect();
-            this.update(cx, |this, cx| this.change_file_stage(false, to_unstage, cx))?;
-            for task in tasks {
-                task.await?;
-            }
-            Ok(())
+            this.update_in(cx, |this, window, cx| {
+                this.trash_created_entries(to_delete, window, cx)
+            })
         })
         .detach_and_prompt_err("Failed to trash files", window, cx, |e, _, _| {
             Some(format!("{e}"))
@@ -6006,47 +6134,59 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(entry) = self.entries.get(ix).and_then(|e| e.status_entry()) else {
+        let Some(entry) = self.entries.get(ix).and_then(|e| e.status_entry()).cloned() else {
             return;
         };
-        let stage_title = if entry.status.staging().is_fully_staged() {
-            "Unstage File"
-        } else {
-            "Stage File"
-        };
-        let restore_title = if entry.status.is_created() {
-            "Trash File"
-        } else {
-            "Discard Changes"
-        };
-        let context_menu = ContextMenu::build(window, cx, |context_menu, _, _| {
-            let is_created = entry.status.is_created();
+        let items = entry_context_menu_items(&entry);
+        let focus_handle = self.focus_handle.clone();
+        let context_menu = ContextMenu::build(window, cx, move |context_menu, _, _| {
+            let mut context_menu = context_menu.context(focus_handle);
+            for item in items {
+                context_menu = match item {
+                    EntryMenuItem::Separator => context_menu.separator(),
+                    EntryMenuItem::Action {
+                        label,
+                        action,
+                        disabled,
+                    } => context_menu.action_disabled_when(disabled, label, action),
+                };
+            }
             context_menu
-                .context(self.focus_handle.clone())
-                .action(stage_title, ToggleStaged.boxed_clone())
-                .action(restore_title, git::RestoreFile::default().boxed_clone())
-                .separator()
-                .action_disabled_when(
-                    !is_created,
-                    "Add to .gitignore",
-                    git::AddToGitignore.boxed_clone(),
-                )
-                .action_disabled_when(
-                    !is_created,
-                    "Add to .git/info/exclude",
-                    git::AddToGitInfoExclude.boxed_clone(),
-                )
-                .separator()
-                .action("Open Diff", menu::Confirm.boxed_clone())
-                .action("Open All Changes", menu::SecondaryConfirm.boxed_clone())
-                .when(!is_created, |context_menu| {
-                    context_menu
-                        .separator()
-                        .action("View File History", Box::new(git::FileHistory))
-                })
         });
         self.selected_entry = Some(ix);
         self.set_context_menu(context_menu, position, window, cx);
+    }
+
+    /// IDEA's "Jump to Source": open the selected entry's file in an ordinary
+    /// editor tab. `Open Diff` (`menu::Confirm`) covers the diff; this is the
+    /// working-tree file itself, opened through the same `Workspace::open_path`
+    /// the rest of the fork uses.
+    fn jump_to_source(&mut self, _: &JumpToSource, window: &mut Window, cx: &mut Context<Self>) {
+        maybe!({
+            let entry = self
+                .entries
+                .get(self.selected_entry?)?
+                .status_entry()?
+                .clone();
+            // A deleted file has no working-tree copy to open; the menu row is
+            // disabled for it, but the action is dispatchable on its own.
+            if entry.status.is_deleted() {
+                return Some(());
+            }
+            let project_path = self
+                .active_repository
+                .as_ref()?
+                .read(cx)
+                .repo_path_to_project_path(&entry.repo_path, cx)?;
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace
+                        .open_path(project_path, None, true, window, cx)
+                        .detach_and_log_err(cx);
+                })
+                .ok()?;
+            Some(())
+        });
     }
 
     fn deploy_panel_context_menu(
@@ -6422,6 +6562,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(Self::open_diff))
             .on_action(cx.listener(Self::open_accordion_diff))
+            .on_action(cx.listener(Self::jump_to_source))
             .on_action(cx.listener(Self::focus_changes_list))
             .on_action(cx.listener(Self::focus_editor))
             .on_action(cx.listener(Self::expand_commit_editor))
@@ -7333,8 +7474,96 @@ mod tests {
         );
     }
 
+    /// The per-file context menu is IDEA-shaped: `Rollback...` instead of
+    /// `Discard Changes` / `Trash File`, `Jump to Source` next to `Open Diff`,
+    /// and no `Open All Changes` row (the action and its `alt-enter` binding
+    /// stay — only the menu row is gone).
+    #[test]
+    fn test_entry_context_menu_shape() {
+        let modified = GitStatusEntry {
+            repo_path: repo_path("src/main.rs"),
+            status: StatusCode::Modified.worktree(),
+            staging: StageStatus::Unstaged,
+            diff_stat: None,
+        };
+        let labels = entry_context_menu_items(&modified)
+            .iter()
+            .filter_map(EntryMenuItem::label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                "Stage File",
+                ROLLBACK_TITLE,
+                "Add to .gitignore",
+                "Add to .git/info/exclude",
+                "Open Diff",
+                "Jump to Source",
+                "View File History",
+            ]
+        );
+        assert!(!labels.contains(&"Open All Changes"));
+        assert!(!labels.contains(&"Discard Changes"));
+        assert!(!labels.contains(&"Trash File"));
+    }
+
+    /// A created file used to get its own `Trash File` wording; it is a
+    /// rollback like any other now, because the modal's "delete local copies of
+    /// added files" checkbox is what decides whether the file survives.
+    #[test]
+    fn test_entry_context_menu_uses_rollback_for_created_files() {
+        let created = GitStatusEntry {
+            repo_path: repo_path("src/new.rs"),
+            status: FileStatus::Untracked,
+            staging: StageStatus::Unstaged,
+            diff_stat: None,
+        };
+        let items = entry_context_menu_items(&created);
+        let labels = items
+            .iter()
+            .filter_map(EntryMenuItem::label)
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&ROLLBACK_TITLE));
+        assert!(!labels.contains(&"Trash File"));
+        // Nothing committed, so there is no history to view.
+        assert!(!labels.contains(&"View File History"));
+        // Ignore rules only make sense for a file git isn't tracking yet.
+        for item in &items {
+            if let EntryMenuItem::Action {
+                label, disabled, ..
+            } = item
+                && *label == "Add to .gitignore"
+            {
+                assert!(!disabled);
+            }
+        }
+    }
+
+    /// A deleted file has no working-tree copy left, so `Jump to Source` is
+    /// offered but disabled rather than silently doing nothing.
+    #[test]
+    fn test_jump_to_source_disabled_for_deleted_file() {
+        let deleted = GitStatusEntry {
+            repo_path: repo_path("src/gone.rs"),
+            status: StatusCode::Deleted.worktree(),
+            staging: StageStatus::Unstaged,
+            diff_stat: None,
+        };
+        let disabled = entry_context_menu_items(&deleted)
+            .iter()
+            .find_map(|item| match item {
+                EntryMenuItem::Action {
+                    label, disabled, ..
+                } if *label == "Jump to Source" => Some(*disabled),
+                _ => None,
+            });
+        assert_eq!(disabled, Some(true));
+    }
+
     #[gpui::test]
-    async fn test_discard_prompt_escapes_markdown_in_file_name(cx: &mut TestAppContext) {
+    async fn test_rollback_opens_the_rollback_modal(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree(
@@ -7388,15 +7617,29 @@ mod tests {
             panel.selected_entry = Some(1);
             panel.revert_selected(&git::RestoreFile::default(), window, cx);
         });
+        cx.run_until_parked();
 
-        let (message, _detail) = cx
-            .pending_prompt()
-            .expect("discard should show a confirmation prompt");
-
-        assert_eq!(
-            message,
-            "Are you sure you want to discard changes to `__somefile__`?"
+        assert!(
+            cx.pending_prompt().is_none(),
+            "the modal is the confirmation — the old two-button prompt must not \
+             also appear"
         );
+
+        let modal = workspace
+            .update(cx, |workspace, cx| {
+                workspace.active_modal::<crate::rollback_modal::RollbackModal>(cx)
+            })
+            .expect("rollback should open the Rollback Changes modal");
+
+        modal.read_with(cx, |modal, _| {
+            let checked = modal
+                .tree()
+                .checked_entries()
+                .iter()
+                .map(|entry| entry.repo_path.as_unix_str().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(checked, vec!["__somefile__".to_string()]);
+        });
     }
 
     #[gpui::test]
@@ -8061,7 +8304,7 @@ mod tests {
             );
         });
 
-        // `Open All Changes` (menu::SecondaryConfirm) opens the stacked accordion
+        // `menu::SecondaryConfirm` (alt-enter) opens the stacked accordion
         // (`ProjectDiff`), scrolled to the selected file.
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_entry = Some(1);
