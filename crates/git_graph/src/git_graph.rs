@@ -148,7 +148,7 @@ use gpui::{
     MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy, SharedString,
     StyleRefinement, Subscription, Task, TextStyleRefinement, UnderlineStyle,
     UniformListScrollHandle, WeakEntity,
-    Window, actions, anchored, deferred, point, prelude::*, px, relative, uniform_list,
+    Window, actions, anchored, deferred, point, prelude::*, px, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
@@ -176,7 +176,7 @@ use std::{
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
-    ButtonLike, Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
+    ButtonLike, Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat,
     HeaderResizeInfo, RedistributableColumnsState, Table, TableInteractionState,
     TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
     prelude::*, render_redistributable_columns_resize_handles, render_table_header,
@@ -288,6 +288,7 @@ impl ChangedFileEntry {
         repository: WeakEntity<Repository>,
         workspace: WeakEntity<Workspace>,
         graph: WeakEntity<GitGraph>,
+        is_selected: bool,
         cx: &App,
     ) -> AnyElement {
         let file_name = self.file_name.clone();
@@ -298,6 +299,8 @@ impl ChangedFileEntry {
         // constant is the header's leading chevron (14px) plus its gap (4px),
         // which the file row has no equivalent of.
         let indent = px(18.0 + ProjectPanelSettings::get_global(cx).indent_size);
+
+        let graph_for_click = graph.clone();
 
         div()
             .w_full()
@@ -320,6 +323,7 @@ impl ChangedFileEntry {
             })
             .child(
                 ButtonLike::new(("changed-file", ix))
+                    .toggle_state(is_selected)
                     .child(
                         h_flex()
                             .min_w_0()
@@ -331,12 +335,33 @@ impl ChangedFileEntry {
                     )
                     .tooltip({
                         let meta = full_path;
-                        move |_, cx| Tooltip::with_meta("View Changes", None, meta.clone(), cx)
+                        move |_, cx| {
+                            Tooltip::with_meta("Open Diff", None, meta.clone(), cx)
+                        }
                     })
+                    // Single click only selects; the diff opens on double
+                    // click, so walking the file list with the mouse does not
+                    // spray tabs across the pane.
                     .on_click({
                         let entry = self.clone();
-                        move |_, window, cx| {
-                            entry.open_file_diff(&commit_sha, &repository, &workspace, window, cx);
+                        let graph = graph_for_click;
+                        move |event: &ClickEvent, window, cx| {
+                            let repo_path = entry.repo_path.clone();
+                            graph
+                                .update(cx, |graph, cx| {
+                                    graph.selected_changed_file = Some(repo_path);
+                                    cx.notify();
+                                })
+                                .ok();
+                            if event.click_count() >= 2 {
+                                entry.open_file_diff(
+                                    &commit_sha,
+                                    &repository,
+                                    &workspace,
+                                    window,
+                                    cx,
+                                );
+                            }
                         }
                     }),
             )
@@ -652,37 +677,56 @@ impl SplitState {
     }
 }
 
-/// Vertical split between the changed-files tree and the commit message inside
-/// the commit detail panel. `None` means "never dragged": the message region
-/// then sizes to its content (capped at half the panel) so a one-line commit
-/// leaves the tree the rest of the space, which is what the panel does before
-/// the user expresses a preference.
+/// Height of the commit-message region inside the detail panel, in pixels; the
+/// changed-files tree above it takes whatever is left.
+///
+/// Pixels, and a definite height rather than a `max_h` over content, for two
+/// reasons that only show up with a long message. A percentage has to resolve
+/// against a container whose own height is definite, and inside this flex chain
+/// it is not — the cap silently evaporates. And an unbounded content height
+/// makes the sibling `uniform_list` measure itself against a container that
+/// overflows its parent, after which it renders no rows at all. A definite
+/// height sizes both regions in one pass and neither can surprise the other.
 pub struct DetailSplitState {
-    top_ratio: Option<f32>,
-    visible_top_ratio: Option<f32>,
+    message_height: Pixels,
+    visible_message_height: Pixels,
 }
+
+/// Smallest either region may be dragged to: enough for a header and a couple
+/// of rows, so neither the file list nor the message can be dragged away.
+const MIN_DETAIL_REGION_HEIGHT: Pixels = px(96.);
+
+/// Message height before the user expresses a preference: roughly a subject,
+/// its ref chips and the author line. Longer messages scroll inside it.
+const DEFAULT_MESSAGE_HEIGHT: Pixels = px(180.);
 
 impl DetailSplitState {
     pub fn new() -> Self {
         Self {
-            top_ratio: None,
-            visible_top_ratio: None,
+            message_height: DEFAULT_MESSAGE_HEIGHT,
+            visible_message_height: DEFAULT_MESSAGE_HEIGHT,
         }
     }
 
-    pub fn ratio(&self) -> Option<f32> {
-        self.visible_top_ratio
+    /// The live height, which during a drag is the in-flight one — the
+    /// committed value only matters once the drag ends.
+    #[allow(clippy::misnamed_getters)]
+    pub fn message_height(&self) -> Pixels {
+        self.visible_message_height
     }
 
-    /// Cursor position within the split container, as a clamped top-pane
-    /// fraction. `None` for a degenerate container, where there is no ratio to
-    /// speak of and the drag must be ignored rather than divide by zero.
-    fn ratio_at(position_y: Pixels, bounds: Bounds<Pixels>) -> Option<f32> {
+    /// Cursor position within the split container as a message height, clamped
+    /// so neither region can be dragged away entirely. `None` for a container
+    /// too short to divide at all.
+    fn height_at(position_y: Pixels, bounds: Bounds<Pixels>) -> Option<Pixels> {
         let height = bounds.bottom() - bounds.top();
-        if height <= px(0.) {
+        if height <= MIN_DETAIL_REGION_HEIGHT * 2.0 {
             return None;
         }
-        Some(((position_y - bounds.top()) / height).clamp(0.1, 0.9))
+        Some(
+            (bounds.bottom() - position_y)
+                .clamp(MIN_DETAIL_REGION_HEIGHT, height - MIN_DETAIL_REGION_HEIGHT),
+        )
     }
 
     fn on_drag_move(
@@ -691,18 +735,18 @@ impl DetailSplitState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        if let Some(ratio) = Self::ratio_at(drag_event.event.position.y, drag_event.bounds) {
-            self.visible_top_ratio = Some(ratio);
+        if let Some(height) = Self::height_at(drag_event.event.position.y, drag_event.bounds) {
+            self.visible_message_height = height;
         }
     }
 
     fn commit_ratio(&mut self) {
-        self.top_ratio = self.visible_top_ratio;
+        self.message_height = self.visible_message_height;
     }
 
     fn on_double_click(&mut self) {
-        self.top_ratio = None;
-        self.visible_top_ratio = None;
+        self.message_height = DEFAULT_MESSAGE_HEIGHT;
+        self.visible_message_height = DEFAULT_MESSAGE_HEIGHT;
     }
 }
 
@@ -1494,8 +1538,7 @@ fn detail_text_style(
     let mut base_text_style = window.text_style();
     base_text_style.refine(&refinement);
 
-    let mut container_style = StyleRefinement::default();
-    container_style.text = refinement;
+    let container_style = StyleRefinement::default();
 
     MarkdownStyle {
         base_text_style,
@@ -1580,6 +1623,10 @@ pub struct GitGraph {
     /// same reason [`SelectedCommitDiff`] is.
     selected_commit_branches: Option<CommitBranches>,
     commit_detail_text: Option<CommitDetailText>,
+    /// Row highlighted in the selected commit's changed-files tree. Keyed by
+    /// path rather than by row index: collapsing a directory rebuilds the row
+    /// list, and an index would then point at whatever moved into that slot.
+    selected_changed_file: Option<RepoPath>,
     _commit_diff_task: Option<Task<()>>,
     _commit_branches_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
@@ -1613,6 +1660,7 @@ impl GitGraph {
         self.selected_commit_diff = None;
         self.selected_commit_branches = None;
         self.commit_detail_text = None;
+        self.selected_changed_file = None;
         self._commit_diff_task = None;
         self._commit_branches_task = None;
         self.collapsed_changed_dirs.clear();
@@ -2080,6 +2128,7 @@ impl GitGraph {
             selected_commit_diff: None,
             selected_commit_branches: None,
             commit_detail_text: None,
+            selected_changed_file: None,
             _commit_branches_task: None,
             log_source,
             log_order,
@@ -2665,6 +2714,7 @@ impl GitGraph {
         self.selected_entry_idx = None;
         self.selected_commit_diff = None;
         self.commit_detail_text = None;
+        self.selected_changed_file = None;
         self._commit_diff_task = None;
     }
 
@@ -2758,6 +2808,7 @@ impl GitGraph {
         self.selected_entry_idx = Some(idx);
         self.selected_commit_diff = None;
         self.selected_commit_branches = None;
+        self.selected_changed_file = None;
         self._commit_diff_task = None;
         self._commit_branches_task = None;
         self.collapsed_changed_dirs.clear();
@@ -3534,7 +3585,7 @@ impl GitGraph {
         let body_style = detail_text_style(TextSize::Default, Color::Default, None, window, cx);
         let identity_style = detail_text_style(TextSize::Small, Color::Muted, None, window, cx);
         let has_body = !detail_text.body.read(cx).source().is_empty();
-        let detail_split_ratio = self.commit_detail_split_state.read(cx).ratio();
+        let message_height = self.commit_detail_split_state.read(cx).message_height();
 
         v_flex()
             .min_w(px(300.))
@@ -3551,253 +3602,203 @@ impl GitGraph {
                 }),
             )
             // Changed-files tree and commit message, split by a draggable
-            // handle. The drag ratio is measured against this container, so
-            // it must not include the action row below.
+            // handle. Both regions are sized in pixels and flex factors, never
+            // in percentages: a percentage has to resolve against a definite
+            // container height, and inside this flex chain it does not, so the
+            // constraint silently evaporated and a long commit message pushed
+            // the file tree and itself out of the panel entirely.
+            .on_drag_move::<DraggedDetailSplitHandle>(cx.listener(
+                |this, event, window, cx| {
+                    this.commit_detail_split_state.update(cx, |state, cx| {
+                        state.on_drag_move(event, window, cx);
+                    });
+                },
+            ))
+            .on_drop::<DraggedDetailSplitHandle>(cx.listener(
+                |this, _event, _window, cx| {
+                    this.commit_detail_split_state.update(cx, |state, _cx| {
+                        state.commit_ratio();
+                    });
+                },
+            ))
+            // Changed-files tree, headed by the file count and the diff stat.
             .child(
                 v_flex()
-                    .id("commit-detail-split")
-                    .flex_1()
+                    .relative()
+                    .min_w_0()
                     .min_h_0()
-                    .on_drag_move::<DraggedDetailSplitHandle>(cx.listener(
-                        |this, event, window, cx| {
-                            this.commit_detail_split_state.update(cx, |state, cx| {
-                                state.on_drag_move(event, window, cx);
-                            });
-                        },
-                    ))
-                    .on_drop::<DraggedDetailSplitHandle>(cx.listener(
-                        |this, _event, _window, cx| {
-                            this.commit_detail_split_state.update(cx, |state, _cx| {
-                                state.commit_ratio();
-                            });
-                        },
-                    ))
-                // Changed-files tree, headed by the file count and the diff stat.
-                .child(
-                    v_flex()
-                        .relative()
-                        .min_w_0()
-                        .min_h_0()
-                        .map(|this| match detail_split_ratio {
-                            Some(ratio) => this
-                                .flex_grow_0()
-                                .flex_shrink_0()
-                                .flex_basis(relative(ratio)),
-                            None => this.flex_1(),
-                        })
-                        .p_2()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .w_full()
-                                .justify_between()
-                                // Pad on the right so the header does not run under
-                                // the absolutely-positioned close button.
-                                .pr_5()
-                                .child(
-                                    Label::new(format!(
-                                        "{} Changed {}",
-                                        changed_files_count,
-                                        if changed_files_count == 1 {
-                                            "File"
-                                        } else {
-                                            "Files"
-                                        }
-                                    ))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                                )
-                                .child(DiffStat::new(
-                                    "commit-diff-stat",
-                                    total_lines_added,
-                                    total_lines_removed,
-                                )),
-                        )
-                        .child(
-                            div().absolute().top_1().right_1().child(
-                                IconButton::new("close-detail", IconName::Close)
-                                    .icon_size(IconSize::Small)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.clear_selection();
-                                        cx.notify();
-                                    })),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .id("changed-files-container")
-                                .flex_1()
-                                .min_h_0()
-                                .child({
-                                    let rows = file_rows;
-                                    let row_count = rows.len();
-                                    let commit_sha = full_sha.clone();
-                                    let repository = repository.downgrade();
-                                    let workspace = self.workspace.clone();
-                                    let graph = cx.weak_entity();
-                                    uniform_list(
-                                        "changed-files-list",
-                                        row_count,
-                                        move |range, _window, cx| {
-                                            range
-                                                .map(|ix| match &rows[ix] {
-                                                    ChangedFileRow::Directory {
-                                                        key,
-                                                        label,
-                                                        file_count,
-                                                        collapsed,
-                                                    } => render_changed_directory_row(
-                                                        ix,
-                                                        key.clone(),
-                                                        label.clone(),
-                                                        *file_count,
-                                                        *collapsed,
-                                                        graph.clone(),
-                                                    ),
-                                                    ChangedFileRow::File(entry) => entry.render(
-                                                        ix,
-                                                        commit_sha.clone(),
-                                                        repository.clone(),
-                                                        workspace.clone(),
-                                                        graph.clone(),
-                                                        cx,
-                                                    ),
-                                                })
-                                                .collect()
-                                        },
-                                    )
-                                    .size_full()
-                                    .ml_neg_1()
-                                    .track_scroll(&self.changed_files_scroll_handle)
-                                })
-                                .vertical_scrollbar_for(&self.changed_files_scroll_handle, window, cx),
-                        ),
-                )
-                    .child(self.render_commit_detail_resize_handle(cx))
-                // Full commit message. Capped rather than split 50/50 so a one-line
-                // commit leaves the file tree the rest of the panel; longer
-                // messages scroll inside the cap.
-                .child(
-                    div()
-                        .id("commit-message-region")
-                        .min_w_0()
-                        .map(|this| match detail_split_ratio {
-                            Some(ratio) => this
-                                .flex_grow_0()
-                                .flex_shrink_0()
-                                .flex_basis(relative(1.0 - ratio)),
-                            None => this.max_h(relative(0.5)),
-                        })
-                        .overflow_y_scroll()
-                        .track_scroll(&self.commit_message_scroll_handle)
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .px_2()
-                                .py_1p5()
-                                .gap_1p5()
-                                .child(
-                                    div().min_w_0().child(MarkdownElement::new(
-                                        detail_text.subject,
-                                        subject_style,
-                                    )),
-                                )
-                                // Ref decorations pointing *at* this commit, which
-                                // IDEA shows next to the subject.
-                                .children((!ref_names.is_empty()).then(|| {
-                                    h_flex().w_full().gap_1().flex_wrap().children(ref_names.iter().map(
-                                        |name| {
-                                            let is_head =
-                                                Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                            self.render_chip(
-                                                name,
-                                                accent_color,
-                                                is_head,
-                                                Some(work_dir.as_path()),
-                                                false,
-                                            )
-                                        },
-                                    ))
-                                }))
-                                .children(has_body.then(|| {
-                                    div()
-                                        .min_w_0()
-                                        .child(MarkdownElement::new(detail_text.body, body_style))
-                                }))
-                                // `flex_1` on the text, not just `min_w_0`: in a
-                                // ROW flex a child's width comes from its own
-                                // content and `min_w_0` lets it shrink to
-                                // nothing, so after the panel is resized the
-                                // markdown could be handed a one-character
-                                // width and wrap the whole identity line
-                                // vertically. A column flex stretches its
-                                // children, which is why the subject above is
-                                // fine with `min_w_0` alone.
-                                .child(
-                                    h_flex()
-                                        .w_full()
-                                        .gap_1p5()
-                                        .items_start()
-                                        .child(div().flex_shrink_0().pt_0p5().child(avatar))
-                                        .child(
-                                            div().flex_1().min_w_0().child(MarkdownElement::new(
-                                                detail_text.identity,
-                                                identity_style,
-                                            )),
-                                        ),
-                                )
-                                .children(branches_line.map(|line| {
-                                    Label::new(line).size(LabelSize::Small).color(Color::Muted)
-                                })),
-                        )
-                        .vertical_scrollbar_for(&self.commit_message_scroll_handle, window, cx),
-                )
-            )
-            // The action row exists only for the "view on provider" link, so a
-            // repository with no recognised remote must not pay for an empty
-            // strip and a divider under the message.
-            .children(
-                remote
-                    .as_ref()
-                    .map(|_| Divider::horizontal().into_any_element()),
-            )
-            .children(remote.clone().map(|_| {
-                h_flex()
-                    .p_1p5()
+                    // Dragged: a fixed height, and the message takes the rest.
+                    // Not dragged: the tree soaks up whatever the message does
+                    // not need, down to a floor that keeps the file list from
+                    // being squeezed out by a long message.
+                    .flex_1()
+                    .p_2()
                     .gap_1()
-                    .w_full()
-                    .when_some(remote.clone(), |this, remote| {
-                        let provider_name = remote.host.name();
-                        let icon = match provider_name.as_str() {
-                            "GitHub" => IconName::Github,
-                            _ => IconName::Link,
-                        };
-                        let parsed_remote = ParsedGitRemote {
-                            owner: remote.owner.as_ref().into(),
-                            repo: remote.repo.as_ref().into(),
-                        };
-                        let params = BuildCommitPermalinkParams {
-                            sha: full_sha.as_ref(),
-                        };
-                        let url = remote
-                            .host
-                            .build_commit_permalink(&parsed_remote, params)
-                            .to_string();
-
-                        this.child(
-                            IconButton::new("view-on-provider", icon)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .w_full()
+                            .justify_between()
+                            // Pad on the right so the header does not run under
+                            // the absolutely-positioned close button.
+                            .pr_5()
+                            .child(
+                                Label::new(format!(
+                                    "{} Changed {}",
+                                    changed_files_count,
+                                    if changed_files_count == 1 {
+                                        "File"
+                                    } else {
+                                        "Files"
+                                    }
+                                ))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            )
+                            .child(DiffStat::new(
+                                "commit-diff-stat",
+                                total_lines_added,
+                                total_lines_removed,
+                            )),
+                    )
+                    .child(
+                        div().absolute().top_1().right_1().child(
+                            IconButton::new("close-detail", IconName::Close)
                                 .icon_size(IconSize::Small)
-                                .tooltip(move |_, cx| {
-                                    Tooltip::simple(format!("View on {provider_name}"), cx)
-                                })
-                                .on_click(move |_, _, cx| {
-                                    cx.open_url(&url);
-                                }),
-                        )
-                    })
-                    .into_any_element()
-            }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.clear_selection();
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("changed-files-container")
+                            .flex_1()
+                            .min_h_0()
+                            .child({
+                                let rows = file_rows;
+                                let row_count = rows.len();
+                                let commit_sha = full_sha.clone();
+                                let repository = repository.downgrade();
+                                let workspace = self.workspace.clone();
+                                let graph = cx.weak_entity();
+                                let selected_changed_file =
+                                    self.selected_changed_file.clone();
+                                uniform_list(
+                                    "changed-files-list",
+                                    row_count,
+                                    move |range, _window, cx| {
+                                        range
+                                            .map(|ix| match &rows[ix] {
+                                                ChangedFileRow::Directory {
+                                                    key,
+                                                    label,
+                                                    file_count,
+                                                    collapsed,
+                                                } => render_changed_directory_row(
+                                                    ix,
+                                                    key.clone(),
+                                                    label.clone(),
+                                                    *file_count,
+                                                    *collapsed,
+                                                    graph.clone(),
+                                                ),
+                                                ChangedFileRow::File(entry) => entry.render(
+                                                    ix,
+                                                    commit_sha.clone(),
+                                                    repository.clone(),
+                                                    workspace.clone(),
+                                                    graph.clone(),
+                                                    selected_changed_file.as_ref()
+                                                        == Some(&entry.repo_path),
+                                                    cx,
+                                                ),
+                                            })
+                                            .collect()
+                                    },
+                                )
+                                .size_full()
+                                .ml_neg_1()
+                                .track_scroll(&self.changed_files_scroll_handle)
+                            })
+                            .vertical_scrollbar_for(&self.changed_files_scroll_handle, window, cx),
+                    ),
+            )
+                .child(self.render_commit_detail_resize_handle(cx))
+            // Full commit message. Capped rather than split 50/50 so a one-line
+            // commit leaves the file tree the rest of the panel; longer
+            // messages scroll inside the cap.
+            .child(
+                div()
+                    .id("commit-message-region")
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .h(message_height)
+                    .overflow_y_scroll()
+                    .track_scroll(&self.commit_message_scroll_handle)
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .px_2()
+                            .py_1p5()
+                            .gap_1p5()
+                            .child(
+                                div().min_w_0().child(MarkdownElement::new(
+                                    detail_text.subject,
+                                    subject_style,
+                                )),
+                            )
+                            // Ref decorations pointing *at* this commit, which
+                            // IDEA shows next to the subject.
+                            .children((!ref_names.is_empty()).then(|| {
+                                h_flex().w_full().gap_1().flex_wrap().children(ref_names.iter().map(
+                                    |name| {
+                                        let is_head =
+                                            Self::is_head_ref(name.as_ref(), &head_branch_name);
+                                        self.render_chip(
+                                            name,
+                                            accent_color,
+                                            is_head,
+                                            Some(work_dir.as_path()),
+                                            false,
+                                        )
+                                    },
+                                ))
+                            }))
+                            .children(has_body.then(|| {
+                                div()
+                                    .min_w_0()
+                                    .child(MarkdownElement::new(detail_text.body, body_style))
+                            }))
+                            // `flex_1` on the text, not just `min_w_0`: in a
+                            // ROW flex a child's width comes from its own
+                            // content and `min_w_0` lets it shrink to
+                            // nothing, so after the panel is resized the
+                            // markdown could be handed a one-character
+                            // width and wrap the whole identity line
+                            // vertically. A column flex stretches its
+                            // children, which is why the subject above is
+                            // fine with `min_w_0` alone.
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_1p5()
+                                    .items_start()
+                                    .child(div().flex_shrink_0().pt_0p5().child(avatar))
+                                    .child(
+                                        div().flex_1().min_w_0().child(MarkdownElement::new(
+                                            detail_text.identity,
+                                            identity_style,
+                                        )),
+                                    ),
+                            )
+                            .children(branches_line.map(|line| {
+                                Label::new(line).size(LabelSize::Small).color(Color::Muted)
+                            })),
+                    )
+                    .vertical_scrollbar_for(&self.commit_message_scroll_handle, window, cx),
+            )
             .into_any_element()
     }
 
@@ -8029,44 +8030,52 @@ mod tests {
         });
     }
 
-    /// The commit detail panel's tree/message split is content-driven until the
-    /// user drags it, and a double-click puts it back — a fixed default ratio
-    /// would waste half the panel on a one-line commit message.
+    /// The detail panel's message region has a definite pixel height, and the
+    /// drag measures from the container's BOTTOM edge — a percentage of a
+    /// container whose height is not yet definite silently resolves to no
+    /// constraint at all, which used to push the whole panel out of view.
     #[test]
-    fn test_detail_split_state_defaults_to_content_driven() {
+    fn test_detail_split_state_is_sized_in_pixels() {
         let bounds = Bounds {
             origin: gpui::point(px(0.), px(100.)),
-            size: gpui::size(px(300.), px(200.)),
+            size: gpui::size(px(300.), px(400.)),
         };
 
         let mut state = DetailSplitState::new();
-        assert_eq!(state.ratio(), None);
+        assert_eq!(state.message_height(), DEFAULT_MESSAGE_HEIGHT);
 
-        // Half-way down a container that starts at y=100 is 0.5, not 0.75 —
-        // the drag is measured from the container's top, not the window's.
-        assert_eq!(DetailSplitState::ratio_at(px(200.), bounds), Some(0.5));
-        // Past either end the panes still keep a usable sliver.
-        assert_eq!(DetailSplitState::ratio_at(px(0.), bounds), Some(0.1));
-        assert_eq!(DetailSplitState::ratio_at(px(9999.), bounds), Some(0.9));
+        // Half-way down a container spanning y 100..500 leaves 200px below the
+        // cursor, and that is the message's height — not the tree's.
+        assert_eq!(DetailSplitState::height_at(px(300.), bounds), Some(px(200.)));
+        // Past either end both regions keep a usable sliver.
         assert_eq!(
-            DetailSplitState::ratio_at(
-                px(200.),
+            DetailSplitState::height_at(px(0.), bounds),
+            Some(px(400.) - MIN_DETAIL_REGION_HEIGHT)
+        );
+        assert_eq!(
+            DetailSplitState::height_at(px(9999.), bounds),
+            Some(MIN_DETAIL_REGION_HEIGHT)
+        );
+        // A container too short to hold both regions is not divisible.
+        assert_eq!(
+            DetailSplitState::height_at(
+                px(120.),
                 Bounds {
                     origin: gpui::point(px(0.), px(100.)),
-                    size: gpui::size(px(300.), px(0.)),
+                    size: gpui::size(px(300.), MIN_DETAIL_REGION_HEIGHT),
                 }
             ),
             None
         );
 
-        state.visible_top_ratio = DetailSplitState::ratio_at(px(200.), bounds);
+        state.visible_message_height = px(200.);
         state.commit_ratio();
-        assert_eq!(state.ratio(), Some(0.5));
-        assert_eq!(state.top_ratio, Some(0.5));
+        assert_eq!(state.message_height(), px(200.));
+        assert_eq!(state.message_height, px(200.));
 
         state.on_double_click();
-        assert_eq!(state.ratio(), None);
-        assert_eq!(state.top_ratio, None);
+        assert_eq!(state.message_height(), DEFAULT_MESSAGE_HEIGHT);
+        assert_eq!(state.message_height, DEFAULT_MESSAGE_HEIGHT);
     }
 
     /// The sidebar's selectable text is backed by cached `Markdown` entities:
