@@ -118,6 +118,9 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/zed/Cargo.toml` `[[bin]]` | Binary name overridden to `sawe` (cargo crate `zed` unchanged). | rebrand |
 | `.cargo/config.toml` | `[target.x86_64-unknown-linux-gnu]` block forcing `-fuse-ld=mold`. See decision 15. | build |
 | `crates/terminal_view/src/terminal_panel.rs` | Dropped the now-unused `TerminalDockPosition` import (a local edit had removed its only use, leaving a dead import that failed `clippy -D warnings`). | upstream-fix |
+| `crates/ui/src/components/scrollbar.rs`, `crates/gpui/src/elements/div.rs` | **(decision #82)** `track_anchor` / `tracks_scroll_handle` + `nested_in_scroll_container`; gpui gains `Interactivity::tracked_scroll_handle()` and `PartialEq` for `ScrollHandle`. | `ui` / `gpui` |
+| `crates/git_ui/src/rollback_modal.rs` | **New.** IDEA's Rollback Changes dialog: checkbox tree over the affected files (reusing the git panel's `TreeViewState::build_tree_entries`), "N modified" summary, "Delete local copies of added files", Rollback / Close. Only checked files are rolled back. | `git_ui` |
+| `crates/workspace/src/mcp/windows.rs` | `windows.click_at` gained a `clicks` parameter — two separate calls are not a double click, so a handler branching on `click_count()` was untestable. | `workspace` |
 | `crates/editor/src/split_connectors.rs` | Connector ribbons for the side-by-side diff. **(decision #62)** `ribbon_edges` gives a collapsed insertion edge the insertion rule's real 2px extent so the ribbon and the rule join flush. | `editor` |
 | `crates/editor/src/split.rs` | **(decision #79)** The left pane mirrors the right pane's `show_headers()` instead of guessing from `is_singleton()`. | `editor` |
 | `crates/git_ui/src/solo_diff_view.rs`, `crates/git_ui/src/project_diff.rs`, `crates/git_ui/src/commit_view.rs` | **(decision #78)** Diff toolbars lost every staging/commit button and gained the `N difference(s)` count (`difference_count_label` + `HunkCountCache`). | `git_ui` |
@@ -1034,6 +1037,20 @@ How to apply: the left pane mirrors `rhs.show_headers()`. That subsumes the sing
 Why: the breakpoint dot was centred in `line_number_area()`, which put it in the middle of the gutter with the right half empty — the numbers themselves are right-aligned on that area's end. JetBrains puts it against the code.
 
 How to apply: `GutterDimensions::indicator_code_edge()` is the rightmost x an indicator may end at without entering a column that paints something of its own (`fold_area_start()` upright, `content_area_start()` mirrored), and `GutterIndicatorColumn::CodeEdge` right-aligns on it. Hover arming must be widened to the same span or pointing at the dot arms nothing. Note the mirrored (right split pane) branch is unit-tested only: split panes turn breakpoints off. Related: in a mirrored gutter the git hunk strip is inset by one deletion-marker reach (`hunk_strip_inset`) so the strip and the wider deletion pill clear the line-number column — anything else deriving an x from `git_gutter_width` must go through `git_column_width`, or it will paint under the strip.
+
+### 81. The commit detail panel's two regions are sized in pixels, never percentages
+
+Why: the panel is a changed-files tree above a commit message, and the message used to be `max_h(relative(0.5))` over content. A percentage max-size only applies when the container's own height is definite, and inside this flex chain it is not — the cap silently became "no cap". With a long message that had two consequences at once: the message claimed more height than the panel had and slid out of view, and the sibling `uniform_list` measured itself against a container that overflowed its parent and rendered **no rows at all**, so the file list looked empty.
+
+How to apply: `DetailSplitState` holds the message region's height in **pixels** (default 180), the tree takes the rest with `flex_1`, and the divider drag writes pixels straight from the drag bounds. Do not reintroduce a percentage here, and do not size the message from its content — a definite height sizes both regions in one pass and neither can surprise the other. Double-click restores the default.
+
+Related trap in the same panel: a bare `div()` is a ROW flex, so a `min_w_0` child takes its width from its own content and can shrink to a single character — which is how the author line came to wrap vertically, one letter per line, after a resize. Use `flex_1().min_w_0()` for text that must fill a row. Conversely, do **not** add `w_full()` to the scrolling message region or its children: the region is a scroll container, and a percentage width inside it does not resolve either, which reproduces the same one-character wrap.
+
+### 82. A scrollbar attached to the element it scrolls must anchor to the viewport
+
+Why: `WithScrollbar` attaches the scrollbar as a *child* of the decorated element. When that element is itself the scroller, `Div::prepaint` prepaints all children — absolutely positioned ones included — inside `with_element_offset(scroll_offset)`, so the track, thumb and hitbox all slide up by the scroll offset. Measured on the commit-message region: at offset 700px the track's top landed at −596px against a 100px viewport. The visible thumb height then shrinks linearly as you scroll, and after the panel is resized there is no thumb to grab at all. The scroll *extent* was never wrong.
+
+How to apply: `ScrollbarState::track_anchor` uses `scroll_handle().viewport()` — recorded before the children are prepainted, hence free of the translation — whenever the decorated element drives the very handle being drawn. 1 of 49 call sites is in that shape; `uniform_list` and `list` own their own viewport and are unaffected. If you add a scrollbar to a div you also called `.track_scroll()` on, this is the path you are on.
 
 ## Where specs and plans live
 
