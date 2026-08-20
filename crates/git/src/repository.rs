@@ -16,6 +16,7 @@ use rope::Rope;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use text::LineEnding;
 
@@ -766,20 +767,27 @@ pub enum LogSource {
 }
 
 impl LogSource {
-    fn get_args(&self) -> Result<Vec<&str>> {
+    fn get_args(&self) -> Vec<Cow<'_, str>> {
         match self {
-            LogSource::All => Ok(vec![
-                "--ignore-missing", // needed in case of unborn HEAD
-                "--branches",
-                "--remotes",
-                "--tags",
-                "HEAD",
-            ]),
-            LogSource::Branch(branch) => Ok(vec![branch.as_str()]),
-            LogSource::Sha(oid) => Ok(vec![
-                str::from_utf8(oid.as_bytes()).context("Failed to build str from sha")?,
-            ]),
-            LogSource::Path(path) => Ok(vec!["--follow", "--", path.as_unix_str()]),
+            LogSource::All => vec![
+                // needed in case of unborn HEAD
+                Cow::Borrowed("--ignore-missing"),
+                Cow::Borrowed("--branches"),
+                Cow::Borrowed("--remotes"),
+                Cow::Borrowed("--tags"),
+                Cow::Borrowed("HEAD"),
+            ],
+            LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
+            // `Oid::as_bytes` is the raw 20/32-byte digest, not text — passing
+            // it through `str::from_utf8` produced an error for virtually every
+            // sha, so this arm never actually reached `git log`. The hex form is
+            // what git wants.
+            LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
+            LogSource::Path(path) => vec![
+                Cow::Borrowed("--follow"),
+                Cow::Borrowed("--"),
+                Cow::Borrowed(path.as_unix_str()),
+            ],
         }
     }
 }
@@ -3790,7 +3798,12 @@ impl GitRepository for RealGitRepository {
                 GRAPH_COMMIT_FORMAT.to_string(),
                 log_order.as_arg().to_string(),
             ];
-            git_log_command.extend(log_source.get_args()?.into_iter().map(str::to_string));
+            git_log_command.extend(
+                log_source
+                    .get_args()
+                    .into_iter()
+                    .map(|arg| arg.into_owned()),
+            );
             git_log_command.extend(extra_args);
 
             // `--` separator is required before any positional path argument
@@ -3871,18 +3884,21 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
 
         async move {
-            let mut args = vec!["log", SEARCH_COMMIT_FORMAT];
-
-            args.push("--fixed-strings");
+            let mut args = vec![
+                Cow::Borrowed("log"),
+                Cow::Borrowed(SEARCH_COMMIT_FORMAT),
+                Cow::Borrowed("--fixed-strings"),
+            ];
 
             if !search_args.case_sensitive {
-                args.push("--regexp-ignore-case");
+                args.push(Cow::Borrowed("--regexp-ignore-case"));
             }
 
-            args.push("--grep");
-            args.push(search_args.query.as_str());
+            args.push(Cow::Borrowed("--grep"));
+            args.push(Cow::Borrowed(search_args.query.as_str()));
 
-            args.extend(log_source.get_args()?);
+            args.extend(log_source.get_args());
+            let args: Vec<&str> = args.iter().map(|arg| arg.as_ref()).collect();
             let mut command = git.build_command(&args);
             command.stdout(Stdio::piped());
             command.stderr(Stdio::null());
@@ -4681,6 +4697,26 @@ mod tests {
 
     use super::*;
     use gpui::TestAppContext;
+
+    /// `LogSource::Sha` used to hand `git log` the raw digest bytes via
+    /// `str::from_utf8`, which fails for almost every sha — so the arm never
+    /// produced a working argument at all.
+    #[test]
+    fn test_log_source_sha_is_passed_as_hex() {
+        let oid = Oid::from_bytes(&[
+            0x82, 0x3a, 0x3f, 0x8a, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        ])
+        .unwrap();
+        assert_eq!(
+            LogSource::Sha(oid).get_args(),
+            vec!["823a3f8a00112233445566778899aabbccddeeff"]
+        );
+        assert_eq!(
+            LogSource::Branch("develop".into()).get_args(),
+            vec!["develop"]
+        );
+    }
 
     fn disable_git_global_config() {
         unsafe {
