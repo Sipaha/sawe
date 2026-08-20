@@ -587,6 +587,12 @@ pub struct ClickAtParams {
     /// `"left"` (default), `"right"`, `"middle"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub button: Option<String>,
+    /// Click count carried by the synthetic events: `2` for a double click,
+    /// `3` for a triple. Defaults to `1`. Two separate `click_at` calls are
+    /// NOT a double click — nothing in this path accumulates a count from
+    /// timing, so a handler that branches on `click_count()` only ever sees 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clicks: Option<usize>,
 }
 
 impl<'de> Deserialize<'de> for ClickAtParams {
@@ -601,6 +607,8 @@ impl<'de> Deserialize<'de> for ClickAtParams {
             modifiers: Vec<String>,
             #[serde(default)]
             button: Option<String>,
+            #[serde(default)]
+            clicks: Option<usize>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -609,6 +617,7 @@ impl<'de> Deserialize<'de> for ClickAtParams {
             y: inner.y,
             modifiers: inner.modifiers,
             button: inner.button,
+            clicks: inner.clicks,
         })
     }
 }
@@ -634,18 +643,22 @@ impl McpServerTool for ClickAtTool {
         let modifiers = parse_modifiers(&input.modifiers)?;
         let button = parse_button(input.button.as_deref())?;
         let position = Point::new(px(input.x), px(input.y));
+        let click_count = input.clicks.unwrap_or(1).max(1);
         let clicked = cx.update(|cx| -> anyhow::Result<bool> {
             let handle = find_window_by_id(&input.window_id, cx)?;
             handle
                 .update(cx, |_view, window, cx| {
-                    dispatch_mouse_click(window, cx, position, button, modifiers);
+                    dispatch_mouse_click(window, cx, position, button, modifiers, click_count);
                 })
                 .map_err(|err| anyhow::anyhow!("click_at dispatch failed: {err}"))?;
             Ok(true)
         })?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
-                text: format!("click at ({}, {})", input.x, input.y),
+                text: format!(
+                    "click at ({}, {}) x{}",
+                    input.x, input.y, click_count
+                ),
             }],
             structured_content: ClickAtResult { clicked },
         })
@@ -681,13 +694,14 @@ fn dispatch_mouse_click(
     position: Point<Pixels>,
     button: MouseButton,
     modifiers: Modifiers,
+    click_count: usize,
 ) {
     window.dispatch_event(
         PlatformInput::MouseDown(MouseDownEvent {
             position,
             modifiers,
             button,
-            click_count: 1,
+            click_count,
             first_mouse: false,
         }),
         cx,
@@ -697,7 +711,7 @@ fn dispatch_mouse_click(
             position,
             modifiers,
             button,
-            click_count: 1,
+            click_count,
         }),
         cx,
     );
@@ -987,7 +1001,7 @@ impl McpServerTool for ClickIdTool {
                         .ok_or_else(|| anyhow::anyhow!("clickable_not_found: id={id}"))?;
                     let center = super::clickables::clickable_center(matched);
                     let arr = matched.bounds;
-                    dispatch_mouse_click(window, cx, center, button, modifiers);
+                    dispatch_mouse_click(window, cx, center, button, modifiers, 1);
                     Ok(arr)
                 })
                 .map_err(|err| anyhow::anyhow!("click_id dispatch failed: {err}"))?
