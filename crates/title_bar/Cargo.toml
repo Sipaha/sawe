@@ -73,6 +73,8 @@ windows.workspace = true
 [dev-dependencies]
 call = { workspace = true, features = ["test-support"] }
 client = { workspace = true, features = ["test-support"] }
+db = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 notifications = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
@@ -80,6 +82,9 @@ release_channel.workspace = true
 remote = { workspace = true, features = ["test-support"] }
 rpc = { workspace = true, features = ["test-support"] }
 semver.workspace = true
+serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+solutions = { workspace = true, features = ["test-support"] }
+theme_settings.workspace = true
 util = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }

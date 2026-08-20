@@ -8,9 +8,7 @@ use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::{SoloDiffOpen, SoloDiffView};
 use crate::{branch_picker, picker_prompt, render_remote_button};
-use crate::{
-    git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
-};
+use crate::{git_panel_settings::GitPanelSettings, git_status_icon};
 use agent_settings::AgentSettings;
 use anyhow::Context as _;
 use collections::{BTreeMap, HashMap, HashSet};
@@ -20,6 +18,7 @@ use editor::{EditorStyle, RewrapOptions};
 use file_icons::FileIcons;
 use futures::channel::oneshot::Canceled;
 use git::Oid;
+use std::str::FromStr as _;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
@@ -266,10 +265,18 @@ const TREE_INDENT: f32 = 16.0;
 /// chevron column (or an invisible spacer of the same width for files), so the
 /// padding is smaller than a plain label row would want.
 const ROW_LEFT_PADDING: f32 = 6.0;
+/// Extra left padding for everything *inside* a section (`Changes` /
+/// `Untracked` / `Conflicts`) — directories and files alike, including the
+/// depth-0 ones. Without it a file directly under a header lines up flush with
+/// the header and the nesting is invisible. One `TREE_INDENT` step, so a
+/// section reads as just another level of the same tree.
+const SECTION_CONTENT_INDENT: f32 = TREE_INDENT;
 /// Horizontal offset of the depth-0 indent guide: half of the chevron column
-/// (`IconSize::Small` is 14px) past the row padding, so the guide runs through
-/// the middle of the chevrons of that depth.
-const INDENT_GUIDE_LEFT_OFFSET: f32 = ROW_LEFT_PADDING + 7.0;
+/// (`IconSize::Small` is 14px) past the left edge of a depth-0 *content* row,
+/// so the guide runs through the middle of the chevrons of that depth. Must
+/// track `changes_list::content_row_padding(0)` — the guides are drawn in the
+/// list's own coordinate space, not the rows'.
+const INDENT_GUIDE_LEFT_OFFSET: f32 = ROW_LEFT_PADDING + SECTION_CONTENT_INDENT + 7.0;
 const SELECTED_BG_ALPHA: f32 = 0.08;
 const MARKED_BG_ALPHA: f32 = 0.12;
 const STATE_OPACITY_STEP: f32 = 0.04;
@@ -365,7 +372,9 @@ impl GitHeaderEntry {
     pub fn title(&self) -> &'static str {
         match self.header {
             Section::Conflict => "Conflicts",
-            Section::Tracked => "Tracked",
+            // The `Tracked` variant keeps the git concept; the user-facing
+            // label is "Changes" (the panel tab this list lives in).
+            Section::Tracked => "Changes",
             Section::New => "Untracked",
         }
     }
@@ -3753,46 +3762,55 @@ impl GitPanel {
         message.push('\n');
     }
 
-    /// First solution (if any) whose `root` is an ancestor of one of this
-    /// panel's project worktrees. Mirrors the resolution the retired
-    /// `ActiveProjectSelector` performed from the workspace, but reads the
-    /// panel's own `project` handle.
-    fn active_solution(&self, cx: &App) -> Option<solutions::Solution> {
-        let store = solutions::SolutionStore::try_global(cx)?;
-        let store = store.read(cx);
-        self.project
-            .read(cx)
-            .worktrees(cx)
-            .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))
-            .cloned()
-    }
-
-    /// The solution-wide active member of this panel's solution, joined from
-    /// the store's `active_member` selection and the solution's member list.
-    fn active_member(&self, cx: &App) -> Option<solutions::SolutionMember> {
-        let solution = self.active_solution(cx)?;
-        let store = solutions::SolutionStore::try_global(cx)?;
-        let store = store.read(cx);
-        let member_id = store.active_member(solution.id)?;
-        solution.member(member_id).cloned()
-    }
-
-    /// If the panel's solution has an active member, override `active_repository`
-    /// to the repo whose `work_directory_abs_path` is under that member's
-    /// `local_path`. Called at the start of `update_visible_entries`, immediately
-    /// after the upstream `project.active_repository(cx)` assignment, so the
-    /// member-driven choice wins for all downstream logic in that fn.
+    /// Resolve the repository this panel acts on. Called at the top of
+    /// `update_visible_entries`, so the member-driven choice wins for all
+    /// downstream logic in that fn.
+    ///
+    /// Inside a Solution the answer is `solutions::active_member_repository`
+    /// (the user's explicit per-member pick, else the member's outermost repo)
+    /// and a `None` there means the active member genuinely owns no git repo —
+    /// falling back to the project-wide default would show some *other*
+    /// member's repository, which is the divergence the shared resolver exists
+    /// to remove. Outside a Solution there is no member scope, so the project
+    /// default stands.
     fn refresh_active_repository_for_selector(&mut self, cx: &mut Context<Self>) {
-        let Some(member) = self.active_member(cx) else {
-            return;
+        let repository = if solutions::active_member_context(&self.project, cx).is_some() {
+            solutions::active_member_repository(&self.project, cx)
+        } else {
+            self.project.read(cx).active_repository(cx)
         };
-        let new_repo = crate::repo_under_member(&self.project, &member, cx);
-        if new_repo.as_ref().map(|r| r.entity_id())
-            != self.active_repository.as_ref().map(|r| r.entity_id())
+        self.set_active_repository(repository, cx);
+    }
+
+    /// Swap the repository every panel surface reads from, dropping everything
+    /// derived from the old one.
+    ///
+    /// The History rows in particular: `commit_history_shas` and
+    /// `_repo_subscriptions` used to be cleared only on a tab switch, and
+    /// `fetch_commit_history_shas` bails out early for a repository with no
+    /// branch, so flipping the active repository — especially to a
+    /// detached-HEAD one — left the *previous* repository's commits rendered
+    /// under the new repository's header.
+    fn set_active_repository(
+        &mut self,
+        repository: Option<Entity<Repository>>,
+        cx: &mut Context<Self>,
+    ) {
+        if repository.as_ref().map(|repo| repo.entity_id())
+            == self.active_repository.as_ref().map(|repo| repo.entity_id())
         {
-            self.active_repository = new_repo;
-            self.entries.clear();
+            return;
         }
+        self.active_repository = repository;
+        self.entries.clear();
+        self.commit_history_shas.take();
+        self.focused_history_entry = None;
+        self._repo_subscriptions.clear();
+        if self.active_tab == GitPanelTab::History {
+            self.focused_history_entry = Some(0);
+            self.load_commit_history(cx);
+        }
+        cx.notify();
     }
 
     fn schedule_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4761,12 +4779,6 @@ impl GitPanel {
             + gap;
 
         let git_panel = cx.entity();
-        let display_name = SharedString::from(Arc::from(
-            active_repository
-                .read(cx)
-                .display_name()
-                .trim_end_matches("/"),
-        ));
         let editor_is_long = self.commit_editor.update(cx, |editor, cx| {
             editor.max_point(cx).row().0 >= MAX_PANEL_EDITOR_LINES as u32
         });
@@ -4785,12 +4797,7 @@ impl GitPanel {
 
         let footer = v_flex()
             .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
-            .child(PanelRepoFooter::new(
-                display_name,
-                branch,
-                head_commit,
-                Some(git_panel),
-            ))
+            .child(PanelRepoFooter::new(branch, head_commit, Some(git_panel)))
             .when(title_exceeds_limit, |this| {
                 this.child(
                     h_flex()
@@ -5320,17 +5327,34 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// Where the History tab reads commits from.
+    ///
+    /// A detached HEAD has no branch to name. Bailing out there is what let the
+    /// previous repository's commits stay on screen, so walk from the head
+    /// commit instead — which is what the user is actually looking at. Only a
+    /// repository with neither a branch nor a head commit (unborn HEAD) falls
+    /// through to `LogSource::All`, where `--ignore-missing` keeps `git log`
+    /// from erroring on the missing ref.
+    fn history_log_source(repository: &Repository) -> LogSource {
+        match repository.branch.as_ref() {
+            Some(branch) => LogSource::Branch(branch.name().to_string().into()),
+            None => match repository
+                .head_commit
+                .as_ref()
+                .and_then(|head| Oid::from_str(&head.sha).ok())
+            {
+                Some(sha) => LogSource::Sha(sha),
+                None => LogSource::All,
+            },
+        }
+    }
+
     fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.as_ref() else {
+        let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
 
-        let Some(branch) = active_repository.read(cx).branch.as_ref() else {
-            return;
-        };
-
-        let branch_name = branch.name().to_string();
-        let log_source = LogSource::Branch(branch_name.into());
+        let log_source = Self::history_log_source(active_repository.read(cx));
         let log_order = LogOrder::DateOrder;
 
         // Kick off the git log fetch so data is ready when the user switches to History.
@@ -5366,16 +5390,11 @@ impl GitPanel {
     }
 
     fn fetch_commit_history_shas(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.as_ref() else {
+        let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
 
-        let Some(branch) = active_repository.read(cx).branch.as_ref() else {
-            return;
-        };
-
-        let branch_name = branch.name().to_string();
-        let log_source = LogSource::Branch(branch_name.into());
+        let log_source = Self::history_log_source(active_repository.read(cx));
         let log_order = LogOrder::DateOrder;
 
         self.commit_history_shas = Some(active_repository.update(cx, |repository, cx| {
@@ -6676,9 +6695,12 @@ impl Render for GitPanelMessageTooltip {
     }
 }
 
+/// The git panel's bottom strip: which branch the active repository is on, plus
+/// the remote (fetch/push) button. It deliberately does *not* offer a repository
+/// switcher — that lives in the title bar now, and duplicating it here is how the
+/// panel came to advertise a different repository than the rest of the window.
 #[derive(IntoElement, RegisterComponent)]
 pub struct PanelRepoFooter {
-    active_repository: SharedString,
     branch: Option<Branch>,
     head_commit: Option<CommitDetails>,
 
@@ -6690,22 +6712,19 @@ pub struct PanelRepoFooter {
 
 impl PanelRepoFooter {
     pub fn new(
-        active_repository: SharedString,
         branch: Option<Branch>,
         head_commit: Option<CommitDetails>,
         git_panel: Option<Entity<GitPanel>>,
     ) -> Self {
         Self {
-            active_repository,
             branch,
             head_commit,
             git_panel,
         }
     }
 
-    pub fn new_preview(active_repository: SharedString, branch: Option<Branch>) -> Self {
+    pub fn new_preview(branch: Option<Branch>) -> Self {
         Self {
-            active_repository,
             branch,
             head_commit: None,
             git_panel: None,
@@ -6715,11 +6734,6 @@ impl PanelRepoFooter {
 
 impl RenderOnce for PanelRepoFooter {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let project = self
-            .git_panel
-            .as_ref()
-            .map(|panel| panel.read(cx).project.clone());
-
         let (workspace, repo) = self
             .git_panel
             .as_ref()
@@ -6728,11 +6742,6 @@ impl RenderOnce for PanelRepoFooter {
                 (panel.workspace.clone(), panel.active_repository.clone())
             })
             .unzip();
-
-        let single_repo = project
-            .as_ref()
-            .map(|project| project.read(cx).git_store().read(cx).repositories().len() == 1)
-            .unwrap_or(true);
 
         const MAX_SHORT_SHA_LEN: usize = 8;
         let branch_name = self
@@ -6749,37 +6758,6 @@ impl RenderOnce for PanelRepoFooter {
                 })
             })
             .unwrap_or_else(|| " (no branch)".to_owned());
-        let show_separator = self.branch.is_some() || self.head_commit.is_some();
-
-        let active_repo_name = self.active_repository.clone();
-
-        let repo_selector = PopoverMenu::new("repository-switcher")
-            .menu({
-                let project = project;
-                move |window, cx| {
-                    let project = project.clone()?;
-                    Some(cx.new(|cx| RepositorySelector::new(project, rems(20.), window, cx)))
-                }
-            })
-            .trigger_with_tooltip(
-                Button::new("repo-selector", active_repo_name)
-                    .size(ButtonSize::None)
-                    .label_size(LabelSize::Small)
-                    .truncate(true),
-                move |_, cx| {
-                    if single_repo {
-                        cx.new(|_| Empty).into()
-                    } else {
-                        Tooltip::simple("Switch Active Repository", cx)
-                    }
-                },
-            )
-            .anchor(Anchor::BottomLeft)
-            .offset(gpui::Point {
-                x: px(0.0),
-                y: px(-2.0),
-            })
-            .into_any_element();
 
         let branch_selector_button = Button::new("branch-selector", branch_name)
             .size(ButtonSize::None)
@@ -6816,23 +6794,11 @@ impl RenderOnce for PanelRepoFooter {
                     .flex_1()
                     .overflow_hidden()
                     .gap_px()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::Small).color(
-                        if single_repo {
-                            Color::Disabled
-                        } else {
-                            Color::Muted
-                        },
-                    ))
-                    .when(!single_repo, |this| {
-                        this.child(div().child(repo_selector).min_w_0()).when(
-                            show_separator,
-                            |this| {
-                                this.child(Label::new("/").size(LabelSize::Small).color(
-                                    Color::Custom(cx.theme().colors().text_muted.opacity(0.4)),
-                                ))
-                            },
-                        )
-                    })
+                    .child(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(div().child(branch_selector).min_w_0()),
             )
             .children(if let Some(git_panel) = self.git_panel {
@@ -6921,10 +6887,6 @@ impl Component for PanelRepoFooter {
             }
         }
 
-        fn active_repository(id: usize) -> SharedString {
-            format!("repo-{}", id).into()
-        }
-
         let example_width = px(340.);
 
         v_flex()
@@ -6940,7 +6902,7 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(active_repository(1), None))
+                                .child(PanelRepoFooter::new_preview(None))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -6949,7 +6911,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    active_repository(2),
                                     Some(branch(unknown_upstream)),
                                 ))
                                 .into_any_element(),
@@ -6960,7 +6921,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    active_repository(3),
                                     Some(branch(no_remote_upstream)),
                                 ))
                                 .into_any_element(),
@@ -6971,7 +6931,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    active_repository(4),
                                     Some(branch(not_ahead_or_behind_upstream)),
                                 ))
                                 .into_any_element(),
@@ -6982,7 +6941,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    active_repository(5),
                                     Some(branch(behind_upstream)),
                                 ))
                                 .into_any_element(),
@@ -6993,7 +6951,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    active_repository(6),
                                     Some(branch(ahead_of_upstream)),
                                 ))
                                 .into_any_element(),
@@ -7004,7 +6961,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    active_repository(7),
                                     Some(branch(ahead_and_behind_upstream)),
                                 ))
                                 .into_any_element(),
@@ -7024,7 +6980,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed"),
                                     Some(custom("main", behind_upstream)),
                                 ))
                                 .into_any_element(),
@@ -7035,7 +6990,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed"),
                                     Some(custom(
                                         "redesign-and-update-git-ui-list-entry-style",
                                         behind_upstream,
@@ -7049,7 +7003,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed-industries-community-examples"),
                                     Some(custom("gpui", ahead_of_upstream)),
                                 ))
                                 .into_any_element(),
@@ -7060,7 +7013,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed-industries-community-examples"),
                                     Some(custom(
                                         "redesign-and-update-git-ui-list-entry-style",
                                         behind_upstream,
@@ -7074,7 +7026,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("LICENSES"),
                                     Some(custom("main", ahead_of_upstream)),
                                 ))
                                 .into_any_element(),
@@ -7085,7 +7036,6 @@ impl Component for PanelRepoFooter {
                                 .w(example_width)
                                 .overflow_hidden()
                                 .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed"),
                                     Some(custom("update-README", behind_upstream)),
                                 ))
                                 .into_any_element(),
@@ -8709,8 +8659,260 @@ mod tests {
         // active.
         panel.read_with(cx, |panel, cx| {
             assert!(
-                panel.active_member(cx).is_none(),
+                solutions::active_member_context(&panel.project, cx).is_none(),
                 "no active member when no solution is active"
+            );
+        });
+    }
+    struct NestedRepoSolution {
+        project: Entity<Project>,
+        member_root: std::path::PathBuf,
+        nested_root: std::path::PathBuf,
+    }
+
+    /// A one-member Solution whose member worktree also contains a vendored
+    /// plugin carrying its own `.git`. Both are first-class repositories — the
+    /// exact shape that made the old `repositories().values().find(|repo| repo
+    /// .work_directory_abs_path.starts_with(member))` lookups pick an arbitrary
+    /// winner, so different git surfaces disagreed about which repo was active.
+    async fn setup_nested_repo_solution(cx: &mut TestAppContext) -> NestedRepoSolution {
+        init_test(cx);
+
+        let root = cx.update(|cx| {
+            // The explicit-pick map is a process-wide global; a leak from an
+            // earlier case would silently decide this one.
+            solutions::member_repository::clear_repository_choices_for_test(cx);
+            let store = solutions::SolutionStore::for_test(std::path::PathBuf::new(), cx);
+            let root = store.update(cx, |store, cx| {
+                let sid = store.create_for_test_minimal("nested-repo", cx);
+                let root = store
+                    .solutions()
+                    .last()
+                    .expect("solution just created")
+                    .root
+                    .clone();
+                let member = store.test_add_member_with_path(sid, "member", root.join("member"));
+                store.set_active_member(sid, member, cx);
+                root
+            });
+            solutions::install_global_for_test(store, cx);
+            root
+        });
+
+        let member_root = root.join("member");
+        let nested_root = member_root.join("plugins").join("gantt-plugin");
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            &root,
+            json!({
+                "member": {
+                    ".git": {},
+                    "outer.txt": "OUTER\n",
+                    "plugins": {
+                        "gantt-plugin": {
+                            ".git": {},
+                            "inner.txt": "INNER\n",
+                        },
+                    },
+                },
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            &member_root.join(".git"),
+            &[("outer.txt", "outer\n".to_string())],
+        );
+        fs.set_head_and_index_for_repo(
+            &nested_root.join(".git"),
+            &[("inner.txt", "inner\n".to_string())],
+        );
+
+        let project = Project::test(fs.clone(), [member_root.as_path()], cx).await;
+        cx.run_until_parked();
+
+        NestedRepoSolution {
+            project,
+            member_root,
+            nested_root,
+        }
+    }
+
+    fn repo_with_work_directory(
+        project: &Entity<Project>,
+        work_directory: &Path,
+        cx: &mut VisualTestContext,
+    ) -> Entity<Repository> {
+        project
+            .read_with(cx, |project, cx| {
+                project
+                    .repositories(cx)
+                    .values()
+                    .find(|repo| repo.read(cx).work_directory_abs_path.as_ref() == work_directory)
+                    .cloned()
+            })
+            .unwrap_or_else(|| panic!("no repository at {work_directory:?}"))
+    }
+
+    fn panel_repo_dir(
+        panel: &Entity<GitPanel>,
+        cx: &mut VisualTestContext,
+    ) -> Option<std::path::PathBuf> {
+        panel.read_with(cx, |panel, cx| {
+            panel
+                .active_repository
+                .as_ref()
+                .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
+        })
+    }
+
+    // The reported bug: the panel footer read `ecos-ui-gantt-chart-widget-plugin`
+    // (a vendored, detached-HEAD nested repo) while other surfaces showed the
+    // member's own repo. With the shared resolver the default is the OUTERMOST
+    // repository under the active member, deterministically.
+    #[gpui::test]
+    async fn test_panel_defaults_to_outer_repo_of_active_member(cx: &mut TestAppContext) {
+        let NestedRepoSolution {
+            project,
+            member_root,
+            nested_root,
+        } = setup_nested_repo_solution(cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        // Both the member repo and the vendored plugin repo must be registered,
+        // otherwise this test would pass for the wrong reason.
+        let repo_count = project.read_with(cx, |project, cx| project.repositories(cx).len());
+        assert_eq!(
+            repo_count, 2,
+            "expected the member repo and the nested plugin repo to both be registered"
+        );
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.update_visible_entries(window, cx)
+        });
+        cx.executor().run_until_parked();
+
+        assert_eq!(
+            panel_repo_dir(&panel, cx).as_deref(),
+            Some(member_root.as_path()),
+            "the panel must default to the member's own repo, not the nested {nested_root:?}"
+        );
+    }
+
+    // …but an explicit pick still wins: once the user chooses the nested repo
+    // through `set_active_member_repository`, every surface — the panel included
+    // — has to follow it.
+    #[gpui::test]
+    async fn test_panel_follows_explicit_nested_repo_choice(cx: &mut TestAppContext) {
+        let NestedRepoSolution {
+            project,
+            nested_root,
+            ..
+        } = setup_nested_repo_solution(cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.update_visible_entries(window, cx)
+        });
+        cx.executor().run_until_parked();
+
+        let nested_repo = repo_with_work_directory(&project, &nested_root, cx);
+        cx.update(|_, cx| {
+            solutions::set_active_member_repository(&project, &nested_repo, cx);
+        });
+        cx.executor().run_until_parked();
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.update_visible_entries(window, cx)
+        });
+        cx.executor().run_until_parked();
+
+        assert_eq!(
+            panel_repo_dir(&panel, cx).as_deref(),
+            Some(nested_root.as_path()),
+            "an explicit per-member pick must win over the outermost default"
+        );
+    }
+
+    // `commit_history_shas` / `_repo_subscriptions` used to be cleared only on a
+    // tab switch, so once the active repository changed the History tab kept the
+    // PREVIOUS repository's rows — and `fetch_commit_history_shas` bails out for
+    // a repo with no branch, so a flip to a detached-HEAD repo had nothing to
+    // overwrite them with. The resolution is re-driven synchronously here, with
+    // no executor turn in between, so only the invalidation can clear the rows.
+    #[gpui::test]
+    async fn test_history_drops_previous_repository_commits(cx: &mut TestAppContext) {
+        let NestedRepoSolution {
+            project,
+            nested_root,
+            ..
+        } = setup_nested_repo_solution(cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.update_visible_entries(window, cx)
+        });
+        cx.executor().run_until_parked();
+
+        // Stand in for a History tab already loaded against the member's own repo.
+        let stale_sha: Oid = "823a3f8a".parse().expect("valid abbreviated sha");
+        cx.update_window_entity(&panel, |panel, _window, cx| {
+            panel.active_tab = GitPanelTab::History;
+            panel.load_commit_history(cx);
+            panel.commit_history_shas = Some(vec![stale_sha]);
+            panel.focused_history_entry = Some(0);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel._repo_subscriptions.is_empty(),
+                "History must be subscribed to the repository it loaded from"
+            );
+        });
+
+        let nested_repo = repo_with_work_directory(&project, &nested_root, cx);
+        cx.update_window_entity(&panel, |panel, _window, cx| {
+            solutions::set_active_member_repository(&project, &nested_repo, cx);
+            panel.refresh_active_repository_for_selector(cx);
+
+            assert_eq!(
+                panel
+                    .active_repository
+                    .as_ref()
+                    .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
+                    .as_deref(),
+                Some(nested_root.as_path()),
+                "precondition: the active repository actually changed"
+            );
+            assert!(
+                !panel
+                    .commit_history_shas
+                    .clone()
+                    .unwrap_or_default()
+                    .contains(&stale_sha),
+                "History kept the previous repository's commits after the repo changed"
             );
         });
     }

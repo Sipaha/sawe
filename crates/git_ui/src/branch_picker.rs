@@ -71,39 +71,6 @@ pub fn switch(
     open(workspace, &zed_actions::git::Branch, window, cx);
 }
 
-/// The repository of the active Solution member, if any. Mirrors
-/// `title_bar::ProjectToolbar::active_member_repository` /
-/// `git_panel::refresh_active_repository_for_selector`: in a multi-member
-/// Solution all members share ONE `Project`, so `Project::active_repository`
-/// can point at whichever repo was last touched rather than the project the
-/// user has selected in the tab strip. Scoping the branch picker to the
-/// active member's repo keeps "New Branch" / "Checkout…" showing only that
-/// project's branches. Returns `None` outside a Solution (plain project), so
-/// the caller falls back to `active_repository`.
-fn active_member_repository(
-    project: &Entity<project::Project>,
-    cx: &App,
-) -> Option<Entity<Repository>> {
-    let store = solutions::SolutionStore::try_global(cx)?;
-    let store = store.read(cx);
-    let solution = project
-        .read(cx)
-        .worktrees(cx)
-        .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))?;
-    let member_id = store.active_member(solution.id)?;
-    let member = solution.member(member_id)?;
-    project
-        .read(cx)
-        .repositories(cx)
-        .values()
-        .find(|repo| {
-            repo.read(cx)
-                .work_directory_abs_path
-                .starts_with(&member.local_path)
-        })
-        .cloned()
-}
-
 pub fn open(
     workspace: &mut Workspace,
     _: &zed_actions::git::Branch,
@@ -112,8 +79,8 @@ pub fn open(
 ) {
     let workspace_handle = workspace.weak_handle();
     let project = workspace.project().clone();
-    let repository =
-        active_member_repository(&project, cx).or_else(|| project.read(cx).active_repository(cx));
+    let repository = solutions::active_member_repository(&project, cx)
+        .or_else(|| project.read(cx).active_repository(cx));
 
     workspace.toggle_modal(window, cx, |window, cx| {
         BranchList::new(

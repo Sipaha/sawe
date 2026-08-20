@@ -671,6 +671,13 @@ impl CommitView {
         self.multibuffer.read(cx).snapshot(cx).total_changed_lines()
     }
 
+    /// Hunks across every file this commit view shows — the same reading the
+    /// other diff toolbars use: how many stops the hunk arrows beside the
+    /// label have.
+    fn hunk_count(&self, cx: &App) -> usize {
+        self.multibuffer.read(cx).snapshot(cx).diff_hunks().count()
+    }
+
     fn open_file_at_head(
         &mut self,
         file: &Arc<dyn language::File>,
@@ -1581,6 +1588,8 @@ impl Render for CommitViewToolbar {
         let sha_for_graph = commit_sha.to_string();
         let commit_view_for_parent = commit_view.downgrade();
 
+        let hunk_count = commit_view_ref.hunk_count(cx);
+
         h_flex()
             .gap_1()
             .when(additions > 0 || deletions > 0, |this| {
@@ -1592,6 +1601,11 @@ impl Render for CommitViewToolbar {
                             additions as usize,
                             deletions as usize,
                         ))
+                        .child(
+                            Label::new(crate::solo_diff_view::difference_count_label(hunk_count))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
                         .child(Divider::vertical()),
                 )
             })

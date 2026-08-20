@@ -1,21 +1,17 @@
 use crate::{git_panel::GitStatusEntry, git_status_icon, soft_wrap_button};
-use anyhow::{Context as _, Result};
-use buffer_diff::DiffHunkSecondaryStatus;
+use anyhow::Result;
 use editor::{
     Direction, Editor, EditorEvent, EditorSettings, SplittableEditor, ToggleSplitDiff,
     actions::{GoToHunk, GoToPreviousHunk, ToggleSoftWrap},
 };
 use fs::Fs;
-use git::{
-    Commit, Restore, StageAndNext, StageFile, ToggleStaged, UnstageAndNext, UnstageFile,
-    repository::RepoPath, status::StageStatus,
-};
+use git::repository::RepoPath;
 use gpui::{
     Action, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, Render, Subscription, Task, WeakEntity, Window,
 };
 use language::{Buffer, HighlightedText};
-use multi_buffer::MultiBuffer;
+use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
 use project::{
     Project,
     git_store::{Repository, RepositoryId},
@@ -23,20 +19,64 @@ use project::{
 use settings::{DiffViewStyle, Settings, SettingsStore, update_settings_file};
 use std::{
     any::{Any, TypeId},
+    cell::Cell,
     sync::Arc,
 };
 use ui::{
-    Color, DiffStat, Divider, Icon, IconButton, IconName, Label, LabelCommon as _, SharedString,
-    Tooltip, prelude::*, vertical_divider,
+    Color, DiffStat, Icon, IconButton, IconName, Label, LabelCommon as _, SharedString, Tooltip,
+    prelude::*, vertical_divider,
 };
 use util::paths::{PathExt as _, PathStyle};
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
     item::{ItemEvent, PreviewTabsSettings, SaveOptions, TabContentParams},
-    notifications::NotifyTaskExt,
     searchable::SearchableItemHandle,
 };
+
+/// Memoized `MultiBufferSnapshot::diff_hunks().count()`.
+///
+/// Counting hunks walks every excerpt and every hunk of the multibuffer with a
+/// couple of O(log n) anchor resolutions per hunk. That is nothing for a
+/// single-file diff, but a project diff over several hundred files repaints its
+/// toolbar often enough that redoing the walk each time is worth avoiding.
+///
+/// Every component of the key is an O(1) sum-tree summary read: `edit_count`
+/// moves on any buffer edit, `non_text_state_update_count` on any buffer
+/// non-text change, and the changed-row totals on any change to the diff itself
+/// (including the async arrival of the initial diff). Staging does not move the
+/// key, and correctly so — it only rewrites secondary hunk status, never the
+/// hunk count.
+#[derive(Default)]
+pub(crate) struct HunkCountCache(Cell<Option<(HunkCountKey, usize)>>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HunkCountKey {
+    edit_count: usize,
+    non_text_state_update_count: usize,
+    added_rows: u32,
+    removed_rows: u32,
+}
+
+impl HunkCountCache {
+    pub(crate) fn count(&self, snapshot: &MultiBufferSnapshot) -> usize {
+        let (added_rows, removed_rows) = snapshot.total_changed_lines();
+        let key = HunkCountKey {
+            edit_count: snapshot.edit_count(),
+            non_text_state_update_count: snapshot.non_text_state_update_count(),
+            added_rows,
+            removed_rows,
+        };
+        if let Some((cached_key, count)) = self.0.get()
+            && cached_key == key
+        {
+            return count;
+        }
+        let count = snapshot.diff_hunks().count();
+        self.0.set(Some((key, count)));
+        count
+    }
+}
 
 /// How a [`SoloDiffView`] should be placed in the pane.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,6 +96,7 @@ pub struct SoloDiffView {
     buffer: Entity<Buffer>,
     editor: Entity<SplittableEditor>,
     workspace: WeakEntity<Workspace>,
+    hunk_count_cache: HunkCountCache,
     _settings_subscription: Subscription,
 }
 
@@ -218,6 +259,7 @@ impl SoloDiffView {
             buffer,
             editor,
             workspace: workspace.downgrade(),
+            hunk_count_cache: HunkCountCache::default(),
             _settings_subscription: settings_subscription,
         }
     }
@@ -226,67 +268,12 @@ impl SoloDiffView {
         self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
     }
 
-    fn button_states(&self, cx: &App) -> SoloDiffButtonStates {
+    /// Number of diff hunks in this file's diff. Also gates the prev/next-hunk
+    /// buttons: with a single hunk there is nowhere to navigate to.
+    fn hunk_count(&self, cx: &App) -> usize {
         let editor = self.editor.read(cx).rhs_editor().read(cx);
-        let multibuffer = editor.buffer().read(cx);
-        let snapshot = multibuffer.snapshot(cx);
-        let prev_next = snapshot.diff_hunks().nth(1).is_some();
-        let mut selection = true;
-
-        let mut ranges = editor
-            .selections
-            .disjoint_anchor_ranges()
-            .collect::<Vec<_>>();
-        if !ranges.iter().any(|range| range.start != range.end) {
-            selection = false;
-            let anchor = editor.selections.newest_anchor().head();
-            if let Some((_, excerpt_range)) = snapshot.excerpt_containing(anchor..anchor)
-                && let Some(range) = snapshot
-                    .anchor_in_buffer(excerpt_range.context.start)
-                    .zip(snapshot.anchor_in_buffer(excerpt_range.context.end))
-                    .map(|(start, end)| start..end)
-            {
-                ranges = vec![range];
-            } else {
-                ranges = Vec::new();
-            }
-        }
-
-        let mut stage = false;
-        let mut unstage = false;
-        for hunk in editor.diff_hunks_in_ranges(&ranges, &snapshot) {
-            match hunk.status.secondary {
-                DiffHunkSecondaryStatus::HasSecondaryHunk
-                | DiffHunkSecondaryStatus::SecondaryHunkAdditionPending => {
-                    stage = true;
-                }
-                DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk => {
-                    stage = true;
-                    unstage = true;
-                }
-                DiffHunkSecondaryStatus::NoSecondaryHunk
-                | DiffHunkSecondaryStatus::SecondaryHunkRemovalPending => {
-                    unstage = true;
-                }
-            }
-        }
-
-        let stage_status = self
-            .repository
-            .read(cx)
-            .status_for_path(&self.repo_path)
-            .map(|entry| entry.status.staging())
-            .unwrap_or(StageStatus::Unstaged);
-
-        SoloDiffButtonStates {
-            stage,
-            unstage,
-            restore: stage || unstage,
-            prev_next,
-            selection,
-            stage_file: stage_status.has_unstaged(),
-            unstage_file: stage_status.has_staged(),
-        }
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        self.hunk_count_cache.count(&snapshot)
     }
 
     fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut App) {
@@ -295,31 +282,6 @@ impl SoloDiffView {
         cx.defer(move |cx| {
             cx.dispatch_action(action.as_ref());
         });
-    }
-
-    fn change_file_stage(&self, stage: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let repository = self.repository.clone();
-        let repo_path = self.repo_path.clone();
-        let workspace = self.workspace.clone();
-        let task = cx.spawn(async move |_, cx| {
-            repository
-                .update(cx, |repository, cx| {
-                    if stage {
-                        repository.stage_entries(vec![repo_path], cx)
-                    } else {
-                        repository.unstage_entries(vec![repo_path], cx)
-                    }
-                })
-                .await
-                .with_context(|| {
-                    if stage {
-                        "failed to stage file"
-                    } else {
-                        "failed to unstage file"
-                    }
-                })
-        });
-        task.detach_and_notify_err(workspace, window, cx);
     }
 }
 
@@ -583,7 +545,7 @@ impl Render for SoloDiffStyleToolbar {
             return div();
         };
         let focus_handle = solo_diff.focus_handle(cx);
-        let prev_next = solo_diff.read(cx).button_states(cx).prev_next;
+        let prev_next = solo_diff.read(cx).hunk_count(cx) > 1;
         let editor_entity = solo_diff.read(cx).editor.clone();
         let editor = editor_entity.read(cx);
         let diff_view_style = editor.diff_view_style();
@@ -666,30 +628,6 @@ impl SoloDiffGitToolbar {
     fn solo_diff(&self) -> Option<Entity<SoloDiffView>> {
         self.solo_diff.as_ref()?.upgrade()
     }
-
-    fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(solo_diff) = self.solo_diff() {
-            solo_diff.update(cx, |solo_diff, cx| {
-                solo_diff.dispatch_action(action, window, cx);
-            });
-        }
-    }
-
-    fn stage_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(solo_diff) = self.solo_diff() {
-            solo_diff.update(cx, |solo_diff, cx| {
-                solo_diff.change_file_stage(true, window, cx);
-            });
-        }
-    }
-
-    fn unstage_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(solo_diff) = self.solo_diff() {
-            solo_diff.update(cx, |solo_diff, cx| {
-                solo_diff.change_file_stage(false, window, cx);
-            });
-        }
-    }
 }
 
 impl EventEmitter<ToolbarItemEvent> for SoloDiffGitToolbar {}
@@ -712,24 +650,13 @@ impl ToolbarItemView for SoloDiffGitToolbar {
     }
 }
 
-struct SoloDiffButtonStates {
-    stage: bool,
-    unstage: bool,
-    restore: bool,
-    prev_next: bool,
-    selection: bool,
-    stage_file: bool,
-    unstage_file: bool,
-}
-
 impl Render for SoloDiffGitToolbar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(solo_diff) = self.solo_diff() else {
             return div();
         };
-        let focus_handle = solo_diff.focus_handle(cx);
         let solo_diff = solo_diff.read(cx);
-        let button_states = solo_diff.button_states(cx);
+        let hunk_count = solo_diff.hunk_count(cx);
         let status_entry = solo_diff
             .repository
             .read(cx)
@@ -749,99 +676,35 @@ impl Render for SoloDiffGitToolbar {
                     .into_any_element()
             }))
             .child(
-                h_group_sm()
-                    .when(button_states.selection, |el| {
-                        el.child(
-                            Button::new("stage", "Toggle Staged")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Toggle Staged",
-                                    &ToggleStaged,
-                                    &focus_handle,
-                                ))
-                                .disabled(!button_states.stage && !button_states.unstage)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&ToggleStaged, window, cx)
-                                })),
-                        )
-                    })
-                    .when(!button_states.selection, |el| {
-                        el.child(
-                            Button::new("stage", "Stage")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Stage and go to next hunk",
-                                    &StageAndNext,
-                                    &focus_handle,
-                                ))
-                                .disabled(!button_states.stage)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&StageAndNext, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("unstage", "Unstage")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Unstage and go to next hunk",
-                                    &UnstageAndNext,
-                                    &focus_handle,
-                                ))
-                                .disabled(!button_states.unstage)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&UnstageAndNext, window, cx)
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("restore", "Restore")
-                            .tooltip(Tooltip::for_action_title_in(
-                                "Restore selected hunk",
-                                &Restore,
-                                &focus_handle,
-                            ))
-                            .disabled(!button_states.restore)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dispatch_action(&Restore, window, cx)
-                            })),
-                    ),
+                Label::new(difference_count_label(hunk_count))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
             )
-            .child(vertical_divider())
-            .child(
-                h_group_sm()
-                    .child(
-                        Button::new("stage-file", "Stage File")
-                            .tooltip(Tooltip::for_action_title_in(
-                                "Stage file",
-                                &StageFile,
-                                &focus_handle,
-                            ))
-                            .disabled(!button_states.stage_file)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.stage_file(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("unstage-file", "Unstage File")
-                            .tooltip(Tooltip::for_action_title_in(
-                                "Unstage file",
-                                &UnstageFile,
-                                &focus_handle,
-                            ))
-                            .disabled(!button_states.unstage_file)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.unstage_file(window, cx)),
-                            ),
-                    )
-                    .child(Divider::vertical())
-                    .child(
-                        Button::new("commit", "Commit")
-                            .tooltip(Tooltip::for_action_title_in(
-                                "Commit",
-                                &Commit,
-                                &focus_handle,
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dispatch_action(&Commit, window, cx);
-                            })),
-                    ),
-            )
+            .child(div().w_1())
+    }
+}
+
+/// IntelliJ IDEA's diff toolbar ends with a bare count of differences, worded
+/// exactly like this. Zero is rendered rather than hidden so the toolbar slot
+/// keeps a stable width and an empty diff reads as "nothing left to review"
+/// instead of "the count is missing".
+pub(crate) fn difference_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 difference".to_string()
+    } else {
+        format!("{count} differences")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::difference_count_label;
+
+    #[test]
+    fn difference_count_label_is_singular_only_at_one() {
+        assert_eq!(difference_count_label(0), "0 differences");
+        assert_eq!(difference_count_label(1), "1 difference");
+        assert_eq!(difference_count_label(2), "2 differences");
+        assert_eq!(difference_count_label(17), "17 differences");
     }
 }

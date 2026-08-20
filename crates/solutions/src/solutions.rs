@@ -10,6 +10,7 @@ mod event_sources;
 pub mod folder_name;
 pub mod git;
 pub mod mcp;
+pub mod member_repository;
 pub mod migrate;
 mod model;
 pub mod path_migrations;
@@ -27,6 +28,10 @@ pub use cache::{default_cache_root, refresh_cache};
 pub use event_sources::install as install_event_sources_for_test;
 pub use folder_name::FolderNameError;
 pub use folder_name::derive as derive_folder_name;
+pub use member_repository::{
+    active_member_repositories, active_member_repository, active_member_context,
+    repositories_under, set_active_member_repository,
+};
 pub use model::{CatalogId, CatalogProject, MemberId, Solution, SolutionId, SolutionMember};
 pub use settings::{BranchProtectionMember, BranchProtectionSettings, SolutionsSettings};
 pub use store::{

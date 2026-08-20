@@ -27,6 +27,25 @@
 
 use super::*;
 
+/// Left padding of a section header row (`Changes` / `Untracked` /
+/// `Conflicts`). Headers are the outermost level, so they get the bare row
+/// padding.
+fn header_row_padding() -> Pixels {
+    px(ROW_LEFT_PADDING)
+}
+
+/// Left padding of a row *inside* a section — a directory or a file, at tree
+/// `depth` (always 0 in flat mode). Section content is stepped in from its
+/// header by `SECTION_CONTENT_INDENT` so that a depth-0 file doesn't line up
+/// flush with the header it belongs to.
+///
+/// `INDENT_GUIDE_LEFT_OFFSET` is derived from the same constants and has to
+/// keep matching this: the guides are positioned in the list's coordinate
+/// space rather than inheriting a row's padding.
+fn content_row_padding(depth: usize) -> Pixels {
+    px(ROW_LEFT_PADDING + SECTION_CONTENT_INDENT + depth as f32 * TREE_INDENT)
+}
+
 impl GitPanel {
     pub(super) fn update_visible_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path_style = self.project.read(cx).path_style(cx);
@@ -35,8 +54,9 @@ impl GitPanel {
             .as_ref()
             .and_then(|op| self.entry_by_path(&op.anchor));
 
-        self.active_repository = self.project.read(cx).active_repository(cx);
-        // Phase 3: let the solution selector override the active repo.
+        // Phase 3: inside a Solution the active member's repository wins over
+        // the project-wide default (which follows whichever buffer was focused
+        // last); outside one this still lands on the project default.
         self.refresh_active_repository_for_selector(cx);
         // S-PCH-HK — pick up the per-repo pre-commit config when the
         // active repository changes (cheap no-op when unchanged).
@@ -531,7 +551,7 @@ impl GitPanel {
             .group(group_name)
             .h(self.list_item_height())
             .w_full()
-            .pl(px(ROW_LEFT_PADDING))
+            .pl(header_row_padding())
             .pr_1()
             .gap_1p5()
             .border_1()
@@ -583,7 +603,10 @@ impl GitPanel {
                             }),
                     ),
             )
-            .child(Label::new(header.title()).size(LabelSize::Small))
+            // Same size as the file names below it (`entry_label`): this is the
+            // section's name, not an annotation. The "N files" count next to it
+            // stays small and muted.
+            .child(Label::new(header.title()))
             .child(
                 Label::new(file_count_label(count))
                     .color(Color::Muted)
@@ -726,7 +749,7 @@ impl GitPanel {
             .id(id)
             .h(self.list_item_height())
             .w_full()
-            .pl(px(ROW_LEFT_PADDING + depth as f32 * TREE_INDENT))
+            .pl(content_row_padding(depth))
             .pr_1()
             .gap_1p5()
             .border_1()
@@ -893,7 +916,7 @@ impl GitPanel {
             .h(self.list_item_height())
             .min_w_0()
             .w_full()
-            .pl(px(ROW_LEFT_PADDING + entry.depth as f32 * TREE_INDENT))
+            .pl(content_row_padding(entry.depth))
             .pr_1()
             .gap_1p5()
             .border_1()
@@ -1391,13 +1414,13 @@ mod tests {
         init_test(cx);
         let (panel, mut cx) = sectioned_panel(cx).await;
 
-        // Flat mode still groups into Tracked / Untracked sections; every file
+        // Flat mode still groups into Changes / Untracked sections; every file
         // is one row, with no directory rows in between.
         panel.read_with(&cx, |panel, _| {
             assert_eq!(
                 visible_rows(panel),
                 vec![
-                    "[Tracked]",
+                    "[Changes]",
                     "src/lib.rs",
                     "src/main.rs",
                     "[Untracked]",
@@ -1414,7 +1437,7 @@ mod tests {
             assert_eq!(
                 visible_rows(panel),
                 vec![
-                    "[Tracked]",
+                    "[Changes]",
                     "dir src",
                     "  lib.rs",
                     "  main.rs",
@@ -1462,7 +1485,7 @@ mod tests {
             assert_eq!(
                 visible_rows(panel),
                 vec![
-                    "[Tracked]",
+                    "[Changes]",
                     "[Untracked]",
                     "dir docs",
                     "  readme.md",
@@ -1478,7 +1501,7 @@ mod tests {
         });
 
         panel.read_with(&cx, |panel, _| {
-            assert_eq!(visible_rows(panel), vec!["[Tracked]", "[Untracked]"]);
+            assert_eq!(visible_rows(panel), vec!["[Changes]", "[Untracked]"]);
         });
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -1490,7 +1513,7 @@ mod tests {
             assert_eq!(
                 visible_rows(panel),
                 vec![
-                    "[Tracked]",
+                    "[Changes]",
                     "dir src",
                     "  lib.rs",
                     "  main.rs",
@@ -1641,6 +1664,80 @@ mod tests {
                 }))
             ));
         });
+    }
+
+    /// Each visible row paired with the left padding it is rendered with, in
+    /// pixels. Calls the very functions the row renderers call, so the
+    /// assertions below track the real layout instead of a copy of it.
+    fn visible_row_paddings(panel: &GitPanel) -> Vec<(String, f32)> {
+        let entries = panel
+            .visible_indices
+            .iter()
+            .filter_map(|&ix| panel.entries.get(ix));
+        visible_rows(panel)
+            .into_iter()
+            .zip(entries)
+            .map(|(label, entry)| {
+                let padding = match entry {
+                    GitListEntry::Header(_) => header_row_padding(),
+                    _ => content_row_padding(entry.depth()),
+                };
+                (label, f32::from(padding))
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_section_content_is_indented_under_its_header(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (panel, mut cx) = sectioned_panel(cx).await;
+
+        let header = ROW_LEFT_PADDING;
+        let depth_0 = ROW_LEFT_PADDING + SECTION_CONTENT_INDENT;
+        let depth_1 = depth_0 + TREE_INDENT;
+        assert!(
+            depth_0 > header,
+            "section content must step in from its header"
+        );
+
+        // Flat mode has no directory rows, but its files are still section
+        // content and still step in.
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                visible_row_paddings(panel),
+                vec![
+                    ("[Changes]".to_string(), header),
+                    ("src/lib.rs".to_string(), depth_0),
+                    ("src/main.rs".to_string(), depth_0),
+                    ("[Untracked]".to_string(), header),
+                    ("docs/readme.md".to_string(), depth_0),
+                    ("new.txt".to_string(), depth_0),
+                ]
+            );
+        });
+
+        set_tree_view(&mut cx, true);
+
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                visible_row_paddings(panel),
+                vec![
+                    ("[Changes]".to_string(), header),
+                    ("dir src".to_string(), depth_0),
+                    ("  lib.rs".to_string(), depth_1),
+                    ("  main.rs".to_string(), depth_1),
+                    ("[Untracked]".to_string(), header),
+                    ("dir docs".to_string(), depth_0),
+                    ("  readme.md".to_string(), depth_1),
+                    ("new.txt".to_string(), depth_0),
+                ]
+            );
+        });
+
+        // The depth-0 indent guide is drawn in the list's coordinate space, so
+        // it has to land on the chevron column of the depth-0 *content* rows
+        // (7px into the 14px chevron), not on the header's.
+        assert_eq!(INDENT_GUIDE_LEFT_OFFSET, depth_0 + 7.0);
     }
 
     /// Index into `entries` of the row for `path`, whether it is a flat or a

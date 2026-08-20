@@ -3,10 +3,11 @@ use crate::{
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
     soft_wrap_button,
+    solo_diff_view::{HunkCountCache, difference_count_label},
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
-use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
+use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
@@ -17,10 +18,7 @@ use editor::{
 use futures_lite::future::yield_now;
 use git::repository::DiffType;
 
-use git::{
-    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext, repository::RepoPath,
-    status::FileStatus,
-};
+use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter,
     FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions,
@@ -89,6 +87,7 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    hunk_count_cache: HunkCountCache,
     _task: Task<Result<()>>,
     _subscription: Subscription,
     _store_subscription: Option<Subscription>,
@@ -126,7 +125,7 @@ impl ProjectDiff {
     ) {
         telemetry::event!("Git Branch Diff Opened");
         let project = workspace.project().clone();
-        let Some(intended_repo) = crate::active_member_repository(&project, cx)
+        let Some(intended_repo) = solutions::active_member_repository(&project, cx)
             .or_else(|| project.read(cx).active_repository(cx))
         else {
             let workspace = cx.entity().downgrade();
@@ -171,7 +170,7 @@ impl ProjectDiff {
         cx: &mut Context<Workspace>,
     ) {
         let project = workspace.project().clone();
-        let Some(repository) = crate::active_member_repository(&project, cx)
+        let Some(repository) = solutions::active_member_repository(&project, cx)
             .or_else(|| project.read(cx).active_repository(cx))
         else {
             let workspace = cx.entity().downgrade();
@@ -346,7 +345,7 @@ impl ProjectDiff {
                 "Action"
             }
         );
-        let intended_repo = crate::active_member_repository(workspace.project(), cx)
+        let intended_repo = solutions::active_member_repository(workspace.project(), cx)
             .or_else(|| workspace.project().read(cx).active_repository(cx));
 
         let existing = workspace
@@ -568,7 +567,7 @@ impl ProjectDiff {
         // which resolves to the wrong member in a Solution window. Merge/branch-diff
         // views keep their explicitly chosen repo.
         if matches!(branch_diff.read(cx).diff_base(), DiffBase::Head) {
-            if let Some(repo) = crate::active_member_repository(&project, cx) {
+            if let Some(repo) = solutions::active_member_repository(&project, cx) {
                 branch_diff.update(cx, |branch_diff, cx| {
                     branch_diff.set_repo(Some(repo), cx);
                 });
@@ -695,7 +694,7 @@ impl ProjectDiff {
                     // Only the HEAD "Uncommitted Changes" view follows the active member;
                     // a branch-diff view is pinned to its explicitly chosen repo+base.
                     if matches!(this.branch_diff.read(cx).diff_base(), DiffBase::Head) {
-                        if let Some(repo) = crate::active_member_repository(&this.project, cx) {
+                        if let Some(repo) = solutions::active_member_repository(&this.project, cx) {
                             this.branch_diff.update(cx, |branch_diff, cx| {
                                 branch_diff.set_repo(Some(repo), cx);
                             });
@@ -715,6 +714,7 @@ impl ProjectDiff {
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            hunk_count_cache: HunkCountCache::default(),
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -812,68 +812,17 @@ impl ProjectDiff {
         &self.editor
     }
 
-    fn button_states(&self, cx: &App) -> ButtonStates {
-        let editor = self.editor.read(cx).rhs_editor().read(cx);
+    /// Total number of diff hunks across every file currently in the
+    /// multibuffer.
+    ///
+    /// "The count" for this view is hunks-across-all-files rather than
+    /// files-changed: the view is one continuous scrollable list of hunks and
+    /// the toolbar's own prev/next arrows step across file boundaries, so this
+    /// is exactly the number of stops those arrows have. File-level counts are
+    /// already carried by the git panel and the per-file headers.
+    fn hunk_count(&self, cx: &App) -> usize {
         let snapshot = self.multibuffer.read(cx).snapshot(cx);
-        let prev_next = snapshot.diff_hunks().nth(1).is_some();
-        let mut selection = true;
-
-        let mut ranges = editor
-            .selections
-            .disjoint_anchor_ranges()
-            .collect::<Vec<_>>();
-        if !ranges.iter().any(|range| range.start != range.end) {
-            selection = false;
-            let anchor = editor.selections.newest_anchor().head();
-            if let Some((_, excerpt_range)) = snapshot.excerpt_containing(anchor..anchor)
-                && let Some(range) = snapshot
-                    .anchor_in_buffer(excerpt_range.context.start)
-                    .zip(snapshot.anchor_in_buffer(excerpt_range.context.end))
-                    .map(|(start, end)| start..end)
-            {
-                ranges = vec![range];
-            } else {
-                ranges = Vec::default();
-            };
-        }
-        let mut has_staged_hunks = false;
-        let mut has_unstaged_hunks = false;
-        for hunk in editor.diff_hunks_in_ranges(&ranges, &snapshot) {
-            match hunk.status.secondary {
-                DiffHunkSecondaryStatus::HasSecondaryHunk
-                | DiffHunkSecondaryStatus::SecondaryHunkAdditionPending => {
-                    has_unstaged_hunks = true;
-                }
-                DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk => {
-                    has_staged_hunks = true;
-                    has_unstaged_hunks = true;
-                }
-                DiffHunkSecondaryStatus::NoSecondaryHunk
-                | DiffHunkSecondaryStatus::SecondaryHunkRemovalPending => {
-                    has_staged_hunks = true;
-                }
-            }
-        }
-        let mut stage_all = false;
-        let mut unstage_all = false;
-        self.workspace
-            .read_with(cx, |workspace, cx| {
-                if let Some(git_panel) = workspace.panel::<GitPanel>(cx) {
-                    let git_panel = git_panel.read(cx);
-                    stage_all = git_panel.can_stage_all();
-                    unstage_all = git_panel.can_unstage_all();
-                }
-            })
-            .ok();
-
-        ButtonStates {
-            stage: has_unstaged_hunks,
-            unstage: has_staged_hunks,
-            prev_next,
-            selection,
-            stage_all,
-            unstage_all,
-        }
+        self.hunk_count_cache.count(&snapshot)
     }
 
     fn handle_editor_event(
@@ -1637,15 +1586,11 @@ mod persistence {
 
 pub struct ProjectDiffToolbar {
     project_diff: Option<WeakEntity<ProjectDiff>>,
-    workspace: WeakEntity<Workspace>,
 }
 
 impl ProjectDiffToolbar {
-    pub fn new(workspace: &Workspace, _: &mut Context<Self>) -> Self {
-        Self {
-            project_diff: None,
-            workspace: workspace.weak_handle(),
-        }
+    pub fn new(_: &mut Context<Self>) -> Self {
+        Self { project_diff: None }
     }
 
     fn project_diff(&self, _: &App) -> Option<Entity<ProjectDiff>> {
@@ -1660,31 +1605,6 @@ impl ProjectDiffToolbar {
         cx.defer(move |cx| {
             cx.dispatch_action(action.as_ref());
         })
-    }
-
-    fn stage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.workspace
-            .update(cx, |workspace, cx| {
-                if let Some(panel) = workspace.panel::<GitPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel.stage_all(&Default::default(), window, cx);
-                    });
-                }
-            })
-            .ok();
-    }
-
-    fn unstage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.workspace
-            .update(cx, |workspace, cx| {
-                let Some(panel) = workspace.panel::<GitPanel>(cx) else {
-                    return;
-                };
-                panel.update(cx, |panel, cx| {
-                    panel.unstage_all(&Default::default(), window, cx);
-                });
-            })
-            .ok();
     }
 }
 
@@ -1717,22 +1637,13 @@ impl ToolbarItemView for ProjectDiffToolbar {
     }
 }
 
-struct ButtonStates {
-    stage: bool,
-    unstage: bool,
-    prev_next: bool,
-    selection: bool,
-    stage_all: bool,
-    unstage_all: bool,
-}
-
 impl Render for ProjectDiffToolbar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(project_diff) = self.project_diff(cx) else {
             return div();
         };
         let focus_handle = project_diff.focus_handle(cx);
-        let button_states = project_diff.read(cx).button_states(cx);
+        let hunk_count = project_diff.read(cx).hunk_count(cx);
         let review_count = project_diff.read(cx).total_review_comment_count();
         let is_soft_wrap_enabled = project_diff
             .read(cx)
@@ -1746,57 +1657,6 @@ impl Render for ProjectDiffToolbar {
             .items_center()
             .flex_wrap()
             .justify_between()
-            .child(
-                h_group_sm()
-                    .when(button_states.selection, |el| {
-                        el.child(
-                            Button::new("stage", "Toggle Staged")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Toggle Staged",
-                                    &ToggleStaged,
-                                    &focus_handle,
-                                ))
-                                .disabled(!button_states.stage && !button_states.unstage)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&ToggleStaged, window, cx)
-                                })),
-                        )
-                    })
-                    .when(!button_states.selection, |el| {
-                        el.child(
-                            Button::new("stage", "Stage")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Stage and go to next hunk",
-                                    &StageAndNext,
-                                    &focus_handle,
-                                ))
-                                .disabled(
-                                    !button_states.prev_next
-                                        && !button_states.stage_all
-                                        && !button_states.unstage_all,
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&StageAndNext, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("unstage", "Unstage")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Unstage and go to next hunk",
-                                    &UnstageAndNext,
-                                    &focus_handle,
-                                ))
-                                .disabled(
-                                    !button_states.prev_next
-                                        && !button_states.stage_all
-                                        && !button_states.unstage_all,
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&UnstageAndNext, window, cx)
-                                })),
-                        )
-                    }),
-            )
             // n.b. the only reason these arrows are here is because we don't
             // support "undo" for staging so we need a way to go back.
             .child(
@@ -1809,7 +1669,7 @@ impl Render for ProjectDiffToolbar {
                                 &GoToPreviousHunk,
                                 &focus_handle,
                             ))
-                            .disabled(!button_states.prev_next)
+                            .disabled(hunk_count < 2)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dispatch_action(&GoToPreviousHunk, window, cx)
                             })),
@@ -1822,7 +1682,7 @@ impl Render for ProjectDiffToolbar {
                                 &GoToHunk,
                                 &focus_handle,
                             ))
-                            .disabled(!button_states.prev_next)
+                            .disabled(hunk_count < 2)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dispatch_action(&GoToHunk, window, cx)
                             })),
@@ -1832,58 +1692,6 @@ impl Render for ProjectDiffToolbar {
                             .shape(ui::IconButtonShape::Square)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dispatch_action(&ToggleSoftWrap, window, cx)
-                            })),
-                    ),
-            )
-            .child(vertical_divider())
-            .child(
-                h_group_sm()
-                    .when(
-                        button_states.unstage_all && !button_states.stage_all,
-                        |el| {
-                            el.child(
-                                Button::new("unstage-all", "Unstage All")
-                                    .tooltip(Tooltip::for_action_title_in(
-                                        "Unstage all changes",
-                                        &UnstageAll,
-                                        &focus_handle,
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.unstage_all(window, cx)
-                                    })),
-                            )
-                        },
-                    )
-                    .when(
-                        !button_states.unstage_all || button_states.stage_all,
-                        |el| {
-                            el.child(
-                                // todo make it so that changing to say "Unstaged"
-                                // doesn't change the position.
-                                div().child(
-                                    Button::new("stage-all", "Stage All")
-                                        .disabled(!button_states.stage_all)
-                                        .tooltip(Tooltip::for_action_title_in(
-                                            "Stage all changes",
-                                            &StageAll,
-                                            &focus_handle,
-                                        ))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.stage_all(window, cx)
-                                        })),
-                                ),
-                            )
-                        },
-                    )
-                    .child(
-                        Button::new("commit", "Commit")
-                            .tooltip(Tooltip::for_action_title_in(
-                                "Commit",
-                                &Commit,
-                                &focus_handle,
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dispatch_action(&Commit, window, cx);
                             })),
                     ),
             )
@@ -1897,6 +1705,11 @@ impl Render for ProjectDiffToolbar {
                     ),
                 )
             })
+            .child(
+                Label::new(difference_count_label(hunk_count))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
     }
 }
 
@@ -2093,6 +1906,15 @@ impl Render for BranchDiffToolbar {
                     ),
                 )
             })
+            // Same count the uncommitted-changes toolbar shows, for the same
+            // reason: it is how many stops the hunk arrows beside it have.
+            .child(
+                Label::new(difference_count_label(
+                    project_diff.read(cx).hunk_count(cx),
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
     }
 }
 
@@ -2313,7 +2135,7 @@ mod tests {
 
         let repo_dir = |cx: &mut TestAppContext| {
             cx.read(|cx| {
-                crate::active_member_repository(&project, cx)
+                solutions::active_member_repository(&project, cx)
                     .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
             })
         };
@@ -3349,5 +3171,65 @@ mod tests {
         let paths_b = diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
         assert_eq!(paths_b.len(), 1);
         assert_eq!(*paths_b[0], *"b.txt");
+    }
+
+    #[gpui::test]
+    async fn test_hunk_count_spans_every_file_in_the_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\nCHANGED\nthree\nfour\nfive\nsix\nseven\nCHANGED\nnine\n",
+                "b.txt": "B\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+
+        let head = [
+            (
+                "a.txt",
+                "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n".to_string(),
+            ),
+            ("b.txt", "b\n".to_string()),
+        ];
+        fs.set_head_for_repo(path!("/project/.git").as_ref(), &head, "deadbeef");
+        fs.set_index_for_repo(path!("/project/.git").as_ref(), &head);
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        // Two separated hunks in a.txt plus one in b.txt: the count is hunks
+        // across all files, not files changed.
+        let count = diff.read_with(cx, |diff, cx| diff.hunk_count(cx));
+        assert_eq!(count, 3);
+        assert_eq!(difference_count_label(count), "3 differences");
+
+        // Moving HEAD onto a.txt's working content leaves b.txt as the only
+        // change, so the label goes singular.
+        fs.set_head_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                (
+                    "a.txt",
+                    "one\nCHANGED\nthree\nfour\nfive\nsix\nseven\nCHANGED\nnine\n".to_string(),
+                ),
+                ("b.txt", "b\n".to_string()),
+            ],
+            "cafebabe",
+        );
+        cx.run_until_parked();
+
+        let count = diff.read_with(cx, |diff, cx| diff.hunk_count(cx));
+        assert_eq!(count, 1);
+        assert_eq!(difference_count_label(count), "1 difference");
     }
 }

@@ -13,8 +13,7 @@ use gpui::{
     IntoElement, ParentElement, Pixels, Render, Styled, Subscription, WeakEntity, Window, actions,
     div, px,
 };
-use project::Project;
-use project::git_store::{GitStore, GitStoreEvent, Repository, RepositoryId};
+use project::git_store::{GitStore, GitStoreEvent, RepositoryId};
 use ui::prelude::*;
 use workspace::{
     Workspace,
@@ -127,7 +126,7 @@ impl GitGraphPanel {
 
     fn resolve_active_repo_id(&self, cx: &App) -> Option<RepositoryId> {
         let project = self.workspace.upgrade()?.read(cx).project().clone();
-        let repo = active_member_repository(&project, cx)
+        let repo = solutions::active_member_repository(&project, cx)
             .or_else(|| project.read(cx).active_repository(cx))?;
         Some(repo.read(cx).id)
     }
@@ -149,35 +148,6 @@ impl GitGraphPanel {
         });
         cx.notify();
     }
-}
-
-/// The repository of the active Solution member, if any. Mirrors
-/// `git_ui::branch_picker::active_member_repository` /
-/// `title_bar::ProjectToolbar::active_member_repository` /
-/// `git_panel::refresh_active_repository_for_selector`: in a multi-member
-/// Solution all members share ONE `Project`, so `Project::active_repository`
-/// follows whichever repo the last-focused editor belongs to rather than the
-/// project the user selected in the tab strip. Returns `None` outside a
-/// Solution so callers fall back to `active_repository`.
-fn active_member_repository(project: &Entity<Project>, cx: &App) -> Option<Entity<Repository>> {
-    let store = solutions::SolutionStore::try_global(cx)?;
-    let store = store.read(cx);
-    let solution = project
-        .read(cx)
-        .worktrees(cx)
-        .find_map(|worktree| store.solution_for_path(&worktree.read(cx).abs_path()))?;
-    let member_id = store.active_member(solution.id)?;
-    let member = solution.member(member_id)?;
-    project
-        .read(cx)
-        .repositories(cx)
-        .values()
-        .find(|repo| {
-            repo.read(cx)
-                .work_directory_abs_path
-                .starts_with(&member.local_path)
-        })
-        .cloned()
 }
 
 impl Focusable for GitGraphPanel {

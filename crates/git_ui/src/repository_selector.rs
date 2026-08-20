@@ -39,42 +39,25 @@ impl RepositorySelector {
     ) -> Self {
         let git_store = project_handle.read(cx).git_store().clone();
 
-        // Resolve the active solution member's local path so we can scope the
-        // repository list to only that project. When there is no active solution
-        // (plain non-solution project) we fall back to listing all repos.
-        let active_member_path: Option<std::path::PathBuf> =
-            solutions::SolutionStore::try_global(cx).and_then(|store| {
-                let store = store.read(cx);
-                let solution = project_handle
-                    .read(cx)
-                    .worktrees(cx)
-                    .find_map(|wt| store.solution_for_path(&wt.read(cx).abs_path()))?;
-                let member_id = store.active_member(solution.id)?;
-                solution
-                    .member(member_id)
-                    .map(|member| member.local_path.clone())
-            });
-
-        let repository_entries = git_store.update(cx, |git_store, _cx| {
-            let mut repos: Vec<_> = git_store.repositories().values().cloned().collect();
-
-            if let Some(member_path) = active_member_path.as_ref() {
-                repos.retain(|repo| {
-                    repo.read(_cx)
-                        .work_directory_abs_path
-                        .starts_with(member_path)
-                });
-            }
-
-            repos.sort_by(|a, b| {
-                a.read(_cx)
+        // Inside a Solution the list is scoped to the active member and already
+        // ordered outermost-first by the shared resolver; the first entry is the
+        // member's own repository and anything vendored inside it follows. A
+        // plain (non-Solution) project has no member scope, so list every repo.
+        let mut repository_entries = solutions::active_member_repositories(&project_handle, cx);
+        if repository_entries.is_empty() {
+            repository_entries = git_store
+                .read(cx)
+                .repositories()
+                .values()
+                .cloned()
+                .collect();
+            repository_entries.sort_by(|left, right| {
+                left.read(cx)
                     .display_name()
                     .to_lowercase()
-                    .cmp(&b.read(_cx).display_name().to_lowercase())
+                    .cmp(&right.read(cx).display_name().to_lowercase())
             });
-
-            repos
-        });
+        }
         let filtered_repositories = repository_entries.clone();
 
         let widest_item_ix = repository_entries.iter().position_max_by(|a, b| {
@@ -91,6 +74,7 @@ impl RepositorySelector {
             .unwrap_or(0);
         let delegate = RepositorySelectorDelegate {
             repository_selector: cx.entity().downgrade(),
+            project: project_handle,
             repository_entries,
             filtered_repositories,
             active_repository,
@@ -160,6 +144,7 @@ impl ModalView for RepositorySelector {}
 
 pub struct RepositorySelectorDelegate {
     repository_selector: WeakEntity<RepositorySelector>,
+    project: Entity<Project>,
     repository_entries: Vec<Entity<Repository>>,
     filtered_repositories: Vec<Entity<Repository>>,
     active_repository: Option<Entity<Repository>>,
@@ -266,9 +251,11 @@ impl PickerDelegate for RepositorySelectorDelegate {
         let Some(selected_repo) = self.filtered_repositories.get(self.selected_index) else {
             return;
         };
-        selected_repo.update(cx, |selected_repo, cx| {
-            selected_repo.set_as_active_repository(cx)
-        });
+        // Route through the shared setter: it records the pick for the active
+        // Solution member (so every git surface resolves to it, not just this
+        // `GitStore` session) and then sets it as the active repository.
+        let selected_repo = selected_repo.clone();
+        solutions::set_active_member_repository(&self.project, &selected_repo, cx);
         self.dismissed(window, cx);
     }
 
