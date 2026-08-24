@@ -29,7 +29,7 @@ pub use event_sources::install as install_event_sources_for_test;
 pub use folder_name::FolderNameError;
 pub use folder_name::derive as derive_folder_name;
 pub use member_repository::{
-    active_member_repositories, active_member_repository, active_member_context,
+    active_member_context, active_member_repositories, active_member_repository,
     repositories_under, set_active_member_repository,
 };
 pub use model::{CatalogId, CatalogProject, MemberId, Solution, SolutionId, SolutionMember};

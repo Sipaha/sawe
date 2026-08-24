@@ -1,4 +1,3 @@
-
 use super::*;
 use gpui::{AppContext, TestAppContext};
 use std::sync::Arc;

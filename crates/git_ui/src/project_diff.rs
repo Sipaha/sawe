@@ -1909,11 +1909,9 @@ impl Render for BranchDiffToolbar {
             // Same count the uncommitted-changes toolbar shows, for the same
             // reason: it is how many stops the hunk arrows beside it have.
             .child(
-                Label::new(difference_count_label(
-                    project_diff.read(cx).hunk_count(cx),
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+                Label::new(difference_count_label(project_diff.read(cx).hunk_count(cx)))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
             )
     }
 }

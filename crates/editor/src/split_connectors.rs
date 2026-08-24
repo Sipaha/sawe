@@ -132,7 +132,13 @@ fn layout_ribbons(
             left_bottom,
             right_top,
             right_bottom,
-        } = ribbon_edges(&connector, bounds.top(), lhs_scroll_top, rhs_scroll_top, line_height);
+        } = ribbon_edges(
+            &connector,
+            bounds.top(),
+            lhs_scroll_top,
+            rhs_scroll_top,
+            line_height,
+        );
 
         if left_top.min(right_top) > bounds.bottom() || left_bottom.max(right_bottom) < bounds.top()
         {

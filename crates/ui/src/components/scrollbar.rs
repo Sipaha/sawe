@@ -200,14 +200,12 @@ where
 
     let mut div = div
         .when_some(state.read(cx).handle_to_track(), |this, handle| {
-            this.track_scroll(handle).when_some(
-                state.read(cx).visible_axes(),
-                |this, axes| match axes {
+            this.track_scroll(handle)
+                .when_some(state.read(cx).visible_axes(), |this, axes| match axes {
                     ScrollAxes::Horizontal => this.overflow_x_scroll(),
                     ScrollAxes::Vertical => this.overflow_y_scroll(),
                     ScrollAxes::Both => this.overflow_scroll(),
-                },
-            )
+                })
         })
         .when_some(
             state
@@ -1771,7 +1769,10 @@ mod tests {
                 viewport.origin.y + SCROLLBAR_PADDING,
                 "track must hug the viewport at offset {offset:?}, not slide with the content"
             );
-            assert_eq!(track.size.height, viewport.size.height - 2. * SCROLLBAR_PADDING);
+            assert_eq!(
+                track.size.height,
+                viewport.size.height - 2. * SCROLLBAR_PADDING
+            );
             assert_eq!(
                 thumb.size.height,
                 px(48.),
@@ -1846,7 +1847,6 @@ mod tests {
             "at the end of the content the thumb must sit at the end of the track"
         );
     }
-
 
     /// Probe: the real panel nests the capped region under `h_full()` +
     /// `flex_basis(relative(..))` ancestors rather than a fixed height. If any

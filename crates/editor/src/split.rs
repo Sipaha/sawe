@@ -2893,7 +2893,8 @@ mod tests {
         let (lhs_snapshot, rhs_snapshot) = editor.update(cx, |editor, cx| {
             let lhs = editor.lhs.as_ref().expect("should have split");
             (
-                lhs.editor.update(cx, |editor, cx| editor.display_snapshot(cx)),
+                lhs.editor
+                    .update(cx, |editor, cx| editor.display_snapshot(cx)),
                 editor
                     .rhs_editor
                     .update(cx, |editor, cx| editor.display_snapshot(cx)),

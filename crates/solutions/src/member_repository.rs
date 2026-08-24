@@ -138,5 +138,7 @@ pub fn set_active_member_repository(
 /// global across cases.
 #[cfg(any(test, feature = "test-support"))]
 pub fn clear_repository_choices_for_test(cx: &mut App) {
-    cx.default_global::<MemberRepositoryChoices>().by_member.clear();
+    cx.default_global::<MemberRepositoryChoices>()
+        .by_member
+        .clear();
 }

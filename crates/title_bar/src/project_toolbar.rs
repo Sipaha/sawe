@@ -179,8 +179,9 @@ impl ProjectToolbar {
                                     .trim_end_matches('/')
                                     .to_string(),
                             );
-                            let is_selected =
-                                selected.as_ref().is_some_and(|path| *path == work_directory);
+                            let is_selected = selected
+                                .as_ref()
+                                .is_some_and(|path| *path == work_directory);
                             menu = menu.toggleable_entry(
                                 label,
                                 is_selected,
@@ -605,7 +606,8 @@ mod tests {
     async fn test_resolution_falls_back_outside_a_solution(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(Path::new("/plain"), single_repo_tree()).await;
+        fs.insert_tree(Path::new("/plain"), single_repo_tree())
+            .await;
         fs.set_branch_name(Path::new("/plain/.git"), Some("main"));
         let project = Project::test(fs.clone(), [Path::new("/plain")], cx).await;
         cx.run_until_parked();

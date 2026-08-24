@@ -147,8 +147,8 @@ use gpui::{
     DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
     MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy, SharedString,
     StyleRefinement, Subscription, Task, TextStyleRefinement, UnderlineStyle,
-    UniformListScrollHandle, WeakEntity,
-    Window, actions, anchored, deferred, point, prelude::*, px, uniform_list,
+    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
+    px, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
@@ -162,10 +162,10 @@ use project::{
 };
 use project_panel::ProjectPanel;
 use project_panel::project_panel_settings::ProjectPanelSettings;
-use settings::Settings as _;
 use search::{
     SearchOption, SearchOptions, SearchSource, ToggleCaseSensitive, ToggleRegex, buffer_search,
 };
+use settings::Settings as _;
 use smallvec::{SmallVec, smallvec};
 use std::{
     ops::Range,
@@ -335,9 +335,7 @@ impl ChangedFileEntry {
                     )
                     .tooltip({
                         let meta = full_path;
-                        move |_, cx| {
-                            Tooltip::with_meta("Open Diff", None, meta.clone(), cx)
-                        }
+                        move |_, cx| Tooltip::with_meta("Open Diff", None, meta.clone(), cx)
                     })
                     // Single click only selects; the diff opens on double
                     // click, so walking the file list with the mouse does not
@@ -3607,20 +3605,16 @@ impl GitGraph {
             // container height, and inside this flex chain it does not, so the
             // constraint silently evaporated and a long commit message pushed
             // the file tree and itself out of the panel entirely.
-            .on_drag_move::<DraggedDetailSplitHandle>(cx.listener(
-                |this, event, window, cx| {
-                    this.commit_detail_split_state.update(cx, |state, cx| {
-                        state.on_drag_move(event, window, cx);
-                    });
-                },
-            ))
-            .on_drop::<DraggedDetailSplitHandle>(cx.listener(
-                |this, _event, _window, cx| {
-                    this.commit_detail_split_state.update(cx, |state, _cx| {
-                        state.commit_ratio();
-                    });
-                },
-            ))
+            .on_drag_move::<DraggedDetailSplitHandle>(cx.listener(|this, event, window, cx| {
+                this.commit_detail_split_state.update(cx, |state, cx| {
+                    state.on_drag_move(event, window, cx);
+                });
+            }))
+            .on_drop::<DraggedDetailSplitHandle>(cx.listener(|this, _event, _window, cx| {
+                this.commit_detail_split_state.update(cx, |state, _cx| {
+                    state.commit_ratio();
+                });
+            }))
             // Changed-files tree, headed by the file count and the diff stat.
             .child(
                 v_flex()
@@ -3683,8 +3677,7 @@ impl GitGraph {
                                 let repository = repository.downgrade();
                                 let workspace = self.workspace.clone();
                                 let graph = cx.weak_entity();
-                                let selected_changed_file =
-                                    self.selected_changed_file.clone();
+                                let selected_changed_file = self.selected_changed_file.clone();
                                 uniform_list(
                                     "changed-files-list",
                                     row_count,
@@ -3725,7 +3718,7 @@ impl GitGraph {
                             .vertical_scrollbar_for(&self.changed_files_scroll_handle, window, cx),
                     ),
             )
-                .child(self.render_commit_detail_resize_handle(cx))
+            .child(self.render_commit_detail_resize_handle(cx))
             // Full commit message. Capped rather than split 50/50 so a one-line
             // commit leaves the file tree the rest of the panel; longer
             // messages scroll inside the cap.
@@ -3752,8 +3745,8 @@ impl GitGraph {
                             // Ref decorations pointing *at* this commit, which
                             // IDEA shows next to the subject.
                             .children((!ref_names.is_empty()).then(|| {
-                                h_flex().w_full().gap_1().flex_wrap().children(ref_names.iter().map(
-                                    |name| {
+                                h_flex().w_full().gap_1().flex_wrap().children(
+                                    ref_names.iter().map(|name| {
                                         let is_head =
                                             Self::is_head_ref(name.as_ref(), &head_branch_name);
                                         self.render_chip(
@@ -3763,8 +3756,8 @@ impl GitGraph {
                                             Some(work_dir.as_path()),
                                             false,
                                         )
-                                    },
-                                ))
+                                    }),
+                                )
                             }))
                             .children(has_body.then(|| {
                                 div()
@@ -3786,12 +3779,10 @@ impl GitGraph {
                                     .gap_1p5()
                                     .items_start()
                                     .child(div().flex_shrink_0().pt_0p5().child(avatar))
-                                    .child(
-                                        div().flex_1().min_w_0().child(MarkdownElement::new(
-                                            detail_text.identity,
-                                            identity_style,
-                                        )),
-                                    ),
+                                    .child(div().flex_1().min_w_0().child(MarkdownElement::new(
+                                        detail_text.identity,
+                                        identity_style,
+                                    ))),
                             )
                             .children(branches_line.map(|line| {
                                 Label::new(line).size(LabelSize::Small).color(Color::Muted)
@@ -8046,7 +8037,10 @@ mod tests {
 
         // Half-way down a container spanning y 100..500 leaves 200px below the
         // cursor, and that is the message's height — not the tree's.
-        assert_eq!(DetailSplitState::height_at(px(300.), bounds), Some(px(200.)));
+        assert_eq!(
+            DetailSplitState::height_at(px(300.), bounds),
+            Some(px(200.))
+        );
         // Past either end both regions keep a usable sliver.
         assert_eq!(
             DetailSplitState::height_at(px(0.), bounds),

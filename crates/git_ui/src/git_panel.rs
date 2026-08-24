@@ -19,7 +19,6 @@ use editor::{EditorStyle, RewrapOptions};
 use file_icons::FileIcons;
 use futures::channel::oneshot::Canceled;
 use git::Oid;
-use std::str::FromStr as _;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
@@ -63,6 +62,7 @@ use solutions;
 use std::future::Future;
 use std::ops::Range;
 use std::path::Path;
+use std::str::FromStr as _;
 use std::{sync::Arc, time::Duration, usize};
 use strum::{IntoEnumIterator, VariantNames};
 use theme_settings::ThemeSettings;
@@ -7051,9 +7051,7 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(branch(unknown_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(unknown_upstream))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7061,9 +7059,9 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(branch(no_remote_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(
+                                    no_remote_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7071,9 +7069,9 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(branch(not_ahead_or_behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(
+                                    not_ahead_or_behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7081,9 +7079,7 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(branch(behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(behind_upstream))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7091,9 +7087,9 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(branch(ahead_of_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(
+                                    ahead_of_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7101,9 +7097,9 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(branch(ahead_and_behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(
+                                    ahead_and_behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                     ],
@@ -7120,9 +7116,10 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(custom("main", behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "main",
+                                    behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7130,12 +7127,10 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(custom(
-                                        "redesign-and-update-git-ui-list-entry-style",
-                                        behind_upstream,
-                                    )),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "redesign-and-update-git-ui-list-entry-style",
+                                    behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7143,9 +7138,10 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(custom("gpui", ahead_of_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "gpui",
+                                    ahead_of_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7153,12 +7149,10 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(custom(
-                                        "redesign-and-update-git-ui-list-entry-style",
-                                        behind_upstream,
-                                    )),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "redesign-and-update-git-ui-list-entry-style",
+                                    behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7166,9 +7160,10 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(custom("main", ahead_of_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "main",
+                                    ahead_of_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -7176,9 +7171,10 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    Some(custom("update-README", behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "update-README",
+                                    behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                     ],

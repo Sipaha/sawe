@@ -16,8 +16,8 @@ use rope::Rope;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use std::borrow::Cow;
 use text::LineEnding;
 
 use std::collections::HashSet;

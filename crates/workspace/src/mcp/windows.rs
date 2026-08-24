@@ -655,10 +655,7 @@ impl McpServerTool for ClickAtTool {
         })?;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
-                text: format!(
-                    "click at ({}, {}) x{}",
-                    input.x, input.y, click_count
-                ),
+                text: format!("click at ({}, {}) x{}", input.x, input.y, click_count),
             }],
             structured_content: ClickAtResult { clicked },
         })

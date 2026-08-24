@@ -1,4 +1,3 @@
-
 //! R-5e enrichment coverage. These tests build a real `AcpThread`
 //! via the mock-agent test infra, push synthetic entries straight
 //! through the public `acp_thread` API, then call the MCP tools

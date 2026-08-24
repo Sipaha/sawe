@@ -5361,7 +5361,9 @@ impl EditorElement {
     fn git_column_width(gutter_dimensions: &GutterDimensions, line_height: Pixels) -> Pixels {
         Self::hunk_strip_inset(gutter_dimensions.mirrored, line_height)
             + Self::gutter_strip_width(line_height)
-            + gutter_dimensions.git_blame_entries_width.unwrap_or_default()
+            + gutter_dimensions
+                .git_blame_entries_width
+                .unwrap_or_default()
     }
 
     /// Marks, in the "before" pane of a split diff, the boundary at which the
@@ -10995,7 +10997,10 @@ mod tests {
             mirrored: true,
         };
         assert_eq!(mirrored.line_number_area(), px(8.)..px(40.));
-        assert_eq!(mirrored.indicator_code_edge(), mirrored.content_area_start());
+        assert_eq!(
+            mirrored.indicator_code_edge(),
+            mirrored.content_area_start()
+        );
 
         let x = GutterIndicatorColumn::CodeEdge.x(&mirrored, line_height, glyph);
         assert_eq!(x, px(24.));
@@ -11028,7 +11033,10 @@ mod tests {
         let colors = theme::ThemeColors::dark();
         let added = colors.version_control_added;
         let deleted = colors.version_control_deleted;
-        assert_ne!(added, deleted, "the fixture must be able to tell them apart");
+        assert_ne!(
+            added, deleted,
+            "the fixture must be able to tell them apart"
+        );
 
         assert_eq!(
             EditorElement::split_hunk_color(SplitSide::Left, true, &colors),
