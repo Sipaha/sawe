@@ -5751,6 +5751,29 @@ impl Repository {
         })
     }
 
+    /// "Compare Versions": the diff between two arbitrary revisions, `base`
+    /// (older) → `head` (newer). Unlike [`Self::load_commit_diff_against_parent`]
+    /// there is no first-parent diff to degrade to for collab repos — an
+    /// arbitrary revision pair has no proto message today, and answering with
+    /// some other commit's diff would be worse than failing — so remote
+    /// repositories report the gap instead.
+    pub fn load_commit_range(
+        &mut self,
+        base: String,
+        head: String,
+    ) -> oneshot::Receiver<Result<CommitDiff>> {
+        self.send_job("load_commit_range", None, move |git_repo, cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.load_commit_range(base, head, cx).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("comparing two revisions is only supported locally")
+                }
+            }
+        })
+    }
+
     pub fn file_history_changed_files(
         &mut self,
         paths: Vec<RepoPath>,

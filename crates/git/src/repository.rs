@@ -1014,6 +1014,20 @@ pub trait GitRepository: Send + Sync {
         }
     }
 
+    /// Diff between two arbitrary revisions, `base` (older) → `head` (newer).
+    fn load_commit_range(
+        &self,
+        base: String,
+        head: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        let _ = (base, head, cx);
+        future::ready(Err(anyhow!(
+            "load_commit_range not supported on this backend"
+        )))
+        .boxed()
+    }
+
     /// Local branches (and remote-tracking branches if there's no
     /// `--list` filter) that contain the given commit. Empty when the
     /// commit is unreachable.
@@ -1611,104 +1625,7 @@ impl GitRepository for RealGitRepository {
             let changes = parse_git_diff_name_status(&show_stdout);
             let parent_sha = format!("{}^", commit);
 
-            let mut cat_file_process = git
-                .build_command(&["cat-file", "--batch=%(objectsize)"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("starting git cat-file process")?;
-
-            let mut files = Vec::<CommitFile>::new();
-            let mut stdin = BufWriter::with_capacity(512, cat_file_process.stdin.take().unwrap());
-            let mut stdout = BufReader::new(cat_file_process.stdout.take().unwrap());
-            let mut info_line = String::new();
-            let mut newline = [b'\0'];
-            for (path, status_code) in changes {
-                // git-show outputs `/`-delimited paths even on Windows.
-                let Some(rel_path) = RelPath::unix(path).log_err() else {
-                    continue;
-                };
-
-                match status_code {
-                    StatusCode::Modified => {
-                        stdin.write_all(commit.as_bytes()).await?;
-                        stdin.write_all(b":").await?;
-                        stdin.write_all(path.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        stdin.write_all(parent_sha.as_bytes()).await?;
-                        stdin.write_all(b":").await?;
-                        stdin.write_all(path.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                    }
-                    StatusCode::Added => {
-                        stdin.write_all(commit.as_bytes()).await?;
-                        stdin.write_all(b":").await?;
-                        stdin.write_all(path.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                    }
-                    StatusCode::Deleted => {
-                        stdin.write_all(parent_sha.as_bytes()).await?;
-                        stdin.write_all(b":").await?;
-                        stdin.write_all(path.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                    }
-                    _ => continue,
-                }
-                stdin.flush().await?;
-
-                info_line.clear();
-                stdout.read_line(&mut info_line).await?;
-
-                let len = info_line.trim_end().parse().with_context(|| {
-                    format!("invalid object size output from cat-file {info_line}")
-                })?;
-                let mut text_bytes = vec![0; len];
-                stdout.read_exact(&mut text_bytes).await?;
-                stdout.read_exact(&mut newline).await?;
-
-                let mut old_text = None;
-                let mut new_text = None;
-                let mut is_binary = is_binary_content(&text_bytes);
-                let text = if is_binary {
-                    String::new()
-                } else {
-                    String::from_utf8_lossy(&text_bytes).to_string()
-                };
-
-                match status_code {
-                    StatusCode::Modified => {
-                        info_line.clear();
-                        stdout.read_line(&mut info_line).await?;
-                        let len = info_line.trim_end().parse().with_context(|| {
-                            format!("invalid object size output from cat-file {}", info_line)
-                        })?;
-                        let mut parent_bytes = vec![0; len];
-                        stdout.read_exact(&mut parent_bytes).await?;
-                        stdout.read_exact(&mut newline).await?;
-                        is_binary = is_binary || is_binary_content(&parent_bytes);
-                        if is_binary {
-                            old_text = Some(String::new());
-                            new_text = Some(String::new());
-                        } else {
-                            old_text = Some(String::from_utf8_lossy(&parent_bytes).to_string());
-                            new_text = Some(text);
-                        }
-                    }
-                    StatusCode::Added => new_text = Some(text),
-                    StatusCode::Deleted => old_text = Some(text),
-                    _ => continue,
-                }
-
-                files.push(CommitFile {
-                    path: RepoPath(Arc::from(rel_path)),
-                    old_text,
-                    new_text,
-                    is_binary,
-                })
-            }
-
-            Ok(CommitDiff { files })
+            collect_commit_diff_files(&git, changes, &parent_sha, &commit).await
         })
         .boxed()
     }
@@ -3369,103 +3286,41 @@ impl GitRepository for RealGitRepository {
             let show_stdout = String::from_utf8_lossy(&show_output.stdout);
             let changes = parse_git_diff_name_status(&show_stdout);
 
-            let mut cat_file_process = git
-                .build_command(&["cat-file", "--batch=%(objectsize)"])
-                .stdin(Stdio::piped())
+            collect_commit_diff_files(&git, changes, &parent_ref, &commit).await
+        })
+        .boxed()
+    }
+
+    fn load_commit_range(
+        &self,
+        base: String,
+        head: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        let git = self.git_binary();
+        cx.background_spawn(async move {
+            let diff_output = git
+                .build_command(&["diff", "--name-status", "-z", "--no-renames"])
+                .arg(&base)
+                .arg(&head)
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()
-                .context("starting git cat-file process")?;
-
-            let mut files = Vec::<CommitFile>::new();
-            let mut stdin = BufWriter::with_capacity(512, cat_file_process.stdin.take().unwrap());
-            let mut stdout = BufReader::new(cat_file_process.stdout.take().unwrap());
-            let mut info_line = String::new();
-            let mut newline = [b'\0'];
-            for (path, status_code) in changes {
-                let Some(rel_path) = RelPath::unix(path).log_err() else {
-                    continue;
-                };
-
-                match status_code {
-                    StatusCode::Modified => {
-                        stdin.write_all(commit.as_bytes()).await?;
-                        stdin.write_all(b":").await?;
-                        stdin.write_all(path.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        stdin.write_all(parent_ref.as_bytes()).await?;
-                        stdin.write_all(b":").await?;
-                        stdin.write_all(path.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                    }
-                    StatusCode::Added => {
-                        stdin.write_all(commit.as_bytes()).await?;
-                        stdin.write_all(b":").await?;
-                        stdin.write_all(path.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                    }
-                    StatusCode::Deleted => {
-                        stdin.write_all(parent_ref.as_bytes()).await?;
-                        stdin.write_all(b":").await?;
-                        stdin.write_all(path.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                    }
-                    _ => continue,
-                }
-                stdin.flush().await?;
-
-                info_line.clear();
-                stdout.read_line(&mut info_line).await?;
-
-                let len = info_line.trim_end().parse().with_context(|| {
-                    format!("invalid object size output from cat-file {info_line}")
-                })?;
-                let mut text_bytes = vec![0; len];
-                stdout.read_exact(&mut text_bytes).await?;
-                stdout.read_exact(&mut newline).await?;
-
-                let mut old_text = None;
-                let mut new_text = None;
-                let mut is_binary = is_binary_content(&text_bytes);
-                let text = if is_binary {
-                    String::new()
-                } else {
-                    String::from_utf8_lossy(&text_bytes).to_string()
-                };
-
-                match status_code {
-                    StatusCode::Modified => {
-                        info_line.clear();
-                        stdout.read_line(&mut info_line).await?;
-                        let len = info_line.trim_end().parse().with_context(|| {
-                            format!("invalid object size output from cat-file {}", info_line)
-                        })?;
-                        let mut parent_bytes = vec![0; len];
-                        stdout.read_exact(&mut parent_bytes).await?;
-                        stdout.read_exact(&mut newline).await?;
-                        is_binary = is_binary || is_binary_content(&parent_bytes);
-                        if is_binary {
-                            old_text = Some(String::new());
-                            new_text = Some(String::new());
-                        } else {
-                            old_text = Some(String::from_utf8_lossy(&parent_bytes).to_string());
-                            new_text = Some(text);
-                        }
-                    }
-                    StatusCode::Added => new_text = Some(text),
-                    StatusCode::Deleted => old_text = Some(text),
-                    _ => continue,
-                }
-
-                files.push(CommitFile {
-                    path: RepoPath(Arc::from(rel_path)),
-                    old_text,
-                    new_text,
-                    is_binary,
-                });
+                .output()
+                .await
+                .context("starting git diff process")?;
+            if !diff_output.status.success() {
+                bail!(
+                    "git diff {} {} failed: {}",
+                    base,
+                    head,
+                    String::from_utf8_lossy(&diff_output.stderr).trim_end()
+                );
             }
+            let diff_stdout = String::from_utf8_lossy(&diff_output.stdout);
+            let changes = parse_git_diff_name_status(&diff_stdout);
 
-            Ok(CommitDiff { files })
+            collect_commit_diff_files(&git, changes, &base, &head).await
         })
         .boxed()
     }
@@ -4048,6 +3903,119 @@ fn parse_shortlog_output(stdout: &str) -> Vec<AuthorHistoryEntry> {
         });
     }
     entries
+}
+
+/// Shared blob-loading half of the `CommitDiff` loaders: for each entry of a
+/// `--name-status -z --no-renames` listing, pull the "before" blob from
+/// `old_rev:<path>` and the "after" blob from `new_rev:<path>` through a single
+/// long-lived `git cat-file --batch` process. `old_rev`/`new_rev` are whatever
+/// the caller diffed (`<sha>^`/`<sha>` for a commit, two arbitrary revisions for
+/// a range), so this stays agnostic about how the listing was produced.
+async fn collect_commit_diff_files<'a>(
+    git: &GitBinary,
+    changes: impl Iterator<Item = (&'a str, StatusCode)>,
+    old_rev: &str,
+    new_rev: &str,
+) -> Result<CommitDiff> {
+    let mut cat_file_process = git
+        .build_command(&["cat-file", "--batch=%(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting git cat-file process")?;
+
+    let mut files = Vec::<CommitFile>::new();
+    let mut stdin = BufWriter::with_capacity(512, cat_file_process.stdin.take().unwrap());
+    let mut stdout = BufReader::new(cat_file_process.stdout.take().unwrap());
+    let mut info_line = String::new();
+    let mut newline = [b'\0'];
+    for (path, status_code) in changes {
+        // git outputs `/`-delimited paths even on Windows.
+        let Some(rel_path) = RelPath::unix(path).log_err() else {
+            continue;
+        };
+
+        match status_code {
+            StatusCode::Modified => {
+                stdin.write_all(new_rev.as_bytes()).await?;
+                stdin.write_all(b":").await?;
+                stdin.write_all(path.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.write_all(old_rev.as_bytes()).await?;
+                stdin.write_all(b":").await?;
+                stdin.write_all(path.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+            }
+            StatusCode::Added => {
+                stdin.write_all(new_rev.as_bytes()).await?;
+                stdin.write_all(b":").await?;
+                stdin.write_all(path.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+            }
+            StatusCode::Deleted => {
+                stdin.write_all(old_rev.as_bytes()).await?;
+                stdin.write_all(b":").await?;
+                stdin.write_all(path.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+            }
+            _ => continue,
+        }
+        stdin.flush().await?;
+
+        info_line.clear();
+        stdout.read_line(&mut info_line).await?;
+
+        let len = info_line
+            .trim_end()
+            .parse()
+            .with_context(|| format!("invalid object size output from cat-file {info_line}"))?;
+        let mut text_bytes = vec![0; len];
+        stdout.read_exact(&mut text_bytes).await?;
+        stdout.read_exact(&mut newline).await?;
+
+        let mut old_text = None;
+        let mut new_text = None;
+        let mut is_binary = is_binary_content(&text_bytes);
+        let text = if is_binary {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&text_bytes).to_string()
+        };
+
+        match status_code {
+            StatusCode::Modified => {
+                info_line.clear();
+                stdout.read_line(&mut info_line).await?;
+                let len = info_line.trim_end().parse().with_context(|| {
+                    format!("invalid object size output from cat-file {}", info_line)
+                })?;
+                let mut parent_bytes = vec![0; len];
+                stdout.read_exact(&mut parent_bytes).await?;
+                stdout.read_exact(&mut newline).await?;
+                is_binary = is_binary || is_binary_content(&parent_bytes);
+                if is_binary {
+                    old_text = Some(String::new());
+                    new_text = Some(String::new());
+                } else {
+                    old_text = Some(String::from_utf8_lossy(&parent_bytes).to_string());
+                    new_text = Some(text);
+                }
+            }
+            StatusCode::Added => new_text = Some(text),
+            StatusCode::Deleted => old_text = Some(text),
+            _ => continue,
+        }
+
+        files.push(CommitFile {
+            path: RepoPath(Arc::from(rel_path)),
+            old_text,
+            new_text,
+            is_binary,
+        })
+    }
+
+    Ok(CommitDiff { files })
 }
 
 async fn run_commit_data_reader(
@@ -6340,6 +6308,109 @@ mod tests {
             "patch-id should be hex, got {patch_id:?}"
         );
         assert!(!patch_id.is_empty(), "patch-id should be non-empty");
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn git_rev_parse(working_directory: &Path, revision: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", revision])
+            .current_dir(working_directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .output()
+            .expect("failed to run git rev-parse");
+        assert!(
+            output.status.success(),
+            "git rev-parse {revision} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git rev-parse emitted non-utf8")
+            .trim()
+            .to_owned()
+    }
+
+    #[gpui::test]
+    async fn test_load_commit_range_spans_intermediate_commits(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let modified_path = repo_dir.path().join("modified.txt");
+        let added_path = repo_dir.path().join("added.txt");
+        let deleted_path = repo_dir.path().join("deleted.txt");
+
+        smol::fs::write(&modified_path, "one\n").await.unwrap();
+        smol::fs::write(&deleted_path, "gone\n").await.unwrap();
+        git_command(repo_dir.path(), ["add", "modified.txt", "deleted.txt"]);
+        git_commit_all_as(repo_dir.path(), "Author", "first");
+        let first_sha = git_rev_parse(repo_dir.path(), "HEAD");
+
+        // Second commit both adds a brand-new file and edits an existing one;
+        // neither change is visible in the third commit's own diff.
+        smol::fs::write(&added_path, "bee\n").await.unwrap();
+        smol::fs::write(&modified_path, "one\ntwo\n").await.unwrap();
+        git_command(repo_dir.path(), ["add", "added.txt"]);
+        git_commit_all_as(repo_dir.path(), "Author", "second");
+
+        smol::fs::write(&added_path, "bee\nbuzz\n").await.unwrap();
+        smol::fs::remove_file(&deleted_path).await.unwrap();
+        git_commit_all_as(repo_dir.path(), "Author", "third");
+        let third_sha = git_rev_parse(repo_dir.path(), "HEAD");
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let diff = repository
+            .load_commit_range(first_sha, third_sha.clone(), cx.to_async())
+            .await
+            .unwrap();
+        let files: HashMap<_, _> = diff
+            .files
+            .iter()
+            .map(|file| (file.path.as_unix_str().to_owned(), file))
+            .collect();
+        assert_eq!(
+            files.len(),
+            3,
+            "expected the union of both commits' changes, got {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+
+        let modified = files["modified.txt"];
+        assert_eq!(modified.old_text.as_deref(), Some("one\n"));
+        assert_eq!(modified.new_text.as_deref(), Some("one\ntwo\n"));
+        assert!(!modified.is_binary);
+
+        // Added in the second commit, edited again in the third: the range
+        // must report it as an addition carrying the final text.
+        let added = files["added.txt"];
+        assert_eq!(added.old_text, None);
+        assert_eq!(added.new_text.as_deref(), Some("bee\nbuzz\n"));
+
+        let deleted = files["deleted.txt"];
+        assert_eq!(deleted.old_text.as_deref(), Some("gone\n"));
+        assert_eq!(deleted.new_text, None);
+
+        let last_commit_only = repository
+            .load_commit(third_sha, cx.to_async())
+            .await
+            .unwrap();
+        let last_commit_paths: Vec<_> = last_commit_only
+            .files
+            .iter()
+            .map(|file| file.path.as_unix_str().to_owned())
+            .collect();
+        assert!(
+            !last_commit_paths.contains(&"modified.txt".to_owned()),
+            "sanity check: the range must be wider than the head commit's own diff, got {last_commit_paths:?}"
+        );
     }
 
     impl RealGitRepository {
