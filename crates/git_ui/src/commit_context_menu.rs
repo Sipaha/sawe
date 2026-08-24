@@ -1118,6 +1118,22 @@ impl NameInputModal {
         }
     }
 
+    /// Seed the input with text the user is expected to edit rather than
+    /// replace (the squash prompt starts from the surviving commit's
+    /// subject). The name prompts leave it empty and show a placeholder.
+    fn with_initial_text(
+        self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Self {
+        self.editor.update(cx, |editor, cx| {
+            editor.set_text(text, window, cx);
+            editor.select_all(&Default::default(), window, cx);
+        });
+        self
+    }
+
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut gpui::Context<Self>) {
         cx.emit(DismissEvent);
     }
@@ -1199,4 +1215,136 @@ fn run_create_patch(ctx: CommitContext, range_to_head: bool, window: &mut Window
         None
     };
     patch_handler::create_patch_action(ctx.workspace, work_dir, sha, sha_to, window, cx);
+}
+
+/// Context for the menu that opens when more than one commit is selected
+/// in the graph (IDEA's multi-select commit menu).
+#[derive(Clone)]
+pub struct MultiCommitContext {
+    pub workspace: WeakEntity<Workspace>,
+    pub repository: Entity<Repository>,
+    /// Selected commits, **oldest first** — the order `SquashOp` wants and
+    /// the order "Compare Versions" reads its base/head from.
+    pub shas: Vec<SharedString>,
+    /// Subjects parallel to `shas`; empty where the commit data has not
+    /// loaded yet.
+    pub subjects: Vec<SharedString>,
+    pub work_dir: Option<PathBuf>,
+    /// Whether the selection is an unbroken first-parent chain. Squash
+    /// rewrites a contiguous range and nothing else, so a gapped
+    /// selection can only be offered as a disabled entry.
+    pub contiguous: bool,
+}
+
+/// The multi-selection counterpart to [`build_commit_context_menu`].
+///
+/// Entries that do not apply to the current selection are shown disabled
+/// rather than hidden, so the menu keeps one shape and the user can see
+/// *why* an action is unavailable (two commits for a comparison, an
+/// unbroken range for a squash).
+pub fn build_multi_commit_context_menu(
+    ctx: MultiCommitContext,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, move |menu, _window, _cx| {
+        let count = ctx.shas.len();
+        let compare_ctx = ctx.clone();
+        let squash_ctx = ctx.clone();
+        let copy_ctx = ctx.clone();
+
+        menu.header(format!("{count} commits selected"))
+            .item(
+                ui::ContextMenuEntry::new("Compare Versions")
+                    .disabled(count != 2)
+                    .handler(move |window, cx| compare_versions(compare_ctx.clone(), window, cx)),
+            )
+            .separator()
+            .item(
+                ui::ContextMenuEntry::new("Squash Commits…")
+                    .disabled(!ctx.contiguous)
+                    .handler(move |window, cx| open_squash_prompt(squash_ctx.clone(), window, cx)),
+            )
+            .separator()
+            .entry("Copy Hashes", None, move |_, cx| {
+                let text = copy_ctx
+                    .shas
+                    .iter()
+                    .rev()
+                    .map(|sha| sha.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            })
+    })
+}
+
+fn multi_work_dir(ctx: &MultiCommitContext, cx: &App) -> PathBuf {
+    ctx.work_dir.clone().unwrap_or_else(|| {
+        ctx.repository
+            .read(cx)
+            .work_directory_abs_path
+            .to_path_buf()
+    })
+}
+
+/// IDEA's "Compare Versions" — diff the two selected commits against each
+/// other, oldest as the base.
+fn compare_versions(ctx: MultiCommitContext, window: &mut Window, cx: &mut App) {
+    let (Some(base), Some(head)) = (ctx.shas.first(), ctx.shas.last()) else {
+        return;
+    };
+    if ctx.shas.len() != 2 {
+        return;
+    }
+    crate::commit_view::CommitView::open_range(
+        base.to_string(),
+        head.to_string(),
+        ctx.repository.downgrade(),
+        ctx.workspace.clone(),
+        window,
+        cx,
+    );
+}
+
+fn open_squash_prompt(ctx: MultiCommitContext, window: &mut Window, cx: &mut App) {
+    let Some(workspace) = ctx.workspace.upgrade() else {
+        return;
+    };
+    // The oldest commit is the one that survives the squash, so its
+    // subject is the least surprising starting point for the combined
+    // message. The input is single-line, matching every other message
+    // prompt in this menu.
+    let initial = ctx
+        .subjects
+        .first()
+        .map(|subject| subject.to_string())
+        .unwrap_or_default();
+    let count = ctx.shas.len();
+    workspace.update(cx, |workspace, cx| {
+        workspace.toggle_modal(window, cx, |window, cx| {
+            NameInputModal::new(
+                format!("Squash {count} Commits"),
+                "Commit message",
+                IconName::GitBranch,
+                window,
+                cx,
+                move |message, window, cx| run_squash(ctx, message, window, cx),
+            )
+            .with_initial_text(&initial, window, cx)
+        });
+    });
+}
+
+fn run_squash(ctx: MultiCommitContext, message: String, window: &mut Window, cx: &mut App) {
+    let work_dir = multi_work_dir(&ctx, cx);
+    let shas = ctx.shas.iter().map(|sha| sha.to_string()).collect();
+    let task = squash::run(
+        work_dir,
+        shas,
+        message,
+        git::operations::rebase::RebaseCallbacks::default(),
+        cx,
+    );
+    task.detach_and_prompt_err("Squash failed", window, cx, |e, _, _| Some(format!("{e}")));
 }

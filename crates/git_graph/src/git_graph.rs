@@ -141,12 +141,17 @@ use git::{
     repository::{CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath},
     status::{FileStatus, StatusCode, TrackedStatus},
 };
-use git_ui::{commit_tooltip::CommitAvatar, commit_view::CommitView, git_status_icon};
+use git_ui::{
+    commit_context_menu::{MultiCommitContext, build_multi_commit_context_menu},
+    commit_tooltip::CommitAvatar,
+    commit_view::CommitView,
+    git_status_icon,
+};
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
-    DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy, SharedString,
-    StyleRefinement, Subscription, Task, TextStyleRefinement, UnderlineStyle,
+    DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Modifiers,
+    MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
+    SharedString, StyleRefinement, Subscription, Task, TextStyleRefinement, UnderlineStyle,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
     px, uniform_list,
 };
@@ -1586,6 +1591,16 @@ pub struct GitGraph {
     table_interaction_state: Entity<TableInteractionState>,
     column_widths: Entity<RedistributableColumnsState>,
     selected_entry_idx: Option<usize>,
+    /// Every selected row, in view space. Multi-row selections only come from
+    /// Ctrl/Shift clicks on commit rows; every other path into
+    /// [`GitGraph::select_entry`] collapses this back to the one active row.
+    /// Invariants: empty exactly while [`GitGraph::selected_entry_idx`] is
+    /// `None`, and otherwise always contains it.
+    selected_entry_idxs: HashSet<usize>,
+    /// Origin row of a Shift+click range, in view space. Moved by every
+    /// plain/Ctrl click on a row and cleared by [`GitGraph::select_entry`], so
+    /// keyboard navigation restarts the range from wherever it lands.
+    selection_anchor_idx: Option<usize>,
     hovered_entry_idx: Option<usize>,
     log_source: LogSource,
     log_order: LogOrder,
@@ -1639,6 +1654,125 @@ pub struct GitGraph {
     pending_select_sha: Option<Oid>,
 }
 
+/// How a click on a commit row folds into the multi-row selection. Derived
+/// from the click's modifiers at the call site so that [`fold_row_click`]
+/// stays a pure function a unit test can drive without a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowSelectionGesture {
+    /// Plain click: the clicked row becomes the whole selection.
+    Replace,
+    /// Ctrl (Cmd on macOS): add the clicked row to the selection, or drop it.
+    Toggle,
+    /// Shift: select the inclusive range between the anchor and the click.
+    Range,
+}
+
+/// Outcome of folding a click into the current selection. `active` is the row
+/// that drives the detail sidebar (it becomes [`GitGraph::selected_entry_idx`])
+/// and is always a member of `selected`.
+#[derive(Debug, PartialEq, Eq)]
+struct RowSelection {
+    active: usize,
+    selected: HashSet<usize>,
+    anchor: Option<usize>,
+}
+
+/// Selection algebra behind [`GitGraph::apply_row_click_selection`].
+///
+/// `local_changes_row` says whether view-index 0 is the synthetic
+/// working-tree row. That row has no commit behind it, so it can never take
+/// part in a multi-row selection: a Ctrl/Shift click that would involve it
+/// degrades to a plain click.
+///
+/// Toggling the last selected row off would leave the graph with nothing
+/// selected and the sidebar with no commit to describe, so the clicked row
+/// stays selected instead. Toggling a row off while others remain moves
+/// `active` to the nearest surviving row rather than to the row just
+/// deselected — the sidebar has to describe a *selected* commit — while the
+/// anchor still follows the click, so a subsequent Shift+click ranges from
+/// where the user last clicked, as it does in IDEA.
+fn fold_row_click(
+    clicked_idx: usize,
+    gesture: RowSelectionGesture,
+    selected: &HashSet<usize>,
+    anchor: Option<usize>,
+    local_changes_row: bool,
+) -> RowSelection {
+    let is_local_changes_row = |idx: usize| local_changes_row && idx == 0;
+
+    let gesture = match gesture {
+        RowSelectionGesture::Replace => RowSelectionGesture::Replace,
+        _ if is_local_changes_row(clicked_idx) => RowSelectionGesture::Replace,
+        RowSelectionGesture::Range if anchor.is_none_or(is_local_changes_row) => {
+            RowSelectionGesture::Replace
+        }
+        other => other,
+    };
+
+    match gesture {
+        RowSelectionGesture::Replace => RowSelection {
+            active: clicked_idx,
+            selected: HashSet::from_iter([clicked_idx]),
+            anchor: Some(clicked_idx),
+        },
+        RowSelectionGesture::Toggle => {
+            let mut selected = selected.clone();
+            selected.retain(|idx| !is_local_changes_row(*idx));
+            let active;
+            if selected.remove(&clicked_idx) {
+                match nearest_selected_row(&selected, clicked_idx) {
+                    Some(nearest) => active = nearest,
+                    None => {
+                        selected.insert(clicked_idx);
+                        active = clicked_idx;
+                    }
+                }
+            } else {
+                selected.insert(clicked_idx);
+                active = clicked_idx;
+            }
+            RowSelection {
+                active,
+                selected,
+                anchor: Some(clicked_idx),
+            }
+        }
+        RowSelectionGesture::Range => {
+            let anchor_idx = anchor.unwrap_or(clicked_idx);
+            let (first, last) = if anchor_idx <= clicked_idx {
+                (anchor_idx, clicked_idx)
+            } else {
+                (clicked_idx, anchor_idx)
+            };
+            RowSelection {
+                active: clicked_idx,
+                selected: (first..=last)
+                    .filter(|idx| !is_local_changes_row(*idx))
+                    .collect(),
+                anchor: Some(anchor_idx),
+            }
+        }
+    }
+}
+
+/// The selected row closest to `idx`, preferring the row above on a tie.
+fn nearest_selected_row(selected: &HashSet<usize>, idx: usize) -> Option<usize> {
+    selected
+        .iter()
+        .copied()
+        .min_by_key(|candidate| (candidate.abs_diff(idx), *candidate))
+}
+
+/// True when `selection` — commit shas paired with their first parent,
+/// **oldest first** — is an unbroken first-parent chain: every commit but the
+/// oldest has the entry before it as its first parent. A single commit is
+/// trivially a chain; an empty selection is too.
+fn is_first_parent_chain(selection: &[(Oid, Option<Oid>)]) -> bool {
+    selection
+        .windows(2)
+        .all(|pair| pair[1].1 == Some(pair[0].0))
+}
+
 impl GitGraph {
     /// Drop the loaded log (and everything derived from it) so the caller can
     /// refetch it.
@@ -1655,6 +1789,8 @@ impl GitGraph {
             self.pending_select_sha = self.selected_commit_sha();
         }
         self.selected_entry_idx = None;
+        self.selected_entry_idxs.clear();
+        self.selection_anchor_idx = None;
         self.selected_commit_diff = None;
         self.selected_commit_branches = None;
         self.commit_detail_text = None;
@@ -2122,6 +2258,8 @@ impl GitGraph {
             table_interaction_state,
             column_widths,
             selected_entry_idx: None,
+            selected_entry_idxs: HashSet::default(),
+            selection_anchor_idx: None,
             hovered_entry_idx: None,
             selected_commit_diff: None,
             selected_commit_branches: None,
@@ -2710,6 +2848,8 @@ impl GitGraph {
 
     fn clear_selection(&mut self) {
         self.selected_entry_idx = None;
+        self.selected_entry_idxs.clear();
+        self.selection_anchor_idx = None;
         self.selected_commit_diff = None;
         self.commit_detail_text = None;
         self.selected_changed_file = None;
@@ -2793,6 +2933,18 @@ impl GitGraph {
             .and_then(|data_idx| self.graph_data.commits.get(data_idx))
             .map(|commit| commit.data.sha);
 
+        // Every route into `select_entry` — keyboard navigation, an
+        // `OpenCommitView` jump, the restore-by-sha after a refetch — is a
+        // single-row selection, so it collapses whatever multi-row selection a
+        // Ctrl/Shift click had built. Done before the no-op early return
+        // below: re-selecting the already-active row still has to drop the
+        // other rows' highlight.
+        let collapsed_multi_selection =
+            self.selected_entry_idxs.len() > 1 || !self.selected_entry_idxs.contains(&idx);
+        self.selected_entry_idxs.clear();
+        self.selected_entry_idxs.insert(idx);
+        self.selection_anchor_idx = None;
+
         // Re-selecting the same row is a no-op only while the diff we hold (or
         // are loading) still belongs to the commit living at that row — after a
         // refetch the same row can point at a different commit, and then the
@@ -2800,6 +2952,9 @@ impl GitGraph {
         if self.selected_entry_idx == Some(idx)
             && self.selected_commit_diff.as_ref().map(|state| state.sha) == target_sha
         {
+            if collapsed_multi_selection {
+                cx.notify();
+            }
             return;
         }
 
@@ -3053,10 +3208,50 @@ impl GitGraph {
         &mut self,
         index: usize,
         _click_count: usize,
+        modifiers: Modifiers,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_entry(index, ScrollStrategy::Center, cx);
+        // Shift wins over the secondary modifier when both are held, matching
+        // every other multi-select list: Ctrl+Shift+click extends the range.
+        let gesture = if modifiers.shift {
+            RowSelectionGesture::Range
+        } else if modifiers.secondary() {
+            RowSelectionGesture::Toggle
+        } else {
+            RowSelectionGesture::Replace
+        };
+        self.apply_row_click_selection(index, gesture, cx);
+    }
+
+    /// Fold a row click into the selection and re-point the detail sidebar at
+    /// the resulting active row.
+    ///
+    /// The sidebar reload is driven by going through [`Self::select_entry`],
+    /// which also collapses the selection; the multi-row set is written back
+    /// on top of it afterwards.
+    fn apply_row_click_selection(
+        &mut self,
+        index: usize,
+        gesture: RowSelectionGesture,
+        cx: &mut Context<Self>,
+    ) {
+        // A stale anchor (the log shrank under us) would range over rows that
+        // no longer exist, so it degrades to "no anchor" instead.
+        let anchor = self
+            .selection_anchor_idx
+            .filter(|anchor| *anchor < self.view_row_count());
+        let selection = fold_row_click(
+            index,
+            gesture,
+            &self.selected_entry_idxs,
+            anchor,
+            self.has_local_changes_row(),
+        );
+        self.select_entry(selection.active, ScrollStrategy::Center, cx);
+        self.selected_entry_idxs = selection.selected;
+        self.selection_anchor_idx = selection.anchor;
+        cx.notify();
     }
 
     fn open_selected_commit_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3204,6 +3399,74 @@ impl GitGraph {
             remotes: self.remote_names.clone(),
         };
         let menu = context_menu::build_commit_context_menu(ctx, window, cx);
+        self.show_context_menu(menu, position, window, cx);
+    }
+
+    /// Right-click inside a multi-row selection: build the menu for the whole
+    /// selection rather than for the single row under the cursor.
+    fn deploy_multi_commit_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        // Rows run newest-first, so oldest-first — the order the multi-commit
+        // menu (and every git range it builds) wants — is descending data
+        // index. The synthetic local-changes row maps to no data index and
+        // drops out here.
+        let mut data_indices: Vec<usize> = self
+            .selected_entry_idxs
+            .iter()
+            .filter_map(|view_idx| self.view_to_data_idx(*view_idx))
+            .collect();
+        data_indices.sort_unstable();
+        data_indices.reverse();
+
+        let mut shas = Vec::with_capacity(data_indices.len());
+        let mut subjects = Vec::with_capacity(data_indices.len());
+        let mut first_parents = Vec::with_capacity(data_indices.len());
+        for data_index in data_indices {
+            let Some(commit_entry) = self.graph_data.commits.get(data_index).cloned() else {
+                continue;
+            };
+            shas.push(SharedString::from(commit_entry.data.sha.to_string()));
+            let data = repository.update(cx, |repo, cx| {
+                repo.fetch_commit_data(commit_entry.data.sha, false, cx)
+                    .clone()
+            });
+            subjects.push(match data {
+                CommitDataState::Loaded(data) => data.subject.clone(),
+                _ => SharedString::default(),
+            });
+            first_parents.push((
+                commit_entry.data.sha,
+                commit_entry.data.parents.first().copied(),
+            ));
+        }
+        if shas.is_empty() {
+            return;
+        }
+
+        let work_dir = Some(
+            repository
+                .read(cx)
+                .work_directory_abs_path
+                .as_ref()
+                .to_path_buf(),
+        );
+        let ctx = MultiCommitContext {
+            workspace: self.workspace.clone(),
+            repository,
+            shas,
+            subjects,
+            work_dir,
+            contiguous: is_first_parent_chain(&first_parents),
+        };
+        let menu = build_multi_commit_context_menu(ctx, window, cx);
         self.show_context_menu(menu, position, window, cx);
     }
 
@@ -4267,7 +4530,7 @@ impl Render for GitGraph {
                         )
                         .child({
                             let row_height = Self::row_height(window, cx);
-                            let selected_entry_idx = self.selected_entry_idx;
+                            let selected_entry_idxs = self.selected_entry_idxs.clone();
                             let hovered_entry_idx = self.hovered_entry_idx;
                             let weak_self = cx.weak_entity();
                             let focus_handle = self.focus_handle.clone();
@@ -4293,7 +4556,7 @@ impl Render for GitGraph {
                                 .hide_row_hover()
                                 .width_config(table_width_config)
                                 .map_row(move |(index, row), window, cx| {
-                                    let is_selected = selected_entry_idx == Some(index);
+                                    let is_selected = selected_entry_idxs.contains(&index);
                                     let is_hovered = hovered_entry_idx == Some(index);
                                     let is_focused = focus_handle.is_focused(window);
                                     let weak = weak_self.clone();
@@ -4327,12 +4590,14 @@ impl Render for GitGraph {
                                         })
                                         .on_click({
                                             let weak = weak.clone();
-                                            move |event, window, cx| {
+                                            move |event: &ClickEvent, window, cx| {
                                                 let click_count = event.click_count();
+                                                let modifiers = event.modifiers();
                                                 weak.update(cx, |this, cx| {
                                                     this.on_row_click(
                                                         index,
                                                         click_count,
+                                                        modifiers,
                                                         window,
                                                         cx,
                                                     );
@@ -4346,6 +4611,23 @@ impl Render for GitGraph {
                                                     return;
                                                 }
                                                 weak.update(cx, |this, cx| {
+                                                    // A right-click inside an
+                                                    // existing multi-row
+                                                    // selection keeps it and
+                                                    // acts on all of it;
+                                                    // anywhere else it selects
+                                                    // the row first, exactly
+                                                    // as a plain click would.
+                                                    if this.selected_entry_idxs.len() >= 2
+                                                        && this.selected_entry_idxs.contains(&index)
+                                                    {
+                                                        this.deploy_multi_commit_context_menu(
+                                                            event.position,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        return;
+                                                    }
                                                     this.select_entry(
                                                         index,
                                                         ScrollStrategy::Center,
@@ -8300,7 +8582,7 @@ mod tests {
         };
 
         git_graph.update_in(cx, |graph, window, cx| {
-            graph.on_row_click(0, 2, window, cx);
+            graph.on_row_click(0, 2, Modifiers::none(), window, cx);
         });
         cx.run_until_parked();
 
@@ -8325,6 +8607,231 @@ mod tests {
             1,
             "the commit view is still reachable explicitly"
         );
+    }
+
+    fn rows(indices: impl IntoIterator<Item = usize>) -> HashSet<usize> {
+        HashSet::from_iter(indices)
+    }
+
+    #[test]
+    fn test_fold_row_click_plain_click_replaces_the_selection() {
+        let folded = fold_row_click(
+            4,
+            RowSelectionGesture::Replace,
+            &rows([1, 2, 3]),
+            Some(1),
+            false,
+        );
+        assert_eq!(folded.active, 4);
+        assert_eq!(folded.selected, rows([4]));
+        assert_eq!(
+            folded.anchor,
+            Some(4),
+            "a plain click re-anchors, so the next Shift+click ranges from it"
+        );
+    }
+
+    #[test]
+    fn test_fold_row_click_ctrl_toggles_rows() {
+        let folded = fold_row_click(4, RowSelectionGesture::Toggle, &rows([1]), Some(1), false);
+        assert_eq!(folded.selected, rows([1, 4]), "Ctrl+click adds a row");
+        assert_eq!(folded.active, 4);
+        assert_eq!(folded.anchor, Some(4));
+
+        // Ctrl+clicking a selected row drops it. The sidebar has to keep
+        // describing a *selected* commit, so the active row moves to the
+        // nearest survivor while the anchor still follows the click.
+        let folded = fold_row_click(
+            4,
+            RowSelectionGesture::Toggle,
+            &rows([1, 4, 9]),
+            Some(4),
+            false,
+        );
+        assert_eq!(folded.selected, rows([1, 9]));
+        assert_eq!(folded.active, 1);
+        assert_eq!(folded.anchor, Some(4));
+
+        // Toggling the only selected row off would leave nothing selected.
+        let folded = fold_row_click(4, RowSelectionGesture::Toggle, &rows([4]), Some(4), false);
+        assert_eq!(folded.selected, rows([4]));
+        assert_eq!(folded.active, 4);
+    }
+
+    #[test]
+    fn test_fold_row_click_shift_selects_a_range() {
+        let folded = fold_row_click(6, RowSelectionGesture::Range, &rows([2]), Some(2), false);
+        assert_eq!(folded.selected, rows([2, 3, 4, 5, 6]));
+        assert_eq!(folded.active, 6);
+        assert_eq!(folded.anchor, Some(2), "the anchor survives a Shift+click");
+
+        // Shrinking the range and reversing direction both range from the
+        // untouched anchor.
+        let folded = fold_row_click(
+            3,
+            RowSelectionGesture::Range,
+            &folded.selected,
+            Some(2),
+            false,
+        );
+        assert_eq!(folded.selected, rows([2, 3]));
+        let folded = fold_row_click(
+            0,
+            RowSelectionGesture::Range,
+            &folded.selected,
+            Some(2),
+            false,
+        );
+        assert_eq!(folded.selected, rows([0, 1, 2]));
+        assert_eq!(folded.active, 0);
+
+        // Ctrl+click moves the anchor, so a following Shift+click ranges from
+        // the Ctrl-clicked row and discards the rows picked before it.
+        let ctrl = fold_row_click(7, RowSelectionGesture::Toggle, &rows([1]), Some(1), false);
+        let shift = fold_row_click(
+            9,
+            RowSelectionGesture::Range,
+            &ctrl.selected,
+            ctrl.anchor,
+            false,
+        );
+        assert_eq!(shift.selected, rows([7, 8, 9]));
+        assert_eq!(shift.anchor, Some(7));
+
+        // With no anchor at all a Shift+click is just a plain click.
+        let folded = fold_row_click(5, RowSelectionGesture::Range, &rows([1, 2]), None, false);
+        assert_eq!(folded.selected, rows([5]));
+        assert_eq!(folded.anchor, Some(5));
+    }
+
+    /// View-index 0 is the synthetic "local changes" row when it is shown. It
+    /// has no commit behind it, so it must never end up in a multi-row
+    /// selection that the multi-commit menu would then act on.
+    #[test]
+    fn test_fold_row_click_never_multi_selects_the_local_changes_row() {
+        let folded = fold_row_click(0, RowSelectionGesture::Toggle, &rows([2, 3]), Some(2), true);
+        assert_eq!(
+            folded.selected,
+            rows([0]),
+            "Ctrl+clicking the local-changes row falls back to a plain click"
+        );
+        assert_eq!(folded.active, 0);
+        assert_eq!(folded.anchor, Some(0));
+
+        let folded = fold_row_click(0, RowSelectionGesture::Range, &rows([2, 3]), Some(3), true);
+        assert_eq!(folded.selected, rows([0]));
+        assert_eq!(folded.active, 0);
+
+        // Anchored on the local-changes row, a Shift+click can't range out of
+        // it either.
+        let folded = fold_row_click(3, RowSelectionGesture::Range, &rows([0]), Some(0), true);
+        assert_eq!(folded.selected, rows([3]));
+        assert_eq!(folded.anchor, Some(3));
+
+        // The same clicks on a commit row still multi-select normally.
+        let folded = fold_row_click(3, RowSelectionGesture::Range, &rows([1]), Some(1), true);
+        assert_eq!(folded.selected, rows([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_is_first_parent_chain() {
+        let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
+
+        // Oldest first: c1 <- c2 <- c3.
+        let contiguous = [
+            (oid(1), None),
+            (oid(2), Some(oid(1))),
+            (oid(3), Some(oid(2))),
+        ];
+        assert!(is_first_parent_chain(&contiguous));
+
+        // c3's first parent is c2, which was not picked.
+        let with_a_gap = [(oid(1), None), (oid(3), Some(oid(2)))];
+        assert!(!is_first_parent_chain(&with_a_gap));
+
+        // A merge whose *second* parent is the selected commit is not a
+        // first-parent chain either.
+        let second_parent_only = [(oid(1), None), (oid(4), Some(oid(9)))];
+        assert!(!is_first_parent_chain(&second_parent_only));
+
+        assert!(is_first_parent_chain(&[(oid(1), Some(oid(2)))]));
+        assert!(is_first_parent_chain(&[]));
+    }
+
+    /// Keyboard navigation, restore-by-sha and every other programmatic
+    /// selection go through `select_entry`, which has to drop a multi-row
+    /// selection built by Ctrl/Shift clicks — including when it re-selects the
+    /// row that was already active and takes its no-op early return.
+    #[gpui::test]
+    async fn test_select_entry_collapses_a_multi_row_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: oid(1),
+                parents: smallvec![oid(2)],
+                ref_names: vec!["HEAD".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid(2),
+                parents: smallvec![oid(3)],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid(3),
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        let (_project, git_graph, cx) = setup_graph_with_commits(&fs, commits, cx).await;
+        draw_graph(&git_graph, cx);
+
+        git_graph.update(cx, |graph, cx| {
+            graph.apply_row_click_selection(0, RowSelectionGesture::Replace, cx);
+            graph.apply_row_click_selection(2, RowSelectionGesture::Toggle, cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.selected_entry_idxs, rows([0, 2]));
+            assert_eq!(graph.selected_entry_idx, Some(2));
+            assert_eq!(graph.selection_anchor_idx, Some(2));
+        });
+
+        git_graph.update(cx, |graph, cx| {
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.selected_entry_idxs, rows([1]));
+            assert_eq!(graph.selected_entry_idx, Some(1));
+            assert_eq!(graph.selection_anchor_idx, None);
+        });
+
+        // Re-select the active row while a multi-row selection is live: the
+        // early return still has to leave a single-row selection behind.
+        git_graph.update(cx, |graph, cx| {
+            graph.apply_row_click_selection(1, RowSelectionGesture::Replace, cx);
+            graph.apply_row_click_selection(0, RowSelectionGesture::Range, cx);
+        });
+        cx.run_until_parked();
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.selected_entry_idxs, rows([0, 1]));
+            assert_eq!(graph.selected_entry_idx, Some(0));
+        });
+
+        git_graph.update(cx, |graph, cx| {
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+        });
+        cx.run_until_parked();
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.selected_entry_idxs, rows([0]));
+            assert_eq!(graph.selection_anchor_idx, None);
+        });
     }
 
     fn describe_changed_file_row(row: &ChangedFileRow) -> String {
