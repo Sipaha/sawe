@@ -2,9 +2,8 @@ use std::cmp;
 
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, Context, DragMoveEvent, Element, Entity,
-    Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length,
-    ParentElement,
+    AnyElement, App, AvailableSpace, Bounds, Context, DragMoveEvent, Element, Entity, Global,
+    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length, ParentElement,
     Pixels, StatefulInteractiveElement, Styled, TextStyleRefinement, Window, deferred, div,
     linear_color_stop, linear_gradient, point, px, size,
 };
@@ -45,8 +44,6 @@ const DEFAULT_SPLIT_RATIO: f32 = 0.5;
 
 pub struct SplitEditorState {
     left_ratio: f32,
-    visible_left_ratio: f32,
-    cached_width: Pixels,
 }
 
 impl SplitEditorState {
@@ -54,58 +51,53 @@ impl SplitEditorState {
         let ratio = cx
             .try_global::<LastSplitRatio>()
             .map_or(DEFAULT_SPLIT_RATIO, |remembered| remembered.0);
-        Self {
-            left_ratio: ratio,
-            visible_left_ratio: ratio,
-            cached_width: px(0.),
-        }
+        Self { left_ratio: ratio }
     }
 
-    #[allow(clippy::misnamed_getters)]
     pub fn left_ratio(&self) -> f32 {
-        self.visible_left_ratio
+        self.left_ratio
     }
 
     pub fn right_ratio(&self) -> f32 {
-        1.0 - self.visible_left_ratio
+        1.0 - self.left_ratio
     }
 
     fn on_drag_move(
         &mut self,
         drag_event: &DragMoveEvent<DraggedSplitHandle>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        let drag_position = drag_event.event.position;
         let bounds = drag_event.bounds;
         let bounds_width = bounds.right() - bounds.left();
-
-        if bounds_width > px(0.) {
-            self.cached_width = bounds_width;
+        if bounds_width <= px(0.) {
+            return;
         }
 
         let min_ratio = 0.1;
         let max_ratio = 0.9;
-
-        let new_ratio = (drag_position.x - bounds.left()) / bounds_width;
-        self.visible_left_ratio = new_ratio.clamp(min_ratio, max_ratio);
+        let new_ratio = (drag_event.event.position.x - bounds.left()) / bounds_width;
+        self.set_ratio(new_ratio.clamp(min_ratio, max_ratio), cx);
     }
 
-    fn commit_ratio(&mut self, cx: &mut App) {
-        self.left_ratio = self.visible_left_ratio;
-        cx.set_global(LastSplitRatio(self.left_ratio));
+    /// Remembers the position as the divider moves rather than when the drag
+    /// ends. The handle sets `block_mouse_except_scroll` and sits under the
+    /// cursor for the whole drag, so it truncates the hover stack: the
+    /// ancestor's `on_drop` listener — which used to be what stored the ratio —
+    /// never saw the mouse up, and every file after the first opened with the
+    /// position the user had just chosen already thrown away.
+    fn set_ratio(&mut self, ratio: f32, cx: &mut App) {
+        self.left_ratio = ratio;
+        cx.set_global(LastSplitRatio(ratio));
     }
 
     #[cfg(test)]
     pub(crate) fn set_left_ratio_for_test(&mut self, ratio: f32) {
         self.left_ratio = ratio;
-        self.visible_left_ratio = ratio;
     }
 
     fn on_double_click(&mut self, cx: &mut App) {
-        self.left_ratio = DEFAULT_SPLIT_RATIO;
-        self.visible_left_ratio = DEFAULT_SPLIT_RATIO;
-        cx.set_global(LastSplitRatio(DEFAULT_SPLIT_RATIO));
+        self.set_ratio(DEFAULT_SPLIT_RATIO, cx);
     }
 }
 
@@ -287,7 +279,6 @@ impl RenderOnce for SplitEditorView {
         );
 
         let state_for_drag = self.split_state.downgrade();
-        let state_for_drop = self.split_state.downgrade();
 
         let buffer_headers = SplitBufferHeadersElement::new(rhs_editor.clone(), self.style.clone());
 
@@ -314,13 +305,6 @@ impl RenderOnce for SplitEditorView {
                         state_for_drag
                             .update(cx, |state, cx| {
                                 state.on_drag_move(event, window, cx);
-                            })
-                            .ok();
-                    })
-                    .on_drop::<DraggedSplitHandle>(move |_, _, cx| {
-                        state_for_drop
-                            .update(cx, |state, cx| {
-                                state.commit_ratio(cx);
                             })
                             .ok();
                     })
@@ -772,10 +756,7 @@ mod tests {
             let first = cx.new(|cx| SplitEditorState::new(cx));
             assert_eq!(first.read(cx).left_ratio(), DEFAULT_SPLIT_RATIO);
 
-            first.update(cx, |state, cx| {
-                state.visible_left_ratio = 0.25;
-                state.commit_ratio(cx);
-            });
+            first.update(cx, |state, cx| state.set_ratio(0.25, cx));
 
             let second = cx.new(|cx| SplitEditorState::new(cx));
             assert_eq!(second.read(cx).left_ratio(), 0.25);
