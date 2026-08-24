@@ -124,6 +124,15 @@ pub struct SolutionSessionView {
     /// and only ratchet down past a ≥ 90 % collapse (see
     /// `status_row::smooth_used_tokens`).
     pub(crate) status_peak_used_tokens: u64,
+    /// The `AcpThread` the peak above was measured against. A compaction,
+    /// `/clear` or a restart mints a fresh thread, and the context it starts
+    /// with has nothing to do with the one that produced the peak — so the
+    /// ratchet is dropped the moment the meter observes a different thread.
+    /// Belt-and-braces next to the `SessionContextReset` handler: that event
+    /// clears the peak immediately, this makes a peak from a dead thread
+    /// impossible to keep even if the event is missed or a stale reading
+    /// lands after it (see the pre-compaction "797.4k" report).
+    pub(crate) status_peak_thread: Option<EntityId>,
     /// True while a model fetch for this session is in flight; deduped so
     /// the row doesn't fire a fresh request every token-update.
     pub(crate) status_pending_model_fetch: bool,

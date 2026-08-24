@@ -1,7 +1,7 @@
 //! Status footer rendered between the conversation list and the compose box: state badge, token meter, model / mode / cwd labels, compact + clear popover.
 
 use chrono::TimeZone as _;
-use gpui::{Animation, AnimationExt, ElementId, WeakEntity, pulsating_between};
+use gpui::{Animation, AnimationExt, ElementId, Entity, WeakEntity, pulsating_between};
 use gpui::{
     Context, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
@@ -270,6 +270,10 @@ pub(crate) fn render_status_row(
                 })
             })
     };
+    // Identity of the thread the usage above was measured against — read here,
+    // while `s` is still borrowed, and compared far below where the meter's
+    // ratchet is applied.
+    let live_thread_id = s.acp_thread().map(Entity::entity_id);
     // Synchronous read of the agent's current session mode
     // ("default", "plan", …). Claude exposes this via ACP — when
     // the connection doesn't implement modes (e.g. mock test
@@ -356,12 +360,19 @@ pub(crate) fn render_status_row(
         // its raw latest context so switching tabs can't pollute either peak.
         raw_used
     } else {
-        let peak = view.status_peak_used_tokens;
-        let used = smooth_used_tokens(raw_used, peak);
-        if used != peak {
-            view.status_peak_used_tokens = used;
-        }
-        used
+        // The ratchet only means anything within one conversation. A
+        // compaction / `/clear` / restart mints a fresh `AcpThread`, and the
+        // peak measured against the old one must not survive it — the
+        // magnitude heuristic below cannot tell "this is a fresh context" from
+        // "this is per-call wobble", so a post-compaction context that lands
+        // above 10% of the old peak would be held at the pre-compaction
+        // number indefinitely.
+        ratchet_used_tokens(
+            &mut view.status_peak_thread,
+            &mut view.status_peak_used_tokens,
+            live_thread_id,
+            raw_used,
+        )
     };
     // claude-acp doesn't always populate `max_tokens` (it's gated by an
     // upstream beta flag). Once a real limit has been seen for this session
@@ -1254,6 +1265,34 @@ pub(crate) fn smooth_used_tokens(raw_used: u64, peak: u64) -> u64 {
     }
 }
 
+/// Apply the meter's high-watermark, scoped to the thread that produced it.
+///
+/// The ratchet only means anything within one conversation: a compaction,
+/// `/clear` or a restart mints a fresh `AcpThread` whose context has nothing
+/// to do with the previous one. [`smooth_used_tokens`] cannot tell "fresh
+/// context" from "per-call wobble", so a post-compaction reading that lands
+/// above 10 % of the old peak would be held at the pre-compaction number for
+/// the rest of the session — the reported "meter stuck at the pre-compaction
+/// 797.4k while the new context was 485k".
+///
+/// `recorded` / `peak` are the caller's stored state and are updated in place.
+pub(crate) fn ratchet_used_tokens<Id: PartialEq>(
+    recorded: &mut Option<Id>,
+    peak: &mut u64,
+    current: Option<Id>,
+    raw_used: u64,
+) -> u64 {
+    if *recorded != current {
+        *recorded = current;
+        *peak = 0;
+    }
+    let used = smooth_used_tokens(raw_used, *peak);
+    if used != *peak {
+        *peak = used;
+    }
+    used
+}
+
 /// The tool call the agent is currently BLOCKED on, as `(display name, unix-ms
 /// when it went InProgress)`. The last in-progress call wins: a nested Agent
 /// Teams call is more specific than its parent's. `None` when the agent is
@@ -1446,6 +1485,50 @@ mod tests {
         assert_eq!(
             resolve_max_tokens(Some(1_000_000), Some(200_000)),
             (1_000_000, Some(1_000_000))
+        );
+    }
+
+    /// A fresh thread (compaction / `/clear` / restart) must drop the peak:
+    /// the post-compaction context is unrelated to the one it was measured
+    /// against, and it is typically well above the 10 % collapse threshold
+    /// that is the only thing `smooth_used_tokens` would react to.
+    #[test]
+    fn ratchet_used_tokens_drops_the_peak_when_the_thread_changes() {
+        let mut recorded: Option<u64> = None;
+        let mut peak = 0u64;
+
+        // One conversation climbing to 797k, with a cache-warm dip held.
+        assert_eq!(
+            super::ratchet_used_tokens(&mut recorded, &mut peak, Some(1), 400_000),
+            400_000
+        );
+        assert_eq!(
+            super::ratchet_used_tokens(&mut recorded, &mut peak, Some(1), 797_438),
+            797_438
+        );
+        assert_eq!(
+            super::ratchet_used_tokens(&mut recorded, &mut peak, Some(1), 300_000),
+            797_438,
+            "same thread: a dip is per-call wobble and the peak holds"
+        );
+
+        // Compaction: new thread, 485k of real context. Held at the old peak
+        // before this fix.
+        assert_eq!(
+            super::ratchet_used_tokens(&mut recorded, &mut peak, Some(2), 485_089),
+            485_089
+        );
+        assert_eq!(peak, 485_089);
+        assert_eq!(recorded, Some(2));
+
+        // And the new conversation ratchets on its own from there.
+        assert_eq!(
+            super::ratchet_used_tokens(&mut recorded, &mut peak, Some(2), 300_000),
+            485_089
+        );
+        assert_eq!(
+            super::ratchet_used_tokens(&mut recorded, &mut peak, Some(2), 500_000),
+            500_000
         );
     }
 

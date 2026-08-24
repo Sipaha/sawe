@@ -2458,6 +2458,14 @@ impl SolutionAgentStore {
                 let new_sub = store.subscribe_to_session(session_id, new_thread, cx);
                 session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
                 store.persist_session_row(session_id, cx);
+                // The metadata write COALESCEs `total_tokens`, so the row still
+                // carries the PRE-rotation count after the write above. Anything
+                // that later reads it back (a cold load, a reopen) would hand the
+                // meter a number belonging to the conversation we just archived —
+                // the "context stayed at 797k right after a compaction" report.
+                if let Some(db) = store.db() {
+                    db.clear_total_tokens(session_id).detach_and_log_err(cx);
+                }
                 // /compact cleared+rebuilt `entries` and bumped the epoch above.
                 // Rewrite the rows wholesale (deleting the now-stale pre-rotation
                 // idx>0 rows) so the next cold load doesn't see new idx 0 + stale
@@ -2655,6 +2663,12 @@ impl SolutionAgentStore {
                 let new_sub = store.subscribe_to_session(session_id, new_thread, cx);
                 session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
                 store.persist_session_row(session_id, cx);
+                // Same COALESCE story as `rotate_context`: the persisted count
+                // has to be cleared explicitly or the wiped conversation's
+                // number outlives it.
+                if let Some(db) = store.db() {
+                    db.clear_total_tokens(session_id).detach_and_log_err(cx);
+                }
                 // /clear cleared `entries` and bumped the epoch above. Rewrite
                 // the rows wholesale (here that deletes ALL rows + saves the
                 // bumped epoch) so the next cold load doesn't replay the stale

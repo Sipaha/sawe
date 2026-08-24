@@ -175,6 +175,7 @@ impl SolutionSessionView {
                         // cleared too so the denominator re-resolves from the
                         // new context's first usage report.
                         this.status_peak_used_tokens = 0;
+                        this.status_peak_thread = None;
                         this.status_cached_max_tokens = None;
                         cx.notify();
                     }
@@ -202,6 +203,7 @@ impl SolutionSessionView {
             status_cached_model: None,
             status_cached_max_tokens: None,
             status_peak_used_tokens: 0,
+            status_peak_thread: None,
             status_pending_model_fetch: false,
             status_thinking_tick: None,
             status_activity_tick: None,

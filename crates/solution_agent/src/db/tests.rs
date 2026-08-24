@@ -92,6 +92,45 @@ fn make_meta(seq: u32, sol: i64) -> SolutionSessionMetadata {
     }
 }
 
+/// `insert_or_update_metadata` COALESCEs `total_tokens`, so a rotation that
+/// clears the in-memory count cannot clear the row by writing `None` — the
+/// pre-compaction number would keep coming back from the DB. `clear_total_tokens`
+/// is the explicit path for that.
+#[gpui::test]
+async fn clear_total_tokens_forgets_the_persisted_count(cx: &mut gpui::TestAppContext) {
+    let db = SolutionAgentDb::open(cx.executor()).unwrap();
+
+    let mut meta = make_meta(1, 1);
+    meta.total_tokens = Some(797_438);
+    let id = meta.id;
+    db.save_metadata(meta.clone()).await.unwrap();
+
+    // A metadata write carrying `None` leaves the stored value alone…
+    let mut without = meta.clone();
+    without.total_tokens = None;
+    db.save_metadata(without.clone()).await.unwrap();
+    let stored = db.list_for_solution(SolutionId(1)).await.unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.total_tokens),
+        Some(797_438),
+        "COALESCE keeps the stored count when the write carries None"
+    );
+
+    // …the explicit clear is what forgets it.
+    db.clear_total_tokens(id).await.unwrap();
+    let stored = db.list_for_solution(SolutionId(1)).await.unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.total_tokens),
+        None
+    );
+}
+
 #[gpui::test]
 async fn save_then_list_returns_inserted_rows(cx: &mut gpui::TestAppContext) {
     let executor = cx.executor();

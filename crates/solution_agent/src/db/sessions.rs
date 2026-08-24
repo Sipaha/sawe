@@ -112,6 +112,22 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Forget the persisted context-token count for a session.
+    ///
+    /// [`insert_or_update_metadata`] COALESCEs `total_tokens`, so a metadata
+    /// write carrying `None` cannot clear it — which is exactly what a
+    /// context rotation needs to do. Without this, the pre-compaction count
+    /// survives in the row and any later read of it (a cold load, a reopen)
+    /// resurrects a number that belongs to a conversation that no longer
+    /// exists.
+    pub fn clear_total_tokens(&self, id: SolutionSessionId) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            clear_total_tokens_by_id(&connection, id)
+        })
+    }
+
     /// Reopen a previously-closed session: clear `closed_at` (it's live
     /// again) AND `tab_order` (detach it from any stale strip slot).
     ///
@@ -375,6 +391,17 @@ pub(crate) fn mark_closed_by_id(
 pub(crate) fn reopen_session_by_id(connection: &Connection, id: SolutionSessionId) -> Result<()> {
     let mut update = connection.exec_bound::<String>(indoc! {"
         UPDATE solution_sessions SET closed_at = NULL, tab_order = NULL WHERE id = ?
+    "})?;
+    update(id.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn clear_total_tokens_by_id(
+    connection: &Connection,
+    id: SolutionSessionId,
+) -> Result<()> {
+    let mut update = connection.exec_bound::<String>(indoc! {"
+        UPDATE solution_sessions SET total_tokens = NULL WHERE id = ?
     "})?;
     update(id.to_string())?;
     Ok(())
