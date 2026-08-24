@@ -629,6 +629,61 @@ async fn test_normalize_whitespace(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_normalize_whitespace_keeps_caret_lines(cx: &mut gpui::TestAppContext) {
+    let text = [
+        "zero  ",   // 2 trailing spaces, no caret
+        "one   ",   // 3 trailing spaces, no caret
+        "    ",     // whitespace-only line, caret on it
+        "three   ", // content plus 3 trailing spaces, caret on it
+        "four  ",   // 2 trailing spaces, no caret
+    ]
+    .join("\n");
+
+    let buffer = cx.new(|cx| Buffer::local(text, cx));
+
+    let format = buffer.update(cx, |buffer, cx| {
+        // A caret at the end of the whitespace-only line (as if the user just pressed enter
+        // inside an indented block), and another one in the middle of a line that has both
+        // content and trailing whitespace.
+        buffer.set_caret_positions(vec![
+            buffer.anchor_before(Point::new(2, 4)),
+            buffer.anchor_before(Point::new(3, 2)),
+        ]);
+        buffer.remove_trailing_whitespace(cx)
+    });
+
+    let format_diff = format.await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.apply_diff(format_diff, cx);
+        assert_eq!(
+            buffer.text(),
+            [
+                "zero",     //
+                "one",      //
+                "    ",     // kept: caret is on this line
+                "three   ", // kept: caret is on this line, trailing spaces survive too
+                "four",     //
+            ]
+            .join("\n")
+        );
+    });
+
+    // Once the carets move away, the same lines are normalized as usual.
+    let format = buffer.update(cx, |buffer, cx| {
+        buffer.set_caret_positions(vec![buffer.anchor_before(Point::new(0, 0))]);
+        buffer.remove_trailing_whitespace(cx)
+    });
+    let format_diff = format.await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.apply_diff(format_diff, cx);
+        assert_eq!(
+            buffer.text(),
+            ["zero", "one", "", "three", "four"].join("\n")
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_reparse(cx: &mut gpui::TestAppContext) {
     let text = "fn a() {}";
     let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(rust_lang(), cx));

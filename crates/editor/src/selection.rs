@@ -1499,6 +1499,12 @@ impl Editor {
                 )
             });
         }
+        // Deliberately not gated on focus: autosave (and thus save-time trailing-whitespace
+        // removal) runs right after the editor loses focus, which is exactly when the caret
+        // rows still need to be known.
+        self.buffer.update(cx, |buffer, cx| {
+            buffer.set_caret_positions(&selection_anchors, cx)
+        });
         let display_map = self
             .display_map
             .update(cx, |display_map, cx| display_map.snapshot(cx));

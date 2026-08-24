@@ -3871,7 +3871,7 @@ fn test_newline(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn test_newline_trailing_whitespace(cx: &mut TestAppContext) {
+fn test_newline_keeps_auto_indent_whitespace(cx: &mut TestAppContext) {
     init_test(cx, |settings| {
         settings.defaults.auto_indent = Some(settings::AutoIndentMode::PreserveIndent);
     });
@@ -3891,7 +3891,7 @@ fn test_newline_trailing_whitespace(cx: &mut TestAppContext) {
             assert_eq!(editor.text(cx), "    hello\n    \n    world\n");
 
             editor.newline(&Newline, window, cx);
-            assert_eq!(editor.text(cx), "    hello\n\n    \n    world\n");
+            assert_eq!(editor.text(cx), "    hello\n    \n    \n    world\n");
         })
         .unwrap();
 
@@ -3913,7 +3913,7 @@ fn test_newline_trailing_whitespace(cx: &mut TestAppContext) {
             assert_eq!(editor.text(cx), "    hel\n    lo\n    world\n");
 
             editor.newline(&Newline, window, cx);
-            assert_eq!(editor.text(cx), "    hel\n\n    lo\n    world\n");
+            assert_eq!(editor.text(cx), "    hel\n    \n    lo\n    world\n");
         })
         .unwrap();
 
@@ -3940,9 +3940,27 @@ fn test_newline_trailing_whitespace(cx: &mut TestAppContext) {
             assert_eq!(editor.text(cx), "\thello\n\t\n\tworld\n");
 
             editor.newline(&Newline, window, cx);
-            assert_eq!(editor.text(cx), "\thello\n\n\t\n\tworld\n");
+            assert_eq!(editor.text(cx), "\thello\n\t\n\t\n\tworld\n");
         })
         .unwrap();
+}
+
+#[gpui::test]
+async fn test_newline_leaves_blank_line_reachable_at_indent(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.auto_indent = Some(settings::AutoIndentMode::PreserveIndent);
+    });
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("    helloˇ\n    world\n");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.newline(&Newline, window, cx);
+        editor.newline(&Newline, window, cx);
+        editor.move_up(&MoveUp, window, cx);
+    });
+
+    cx.assert_editor_state("    hello\n    ˇ\n    \n    world\n");
 }
 
 #[gpui::test]
@@ -15302,6 +15320,14 @@ async fn test_multiple_formatters(cx: &mut TestAppContext) {
     let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
     let (editor, cx) = cx.add_window_view(|window, cx| {
         build_editor_with_project(project.clone(), buffer, window, cx)
+    });
+    // Formatting spares the line a cursor is on, so park it on the one line
+    // that has no trailing whitespace to strip — otherwise this test would be
+    // asserting that behaviour rather than the formatter ordering it is about.
+    editor.update_in(cx, |editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |s| {
+            s.select_ranges([Point::new(2, 0)..Point::new(2, 0)])
+        });
     });
 
     let fake_server = fake_servers.next().await.unwrap();

@@ -6274,3 +6274,74 @@ fn test_is_valid_anchor_past_last_excerpt_for_buffer(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+async fn test_set_caret_positions(cx: &mut TestAppContext) {
+    let buffer_1 = cx.new(|cx| Buffer::local("abcd  \nefgh  ", cx));
+    let buffer_2 = cx.new(|cx| Buffer::local("ijkl  ", cx));
+    let multibuffer = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            buffer_1.clone(),
+            [Point::new(0, 0)..Point::new(1, 6)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(1),
+            buffer_2.clone(),
+            [Point::new(0, 0)..Point::new(0, 6)],
+            0,
+            cx,
+        );
+        multibuffer
+    });
+
+    let cursor_at = |point: Point, cx: &mut TestAppContext| {
+        let anchor = multibuffer.update(cx, |multibuffer, cx| {
+            multibuffer.snapshot(cx).anchor_before(point)
+        });
+        Selection {
+            id: 0,
+            start: anchor,
+            end: anchor,
+            reversed: false,
+            goal: language::SelectionGoal::None,
+        }
+    };
+
+    // Put the caret on the second line of the first buffer.
+    let selection = cursor_at(Point::new(1, 5), cx);
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_caret_positions(std::slice::from_ref(&selection), cx)
+    });
+
+    let diff_1 = buffer_1
+        .update(cx, |buffer, cx| buffer.remove_trailing_whitespace(cx))
+        .await;
+    let diff_2 = buffer_2
+        .update(cx, |buffer, cx| buffer.remove_trailing_whitespace(cx))
+        .await;
+    buffer_1.update(cx, |buffer, cx| {
+        buffer.apply_diff(diff_1, cx);
+        assert_eq!(buffer.text(), "abcd\nefgh  ");
+    });
+    buffer_2.update(cx, |buffer, cx| {
+        buffer.apply_diff(diff_2, cx);
+        assert_eq!(buffer.text(), "ijkl");
+    });
+
+    // Moving the caret into the second buffer must clear the first buffer's protection.
+    let selection = cursor_at(Point::new(2, 0), cx);
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_caret_positions(std::slice::from_ref(&selection), cx)
+    });
+    let diff_1 = buffer_1
+        .update(cx, |buffer, cx| buffer.remove_trailing_whitespace(cx))
+        .await;
+    buffer_1.update(cx, |buffer, cx| {
+        buffer.apply_diff(diff_1, cx);
+        assert_eq!(buffer.text(), "abcd\nefgh");
+    });
+}

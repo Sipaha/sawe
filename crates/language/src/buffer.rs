@@ -119,6 +119,9 @@ pub struct Buffer {
     reparse: Option<Task<()>>,
     parse_status: (watch::Sender<ParseStatus>, watch::Receiver<ParseStatus>),
     non_text_state_update_count: usize,
+    /// The local UI's cursor positions, kept as anchors so they survive edits from
+    /// other sources. Purely local: never broadcast, never part of a snapshot.
+    caret_positions: Vec<Anchor>,
     diagnostics: TreeMap<LanguageServerId, DiagnosticSet>,
     remote_selections: TreeMap<ReplicaId, SelectionSet>,
     diagnostics_timestamp: clock::Lamport,
@@ -1121,6 +1124,7 @@ impl Buffer {
             syntax_map,
             reparse: None,
             non_text_state_update_count: 0,
+            caret_positions: Vec::new(),
             sync_parse_timeout: if cfg!(any(test, feature = "test-support")) {
                 Some(Duration::from_millis(10))
             } else {
@@ -2264,10 +2268,22 @@ impl Buffer {
 
     /// Spawns a background task that searches the buffer for any whitespace
     /// at the ends of a lines, and returns a `Diff` that removes that whitespace.
+    ///
+    /// Lines that currently hold one of the carets reported via
+    /// [`Buffer::set_caret_positions`] are left untouched, so that saving does not swallow the
+    /// indentation the user is typing on (this mirrors IntelliJ IDEA's "always keep trailing
+    /// spaces on caret line").
     pub fn remove_trailing_whitespace(&self, cx: &App) -> Task<Diff> {
         let old_text = self.as_rope().clone();
         let line_ending = self.line_ending();
         let base_version = self.version();
+        // Resolve the anchors here, on the foreground: they are only meaningful against the
+        // buffer's current state, which the background task does not have.
+        let protected_rows = self
+            .caret_positions
+            .iter()
+            .map(|anchor| anchor.summary::<Point>(self).row)
+            .collect::<HashSet<u32>>();
         cx.background_spawn(async move {
             let ranges = trailing_whitespace_ranges(&old_text);
             let empty = Arc::<str>::from("");
@@ -2276,6 +2292,9 @@ impl Buffer {
                 line_ending,
                 edits: ranges
                     .into_iter()
+                    .filter(|range| {
+                        !protected_rows.contains(&old_text.offset_to_point(range.start).row)
+                    })
                     .map(|range| (range, empty.clone()))
                     .collect(),
             }
@@ -2578,6 +2597,18 @@ impl Buffer {
             rx = Some(channel.1);
         }
         rx
+    }
+
+    /// Records where the local UI's carets currently are, so that operations which rewrite
+    /// the buffer on the user's behalf can leave the line being edited alone (see
+    /// [`Buffer::remove_trailing_whitespace`]).
+    ///
+    /// Unlike [`Buffer::set_active_selections`], this is purely local bookkeeping: it sends no
+    /// collaboration operation, does not bump the non-text state update count, and does not
+    /// notify observers. It is called on every selection change, so it must stay free of any
+    /// re-render or network cost.
+    pub fn set_caret_positions(&mut self, positions: Vec<Anchor>) {
+        self.caret_positions = positions;
     }
 
     /// Stores a set of selections that should be broadcasted to all of the buffer's replicas.

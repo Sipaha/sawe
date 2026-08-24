@@ -1780,6 +1780,40 @@ impl MultiBuffer {
         }
     }
 
+    /// Reports where the local carets are to each underlying buffer, so that save-time
+    /// rewrites can leave the line being edited alone. Only the selection heads matter here.
+    ///
+    /// Unlike [`MultiBuffer::set_active_selections`] this must stay cheap: it is called on every
+    /// selection change and performs no notification or collaboration work.
+    pub fn set_caret_positions(&self, selections: &[Selection<Anchor>], cx: &mut Context<Self>) {
+        let snapshot = self.snapshot(cx);
+        let mut positions_by_buffer: HashMap<BufferId, Vec<text::Anchor>> = Default::default();
+
+        for selection in selections {
+            let head = selection.head();
+            for (buffer_snapshot, buffer_range, _) in snapshot.range_to_buffer_ranges(head..head) {
+                positions_by_buffer
+                    .entry(buffer_snapshot.remote_id())
+                    .or_default()
+                    .push(buffer_snapshot.anchor_at(buffer_range.start, head.bias()));
+            }
+        }
+
+        for (buffer_id, buffer_state) in self.buffers.iter() {
+            if !positions_by_buffer.contains_key(buffer_id) {
+                buffer_state
+                    .buffer
+                    .update(cx, |buffer, _| buffer.set_caret_positions(Vec::new()));
+            }
+        }
+
+        for (buffer_id, positions) in positions_by_buffer {
+            self.buffers[&buffer_id].buffer.update(cx, |buffer, _| {
+                buffer.set_caret_positions(positions);
+            });
+        }
+    }
+
     #[instrument(skip_all)]
     fn merge_excerpt_ranges<'a>(
         expanded_ranges: impl IntoIterator<Item = &'a ExcerptRange<Point>> + 'a,
