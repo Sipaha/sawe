@@ -155,6 +155,88 @@ fn rebase_with_drop_completes() {
     assert_eq!(subjects, vec!["second", "first"]);
 }
 
+/// Squashing a range that does not reach HEAD used to be rejected as a
+/// contiguity violation: every commit newer than the range was compared
+/// against the squash targets instead of simply being replayed.
+#[test]
+fn squash_middle_range_keeps_newer_commits() {
+    let _helper = install_helper();
+    let repo = tempfile::Builder::new()
+        .prefix("rebase-e2e-repo-")
+        .tempdir()
+        .expect("tempdir");
+    init_repo(repo.path());
+    commit(repo.path(), "a.txt", "A1\n", "first");
+    commit(repo.path(), "b.txt", "B1\n", "second");
+    commit(repo.path(), "c.txt", "C1\n", "third");
+    commit(repo.path(), "d.txt", "D1\n", "fourth");
+
+    let second = rev(repo.path(), "HEAD~2");
+    let third = rev(repo.path(), "HEAD~1");
+
+    let handle = smol::block_on(
+        git::operations::squash::SquashOp {
+            shas: vec![second, third],
+            final_message: "second and third".to_string(),
+        }
+        .run(repo.path(), RebaseCallbacks::default()),
+    )
+    .expect("squash ran");
+    match handle.state() {
+        RebaseState::Completed => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    assert_eq!(
+        log_subjects(repo.path(), "HEAD"),
+        vec!["fourth", "second and third", "first"]
+    );
+    for file in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        assert!(
+            repo.path().join(file).exists(),
+            "{file} survived the squash"
+        );
+    }
+}
+
+/// Same contiguity rule as the squash test above — `fixup` shares the
+/// history walk and shared the bug.
+#[test]
+fn fixup_middle_range_keeps_newer_commits() {
+    let _helper = install_helper();
+    let repo = tempfile::Builder::new()
+        .prefix("rebase-e2e-repo-")
+        .tempdir()
+        .expect("tempdir");
+    init_repo(repo.path());
+    commit(repo.path(), "a.txt", "A1\n", "first");
+    commit(repo.path(), "b.txt", "B1\n", "second");
+    commit(repo.path(), "c.txt", "C1\n", "third");
+    commit(repo.path(), "d.txt", "D1\n", "fourth");
+
+    let second = rev(repo.path(), "HEAD~2");
+    let third = rev(repo.path(), "HEAD~1");
+
+    let handle = smol::block_on(
+        git::operations::fixup::FixupOp {
+            shas: vec![second, third],
+        }
+        .run(repo.path(), RebaseCallbacks::default()),
+    )
+    .expect("fixup ran");
+    match handle.state() {
+        RebaseState::Completed => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    // `fixup` keeps the oldest selected commit's message.
+    assert_eq!(
+        log_subjects(repo.path(), "HEAD"),
+        vec!["fourth", "second", "first"]
+    );
+    assert!(repo.path().join("c.txt").exists(), "third's file survived");
+}
+
 #[test]
 fn rebase_with_conflict_pauses() {
     let _helper = install_helper();

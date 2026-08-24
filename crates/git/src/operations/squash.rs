@@ -72,7 +72,13 @@ impl SquashOp {
                 }
                 continue;
             }
-            if squash_targets.iter().any(|s| shas_equal(&commit, s)) {
+            if squashes_emitted == squash_targets.len() {
+                // Every selected commit has been folded; whatever else is
+                // between the range and HEAD is untouched history and has to
+                // be replayed, not rejected. Rejecting it is what made this
+                // op fail for any selection that did not end at HEAD.
+                builder = builder.pick(commit);
+            } else if squash_targets.iter().any(|s| shas_equal(&commit, s)) {
                 builder = builder.fixup(commit);
                 squashes_emitted += 1;
             } else {

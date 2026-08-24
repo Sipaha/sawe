@@ -38,7 +38,7 @@ impl FixupOp {
         }
 
         let mut emitted_first = false;
-        let mut emitted_any_target = false;
+        let mut fixups_emitted = 0usize;
         for commit in history {
             if !emitted_first && shas_equal(&commit, &first) {
                 builder = builder.pick(commit.clone());
@@ -49,20 +49,15 @@ impl FixupOp {
                 builder = builder.pick(commit);
                 continue;
             }
-            if squash_targets.iter().any(|s| shas_equal(&commit, s)) {
+            if fixups_emitted == squash_targets.len() {
+                // The selected range is folded; the commits after it are
+                // untouched history and have to be replayed. Rejecting them
+                // is what made this op fail for any selection not ending at
+                // HEAD.
+                builder = builder.pick(commit);
+            } else if squash_targets.iter().any(|s| shas_equal(&commit, s)) {
                 builder = builder.fixup(commit);
-                emitted_any_target = true;
-            } else if shas.iter().skip(1).any(|s| shas_equal(&commit, s)) {
-                // already covered above; redundancy guard
-                builder = builder.fixup(commit);
-                emitted_any_target = true;
-            } else if shas
-                .iter()
-                .skip(1)
-                .any(|s| s.to_lowercase() == commit.to_lowercase())
-            {
-                builder = builder.fixup(commit);
-                emitted_any_target = true;
+                fixups_emitted += 1;
             } else {
                 bail!(
                     "fixup targets are not contiguous: commit {} sits between selected commits",
@@ -70,7 +65,7 @@ impl FixupOp {
                 );
             }
         }
-        if shas.len() > 1 && !emitted_any_target {
+        if fixups_emitted != squash_targets.len() {
             bail!("fixup: not all selected commits found in history");
         }
         let todo = builder.build();
