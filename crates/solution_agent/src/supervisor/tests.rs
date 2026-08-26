@@ -451,6 +451,89 @@ fn parse_reset_none_when_no_clause() {
     );
 }
 
+/// The maintainer's literal wall from `sawe.log.old` (2026-08-26): a weekly
+/// reset printed as a MONTH-DAY date, not a weekday token. Before this fix
+/// the parser found no weekday, fell into the bare-time branch, and resolved
+/// to "today/tomorrow at 9pm" — three days early — which is exactly the
+/// erratic wake-up the maintainer observed.
+#[test]
+fn parse_reset_month_day_maintainer_literal() {
+    use chrono::TimeZone as _;
+    use chrono_tz::Tz;
+    let tz: Tz = "Asia/Novosibirsk".parse().unwrap();
+    // 2026-08-26 10:49 Novosibirsk (UTC+7) == 03:49 UTC — matches the log ts.
+    let now = chrono::Utc.with_ymd_and_hms(2026, 8, 26, 3, 49, 0).unwrap();
+    let got = parse_usage_limit_reset_ms(
+        "You've hit your weekly limit · resets Aug 29, 9pm (Asia/Novosibirsk)",
+        now.timestamp_millis(),
+    )
+    .expect("parse");
+    let want = tz
+        .with_ymd_and_hms(2026, 8, 29, 21, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    assert_eq!(got, want);
+}
+
+/// Tolerant variants of the month-day form: no comma, day before month, and a
+/// full month name instead of the 3-letter abbreviation. All must resolve to
+/// the same instant as the canonical `"Aug 29, 9pm"` form.
+#[test]
+fn parse_reset_month_day_tolerant_variants() {
+    use chrono::TimeZone as _;
+    use chrono_tz::Tz;
+    let tz: Tz = "Asia/Novosibirsk".parse().unwrap();
+    let now = chrono::Utc.with_ymd_and_hms(2026, 8, 26, 3, 49, 0).unwrap();
+    let want = tz
+        .with_ymd_and_hms(2026, 8, 29, 21, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+
+    for message in [
+        "resets Aug 29 9pm (Asia/Novosibirsk)",     // no comma
+        "resets 29 Aug, 9pm (Asia/Novosibirsk)",    // day before month
+        "resets 29 Aug 9pm (Asia/Novosibirsk)",     // day before month, no comma
+        "resets August 29, 9pm (Asia/Novosibirsk)", // full month name
+    ] {
+        let got = parse_usage_limit_reset_ms(message, now.timestamp_millis())
+            .unwrap_or_else(|| panic!("expected a parse for {message:?}"));
+        assert_eq!(got, want, "mismatch for {message:?}");
+    }
+}
+
+/// A month-day reset that has already passed THIS year (e.g. a "Jan 3" wall
+/// seen in December) must roll over to next year, not resolve to a stale past
+/// date.
+#[test]
+fn parse_reset_month_day_year_rollover() {
+    use chrono::TimeZone as _;
+    use chrono_tz::Tz;
+    let tz: Tz = "Asia/Novosibirsk".parse().unwrap();
+    let now = chrono::Utc.with_ymd_and_hms(2026, 12, 15, 3, 0, 0).unwrap();
+    let got = parse_usage_limit_reset_ms(
+        "You've hit your weekly limit · resets Jan 3, 9am (Asia/Novosibirsk)",
+        now.timestamp_millis(),
+    )
+    .expect("parse");
+    let want = tz
+        .with_ymd_and_hms(2027, 1, 3, 9, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    assert_eq!(got, want);
+}
+
+/// A month-day-shaped message with no parseable time clause at all must still
+/// return `None` — the malformed-input safety net is not weakened by the new
+/// date branch.
+#[test]
+fn parse_reset_month_day_malformed_still_none() {
+    let now = 1_782_000_000_000;
+    assert_eq!(
+        parse_usage_limit_reset_ms("resets Aug the limit is gone", now),
+        None
+    );
+}
+
 #[test]
 fn parse_clock_forms() {
     assert_eq!(parse_clock("8:20pm"), Some((20, 20)));

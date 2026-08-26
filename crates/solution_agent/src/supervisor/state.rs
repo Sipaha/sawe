@@ -454,25 +454,43 @@ pub fn classify_judge_error(message: &str) -> JudgeFailure {
     JudgeFailure::Transient
 }
 
+/// What the reset moment is anchored to, once `parse_usage_limit_reset_ms`
+/// has scanned the `resets <clause>` tail for a date-shaped token.
+enum ResetTarget {
+    /// A weekday token (`mon`..`sun`) — the weekly limit's usual shape.
+    Weekday(chrono::Weekday),
+    /// A month + day-of-month pair (`aug 29`, `29 aug`, `august 29`) — the
+    /// weekly limit printed as a calendar date instead of a weekday.
+    MonthDay { month: u32, day: u32 },
+    /// No date token at all: today (or tomorrow if already past).
+    Today,
+}
+
 /// Parse the reset moment from a claude usage-limit message and return it as
 /// epoch-millis (UTC). The message carries a wall-clock time plus, usually, a
 /// timezone in parentheses, e.g.:
 ///   "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
 ///   "...weekly limit · resets Wed 9am (America/New_York)"
+///   "...weekly limit · resets Aug 29, 9pm (Asia/Novosibirsk)"  (month-day)
 ///   "...resets 20:20"                              (24h, no tz)
 ///
 /// Resolution order for the timezone: the IANA name in parentheses first
 /// (claude prints it), falling back to the machine's local timezone (which is
 /// what claude reports against anyway). A weekday token (`mon`..`sun`) selects
-/// the next matching date — used by the weekly limit; without one the time is
-/// taken as today (or tomorrow if already past) — the session limit.
+/// the next matching date; a month + day-of-month pair (`aug 29`, `29 aug`,
+/// `august 29`, with or without a comma) selects the next occurrence of that
+/// calendar date (rolling into next year if it has already passed this year);
+/// without either, the time is taken as today (or tomorrow if already past).
+/// Both weekly forms are used interchangeably by claude for the same wall —
+/// this must handle both.
 ///
 /// Returns `None` when there is no parseable `resets <time>` clause, so the
 /// caller can fall back to a terminal stop. An *under*-estimate (e.g. a weekly
-/// reset printed without a weekday, resolved to tomorrow) is self-correcting:
-/// the resumed turn re-hits the still-active limit and re-schedules.
+/// reset printed without a weekday or date, resolved to tomorrow) is
+/// self-correcting: the resumed turn re-hits the still-active limit and
+/// re-schedules.
 pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
-    use chrono::{Datelike, Duration, NaiveTime, TimeZone, Utc, Weekday};
+    use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 
     let lower = message.to_ascii_lowercase();
     let after = lower.split("resets").nth(1)?;
@@ -484,15 +502,53 @@ pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
         .and_then(|(_, rest)| rest.split_once(')'))
         .and_then(|(name, _)| name.trim().parse::<chrono_tz::Tz>().ok());
 
-    // Optional weekday token (weekly limit).
-    let weekday: Option<Weekday> = after.split_whitespace().find_map(parse_weekday);
+    let tokens: Vec<&str> = after.split_whitespace().collect();
 
-    // First time-looking token: "8:20pm" / "8pm" / "20:20" / "9".
-    let (hour, minute) = after
-        .split_whitespace()
-        .find_map(|tok| parse_clock(tok.trim_matches(|c: char| c == '.' || c == ',')))?;
+    // Optional weekday token (weekly limit, weekday shape).
+    let weekday = tokens.iter().find_map(|t| parse_weekday(t));
+
+    // Optional month + day-of-month pair (weekly limit, calendar-date shape).
+    // Tolerates "aug 29", "29 aug", with or without a trailing comma on the
+    // day token. Tracks which token indices it consumed so the time scan
+    // below doesn't mistake the day-of-month for an hour (e.g. day 9 read as
+    // "9" o'clock).
+    let mut month_day: Option<(u32, u32)> = None;
+    let mut consumed: [Option<usize>; 2] = [None, None];
+    if weekday.is_none() {
+        let found_month = tokens
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| parse_month(t).map(|month| (i, month)));
+        if let Some((mi, month)) = found_month {
+            if let Some(day) = tokens.get(mi + 1).and_then(|t| parse_day_of_month(t)) {
+                month_day = Some((month, day));
+                consumed = [Some(mi), Some(mi + 1)];
+            } else if mi > 0 {
+                if let Some(day) = parse_day_of_month(tokens[mi - 1]) {
+                    month_day = Some((month, day));
+                    consumed = [Some(mi - 1), Some(mi)];
+                }
+            }
+        }
+    }
+
+    // First time-looking token: "8:20pm" / "8pm" / "20:20" / "9". Skips
+    // whichever tokens were consumed above as the month/day pair.
+    let (hour, minute) = tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !consumed.contains(&Some(*i)))
+        .find_map(|(_, tok)| parse_clock(tok.trim_matches(|c: char| c == '.' || c == ',')))?;
 
     let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+
+    let target = match weekday {
+        Some(w) => ResetTarget::Weekday(w),
+        None => match month_day {
+            Some((month, day)) => ResetTarget::MonthDay { month, day },
+            None => ResetTarget::Today,
+        },
+    };
 
     // Build the target instant in the resolved timezone, then convert to UTC
     // millis. Done generically over the timezone so the local-fallback and the
@@ -501,19 +557,19 @@ pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
         tz: Tz,
         now_ms: i64,
         time: NaiveTime,
-        weekday: Option<Weekday>,
+        target: &ResetTarget,
     ) -> Option<i64> {
         let now = Utc
             .timestamp_millis_opt(now_ms)
             .single()?
             .with_timezone(&tz);
-        let mut date = now.date_naive();
-        match weekday {
-            Some(target) => {
+        match target {
+            ResetTarget::Weekday(target_weekday) => {
+                let mut date = now.date_naive();
                 // Advance to the next date whose weekday matches (today counts
                 // only if the time hasn't passed yet).
                 for _ in 0..8 {
-                    if date.weekday() == target {
+                    if date.weekday() == *target_weekday {
                         if let Some(dt) = tz
                             .from_local_datetime(&date.and_time(time))
                             .single()
@@ -526,7 +582,26 @@ pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
                 }
                 None
             }
-            None => {
+            ResetTarget::MonthDay { month, day } => {
+                // Next occurrence of this calendar date: this year if it's
+                // still ahead, else roll into next year (e.g. a "Jan 3" wall
+                // read in December).
+                let this_year = now.year();
+                let candidate = NaiveDate::from_ymd_opt(this_year, *month, *day)?;
+                if let Some(dt) = tz
+                    .from_local_datetime(&candidate.and_time(time))
+                    .single()
+                    .filter(|dt| dt.timestamp_millis() > now_ms)
+                {
+                    return Some(dt.timestamp_millis());
+                }
+                let next_year = NaiveDate::from_ymd_opt(this_year + 1, *month, *day)?;
+                tz.from_local_datetime(&next_year.and_time(time))
+                    .single()
+                    .map(|dt| dt.timestamp_millis())
+            }
+            ResetTarget::Today => {
+                let date = now.date_naive();
                 let today = tz.from_local_datetime(&date.and_time(time)).single();
                 match today {
                     Some(dt) if dt.timestamp_millis() > now_ms => Some(dt.timestamp_millis()),
@@ -562,8 +637,8 @@ pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
     }
 
     match tz {
-        Some(tz) => resolve(tz, now_ms, time, weekday),
-        None => resolve(chrono::Local, now_ms, time, weekday),
+        Some(tz) => resolve(tz, now_ms, time, &target),
+        None => resolve(chrono::Local, now_ms, time, &target),
     }
 }
 
@@ -584,6 +659,43 @@ pub(crate) fn parse_weekday(token: &str) -> Option<chrono::Weekday> {
         "sun" => Sun,
         _ => return None,
     })
+}
+
+/// Parse a 3+ letter month prefix (`aug`, `august`, …) — lowercase input.
+/// Returns `1..=12`. Mirrors [`parse_weekday`]'s prefix-matching shape.
+pub(crate) fn parse_month(token: &str) -> Option<u32> {
+    let t = token.trim_matches(|c: char| !c.is_ascii_alphabetic());
+    if t.len() < 3 {
+        return None;
+    }
+    Some(match &t[..3] {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    })
+}
+
+/// Parse a bare day-of-month token (`29`, `29,`, `3.`) into `1..=31`.
+/// Deliberately rejects anything with a letter or colon in it (`9pm`,
+/// `8:20`) so a clock token is never misread as a day-of-month — the caller
+/// relies on that to tell the two apart when they're adjacent in the message.
+pub(crate) fn parse_day_of_month(token: &str) -> Option<u32> {
+    let t = token.trim_matches(|c: char| c == ',' || c == '.');
+    if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let day: u32 = t.parse().ok()?;
+    (1..=31).contains(&day).then_some(day)
 }
 
 /// Parse a clock token into `(hour_0_23, minute)`. Accepts 12h (`8pm`,
