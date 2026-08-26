@@ -1438,6 +1438,7 @@ mod tests {
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use settings::SettingsStore;
+    use crate::ToggleFocus;
     use solution_agent::store::SolutionAgentStore;
     use workspace::Workspace;
 
@@ -1682,6 +1683,201 @@ mod tests {
         // into `SolutionAgentStore`) does not panic while the `Workspace` is
         // leased.
         cx.run_until_parked();
+    }
+
+    /// Bootstrap a `Workspace` with BOTH Solution-band slots filled — the
+    /// `SolutionBand` in `solution_band_item` and a `ConsolePanel` in
+    /// `solution_band_utility_item` — which is what `handle_toggle_focus`
+    /// resolves at runtime. `worktree_under_solution` decides whether the
+    /// workspace's worktree lives under the created Solution's root (so
+    /// `SolutionBand::solution_id` resolves to `Some`) or in an unrelated
+    /// plain folder (so it resolves to `None` and the band falls back to its
+    /// window-local state). Returns the created Solution's id either way, so
+    /// the caller can assert which of the two stores the toggle wrote to.
+    async fn bootstrap_band_and_panel(
+        cx: &mut TestAppContext,
+        worktree_under_solution: bool,
+    ) -> (
+        gpui::WindowHandle<Workspace>,
+        Entity<ConsolePanel>,
+        SolutionId,
+    ) {
+        init_test(cx);
+
+        let (solution_id, solution_root) = cx.update(|cx| {
+            let store = SolutionStore::for_test(std::path::PathBuf::from("/cfg.json"), cx);
+            let created = store.update(cx, |store, cx| {
+                let id = store.create_for_test_minimal("ToggleFocusGuard", cx);
+                let root = store
+                    .solutions()
+                    .iter()
+                    .find(|sol| sol.id == id)
+                    .map(|sol| sol.root.clone())
+                    .expect("just-created solution");
+                (id, root)
+            });
+            solutions::install_global_for_test(store, cx);
+            created
+        });
+
+        let worktree = if worktree_under_solution {
+            solution_root.clone()
+        } else {
+            std::path::PathBuf::from("/plain-folder")
+        };
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(&solution_root, serde_json::json!({})).await;
+        if worktree != solution_root {
+            fs.insert_tree(&worktree, serde_json::json!({})).await;
+        }
+        let project = Project::test(fs, [worktree.as_path()], cx).await;
+
+        let connect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cx.update(|cx| {
+            let registry = std::sync::Arc::new(solution_agent::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+            let agent_store = SolutionAgentStore::global(cx);
+            agent_store.update(cx, |s, _| {
+                s.register_agent_server(
+                    gpui::SharedString::from(solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID),
+                    std::rc::Rc::new(solution_agent::test_support::MockAgentServer::new(
+                        connect_count,
+                    )),
+                );
+            });
+        });
+
+        let window_handle = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let panel = window_handle
+            .update(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| ConsolePanel::new(workspace.weak_handle(), cx));
+                let band = cx.new(|cx| {
+                    SolutionBand::new(
+                        workspace.weak_handle(),
+                        workspace.project().clone(),
+                        cx,
+                    )
+                });
+                workspace.set_solution_band_item(band.into(), window, cx);
+                workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
+                panel
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        (window_handle, panel, solution_id)
+    }
+
+    fn band_of(
+        window_handle: &gpui::WindowHandle<Workspace>,
+        cx: &mut TestAppContext,
+    ) -> Entity<SolutionBand> {
+        window_handle
+            .update(cx, |workspace, _window, _cx| {
+                workspace
+                    .solution_band_item()
+                    .and_then(|item| item.downcast::<SolutionBand>().ok())
+                    .expect("the band was installed by bootstrap_band_and_panel")
+            })
+            .unwrap()
+    }
+
+    /// Double-lease guard for `ctrl-\``, the sibling of
+    /// `new_chat_action_does_not_double_lease_the_workspace` below.
+    /// `handle_toggle_focus` runs under `workspace.register_action`'s mutable
+    /// `Workspace` lease and now reaches all the way into
+    /// `SolutionBand::toggle_utility_focus` → `utility_visible` →
+    /// `solution_id`, which has to answer "which Solution is this?" before it
+    /// can read or write the band's persisted geometry. Resolving that by
+    /// upgrading the band's `WeakEntity<Workspace>` and reading it — the
+    /// obvious implementation — re-acquires the SAME entity's lease and
+    /// panics at runtime while compiling clean and passing every other unit
+    /// test in this crate. The band therefore walks its `Entity<Project>`
+    /// instead. `WindowHandle::update`'s closure leases the root view
+    /// (`Workspace`) exactly the way the real action dispatch does, and the
+    /// Solution set up here makes `solution_id` resolve to `Some`, so the
+    /// call actually reaches the lookup that would double-lease.
+    #[gpui::test]
+    async fn toggle_focus_action_does_not_double_lease_the_workspace(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, _panel, solution_id) = bootstrap_band_and_panel(cx, true).await;
+        let band = band_of(&window_handle, cx);
+
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "the utility section starts hidden"
+        );
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "ctrl-` reveals the utility section"
+        );
+        cx.update(|cx| {
+            assert!(
+                SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .band_state(solution_id)
+                    .utility_visible,
+                "the toggle must land on the OWNING Solution's band state, not the \
+                 window-local fallback — otherwise the Solution lookup silently \
+                 resolved to None and this test would no longer be exercising the \
+                 double-lease path at all"
+            );
+        });
+    }
+
+    /// A plain-folder window that belongs to no Solution is a supported case
+    /// in this fork, and `ctrl-\`` has to keep working there — that is the
+    /// entire reason `SolutionBand` carries a window-local `BandState`
+    /// fallback. Keyed on a `SolutionId` alone, this toggle would be a no-op.
+    #[gpui::test]
+    async fn toggle_focus_works_in_a_workspace_with_no_solution(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, _panel, solution_id) = bootstrap_band_and_panel(cx, false).await;
+        let band = band_of(&window_handle, cx);
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "ctrl-` must reveal the terminal in a window with no Solution too"
+        );
+        cx.update(|cx| {
+            assert!(
+                !SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .band_state(solution_id)
+                    .utility_visible,
+                "a Solution-less window must not write into some unrelated \
+                 Solution's persisted band geometry"
+            );
+        });
+
+        // Hiding again goes back through the same fallback rather than
+        // sticking on `true` (the tri-state's second leg).
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "a second ctrl-` on the focused section hides it again"
+        );
     }
 
     /// Regression: the empty-solution guard used to ask

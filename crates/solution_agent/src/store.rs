@@ -473,9 +473,16 @@ pub enum SolutionAgentStoreEvent {
     /// selection and the other stays in sync.
     ActiveDialogSessionChanged { solution_id: SolutionId },
     /// The band's divider position or utility-section visibility changed for
-    /// `solution_id`. Separate from `ActiveDialogSessionChanged` so the tab
-    /// strip — which only cares about the selection — isn't repainted on
-    /// every frame of a divider drag.
+    /// `solution_id`. A divider drag emits one of these per `on_drag_move`,
+    /// so it is kept separate from `ActiveDialogSessionChanged` to keep
+    /// `SessionTabStrip` — which filters on an explicit event list and only
+    /// cares about the selection — out of the drag's repaint path. Note this
+    /// buys nothing for the catch-all subscribers that notify on ANY store
+    /// event (`SolutionAgentStatusItem`, `solutions_ui::SolutionTabStrip`);
+    /// they repaint per move regardless, which is free only because GPUI
+    /// coalesces `Effect::Notify` per entity per frame and the window is
+    /// already repainting for the drag. A future subscriber that does real
+    /// work on this event needs to debounce it itself.
     BandStateChanged { solution_id: SolutionId },
 }
 
@@ -493,8 +500,6 @@ fn tool_name_is_agent(name: Option<&str>) -> bool {
     matches!(name, Some(n) if n.eq_ignore_ascii_case("agent"))
 }
 
-/// Don't GC session archives until a solution has more than this many sessions
-/// (closed ones included) — small workspaces keep their full history on disk.
 /// How long the band's divider must sit still before its position is
 /// written to SQLite. `on_drag_move` fires per mouse move, so an
 /// undebounced write would be a DB round-trip per frame of the drag; the
@@ -502,6 +507,8 @@ fn tool_name_is_agent(name: Option<&str>) -> bool {
 /// invisible unless the editor is killed mid-drag.
 const BAND_STATE_WRITE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// Don't GC session archives until a solution has more than this many sessions
+/// (closed ones included) — small workspaces keep their full history on disk.
 const ARCHIVE_REAP_MIN_SESSIONS: usize = 10;
 /// A session's `.agents/<sid>/` archive is eligible for GC once its last
 /// activity is older than this.
@@ -1387,11 +1394,21 @@ impl SolutionAgentStore {
         visible: bool,
         cx: &mut Context<Self>,
     ) {
-        let entry = self.band_state.entry(solution_id).or_default();
-        if entry.utility_visible == visible {
+        // The no-op check reads through `band_state`, NOT through
+        // `entry(..).or_default()`: `or_default` runs before the early return
+        // and would insert a defaults row for a Solution nothing has touched.
+        // `set_persistence`'s hydration is `or_insert`-only, so one such
+        // phantom entry created before the DB finishes opening permanently
+        // blocks that Solution's persisted row from loading — its divider
+        // ratio and active dialog would be silently discarded, then
+        // overwritten with defaults by the next real mutation.
+        if self.band_state(solution_id).utility_visible == visible {
             return;
         }
-        entry.utility_visible = visible;
+        self.band_state
+            .entry(solution_id)
+            .or_default()
+            .utility_visible = visible;
         self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();
@@ -1407,11 +1424,12 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         let ratio = clamp_divider_ratio(ratio);
-        let entry = self.band_state.entry(solution_id).or_default();
-        if entry.divider_ratio == ratio {
+        // Same `or_default`-before-early-return hazard as
+        // `set_band_utility_visible` — see the comment there.
+        if self.band_state(solution_id).divider_ratio == ratio {
             return;
         }
-        entry.divider_ratio = ratio;
+        self.band_state.entry(solution_id).or_default().divider_ratio = ratio;
         self.persist_band_state_debounced(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();

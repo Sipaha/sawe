@@ -381,6 +381,132 @@ mod tests {
         );
     }
 
+    /// Store + in-memory DB, wired together and settled. The tempdir must
+    /// outlive the test: it holds the on-disk solution the store resolves
+    /// paths under.
+    async fn store_with_persistence(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<SolutionAgentStore>,
+        Arc<SolutionAgentDb>,
+        tempfile::TempDir,
+    ) {
+        let (_solution_id, tmp, _project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+        let store = cx.update(|cx| SolutionAgentStore::global(cx));
+        let db = Arc::new(SolutionAgentDb::open(cx.executor()).expect("open db"));
+        store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+        cx.run_until_parked();
+        (store, db, tmp)
+    }
+
+    /// What is actually on disk for `solution_id` right now, or `None` when
+    /// no row has been written yet.
+    async fn persisted(db: &Arc<SolutionAgentDb>, solution_id: SolutionId) -> Option<BandState> {
+        db.load_band_states()
+            .await
+            .expect("load band states")
+            .into_iter()
+            .find(|(id, _)| *id == solution_id)
+            .map(|(_, state)| state)
+    }
+
+    /// Ruling-5 invariant (a): the ratio's write is cancel-on-replace, not
+    /// one queued write per `on_drag_move`. Proven by timing rather than by
+    /// the stored value — the debounced write re-reads the state after its
+    /// wait, so an uncancelled first write would store the *same* final ratio
+    /// and be invisible in the row's contents. What it cannot fake is landing
+    /// 400 ms after the FIRST call instead of 400 ms after the last one.
+    #[gpui::test]
+    async fn a_replaced_divider_drag_cancels_the_write_it_supersedes(cx: &mut TestAppContext) {
+        let (store, db, _tmp) = store_with_persistence(cx).await;
+        let solution_id = SolutionId(1);
+
+        // Seed a row so "nothing written yet" is distinguishable from "wrote
+        // the new ratio" — an absent row would make the assertion below pass
+        // for the wrong reason.
+        store.update(cx, |store, cx| {
+            store.set_band_utility_visible(solution_id, true, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            persisted(&db, solution_id).await.map(|s| s.divider_ratio),
+            Some(DEFAULT_DIVIDER_RATIO)
+        );
+
+        store.update(cx, |store, cx| {
+            store.set_band_divider_ratio(solution_id, 0.7, cx)
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        store.update(cx, |store, cx| {
+            store.set_band_divider_ratio(solution_id, 0.8, cx)
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+
+        assert_eq!(
+            persisted(&db, solution_id).await.map(|s| s.divider_ratio),
+            Some(DEFAULT_DIVIDER_RATIO),
+            "600ms after the first drag but only 300ms after the second, nothing \
+             may have been written yet: the first drag's timer must have been \
+             cancelled rather than left to fire at its own 400ms mark"
+        );
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(
+            persisted(&db, solution_id).await.map(|s| s.divider_ratio),
+            Some(0.8),
+            "and the surviving timer writes the position the drag ended on"
+        );
+    }
+
+    /// Ruling-5 invariant (b): an immediate write (`utility_visible` /
+    /// `active_dialog_session`) drops the pending ratio write, so it must
+    /// carry that ratio itself. If it wrote a snapshot captured before the
+    /// drag instead, dragging the divider and then hitting `ctrl-\`` would
+    /// silently roll the divider back on the next restart.
+    #[gpui::test]
+    async fn an_immediate_band_write_carries_the_pending_divider_ratio(cx: &mut TestAppContext) {
+        let (store, db, _tmp) = store_with_persistence(cx).await;
+        let solution_id = SolutionId(1);
+
+        store.update(cx, |store, cx| {
+            store.set_band_divider_ratio(solution_id, 0.8, cx)
+        });
+        // No clock advance — the ratio's write is still parked when the
+        // immediate write below drops it.
+        store.update(cx, |store, cx| {
+            store.set_band_utility_visible(solution_id, true, cx)
+        });
+        cx.run_until_parked();
+
+        let written = persisted(&db, solution_id)
+            .await
+            .expect("the immediate write lands without waiting on the debounce");
+        assert_eq!(
+            written.divider_ratio, 0.8,
+            "the immediate write must persist the CURRENT state, including the \
+             ratio whose debounced write it just cancelled"
+        );
+        assert!(written.utility_visible);
+
+        // The cancelled timer must stay cancelled — no late write resurrecting
+        // a stale snapshot over the row that just landed.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(persisted(&db, solution_id).await, Some(written));
+    }
+
     #[gpui::test]
     async fn band_geometry_round_trips_per_solution(cx: &mut TestAppContext) {
         let (_solution_id, _tmp, _project) =
