@@ -52,30 +52,21 @@ impl Default for AiCherryPickSuggestSettings {
 
 /// Solution-wide branch-protection policy. See
 /// [`crate::branch_protection`] for the matching semantics.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BranchProtectionSettings {
     /// Glob patterns matched against branch names. Applied to every
     /// member of the Solution unless a per-member override extends or
     /// supersedes them.
+    ///
+    /// Empty by default (see FORK.md #90): whether a branch may be written
+    /// is the *server's* call — GitHub/GitLab branch protection, hooks, CI —
+    /// and the server enforces it on push regardless of what this client
+    /// believes. Guessing from a branch name locally only ever produced
+    /// false positives (`master` is an ordinary working branch in plenty of
+    /// repos) while adding no safety the remote did not already provide.
     pub default_protected: Vec<String>,
     /// Per-member overrides keyed by `SolutionMember::catalog_id`.
     pub members: HashMap<String, BranchProtectionMember>,
-}
-
-impl Default for BranchProtectionSettings {
-    fn default() -> Self {
-        Self {
-            // Empty by design: whether a branch may be written is the *server's*
-            // call (GitHub/GitLab branch protection, hooks), and it enforces that
-            // on push regardless of what this client believes. Guessing from a
-            // branch name locally only ever produced false positives — `master`
-            // is an ordinary working branch in plenty of repos — while adding no
-            // safety the remote does not already provide. Opt in explicitly if
-            // you want local nagging.
-            default_protected: Vec::new(),
-            members: HashMap::new(),
-        }
-    }
 }
 
 /// Per-member tightening of [`BranchProtectionSettings`].
