@@ -634,10 +634,13 @@ pub(crate) fn render_status_row(
             // Overloaded blurb) with an ellipsis so they can't blow the status
             // row out to full panel width — the full text is in the tooltip.
             label = label.color(Color::Error).truncate();
-        } else if is_running || is_resuming {
-            label = label.color(Color::Accent);
-        } else if is_cold {
-            label = label.color(Color::Muted);
+        } else {
+            // `error_text.is_some()` above is the only path that sets
+            // `is_errored` true (see `state_dot_color`'s doc comment), so this
+            // branch always passes `false` for it. Shared with
+            // `session_tab_strip`'s per-tab dot so the two surfaces can never
+            // disagree about the same session's color.
+            label = label.color(state_dot_color(false, is_running || is_resuming, is_cold));
         }
         let inner: gpui::AnyElement = if is_running {
             let icon = div()
@@ -1194,6 +1197,26 @@ fn supervisor_popover_menu(
 
         menu
     })
+}
+
+/// Color for the per-session state indicator, shared between this row's own
+/// state badge (above) and `session_tab_strip`'s per-tab dot so the two
+/// surfaces can never disagree about the same session's color. Priority
+/// mirrors the badge exactly: an error always wins, then "doing something"
+/// (running / stopping — the caller folds a view-local `is_resuming` into
+/// `is_running` since resuming isn't part of `SessionState` itself), then
+/// cold (restored from disk but not yet spawned), else the default (idle)
+/// text color.
+pub(crate) fn state_dot_color(is_errored: bool, is_running: bool, is_cold: bool) -> Color {
+    if is_errored {
+        Color::Error
+    } else if is_running {
+        Color::Accent
+    } else if is_cold {
+        Color::Muted
+    } else {
+        Color::Default
+    }
 }
 
 /// Hardcoded fallback when claude-acp doesn't advertise the model's

@@ -26,6 +26,7 @@ pub(crate) mod pool;
 pub mod rename_session_modal;
 pub mod reopen_session_modal;
 pub mod session_entry;
+pub mod session_tab_strip;
 pub mod session_view;
 pub(crate) mod slash_commands;
 pub mod status_item;

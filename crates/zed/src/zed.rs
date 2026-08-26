@@ -619,7 +619,17 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let solutions_status = cx.new(|cx| solutions_ui::SolutionsStatusItem::new(workspace, cx));
         let remote_control_status =
             cx.new(|cx| remote_control_ui::RemoteControlStatusItem::new(workspace, cx));
+        // Sawe: the Solution-scoped AI session tabs (phase 2a) — mirrors how
+        // the title bar carries the Solution tab strip. Registered first so
+        // it sits leftmost, ahead of the file/LSP/diagnostics items.
+        let session_tab_strip = cx.new(|cx| {
+            solution_agent::session_tab_strip::SessionTabStrip::new(
+                workspace.multi_workspace().cloned(),
+                cx,
+            )
+        });
         workspace.status_bar().update(cx, |status_bar, cx| {
+            status_bar.add_left_item(session_tab_strip, window, cx);
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
