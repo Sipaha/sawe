@@ -1024,6 +1024,14 @@ impl ConsolePanel {
 
     /// Spawn or rerun a task. Mirrors `TerminalPanel::spawn_task` but uses
     /// `self.tabs` as the registry of existing terminals instead of a Pane.
+    ///
+    /// **Must not be called while the `Workspace` entity is leased** — it reads
+    /// its own `WeakEntity<Workspace>` below, so calling it from a
+    /// `workspace.register_action` handler (or anything else holding
+    /// `&mut Workspace`) aborts the process, compiles clean and passes unit
+    /// tests. Call it from an async task instead, as
+    /// `terminal_view::terminal_panel::TerminalProvider::spawn` and
+    /// `run_config_ui::run_controller::RunController` both do.
     pub fn spawn_task(
         &mut self,
         task: &SpawnInTerminal,
@@ -1104,6 +1112,11 @@ impl ConsolePanel {
         cx.spawn(async move |_, _| rx.await?)
     }
 
+    /// Inherits `spawn_task`'s no-active-`Workspace`-lease requirement, and
+    /// tightens it: the `RevealTarget::Center` arm updates the workspace
+    /// synchronously (`add_center_terminal` needs `&mut Workspace`), so it
+    /// panics under a caller's lease even for a `spawn_task` path that would
+    /// otherwise only read.
     fn spawn_in_new_terminal(
         &mut self,
         spawn_task: SpawnInTerminal,

@@ -519,6 +519,18 @@ impl RunController {
     ) {
         let poller_config_id = config_id.clone();
         let poller = cx.spawn_in(window, async move |this, cx| {
+            // `insert_terminal_run` marks the run active synchronously but the
+            // spawn below only happens on a later tick, so a `stop()` in
+            // between would otherwise start a process purely to kill it.
+            // Losing the controller counts as cancelled: nothing left to track.
+            let cancelled = this
+                .update(cx, |this, _| {
+                    this.terminal_launches_pending_kill.remove(&launch_token)
+                })
+                .unwrap_or(true);
+            if cancelled {
+                return;
+            }
             // Deliberately inside the poller: `ConsolePanel::spawn_task` reads
             // the `Workspace` entity, which `run`'s caller is still borrowing
             // at the point this task was created.
@@ -732,20 +744,6 @@ impl RunController {
         cx.notify();
     }
 
-    /// Stop `config_id` if it is running, then start it again. Same
-    /// workspace-borrow contract as [`RunController::run`].
-    pub fn rerun(
-        controller: &Entity<Self>,
-        workspace: &mut Workspace,
-        config_id: RunConfigId,
-        executor: Executor,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        controller.update(cx, |this, cx| this.stop(&config_id, cx));
-        Self::run(controller, workspace, config_id, executor, window, cx);
-    }
-
     pub fn stop(&mut self, id: &RunConfigId, cx: &mut Context<Self>) {
         let Some(run) = self.active.remove(id) else {
             return;
@@ -860,7 +858,7 @@ mod tests {
     use std::future;
     use std::process::ExitStatus;
     use ui::IconName;
-    use workspace::{AppState, Workspace};
+    use workspace::{AppState, MultiWorkspace, Workspace};
 
     struct MockProvider;
 
@@ -997,9 +995,13 @@ mod tests {
             store.update(cx, |store, cx| store.upsert(mock_config(name), cx));
         }
         let project = Project::test(app_state.fs.clone(), [], cx).await;
-        let (workspace, _cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
-        workspace
+        // A `MultiWorkspace` root view, not a bare `Workspace`: that is what
+        // `dispatch_run_command` finds at runtime, and it lets
+        // `dispatch_under_workspace_lease` reproduce both of the leases the
+        // real dispatch path holds.
+        let (multi_workspace, _cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
     }
 
     #[gpui::test]
@@ -1157,6 +1159,29 @@ mod tests {
         })
     }
 
+    /// Install a real `ConsolePanel` into `Workspace::solution_band_utility_item`
+    /// — the type-erased slot `zed.rs` uses — so `console_panel_for_workspace`
+    /// finds it and `run` takes the real-panel branch instead of the headless
+    /// `spawn_in_terminal` fallback. Mirrors
+    /// `console_panel::panel::tests::bootstrap_panel`.
+    fn install_console_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut TestAppContext,
+    ) -> Entity<ConsolePanel> {
+        let window = cx
+            .update(|cx| cx.windows().first().copied())
+            .expect("a window exists");
+        window
+            .update(cx, |_, window, cx| {
+                let panel = cx.new(|cx| ConsolePanel::new(workspace.downgrade(), cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
+                });
+                panel
+            })
+            .expect("window is still open")
+    }
+
     /// Call `RunController::run` with an **active `Workspace` lease** around it,
     /// the way both production entry points do — GPUI hands a
     /// `workspace.register_action` handler `&mut Workspace`, and
@@ -1185,17 +1210,19 @@ mod tests {
 
     /// Like `run_under_workspace_lease`, but entering through the real
     /// `apply_run_command` seam that `dispatch_run_command` (and therefore the
-    /// `run_config.run` MCP tool) uses.
-    fn dispatch_under_workspace_lease(
-        workspace: &Entity<Workspace>,
-        command: RunCommand,
-        cx: &mut TestAppContext,
-    ) {
+    /// `run_config.run` MCP tool) uses — including the outer `MultiWorkspace`
+    /// lease that seam holds, so a future `run` branch that reaches for
+    /// `MultiWorkspace` cannot slip through the way this bug slipped through
+    /// the old bare-`&mut App` tests.
+    fn dispatch_under_workspace_lease(command: RunCommand, cx: &mut TestAppContext) {
         let window = cx
             .update(|cx| cx.windows().first().copied())
-            .expect("a window exists");
+            .expect("a window exists")
+            .downcast::<MultiWorkspace>()
+            .expect("the test window's root view is a MultiWorkspace");
         window
-            .update(cx, |_, window, cx| {
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
                     crate::toolbar_strip::apply_run_command(workspace, command, window, cx);
                 });
@@ -1207,23 +1234,11 @@ mod tests {
     async fn run_under_workspace_lease_reaches_a_real_console_panel(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let workspace = setup(cx, &["a"]).await;
-        let window = cx
-            .update(|cx| cx.windows().first().copied())
-            .expect("a window exists");
-        let console_panel = window
-            .update(cx, |_, window, cx| {
-                let panel = cx.new(|cx| ConsolePanel::new(workspace.downgrade(), cx));
-                workspace.update(cx, |workspace, cx| {
-                    workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
-                });
-                panel
-            })
-            .expect("window is still open");
+        let console_panel = install_console_panel(&workspace, cx);
         install_controller(&workspace, cx);
         cx.run_until_parked();
 
         dispatch_under_workspace_lease(
-            &workspace,
             RunCommand::Run {
                 id: RunConfigId::from_raw("mock:a"),
                 executor: Executor::Run,
@@ -1243,6 +1258,51 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn stop_before_the_poller_ticks_never_spawns_a_terminal(cx: &mut TestAppContext) {
+        // `ConsolePanel::spawn_task` runs from the poller rather than inline
+        // (it reads the `Workspace` entity our caller is still borrowing), so
+        // between `run` and the poller's first tick there is a window where the
+        // run is already tracked but nothing has been spawned. A `stop` landing
+        // in that window must cancel the launch outright, not start a process
+        // and immediately kill it. Reachable in one turn over MCP with
+        // back-to-back `run_config.run` / `run_config.stop`.
+        cx.executor().allow_parking();
+        let workspace = setup(cx, &["a"]).await;
+        let console_panel = install_console_panel(&workspace, cx);
+        let controller = install_controller(&workspace, cx);
+        cx.run_until_parked();
+
+        let id = RunConfigId::from_raw("mock:a");
+        dispatch_under_workspace_lease(
+            RunCommand::Run {
+                id: id.clone(),
+                executor: Executor::Run,
+            },
+            cx,
+        );
+        // Deliberately no `run_until_parked` here: stop while the poller is
+        // still queued.
+        dispatch_under_workspace_lease(RunCommand::Stop { id: id.clone() }, cx);
+        cx.run_until_parked();
+
+        console_panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tab_count(),
+                0,
+                "a stop inside the launch window must cancel the spawn, not spawn a terminal \
+                 only to kill it"
+            );
+        });
+        controller.read_with(cx, |controller, _| {
+            assert!(!controller.is_running(&id), "stop clears the active run");
+            assert!(
+                controller.terminal_launches_pending_kill.is_empty(),
+                "the cancelled launch drains its own kill token"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn run_of_a_missing_config_under_workspace_lease_reports_an_error(
         cx: &mut TestAppContext,
     ) {
@@ -1254,7 +1314,6 @@ mod tests {
         cx.run_until_parked();
 
         dispatch_under_workspace_lease(
-            &workspace,
             RunCommand::Run {
                 id: RunConfigId::from_raw("mock:gone"),
                 executor: Executor::Run,

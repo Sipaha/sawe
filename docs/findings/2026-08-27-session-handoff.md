@@ -122,25 +122,32 @@ logs where it used to purge (safe).
 
 ## Outstanding task pool, in priority order
 
-### 1. `RunController::run` double-lease crash (pre-existing, blocks a 2a verification item)
+### 1. ~~`RunController::run` double-lease crash~~ — FIXED 2026-08-27 (`4038606620`)
 
-The Terminal branch of `RunController::run` aborts the whole editor with a
-GPUI double-lease panic at `run_controller.rs:419`, reachable from the
+**Do not re-implement this.** The Terminal branch of `RunController::run`
+aborted the whole editor with a GPUI double-lease panic, reachable from the
 ordinary UI Run button (`alt-shift-f10`, `run_config::Run`) **and** from
-`run_config.run` over MCP. Reproduced on both paths this session. Repro and
-analysis: `docs/findings/2026-08-26-run-controller-terminal-double-lease-crash.md`.
+`run_config.run` over MCP. Pre-existing since the 2026-06-24 refork; task 6
+neither introduced nor worsened it.
 
-Pre-existing since the 2026-06-24 refork; Task 6 neither introduced nor
-worsened it. Invisible to the suite because every existing test calls the
-controller via `AnyWindowHandle::update` (bare `&mut App`, no lease) rather
-than the real `workspace.update` shape. The fix is multi-file: `run`/`rerun`
-must take `&mut Workspace` from their callers (`actions.rs`,
-`toolbar_strip.rs`) instead of re-deriving it from a weak handle.
+The fix needed **two** halves, and the prescription this document previously
+carried ("`run`/`rerun` must take `&mut Workspace` from their callers") was
+only the first — shipping it alone still aborts the editor:
 
-This is **the one Task 8 verification item that could not be checked** —
-"run-configuration output lands in the band's terminal". Every other Step-3
-item passed against 16 screenshots. Phase 2a shipped without it rather than
-holding a finished layout hostage to an unrelated crash.
+1. `RunController::run` is an associated function taking the caller's
+   `&mut Workspace` + `Context<Workspace>`; the controller-only work moved
+   into `prepare_run`. `rerun` was deleted (zero callers).
+2. `ConsolePanel::spawn_task` is called from inside the completion poller's
+   async body, because it reads its **own** `WeakEntity<Workspace>`
+   synchronously and so panics under the caller's lease even with half 1
+   applied. Verified by re-introducing each half separately.
+
+Full record, including the failure output for each half and the live
+headless verification: `docs/findings/2026-08-26-run-controller-terminal-double-lease-crash.md`.
+
+The task-8 verification item this blocked — "run-configuration output lands
+in the band's terminal" — is now confirmed: a task's terminal tab paints in
+the Solution band's utility section on a live headless instance.
 
 ### 2. Plan and execute phase 2b
 

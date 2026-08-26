@@ -197,7 +197,7 @@ pub(crate) fn run_selected_config(
 /// under a `RunController` lease nested inside the caller's `Workspace` lease,
 /// so anything that reads or updates `Workspace` from in there aborts the
 /// process. Launching a config goes through `run_by_id` instead.
-pub fn with_controller(
+pub(crate) fn with_controller(
     workspace: &mut Workspace,
     cx: &mut Context<Workspace>,
     f: impl FnOnce(&mut RunController, &mut Context<RunController>),
