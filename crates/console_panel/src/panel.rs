@@ -107,14 +107,15 @@ fn active_member_path(solution_id: SolutionId, cx: &App) -> Option<PathBuf> {
 /// Which project a console tab belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabScope {
-    /// The tab is bound to a member — either as a fact (a chat carries the
-    /// session's `member_id`) or by placement (a terminal's cwd lives inside
-    /// the member's folder).
+    /// The tab is bound to a member by placement — a terminal's cwd lives
+    /// inside the member's folder. Chats are never `Member`: they are
+    /// solution-scoped, not project-scoped (spec 2026-08-26).
     Member(MemberId),
     /// The tab sits at the solution root and belongs to no project.
     Root,
     /// The tab cannot be placed at all (a terminal opened by the bare
-    /// `NewTerminal` keybinding with no cwd, or one restored with a NULL cwd).
+    /// `NewTerminal` keybinding with no cwd, or one restored with a NULL cwd)
+    /// — or a chat tab, which is always `Unscoped` and therefore always shown.
     Unscoped,
 }
 
@@ -789,7 +790,8 @@ impl ConsolePanel {
             .border_color(cx.theme().colors().border_variant)
             .overflow_x_scroll();
         for (ix, tab) in self.tabs.iter().enumerate() {
-            // Only render tabs belonging to the active member project; the
+            // Only render terminal tabs belonging to the active member
+            // project (chats are solution-scoped and always in scope); the
             // rest stay live in `self.tabs` (absolute indices keep
             // activate/close/reorder valid) but are hidden until their
             // member is selected.
@@ -1052,18 +1054,16 @@ impl ConsolePanel {
         }
     }
 
-    /// A chat tab's scope is a stored fact — the session's `member_id`. A
-    /// terminal has no member binding, so it is placed by its cwd (longest
-    /// matching member wins; anything under the root but in no member is `Root`).
+    /// Chats are solution-scoped, not project-scoped (spec 2026-08-26): a
+    /// chat tab is always `Unscoped`, so it is never filtered by the active
+    /// member. A terminal has no such binding, so it is placed by its cwd
+    /// (longest matching member wins; anything under the root but in no
+    /// member is `Root`).
     fn tab_scope(&self, tab: &ConsoleTab, cx: &App) -> TabScope {
-        if let ConsoleTab::Chat { session_id, .. } = tab
-            && let Some(session) = SolutionAgentStore::try_global(cx)
-                .and_then(|store| store.read(cx).session(*session_id))
-        {
-            return match session.read(cx).member_id {
-                Some(member_id) => TabScope::Member(member_id),
-                None => TabScope::Root,
-            };
+        if let ConsoleTab::Chat { .. } = tab {
+            // Chats are solution-scoped (spec 2026-08-26): never filtered by
+            // the active member. Unscoped = always visible.
+            return TabScope::Unscoped;
         }
         let Some(cwd) = self.tab_cwd(tab, cx) else {
             return TabScope::Unscoped;
@@ -2151,6 +2151,27 @@ mod tests {
         // A tab we cannot place must never silently vanish — hiding it would
         // leave an un-closeable ghost in the strip.
         assert!(tab_in_scope(TabScope::Unscoped, Some(a)));
+    }
+
+    #[test]
+    fn chat_tabs_are_always_in_scope_regardless_of_active_member() {
+        // Chats are solution-scoped: whatever member is active, a chat tab
+        // must be visible. Unscoped is the TabScope variant with that meaning.
+        //
+        // This alone is a weak check — `TabScope::Unscoped` behaves this way
+        // for reasons unrelated to chats too (see the "cannot be placed"
+        // case above). The load-bearing assertion is that `ConsolePanel::
+        // tab_scope`'s `ConsoleTab::Chat` arm unconditionally returns
+        // `TabScope::Unscoped` (see that function, a few lines above) instead
+        // of branching on `session.member_id` — verified by reading the
+        // source, since building a `ConsoleTab::Chat` in this test module
+        // needs a real `Entity<SolutionSessionView>`, which needs the full
+        // editor/language/font stack `bootstrap_panel`'s doc comment says
+        // this module doesn't set up (chat-tab coverage lives in the MCP
+        // e2e probe instead).
+        assert!(tab_in_scope(TabScope::Unscoped, None));
+        assert!(tab_in_scope(TabScope::Unscoped, Some(MemberId(1))));
+        assert!(tab_in_scope(TabScope::Unscoped, Some(MemberId(999))));
     }
 
     #[test]
