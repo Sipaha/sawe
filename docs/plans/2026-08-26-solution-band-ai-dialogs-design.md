@@ -135,6 +135,26 @@ The merged Terminal+Chat panel splits:
 - Reintroducing sessions as workspace pane Items (FORK.md #7 still stands —
   the band is a dedicated region, not the center pane).
 
+## Carried into phase 2
+
+Phase 1 (`docs/plans/2026-08-26-solution-scoped-sessions.md`) removed member
+filtering from the chat-tab strip's *visibility* (no dialog is hidden by a
+project switch any more) but deliberately left one piece of per-member
+bookkeeping in place: `ConsolePanel::active_by_member` (`panel.rs`, ~1119–1144)
+still records and restores a per-member *active* tab, so switching the active
+project can still move the highlighted/selected chat tab away from the one the
+user was just looking at — even though the tab itself stays reachable in the
+strip. This was ruled explicitly in scope for later, not a bug in phase 1 (see
+that plan's Task 6 self-review).
+
+Phase 2 must narrow `active_by_member`-style bookkeeping to the Terminal
+section only, once the dialog's active session becomes solution-level state
+(§4 above: chat tabs leave `ConsolePanel` for the solution band, where there
+is no more "active member" axis to key a per-member selection off of). Until
+then, don't build on `active_by_member` as if it tracks anything but a UI
+convenience — it is not the source of truth for which sessions exist or which
+are visible.
+
 ## 7. Verification
 
 - Debug build + `script/run-mcp --debug --headless`; `workspace.screenshot`
