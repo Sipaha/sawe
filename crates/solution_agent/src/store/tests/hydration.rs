@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[gpui::test]
-async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
+async fn hydrate_all_hydrates_cold_sessions(cx: &mut TestAppContext) {
     let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
     let registry = Arc::new(AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
@@ -80,11 +80,15 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("restore");
-    assert_eq!(ordered, vec![id_b, id_a]);
+    // `hydrate_all_for_solution` returns the ids it hydrated in the order the
+    // metadata query yielded them, NOT in tab order — the tab-order contract
+    // lives in `by_solution`, asserted through `sessions_for` below.
+    assert_eq!(ordered.len(), 2);
+    assert!(ordered.contains(&id_a) && ordered.contains(&id_b));
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -107,10 +111,10 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
                 // No blob saved for B → entries empty.
                 assert!(s.entries.is_empty());
             });
-            // sessions_for is what the navigator's reconcile path
-            // reads; insertion order into `by_solution` must match
-            // the `tab_order ASC` returned by the DB so the strip
-            // ends up identical to what the user closed last time.
+            // `sessions_for` is what the tab strip reads; insertion order
+            // into `by_solution` must match the `tab_order ASC` returned by
+            // the DB so the strip ends up identical to what the user closed
+            // last time.
             let listed: Vec<_> = store
                 .sessions_for(&solution_id)
                 .into_iter()
@@ -129,7 +133,7 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
 /// DB writes with no happens-before. `update_tab_orders` is UPDATE-only, so
 /// if it wins the race against the metadata INSERT it no-ops (no row yet),
 /// and the INSERT used to land the row with `tab_order = NULL` — invisible to
-/// `select_open_tabs` / `restore_open_tabs`, so the session was never
+/// `select_open_tabs` / hydration, so the session was never
 /// re-hydrated on restart. The fix re-persists the row AFTER pinning so the
 /// metadata write carries the real tab_order, and the INSERT's COALESCE
 /// ON CONFLICT keeps it order-independent. Here we drive the real create flow
@@ -172,7 +176,7 @@ async fn create_session_persists_tab_order_for_restart(cx: &mut TestAppContext) 
     cx.run_until_parked();
 
     // The session never received a message — but its strip position must still
-    // be durable, so a restart's `restore_open_tabs` (which queries
+    // be durable, so a restart's hydration (which queries
     // `list_open_tabs`) re-hydrates it instead of raising "unknown session".
     let open_tabs = db
         .list_open_tabs(solution_id)
@@ -206,7 +210,7 @@ async fn create_session_persists_tab_order_for_restart(cx: &mut TestAppContext) 
 /// Regression for the close→reopen empty-history bug: the extracted
 /// blob→cold_entries helper must produce exactly the same shape from
 /// the same input regardless of which call site invokes it. Pre-fix,
-/// the v2 reconstruction was inlined in `restore_open_tabs` only; the
+/// the v2 reconstruction was inlined in the tab-restore path only; the
 /// `resume_session` ELSE branch silently created an empty
 /// `cold_entries` because `claude --resume` doesn't re-emit the
 /// transcript. This test pins the helper's contract: a structured v2
@@ -365,7 +369,7 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -627,7 +631,7 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -747,7 +751,7 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -876,7 +880,7 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
 
     cx.update(|cx| {
         SolutionAgentStore::global(cx)
-            .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+            .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
     })
     .await
     .expect("restore");
@@ -979,7 +983,7 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("restore");
@@ -1023,7 +1027,7 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     let ordered2 = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("restore 2");
@@ -1208,7 +1212,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("first restore");
@@ -1256,7 +1260,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     let ordered2 = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("second restore");
@@ -1341,7 +1345,7 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
     let ordered = cx
         .update(|cx| {
             SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.restore_open_tabs(solution_id, cx))
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
         })
         .await
         .expect("restore");

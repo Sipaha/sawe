@@ -178,7 +178,8 @@ impl SolutionAgentDb {
         apply_idempotent_add_column(&connection, "change_seq INTEGER");
         // Phase 4 Task 3a: persist model/effort/cached_models as columns so they
         // survive the removal of the transcript blob (Task 5). NULL = not set or
-        // pre-Task-3a rows; read column-first then blob-fallback in restore_open_tabs.
+        // pre-Task-3a rows; read column-first then blob-fallback in
+        // `hydrate_all_for_solution`.
         apply_idempotent_add_column(&connection, "desired_model TEXT");
         apply_idempotent_add_column(&connection, "desired_effort TEXT");
         apply_idempotent_add_column(&connection, "cached_models TEXT");

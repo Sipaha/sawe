@@ -791,10 +791,12 @@ mod tests {
     /// actually runs — as the only thing that repopulates it. The strip has to
     /// come back with one tab per restored session, in `tab_order` order.
     ///
-    /// Every other hydration test drives `restore_open_tabs`, which no production
-    /// code path calls; that blind spot is why a restart shipped with the strip
-    /// empty even though the transcripts, the tab order and the persisted
-    /// active-dialog selection had all been restored.
+    /// The hydration tests used to drive `restore_open_tabs`, which no
+    /// production code path called; that blind spot is why a restart shipped
+    /// with the strip empty even though the transcripts, the tab order and the
+    /// persisted active-dialog selection had all been restored. That function
+    /// is gone and its tests were re-pointed here, but keep this one: it is the
+    /// only one that asserts on the strip itself rather than on the store.
     #[gpui::test]
     async fn cold_hydrated_sessions_come_back_as_tabs(cx: &mut TestAppContext) {
         use crate::store::SolutionAgentStoreEvent;
@@ -898,7 +900,7 @@ mod tests {
         );
 
         // `by_solution` insertion order is the ordering contract
-        // `restore_open_tabs` already documents: tab_order ASC, untabbed last.
+        // `hydrate_all_for_solution` documents: tab_order ASC, untabbed last.
         let indexed = cx.update(|cx| {
             SolutionAgentStore::global(cx).read_with(cx, |store, cx| {
                 store

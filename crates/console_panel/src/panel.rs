@@ -453,7 +453,7 @@ impl ConsolePanel {
             // Reconcile SolutionSession.tab_order against the restored panel
             // strip. Without this, boot leaves two sources of truth: this
             // panel's persisted tabs vs. the tab_order column hydrated by
-            // restore_open_tabs — they were free to diverge once a desktop
+            // `hydrate_all_for_solution` — they were free to diverge once a desktop
             // user added a tab in a previous run (only ConsolePanel persisted
             // the new tab; tab_order stayed pointing at the previous set).
             // Calling persist here at end of restore harmonises them.

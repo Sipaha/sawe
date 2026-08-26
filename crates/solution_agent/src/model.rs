@@ -444,15 +444,18 @@ pub struct SolutionSession {
     /// loaded cold rows are not needlessly re-upserted on the first post-load
     /// persist.
     pub persisted_main_seq: u64,
-    /// `true` while a restored tab's `acp_thread_blob` is still being
-    /// deserialised on a background task. Set by the lazy-hydration path
-    /// ([`SolutionAgentStore::restore_open_tabs_lazy`]) when a placeholder
-    /// session entity is materialised with empty `entries`; cleared
-    /// once the blob lands and `entries` is populated. The session
-    /// view renders a loading spinner (instead of "no messages yet") while
-    /// this is `true` and there is no live thread, so a not-yet-hydrated
-    /// background tab reads as "loading", not "empty". Always `false` for
-    /// fresh/live sessions and for tabs hydrated synchronously.
+    /// `true` while a restored tab's transcript is still being loaded on a
+    /// background task: the session view renders a loading spinner (instead
+    /// of "no messages yet") while this is `true` and there is no live
+    /// thread, so a not-yet-hydrated background tab reads as "loading", not
+    /// "empty".
+    ///
+    /// NOTHING SETS IT ANY MORE. Its only writer was the lazy-hydration path
+    /// (`hydrate_open_tabs_lazy`), deleted along with `restore_open_tabs`
+    /// once both were confirmed to have no production caller. The read side
+    /// is kept because `hydrate_all_for_solution` loads serially and could
+    /// grow the same placeholder-then-fill shape; until it does, this is
+    /// always `false`.
     pub hydrating: bool,
     /// Wall-clock duration of the most recently completed turn (set on
     /// `Running → Idle`). The status row reads this to render
@@ -466,7 +469,7 @@ pub struct SolutionSession {
     /// Last-known total token count for the conversation, used by the
     /// status-row meter to keep showing "X / Y · Z%" on a cold tab
     /// (no live `AcpThread` → no `TokenUsage` to read). Populated on
-    /// `restore_open_tabs` from the persisted metadata, refreshed
+    /// `hydrate_all_for_solution` from the persisted metadata, refreshed
     /// whenever the live thread emits a `TokenUsageUpdated` event so
     /// the cached value stays in sync until the next cold restore.
     /// `None` for fresh sessions whose first turn hasn't shipped yet.
@@ -557,8 +560,9 @@ pub struct SolutionSession {
     pub background_shell_order: Vec<background_shell::BackgroundShellId>,
     /// Position in the desktop session-tab strip. `None` means the session is
     /// not currently in the strip (either never opened, or its tab was closed
-    /// via `persist_tab_order(.., None)`). Populated on `restore_open_tabs`
-    /// from `solution_sessions.tab_order` and maintained by every code path
+    /// via `persist_tab_order(.., None)`). Populated on
+    /// `hydrate_all_for_solution` from `solution_sessions.tab_order` and
+    /// maintained by every code path
     /// that mutates that DB column.
     ///
     /// The mobile `workspace.snapshot` filter uses `tab_order.is_some()` to
@@ -1163,7 +1167,7 @@ pub struct SolutionSessionMetadata {
     /// `persist_tab_order` -> `update_tab_orders`); COALESCE(NULL, existing)
     /// preserves that write even when the INSERT lands AFTER the UPDATE (the
     /// lost-update race at create time that left idle never-touched sessions
-    /// with `tab_order = NULL`, so `restore_open_tabs` never re-hydrated them).
+    /// with `tab_order = NULL`, so hydration never re-hydrated them).
     pub tab_order: Option<i64>,
 }
 

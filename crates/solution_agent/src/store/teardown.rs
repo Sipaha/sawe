@@ -345,7 +345,7 @@ impl SolutionAgentStore {
     /// Solution-window close: stop the solution's pooled subprocess(es) and
     /// evict its sessions from memory, WITHOUT marking them `closed_at`. The
     /// transcript + `tab_order` stay in the DB, so reopening the solution
-    /// restores every tab via `restore_open_tabs`. Distinct from
+    /// restores every tab via `hydrate_all_for_solution`. Distinct from
     /// [`close_session`](Self::close_session) (a permanent per-tab close that
     /// sets `closed_at`) and from [`gc_orphan_solutions`](Self::gc_orphan_solutions)
     /// (which fires only when a solution is *deleted* from the store).

@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, Global, SharedString, Subscription,
-    Task, TaskExt as _, WeakEntity,
+    Task, TaskExt as _,
 };
 use solutions::{Solution, SolutionId, SolutionStore, SolutionStoreEvent};
 use util::ResultExt;
@@ -1189,7 +1189,7 @@ impl SolutionAgentStore {
                     // DB writes lands last, the row ends with the concrete
                     // tab_order rather than NULL. Without this an idle,
                     // never-touched new chat could persist with `tab_order = NULL`
-                    // and vanish from `restore_open_tabs` on restart ("unknown
+                    // and vanish from hydration on restart ("unknown
                     // session" on the next send).
                     store.persist_session_row(session_id, cx);
                 })?;
@@ -1606,7 +1606,7 @@ impl SolutionAgentStore {
     /// `solution_id` from). Deliberately NOT called from
     /// `cold_close_solution`: that path evicts sessions from memory for a
     /// closed window without deleting their persisted rows or `tab_order`,
-    /// and `restore_open_tabs` re-hydrates the same ids on reopen, so the
+    /// and `hydrate_all_for_solution` re-hydrates the same ids on reopen, so the
     /// selection stays valid across that round-trip.
     fn clear_active_dialog_for_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
         let affected: Vec<SolutionId> = self
