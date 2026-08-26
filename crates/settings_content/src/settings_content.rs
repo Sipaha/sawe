@@ -1279,8 +1279,10 @@ pub struct SolutionAgentEphemeralSettingsContent {
 pub struct SolutionBranchProtectionSettingsContent {
     /// Glob patterns matched against branch names (gitignore-style).
     /// `release/*` matches `release/v1` but not `release/v2/hotfix`;
-    /// use `release/**` for recursive matches. When omitted, defaults
-    /// to `["main", "master", "release/*"]`.
+    /// use `release/**` for recursive matches. Empty by default — the
+    /// server, not this client, decides which branches are writable, and
+    /// it enforces that on push. Set this only if you want local prompts
+    /// on top of that.
     pub default_protected: Option<Vec<String>>,
 
     /// Per-member overrides keyed by `SolutionMember::catalog_id`. Each

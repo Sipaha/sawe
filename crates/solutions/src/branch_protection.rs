@@ -85,12 +85,9 @@ fn active_snapshot() -> ActiveSnapshot {
     //
     // When the snapshot hasn't been installed yet (early init, unit
     // tests outside `TestAppContext`, headless tools that bypass the
-    // `Settings::register` flow), fall back to an empty policy rather
-    // than the default-protected `["main", "master", "release/*"]`.
-    // Otherwise every test that touches the real `branch_protection`
-    // code path would have to install the cache; an empty policy is
-    // the safer no-op for those callers and the production path
-    // populates the cache through `SolutionsSettings::from_settings`.
+    // `Settings::register` flow), fall back to an empty policy — which
+    // is also what the shipped default now is, so this fallback and the
+    // configured default agree instead of diverging.
     crate::store::active_branch_protection_snapshot()
         .map(|(settings, solution)| ActiveSnapshot { settings, solution })
         .unwrap_or_else(|| ActiveSnapshot {

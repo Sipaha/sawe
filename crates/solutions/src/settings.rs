@@ -65,7 +65,14 @@ pub struct BranchProtectionSettings {
 impl Default for BranchProtectionSettings {
     fn default() -> Self {
         Self {
-            default_protected: vec!["main".into(), "master".into(), "release/*".into()],
+            // Empty by design: whether a branch may be written is the *server's*
+            // call (GitHub/GitLab branch protection, hooks), and it enforces that
+            // on push regardless of what this client believes. Guessing from a
+            // branch name locally only ever produced false positives — `master`
+            // is an ordinary working branch in plenty of repos — while adding no
+            // safety the remote does not already provide. Opt in explicitly if
+            // you want local nagging.
+            default_protected: Vec::new(),
             members: HashMap::new(),
         }
     }
@@ -211,16 +218,12 @@ mod tests {
     }
 
     #[test]
-    fn branch_protection_defaults_cover_main_master_release() {
+    fn branch_protection_protects_nothing_by_default() {
         let s = SolutionsSettings::default();
-        let patterns: Vec<&str> = s
-            .branch_protection
-            .default_protected
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        assert!(patterns.contains(&"main"));
-        assert!(patterns.contains(&"master"));
-        assert!(patterns.contains(&"release/*"));
+        assert!(
+            s.branch_protection.default_protected.is_empty(),
+            "the client must not infer protection from branch names; the server enforces it"
+        );
+        assert!(s.branch_protection.members.is_empty());
     }
 }
