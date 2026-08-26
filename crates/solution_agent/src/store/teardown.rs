@@ -183,12 +183,39 @@ impl SolutionAgentStore {
         cx.notify();
     }
 
-    /// Purge every hydrated, non-ephemeral session whose `cwd` no longer falls
+    /// Purge every **live**, non-ephemeral session whose `cwd` no longer falls
     /// under any alive member's `local_path` (nor the solution root) — i.e. the
     /// member directory the session was scoped to has been removed from the
     /// Solution. Ephemeral supervisor children are skipped (their parent's purge
     /// reaps them via `finish_judge`/`finish_auditor`). Driven from
     /// `on_solution_event` on a `Changed` (member add/remove) signal.
+    ///
+    /// "Live" means `acp_thread().is_some()`. A COLD orphan — one restored from
+    /// disk by `hydrate_all_for_solution`, never resumed this process — is
+    /// logged and left alone. Two reasons, and they are both about the fact
+    /// that this GC hard-purges (six tables in one savepoint plus
+    /// `remove_dir_all(<root>/.agents/<sid>)`) with no confirmation and no undo:
+    ///
+    /// * Reach. Until cold hydration started indexing `by_solution`, everything
+    ///   this loop could see had arrived via `create_session_with_parent` or
+    ///   `resume_session`, so it only ever destroyed sessions the user had
+    ///   actually opened in this process. Indexing cold sessions silently
+    ///   widened that to every transcript on disk: a real database here carries
+    ///   ~18 open sessions whose cwd points at long-removed members, and this
+    ///   loop purges every orphan it can see on ANY `Changed`, not just ones
+    ///   under the member that was just removed. The liveness gate restores the
+    ///   old blast radius exactly.
+    /// * Trust in `cwd`. A cold session's in-memory `cwd` is only as fresh as
+    ///   the `metas` snapshot hydration read from the DB. A member/solution
+    ///   rename that lands mid-hydration is fixed in the DB by
+    ///   `rewrite_session_cwds_for_move`, but that runs on `PathsMoved` and
+    ///   finds nothing in `by_solution` yet, so the foreground block goes on to
+    ///   build entities from the pre-rename paths — which read as orphans here.
+    ///   A live session cannot have that problem: its `cwd` was either set at
+    ///   create time or rewritten in place by the same helper.
+    ///
+    /// So the cold backlog stays a decision the maintainer makes from the log,
+    /// not a deletion the editor makes on their behalf.
     pub(crate) fn gc_orphan_members(&mut self, cx: &mut Context<Self>) {
         let Some(store) = SolutionStore::try_global(cx) else {
             return;
@@ -238,14 +265,35 @@ impl SolutionAgentStore {
                 // cwd, so moving it would orphan the on-disk transcript. The
                 // consequence, spelled out in #89: removing that member still
                 // hard-purges the session below, even though it now reads as
-                // Solution-level to the user.
+                // Solution-level to the user — but only when the session is
+                // live. Cold orphans are logged (see this method's doc).
                 let at_root = cwd == root;
                 let under_member = members
                     .iter()
                     .any(|m| cwd == m || cwd.strip_prefix(m).is_ok());
-                if !at_root && !under_member {
-                    orphans.push(*id);
+                if at_root || under_member {
+                    continue;
                 }
+                if session.acp_thread().is_none() {
+                    log::warn!(
+                        target: "solution_agent::gc",
+                        "solution={} session={} title={:?} cwd={} is orphaned \
+                         (no current member covers it) but was restored from disk \
+                         and never resumed — NOT purging. Current members: [{}]. \
+                         Close the chat to archive it, or re-add the member.",
+                        solution_id.0,
+                        id,
+                        session.title,
+                        cwd.display(),
+                        members
+                            .iter()
+                            .map(|m| m.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    continue;
+                }
+                orphans.push(*id);
             }
         }
         for id in orphans {
@@ -269,11 +317,43 @@ impl SolutionAgentStore {
             .get(solution_id)
             .cloned()
             .unwrap_or_default();
-        // Flush each transcript before dropping the live thread. Incremental
-        // saves usually have the latest state already; this captures any
-        // un-debounced tail so a reopen restores the full conversation.
+        // Flush each LIVE transcript before dropping its thread, to capture any
+        // un-debounced tail.
+        //
+        // Two things to know before touching this. First, the flush currently
+        // does not reach disk AT ALL: `persist_all_rows` parks its work in a
+        // `cx.spawn` task stored in `entries_persist_chain`, and
+        // `evict_session_runtime_maps` below drops that entry inside this same
+        // synchronous block — so the task is cancelled before the executor ever
+        // polls it. Verified empirically: a live session with three rows on disk
+        // and an empty Main stream still has three rows after this call, even
+        // though an executed flush would have truncated it to zero. The "capture
+        // the un-debounced tail" promise has therefore been silently unmet;
+        // fixing it is its own change, not this one.
+        //
+        // Second, why the liveness gate is here anyway. `persist_all_rows` is a
+        // full rewrite, not an append: it upserts the Main stream at Main-local
+        // indices and then `delete_entries_from(main_len)`. On a legacy pre-6b
+        // row layout `entries.len() > main_len` — teammate-tagged rows demux out
+        // of Main — so an executed flush DELETES those teammate rows. That
+        // one-time realign is defensible for a session the user actually worked
+        // in. It is not defensible for a cold-hydrated one, which cannot have
+        // changed since hydration (every ingest path needs an `acp_thread`; even
+        // `push_system_note` bails without one) and which only became reachable
+        // here at all once cold sessions started being indexed into
+        // `by_solution`. So whoever repairs the cancellation above must not
+        // thereby turn "user closed a Solution window" into "editor truncated
+        // the transcripts of every chat it had merely restored" — this gate is
+        // what keeps that from happening, and until then it just avoids
+        // scheduling work that is doomed to be dropped.
         for id in &session_ids {
-            self.persist_all_rows(*id, cx);
+            let is_live = self
+                .sessions
+                .get(id)
+                .is_some_and(|entity| entity.read(cx).acp_thread().is_some());
+            if is_live {
+                self.persist_all_rows(*id, cx);
+            }
         }
         // Reap each session's in-flight judge/auditor (closes their hidden child
         // sessions) and drop ALL per-session runtime maps — this path bypasses

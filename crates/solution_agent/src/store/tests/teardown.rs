@@ -508,9 +508,88 @@ async fn cold_close_solution_keeps_sessions_restorable(cx: &mut gpui::TestAppCon
     );
 }
 
-/// `gc_orphan_members` purges only sessions whose `cwd` is no longer under any
-/// alive member path (nor the solution root). Sessions under a member dir, or
-/// at the solution root, survive.
+/// `cold_close_solution` must not rewrite a cold-hydrated session's persisted
+/// entry rows.
+///
+/// NOTE ON WHAT THIS DOES AND DOES NOT PROVE. This assertion currently holds
+/// for two independent reasons, and it cannot tell them apart:
+///
+///   1. the liveness gate in `cold_close_solution` skips `persist_all_rows` for
+///      a session with no `acp_thread`, and
+///   2. `persist_all_rows`'s work is parked in an `entries_persist_chain` task
+///      that `evict_session_runtime_maps` drops later in the same synchronous
+///      block, so the flush never reaches disk for ANY session, live or cold.
+///
+/// (2) was verified by probe: a LIVE session with three rows on disk and an
+/// empty Main stream also comes through this call with three rows, though an
+/// executed flush would have truncated it to zero via
+/// `delete_entries_from(main_len)`. So removing the gate today does not make
+/// this test fail — it is pinning the invariant, not the mechanism.
+///
+/// It earns its place anyway: the day someone repairs (2), this is what fails
+/// if they repair it without keeping (1), and the failure mode they would
+/// otherwise ship is "closing a Solution window truncates the transcript of
+/// every chat the editor had merely restored from disk" — on legacy pre-6b
+/// layouts, where teammate-tagged rows demux out of Main so `entries.len() >
+/// main_len`. Do not delete this because it looks tautological.
+#[gpui::test]
+async fn cold_close_solution_does_not_rewrite_cold_session_rows(cx: &mut gpui::TestAppContext) {
+    let (store, live_id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (db, sol) = store.update(cx, |store, cx| {
+        (
+            store.persistence().expect("persistence"),
+            store.session(live_id).expect("session").read(cx).solution_id,
+        )
+    });
+
+    let cold_id = SolutionSessionId::new();
+    store.update(cx, |store, cx| {
+        insert_cold_session(
+            cold_id,
+            sol,
+            SharedString::from("claude-acp"),
+            None,
+            None,
+            store,
+            cx,
+        );
+    });
+    // Two rows on disk that the in-memory (cold, stream-less) entity does not
+    // mirror — exactly the shape a legacy teammate-tagged transcript hydrates as.
+    for idx in 0..2 {
+        db.upsert_entry(cold_id, idx, 1, 1_700_000_000_000 + idx, None, vec![1, 2, 3])
+            .await
+            .expect("seed row");
+    }
+    assert_eq!(
+        db.load_entries(cold_id).await.expect("load").len(),
+        2,
+        "precondition: rows on disk"
+    );
+
+    store.update(cx, |store, cx| store.cold_close_solution(&sol, cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_entries(cold_id).await.expect("load after close").len(),
+        2,
+        "cold close must not flush a session that was never resumed — \
+         persist_all_rows' delete_entries_from(main_len) would truncate it"
+    );
+}
+
+/// `gc_orphan_members` purges only **live** sessions whose `cwd` is no longer
+/// under any alive member path (nor the solution root). Sessions under a member
+/// dir, or at the solution root, survive — and so does an orphan that was
+/// restored from disk and never resumed.
+///
+/// The cold-orphan case is the regression guard that matters. `gc_orphan_members`
+/// hard-purges (six DB tables plus `remove_dir_all(<root>/.agents/<sid>)`), and
+/// it purges every orphan in the store on any `Changed`, not just ones under the
+/// member that was removed. Once cold hydration started indexing `by_solution`,
+/// dropping this gate would put a real user's whole backlog of
+/// removed-member transcripts — ~18 of them in the maintainer's database — one
+/// solution-open away from irreversible deletion.
 #[gpui::test]
 async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::TestAppContext) {
     use solutions::{CatalogId, SolutionStore};
@@ -542,20 +621,42 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
     let store = cx.update(|cx| SolutionAgentStore::global(cx));
 
+    // A live `AcpThread` for the one session that is allowed to be purged.
+    let fs = fs::FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(root.clone(), serde_json::json!({ ".keep": "" }))
+        .await;
+    let project = project::Project::test(fs, [root.as_path()], cx).await;
+    let connection = Rc::new(MockConnection::new());
+    let live_thread = cx
+        .update(|cx| {
+            use acp_thread::AgentConnection as _;
+            Rc::clone(&connection).new_session(
+                project.clone(),
+                util::path_list::PathList::new(&[root.clone()]),
+                cx,
+            )
+        })
+        .await
+        .expect("new_session");
+
     let agent = SharedString::from("claude-acp");
     let under_member = SolutionSessionId::new();
     let at_root = SolutionSessionId::new();
-    let orphan = SolutionSessionId::new();
+    let live_orphan = SolutionSessionId::new();
+    let cold_orphan = SolutionSessionId::new();
 
     store.update(cx, |store, cx| {
         for (sid, cwd) in [
             (under_member, member_path.join("sub")),
             (at_root, root.clone()),
-            (orphan, root.join("removed-member")),
+            (live_orphan, root.join("removed-member")),
+            (cold_orphan, root.join("also-removed-member")),
         ] {
             let session = insert_cold_session(sid, sol, agent.clone(), None, None, store, cx);
             session.update(cx, |s, _| s.cwd = cwd);
         }
+        let live = store.session(live_orphan).expect("live orphan inserted");
+        live.update(cx, |s, cx| s.set_acp_thread(Some(live_thread.clone()), cx));
         store.gc_orphan_members(cx);
     });
     cx.run_until_parked();
@@ -567,8 +668,13 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
         );
         assert!(store.session(at_root).is_some(), "root session kept");
         assert!(
-            store.session(orphan).is_none(),
-            "removed-member session purged"
+            store.session(live_orphan).is_none(),
+            "removed-member session with a live thread purged"
+        );
+        assert!(
+            store.session(cold_orphan).is_some(),
+            "a removed-member session restored from disk and never resumed must be \
+             logged, NOT hard-purged — see gc_orphan_members' doc"
         );
     });
 }
