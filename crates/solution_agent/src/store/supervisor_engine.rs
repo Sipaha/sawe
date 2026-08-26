@@ -1076,6 +1076,19 @@ impl SolutionAgentStore {
     /// else ticks. Otherwise (observer off, or no reset time) fall back to a
     /// terminal `Stopped(Quota)`. Shared by the judge-failure path
     /// (`on_judge_failed`) and the stuck-session watchdog (`tick_stuck_sessions`).
+    ///
+    /// `tick_stuck_sessions` calls this with NO `enabled` gate at the call
+    /// site — a stall is detected from the underlying `SessionState`, which
+    /// is independent of whether the user has this supervisor's Eye toggle
+    /// on. So this function must self-gate: a status the user (or an earlier
+    /// terminal stop) already parked deliberately — `Disabled`, `Held`, or
+    /// any `Stopped(_)` — is a no-op here. Overwriting `Disabled`/`Held`
+    /// would resurrect a supervisor the user turned off (the session's next
+    /// successful turn would then trip `clear_terminal_quota_stop` and
+    /// re-enable it behind the user's back); overwriting an existing
+    /// `Stopped(_)` (including a different `StoppedReason`, e.g.
+    /// `ProviderError`/`Done`) would lose that more specific terminal reason
+    /// for no benefit, since the session is already parked either way.
     pub(crate) fn apply_usage_limit_stop(
         &mut self,
         id: SolutionSessionId,
@@ -1083,6 +1096,15 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         use crate::supervisor::{StoppedReason, SupervisorStatus};
+        let already_parked = self.supervisor_states.get(&id).is_some_and(|s| {
+            matches!(
+                s.status,
+                SupervisorStatus::Disabled | SupervisorStatus::Held | SupervisorStatus::Stopped(_)
+            )
+        });
+        if already_parked {
+            return;
+        }
         {
             use rand::Rng as _;
             let now_ms = chrono::Utc::now().timestamp_millis();

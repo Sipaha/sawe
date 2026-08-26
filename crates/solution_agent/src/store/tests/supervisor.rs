@@ -2993,3 +2993,149 @@ async fn successful_turn_does_not_resurrect_held_supervisor(cx: &mut TestAppCont
         });
     });
 }
+
+// ---------------------------------------------------------------------------
+// Defect A: `tick_stuck_sessions` calls `apply_usage_limit_stop` with no
+// `enabled` gate at the call site, so the function itself must not rewrite a
+// status the user (or an earlier terminal stop) already parked deliberately.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn apply_usage_limit_stop_leaves_disabled_supervisor_alone(cx: &mut TestAppContext) {
+    // Reduced to exactly what `tick_stuck_sessions` would produce: a session
+    // the user turned OFF via the real Eye toggle (`set_supervision_enabled`)
+    // that later goes silent-and-walled while the user is chatting manually.
+    let (session_id, _acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.set_supervision_enabled(session_id, false, cx);
+            store.apply_usage_limit_stop(session_id, "usage limit reached", cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Disabled,
+                "apply_usage_limit_stop must not overwrite a user-disabled supervisor"
+            );
+            assert!(!st.enabled, "must not have been silently re-enabled");
+        });
+    });
+}
+
+#[gpui::test]
+async fn apply_usage_limit_stop_leaves_held_supervisor_alone(cx: &mut TestAppContext) {
+    // Same shape, for the manual-Stop path (`hold_supervisor`).
+    let (session_id, _acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.hold_supervisor(session_id, cx);
+            store.apply_usage_limit_stop(session_id, "usage limit reached", cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Held,
+                "apply_usage_limit_stop must not overwrite a manually-Held supervisor"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn apply_usage_limit_stop_still_parks_enabled_supervisor(cx: &mut TestAppContext) {
+    // Regression: an ordinarily-enabled, actively-Watching supervisor must
+    // still park on an unparseable wall exactly as before the gate — proves
+    // the fix didn't just disable the terminal-park feature outright.
+    let (session_id, _acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.apply_usage_limit_stop(session_id, "usage limit reached", cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Stopped(
+                    crate::supervisor::StoppedReason::Quota
+                ),
+                "an enabled, actively-watching supervisor must still terminal-park on an \
+                 unparseable wall (regression)"
+            );
+            assert!(!st.enabled);
+        });
+    });
+}
+
+#[gpui::test]
+async fn disabled_supervisor_survives_wall_then_successful_turn(cx: &mut TestAppContext) {
+    // The full chain that made Defect A Critical: user disables the
+    // supervisor -> the (still-running, manually-driven) session hits a wall,
+    // reaching `apply_usage_limit_stop` via the un-gated `tick_stuck_sessions`
+    // path -> a later successful turn on the SAME session must NOT resurrect
+    // it, because the wall must never have overwritten `Disabled` to begin
+    // with. This is the test that proves the Critical is actually gone,
+    // rather than merely unreachable by the one path this session happened
+    // to probe.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.set_supervision_enabled(session_id, false, cx);
+            store.apply_usage_limit_stop(session_id, "usage limit reached", cx);
+        });
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Disabled,
+                "sanity: still disabled right after the wall hit"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Disabled,
+                "a disabled supervisor must still be disabled after wall + successful turn"
+            );
+            assert!(!st.enabled, "must not have been silently re-enabled");
+        });
+    });
+}
