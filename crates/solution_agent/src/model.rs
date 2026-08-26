@@ -1197,10 +1197,51 @@ pub fn clamp_divider_ratio(ratio: f32) -> f32 {
     ratio.clamp(MIN_DIVIDER_RATIO, MAX_DIVIDER_RATIO)
 }
 
+/// Shortest the Solution band may be dragged. Below this the compose box
+/// and the status row stop fitting together, which is the state phase 2a
+/// shipped by accident.
+pub const MIN_BAND_HEIGHT: f32 = 140.0;
+/// What a band with no persisted row opens at, and what double-clicking
+/// the band's top edge restores.
+pub const DEFAULT_BAND_HEIGHT: f32 = 320.0;
+/// Hard ceiling applied to a stored value, independent of any window. Only
+/// guards a corrupt or hand-edited row; the real ceiling is the viewport
+/// fraction below, applied at render.
+pub const MAX_BAND_HEIGHT: f32 = 4096.0;
+/// Most of the window the band may occupy, leaving the project zone
+/// something to be. Applied at render against the live viewport.
+pub const MAX_BAND_HEIGHT_FRACTION: f32 = 0.8;
+
+/// Clamp a stored band height into the range a row may hold. Mirrors
+/// `clamp_divider_ratio`, including the NaN fold: `f32::clamp` propagates
+/// NaN, and a NaN height lays out as garbage.
+pub fn clamp_band_height(height: f32) -> f32 {
+    if height.is_nan() {
+        return DEFAULT_BAND_HEIGHT;
+    }
+    height.clamp(MIN_BAND_HEIGHT, MAX_BAND_HEIGHT)
+}
+
+/// The height the band actually paints at: the stored height, capped so the
+/// band can never eat the whole window. Deliberately a pure function of the
+/// stored value and the live viewport — the cap is NOT written back to the
+/// store, because a `cx.notify()` raised during a draw is discarded (see the
+/// plan's Global Constraints) and because a temporarily-shrunk window must
+/// not permanently shrink the user's saved geometry.
+pub fn effective_band_height(stored: f32, viewport_height: f32) -> f32 {
+    let ceiling = (viewport_height * MAX_BAND_HEIGHT_FRACTION).max(MIN_BAND_HEIGHT);
+    clamp_band_height(stored).min(ceiling)
+}
+
 /// The Solution band's geometry for one Solution: where the divider sits,
-/// whether the utility (terminal) section is shown, and which session's
-/// dialog fills the other half. Persisted as a single `solution_band_state`
-/// row so the band reopens the way the user left it.
+/// whether the utility (terminal) section is shown, which session's dialog
+/// fills the other half, and how tall the band is. Persisted as a single
+/// `solution_band_state` row so the band reopens the way the user left it.
+///
+/// `height` is stored in absolute logical pixels, not a fraction of the
+/// window — the window-relative cap that keeps the band from eating the
+/// whole viewport is applied at render (`effective_band_height`), never
+/// written back here.
 ///
 /// There is deliberately no separate "dialog collapsed" flag:
 /// `active_dialog_session == None` *is* the collapsed state, which is what
@@ -1212,6 +1253,7 @@ pub struct BandState {
     pub divider_ratio: f32,
     pub utility_visible: bool,
     pub active_dialog_session: Option<SolutionSessionId>,
+    pub height: f32,
 }
 
 impl Default for BandState {
@@ -1222,6 +1264,7 @@ impl Default for BandState {
             // dock had before the band took the terminal over.
             utility_visible: false,
             active_dialog_session: None,
+            height: DEFAULT_BAND_HEIGHT,
         }
     }
 }

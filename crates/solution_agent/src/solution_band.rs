@@ -366,7 +366,10 @@ impl Render for SolutionBand {
 mod tests {
     use super::*;
     use crate::db::SolutionAgentDb;
-    use crate::model::{MAX_DIVIDER_RATIO, MIN_DIVIDER_RATIO};
+    use crate::model::{
+        DEFAULT_BAND_HEIGHT, MAX_BAND_HEIGHT, MAX_DIVIDER_RATIO, MIN_BAND_HEIGHT,
+        MIN_DIVIDER_RATIO, clamp_band_height, effective_band_height,
+    };
     use gpui::TestAppContext;
     use std::sync::Arc;
 
@@ -380,6 +383,41 @@ mod tests {
             DEFAULT_DIVIDER_RATIO,
             "NaN survives `f32::clamp`, so it must be folded to the default \
              before it can reach a `flex_basis` fraction"
+        );
+    }
+
+    #[test]
+    fn band_height_is_clamped_to_a_usable_range() {
+        assert_eq!(clamp_band_height(-1.0), MIN_BAND_HEIGHT);
+        assert_eq!(clamp_band_height(1_000_000.0), MAX_BAND_HEIGHT);
+        assert_eq!(clamp_band_height(500.0), 500.0);
+        assert_eq!(
+            clamp_band_height(f32::NAN),
+            DEFAULT_BAND_HEIGHT,
+            "NaN survives `f32::clamp`, so it must be folded to the default \
+             before it can reach a layout height"
+        );
+    }
+
+    #[test]
+    fn effective_band_height_caps_against_the_live_viewport() {
+        assert_eq!(
+            effective_band_height(600.0, 400.0),
+            320.0,
+            "a stored height above 80% of a small viewport is capped at render, \
+             without touching the stored value"
+        );
+        assert_eq!(
+            effective_band_height(320.0, 4000.0),
+            320.0,
+            "under a large viewport the stored value is returned unchanged"
+        );
+        assert_eq!(
+            effective_band_height(300.0, 10.0),
+            MIN_BAND_HEIGHT,
+            "an absurdly short viewport must still leave room for the compose \
+             box and status row — the viewport-fraction ceiling never drops \
+             below MIN_BAND_HEIGHT"
         );
     }
 
@@ -509,6 +547,97 @@ mod tests {
         assert_eq!(persisted(&db, solution_id).await, Some(written));
     }
 
+    /// `set_band_height` round-trips through the debounce like the divider
+    /// ratio does, without disturbing the row's other fields.
+    #[gpui::test]
+    async fn band_height_round_trips_and_leaves_other_fields_alone(cx: &mut TestAppContext) {
+        let (store, db, _tmp) = store_with_persistence(cx).await;
+        let solution_id = SolutionId(1);
+        let dialog = SolutionSessionId::new();
+
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, Some(dialog), cx);
+            store.set_band_utility_visible(solution_id, true, cx);
+            store.set_band_divider_ratio(solution_id, 0.7, cx);
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+
+        store.update(cx, |store, cx| {
+            store.set_band_height(solution_id, 600.0, cx)
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let written = db
+            .load_band_states()
+            .await
+            .expect("load band states")
+            .into_iter()
+            .find(|(id, _)| *id == solution_id)
+            .map(|(_, state)| state)
+            .expect("row exists");
+        assert_eq!(written.height, 600.0);
+        assert_eq!(
+            written.divider_ratio, 0.7,
+            "the height write must not clobber the divider ratio set earlier"
+        );
+        assert!(written.utility_visible);
+        assert_eq!(written.active_dialog_session, Some(dialog));
+    }
+
+    /// Ruling-5 invariant (a), for height: the write is cancel-on-replace,
+    /// not one queued write per `on_drag_move`. Mirrors
+    /// `a_replaced_divider_drag_cancels_the_write_it_supersedes`.
+    #[gpui::test]
+    async fn a_replaced_height_drag_cancels_the_write_it_supersedes(cx: &mut TestAppContext) {
+        let (store, db, _tmp) = store_with_persistence(cx).await;
+        let solution_id = SolutionId(1);
+
+        // Seed a row so "nothing written yet" is distinguishable from "wrote
+        // the new height".
+        store.update(cx, |store, cx| {
+            store.set_band_utility_visible(solution_id, true, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            persisted(&db, solution_id).await.map(|s| s.height),
+            Some(DEFAULT_BAND_HEIGHT)
+        );
+
+        store.update(cx, |store, cx| {
+            store.set_band_height(solution_id, 400.0, cx)
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        store.update(cx, |store, cx| {
+            store.set_band_height(solution_id, 500.0, cx)
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+
+        assert_eq!(
+            persisted(&db, solution_id).await.map(|s| s.height),
+            Some(DEFAULT_BAND_HEIGHT),
+            "600ms after the first drag but only 300ms after the second, nothing \
+             may have been written yet: the first drag's timer must have been \
+             cancelled rather than left to fire at its own 400ms mark"
+        );
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(
+            persisted(&db, solution_id).await.map(|s| s.height),
+            Some(500.0),
+            "and the surviving timer writes the height the drag ended on"
+        );
+    }
+
     /// Store + in-memory DB with persistence NOT yet wired, plus a band row
     /// already on disk — the state the app is in while
     /// `SolutionAgentDb::connect` and `run_identity_migration` are still
@@ -533,6 +662,7 @@ mod tests {
             divider_ratio: 0.7,
             utility_visible: false,
             active_dialog_session: Some(SolutionSessionId::new()),
+            height: 500.0,
         };
         db.save_band_state(SolutionId(1), saved)
             .await
@@ -599,6 +729,46 @@ mod tests {
         };
         store.read_with(cx, |store, _| {
             assert_eq!(store.band_state(solution_id), expected);
+        });
+        assert_eq!(persisted(&db, solution_id).await, Some(expected));
+    }
+
+    /// Field-wise touched-mask discipline for `height` specifically: a
+    /// pre-hydration `set_band_height` must win for `height` while the
+    /// persisted row's `divider_ratio` (also non-default here) survives
+    /// untouched, proving the overlay is per-field and not all-or-nothing.
+    #[gpui::test]
+    async fn a_height_touch_before_the_db_opens_keeps_the_persisted_ratio(cx: &mut TestAppContext) {
+        let (store, db, saved, _tmp) = store_with_a_saved_row_and_no_persistence_yet(cx).await;
+        let solution_id = SolutionId(1);
+        assert_ne!(
+            saved.divider_ratio, DEFAULT_DIVIDER_RATIO,
+            "the persisted ratio must be distinguishable from the default for \
+             this test to prove anything"
+        );
+        assert_ne!(
+            saved.height, DEFAULT_BAND_HEIGHT,
+            "same for height, or a bug that always fell back to the default \
+             would pass unnoticed"
+        );
+
+        store.update(cx, |store, cx| {
+            store.set_band_height(solution_id, 900.0, cx)
+        });
+        store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+        cx.run_until_parked();
+
+        let expected = BandState {
+            height: 900.0,
+            ..saved
+        };
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.band_state(solution_id),
+                expected,
+                "height is the live value the user set; divider_ratio is still \
+                 whatever the persisted row held"
+            );
         });
         assert_eq!(persisted(&db, solution_id).await, Some(expected));
     }

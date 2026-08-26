@@ -20,7 +20,7 @@ use crate::db::SolutionAgentDb;
 use crate::metrics_emitter::MetricsEmitter;
 use crate::model::{
     AgentServerId, BandState, SessionContextCount, SessionState, SolutionSession,
-    SolutionSessionId, SolutionSessionMetadata, clamp_divider_ratio,
+    SolutionSessionId, SolutionSessionMetadata, clamp_band_height, clamp_divider_ratio,
 };
 use crate::model_catalog::ModelCatalog;
 use crate::notifier;
@@ -379,6 +379,7 @@ struct BandStateTouched {
     divider_ratio: bool,
     utility_visible: bool,
     active_dialog_session: bool,
+    height: bool,
 }
 
 impl BandStateTouched {
@@ -399,6 +400,11 @@ impl BandStateTouched {
                 live.active_dialog_session
             } else {
                 persisted.active_dialog_session
+            },
+            height: if self.height {
+                live.height
+            } else {
+                persisted.height
             },
         }
     }
@@ -1537,6 +1543,37 @@ impl SolutionAgentStore {
                 .entry(solution_id)
                 .or_default()
                 .divider_ratio = true;
+        }
+        self.persist_band_state_debounced(solution_id, cx);
+        cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
+        cx.notify();
+    }
+
+    /// Set the Solution band's height. The in-memory value lands synchronously
+    /// so the dragged edge tracks the cursor on the next frame; the row is
+    /// written behind the same debounce the divider ratio uses (see
+    /// `band_state_writes`) — they share one pending-write slot per Solution
+    /// because a drag of one is never concurrent with a drag of the other.
+    pub fn set_band_height(
+        &mut self,
+        solution_id: SolutionId,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let height = clamp_band_height(height);
+        // Reads through `band_state` rather than `entry(..).or_default()` for
+        // the same reason as `set_band_utility_visible` — see the comment
+        // there, including why this check is not what makes pre-hydration
+        // mutations safe.
+        if self.band_state(solution_id).height == height {
+            return;
+        }
+        self.band_state.entry(solution_id).or_default().height = height;
+        if !self.band_states_hydrated {
+            self.band_state_touched
+                .entry(solution_id)
+                .or_default()
+                .height = true;
         }
         self.persist_band_state_debounced(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });

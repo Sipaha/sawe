@@ -5,7 +5,7 @@ use chrono::{TimeZone, Utc};
 use gpui::SharedString;
 use solutions::SolutionId;
 
-use crate::model::{SolutionSessionId, SolutionSessionMetadata};
+use crate::model::{DEFAULT_BAND_HEIGHT, SolutionSessionId, SolutionSessionMetadata};
 
 #[gpui::test]
 async fn supervisor_state_roundtrips(cx: &mut gpui::TestAppContext) {
@@ -1317,4 +1317,44 @@ async fn migrate_identity_is_idempotent(cx: &mut gpui::TestAppContext) {
         .expect("count")
     };
     assert_eq!(count, vec![3], "no rows created or destroyed");
+}
+
+/// A row written before `band_height` existed loads as `DEFAULT_BAND_HEIGHT`.
+/// Constructed by inserting through the raw connection with `band_height`
+/// omitted from the column list, so SQLite applies the column's own
+/// `DEFAULT 320` — the exact mechanism `apply_idempotent_add_column_to`'s
+/// `NOT NULL DEFAULT 320` backfill relies on for a row that predates the
+/// migration on a real user's DB. This exercises `select_band_states` for
+/// real, rather than merely asserting the schema's default value in
+/// isolation.
+#[gpui::test]
+async fn a_band_row_without_band_height_loads_as_the_default(cx: &mut gpui::TestAppContext) {
+    let db = SolutionAgentDb::open(cx.executor()).expect("open db");
+    {
+        let connection = db.connection.lock();
+        connection
+            .exec(
+                "INSERT INTO solution_band_state
+                    (solution_id, divider_ratio, utility_visible, active_dialog_session)
+                 VALUES (1, 0.7, 1, NULL)",
+            )
+            .expect("prepare pre-migration row insert")()
+        .expect("insert pre-migration row");
+    }
+
+    let bands = db.load_band_states().await.expect("load band states");
+    let (_, state) = bands
+        .into_iter()
+        .find(|(id, _)| *id == SolutionId(1))
+        .expect("row exists");
+    assert_eq!(
+        state.height, DEFAULT_BAND_HEIGHT,
+        "a row that never had an explicit band_height must load at the default, \
+         not zero or some other garbage value"
+    );
+    assert_eq!(
+        state.divider_ratio, 0.7,
+        "the column omission must not disturb the row's other fields"
+    );
+    assert!(state.utility_visible);
 }

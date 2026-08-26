@@ -344,10 +344,24 @@ impl SolutionAgentDb {
                 solution_id           INTEGER PRIMARY KEY,
                 divider_ratio         REAL    NOT NULL,
                 utility_visible       INTEGER NOT NULL,
-                active_dialog_session TEXT
+                active_dialog_session TEXT,
+                band_height           REAL    NOT NULL DEFAULT 320
             )
         "})?()
         .map_err(|e| anyhow!("Failed to create solution_band_state table: {}", e))?;
+
+        // Band height (2026-08-27 follow-up to phase 2a task 7). The
+        // `CREATE TABLE IF NOT EXISTS` above only applies to a brand-new DB
+        // file — every install that already ran phase 2a has this table
+        // without the column, and `IF NOT EXISTS` is a no-op against it, so
+        // the idempotent `ADD COLUMN` is what actually widens an existing
+        // row set. `NOT NULL DEFAULT 320` backfills every pre-existing row to
+        // `DEFAULT_BAND_HEIGHT` in the same statement.
+        apply_idempotent_add_column_to(
+            &connection,
+            "solution_band_state",
+            "band_height REAL NOT NULL DEFAULT 320",
+        );
 
         Ok(Self {
             executor,
