@@ -567,6 +567,14 @@ impl Render for ConsolePanel {
         });
         v_flex()
             .size_full()
+            // The band's utility half has no background of its own and the
+            // workspace root paints none either, so without this the region
+            // below the tab strip is left transparent whenever no terminal is
+            // in scope for the active member — the renderer clears to
+            // transparent, which reads as a bare slab in the middle of the
+            // band. An in-scope terminal covers it with its own background,
+            // so this only ever shows through in the empty state.
+            .bg(cx.theme().colors().panel_background)
             .key_context("ConsolePanel")
             .track_focus(&self.focus_handle)
             .child(self.render_tab_strip(window, cx))
@@ -1415,7 +1423,6 @@ impl ConsolePanel {
         cx.notify();
         self.persist(cx);
     }
-
 }
 
 async fn wait_for_terminals_tasks(
@@ -1435,10 +1442,10 @@ async fn wait_for_terminals_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToggleFocus;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use settings::SettingsStore;
-    use crate::ToggleFocus;
     use solution_agent::store::SolutionAgentStore;
     use workspace::Workspace;
 
@@ -1753,11 +1760,7 @@ mod tests {
             .update(cx, |workspace, window, cx| {
                 let panel = cx.new(|cx| ConsolePanel::new(workspace.weak_handle(), cx));
                 let band = cx.new(|cx| {
-                    SolutionBand::new(
-                        workspace.weak_handle(),
-                        workspace.project().clone(),
-                        cx,
-                    )
+                    SolutionBand::new(workspace.weak_handle(), workspace.project().clone(), cx)
                 });
                 workspace.set_solution_band_item(band.into(), window, cx);
                 workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);

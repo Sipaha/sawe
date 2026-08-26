@@ -51,8 +51,8 @@ use std::collections::HashMap;
 
 use gpui::{
     AnyView, App, AppContext as _, ClickEvent, Context, DefiniteLength, DragMoveEvent, Entity,
-    FocusHandle, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement,
-    Styled, Subscription, WeakEntity, Window, deferred, div, px,
+    FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, deferred, div, px,
 };
 use project::Project;
 use solutions::{SolutionId, SolutionStore};
@@ -134,7 +134,9 @@ impl SolutionBand {
     /// window-local fallback when there is no Solution.
     fn band_state(&self, cx: &App) -> BandState {
         match self.solution_id(cx) {
-            Some(solution_id) => SolutionAgentStore::global(cx).read(cx).band_state(solution_id),
+            Some(solution_id) => SolutionAgentStore::global(cx)
+                .read(cx)
+                .band_state(solution_id),
             None => self.local_state,
         }
     }
@@ -282,14 +284,12 @@ impl SolutionBand {
                     .w(px(DIVIDER_HIT_SLOP * 2. + 1.))
                     .cursor_col_resize()
                     .block_mouse_except_scroll()
-                    .on_click(cx.listener(
-                        move |this, event: &ClickEvent, _window, cx| {
-                            if event.click_count() >= 2 {
-                                this.set_divider_ratio(solution_id, DEFAULT_DIVIDER_RATIO, cx);
-                            }
-                            cx.stop_propagation();
-                        },
-                    ))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                        if event.click_count() >= 2 {
+                            this.set_divider_ratio(solution_id, DEFAULT_DIVIDER_RATIO, cx);
+                        }
+                        cx.stop_propagation();
+                    }))
                     .on_drag(DraggedBandDivider, |_, _, _, cx| cx.new(|_| gpui::Empty)),
             ))
     }
@@ -309,7 +309,9 @@ impl Render for SolutionBand {
             if let Some(view) = self.views.get(&session_id) {
                 return Some(view.clone());
             }
-            let session = SolutionAgentStore::global(cx).read(cx).session(session_id)?;
+            let session = SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(session_id)?;
             let view = cx.new(|cx| {
                 SolutionSessionView::new(session_id, session, self.workspace.clone(), window, cx)
             });
@@ -534,7 +536,8 @@ mod tests {
             store.set_band_divider_ratio(solution_a, 0.7, cx);
             store.set_band_divider_ratio(solution_b, 0.25, cx);
         });
-        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
         cx.run_until_parked();
 
         // Simulate a restart: drop the in-memory geometry and re-run the

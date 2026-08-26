@@ -34,8 +34,8 @@
 use std::cell::RefCell;
 
 use gpui::{
-    App, Context, ElementId, IntoElement, ParentElement, PromptLevel, Render, SharedString,
-    Styled, Subscription, WeakEntity, Window, div, px,
+    App, Context, ElementId, IntoElement, ParentElement, PromptLevel, Render, SharedString, Styled,
+    Subscription, WeakEntity, Window, div, px,
 };
 use solutions::{SolutionId, SolutionStore};
 use ui::{ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*, right_click_menu};
@@ -362,7 +362,11 @@ impl SessionTabStrip {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let session_id = candidate.session_id;
-        let dot_color = state_dot_color(candidate.is_errored, candidate.is_running, candidate.is_cold);
+        let dot_color = state_dot_color(
+            candidate.is_errored,
+            candidate.is_running,
+            candidate.is_cold,
+        );
         let title = if candidate.title.is_empty() {
             SharedString::from(session_id.to_string())
         } else {
@@ -389,11 +393,10 @@ impl SessionTabStrip {
             .cursor_pointer()
             .child(Indicator::dot().color(dot_color))
             .child(
-                div().flex_1().min_w_0().child(
-                    Label::new(title.clone())
-                        .size(LabelSize::Small)
-                        .truncate(),
-                ),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(title.clone()).size(LabelSize::Small).truncate()),
             )
             .child(
                 IconButton::new(("session-tab-strip-close", ix), IconName::Close)
@@ -415,23 +418,17 @@ impl SessionTabStrip {
             // GPUI's movement threshold, so a plain click still reaches
             // `on_mouse_down` above and selects the tab.
             .on_drag(
-                DraggedSessionTab {
-                    session_id,
-                    title: title.clone(),
-                },
+                DraggedSessionTab { session_id, title },
                 |dragged, _offset, _window, cx| cx.new(|_| dragged.clone()),
             )
             .drag_over::<DraggedSessionTab>(|style, _dragged, _window, cx| {
                 style.bg(cx.theme().colors().drop_target_background)
             })
-            .on_drop({
-                let order = order.clone();
-                move |dragged: &DraggedSessionTab, _window, cx| {
-                    let new_order = reorder_to(&order, dragged.session_id, session_id);
-                    SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                        store.persist_tab_order(solution_id, new_order, cx);
-                    });
-                }
+            .on_drop(move |dragged: &DraggedSessionTab, _window, cx| {
+                let new_order = reorder_to(&order, dragged.session_id, session_id);
+                SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                    store.persist_tab_order(solution_id, new_order, cx);
+                });
             });
 
         // Right-click menu restoring the affordances the old dock chat-tab
@@ -593,16 +590,20 @@ impl Render for SessionTabStrip {
                                     let weak_workspace = weak_workspace.clone();
                                     submenu
                                         .entry("Select", None, move |_window, cx| {
-                                            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                                                let current =
-                                                    store.active_dialog_session(solution_id);
-                                                let next = toggle_selection(current, session_id);
-                                                store.set_active_dialog_session(
-                                                    solution_id,
-                                                    next,
-                                                    cx,
-                                                );
-                                            });
+                                            SolutionAgentStore::global(cx).update(
+                                                cx,
+                                                |store, cx| {
+                                                    let current =
+                                                        store.active_dialog_session(solution_id);
+                                                    let next =
+                                                        toggle_selection(current, session_id);
+                                                    store.set_active_dialog_session(
+                                                        solution_id,
+                                                        next,
+                                                        cx,
+                                                    );
+                                                },
+                                            );
                                         })
                                         .entry("Rename Session", None, move |window, cx| {
                                             if let Some(weak_workspace) = weak_workspace.as_ref() {
@@ -615,9 +616,11 @@ impl Render for SessionTabStrip {
                                             }
                                         })
                                         .entry("Restart Agent", None, move |_window, cx| {
-                                            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                                                store.restart_agent(session_id, cx)
-                                            }).detach_and_log_err(cx);
+                                            SolutionAgentStore::global(cx)
+                                                .update(cx, |store, cx| {
+                                                    store.restart_agent(session_id, cx)
+                                                })
+                                                .detach_and_log_err(cx);
                                         })
                                         .entry("Close", None, move |window, cx| {
                                             weak_close
@@ -872,16 +875,16 @@ mod tests {
         });
 
         cx.update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("hydrate");
         cx.run_until_parked();
 
         let strip = cx.update(|cx| cx.new(|cx| SessionTabStrip::new(None, cx)));
-        let candidates =
-            strip.read_with(cx, |strip, cx| strip.candidates_for(solution_id, cx));
+        let candidates = strip.read_with(cx, |strip, cx| strip.candidates_for(solution_id, cx));
         let tabbed: Vec<(SolutionSessionId, i64)> = candidates
             .iter()
             .map(|candidate| (candidate.session_id, candidate.tab_order))

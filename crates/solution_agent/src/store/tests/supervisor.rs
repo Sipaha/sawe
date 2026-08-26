@@ -3217,7 +3217,10 @@ async fn successful_turn_clears_sibling_stopped_quota(cx: &mut TestAppContext) {
                 "a sibling's terminal quota stop must be lifted by another session's \
                  successful turn"
             );
-            assert!(st.enabled, "the sibling's enabled flag must be restored too");
+            assert!(
+                st.enabled,
+                "the sibling's enabled flag must be restored too"
+            );
             assert_eq!(st.next_eligible_ms, None);
             assert_eq!(st.backoff_attempt, 0);
             assert!(!store.backoff_timers.contains_key(&sibling_id));

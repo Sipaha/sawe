@@ -61,21 +61,23 @@ fn select_band_states(connection: &Connection) -> Result<Vec<(SolutionId, BandSt
     let rows = select()?;
     Ok(rows
         .into_iter()
-        .map(|(solution_id, divider_ratio, utility_visible, active_dialog_session)| {
-            let active_dialog_session = active_dialog_session.and_then(|id| {
-                // A malformed id is the user's own row gone bad, not a reason
-                // to drop every other Solution's geometry — log it and treat
-                // that one Solution as having a collapsed dialog.
-                SolutionSessionId::parse(&id).log_err()
-            });
-            (
-                SolutionId(solution_id),
-                BandState {
-                    divider_ratio: clamp_divider_ratio(divider_ratio),
-                    utility_visible: utility_visible != 0,
-                    active_dialog_session,
-                },
-            )
-        })
+        .map(
+            |(solution_id, divider_ratio, utility_visible, active_dialog_session)| {
+                let active_dialog_session = active_dialog_session.and_then(|id| {
+                    // A malformed id is the user's own row gone bad, not a reason
+                    // to drop every other Solution's geometry — log it and treat
+                    // that one Solution as having a collapsed dialog.
+                    SolutionSessionId::parse(&id).log_err()
+                });
+                (
+                    SolutionId(solution_id),
+                    BandState {
+                        divider_ratio: clamp_divider_ratio(divider_ratio),
+                        utility_visible: utility_visible != 0,
+                        active_dialog_session,
+                    },
+                )
+            },
+        )
         .collect())
 }

@@ -538,7 +538,11 @@ async fn cold_close_solution_does_not_rewrite_cold_session_rows(cx: &mut gpui::T
     let (db, sol) = store.update(cx, |store, cx| {
         (
             store.persistence().expect("persistence"),
-            store.session(seeded_id).expect("session").read(cx).solution_id,
+            store
+                .session(seeded_id)
+                .expect("session")
+                .read(cx)
+                .solution_id,
         )
     });
 
@@ -557,9 +561,16 @@ async fn cold_close_solution_does_not_rewrite_cold_session_rows(cx: &mut gpui::T
     // Two rows on disk that the in-memory (cold, stream-less) entity does not
     // mirror — exactly the shape a legacy teammate-tagged transcript hydrates as.
     for idx in 0..2 {
-        db.upsert_entry(cold_id, idx, 1, 1_700_000_000_000 + idx, None, vec![1, 2, 3])
-            .await
-            .expect("seed row");
+        db.upsert_entry(
+            cold_id,
+            idx,
+            1,
+            1_700_000_000_000 + idx,
+            None,
+            vec![1, 2, 3],
+        )
+        .await
+        .expect("seed row");
     }
     assert_eq!(
         db.load_entries(cold_id).await.expect("load").len(),
@@ -571,7 +582,10 @@ async fn cold_close_solution_does_not_rewrite_cold_session_rows(cx: &mut gpui::T
     cx.run_until_parked();
 
     assert_eq!(
-        db.load_entries(cold_id).await.expect("load after close").len(),
+        db.load_entries(cold_id)
+            .await
+            .expect("load after close")
+            .len(),
         2,
         "cold close must not flush a session that was never resumed — \
          persist_all_rows' delete_entries_from(main_len) would truncate it"
@@ -632,7 +646,7 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
             use acp_thread::AgentConnection as _;
             Rc::clone(&connection).new_session(
                 project.clone(),
-                util::path_list::PathList::new(&[root.clone()]),
+                util::path_list::PathList::new(std::slice::from_ref(&root)),
                 cx,
             )
         })

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -471,7 +472,9 @@ pub enum SolutionAgentStoreEvent {
     /// to avoid the band rendering a dangling id. Both the band (Task 4) and
     /// the tab strip (Task 3) subscribe to this so either view can drive the
     /// selection and the other stays in sync.
-    ActiveDialogSessionChanged { solution_id: SolutionId },
+    ActiveDialogSessionChanged {
+        solution_id: SolutionId,
+    },
     /// The band's divider position or utility-section visibility changed for
     /// `solution_id`. A divider drag emits one of these per `on_drag_move`,
     /// so it is kept separate from `ActiveDialogSessionChanged` to keep
@@ -483,7 +486,9 @@ pub enum SolutionAgentStoreEvent {
     /// coalesces `Effect::Notify` per entity per frame and the window is
     /// already repainting for the drag. A future subscriber that does real
     /// work on this event needs to debounce it itself.
-    BandStateChanged { solution_id: SolutionId },
+    BandStateChanged {
+        solution_id: SolutionId,
+    },
 }
 
 impl EventEmitter<SolutionAgentStoreEvent> for SolutionAgentStore {}
@@ -779,8 +784,8 @@ impl SolutionAgentStore {
                 this.update(cx, |this, cx| {
                     let mut changed = false;
                     for (solution_id, state) in bands {
-                        if this.band_state.get(&solution_id).is_none() {
-                            this.band_state.insert(solution_id, state);
+                        if let hash_map::Entry::Vacant(slot) = this.band_state.entry(solution_id) {
+                            slot.insert(state);
                             cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
                             cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged {
                                 solution_id,
@@ -1429,7 +1434,10 @@ impl SolutionAgentStore {
         if self.band_state(solution_id).divider_ratio == ratio {
             return;
         }
-        self.band_state.entry(solution_id).or_default().divider_ratio = ratio;
+        self.band_state
+            .entry(solution_id)
+            .or_default()
+            .divider_ratio = ratio;
         self.persist_band_state_debounced(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();

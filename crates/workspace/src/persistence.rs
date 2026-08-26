@@ -6114,9 +6114,8 @@ mod tests {
         let all_migrations = <WorkspaceDb as Domain>::MIGRATIONS;
         let up_to_cleanup = &all_migrations[..all_migrations.len() - 1];
 
-        let conn = Connection::open_memory(Some(
-            "test_chat_kind_rows_are_purged_by_one_shot_migration",
-        ));
+        let conn =
+            Connection::open_memory(Some("test_chat_kind_rows_are_purged_by_one_shot_migration"));
         conn.migrate(
             <WorkspaceDb as Domain>::NAME,
             up_to_cleanup,
