@@ -1026,12 +1026,16 @@ impl ConsolePanel {
     /// `self.tabs` as the registry of existing terminals instead of a Pane.
     ///
     /// **Must not be called while the `Workspace` entity is leased** — it reads
-    /// its own `WeakEntity<Workspace>` below, so calling it from a
-    /// `workspace.register_action` handler (or anything else holding
-    /// `&mut Workspace`) aborts the process, compiles clean and passes unit
-    /// tests. Call it from an async task instead, as
-    /// `terminal_view::terminal_panel::TerminalProvider::spawn` and
-    /// `run_config_ui::run_controller::RunController` both do.
+    /// its own `WeakEntity<Workspace>` below, and under a lease a read aborts
+    /// the process exactly as an update does (`entity_map.rs:164`), while
+    /// compiling clean and passing unit tests. So calling it from a
+    /// `workspace.register_action` handler — or anything else holding
+    /// `&mut Workspace` — kills the editor. Call it from an async task
+    /// instead. Its only caller,
+    /// `run_config_ui::run_controller::RunController`, does that; the method
+    /// this one mirrors, `TerminalPanel::spawn_task`, carries the same
+    /// constraint and its private `TerminalProvider::spawn` wrapper satisfies
+    /// it the same way, from inside `window.spawn`.
     pub fn spawn_task(
         &mut self,
         task: &SpawnInTerminal,
@@ -1112,11 +1116,11 @@ impl ConsolePanel {
         cx.spawn(async move |_, _| rx.await?)
     }
 
-    /// Inherits `spawn_task`'s no-active-`Workspace`-lease requirement, and
-    /// tightens it: the `RevealTarget::Center` arm updates the workspace
-    /// synchronously (`add_center_terminal` needs `&mut Workspace`), so it
-    /// panics under a caller's lease even for a `spawn_task` path that would
-    /// otherwise only read.
+    /// Inherits `spawn_task`'s no-active-`Workspace`-lease requirement. The
+    /// `RevealTarget::Center` arm below is a second, independent violation of
+    /// it — it *updates* the workspace synchronously, since
+    /// `add_center_terminal` takes `&mut Workspace` — so removing the read in
+    /// `spawn_task` would not make this path callable under a lease.
     fn spawn_in_new_terminal(
         &mut self,
         spawn_task: SpawnInTerminal,

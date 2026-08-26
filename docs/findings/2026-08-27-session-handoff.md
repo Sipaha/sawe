@@ -372,7 +372,11 @@ This is a 2b task and it is the one a user would notice first.
 - **GPUI double-lease**: reading the `Workspace` entity under a `Workspace`
   lease panics at runtime, compiles clean, and unit tests on the
   `AnyWindowHandle::update` shape miss it entirely. Hit again in Task 7, and
-  it is the root of the outstanding `RunController` crash.
+  it was the root of the `RunController` crash — **fixed 2026-08-27**
+  (`4038606620`, `deb1c861e8`; see pool item 1 above). Note the trap has a
+  second half that the fix had to discover: threading `&mut Workspace` in
+  from the caller is not enough if a *callee* re-derives the workspace from
+  its own weak handle, as `ConsolePanel::spawn_task` does.
 - **`ui::ContextMenu` will not nest a `right_click_menu` inside an open
   popover.** `ContextMenu::build/new` unconditionally wires
   `cx.on_blur(focus_handle) -> cancel() -> DismissEvent`, and
