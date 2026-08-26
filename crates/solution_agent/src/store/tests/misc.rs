@@ -185,9 +185,7 @@ async fn create_session_roots_cwd_at_solution_root(cx: &mut TestAppContext) {
 /// 2026-08-26). Prove it directly: a solution with zero members registered
 /// must still produce a session, rooted at the solution root.
 #[gpui::test]
-async fn create_session_in_a_member_less_solution_roots_at_solution_root(
-    cx: &mut TestAppContext,
-) {
+async fn create_session_in_a_member_less_solution_roots_at_solution_root(cx: &mut TestAppContext) {
     let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
     let agent_id = SharedString::from("mock-agent");
 
@@ -204,7 +202,10 @@ async fn create_session_in_a_member_less_solution_roots_at_solution_root(
         });
 
         let solution_store = solutions::SolutionStore::global(cx);
-        let solution = solution_store.read(cx).find_solution(solution_id).expect("solution");
+        let solution = solution_store
+            .read(cx)
+            .find_solution(solution_id)
+            .expect("solution");
         assert!(
             solution.members.is_empty(),
             "precondition: no members registered"
