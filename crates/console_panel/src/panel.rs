@@ -1502,11 +1502,19 @@ impl ConsolePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Routes through the same `new_chat_cwd` decision as the "+" menu
-        // (see `render_plus_popover`) so the two chat-creation entry points
-        // cannot diverge on the active member path the way they did before
-        // (Critical 1, 2026-08-26 final review).
-        let cwd = new_chat_cwd(self.active_member_path(cx).as_deref());
+        // `None`, not `self.active_member_path(cx)`: this runs under the
+        // `NewChat` handler's mutable `Workspace` lease (see that handler's
+        // comment in `console_panel.rs`), and `active_member_path` reads the
+        // `Workspace` entity via `cx` — a double_lease_panic. `new_chat_cwd`
+        // ignores its argument anyway (a chat never uses the active member),
+        // so passing the (unreadable, here) active path would buy nothing and
+        // cost a crash. Routes through the same `new_chat_cwd` decision as
+        // the "+" menu (see `render_plus_popover`) so the two chat-creation
+        // entry points cannot diverge on the active member path the way they
+        // did before (Critical 1, 2026-08-26 final review) — the "+" menu's
+        // call site can pass its real `active_path` because it runs at
+        // render time with nothing leased.
+        let cwd = new_chat_cwd(None);
         self.add_chat_tab_with_cwd(solution_id, project, cwd, window, cx);
     }
 
@@ -2319,6 +2327,41 @@ mod tests {
             assert!(matches!(p.tabs[0], ConsoleTab::Terminal { .. }));
             assert_eq!(p.active_index, Some(0));
         });
+    }
+
+    /// Regression guard for the Critical-1-fix regression (2026-08-26
+    /// second-pass final review): `add_chat_tab` runs under the `NewChat`
+    /// action handler's mutable `Workspace` lease (see that handler's
+    /// comment in `console_panel.rs`), so anything it does that re-reads the
+    /// `Workspace` entity via `cx` — e.g. `self.active_member_path(cx)`,
+    /// which walks `self.workspace.upgrade()?.read(cx)` — double-lease-
+    /// panics. `WindowHandle::update`'s closure leases the root view
+    /// (`Workspace`) the same way the real dispatch does, so calling
+    /// `add_chat_tab` from inside one reproduces the exact shape of the bug:
+    /// this test panicked before the cwd-computation fix (verified by
+    /// temporarily reverting `add_chat_tab` to
+    /// `new_chat_cwd(self.active_member_path(cx).as_deref())` and rerunning)
+    /// and must keep passing (i.e. not panic) after it.
+    #[gpui::test]
+    async fn add_chat_tab_does_not_double_lease_the_workspace(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel) = bootstrap_panel(cx).await;
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                let project = workspace.project().clone();
+                panel.update(cx, |panel, cx| {
+                    panel.add_chat_tab(SolutionId(1), project, window, cx);
+                });
+            })
+            .unwrap();
+        // The async `create_session_with_cwd` task itself will fail (no
+        // `SolutionStore`/Solution registered by `bootstrap_panel`) and log
+        // an error via `detach_and_log_err` — that's fine, it's async and
+        // happens after this call returns. What this test guards is that the
+        // synchronous part of `add_chat_tab` (the cwd computation) does not
+        // panic while the `Workspace` is leased.
+        cx.run_until_parked();
     }
 
     /// Regression: the empty-solution guard used to ask
