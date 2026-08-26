@@ -9,20 +9,18 @@ gpui::actions!(
         ToggleFocus,
         /// Opens a new terminal tab in the console panel.
         NewTerminal,
-        /// Opens a new AI-chat tab in the console panel.
+        /// Creates a new AI-chat session and shows it in the Solution band.
         NewChat,
     ]
 );
 
-/// Shows (and activates) the console-panel chat tab for a specific AI
-/// session, spawning the tab if it isn't in the strip yet. This is the
-/// deterministic "bring session N into view" seam that the live
-/// `ChatProviderEvent::TabsChanged` path can't guarantee (a session pinned
-/// out-of-band — e.g. via the `workspace.open_session` RPC — may never
-/// surface a desktop tab). Primarily for MCP-driven UI verification: dispatch
-/// via `windows.dispatch_action` with `{"session_id": "…"}` then
-/// `windows.screenshot`. `session_id` is a `SolutionSessionId` string (as
-/// returned by `solution_agent.list_sessions`).
+/// Selects a specific AI session as the Solution band's active dialog
+/// (`SolutionAgentStore::set_active_dialog_session`), the deterministic
+/// "bring session N into view" seam a session pinned out-of-band — e.g. via
+/// the `workspace.open_session` RPC — cannot otherwise guarantee. Primarily
+/// for MCP-driven UI verification: dispatch via `windows.dispatch_action`
+/// with `{"session_id": "…"}` then `windows.screenshot`. `session_id` is a
+/// `SolutionSessionId` string (as returned by `solution_agent.list_sessions`).
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = console_panel)]
 #[serde(deny_unknown_fields)]

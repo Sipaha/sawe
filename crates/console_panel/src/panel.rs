@@ -5,16 +5,10 @@ use futures::future::join_all;
 use gpui::{
     Action, Anchor, App, AppContext as _, AsyncApp, AsyncWindowContext, Context, DismissEvent,
     Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, Pixels,
-    Point, PromptLevel, Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
+    Point, Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
 };
-use project::Project;
 use settings::Settings as _;
-use solution_agent::SolutionSessionId;
-use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
-use solution_agent::model::SessionState;
-use solution_agent::rename_session_modal::RenameSessionModal;
 use solution_agent::reopen_session_modal::{ReopenSessionModal, ReopenableSession};
-use solution_agent::session_view::SolutionSessionView;
 use solution_agent::store::SolutionAgentStore;
 use solutions::{MemberId, SolutionId, SolutionStore};
 use std::path::PathBuf;
@@ -30,7 +24,7 @@ use workspace::{
 };
 
 use crate::actions::{NewChat, ToggleFocus};
-use crate::{ChatProvider, ChatProviderEvent, ConsolePanelSettings, TerminalProvider};
+use crate::{ConsolePanelSettings, TerminalProvider};
 
 const CONSOLE_PANEL_KEY: &str = "ConsolePanel";
 
@@ -57,9 +51,8 @@ pub fn active_solution_id_for_workspace(workspace: &Workspace, cx: &App) -> Opti
 
 /// Whether this workspace has a project to run a terminal in — the gate on
 /// terminal creation ("+" menu state, `NewTerminal`). AI chats are
-/// solution-scoped (spec 2026-08-26: a chat always roots at `solution.root`,
-/// see [`new_chat_cwd`]) and never use this gate — only a terminal needs a
-/// directory to `cd` into.
+/// solution-scoped (spec 2026-08-26: a chat always roots at `solution.root`)
+/// and never use this gate — only a terminal needs a directory to `cd` into.
 ///
 /// For a **Solution** workspace the authoritative answer is its member list, not
 /// its worktrees: `solutions_ui::open` opens an EMPTY solution with the solution
@@ -98,42 +91,25 @@ pub fn workspace_has_project(workspace: &Workspace, cx: &App) -> bool {
 /// Folder of the solution's *active* project — the one selected in the
 /// project tab strip — falling back to the solution root when there is no
 /// active member. Used as the `cwd` for new terminals started from the "+"
-/// menu; a chat never uses this (see [`new_chat_cwd`]) — it is
-/// solution-scoped and always roots at `solution.root` (spec 2026-08-26).
+/// menu; a chat never uses this — it is solution-scoped and always roots at
+/// `solution.root` (spec 2026-08-26), decided by the `NewChat` action
+/// handler in `console_panel.rs`.
 fn active_member_path(solution_id: SolutionId, cx: &App) -> Option<PathBuf> {
     let store = SolutionStore::try_global(cx)?;
     let store = store.read(cx);
     store.active_member_path(solution_id)
 }
 
-/// The cwd for a freshly created chat session, given the solution's active
-/// member path (the same value a new terminal uses). Chats are
-/// solution-scoped (spec 2026-08-26): the active member path is accepted
-/// only so both creation entry points (the "+" menu and
-/// [`ConsolePanel::add_chat_tab`]) can share one lookup with the terminal
-/// path, but it is deliberately never returned here — a chat always roots
-/// at `solution.root` (`create_session_with_cwd` treats `None` as "use the
-/// solution root"). Regression guard for Critical 1 (2026-08-26 final
-/// review): the "+" menu used to pass the active member path straight
-/// through as the chat cwd, silently re-binding a "solution-scoped" session
-/// — and its `~/.claude/projects/<cwd>/` transcript bucket — to whichever
-/// member happened to be selected.
-fn new_chat_cwd(_active_member_path: Option<&std::path::Path>) -> Option<PathBuf> {
-    None
-}
-
 /// Which project a console tab belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TabScope {
     /// The tab is bound to a member by placement — a terminal's cwd lives
-    /// inside the member's folder. Chats are never `Member`: they are
-    /// solution-scoped, not project-scoped (spec 2026-08-26).
+    /// inside the member's folder.
     Member(MemberId),
     /// The tab sits at the solution root and belongs to no project.
     Root,
-    /// The tab cannot be placed at all (a terminal opened by the bare
-    /// `NewTerminal` keybinding with no cwd, or one restored with a NULL cwd)
-    /// — or a chat tab, which is always `Unscoped` and therefore always shown.
+    /// The tab cannot be placed at all — a terminal opened by the bare
+    /// `NewTerminal` keybinding with no cwd, or one restored with a NULL cwd.
     Unscoped,
 }
 
@@ -196,10 +172,6 @@ pub enum ConsoleTab {
         /// silently drop out of scope and vanish from the strip.
         origin_cwd: Option<PathBuf>,
     },
-    Chat {
-        view: Entity<SolutionSessionView>,
-        session_id: SolutionSessionId,
-    },
 }
 
 /// Stable per-tab identity used to remember the active tab for each member
@@ -208,7 +180,6 @@ pub enum ConsoleTab {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ConsoleTabKey {
     Terminal(gpui::EntityId),
-    Chat(SolutionSessionId),
 }
 
 /// Drag payload for reordering console tabs. The bespoke tab strip
@@ -249,24 +220,16 @@ pub struct ConsolePanel {
     active_index: Option<usize>,
     dock_position: DockPosition,
     terminal_provider: Entity<TerminalProvider>,
-    chat_provider: Entity<ChatProvider>,
     focus_handle: FocusHandle,
     tab_context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     pending_terminals_to_add: usize,
     deferred_tasks: HashMap<TaskId, Task<()>>,
     assistant_enabled: bool,
-    /// Session whose chat tab should be activated once it lands in the
-    /// strip. Set by [`add_chat_tab_with_cwd`] when the local user creates
-    /// a chat. Because chat tabs now have a single writer
-    /// ([`apply_external_tab_changes`], driven by the store's
-    /// create-implies-open pin), the creating code can't push-and-activate
-    /// the tab directly — it records the id here and whichever of the two
-    /// orderings wins (the tab landing vs. the create future resolving)
-    /// performs the activation and clears this.
-    chat_tab_to_activate: Option<SolutionSessionId>,
     /// Last-active tab per member project, so switching back to a member
-    /// restores the exact dialog the user last had open there. In-memory
-    /// only — on restart the panel falls back to each member's first tab.
+    /// restores the exact terminal the user last had open there — every key
+    /// is a terminal tab now that chats left `ConsolePanel` for the Solution
+    /// band (phase 2a task 5). In-memory only — on restart the panel falls
+    /// back to each member's first tab.
     active_by_member: HashMap<PathBuf, ConsoleTabKey>,
     /// The member path the panel last rendered for; used to attribute the
     /// outgoing active tab to the correct member when the active member flips.
@@ -275,46 +238,9 @@ pub struct ConsolePanel {
 }
 
 impl ConsolePanel {
-    pub fn new(
-        workspace: WeakEntity<Workspace>,
-        store: Entity<SolutionAgentStore>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let settings = ConsolePanelSettings::get_global(cx).clone();
         let terminal_provider = cx.new(|_| TerminalProvider::new(workspace.clone()));
-        let chat_provider = cx.new(|cx| ChatProvider::new(workspace.clone(), store, cx));
-        // Subscribe to external store mutations (mobile-side wire RPCs
-        // driving the same store) so the desktop strip mirrors them in
-        // real time. The handler filters by this panel's active
-        // solution_id so a foreign-solution mutation doesn't open
-        // ghost tabs in unrelated workspaces.
-        let chat_event_sub = cx.subscribe_in(
-            &chat_provider,
-            window,
-            |this, _provider, event, window, cx| match event {
-                ChatProviderEvent::TabsChanged {
-                    solution_id,
-                    opened,
-                    closed,
-                } => this.apply_external_tab_changes(
-                    *solution_id,
-                    opened.clone(),
-                    closed.clone(),
-                    window,
-                    cx,
-                ),
-                ChatProviderEvent::SessionRemoved(id) => {
-                    this.close_chat_tab_by_session_id(*id, cx);
-                }
-                ChatProviderEvent::SessionCreatedExternally(_) => {
-                    // No-op: creates without an `open_session` follow-up
-                    // don't pin the session in the strip; the user has to
-                    // explicitly open it. Matches desktop's "new session"
-                    // path, which calls open_session after create_session.
-                }
-            },
-        );
         // Re-scope the visible tabs whenever the solution-wide active member
         // flips, so the strip + content swap to that project's own dialogs —
         // mirroring how Project Panel / Git Panel follow the active member.
@@ -328,48 +254,42 @@ impl ConsolePanel {
                 }
             })
         });
-        let mut subscriptions = vec![chat_event_sub];
-        subscriptions.extend(member_change_sub);
+        let subscriptions = member_change_sub.into_iter().collect();
         Self {
             workspace,
             tabs: Vec::new(),
             active_index: None,
             dock_position: settings.default_position,
             terminal_provider,
-            chat_provider,
             focus_handle: cx.focus_handle(),
             tab_context_menu: None,
             pending_terminals_to_add: 0,
             deferred_tasks: HashMap::default(),
             assistant_enabled: false,
-            chat_tab_to_activate: None,
             active_by_member: HashMap::default(),
             last_member_path: None,
             _subscriptions: subscriptions,
         }
     }
 
-    /// Loader. Constructs a fresh `ConsolePanel` and then restores any
-    /// persisted tabs from the workspace DB. Terminal tabs are re-spawned at
-    /// their stored CWD with a fresh shell (clean-start policy: state inside
-    /// the shell is *not* restored). Chat tabs are reattached to existing
-    /// sessions in `SolutionAgentStore`; rows whose session is no longer in
-    /// the store are skipped with a warning.
     pub fn dock_position(&self) -> DockPosition {
         self.dock_position
     }
 
+    /// Loader. Constructs a fresh `ConsolePanel` and then restores any
+    /// persisted terminal tabs from the workspace DB, re-spawning each at its
+    /// stored CWD with a fresh shell (clean-start policy: state inside the
+    /// shell is *not* restored). Chat tabs left `ConsolePanel` for the
+    /// Solution band (phase 2a task 5); any persisted `console_panel_state`
+    /// row of kind `chat` is legacy data from before that move and is
+    /// skipped here (see [`restore_from_db`]) and purged by a one-shot DB
+    /// migration (`crates/workspace/src/persistence.rs`).
     pub async fn load(
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
-        // The store is only available once `SolutionAgentStore::init_global`
-        // has run; in production that is guaranteed before any workspace
-        // boots. Tests that don't init the store can't load the panel either,
-        // which matches TerminalPanel's old behaviour for solution_agent.
-        let store = workspace.update(&mut cx, |_, cx| SolutionAgentStore::global(cx))?;
-        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
-            cx.new(|cx| Self::new(workspace.weak_handle(), store, window, cx))
+        let panel = workspace.update_in(&mut cx, |workspace, _window, cx| {
+            cx.new(|cx| Self::new(workspace.weak_handle(), cx))
         })?;
 
         // Restore persisted tabs in the BACKGROUND. `load` is awaited by
@@ -420,56 +340,8 @@ impl ConsolePanel {
             return Ok(());
         }
 
-        // If any persisted row is a chat tab, hydrate the active solution's
-        // sessions from disk so `ChatProvider::new_tab_from_existing` can find
-        // them. Without this the session lives in DB but not in the in-memory
-        // store, so chat-tab restore silently skips with a "session no longer
-        // exists" warning. The store filters out `closed_at != null` rows
-        // internally, so explicitly-closed sessions still don't come back.
-        //
-        // We use the LAZY path (`hydrate_open_tabs_lazy`): it materialises
-        // empty placeholder entities for every open chat tab fast, then loads
-        // each transcript blob in the background — the active tab first
-        // (passed as `priority` so it paints with content, not a spinner),
-        // the rest detached. Only the placeholder pass is awaited here, so
-        // `new_tab_from_existing` finds every session id while the heavy blob
-        // loads are still in flight; tabs whose blob hasn't landed render a
-        // loading spinner until it does.
-        let has_chat_rows = rows.iter().any(|(_, kind, _, _, _)| kind == "chat");
-        if has_chat_rows {
-            let solution_id = workspace
-                .read_with(cx, |ws, cx| active_solution_id_for_workspace(ws, cx))
-                .ok()
-                .flatten();
-            if solution_id.is_none() {
-                log::warn!(
-                    "ConsolePanel restore: workspace has chat tabs but no active solution; \
-                     skipping session hydration — chat rows will not restore this boot"
-                );
-            }
-            if let Some(solution_id) = solution_id {
-                // The active chat tab (active==1) is the one the user will see
-                // first; prioritise loading its transcript so it doesn't flash
-                // a spinner.
-                let priority = rows
-                    .iter()
-                    .find(|(_, kind, _, _, active)| kind == "chat" && *active)
-                    .and_then(|(_, _, item_id, _, _)| SolutionSessionId::parse(item_id).ok());
-                let hydrate = cx.update(|_, cx| {
-                    SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                        store.hydrate_open_tabs_lazy(solution_id, priority, cx)
-                    })
-                });
-                if let Ok(task) = hydrate {
-                    task.await.log_err();
-                }
-            }
-        }
-
-        let (terminal_provider, chat_provider): (Entity<TerminalProvider>, Entity<ChatProvider>) =
-            panel.read_with(cx, |panel, _| {
-                (panel.terminal_provider.clone(), panel.chat_provider.clone())
-            });
+        let terminal_provider: Entity<TerminalProvider> =
+            panel.read_with(cx, |panel, _| panel.terminal_provider.clone());
 
         let mut active_index: Option<usize> = None;
         let rows_persisted = rows.len();
@@ -512,58 +384,18 @@ impl ConsolePanel {
                     }
                 }
                 "chat" => {
-                    let session_id = match SolutionSessionId::parse(&item_id) {
-                        Ok(id) => id,
-                        Err(err) => {
-                            log::warn!(
-                                "ConsolePanel restore: chat tab #{tab_index} has invalid item_id \
-                                 {item_id:?}: {err:#}; skipping row"
-                            );
-                            continue;
-                        }
-                    };
-                    // Skip rows whose session is no longer in the store
-                    // before spending an entity construction on them.
-                    let session_exists = cx
-                        .update(|_, cx| {
-                            SolutionAgentStore::global(cx)
-                                .read(cx)
-                                .session(session_id)
-                                .is_some()
-                        })
-                        .unwrap_or(false);
-                    if !session_exists {
-                        log::warn!(
-                            "ConsolePanel restore: chat tab #{tab_index} references session \
-                             {session_id} that no longer exists; skipping row"
-                        );
-                        continue;
-                    }
-                    let provider = chat_provider.clone();
-                    let task = cx.update(|window, cx| {
-                        provider.update(cx, |provider, cx| {
-                            provider.new_tab_from_existing(session_id, window, cx)
-                        })
-                    });
-                    match task {
-                        Ok(task) => match task.await {
-                            Ok(view) => Some(ConsoleTab::Chat { view, session_id }),
-                            Err(err) => {
-                                log::warn!(
-                                    "ConsolePanel restore: chat tab #{tab_index} session={session_id} \
-                                     failed to reattach: {err:#}; skipping row"
-                                );
-                                None
-                            }
-                        },
-                        Err(err) => {
-                            log::warn!(
-                                "ConsolePanel restore: chat tab #{tab_index} could not be \
-                                 scheduled (window gone?): {err:#}; aborting restore"
-                            );
-                            break;
-                        }
-                    }
+                    // Chat tabs left `ConsolePanel` for the Solution band
+                    // (phase 2a task 5) — this row is legacy data from
+                    // before that move. The panel can no longer restore it;
+                    // a one-shot DB migration purges these rows so they
+                    // don't accumulate (`crates/workspace/src/persistence.rs`).
+                    // The session itself is untouched in `solution_sessions`
+                    // — only the panel's memory of "it was open" is gone.
+                    log::info!(
+                        "ConsolePanel restore: skipping legacy chat tab #{tab_index} \
+                         (item_id={item_id:?}); chat tabs now live in the Solution band"
+                    );
+                    None
                 }
                 other => {
                     log::warn!(
@@ -622,26 +454,15 @@ impl ConsolePanel {
         Ok(())
     }
 
-    /// Snapshot the current tab list into `console_panel_state` AND reconcile
-    /// the global `SolutionSession.tab_order` field so `workspace.snapshot`
-    /// (the mobile WorkspaceScreen feed) returns the same set of chat tabs
-    /// the user actually sees on the desktop strip. Without that reconciliation
-    /// the two stores diverge: `console_panel_state` tracks every panel
-    /// mutation, but `tab_order` was only being touched by the mobile-side
-    /// `workspace.open_session` / `close_session` RPCs and by the boot-time
-    /// `restore_open_tabs` DB hydration — so a desktop user opening a new
-    /// console here left mobile seeing a stale set of sessions from whatever
-    /// `tab_order` happened to be persisted last.
+    /// Snapshot the current (terminal-only) tab list into `console_panel_state`.
+    /// Chat tabs left `ConsolePanel` for the Solution band (phase 2a task 5),
+    /// so this no longer needs to reconcile `SolutionSession.tab_order` — that
+    /// field is now owned entirely by the store's own session-lifecycle calls
+    /// (`create_session_with_cwd`'s create-implies-open pin, `close_session`).
     fn persist(&self, cx: &mut Context<Self>) {
-        // Reconcile tab_order on every persist (add / close / reorder / restore).
-        // `persist_tab_order` already emits the seq-ed `workspace.session_opened`
-        // / `workspace.session_closed` deltas, so the mobile client picks up
-        // the new strip without a manual snapshot refresh.
-        self.sync_chat_tab_order(cx);
-
-        // Snapshot tab state synchronously — we only read TerminalView /
-        // SolutionSession entities here, never the Workspace. Workspace lookup
-        // for `database_id` is deferred into the spawned task below so this
+        // Snapshot tab state synchronously — we only read TerminalView
+        // entities here, never the Workspace. Workspace lookup for
+        // `database_id` is deferred into the spawned task below so this
         // method is safe to call while a `Workspace::update` is in flight on
         // the outer borrow stack (action handlers, modal close paths, …).
         let active_index = self.active_index;
@@ -650,30 +471,28 @@ impl ConsolePanel {
             .iter()
             .enumerate()
             .map(|(ix, tab)| {
-                let (kind, item_id, cwd) = match tab {
-                    ConsoleTab::Terminal { origin_cwd, .. } => {
-                        // Persist the immutable `origin_cwd` (the owning member
-                        // path), NOT the live working directory: the shell
-                        // process doesn't survive restart, and restore re-spawns
-                        // the terminal in this cwd — reopening it in its member
-                        // dir keeps the tab in scope (a live cwd captured under
-                        // `sudo su` would be empty/unreadable and drop the
-                        // restored tab out of scope).
-                        let cwd = origin_cwd
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().into_owned());
-                        // For terminal rows the `item_id` is informational;
-                        // restore only consults `cwd`. We use the cwd string
-                        // (or an empty marker) so the column stays
-                        // human-readable in the DB.
-                        let item_id = cwd.clone().unwrap_or_default();
-                        ("terminal".to_string(), item_id, cwd)
-                    }
-                    ConsoleTab::Chat { session_id, .. } => {
-                        ("chat".to_string(), session_id.to_string(), None)
-                    }
-                };
-                (ix as i64, kind, item_id, cwd, active_index == Some(ix))
+                let ConsoleTab::Terminal { origin_cwd, .. } = tab;
+                // Persist the immutable `origin_cwd` (the owning member
+                // path), NOT the live working directory: the shell process
+                // doesn't survive restart, and restore re-spawns the
+                // terminal in this cwd — reopening it in its member dir
+                // keeps the tab in scope (a live cwd captured under `sudo
+                // su` would be empty/unreadable and drop the restored tab
+                // out of scope).
+                let cwd = origin_cwd
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned());
+                // The `item_id` column is informational for terminal rows;
+                // restore only consults `cwd`. We use the cwd string (or an
+                // empty marker) so the column stays human-readable in the DB.
+                let item_id = cwd.clone().unwrap_or_default();
+                (
+                    ix as i64,
+                    "terminal".to_string(),
+                    item_id,
+                    cwd,
+                    active_index == Some(ix),
+                )
             })
             .collect();
 
@@ -692,61 +511,6 @@ impl ConsolePanel {
                 .log_err();
         })
         .detach();
-    }
-
-    /// Project the in-memory chat-tab order onto `SolutionSession.tab_order`
-    /// per solution. Terminal tabs are ignored — only chat tabs map onto
-    /// `solution_agent` sessions. Called from [`persist`] so every tab
-    /// mutation (add / close / reorder / restore) keeps the field aligned
-    /// with what the panel actually shows.
-    fn sync_chat_tab_order(&self, cx: &mut Context<Self>) {
-        let Some(store) = SolutionAgentStore::try_global(cx) else {
-            return;
-        };
-        let chat_ids: Vec<SolutionSessionId> = self
-            .tabs
-            .iter()
-            .filter_map(|tab| match tab {
-                ConsoleTab::Chat { session_id, .. } => Some(*session_id),
-                ConsoleTab::Terminal { .. } => None,
-            })
-            .collect();
-
-        // Bucket chat session ids by solution_id, preserving tab-strip order
-        // within each bucket. The workspace is typically a single Solution but
-        // the model doesn't enforce that — group defensively so a cross-
-        // solution panel layout (rare / future) doesn't silently truncate
-        // any solution's tab strip to the first one we encounter.
-        //
-        // `persist_tab_order` clears tab_order on every session of the given
-        // solution that isn't in `ordered_ids`. Solutions absent from the
-        // panel are intentionally NOT touched — those tabs live elsewhere
-        // (other workspaces / future mobile-only strips) and we don't want
-        // to clobber their state.
-        let mut per_solution: std::collections::HashMap<SolutionId, Vec<SolutionSessionId>> =
-            std::collections::HashMap::new();
-        {
-            let store_ref = store.read(cx);
-            for session_id in &chat_ids {
-                let Some(entity) = store_ref.session(*session_id) else {
-                    continue;
-                };
-                let solution_id = entity.read(cx).solution_id;
-                per_solution
-                    .entry(solution_id)
-                    .or_default()
-                    .push(*session_id);
-            }
-        }
-
-        if per_solution.is_empty() {
-            return;
-        }
-        store.update(cx, |store, cx| {
-            for (solution_id, ordered_ids) in per_solution {
-                store.persist_tab_order(solution_id, ordered_ids, cx);
-            }
-        });
     }
 }
 
@@ -809,28 +573,15 @@ impl ConsolePanel {
             .overflow_x_scroll();
         for (ix, tab) in self.tabs.iter().enumerate() {
             // Only render terminal tabs belonging to the active member
-            // project (chats are solution-scoped and always in scope); the
-            // rest stay live in `self.tabs` (absolute indices keep
-            // activate/close/reorder valid) but are hidden until their
+            // project; the rest stay live in `self.tabs` (absolute indices
+            // keep activate/close/reorder valid) but are hidden until their
             // member is selected.
             if !scope_flags.get(ix).copied().unwrap_or(true) {
                 continue;
             }
-            let (icon, title): (IconName, SharedString) = match tab {
-                ConsoleTab::Terminal { view, .. } => {
-                    (IconName::Terminal, view.read(cx).tab_content_text(0, cx))
-                }
-                ConsoleTab::Chat {
-                    view: _,
-                    session_id,
-                } => {
-                    let title = SolutionAgentStore::global(cx)
-                        .read_with(cx, |s, _| s.session(*session_id))
-                        .map(|entity| entity.read(cx).title.clone())
-                        .unwrap_or_else(|| SharedString::from(session_id.to_string()));
-                    (IconName::Sparkle, title)
-                }
-            };
+            let ConsoleTab::Terminal { view, .. } = tab;
+            let (icon, title): (IconName, SharedString) =
+                (IconName::Terminal, view.read(cx).tab_content_text(0, cx));
             let is_active = active == Some(ix);
             let bg = if is_active {
                 cx.theme().colors().tab_active_background
@@ -872,9 +623,7 @@ impl ConsolePanel {
                 .child(
                     IconButton::new(("console-close", ix), IconName::Close)
                         .icon_size(IconSize::Small)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close_tab_at(ix, window, cx)
-                        })),
+                        .on_click(cx.listener(move |this, _, _, cx| this.close_tab(ix, cx))),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -916,10 +665,9 @@ impl ConsolePanel {
         let active_solution_id = self.active_solution_id(cx);
         let has_active_solution = active_solution_id.is_some();
         // New terminals open in the active project's folder (the project
-        // selected in the project tab strip); new chats never do — see
-        // `new_chat_cwd`. Model and effort are no longer chosen here — they're
-        // picked in the status bar after the chat is created, before the
-        // first message is sent.
+        // selected in the project tab strip). New chats are solution-scoped
+        // and always root at `solution.root` — handled entirely by the
+        // `NewChat` action (`console_panel.rs`), not here.
         let active_path = active_solution_id.and_then(|id| active_member_path(id, cx));
         // A terminal needs a project directory to run in. An empty solution has
         // no member project, so grey out "New Terminal" (the action handlers
@@ -929,14 +677,6 @@ impl ConsolePanel {
             .workspace
             .upgrade()
             .is_some_and(|ws| workspace_has_project(ws.read(cx), cx));
-        // Read the project handle here, in render context, where nothing is
-        // leased — `add_chat_tab_with_cwd` no longer reads it from the
-        // Workspace entity (see its doc comment: the action path holds the
-        // Workspace mutably).
-        let project = self
-            .workspace
-            .upgrade()
-            .map(|workspace| workspace.read(cx).project().clone());
         let weak_self = cx.weak_entity();
 
         let plus_container = div()
@@ -957,7 +697,6 @@ impl ConsolePanel {
                 .anchor(Anchor::TopLeft)
                 .menu(move |window, cx| {
                     let active_path = active_path.clone();
-                    let project = project.clone();
                     let weak_self = weak_self.clone();
                     Some(ContextMenu::build(window, cx, move |menu, _, _| {
                         // New Terminal in the active project's folder. Disabled
@@ -983,36 +722,19 @@ impl ConsolePanel {
                                     }),
                             )
                         };
-                        // New AI Chat, unlike New Terminal above: a chat is
-                        // solution-scoped and always roots at `solution.root`
-                        // (spec 2026-08-26; `new_chat_cwd` never returns the
-                        // active member path), so it needs only an active
-                        // solution, not a member project.
-                        let menu = if let (Some(solution_id), Some(project)) =
-                            (active_solution_id, project.clone())
-                        {
-                            let weak_self = weak_self.clone();
-                            let cwd = new_chat_cwd(active_path.as_deref());
-                            menu.entry("New AI Chat", None, move |window, cx| {
-                                if let Some(panel) = weak_self.upgrade() {
-                                    panel.update(cx, |panel, cx| {
-                                        panel.add_chat_tab_with_cwd(
-                                            solution_id,
-                                            project.clone(),
-                                            cwd.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            })
-                        } else {
-                            menu.action_disabled_when(
-                                true,
-                                "New AI Chat (no solution)",
-                                NewChat.boxed_clone(),
-                            )
-                        };
+                        // New AI Chat: dispatches the same `NewChat` action the
+                        // status-bar session tab strip's own "+" button uses
+                        // (`solution_agent::session_tab_strip`), so chat
+                        // creation has exactly one code path regardless of
+                        // which "+" menu triggered it — two paths disagreeing
+                        // on a new chat's cwd was the phase-1 Critical. The
+                        // handler itself no-ops without an active solution;
+                        // grey the entry out for the same reason here.
+                        let menu = menu.action_disabled_when(
+                            !has_active_solution,
+                            "New AI Chat",
+                            NewChat.boxed_clone(),
+                        );
                         // Reopen a chat that was closed but still lives on disk.
                         // Solution-scoped like New AI Chat above — needs an
                         // active solution, not a member project.
@@ -1053,21 +775,14 @@ impl ConsolePanel {
         active_member_path(solution_id, cx)
     }
 
-    /// Chats are solution-scoped, not project-scoped (spec 2026-08-26): a
-    /// chat tab is always `Unscoped`, so it is never filtered by the active
-    /// member. A terminal has no such binding, so it is placed by its
-    /// *immutable* creation-time `origin_cwd` (longest matching member wins;
-    /// anything under the root but in no member is `Root`) — deliberately
-    /// NOT the terminal's live working directory, which wanders with `cd`
-    /// and goes unreadable under a foreign-user foreground process (`sudo
-    /// su`), which would drop the tab out of scope and make it disappear
-    /// from the strip.
+    /// A terminal is placed by its *immutable* creation-time `origin_cwd`
+    /// (longest matching member wins; anything under the root but in no
+    /// member is `Root`) — deliberately NOT the terminal's live working
+    /// directory, which wanders with `cd` and goes unreadable under a
+    /// foreign-user foreground process (`sudo su`), which would drop the tab
+    /// out of scope and make it disappear from the strip.
     fn tab_scope(&self, tab: &ConsoleTab, cx: &App) -> TabScope {
-        let ConsoleTab::Terminal { origin_cwd, .. } = tab else {
-            // Chats are solution-scoped (spec 2026-08-26): never filtered by
-            // the active member. Unscoped = always visible.
-            return TabScope::Unscoped;
-        };
+        let ConsoleTab::Terminal { origin_cwd, .. } = tab;
         let Some(cwd) = origin_cwd.clone() else {
             return TabScope::Unscoped;
         };
@@ -1107,21 +822,20 @@ impl ConsolePanel {
     /// Stable identity for a tab, used to remember the active tab per member
     /// across active-member switches.
     fn tab_key(tab: &ConsoleTab) -> ConsoleTabKey {
-        match tab {
-            ConsoleTab::Terminal { view, .. } => ConsoleTabKey::Terminal(view.entity_id()),
-            ConsoleTab::Chat { session_id, .. } => ConsoleTabKey::Chat(*session_id),
-        }
+        let ConsoleTab::Terminal { view, .. } = tab;
+        ConsoleTabKey::Terminal(view.entity_id())
     }
 
     /// Re-resolve `active_index` for the now-active member: remember the tab
     /// that was active for the previous member, then restore the new
     /// member's last-active tab (if it is still present and in scope),
     /// falling back to its first in-scope tab. Called when the solution-wide
-    /// active member flips so the strip and content swap to that project's
-    /// own dialogs.
+    /// active member flips so the strip swaps to that project's own
+    /// terminals. Every key here is a terminal tab now that chats left
+    /// `ConsolePanel` for the Solution band (phase 2a task 5).
     fn on_active_member_changed(&mut self, cx: &mut Context<Self>) {
         // Stash the outgoing member's active tab so switching back restores
-        // the exact dialog the user last had open.
+        // the exact terminal the user last had open.
         if let Some(prev) = self.last_member_path.take()
             && let Some(ix) = self.active_index
             && let Some(tab) = self.tabs.get(ix)
@@ -1438,16 +1152,14 @@ impl ConsolePanel {
         self.tabs
             .iter()
             .enumerate()
-            .filter_map(|(index, tab)| match tab {
-                ConsoleTab::Terminal { view, .. } => {
-                    let task_state = view.read(cx).terminal().read(cx).task()?;
-                    if task_state.spawned_task.full_label == label {
-                        Some((index, view.clone()))
-                    } else {
-                        None
-                    }
+            .filter_map(|(index, tab)| {
+                let ConsoleTab::Terminal { view, .. } = tab;
+                let task_state = view.read(cx).terminal().read(cx).task()?;
+                if task_state.spawned_task.full_label == label {
+                    Some((index, view.clone()))
+                } else {
+                    None
                 }
-                _ => None,
             })
             .collect()
     }
@@ -1457,16 +1169,15 @@ impl ConsolePanel {
     pub fn terminal_selections(&self, cx: &App) -> Vec<String> {
         self.tabs
             .iter()
-            .filter_map(|tab| match tab {
-                ConsoleTab::Terminal { view, .. } => view
-                    .read(cx)
+            .filter_map(|tab| {
+                let ConsoleTab::Terminal { view, .. } = tab;
+                view.read(cx)
                     .terminal()
                     .read(cx)
                     .last_content
                     .selection_text
                     .clone()
-                    .filter(|text| !text.is_empty()),
-                _ => None,
+                    .filter(|text| !text.is_empty())
             })
             .collect()
     }
@@ -1474,10 +1185,8 @@ impl ConsolePanel {
     /// The currently-active terminal tab's view, if any.
     pub fn active_terminal_view(&self, _cx: &App) -> Option<Entity<TerminalView>> {
         let ix = self.active_index?;
-        match self.tabs.get(ix)? {
-            ConsoleTab::Terminal { view, .. } => Some(view.clone()),
-            _ => None,
-        }
+        let ConsoleTab::Terminal { view, .. } = self.tabs.get(ix)?;
+        Some(view.clone())
     }
 
     pub fn assistant_enabled(&self) -> bool {
@@ -1495,143 +1204,6 @@ impl ConsolePanel {
         }
     }
 
-    pub fn add_chat_tab(
-        &mut self,
-        solution_id: SolutionId,
-        project: Entity<Project>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // `None`, not `self.active_member_path(cx)`: this runs under the
-        // `NewChat` handler's mutable `Workspace` lease (see that handler's
-        // comment in `console_panel.rs`), and `active_member_path` reads the
-        // `Workspace` entity via `cx` — a double_lease_panic. `new_chat_cwd`
-        // ignores its argument anyway (a chat never uses the active member),
-        // so passing the (unreadable, here) active path would buy nothing and
-        // cost a crash. Routes through the same `new_chat_cwd` decision as
-        // the "+" menu (see `render_plus_popover`) so the two chat-creation
-        // entry points cannot diverge on the active member path the way they
-        // did before (Critical 1, 2026-08-26 final review) — the "+" menu's
-        // call site can pass its real `active_path` because it runs at
-        // render time with nothing leased.
-        let cwd = new_chat_cwd(None);
-        self.add_chat_tab_with_cwd(solution_id, project, cwd, window, cx);
-    }
-
-    /// Create a chat session (create-implies-open) under `solution_id` rooted
-    /// at `cwd`. `project` is passed in rather than read from `self.workspace`
-    /// because callers may already hold the `Workspace` mutably (the `NewChat`
-    /// workspace-action handler does): re-leasing the `Workspace` entity here
-    /// via `workspace.read(cx)` would `double_lease_panic`. Callers that own a
-    /// `&mut Workspace` pass `workspace.project().clone()`; the render-time
-    /// menu path reads it while nothing is leased.
-    pub fn add_chat_tab_with_cwd(
-        &mut self,
-        solution_id: SolutionId,
-        project: Entity<Project>,
-        cwd: Option<PathBuf>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Create-implies-open: `create_session_with_cwd` pins the new
-        // session into the strip itself (sets tab_order + emits the
-        // `TabsChanged` fan-out), so the actual tab is built and pushed by
-        // [`apply_external_tab_changes`] — the single chat-tab writer. We
-        // only need to remember which session to activate once its tab
-        // lands. This is the same path a mobile-driven create takes, so the
-        // two surfaces can't diverge.
-        // Model and effort are chosen in the status bar after the chat is
-        // created (and applied before the first message starts the session),
-        // so the create call no longer carries them.
-        let store = SolutionAgentStore::global(cx);
-        let task = store.update(cx, |store, cx| {
-            store.create_session_with_cwd(
-                solution_id,
-                SharedString::from(CLAUDE_ACP_AGENT_ID),
-                project,
-                cwd,
-                None,
-                None,
-                cx,
-            )
-        });
-        cx.spawn(async move |this, cx| {
-            let session_id = task.await?;
-            this.update(cx, |this, cx| {
-                this.chat_tab_to_activate = Some(session_id);
-                // The tab may already have landed (the create-time pin's
-                // `TabsChanged` can fire before this future resolves) — if
-                // so, activate it now; otherwise the add path activates it.
-                this.activate_chat_tab_if_present(session_id, cx);
-            })?;
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    }
-
-    /// If a chat tab for `session_id` is present in the strip, make it the
-    /// active tab (and clear [`chat_tab_to_activate`] if it was the pending
-    /// one). No-op when the tab hasn't landed yet.
-    fn activate_chat_tab_if_present(
-        &mut self,
-        session_id: SolutionSessionId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(ix) = self.tabs.iter().position(
-            |tab| matches!(tab, ConsoleTab::Chat { session_id: sid, .. } if *sid == session_id),
-        ) else {
-            return;
-        };
-        self.active_index = Some(ix);
-        if self.chat_tab_to_activate == Some(session_id) {
-            self.chat_tab_to_activate = None;
-        }
-        cx.notify();
-        self.persist(cx);
-    }
-
-    /// Ensure a chat tab exists for `session_id` and make it the active tab.
-    /// Backs the [`crate::ShowSession`] action (MCP-driven UI verification).
-    ///
-    /// Unlike [`add_chat_tab_with_cwd`](Self::add_chat_tab_with_cwd), which
-    /// leans on the create-time `TabsChanged` fan-out to build the tab, this
-    /// spawns the view directly. That matters because a session pinned
-    /// out-of-band (e.g. the `workspace.open_session` RPC) may never produce
-    /// a desktop tab through the event path, so relying on it would leave the
-    /// session unreachable from the strip. Spawning here is idempotent: the
-    /// `has_chat_tab_for` guard (both before the await and inside it) dedupes
-    /// against a tab a parallel handler may have added meanwhile.
-    pub fn show_session(
-        &mut self,
-        session_id: SolutionSessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.has_chat_tab_for(session_id) {
-            self.activate_chat_tab_if_present(session_id, cx);
-            return;
-        }
-        let task = self.chat_provider.update(cx, |provider, cx| {
-            provider.new_tab_from_existing(session_id, window, cx)
-        });
-        cx.spawn(async move |this, cx| {
-            let view = task.await.log_err()?;
-            this.update(cx, |this, cx| {
-                if this.has_chat_tab_for(session_id) {
-                    this.activate_chat_tab_if_present(session_id, cx);
-                    return;
-                }
-                this.tabs.push(ConsoleTab::Chat { view, session_id });
-                this.active_index = Some(this.tabs.len() - 1);
-                cx.notify();
-                this.persist(cx);
-            })
-            .log_err();
-            Some(())
-        })
-        .detach();
-    }
-
     fn show_tab_context_menu(
         &mut self,
         tab_index: usize,
@@ -1639,81 +1211,39 @@ impl ConsolePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.tabs.get(tab_index) else {
+        let Some(ConsoleTab::Terminal { view, .. }) = self.tabs.get(tab_index) else {
             return;
         };
+        let view = view.clone();
         let weak = cx.weak_entity();
-        let menu = match tab {
-            ConsoleTab::Terminal { view, .. } => {
-                let view = view.clone();
-                ContextMenu::build(window, cx, |menu, _, _| {
-                    let weak_close = weak.clone();
-                    let weak_rename = weak.clone();
-                    let weak_reveal = weak.clone();
-                    let view_rename = view.clone();
-                    let view_reveal = view;
-                    menu.entry("Close", None, move |_, cx| {
-                        if let Some(this) = weak_close.upgrade() {
-                            this.update(cx, |this, cx| this.close_tab(tab_index, cx));
-                        }
-                    })
-                    .entry("Rename Tab", None, move |window, cx| {
-                        if let Some(this) = weak_rename.upgrade() {
-                            this.update(cx, |_, cx| {
-                                view_rename.update(cx, |view, cx| {
-                                    view.rename_terminal(
-                                        &terminal_view::RenameTerminal,
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            });
-                        }
-                    })
-                    .entry(
-                        "Reveal CWD in Project Panel",
-                        None,
-                        move |window, cx| {
-                            if let Some(this) = weak_reveal.upgrade() {
-                                this.update(cx, |this, cx| {
-                                    this.reveal_terminal_cwd(&view_reveal, window, cx);
-                                });
-                            }
-                        },
-                    )
-                })
-            }
-            ConsoleTab::Chat { session_id, .. } => {
-                let session_id = *session_id;
-                ContextMenu::build(window, cx, |menu, _, _| {
-                    let weak_close = weak.clone();
-                    let weak_rename = weak.clone();
-                    let weak_restart = weak.clone();
-                    menu.entry("Close", None, move |_, cx| {
-                        if let Some(this) = weak_close.upgrade() {
-                            this.update(cx, |this, cx| this.close_tab(tab_index, cx));
-                        }
-                    })
-                    .entry("Rename Session", None, move |window, cx| {
-                        if let Some(this) = weak_rename.upgrade() {
-                            this.update(cx, |this, cx| {
-                                this.open_rename_session_modal(session_id, window, cx);
-                            });
-                        }
-                    })
-                    .entry("Restart Agent", None, move |_, cx| {
-                        if let Some(this) = weak_restart.upgrade() {
-                            this.update(cx, |_, cx| {
-                                let store = SolutionAgentStore::global(cx);
-                                store
-                                    .update(cx, |store, cx| store.restart_agent(session_id, cx))
-                                    .detach_and_log_err(cx);
-                            });
-                        }
-                    })
-                })
-            }
-        };
+        let menu = ContextMenu::build(window, cx, |menu, _, _| {
+            let weak_close = weak.clone();
+            let weak_rename = weak.clone();
+            let weak_reveal = weak.clone();
+            let view_rename = view.clone();
+            let view_reveal = view;
+            menu.entry("Close", None, move |_, cx| {
+                if let Some(this) = weak_close.upgrade() {
+                    this.update(cx, |this, cx| this.close_tab(tab_index, cx));
+                }
+            })
+            .entry("Rename Tab", None, move |window, cx| {
+                if let Some(this) = weak_rename.upgrade() {
+                    this.update(cx, |_, cx| {
+                        view_rename.update(cx, |view, cx| {
+                            view.rename_terminal(&terminal_view::RenameTerminal, window, cx);
+                        });
+                    });
+                }
+            })
+            .entry("Reveal CWD in Project Panel", None, move |window, cx| {
+                if let Some(this) = weak_reveal.upgrade() {
+                    this.update(cx, |this, cx| {
+                        this.reveal_terminal_cwd(&view_reveal, window, cx);
+                    });
+                }
+            })
+        });
         let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
             this.tab_context_menu.take();
             cx.notify();
@@ -1747,26 +1277,6 @@ impl ConsolePanel {
         });
     }
 
-    fn open_rename_session_modal(
-        &self,
-        session_id: SolutionSessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let current_title = SolutionAgentStore::global(cx)
-            .read_with(cx, |s, _| s.session(session_id))
-            .map(|entity| entity.read(cx).title.to_string())
-            .unwrap_or_default();
-        workspace.update(cx, |workspace, cx| {
-            workspace.toggle_modal(window, cx, move |window, cx| {
-                RenameSessionModal::new(session_id, current_title, window, cx)
-            });
-        });
-    }
-
     /// Reopen-a-closed-chat flow. Hydrates the active solution's
     /// on-disk sessions, gathers the top-level ones that aren't currently
     /// pinned in the strip (closed tabs whose transcript survives), and
@@ -1774,6 +1284,18 @@ impl ConsolePanel {
     /// `SolutionAgentStore::open_session_in_strip` — the same "open" path
     /// create and the wire RPC use — so the tab lands through the normal
     /// `TabsChanged` writer.
+    ///
+    /// Deliberately kept in `ConsolePanel`'s "+" popover even though chat
+    /// tabs left the panel for the Solution band (phase 2a task 5): unlike
+    /// `add_chat_tab`, this flow never builds a `ConsoleTab` — it only reads
+    /// the store and opens a modal — so it has no replacement to migrate to
+    /// and no reason to move. `Rename Session` / `Restart Agent`, which used
+    /// to live on the (now-deleted) chat tab's right-click menu, have no
+    /// such home any more; both remain reachable via the
+    /// `solution_agent.{rename_session,restart_agent}` MCP tools but not
+    /// from a desktop click path until a future task gives the status-bar
+    /// `SessionTabStrip` (`solution_agent::session_tab_strip`) its own
+    /// context menu.
     fn open_reopen_session_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(solution_id) = self.active_solution_id(cx) else {
             return;
@@ -1808,20 +1330,13 @@ impl ConsolePanel {
         let Some(ix) = effective_active_index(&scope_flags, self.active_index) else {
             return div().flex_1().min_h_0().into_any_element();
         };
-        match &self.tabs[ix] {
-            ConsoleTab::Terminal { view, .. } => div()
-                .flex_1()
-                .min_h_0()
-                .overflow_hidden()
-                .child(view.clone())
-                .into_any_element(),
-            ConsoleTab::Chat { view, .. } => div()
-                .flex_1()
-                .min_h_0()
-                .overflow_hidden()
-                .child(view.clone())
-                .into_any_element(),
-        }
+        let ConsoleTab::Terminal { view, .. } = &self.tabs[ix];
+        div()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .child(view.clone())
+            .into_any_element()
     }
 
     fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1861,68 +1376,6 @@ impl ConsolePanel {
         self.persist(cx);
     }
 
-    /// Close button dispatch. A terminal tab is just dropped from the strip
-    /// ([`close_tab`]). A chat tab is fully closed via the store
-    /// ([`SolutionAgentStore::close_session`]): the transcript is flushed,
-    /// the session is evicted + marked `closed_at` in the DB (so it surfaces
-    /// in "Reopen Closed Chat"), and the resulting `SessionClosed` →
-    /// `ChatProviderEvent::SessionRemoved` round-trip removes the tab here.
-    fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        match self.tabs.get(index) {
-            Some(ConsoleTab::Chat { session_id, .. }) => {
-                let id = *session_id;
-                // Closing a chat tab is destructive-looking: the session is
-                // evicted and has to be dug back out of "Reopen Closed Chat".
-                // Doing that to an agent that is still mid-turn also abandons
-                // work in flight, so a non-terminal session gets a speed-bump.
-                // Terminal states (Idle / AwaitingInput / Errored) close
-                // straight through — a confirmation on every close would just
-                // train the user to dismiss it.
-                let busy = SolutionAgentStore::global(cx)
-                    .read(cx)
-                    .session(id)
-                    .map(|session| match session.read(cx).state {
-                        SessionState::Running { .. } => Some("Агент сейчас работает"),
-                        SessionState::Stopping { .. } => Some("Агент останавливается"),
-                        SessionState::Idle
-                        | SessionState::AwaitingInput
-                        | SessionState::Errored(_) => None,
-                    })
-                    .unwrap_or(None);
-                let Some(busy) = busy else {
-                    SolutionAgentStore::global(cx)
-                        .update(cx, |store, cx| store.close_session(id, cx))
-                        .log_err();
-                    return;
-                };
-                let answer = window.prompt(
-                    PromptLevel::Warning,
-                    "Закрыть вкладку с агентом?",
-                    Some(&format!(
-                        "{busy}. Закрытие прервёт текущий ход — вкладку можно будет вернуть \
-                         через «Reopen Closed Chat»."
-                    )),
-                    &["Закрыть", "Отмена"],
-                    cx,
-                );
-                cx.spawn(async move |this, cx| {
-                    if answer.await.ok() != Some(0) {
-                        return;
-                    }
-                    this.update(cx, |_, cx| {
-                        SolutionAgentStore::global(cx)
-                            .update(cx, |store, cx| store.close_session(id, cx))
-                            .log_err();
-                    })
-                    .ok();
-                })
-                .detach();
-            }
-            Some(ConsoleTab::Terminal { .. }) => self.close_tab(index, cx),
-            None => {}
-        }
-    }
-
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
@@ -1941,107 +1394,6 @@ impl ConsolePanel {
         self.persist(cx);
     }
 
-    /// React to an external `persist_tab_order` mutation (mobile wire RPC,
-    /// most commonly): close any local tab whose session is in `closed`,
-    /// then spawn a tab for each session in `opened` that isn't already
-    /// represented. Scoped to this panel's active solution — events for
-    /// foreign solutions are ignored.
-    fn apply_external_tab_changes(
-        &mut self,
-        solution_id: SolutionId,
-        opened: Vec<SolutionSessionId>,
-        closed: Vec<SolutionSessionId>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let active_solution =
-            workspace.read_with(cx, |ws, cx| active_solution_id_for_workspace(ws, cx));
-        if active_solution.as_ref() != Some(&solution_id) {
-            return;
-        }
-        for id in closed {
-            self.close_chat_tab_by_session_id(id, cx);
-        }
-        for id in opened {
-            if self.has_chat_tab_for(id) {
-                continue;
-            }
-            // Spawn the tab. `new_tab_from_existing` returns a Task that
-            // resolves once the SessionSessionView is wired up.
-            let task = self.chat_provider.update(cx, |provider, cx| {
-                provider.new_tab_from_existing(id, window, cx)
-            });
-            cx.spawn(async move |this, cx| {
-                let view = task.await.log_err()?;
-                this.update(cx, |this, cx| {
-                    if this.has_chat_tab_for(id) {
-                        // Race: a parallel handler already added the
-                        // tab while we awaited the view. Drop ours.
-                        return;
-                    }
-                    // Race: the session was created then closed (e.g. a fast
-                    // internal one-shot helper) while we awaited the view
-                    // build. Its synchronous close/remove already ran and
-                    // found no tab — pushing one now would strand a ghost
-                    // tab that nothing removes. Drop ours instead.
-                    let still_exists = this.chat_provider.read(cx).session_exists(id, cx);
-                    if !still_exists {
-                        return;
-                    }
-                    this.tabs.push(ConsoleTab::Chat {
-                        view,
-                        session_id: id,
-                    });
-                    let new_index = this.tabs.len() - 1;
-                    // Activate when this is the session the local user just
-                    // created (create-implies-open), or when the strip had
-                    // no active tab yet. A remotely-created session that the
-                    // desktop user didn't ask for lands without stealing the
-                    // active tab.
-                    if this.chat_tab_to_activate == Some(id) {
-                        this.active_index = Some(new_index);
-                        this.chat_tab_to_activate = None;
-                    } else if this.active_index.is_none() {
-                        this.active_index = Some(new_index);
-                    }
-                    cx.notify();
-                    this.persist(cx);
-                })
-                .log_err();
-                Some(())
-            })
-            .detach();
-        }
-    }
-
-    /// Returns true when one of [`self.tabs`] is a Chat tab for
-    /// [`session_id`]. Used by the external-mutation path to dedupe
-    /// against tabs the user (or a previous handler) already opened.
-    fn has_chat_tab_for(&self, session_id: SolutionSessionId) -> bool {
-        self.tabs.iter().any(
-            |tab| matches!(tab, ConsoleTab::Chat { session_id: sid, .. } if *sid == session_id),
-        )
-    }
-
-    /// Close the Chat tab (if any) hosting [`session_id`]. No-op when
-    /// no such tab is open. Driven by external store mutations: the
-    /// wire-side `workspace.close_session` RPC and the destructive
-    /// `solution_agent.delete_session` path both surface here.
-    fn close_chat_tab_by_session_id(
-        &mut self,
-        session_id: SolutionSessionId,
-        cx: &mut Context<Self>,
-    ) {
-        let index = self.tabs.iter().position(
-            |tab| matches!(tab, ConsoleTab::Chat { session_id: sid, .. } if *sid == session_id),
-        );
-        if let Some(index) = index {
-            self.close_tab(index, cx);
-        }
-    }
 }
 
 impl Panel for ConsolePanel {
@@ -2150,42 +1502,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_tabs_are_always_in_scope_regardless_of_active_member() {
-        // Chats are solution-scoped: whatever member is active, a chat tab
-        // must be visible. Unscoped is the TabScope variant with that meaning.
-        //
-        // This alone is a weak check — `TabScope::Unscoped` behaves this way
-        // for reasons unrelated to chats too (see the "cannot be placed"
-        // case above). The load-bearing assertion is that `ConsolePanel::
-        // tab_scope`'s `ConsoleTab::Chat` arm unconditionally returns
-        // `TabScope::Unscoped` (see that function, a few lines above) instead
-        // of branching on `session.member_id` — verified by reading the
-        // source, since building a `ConsoleTab::Chat` in this test module
-        // needs a real `Entity<SolutionSessionView>`, which needs the full
-        // editor/language/font stack `bootstrap_panel`'s doc comment says
-        // this module doesn't set up (chat-tab coverage lives in the MCP
-        // e2e probe instead).
-        assert!(tab_in_scope(TabScope::Unscoped, None));
-        assert!(tab_in_scope(TabScope::Unscoped, Some(MemberId(1))));
-        assert!(tab_in_scope(TabScope::Unscoped, Some(MemberId(999))));
-    }
-
-    #[test]
-    fn new_chat_cwd_ignores_the_active_member_path() {
-        // Regression for Critical 1 (2026-08-26 final review): the "+" menu's
-        // "New AI Chat" entry used to pass the active member's folder
-        // straight through as the new session's cwd, silently re-binding a
-        // "solution-scoped" chat (and its `~/.claude/projects/<cwd>/`
-        // transcript bucket) to whichever project happened to be selected —
-        // while the keyboard/MCP path (`add_chat_tab`) correctly passed
-        // `None`. Both entry points now route through this one function, so
-        // a chat's cwd can no longer depend on which member is active.
-        let member_path = std::path::Path::new("/solutions/demo/member-a");
-        assert_eq!(new_chat_cwd(Some(member_path)), None);
-        assert_eq!(new_chat_cwd(None), None);
-    }
-
-    #[test]
     fn effective_active_index_prefers_in_scope_active() {
         // Stored active tab is in scope → it stays active.
         assert_eq!(
@@ -2220,12 +1536,14 @@ mod tests {
         // Nothing persisted, nothing restored → vacuously complete.
         assert!(restore_may_reconcile(0, 0));
 
-        // A skipped row (dead session / invalid item_id / failed spawn) or an
-        // aborted loop (window went away) → do NOT commit the loss.
+        // A skipped row (failed terminal spawn, legacy chat row, unknown
+        // kind) or an aborted loop (window went away) → do NOT commit the
+        // loss.
         assert!(!restore_may_reconcile(3, 2));
         assert!(!restore_may_reconcile(1, 0));
-        // The pathological case the bug reproduced: chat tabs persisted, none
-        // restored because their sessions were archived out from under us.
+        // The pathological case the bug reproduced: every persisted tab was
+        // a legacy chat row, none of which the panel can restore any more
+        // (chat tabs left `ConsolePanel` for the Solution band).
         assert!(!restore_may_reconcile(5, 0));
     }
 
@@ -2256,11 +1574,10 @@ mod tests {
         });
     }
 
-    /// Bootstrap a real `Workspace` + `SolutionAgentStore` + `ConsolePanel`
-    /// for terminal-tab tests. Chat-tab tests would additionally need the
-    /// editor / language / font stack (`SolutionSessionView::new` embeds a
-    /// real `editor::Editor`) — covered by the MCP e2e probe at runtime,
-    /// not by these unit tests.
+    /// Bootstrap a real `Workspace` + `SolutionAgentStore` + `ConsolePanel`.
+    /// `ConsolePanel` is terminal-only (chat tabs left for the Solution band
+    /// in phase 2a task 5); the `SolutionAgentStore` is still wired up here
+    /// because it backs "Reopen Closed Chat…" in the "+" popover.
     async fn bootstrap_panel(
         cx: &mut TestAppContext,
     ) -> (gpui::WindowHandle<Workspace>, Entity<ConsolePanel>) {
@@ -2298,13 +1615,11 @@ mod tests {
             });
         });
 
-        let store = cx.read(|cx| SolutionAgentStore::global(cx));
-
         let window_handle = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
 
         let panel = window_handle
-            .update(cx, |workspace, window, cx| {
-                cx.new(|cx| ConsolePanel::new(workspace.weak_handle(), store, window, cx))
+            .update(cx, |workspace, _window, cx| {
+                cx.new(|cx| ConsolePanel::new(workspace.weak_handle(), cx))
             })
             .unwrap();
 
@@ -2347,37 +1662,76 @@ mod tests {
     }
 
     /// Regression guard for the Critical-1-fix regression (2026-08-26
-    /// second-pass final review): `add_chat_tab` runs under the `NewChat`
-    /// action handler's mutable `Workspace` lease (see that handler's
-    /// comment in `console_panel.rs`), so anything it does that re-reads the
-    /// `Workspace` entity via `cx` — e.g. `self.active_member_path(cx)`,
-    /// which walks `self.workspace.upgrade()?.read(cx)` — double-lease-
-    /// panics. `WindowHandle::update`'s closure leases the root view
-    /// (`Workspace`) the same way the real dispatch does, so calling
-    /// `add_chat_tab` from inside one reproduces the exact shape of the bug:
-    /// this test panicked before the cwd-computation fix (verified by
-    /// temporarily reverting `add_chat_tab` to
-    /// `new_chat_cwd(self.active_member_path(cx).as_deref())` and rerunning)
-    /// and must keep passing (i.e. not panic) after it.
+    /// second-pass final review), now guarding `handle_new_chat`
+    /// (`console_panel.rs`) — the direct `Workspace`-action successor to
+    /// `ConsolePanel::add_chat_tab`, which is what this test used to drive
+    /// before chat tabs left `ConsolePanel` for the Solution band (phase 2a
+    /// task 5). `handle_new_chat` runs under `workspace.register_action`'s
+    /// mutable `Workspace` lease; anything it does that re-acquires that
+    /// SAME entity's lease through a weak handle (`self.workspace.upgrade()
+    /// ?.read(cx)`, the exact shape `add_chat_tab`'s `active_member_path`
+    /// call used to have) double-lease-panics. `WindowHandle::update`'s
+    /// closure leases the root view (`Workspace`) the same way the real
+    /// dispatch does, and the Solution/member setup below makes
+    /// `active_solution_id_for_workspace` resolve to `Some`, so the call
+    /// actually reaches the project-read + `SolutionAgentStore` call that
+    /// would double-lease if it ever went back to reading `Workspace`
+    /// through `self` instead of the `&mut Workspace` it's handed.
     #[gpui::test]
-    async fn add_chat_tab_does_not_double_lease_the_workspace(cx: &mut TestAppContext) {
+    async fn new_chat_action_does_not_double_lease_the_workspace(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let (window_handle, panel) = bootstrap_panel(cx).await;
+        init_test(cx);
+
+        let connect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cx.update(|cx| {
+            let registry = std::sync::Arc::new(solution_agent::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+            let agent_store = SolutionAgentStore::global(cx);
+            agent_store.update(cx, |s, _| {
+                s.register_agent_server(
+                    gpui::SharedString::from(solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID),
+                    std::rc::Rc::new(solution_agent::test_support::MockAgentServer::new(
+                        connect_count,
+                    )),
+                );
+            });
+        });
+
+        // A Solution whose root the test workspace's worktree lives under,
+        // so `active_solution_id_for_workspace` resolves to `Some` and
+        // `handle_new_chat` runs past its first guard.
+        let solution_root = cx.update(|cx| {
+            let store = SolutionStore::for_test(std::path::PathBuf::from("/cfg.json"), cx);
+            let root = store.update(cx, |store, cx| {
+                let id = store.create_for_test_minimal("NewChatGuard", cx);
+                store
+                    .solutions()
+                    .iter()
+                    .find(|sol| sol.id == id)
+                    .map(|sol| sol.root.clone())
+                    .expect("just-created solution")
+            });
+            solutions::install_global_for_test(store, cx);
+            root
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(&solution_root, serde_json::json!({})).await;
+        let project = Project::test(fs, [solution_root.as_path()], cx).await;
+        let window_handle = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        cx.run_until_parked();
 
         window_handle
             .update(cx, |workspace, window, cx| {
-                let project = workspace.project().clone();
-                panel.update(cx, |panel, cx| {
-                    panel.add_chat_tab(SolutionId(1), project, window, cx);
-                });
+                crate::handle_new_chat(workspace, &NewChat, window, cx);
             })
             .unwrap();
-        // The async `create_session_with_cwd` task itself will fail (no
-        // `SolutionStore`/Solution registered by `bootstrap_panel`) and log
-        // an error via `detach_and_log_err` — that's fine, it's async and
-        // happens after this call returns. What this test guards is that the
-        // synchronous part of `add_chat_tab` (the cwd computation) does not
-        // panic while the `Workspace` is leased.
+        // The async `create_session_with_cwd` task settles (successfully or
+        // not) after this call returns — either way is fine. What this test
+        // guards is that the synchronous part of `handle_new_chat` (reading
+        // the active solution + project off `&mut Workspace`, then calling
+        // into `SolutionAgentStore`) does not panic while the `Workspace` is
+        // leased.
         cx.run_until_parked();
     }
 
@@ -2515,9 +1869,7 @@ mod tests {
 
         panel.read_with(cx, |p, _cx| {
             assert_eq!(p.tabs.len(), 1);
-            let ConsoleTab::Terminal { origin_cwd, .. } = &p.tabs[0] else {
-                panic!("expected a terminal tab");
-            };
+            let ConsoleTab::Terminal { origin_cwd, .. } = &p.tabs[0];
             assert_eq!(
                 origin_cwd.as_deref(),
                 Some(origin.as_path()),
@@ -2583,9 +1935,9 @@ mod tests {
         let ids = |p: &ConsolePanel| -> Vec<gpui::EntityId> {
             p.tabs
                 .iter()
-                .map(|t| match t {
-                    ConsoleTab::Terminal { view, .. } => view.entity_id(),
-                    ConsoleTab::Chat { view, .. } => view.entity_id(),
+                .map(|t| {
+                    let ConsoleTab::Terminal { view, .. } = t;
+                    view.entity_id()
                 })
                 .collect()
         };

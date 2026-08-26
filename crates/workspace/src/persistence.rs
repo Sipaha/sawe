@@ -1062,6 +1062,19 @@ impl Domain for WorkspaceDb {
                 ON UPDATE CASCADE
             );
         ),
+        // fork-local: chat tabs left `ConsolePanel` for the Solution band
+        // (phase 2a task 5) — `kind = "chat"` rows are no longer written or
+        // restorable (`ConsolePanel::restore_from_db` now skips them on
+        // sight). This is a one-shot cleanup so pre-existing rows from
+        // before that move don't accumulate forever; the `kind` CHECK
+        // constraint above is left as-is (rebuilding the table just to
+        // narrow it isn't worth it) — nothing writes "chat" rows any more,
+        // so leaving the value legal at the schema level is harmless. The
+        // sessions themselves are untouched in `solution_sessions`; this
+        // only forgets which one a workspace had showing.
+        sql!(
+            DELETE FROM console_panel_state WHERE kind = "chat";
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -2676,13 +2689,18 @@ VALUES {placeholders};"#
     // fork-local: ConsolePanel tab persistence. Rows are
     // (tab_index, kind, item_id, cwd, active).
     //
-    //   * `kind` is `"terminal"` or `"chat"`.
-    //   * `item_id`: for chat tabs the stringified `SolutionSessionId`; for
-    //     terminal tabs an opaque stable string (currently the cwd as text,
-    //     but the loader only relies on `cwd` for re-spawn so the column is
-    //     informational for terminals).
+    //   * `kind` is `"terminal"` (the only kind `ConsolePanel` writes since
+    //     chat tabs left it for the Solution band, phase 2a task 5) or the
+    //     legacy `"chat"` — a one-shot migration purges pre-existing `"chat"`
+    //     rows, and `ConsolePanel::restore_from_db` skips any that show up
+    //     anyway (e.g. from a row written between the migration running and
+    //     a rollback to an older build).
+    //   * `item_id`: for a legacy chat row, the stringified
+    //     `SolutionSessionId`; for terminal tabs an opaque stable string
+    //     (currently the cwd as text, but the loader only relies on `cwd`
+    //     for re-spawn so the column is informational for terminals).
     //   * `cwd`: terminal-only — the captured working directory used by
-    //     `TerminalProvider::new_tab` on restore. `NULL` for chat rows.
+    //     `TerminalProvider::new_tab` on restore. `NULL` for legacy chat rows.
     //   * `active`: at most one row per workspace should have `active = 1`.
     query! {
         pub fn console_panel_tabs(workspace_id: WorkspaceId) -> Result<Vec<(i64, String, String, Option<String>, bool)>> {
@@ -6075,6 +6093,66 @@ mod tests {
         assert!(
             loaded.is_empty(),
             "saving an empty list must clear the workspace's rows"
+        );
+    }
+
+    // fork-local: the one-shot migration that purges pre-existing
+    // `console_panel_state` rows of kind `"chat"` (phase 2a task 5 — chat
+    // tabs left `ConsolePanel` for the Solution band, and `"chat"` rows are
+    // no longer restorable). `WorkspaceDb::open_test_db` always runs the
+    // full migration list against a fresh, empty table, so the cleanup is a
+    // no-op there and never exercises the case it exists for. To reproduce
+    // that case — a `"chat"` row already present when the cleanup migration
+    // *first* runs, as would happen on an upgrade from a pre-2a DB — this
+    // applies every migration EXCEPT the cleanup on a raw connection, seeds
+    // a legacy row directly, then runs the full list (cleanup included) on
+    // that same connection.
+    #[gpui::test]
+    async fn chat_kind_rows_are_purged_by_one_shot_migration() {
+        zlog::init_test();
+
+        let all_migrations = <WorkspaceDb as Domain>::MIGRATIONS;
+        let up_to_cleanup = &all_migrations[..all_migrations.len() - 1];
+
+        let conn = Connection::open_memory(Some(
+            "test_chat_kind_rows_are_purged_by_one_shot_migration",
+        ));
+        conn.migrate(
+            <WorkspaceDb as Domain>::NAME,
+            up_to_cleanup,
+            &mut <WorkspaceDb as Domain>::should_allow_migration_change,
+        )
+        .expect("pre-cleanup migrations");
+
+        conn.exec(sql!(
+            INSERT INTO workspaces(workspace_id) VALUES (1)
+        ))
+        .expect("prepare seed workspace insert")()
+        .expect("seed a workspace row for the FK");
+        conn.exec(sql!(
+            INSERT INTO console_panel_state(workspace_id, tab_index, kind, item_id, cwd, active)
+            VALUES (1, 0, "chat", "legacy-session-id", NULL, 1)
+        ))
+        .expect("prepare seed insert")()
+        .expect("seed a pre-2a chat row");
+
+        conn.migrate(
+            <WorkspaceDb as Domain>::NAME,
+            all_migrations,
+            &mut <WorkspaceDb as Domain>::should_allow_migration_change,
+        )
+        .expect("cleanup migration");
+
+        let remaining_chat_rows = conn
+            .select::<i64>(sql!(
+                SELECT COUNT(*) FROM console_panel_state WHERE kind = "chat"
+            ))
+            .expect("prepare count query")()
+        .expect("run count query");
+        assert_eq!(
+            remaining_chat_rows,
+            vec![0],
+            "the one-shot migration must purge pre-existing chat rows"
         );
     }
 }

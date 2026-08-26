@@ -1,6 +1,6 @@
 //! Route a click on a "Sawe — …" desktop notification back to the session it
 //! came from: raise the editor window, activate that session's Solution tab,
-//! reveal + focus the ConsolePanel, and select the session's chat tab.
+//! and select the session as the Solution band's active dialog.
 //!
 //! The notifier (`solution_agent::notifier::dispatch`) tags each notification
 //! with the id `dev.sawe.session-{session_id}` and a `default_action("open")`,
@@ -8,10 +8,19 @@
 //! clicked. This module owns the single long-lived listener for that signal
 //! (Linux/FreeBSD; other platforms have no portal backend yet) and the
 //! main-thread focus routing. It lives in the `zed` crate because the routing
-//! spans `solution_agent` + `solutions` + `workspace` + `console_panel`, which
-//! only the top-level app crate may depend on together.
+//! spans `solution_agent` + `solutions` + `workspace`, which only the
+//! top-level app crate may depend on together.
+//!
+//! Chat tabs left `ConsolePanel` for the Solution band (phase 2a task 5), so
+//! this module no longer touches `console_panel` at all: selecting the
+//! session is a single `SolutionAgentStore::set_active_dialog_session` call,
+//! not a panel lookup. It is called directly here rather than through the
+//! `console_panel::ShowSession` action's dispatch path — a background
+//! notification click has no reliable focused view to dispatch an action
+//! from — but the effect is identical to that action (see its handler in
+//! `crates/console_panel/src/console_panel.rs`, which does the same two
+//! calls for the in-app/MCP path).
 
-use console_panel::ConsolePanel;
 use gpui::App;
 use solution_agent::model::SolutionSessionId;
 use solution_agent::store::SolutionAgentStore;
@@ -65,9 +74,9 @@ fn session_id_from_notification_id(id: &str) -> Option<SolutionSessionId> {
 }
 
 /// Bring the given session fully into view on the main thread: raise its
-/// window, activate its Solution, reveal + focus the ConsolePanel, and select
-/// its chat tab. Silent no-op if the session / its solution / its window can no
-/// longer be resolved (closed since the notification fired).
+/// window, activate its Solution, and select it as the Solution band's
+/// active dialog. Silent no-op if the session / its solution / its window
+/// can no longer be resolved (closed since the notification fired).
 pub fn focus_session(session_id: SolutionSessionId, cx: &mut App) {
     let Some(store) = SolutionAgentStore::try_global(cx) else {
         return;
@@ -84,6 +93,7 @@ pub fn focus_session(session_id: SolutionSessionId, cx: &mut App) {
         .into_iter()
         .filter_map(|w| w.downcast::<MultiWorkspace>())
         .collect();
+    let mut focused_any = false;
     for handle in windows {
         let focused = handle
             .update(cx, |multi_workspace, window, cx| {
@@ -92,21 +102,26 @@ pub fn focus_session(session_id: SolutionSessionId, cx: &mut App) {
                 };
                 // 1. raise the OS window, 2. activate the Solution's tab.
                 window.activate_window();
-                multi_workspace.activate(target.clone(), None, window, cx);
-                // 3. reveal + focus the console dock, 4. select the session tab.
-                target.update(cx, |workspace, cx| {
-                    workspace.focus_panel::<ConsolePanel>(window, cx);
-                    if let Some(panel) = workspace.panel::<ConsolePanel>(cx) {
-                        panel.update(cx, |panel, cx| panel.show_session(session_id, window, cx));
-                    }
-                });
+                multi_workspace.activate(target, None, window, cx);
                 true
             })
             .unwrap_or(false);
         if focused {
+            focused_any = true;
             break;
         }
     }
+    if !focused_any {
+        return;
+    }
+
+    // 3. Select the session as the Solution band's active dialog — a store
+    // mutation, not a panel lookup, since chat tabs left `ConsolePanel` for
+    // the band (phase 2a task 5). `SolutionBand` reads this selection
+    // directly, so there is no dock/panel to reveal any more.
+    SolutionAgentStore::global(cx).update(cx, |store, cx| {
+        store.set_active_dialog_session(solution_id, Some(session_id), cx);
+    });
 }
 
 /// Find the retained `Workspace` inside `multi_workspace` whose project holds a

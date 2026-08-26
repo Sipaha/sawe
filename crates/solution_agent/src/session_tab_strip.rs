@@ -157,12 +157,12 @@ impl SessionTabStrip {
         });
     }
 
-    /// Close a tab's session, mirroring `console_panel::ConsolePanel::close_tab_at`'s
-    /// busy-state speed bump: a session that's still `Running`/`Stopping` gets a
-    /// confirmation prompt (closing abandons in-flight agent work), a terminal-state
-    /// session closes straight through. Same underlying `close_session` call either
-    /// way, so this surface and the old dock tab strip cannot diverge on what "close"
-    /// means while both exist (phase 2a tasks 3–5).
+    /// Close a tab's session, applying the same busy-state speed bump the old
+    /// dock chat strip used before phase 2a task 5 removed it: a session
+    /// that's still `Running`/`Stopping` gets a confirmation prompt (closing
+    /// abandons in-flight agent work), a terminal-state session closes
+    /// straight through. This is now the only surface that closes a chat
+    /// session's tab, so there is nothing left to diverge from.
     fn close_tab(
         &mut self,
         session_id: SolutionSessionId,
@@ -175,8 +175,7 @@ impl SessionTabStrip {
         // `status_row.rs` exactly), this is a different question: "would
         // closing right now abandon in-flight agent work?" A cancel is
         // still winding down during `Stopping`, so it's just as much a
-        // reason to confirm as `Running` is. Mirrors
-        // `console_panel::close_tab_at`'s own busy check.
+        // reason to confirm as `Running` is.
         let busy = store
             .read(cx)
             .session(session_id)
