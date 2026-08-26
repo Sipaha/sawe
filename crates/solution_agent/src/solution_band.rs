@@ -509,6 +509,100 @@ mod tests {
         assert_eq!(persisted(&db, solution_id).await, Some(written));
     }
 
+    /// Store + in-memory DB with persistence NOT yet wired, plus a band row
+    /// already on disk — the state the app is in while
+    /// `SolutionAgentDb::connect` and `run_identity_migration` are still
+    /// awaiting and the user can already press `ctrl-\``.
+    async fn store_with_a_saved_row_and_no_persistence_yet(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<SolutionAgentStore>,
+        Arc<SolutionAgentDb>,
+        BandState,
+        tempfile::TempDir,
+    ) {
+        let (_solution_id, tmp, _project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+        let store = cx.update(|cx| SolutionAgentStore::global(cx));
+        let db = Arc::new(SolutionAgentDb::open(cx.executor()).expect("open db"));
+        let saved = BandState {
+            divider_ratio: 0.7,
+            utility_visible: false,
+            active_dialog_session: Some(SolutionSessionId::new()),
+        };
+        db.save_band_state(SolutionId(1), saved)
+            .await
+            .expect("seed the saved row");
+        (store, db, saved, tmp)
+    }
+
+    /// The pre-hydration mutation must not cost the user their saved geometry.
+    /// `set_persistence` is gated behind two sequential DB awaits, and
+    /// `ctrl-\`` inside that window used to occupy the map key with a
+    /// defaults-seeded entry — after which the merge skipped the Solution and
+    /// the divider position and selected chat were gone from memory and, on
+    /// the next write, from disk.
+    #[gpui::test]
+    async fn a_band_touch_before_the_db_opens_keeps_the_persisted_row(cx: &mut TestAppContext) {
+        let (store, db, saved, _tmp) = store_with_a_saved_row_and_no_persistence_yet(cx).await;
+        let solution_id = SolutionId(1);
+
+        store.update(cx, |store, cx| {
+            store.set_band_utility_visible(solution_id, true, cx)
+        });
+        store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+        cx.run_until_parked();
+
+        let expected = BandState {
+            utility_visible: true,
+            ..saved
+        };
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.band_state(solution_id),
+                expected,
+                "the fields the user did not touch must come from the saved row, \
+                 and the one they did touch must survive the merge"
+            );
+        });
+        assert_eq!(
+            persisted(&db, solution_id).await,
+            Some(expected),
+            "and the row that lands on disk must not be a defaults-seeded one"
+        );
+    }
+
+    /// The same hazard one step later: persistence is wired but the SELECT has
+    /// not come back yet, so a write here would flatten the row the merge is
+    /// about to read.
+    #[gpui::test]
+    async fn a_band_touch_while_hydration_is_in_flight_keeps_the_persisted_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, db, saved, _tmp) = store_with_a_saved_row_and_no_persistence_yet(cx).await;
+        let solution_id = SolutionId(1);
+
+        store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+        // Deliberately no `run_until_parked` before the mutation.
+        store.update(cx, |store, cx| {
+            store.set_band_utility_visible(solution_id, true, cx)
+        });
+        cx.run_until_parked();
+
+        let expected = BandState {
+            utility_visible: true,
+            ..saved
+        };
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.band_state(solution_id), expected);
+        });
+        assert_eq!(persisted(&db, solution_id).await, Some(expected));
+    }
+
     #[gpui::test]
     async fn band_geometry_round_trips_per_solution(cx: &mut TestAppContext) {
         let (_solution_id, _tmp, _project) =

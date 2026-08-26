@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::collections::hash_map;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -361,6 +360,48 @@ pub struct SolutionAgentStore {
     /// for the same band. `on_drag_move` fires continuously for the whole
     /// drag; without this every mouse move would queue a SQLite round-trip.
     band_state_writes: HashMap<SolutionId, Task<()>>,
+    /// Which band fields the user changed before `set_persistence`'s hydration
+    /// landed, per solution. Drained by that hydration, which uses it to decide
+    /// field-by-field whether the persisted row or the live value wins; empty
+    /// (and unwritten) afterwards.
+    band_state_touched: HashMap<SolutionId, BandStateTouched>,
+    /// Whether `load_band_states` has merged yet. Band rows must not be written
+    /// before it has: a write would flatten the very row hydration is about to
+    /// read back.
+    band_states_hydrated: bool,
+}
+
+/// Which of [`BandState`]'s fields a setter has explicitly changed this run.
+/// Only meaningful in the window between process start and the persisted rows
+/// being merged — see `SolutionAgentStore::band_state_touched`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BandStateTouched {
+    divider_ratio: bool,
+    utility_visible: bool,
+    active_dialog_session: bool,
+}
+
+impl BandStateTouched {
+    /// The persisted row with the live value overlaid on each touched field.
+    fn overlay(self, persisted: BandState, live: BandState) -> BandState {
+        BandState {
+            divider_ratio: if self.divider_ratio {
+                live.divider_ratio
+            } else {
+                persisted.divider_ratio
+            },
+            utility_visible: if self.utility_visible {
+                live.utility_visible
+            } else {
+                persisted.utility_visible
+            },
+            active_dialog_session: if self.active_dialog_session {
+                live.active_dialog_session
+            } else {
+                persisted.active_dialog_session
+            },
+        }
+    }
 }
 
 /// Metadata captured by [`SolutionAgentStore::teardown_session_runtime`] while
@@ -749,6 +790,8 @@ impl SolutionAgentStore {
             raw_transcript_history: HashMap::new(),
             band_state: HashMap::new(),
             band_state_writes: HashMap::new(),
+            band_state_touched: HashMap::new(),
+            band_states_hydrated: false,
         }
     }
 
@@ -773,25 +816,49 @@ impl SolutionAgentStore {
 
     pub fn set_persistence(&mut self, db: Arc<SolutionAgentDb>, cx: &mut Context<Self>) {
         self.persistence = Some(db.clone());
-        // One-time load: merge persisted band geometry into the in-memory map.
-        // `or_insert` for the same reason as the supervisor states below — the
-        // band may already have been touched before the DB finished opening,
-        // and the live value is the newer of the two.
+        // One-time load: merge persisted band geometry into the in-memory map,
+        // FIELD-WISE against `band_state_touched`. A whole-entry `or_insert`
+        // is not enough: the map's absent-entry default is a real `BandState`,
+        // so a single pre-hydration `ctrl-\`` (which only means to change
+        // `utility_visible`) would occupy the key with a defaults-seeded row
+        // and make hydration skip that Solution's saved divider ratio and
+        // active dialog for the rest of the process. Only the fields the user
+        // actually set this run beat the persisted row; everything else comes
+        // from disk. Band writes are suppressed until this lands (see
+        // `persist_band_state_now`), so the row is still intact when the
+        // SELECT below runs.
+        self.band_states_hydrated = false;
         cx.spawn({
             let db = db.clone();
             async move |this, cx| {
                 let bands = db.load_band_states().await.log_err().unwrap_or_default();
                 this.update(cx, |this, cx| {
                     let mut changed = false;
-                    for (solution_id, state) in bands {
-                        if let hash_map::Entry::Vacant(slot) = this.band_state.entry(solution_id) {
-                            slot.insert(state);
+                    for (solution_id, persisted) in bands {
+                        let live = this.band_state(solution_id);
+                        let touched = this
+                            .band_state_touched
+                            .get(&solution_id)
+                            .copied()
+                            .unwrap_or_default();
+                        let merged = touched.overlay(persisted, live);
+                        if merged != live || !this.band_state.contains_key(&solution_id) {
+                            this.band_state.insert(solution_id, merged);
                             cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
                             cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged {
                                 solution_id,
                             });
                             changed = true;
                         }
+                    }
+                    this.band_states_hydrated = true;
+                    // Flush what the suppression above held back. Drains the
+                    // mask: after hydration every mutation writes through
+                    // immediately, so nothing more needs tracking.
+                    let pending: Vec<SolutionId> =
+                        this.band_state_touched.drain().map(|(id, _)| id).collect();
+                    for solution_id in pending {
+                        this.persist_band_state_now(solution_id, cx);
                     }
                     if changed {
                         cx.notify();
@@ -1384,6 +1451,12 @@ impl SolutionAgentStore {
             .entry(solution_id)
             .or_default()
             .active_dialog_session = session_id;
+        if !self.band_states_hydrated {
+            self.band_state_touched
+                .entry(solution_id)
+                .or_default()
+                .active_dialog_session = true;
+        }
         self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged { solution_id });
         cx.notify();
@@ -1400,13 +1473,13 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         // The no-op check reads through `band_state`, NOT through
-        // `entry(..).or_default()`: `or_default` runs before the early return
-        // and would insert a defaults row for a Solution nothing has touched.
-        // `set_persistence`'s hydration is `or_insert`-only, so one such
-        // phantom entry created before the DB finishes opening permanently
-        // blocks that Solution's persisted row from loading — its divider
-        // ratio and active dialog would be silently discarded, then
-        // overwritten with defaults by the next real mutation.
+        // `entry(..).or_default()`, so a defensive reveal on an untouched
+        // Solution neither materialises a map entry nor queues a write. It is
+        // only an optimisation: what protects the persisted row from a
+        // pre-hydration mutation is `band_state_touched` (see
+        // `set_persistence`), because this check can't fire for the case that
+        // matters — before hydration the in-memory value is the *default*,
+        // which is exactly what a saved row differs from.
         if self.band_state(solution_id).utility_visible == visible {
             return;
         }
@@ -1414,6 +1487,12 @@ impl SolutionAgentStore {
             .entry(solution_id)
             .or_default()
             .utility_visible = visible;
+        if !self.band_states_hydrated {
+            self.band_state_touched
+                .entry(solution_id)
+                .or_default()
+                .utility_visible = true;
+        }
         self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();
@@ -1429,8 +1508,10 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         let ratio = clamp_divider_ratio(ratio);
-        // Same `or_default`-before-early-return hazard as
-        // `set_band_utility_visible` — see the comment there.
+        // Reads through `band_state` rather than `entry(..).or_default()` for
+        // the same reason as `set_band_utility_visible` — see the comment
+        // there, including why this check is not what makes pre-hydration
+        // mutations safe.
         if self.band_state(solution_id).divider_ratio == ratio {
             return;
         }
@@ -1438,6 +1519,12 @@ impl SolutionAgentStore {
             .entry(solution_id)
             .or_default()
             .divider_ratio = ratio;
+        if !self.band_states_hydrated {
+            self.band_state_touched
+                .entry(solution_id)
+                .or_default()
+                .divider_ratio = true;
+        }
         self.persist_band_state_debounced(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();
@@ -1449,6 +1536,7 @@ impl SolutionAgentStore {
     pub(crate) fn forget_band_state(&mut self, solution_id: SolutionId) {
         self.band_state.remove(&solution_id);
         self.band_state_writes.remove(&solution_id);
+        self.band_state_touched.remove(&solution_id);
     }
 
     fn persist_band_state_now(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
@@ -1458,6 +1546,13 @@ impl SolutionAgentStore {
         let Some(db) = self.persistence.clone() else {
             return;
         };
+        // `save_band_state` upserts the whole row, so writing before hydration
+        // has merged would overwrite the saved ratio/dialog with the defaults
+        // this process happens to hold. The hydration task flushes every
+        // solution in `band_state_touched` once the merge is done.
+        if !self.band_states_hydrated {
+            return;
+        }
         let state = self.band_state(solution_id);
         db.save_band_state(solution_id, state)
             .detach_and_log_err(cx);
@@ -1465,6 +1560,11 @@ impl SolutionAgentStore {
 
     fn persist_band_state_debounced(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
         if self.persistence.is_none() {
+            return;
+        }
+        // Same pre-hydration suppression as `persist_band_state_now`, and for
+        // the same reason: the flush there covers this solution too.
+        if !self.band_states_hydrated {
             return;
         }
         let write = cx.spawn(async move |this, cx| {
