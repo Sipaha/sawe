@@ -437,7 +437,9 @@ fn migrate_identity_fn(
         if solution_id.parse::<i64>().is_ok() {
             continue;
         }
-        let Some((_, new_id)) = legacy_solution_ids.iter().find(|(old, _)| old == solution_id)
+        let Some((_, new_id)) = legacy_solution_ids
+            .iter()
+            .find(|(old, _)| old == solution_id)
         else {
             if !unmapped.contains(solution_id) {
                 unmapped.push(solution_id.clone());
@@ -454,13 +456,12 @@ fn migrate_identity_fn(
     // to a member project any more. Clear whatever a pre-Task-3 build wrote so
     // no stale binding survives an upgrade. Count first (rather than relying
     // on a driver-specific rows-affected return) so the report is unambiguous.
-    let bound_before = connection
-        .select::<i64>(indoc! {"
+    let bound_before = connection.select::<i64>(indoc! {"
             SELECT COUNT(*) FROM solution_sessions WHERE member_id IS NOT NULL
         "})?()?
-        .first()
-        .copied()
-        .unwrap_or(0);
+    .first()
+    .copied()
+    .unwrap_or(0);
     connection.exec(indoc! {"
         UPDATE solution_sessions SET member_id = NULL WHERE member_id IS NOT NULL
     "})?()?;

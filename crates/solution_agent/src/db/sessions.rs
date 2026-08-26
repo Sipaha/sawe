@@ -278,12 +278,7 @@ pub(crate) fn insert_or_update_metadata(
             Option<String>,
             Option<String>,
         ),
-        (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-        ),
+        (Option<String>, Option<String>, Option<String>, Option<i64>),
     )>(indoc! {"
         INSERT INTO solution_sessions (
             id, solution_id, agent_id, acp_session_id, title,
@@ -601,12 +596,7 @@ pub(crate) fn select_metadata_for_solution(
             Option<String>,
             Option<String>,
         ),
-        (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-        ),
+        (Option<String>, Option<String>, Option<String>, Option<i64>),
     )>(indoc! {"
         SELECT id, solution_id, agent_id, acp_session_id, title,
                created_at, last_activity_at, preview, total_tokens,

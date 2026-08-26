@@ -1299,10 +1299,7 @@ async fn migrate_identity_is_idempotent(cx: &mut gpui::TestAppContext) {
     db.migrate_identity(mapping.clone())
         .await
         .expect("first run");
-    let second = db
-        .migrate_identity(mapping)
-        .await
-        .expect("second run");
+    let second = db.migrate_identity(mapping).await.expect("second run");
 
     assert_eq!(
         second.sessions_remapped, 0,
