@@ -62,8 +62,13 @@ impl SessionStateDto {
 pub struct SessionSummary {
     pub id: String,
     pub solution_id: i64,
-    /// Sessions are solution-scoped since 2026-08-26; the field is kept on the
-    /// wire so older mobile clients keep deserializing, but it is always null.
+    /// Sessions are solution-scoped since 2026-08-26 (FORK.md decision #89)
+    /// and this is always `None`; `SessionSummary` is `Serialize`-only, and
+    /// `skip_serializing_if` means the field is never actually written to
+    /// the wire — the JSON is byte-identical to what deleting it would
+    /// produce. It is kept purely because it derives `JsonSchema`, which
+    /// still advertises the property: a client codegen'd from the published
+    /// schema keeps its (always-absent) field without regenerating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_id: Option<i64>,
     pub agent_id: String,
@@ -269,8 +274,8 @@ pub fn session_summary(session: &SolutionSession, cx: &App) -> SessionSummary {
     SessionSummary {
         id: session.id.to_string(),
         solution_id: session.solution_id.0,
-        // Sessions are solution-scoped since 2026-08-26; the field is kept on the
-        // wire so older mobile clients keep deserializing, but it is always null.
+        // Always None (never emitted — see the doc comment on the field
+        // above): sessions are solution-scoped since 2026-08-26 (FORK.md #89).
         member_id: None,
         agent_id: session.agent_id.to_string(),
         title: session.title.to_string(),

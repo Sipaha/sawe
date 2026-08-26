@@ -217,6 +217,16 @@ impl SolutionAgentStore {
                 // physically remains under `root`, so we must match `root`
                 // EXACTLY here — a `strip_prefix(root)` test would wrongly keep
                 // every removed-member session (they all live at `root/<member>`).
+                //
+                // why: this is the one surviving cwd->member inference on an
+                // otherwise Solution-scoped model (FORK.md decision #89). It
+                // stays because a legacy (pre-2026-08 plan) session's cwd sits
+                // inside a member folder and can never be rewritten to
+                // `solution.root` — claude-acp buckets transcripts by encoded
+                // cwd, so moving it would orphan the on-disk transcript. The
+                // consequence, spelled out in #89: removing that member still
+                // hard-purges the session below, even though it now reads as
+                // Solution-level to the user.
                 let at_root = cwd == root;
                 let under_member = members
                     .iter()

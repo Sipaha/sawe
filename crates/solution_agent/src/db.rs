@@ -182,13 +182,16 @@ impl SolutionAgentDb {
         apply_idempotent_add_column(&connection, "desired_model TEXT");
         apply_idempotent_add_column(&connection, "desired_effort TEXT");
         apply_idempotent_add_column(&connection, "cached_models TEXT");
-        // Phase 1 (rename/identity): the session's project, as a fact rather
-        // than an inference. NULL = the session runs at the solution root (the
-        // "ROOT" label). Previously the project was derived by comparing `cwd`
-        // to each member's `local_path` with exact equality, so any path drift
-        // silently degraded the label to ROOT. No FK: `solution_agent.db` is a
-        // different file from the solutions DB, so a dangling member_id degrades
-        // to "unknown project" instead of corrupting the row.
+        // Phase 1 (rename/identity) added this column to stamp a session's
+        // project as a fact rather than an inference; the 2026-08-26
+        // solution-scoped-sessions plan reverted that (FORK.md decision #89)
+        // — sessions no longer carry a member binding, and nothing reads this
+        // column anymore. It is kept ONLY because `migrate_identity` below
+        // needs a column to run `UPDATE solution_sessions SET member_id = NULL
+        // WHERE member_id IS NOT NULL` against on upgrade from a pre-revert
+        // build (its `WHERE member_id IS NOT NULL` would error on a column
+        // that doesn't exist), and dropping columns in SQLite is its own
+        // hazard. Do not resurrect a write path for it.
         apply_idempotent_add_column(&connection, "member_id INTEGER");
 
         connection.exec(indoc! {"

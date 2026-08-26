@@ -42,11 +42,12 @@ pub struct CreateSessionParams {
     /// this. Renamable later via `solution_agent.rename_session`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Optional working directory for the agent subprocess. Must be one
-    /// of the solution's visible worktree roots — values outside the
-    /// solution are rejected. When absent, the first worktree of the
-    /// active project for `solution_id` is used (matches the previous
-    /// behaviour).
+    /// Optional working directory for the agent subprocess, passed through
+    /// verbatim to `create_session_with_parent` — there is no validation
+    /// that it lies inside the solution, or exists at all. When absent, the
+    /// new session roots at `solution.root` (sessions are solution-scoped:
+    /// spec 2026-08-26 / FORK.md decision #89), not at any member's
+    /// worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
