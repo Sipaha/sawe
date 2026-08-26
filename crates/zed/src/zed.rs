@@ -616,7 +616,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
-        let solutions_status = cx.new(|cx| solutions_ui::SolutionsStatusItem::new(workspace, cx));
         let remote_control_status =
             cx.new(|cx| remote_control_ui::RemoteControlStatusItem::new(workspace, cx));
         // Sawe: the Solution-scoped AI session tabs (phase 2a) — mirrors how
@@ -651,7 +650,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_right_item(solutions_status, window, cx);
             status_bar.add_right_item(remote_control_status, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
@@ -5678,11 +5676,12 @@ mod tests {
             cx.set_global(db::AppDatabase::test_new());
             AppState::set_global(app_state.clone(), cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
-            // `initialize_workspace` installs fork-local status items
-            // (`SolutionsStatusItem`) that read the `SolutionStore` global.
-            // Production installs it in `solutions::init` long before the
-            // first window opens; the real `init` needs an on-disk DB, so
-            // tests get the in-memory equivalent instead.
+            // `initialize_workspace` installs fork-local surfaces (the
+            // title-bar Solution tab strip, the Solution band) that read the
+            // `SolutionStore` global. Production installs it in
+            // `solutions::init` long before the first window opens; the real
+            // `init` needs an on-disk DB, so tests get the in-memory
+            // equivalent instead.
             solutions::SolutionsSettings::register(cx);
             let solution_store =
                 solutions::SolutionStore::for_test(paths::config_dir().join("solutions.json"), cx);

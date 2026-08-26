@@ -30,7 +30,6 @@ pub mod session_tab_strip;
 pub mod session_view;
 pub(crate) mod slash_commands;
 pub mod solution_band;
-pub mod status_item;
 pub(crate) mod status_row;
 pub mod store;
 pub mod stream;
@@ -59,7 +58,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gpui::{App, AppContext, AsyncApp, SharedString};
+use gpui::{App, AsyncApp, SharedString};
 use project::agent_server_store::AgentId;
 
 pub fn init(cx: &mut App) {
@@ -135,26 +134,16 @@ pub fn init(cx: &mut App) {
         }
     }
 
-    // Workspace hook for the status-bar item. The standalone
-    // `SolutionSessionsNavigator` dock was removed when ConsolePanel
-    // took over chat hosting — `FocusNavigator` is now a no-op until
-    // B10 rewires it to focus the ConsolePanel's chat tab. The action
-    // is kept registered so the keybind still resolves (instead of
-    // surfacing as "no handler").
-    cx.observe_new::<workspace::Workspace>(|workspace, window, cx| {
-        let Some(window) = window else {
-            return;
-        };
-
-        // TODO(B10): focus the active ConsolePanel chat tab here once
-        // ConsolePanel's focus API is settled.
+    // The standalone `SolutionSessionsNavigator` dock was removed when
+    // `ConsolePanel` took over chat hosting, and chat then moved on again into
+    // the Solution band (phase 2a). `FocusNavigator` has had nothing to focus
+    // since; the action stays registered so the keybind still resolves instead
+    // of surfacing as "no handler".
+    cx.observe_new::<workspace::Workspace>(|workspace, _window, _cx| {
+        // TODO(B10): focus the Solution band's active dialog here once the
+        // band exposes a focus seam.
         workspace.register_action(|_workspace, _: &actions::FocusNavigator, _window, _cx| {
-            log::debug!("FocusNavigator dispatched: no-op until B10 wires ConsolePanel focus");
-        });
-
-        let status_item = cx.new(|cx| status_item::SolutionAgentStatusItem::new(cx));
-        workspace.status_bar().update(cx, |bar, cx| {
-            bar.add_right_item(status_item, window, cx);
+            log::debug!("FocusNavigator dispatched: no-op until B10 wires Solution band focus");
         });
     })
     .detach();

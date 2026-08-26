@@ -313,43 +313,21 @@ fn build_title_bar_node(workspace: &workspace::Workspace, cx: &App) -> VisualNod
 }
 
 /// Synthesize what the StatusBar would render for this workspace.
-/// Currently surfaces the SolutionsStatusItem widget content
-/// (`<solution name>`, `<member count>`); other status bar widgets
-/// remain opaque for now.
+///
+/// Only the bar's visibility is reported: this function does not walk the
+/// registered `StatusItemView`s, so it can only describe items it has been
+/// taught about by hand. It used to synthesize a `SolutionsStatusItem` child
+/// from the `SolutionStore`; that item was removed from the bar (phase 2a
+/// task 8 — the title-bar Solution tab strip already names the Solution), and
+/// a hand-written child that no longer matches what is painted is worse than
+/// no child at all. Use `workspace.screenshot` to see the bar's real contents.
 fn build_status_bar_node(workspace: &workspace::Workspace, cx: &App) -> VisualNode {
-    let mut children: Vec<VisualNode> = Vec::new();
-
-    if let Some(store) = SolutionStore::try_global(cx) {
-        let project = workspace.project().read(cx);
-        let mut matching: Option<(String, usize)> = None;
-        for tree in project.worktrees(cx) {
-            let path = tree.read(cx).abs_path();
-            let solution = store.read_with(cx, |s, _| {
-                s.solution_for_path(&path)
-                    .map(|sol| (sol.name.clone(), sol.members.len()))
-            });
-            if let Some(found) = solution {
-                matching = Some(found);
-                break;
-            }
-        }
-        if let Some((name, count)) = matching {
-            children.push(VisualNode {
-                kind: "SolutionsStatusItem".to_string(),
-                label: Some(format!("● {name} · {count} projects")),
-                visible: true,
-                focused: false,
-                children: Vec::new(),
-            });
-        }
-    }
-
     VisualNode {
         kind: "StatusBar".to_string(),
         label: None,
         visible: workspace.status_bar_visible(cx),
         focused: false,
-        children,
+        children: Vec::new(),
     }
 }
 
