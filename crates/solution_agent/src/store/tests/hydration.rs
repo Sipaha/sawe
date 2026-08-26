@@ -1058,12 +1058,6 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     });
 }
 
-/// Regression guard: a v2 blob with `desired_model` set migrates on the first
-/// restore (MIGRATE branch recovers model from blob and writes rows). On the
-/// SECOND cold-restore (ROWS branch — no blob deserialization), the session
-/// must still carry the same `desired_model`. This proves that
-/// `persist_session_row` is called during migration, flushing the recovered
-/// model/effort to the metadata columns before the blob path is bypassed.
 /// The production hydration path must seed the model/effort a cold tab's status
 /// row renders. It used to leave all three at their defaults, which was
 /// invisible while cold tabs were unreachable and self-healed on first use;
@@ -1144,6 +1138,12 @@ async fn hydrate_all_restores_model_and_effort(cx: &mut TestAppContext) {
     });
 }
 
+/// Regression guard: a v2 blob with `desired_model` set migrates on the first
+/// restore (MIGRATE branch recovers model from blob and writes rows). On the
+/// SECOND cold-restore (ROWS branch — no blob deserialization), the session
+/// must still carry the same `desired_model`. This proves that
+/// `persist_session_row` is called during migration, flushing the recovered
+/// model/effort to the metadata columns before the blob path is bypassed.
 #[gpui::test]
 async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContext) {
     use crate::cold_persistence::{PersistedEntryV2, PersistedUserMessage};

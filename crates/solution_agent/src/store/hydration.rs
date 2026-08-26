@@ -1,18 +1,29 @@
 //! Session hydration & cold→live resume engine: the Store-side methods that
 //! promote a cold session tab to a live `claude` thread (`resume_session`),
-//! restore/hydrate persisted session tabs on startup, lazily load cold
-//! transcript blobs, reap stale archives, and list/reopen closed sessions —
-//! plus the cx-free decode/title/preview helpers they share. Relocated
-//! verbatim from `store.rs` (Tier-4 god-object refactor) — the methods are
-//! `impl SolutionAgentStore` and still own `&mut SolutionAgentStore` /
-//! `Context<Self>`; this split moves *source text*, not state ownership.
+//! hydrate a Solution's persisted sessions when it opens
+//! (`hydrate_all_for_solution`), reap stale archives, and list/reopen closed
+//! sessions — plus the cx-free decode/title/preview helpers they share.
+//! Relocated verbatim from `store.rs` (Tier-4 god-object refactor) — the
+//! methods are `impl SolutionAgentStore` and still own
+//! `&mut SolutionAgentStore` / `Context<Self>`; this split moves *source
+//! text*, not state ownership.
+//!
+//! There is exactly ONE hydration path, and it loads a solution's transcripts
+//! serially in the foreground. The crate used to also carry a lazy variant
+//! that materialised placeholder entities and filled them from detached
+//! per-session tasks (`hydrate_open_tabs_lazy` /
+//! `load_cold_blob_into_session`), and a tab-only variant
+//! (`restore_open_tabs`); both lost their production callers when chat tabs
+//! moved to the Solution band and were deleted rather than left to drift out
+//! of sync with the surviving path — which is precisely how the empty-strip
+//! bug shipped. `SolutionSession::hydrating` is the vestige of the lazy one.
 //!
 //! Hardening carried by this cluster is preserved byte-for-byte: #35 (every
 //! turn-end path flushes the end-of-turn tail), #40 (every writer of
 //! `session.entries` calls `rebuild_streams()` — the cold-load/hydration
 //! paths), and #43 (cold-load purges background agents via
-//! `reconcile_background_agents_for` inside `load_cold_blob_into_session` /
-//! `hydrate_all_for_solution`).
+//! `reconcile_background_agents_for`, now reached only from
+//! `hydrate_all_for_solution`'s post-hydration `for sid in &hydrated` loop).
 
 use super::*;
 

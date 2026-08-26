@@ -1608,6 +1608,16 @@ impl SolutionAgentStore {
     /// closed window without deleting their persisted rows or `tab_order`,
     /// and `hydrate_all_for_solution` re-hydrates the same ids on reopen, so the
     /// selection stays valid across that round-trip.
+    ///
+    /// This is the fourth writer of `active_dialog_session` and the only one
+    /// that does NOT mark `band_state_touched` — deliberately, and it is not an
+    /// oversight to repair. Pre-hydration the mask is what keeps a persisted row
+    /// from being overwritten with defaults (see `set_persistence`), but this
+    /// function can only fire for a solution whose in-memory state already reads
+    /// `Some(id)`, and before hydration the only way an entry says that is if
+    /// `set_active_dialog_session` put it there — which set that solution's
+    /// `active_dialog_session` mask bit. So the clear is always inside a flush
+    /// the mask has already scheduled, and marking it again would be a no-op.
     fn clear_active_dialog_for_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
         let affected: Vec<SolutionId> = self
             .band_state
