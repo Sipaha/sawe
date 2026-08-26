@@ -11345,6 +11345,13 @@ mod tests {
     use util::path;
     use util::rel_path::rel_path;
 
+    // This only round-trips the `set_solution_band_item`/`solution_band_item`
+    // accessor pair — it asserts nothing about where the band paints relative
+    // to the rest of the workspace tree. Placement (full-width row between
+    // the project zone and the status bar) is verified visually, not here:
+    // see the phase-2a task-4 screenshot at
+    // `.superpowers/sdd/2026-08-26-solution-band-layout/task-4-screenshot.png`.
+    // Deliberately not turned into a geometry assertion (see that task's report).
     #[gpui::test]
     async fn solution_band_item_renders_between_the_workspace_area_and_the_status_bar(
         cx: &mut TestAppContext,

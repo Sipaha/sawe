@@ -29,6 +29,7 @@ pub mod session_entry;
 pub mod session_tab_strip;
 pub mod session_view;
 pub(crate) mod slash_commands;
+pub mod solution_band;
 pub mod status_item;
 pub(crate) mod status_row;
 pub mod store;

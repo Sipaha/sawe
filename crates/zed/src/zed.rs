@@ -628,6 +628,16 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 cx,
             )
         });
+        // Sawe: the Solution band (phase 2a task 4) — the full-width dialog
+        // row between the project zone and the status bar that the tab strip
+        // above selects into. `weak_handle()` only reads a plain field off
+        // `&mut Workspace`, not the entity itself, so it's safe to call while
+        // this closure still holds the borrow that `SolutionBand::new` must
+        // not read through (see the module doc on `solution_band`).
+        let solution_band = cx.new(|cx| {
+            solution_agent::solution_band::SolutionBand::new(workspace.weak_handle(), cx)
+        });
+        workspace.set_solution_band_item(solution_band.into(), window, cx);
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(session_tab_strip, window, cx);
             status_bar.add_left_item(search_button, window, cx);
