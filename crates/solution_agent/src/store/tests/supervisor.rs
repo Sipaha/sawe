@@ -11,6 +11,38 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// The badge counts cold restored transcripts, not just sessions with a live
+/// subprocess. Pinned because the name says "visible" and the tab strip's
+/// module doc used to say "live AI", which reads as an invitation to filter
+/// `is_cold()` out — that would blank the badge for every Solution at startup,
+/// where the restored tab strip shows a tab per chat.
+#[gpui::test]
+fn visible_session_count_includes_cold_restored_sessions(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sol = SolutionId(1);
+            let agent = SharedString::from("claude-acp");
+            let ids = [SolutionSessionId::new(), SolutionSessionId::new()];
+            for id in ids {
+                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+            }
+            for id in ids {
+                assert!(
+                    store
+                        .session(id)
+                        .is_some_and(|session| session.read(cx).is_cold()),
+                    "precondition: these stand in for hydrated transcripts, not live threads"
+                );
+            }
+            assert_eq!(store.visible_session_count(&sol), 2);
+        });
+    });
+}
+
 #[gpui::test]
 fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());

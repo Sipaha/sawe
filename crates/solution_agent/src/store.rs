@@ -1383,14 +1383,27 @@ impl SolutionAgentStore {
             .unwrap_or_default()
     }
 
-    /// Count of `solution_id`'s live sessions that are user-visible — i.e.
-    /// [`sessions_for`](Self::sessions_for) minus the ephemeral supervisor
-    /// judge sessions. The judge is spawned on every idle wake-up, runs for
-    /// seconds, then is torn down by `finish_judge`; it must not tick the
-    /// Sparkle AI-session badge up by 1 each time. User-created child sessions
-    /// (`parent_session_id` set via the wire `create_session` tool) are NOT
-    /// excluded — only live judges, identified authoritatively from the
-    /// `judge_sessions` handle map.
+    /// Count behind the Solution tab's Sparkle badge: everything indexed under
+    /// `solution_id` in `by_solution` — i.e. [`sessions_for`](Self::sessions_for)
+    /// — minus the live ephemeral supervisor sessions.
+    ///
+    /// "Live" is NOT part of that definition any more, whatever the badge's
+    /// name suggests. Cold hydration indexes restored transcripts into
+    /// `by_solution`, so on a real database a fresh start counts every chat the
+    /// Solution has on disk (~18, not 0) before a single subprocess exists.
+    /// That is the intended reading — the badge answers "how many chats does
+    /// this Solution carry", which is what the restored tab strip shows too —
+    /// so do not "fix" it back to live-only.
+    ///
+    /// It is not exactly the tab strip's set either, and deliberately so:
+    /// `session_tab_strip::candidates_for` additionally drops anything
+    /// `SolutionSession::can_be_active_dialog` rejects, so a user-created child
+    /// session (`parent_session_id` set via the wire `create_session` tool) or a
+    /// live `is_ephemeral` helper counts here while the strip draws no tab for
+    /// it. Only the supervisor's own judge/auditor sessions are excluded, from
+    /// the `judge_sessions` / `auditor_sessions` handle maps: a judge is spawned
+    /// on every idle wake-up and torn down seconds later by `finish_judge`, and
+    /// must not tick the badge up by 1 each time.
     pub fn visible_session_count(&self, solution_id: &SolutionId) -> usize {
         let hidden_ids = self.live_supervisor_session_ids();
         self.by_solution

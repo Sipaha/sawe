@@ -13,9 +13,12 @@
 //!     solution is highlighted as the active tab.
 //!   * `SolutionStore::solutions()` for the displayed name and to count
 //!     closed solutions for the `+` button branching.
-//!   * `SolutionAgentStore::visible_session_count(&id)` for the live AI
-//!     session count badge on each tab (excludes ephemeral supervisor
-//!     judge sessions so they never tick the badge during an idle wake-up).
+//!   * `SolutionAgentStore::visible_session_count(&id)` for the AI session
+//!     count badge on each tab. It counts every session indexed under the
+//!     Solution, cold restored transcripts included — so the badge is
+//!     non-zero at startup, before any subprocess exists — minus the
+//!     ephemeral supervisor judge/auditor sessions, so an idle wake-up never
+//!     ticks it. See that function's docs before assuming "live".
 //!
 //! Re-render triggers (registered in [`SolutionTabStrip::new`]):
 //!   * `SolutionStoreEvent` — covers solution add/remove/rename and
