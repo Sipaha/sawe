@@ -592,9 +592,32 @@ impl SolutionAgentStore {
         // solution root). The pixels survive as base64 in the persisted entries,
         // so reopen is unaffected. Must run BEFORE teardown (it needs the entity).
         self.purge_session_attachments(id, cx);
-        // Flush the latest transcript while the session is still live, so a later
-        // "Reopen Closed Chat" restores the full conversation. The in-flight-turn
-        // cancel + entity drop happen inside `teardown_session_runtime`.
+        // Flush the latest transcript while the session is still live — except
+        // this flush does NOT reach disk. `persist_all_rows` parks its work in a
+        // `cx.spawn` task stored in `entries_persist_chain`, and
+        // `teardown_session_runtime` below → `evict_session_runtime_maps` drops
+        // that entry inside this same synchronous block, so the task is
+        // cancelled before the executor ever polls it. The mechanism, the
+        // empirical verification, and why repairing it is its own change (an
+        // executed flush is a full rewrite whose `delete_entries_from(main_len)`
+        // deletes legacy teammate-tagged rows) are written up at length in
+        // `cold_close_solution` — read that before touching this line.
+        //
+        // What the cancellation costs: `persist_all_rows` advances the session's
+        // `persisted_main_seq` watermark SYNCHRONOUSLY before spawning, and
+        // every persist filters on `entry.mod_seq > old_watermark`, so any row
+        // the cancelled flush was covering can no longer be written by a persist
+        // that still runs for this session (the in-flight-turn cancel inside
+        // `teardown_session_runtime` can trigger one). The un-debounced tail is
+        // therefore lost for good rather than merely deferred, and "Reopen
+        // Closed Chat" restores the conversation as of the last incremental
+        // persist, not as of the close. `cold_close_solution` calls the same
+        // `persist_all_rows` for every live session and pays exactly the same
+        // price — this call site is not more dangerous, it was just carrying the
+        // opposite claim.
+        //
+        // The in-flight-turn cancel + entity drop happen inside
+        // `teardown_session_runtime`.
         self.persist_all_rows(id, cx);
         let teardown = self
             .teardown_session_runtime(id, cx)
