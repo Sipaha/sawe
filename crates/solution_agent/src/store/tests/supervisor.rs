@@ -2859,3 +2859,137 @@ async fn rehit_error_keeps_pending_usage_limit_resume_gate(cx: &mut TestAppConte
         });
     });
 }
+
+/// Directly park `session_id`'s supervisor in the terminal `Stopped(Quota)`
+/// state exactly as `apply_usage_limit_stop`'s "no reset time parsed" branch
+/// does: `enabled` overridden to `false`, `next_eligible_ms` cleared, no live
+/// backoff timer (the terminal branch already dropped it).
+fn park_terminal_quota_stop(store: &mut SolutionAgentStore, session_id: SolutionSessionId) {
+    let st = store
+        .supervisor_states
+        .entry(session_id)
+        .or_insert_with(|| crate::supervisor::SupervisorState::new(session_id));
+    st.enabled = false;
+    st.status =
+        crate::supervisor::SupervisorStatus::Stopped(crate::supervisor::StoppedReason::Quota);
+    st.next_eligible_ms = None;
+    st.backoff_attempt = 2;
+    store.backoff_timers.remove(&session_id);
+}
+
+#[gpui::test]
+async fn successful_turn_resurrects_terminal_quota_stop(cx: &mut TestAppContext) {
+    // Defect 2: `apply_usage_limit_stop`'s terminal branch (no parseable reset
+    // time) disables supervision and parks `Stopped(Quota)`. A later
+    // successful turn on the SAME session — ordinary turns run regardless of
+    // whether supervision itself is enabled — is direct proof the usage wall
+    // has lifted, so it must lift the system-imposed stop back to `Watching`
+    // and restore `enabled` so `tick_supervisor` can fire again.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| park_terminal_quota_stop(store, session_id));
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Watching,
+                "a successful turn must lift a terminal quota stop back to Watching"
+            );
+            assert!(
+                st.enabled,
+                "a successful turn must restore `enabled` (the wall overrode it)"
+            );
+            assert_eq!(st.next_eligible_ms, None);
+            assert_eq!(st.backoff_attempt, 0);
+            assert!(!store.backoff_timers.contains_key(&session_id));
+        });
+    });
+}
+
+#[gpui::test]
+async fn successful_turn_does_not_resurrect_user_disabled_supervisor(cx: &mut TestAppContext) {
+    // A user-driven Eye-toggle-off must NEVER be resurrected by this path —
+    // only the SYSTEM-imposed `Stopped(Quota)` status is eligible. A user
+    // disable always lands on `SupervisorStatus::Disabled`, which is
+    // deliberately excluded.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.set_supervision_enabled(session_id, false, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Disabled,
+                "a user-disabled supervisor must stay disabled after a successful turn"
+            );
+            assert!(!st.enabled);
+        });
+    });
+}
+
+#[gpui::test]
+async fn successful_turn_does_not_resurrect_held_supervisor(cx: &mut TestAppContext) {
+    // A manually-Held supervisor (Stop button) must stay held — only the next
+    // human message re-arms it (`reset_supervisor_continue_counter`), never an
+    // agent-side turn completion.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.hold_supervisor(session_id, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Held,
+                "a Held supervisor must stay held after a successful turn"
+            );
+        });
+    });
+}

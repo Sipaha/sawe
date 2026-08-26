@@ -2285,6 +2285,12 @@ impl SolutionAgentStore {
     /// claude_native orphan-result handling — so the gate correctly SURVIVES
     /// that case and we keep waiting. Idempotent; no-op when no gate is set.
     /// Mirrors the success-clear in [`apply_verdict`](Self::apply_verdict).
+    ///
+    /// Also called from the `NewEntry` handler on any genuine non-wall
+    /// activity (not just full `Stopped`) — see `handle_acp_event`'s "External
+    /// usage-limit lift" comment. That earlier, weaker signal is intentionally
+    /// NOT trusted to resurrect the stronger [`clear_terminal_quota_stop`]
+    /// below (see that function's doc for why the two are split).
     pub(crate) fn clear_resume_gate_on_agent_response(
         &mut self,
         id: SolutionSessionId,
@@ -2298,6 +2304,56 @@ impl SolutionAgentStore {
             return;
         }
         if let Some(state) = self.supervisor_states.get_mut(&id) {
+            state.next_eligible_ms = None;
+            state.backoff_attempt = 0;
+        }
+        self.backoff_timers.remove(&id);
+        self.persist_supervisor_state(id, cx);
+    }
+
+    /// Lift the TERMINAL `Stopped(StoppedReason::Quota)` stop that
+    /// `apply_usage_limit_stop` enters when the wall's reset time couldn't be
+    /// parsed (`enabled` forced `false`, `next_eligible_ms` already `None` —
+    /// so [`clear_resume_gate_on_agent_response`]'s `gated` check alone can
+    /// never reach it). Called ONLY on a completed `Stopped` turn — a strictly
+    /// stronger signal than the `NewEntry` "any activity" trigger that clears
+    /// the ordinary resume gate, because `NewEntry` also fires for the user's
+    /// own outgoing message before the agent has even attempted a response; a
+    /// full `Stopped` means the request actually round-tripped successfully.
+    /// Deliberately scoped to `Quota` alone — NOT `Stopped(ProviderError)`
+    /// (the backoff-exhausted judge-failure terminal state): that failure is
+    /// about the judge-SPAWN path specifically and can have causes unrelated
+    /// to whether the user's ordinary turns succeed, so auto-resurrecting it
+    /// risks a flapping judge loop; a user can still re-enable it explicitly
+    /// via the Eye toggle. And deliberately scoped to THIS session only, not
+    /// solution/account-wide: propagating to sibling sessions would need to
+    /// reach past `Disabled`/`Held` states on OTHER sessions too, multiplying
+    /// the ways this could accidentally resurrect a deliberately-off
+    /// supervisor; each session's own next real activity re-derives its own
+    /// correct `next_eligible_ms` independently (and does so accurately now
+    /// that the reset-time parser handles the month-day form).
+    ///
+    /// Never touches `Disabled` (user Eye-toggle-off) or `Held` (user Stop) —
+    /// both use their own status values, so this is a no-op for them.
+    /// Idempotent.
+    pub(crate) fn clear_terminal_quota_stop(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::supervisor::{StoppedReason, SupervisorStatus};
+        let Some(state) = self.supervisor_states.get(&id) else {
+            return;
+        };
+        if !matches!(
+            state.status,
+            SupervisorStatus::Stopped(StoppedReason::Quota)
+        ) {
+            return;
+        }
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            state.enabled = true;
+            state.status = SupervisorStatus::Watching;
             state.next_eligible_ms = None;
             state.backoff_attempt = 0;
         }

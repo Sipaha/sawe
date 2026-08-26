@@ -189,6 +189,13 @@ impl SolutionAgentStore {
                 // re-hit of the wall arrives as `Error`, not `Stopped`, so the
                 // gate survives that case.
                 self.clear_resume_gate_on_agent_response(session_id, cx);
+                // Stronger still: a completed turn also lifts a TERMINAL
+                // `Stopped(Quota)` stop (the wall parked with no reset time
+                // parsed, which disabled supervision outright) — the round
+                // trip just proved the wall is gone, so re-arm it rather than
+                // leaving the observer dormant until the user notices and
+                // flips the Eye toggle back on themselves.
+                self.clear_terminal_quota_stop(session_id, cx);
                 // A completed turn is genuinely-new state: cancel any parked
                 // one-shot `wait`. Otherwise, if the agent self-resumed and
                 // FINISHED before the wait deadline, the mechanism would still
