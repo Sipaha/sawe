@@ -22,18 +22,29 @@
 //! Reusing that action (instead of calling `SolutionAgentStore::create_session`
 //! directly) keeps session creation on exactly one code path — two paths
 //! disagreeing about the new session's cwd was the phase-1 Critical.
+//!
+//! Right-click a tab for Rename Session / Restart Agent / Close, and drag a
+//! tab onto another to reorder (persisted via `SolutionAgentStore::
+//! persist_tab_order`) — phase-2a task-5b restoring what the deleted
+//! `ConsolePanel` chat-tab strip carried. See `reorder_to` and
+//! `open_rename_session_modal` for the mechanics; the overflow popover's
+//! rows are `submenu`s (not plain entries) so the same three actions stay
+//! reachable for a tab that has spilled past `MAX_VISIBLE_TABS`.
+
+use std::cell::RefCell;
 
 use gpui::{
-    App, Context, IntoElement, ParentElement, PromptLevel, Render, SharedString, Styled,
-    Subscription, WeakEntity, Window, div, px,
+    App, Context, ElementId, IntoElement, ParentElement, PromptLevel, Render, SharedString,
+    Styled, Subscription, WeakEntity, Window, div, px,
 };
 use solutions::{SolutionId, SolutionStore};
-use ui::{ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*};
+use ui::{ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 use workspace::item::ItemHandle;
-use workspace::{HideStatusItem, MultiWorkspace, StatusItemView};
+use workspace::{HideStatusItem, MultiWorkspace, StatusItemView, Workspace};
 
 use crate::model::{SessionState, SolutionSessionId};
+use crate::rename_session_modal::RenameSessionModal;
 use crate::status_row::state_dot_color;
 use crate::store::{SolutionAgentStore, SolutionAgentStoreEvent};
 
@@ -86,6 +97,97 @@ fn toggle_selection(
     } else {
         Some(clicked)
     }
+}
+
+/// Would closing `session_id` right now abandon an in-flight agent turn?
+/// Extracted from [`SessionTabStrip::close_tab`] so the busy/idle split it
+/// gates the confirmation prompt on is unit-testable without a live
+/// `SolutionSession` entity. Deliberately includes `Stopping` — a cancel is
+/// still winding down, so it is just as much a reason to confirm as
+/// `Running` is. Does NOT match `status_row.rs`'s `is_running` (which feeds
+/// the tab's status dot and excludes `Stopping`) — the two are different
+/// questions answered from the same `SessionState`.
+fn is_busy_state(state: &SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Running { .. } | SessionState::Stopping { .. }
+    )
+}
+
+/// Move `from` so it lands at the slot currently occupied by `target`,
+/// preserving the relative order of every other session. Mirrors
+/// `solutions_ui::project_tab::reorder_to` — the live precedent for
+/// drag-reorder in a tab strip (this one, unlike the deleted
+/// `ConsolePanel::reorder_tab`, is built for the same kind of container).
+/// Returns the original order unchanged when either id is missing, or when
+/// dropping a tab onto itself.
+fn reorder_to(
+    order: &[SolutionSessionId],
+    from: SolutionSessionId,
+    target: SolutionSessionId,
+) -> Vec<SolutionSessionId> {
+    if from == target || !order.contains(&from) || !order.contains(&target) {
+        return order.to_vec();
+    }
+    let mut remaining: Vec<SolutionSessionId> =
+        order.iter().copied().filter(|id| *id != from).collect();
+    let insert_at = remaining
+        .iter()
+        .position(|id| *id == target)
+        .unwrap_or(remaining.len());
+    remaining.insert(insert_at, from);
+    remaining
+}
+
+/// Drag payload for reordering session tabs, carrying enough to render a
+/// drag preview that looks like the tab being dragged. Mirrors
+/// `solutions_ui::project_tab::DraggedProjectTab`.
+#[derive(Clone)]
+struct DraggedSessionTab {
+    session_id: SolutionSessionId,
+    title: SharedString,
+}
+
+impl Render for DraggedSessionTab {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .px_2()
+            .h_7()
+            .bg(cx.theme().colors().tab_active_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_sm()
+            .child(Label::new(self.title.clone()).size(LabelSize::Small))
+    }
+}
+
+/// Open the rename-session popup for `session_id`, seeded with its current
+/// title. Free function (not a `SessionTabStrip` method) because it is
+/// called from context-menu entry handlers, which only get `(Window, App)`
+/// — no access to `Self` is needed here, only to the Solution's workspace
+/// (to host the modal) and the store (to read the current title).
+fn open_rename_session_modal(
+    weak_workspace: &WeakEntity<Workspace>,
+    session_id: SolutionSessionId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = weak_workspace.upgrade() else {
+        return;
+    };
+    let current_title = SolutionAgentStore::global(cx)
+        .read(cx)
+        .session(session_id)
+        .map(|entity| entity.read(cx).title.to_string())
+        .unwrap_or_default();
+    workspace.update(cx, |workspace, cx| {
+        workspace.toggle_modal(window, cx, move |window, cx| {
+            RenameSessionModal::new(session_id, current_title, window, cx)
+        });
+    });
 }
 
 pub struct SessionTabStrip {
@@ -143,6 +245,14 @@ impl SessionTabStrip {
         })
     }
 
+    /// Weak handle to the Solution's active workspace, used to host the
+    /// rename-session modal. `MultiWorkspace::workspace()` is the same
+    /// active-workspace lookup `active_solution_id` uses.
+    fn workspace_weak(&self, cx: &App) -> Option<WeakEntity<Workspace>> {
+        let mw = self.multi_workspace.as_ref()?.upgrade()?;
+        Some(mw.read(cx).workspace().downgrade())
+    }
+
     fn on_tab_clicked(
         &mut self,
         solution_id: SolutionId,
@@ -170,21 +280,10 @@ impl SessionTabStrip {
         cx: &mut Context<Self>,
     ) {
         let store = SolutionAgentStore::global(cx);
-        // Deliberately includes `Stopping` — unlike `candidates_for`'s
-        // `is_running` (which feeds the dot color and must match
-        // `status_row.rs` exactly), this is a different question: "would
-        // closing right now abandon in-flight agent work?" A cancel is
-        // still winding down during `Stopping`, so it's just as much a
-        // reason to confirm as `Running` is.
         let busy = store
             .read(cx)
             .session(session_id)
-            .map(|session| {
-                matches!(
-                    session.read(cx).state,
-                    SessionState::Running { .. } | SessionState::Stopping { .. }
-                )
-            })
+            .map(|session| is_busy_state(&session.read(cx).state))
             .unwrap_or(false);
         if !busy {
             store
@@ -257,6 +356,9 @@ impl SessionTabStrip {
         candidate: &TabCandidate,
         is_active: bool,
         ix: usize,
+        order: Vec<SolutionSessionId>,
+        weak_self: WeakEntity<Self>,
+        weak_workspace: Option<WeakEntity<Workspace>>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let session_id = candidate.session_id;
@@ -272,7 +374,7 @@ impl SessionTabStrip {
             cx.theme().colors().tab_inactive_background
         };
 
-        div()
+        let row = div()
             .id(("session-tab-strip-tab", ix))
             .flex()
             .flex_none()
@@ -288,7 +390,7 @@ impl SessionTabStrip {
             .child(Indicator::dot().color(dot_color))
             .child(
                 div().flex_1().min_w_0().child(
-                    Label::new(title)
+                    Label::new(title.clone())
                         .size(LabelSize::Small)
                         .truncate(),
                 ),
@@ -307,6 +409,70 @@ impl SessionTabStrip {
                     this.on_tab_clicked(solution_id, session_id, cx);
                 }),
             )
+            // Drag-and-drop reorder, mirroring `project_tab`'s idiom (the
+            // live precedent — see `reorder_to`'s doc comment for why NOT
+            // the deleted dock-strip machinery). `on_drag` only fires past
+            // GPUI's movement threshold, so a plain click still reaches
+            // `on_mouse_down` above and selects the tab.
+            .on_drag(
+                DraggedSessionTab {
+                    session_id,
+                    title: title.clone(),
+                },
+                |dragged, _offset, _window, cx| cx.new(|_| dragged.clone()),
+            )
+            .drag_over::<DraggedSessionTab>(|style, _dragged, _window, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop({
+                let order = order.clone();
+                move |dragged: &DraggedSessionTab, _window, cx| {
+                    let new_order = reorder_to(&order, dragged.session_id, session_id);
+                    SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                        store.persist_tab_order(solution_id, new_order, cx);
+                    });
+                }
+            });
+
+        // Right-click menu restoring the affordances the old dock chat-tab
+        // strip carried (see the phase-2a task-5b brief): rename, restart
+        // the agent subprocess (keeping the conversation), and close —
+        // routed through the same busy-confirmation `close_tab` the tab's
+        // own close button uses, so there is exactly one close path.
+        let menu_id = ElementId::from(SharedString::from(format!(
+            "session-tab-strip-menu-{session_id}"
+        )));
+        let row_cell = RefCell::new(Some(row.into_any_element()));
+        right_click_menu(menu_id)
+            .trigger(move |_, _, _| {
+                row_cell
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_else(|| div().into_any_element())
+            })
+            .menu(move |window, cx| {
+                let weak_close = weak_self.clone();
+                let weak_workspace = weak_workspace.clone();
+                ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    let weak_close = weak_close.clone();
+                    let weak_workspace = weak_workspace.clone();
+                    menu.entry("Close", None, move |window, cx| {
+                        weak_close
+                            .update(cx, |this, cx| this.close_tab(session_id, window, cx))
+                            .log_err();
+                    })
+                    .entry("Rename Session", None, move |window, cx| {
+                        if let Some(weak_workspace) = weak_workspace.as_ref() {
+                            open_rename_session_modal(weak_workspace, session_id, window, cx);
+                        }
+                    })
+                    .entry("Restart Agent", None, move |_window, cx| {
+                        SolutionAgentStore::global(cx)
+                            .update(cx, |store, cx| store.restart_agent(session_id, cx))
+                            .detach_and_log_err(cx);
+                    })
+                })
+            })
     }
 
     fn render_plus_button(&self, _cx: &Context<Self>) -> impl IntoElement {
@@ -336,6 +502,14 @@ impl Render for SessionTabStrip {
         let active_session = store.read(cx).active_dialog_session(solution_id);
         let candidates = self.candidates_for(solution_id, cx);
         let (visible, overflow) = split_visible_overflow(&candidates);
+        // Full order across visible AND overflow tabs — `persist_tab_order`
+        // NULLs `tab_order` on every session of the solution that is absent
+        // from what it's handed, so a drop handler built from `visible`
+        // alone would silently evict every overflowing tab from the strip
+        // on the next reorder.
+        let order: Vec<SolutionSessionId> = candidates.iter().map(|c| c.session_id).collect();
+        let weak_self = cx.weak_entity();
+        let weak_workspace = self.workspace_weak(cx);
 
         let tabs = visible.iter().enumerate().map(|(ix, candidate)| {
             self.render_tab(
@@ -343,11 +517,23 @@ impl Render for SessionTabStrip {
                 candidate,
                 active_session == Some(candidate.session_id),
                 ix,
+                order.clone(),
+                weak_self.clone(),
+                weak_workspace.clone(),
                 cx,
             )
         });
 
         let overflow_popover = (!overflow.is_empty()).then(|| {
+            // Each overflowing tab still needs everything a visible tab's
+            // right-click menu offers — otherwise a session that spills
+            // past `MAX_VISIBLE_TABS` becomes unreachable for rename/
+            // restart/close from the UI (constraint C, phase-2a task-5b
+            // brief). A `ContextMenu` entry only fires a single click
+            // handler, so each overflow row is a `submenu` instead: "Select"
+            // reproduces the old plain-entry click, the rest mirror the
+            // visible tab's menu exactly. Submenus open on hover per
+            // `ContextMenu`'s own idiom (see repo `.rules`).
             let overflow_entries: Vec<(SolutionSessionId, SharedString)> = overflow
                 .iter()
                 .map(|c| {
@@ -359,6 +545,8 @@ impl Render for SessionTabStrip {
                     (c.session_id, title)
                 })
                 .collect();
+            let weak_self = weak_self.clone();
+            let weak_workspace = weak_workspace.clone();
             let more_button = IconButton::new("session-tab-strip-more", IconName::Ellipsis)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
@@ -367,17 +555,53 @@ impl Render for SessionTabStrip {
                 .trigger(more_button)
                 .menu(move |window, cx| {
                     let overflow_entries = overflow_entries.clone();
+                    let weak_self = weak_self.clone();
+                    let weak_workspace = weak_workspace.clone();
                     Some(ContextMenu::build(
                         window,
                         cx,
                         move |mut menu, _window, _cx| {
                             for (session_id, title) in overflow_entries {
-                                menu = menu.entry(title, None, move |_window, cx| {
-                                    SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                                        let current = store.active_dialog_session(solution_id);
-                                        let next = toggle_selection(current, session_id);
-                                        store.set_active_dialog_session(solution_id, next, cx);
-                                    });
+                                let weak_close = weak_self.clone();
+                                let weak_workspace = weak_workspace.clone();
+                                menu = menu.submenu(title, move |submenu, _window, _cx| {
+                                    let weak_close = weak_close.clone();
+                                    let weak_workspace = weak_workspace.clone();
+                                    submenu
+                                        .entry("Select", None, move |_window, cx| {
+                                            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                                                let current =
+                                                    store.active_dialog_session(solution_id);
+                                                let next = toggle_selection(current, session_id);
+                                                store.set_active_dialog_session(
+                                                    solution_id,
+                                                    next,
+                                                    cx,
+                                                );
+                                            });
+                                        })
+                                        .entry("Rename Session", None, move |window, cx| {
+                                            if let Some(weak_workspace) = weak_workspace.as_ref() {
+                                                open_rename_session_modal(
+                                                    weak_workspace,
+                                                    session_id,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        })
+                                        .entry("Restart Agent", None, move |_window, cx| {
+                                            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                                                store.restart_agent(session_id, cx)
+                                            }).detach_and_log_err(cx);
+                                        })
+                                        .entry("Close", None, move |window, cx| {
+                                            weak_close
+                                                .update(cx, |this, cx| {
+                                                    this.close_tab(session_id, window, cx)
+                                                })
+                                                .log_err();
+                                        })
                                 });
                             }
                             menu
@@ -445,6 +669,73 @@ mod tests {
         assert_eq!(overflow.len(), 3);
         assert_eq!(visible, &ids[..MAX_VISIBLE_TABS]);
         assert_eq!(overflow, &ids[MAX_VISIBLE_TABS..]);
+    }
+
+    #[test]
+    fn reorder_to_moves_the_dragged_tab_next_to_its_drop_target() {
+        let ids: Vec<SolutionSessionId> = (0..4).map(|_| SolutionSessionId::new()).collect();
+        let order = ids.clone();
+
+        // Move right: dragging the first tab onto the third lands it
+        // directly before the third.
+        let moved_right = reorder_to(&order, ids[0], ids[2]);
+        assert_eq!(moved_right, vec![ids[1], ids[0], ids[2], ids[3]]);
+
+        // Move left: dragging the last tab onto the second lands it
+        // directly before the second.
+        let moved_left = reorder_to(&order, ids[3], ids[1]);
+        assert_eq!(moved_left, vec![ids[0], ids[3], ids[1], ids[2]]);
+    }
+
+    #[test]
+    fn reorder_to_is_a_noop_for_a_tab_dropped_onto_itself() {
+        let ids: Vec<SolutionSessionId> = (0..3).map(|_| SolutionSessionId::new()).collect();
+        assert_eq!(reorder_to(&ids, ids[1], ids[1]), ids);
+    }
+
+    #[test]
+    fn reorder_to_is_a_noop_for_an_unknown_id() {
+        let ids: Vec<SolutionSessionId> = (0..3).map(|_| SolutionSessionId::new()).collect();
+        let unknown = SolutionSessionId::new();
+        assert_eq!(reorder_to(&ids, unknown, ids[0]), ids);
+        assert_eq!(reorder_to(&ids, ids[0], unknown), ids);
+    }
+
+    #[test]
+    fn reorder_to_handles_the_boundary_positions() {
+        let ids: Vec<SolutionSessionId> = (0..4).map(|_| SolutionSessionId::new()).collect();
+        // Dragging the first tab all the way past every other tab lands it
+        // just before the last one (there is no separate "append past the
+        // last tab" drop zone in this strip — see the module's drag-reorder
+        // notes in the phase-2a task-5b report).
+        assert_eq!(
+            reorder_to(&ids, ids[0], ids[3]),
+            vec![ids[1], ids[2], ids[0], ids[3]]
+        );
+        // Dragging the last tab onto the first becomes the new first tab.
+        assert_eq!(
+            reorder_to(&ids, ids[3], ids[0]),
+            vec![ids[3], ids[0], ids[1], ids[2]]
+        );
+    }
+
+    #[test]
+    fn is_busy_state_matches_running_and_stopping_only() {
+        use crate::model::SessionState;
+        use std::time::Instant;
+
+        assert!(is_busy_state(&SessionState::Running {
+            started_at: Instant::now(),
+            notified: false,
+        }));
+        assert!(is_busy_state(&SessionState::Stopping {
+            started_at: Instant::now(),
+        }));
+        assert!(!is_busy_state(&SessionState::Idle));
+        assert!(!is_busy_state(&SessionState::AwaitingInput));
+        assert!(!is_busy_state(&SessionState::Errored(SharedString::from(
+            "boom"
+        ))));
     }
 
     #[test]
