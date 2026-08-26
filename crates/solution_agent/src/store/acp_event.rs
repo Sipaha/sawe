@@ -196,6 +196,12 @@ impl SolutionAgentStore {
                 // leaving the observer dormant until the user notices and
                 // flips the Eye toggle back on themselves.
                 self.clear_terminal_quota_stop(session_id, cx);
+                // A usage wall is account-wide: this same round trip is also
+                // evidence for every OTHER session parked the same way, not
+                // just this one — otherwise a Disabled-by-park sibling (e.g.
+                // a background agent) stays dormant since a disabled session
+                // is never driven by tick_supervisor on its own.
+                self.clear_sibling_quota_stops(session_id, cx);
                 // A completed turn is genuinely-new state: cancel any parked
                 // one-shot `wait`. Otherwise, if the agent self-resumed and
                 // FINISHED before the wait deadline, the mechanism would still

@@ -3139,3 +3139,205 @@ async fn disabled_supervisor_survives_wall_then_successful_turn(cx: &mut TestApp
         });
     });
 }
+
+// ---------------------------------------------------------------------------
+// Defect B: a usage wall is account-wide, so a successful turn on ANY session
+// must also lift every OTHER session parked in Stopped(Quota) — store-wide,
+// since `supervisor_states` has no per-Solution nesting.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn successful_turn_clears_sibling_stopped_quota(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    let sibling_id = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let (solution_id, agent_id) = {
+                let s = store.session(session_id).unwrap();
+                let s = s.read(cx);
+                (s.solution_id, s.agent_id.clone())
+            };
+            let sibling_id = crate::model::SolutionSessionId::new();
+            crate::store::tests::insert_cold_session(
+                sibling_id,
+                solution_id,
+                agent_id,
+                None,
+                None,
+                store,
+                cx,
+            );
+            // Real terminal-park path: enable, then an unparseable wall —
+            // exactly what `apply_usage_limit_stop` produces in production.
+            store.set_supervision_enabled(sibling_id, true, cx);
+            store.apply_usage_limit_stop(sibling_id, "usage limit reached", cx);
+            sibling_id
+        })
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&sibling_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Stopped(
+                    crate::supervisor::StoppedReason::Quota
+                ),
+                "sanity: sibling parked in terminal quota stop"
+            );
+        });
+    });
+
+    // The reporting session's own turn succeeds — it is NOT itself parked, an
+    // ordinary Watching supervisor, so this exercises the "any session's
+    // success is evidence for all" propagation rather than the single-session
+    // clear covered by `successful_turn_resurrects_terminal_quota_stop`.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+        });
+    });
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&sibling_id).expect("state");
+            assert_eq!(
+                st.status,
+                crate::supervisor::SupervisorStatus::Watching,
+                "a sibling's terminal quota stop must be lifted by another session's \
+                 successful turn"
+            );
+            assert!(st.enabled, "the sibling's enabled flag must be restored too");
+            assert_eq!(st.next_eligible_ms, None);
+            assert_eq!(st.backoff_attempt, 0);
+            assert!(!store.backoff_timers.contains_key(&sibling_id));
+        });
+    });
+}
+
+#[gpui::test]
+async fn successful_turn_does_not_touch_non_quota_siblings(cx: &mut TestAppContext) {
+    // The hard boundary: Disabled / Held / Stopped(ProviderError) siblings
+    // must never be swept, regardless of another session's success. Every
+    // negative is driven through the real API that produces that status in
+    // production, not a hand-written `SupervisorState`.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    let (solution_id, agent_id) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let s = store.session(session_id).unwrap();
+            let s = s.read(cx);
+            (s.solution_id, s.agent_id.clone())
+        })
+    });
+
+    let disabled_id = crate::model::SolutionSessionId::new();
+    let held_id = crate::model::SolutionSessionId::new();
+    let provider_error_id = crate::model::SolutionSessionId::new();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            for id in [disabled_id, held_id, provider_error_id] {
+                crate::store::tests::insert_cold_session(
+                    id,
+                    solution_id,
+                    agent_id.clone(),
+                    None,
+                    None,
+                    store,
+                    cx,
+                );
+            }
+            // Disabled via the real Eye toggle.
+            store.set_supervision_enabled(disabled_id, true, cx);
+            store.set_supervision_enabled(disabled_id, false, cx);
+
+            // Held via the real Stop-button API.
+            store.set_supervision_enabled(held_id, true, cx);
+            store.hold_supervisor(held_id, cx);
+
+            // Stopped(ProviderError) via real backoff exhaustion: 9 transient
+            // judge failures (BACKOFF_SCHEDULE_MINS has 8 entries, so the 9th
+            // gives up). "network connection error" does not match any
+            // usage-limit wall phrasing, so `classify_judge_error` reads it as
+            // Transient, not Quota.
+            store.set_supervision_enabled(provider_error_id, true, cx);
+            for _ in 0..9 {
+                store.on_judge_failed(
+                    provider_error_id,
+                    "network connection error".to_string(),
+                    cx,
+                );
+            }
+        });
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store
+                    .supervisor_states
+                    .get(&provider_error_id)
+                    .unwrap()
+                    .status,
+                crate::supervisor::SupervisorStatus::Stopped(
+                    crate::supervisor::StoppedReason::ProviderError
+                ),
+                "sanity: backoff-exhausted provider error"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+        });
+    });
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::EndTurn,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.supervisor_states.get(&disabled_id).unwrap().status,
+                crate::supervisor::SupervisorStatus::Disabled,
+                "a Disabled sibling must never be swept"
+            );
+            assert_eq!(
+                store.supervisor_states.get(&held_id).unwrap().status,
+                crate::supervisor::SupervisorStatus::Held,
+                "a Held sibling must never be swept"
+            );
+            assert_eq!(
+                store
+                    .supervisor_states
+                    .get(&provider_error_id)
+                    .unwrap()
+                    .status,
+                crate::supervisor::SupervisorStatus::Stopped(
+                    crate::supervisor::StoppedReason::ProviderError
+                ),
+                "a Stopped(ProviderError) sibling must never be swept"
+            );
+        });
+    });
+}

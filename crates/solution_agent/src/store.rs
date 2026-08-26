@@ -2325,13 +2325,11 @@ impl SolutionAgentStore {
     /// about the judge-SPAWN path specifically and can have causes unrelated
     /// to whether the user's ordinary turns succeed, so auto-resurrecting it
     /// risks a flapping judge loop; a user can still re-enable it explicitly
-    /// via the Eye toggle. And deliberately scoped to THIS session only, not
-    /// solution/account-wide: propagating to sibling sessions would need to
-    /// reach past `Disabled`/`Held` states on OTHER sessions too, multiplying
-    /// the ways this could accidentally resurrect a deliberately-off
-    /// supervisor; each session's own next real activity re-derives its own
-    /// correct `next_eligible_ms` independently (and does so accurately now
-    /// that the reset-time parser handles the month-day form).
+    /// via the Eye toggle.
+    ///
+    /// Scoped to `id` itself only — see [`clear_sibling_quota_stops`] for the
+    /// store-wide propagation to OTHER sessions parked the same way, called
+    /// right after this at the same call site.
     ///
     /// Never touches `Disabled` (user Eye-toggle-off) or `Held` (user Stop) —
     /// both use their own status values, so this is a no-op for them.
@@ -2351,6 +2349,57 @@ impl SolutionAgentStore {
         ) {
             return;
         }
+        self.lift_quota_stop(id, cx);
+    }
+
+    /// Lift every OTHER session's terminal `Stopped(StoppedReason::Quota)`
+    /// park on `id`'s completed turn, alongside [`clear_terminal_quota_stop`]
+    /// on `id` itself. A Claude usage wall is account-wide, not per-session —
+    /// ANY session's successful round trip is evidence the wall lifted for
+    /// every session still parked waiting on it, not just the one that
+    /// happened to produce this turn. Store-wide, not per-Solution:
+    /// `supervisor_states` is a flat map with no Solution nesting, and the
+    /// wall itself is per-account, matching that shape directly.
+    ///
+    /// This is the ONLY thing that revives a sibling parked this way — a
+    /// terminal quota stop also forces `enabled = false`, and a disabled
+    /// session is never driven by `tick_supervisor` at all, so without this a
+    /// background sibling would sit fully dormant until the user noticed and
+    /// re-enabled its Eye toggle by hand.
+    ///
+    /// Excludes `id` (handled by `clear_terminal_quota_stop` instead) purely
+    /// to avoid a redundant double persist — the effect would be identical
+    /// either way. Never touches `Disabled`, `Held`, or any OTHER
+    /// `Stopped(_)` reason (`ProviderError`, `Done`): those are the user's
+    /// explicit choice or a different failure class, not evidence a quota
+    /// wall lifted. Idempotent.
+    pub(crate) fn clear_sibling_quota_stops(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::supervisor::{StoppedReason, SupervisorStatus};
+        let siblings: Vec<SolutionSessionId> = self
+            .supervisor_states
+            .iter()
+            .filter(|(sibling_id, s)| {
+                **sibling_id != id
+                    && matches!(s.status, SupervisorStatus::Stopped(StoppedReason::Quota))
+            })
+            .map(|(sibling_id, _)| *sibling_id)
+            .collect();
+        for sibling_id in siblings {
+            self.lift_quota_stop(sibling_id, cx);
+        }
+    }
+
+    /// Shared restoration for a session parked in `Stopped(StoppedReason::Quota)`:
+    /// re-enable, return to `Watching`, and clear the resume gate + its wake
+    /// timer. Used by both [`clear_terminal_quota_stop`] (the reporting
+    /// session) and [`clear_sibling_quota_stops`] (every other parked
+    /// session) so the two apply identical treatment.
+    fn lift_quota_stop(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        use crate::supervisor::SupervisorStatus;
         if let Some(state) = self.supervisor_states.get_mut(&id) {
             state.enabled = true;
             state.status = SupervisorStatus::Watching;
