@@ -529,11 +529,35 @@ impl Render for SessionTabStrip {
             // right-click menu offers — otherwise a session that spills
             // past `MAX_VISIBLE_TABS` becomes unreachable for rename/
             // restart/close from the UI (constraint C, phase-2a task-5b
-            // brief). A `ContextMenu` entry only fires a single click
-            // handler, so each overflow row is a `submenu` instead: "Select"
-            // reproduces the old plain-entry click, the rest mirror the
-            // visible tab's menu exactly. Submenus open on hover per
-            // `ContextMenu`'s own idiom (see repo `.rules`).
+            // brief).
+            //
+            // Tried first: a `custom_row` (opts out of `ContextMenu`'s own
+            // click/dismiss machinery, `selectable: false`) hosting the SAME
+            // `right_click_menu`-wrapped row a visible tab uses, so the
+            // whole strip would share one interaction model. It does not
+            // work: `ContextMenu::build`/`new` unconditionally wires
+            // `cx.on_blur(focus_handle, ...)` to `cancel()` → `emit(
+            // DismissEvent)` the instant the menu's focus_handle loses
+            // focus (context_menu.rs ~273-296), and `right_click_menu`'s own
+            // right-click handler grabs focus for its freshly-built inner
+            // `ContextMenu` two frames later — which blurs whatever
+            // currently holds focus, here the "more" popover's OUTER
+            // `ContextMenu`. That immediately dismisses the outer menu,
+            // which tears down its whole deferred child tree — including
+            // the row and the inner menu nested inside it — before the
+            // inner menu ever gets to render. Confirmed live: a right-click
+            // on an overflow row closes the entire popover, no nested menu
+            // appears. The one escape hatch for this exact race
+            // (`ignore_blur_until`, used internally for submenu-vs-parent
+            // blur races) is a private field with no public setter beyond
+            // wholesale-replacing the blur subscription — fixing this
+            // properly means reworking shared `ui::ContextMenu` internals,
+            // out of scope here. So: each overflow row is a `submenu`
+            // instead. "Select" reproduces the old plain-entry click, the
+            // rest mirror the visible tab's menu exactly. Submenus open on
+            // hover per `ContextMenu`'s own idiom (see repo `.rules`) — a
+            // second interaction model from the visible tabs' right-click,
+            // but a working one.
             let overflow_entries: Vec<(SolutionSessionId, SharedString)> = overflow
                 .iter()
                 .map(|c| {
