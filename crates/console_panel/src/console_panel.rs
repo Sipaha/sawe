@@ -145,13 +145,21 @@ fn handle_show_session(
     let Ok(session_id) = SolutionSessionId::parse(&action.session_id) else {
         return;
     };
-    let Some(solution_id) = SolutionAgentStore::global(cx)
-        .read(cx)
-        .session(session_id)
-        .map(|session| session.read(cx).solution_id)
-    else {
+    let Some(session) = SolutionAgentStore::global(cx).read(cx).session(session_id) else {
         return;
     };
+    // The band would happily paint any session in the store, but the strip
+    // only builds tabs for the ones `can_be_active_dialog` admits — an
+    // ephemeral helper or a session with no `tab_order` would leave the user a
+    // dialog with no tab, and no way to deselect it. Persisted, so it survives
+    // a restart; an MCP-driven `ShowSession` must not be able to leave the
+    // band reopening on a tab-less sub-agent dialog.
+    let (solution_id, selectable) = session.read_with(cx, |session, _| {
+        (session.solution_id, session.can_be_active_dialog())
+    });
+    if !selectable {
+        return;
+    }
     SolutionAgentStore::global(cx).update(cx, |store, cx| {
         store.set_active_dialog_session(solution_id, Some(session_id), cx);
     });

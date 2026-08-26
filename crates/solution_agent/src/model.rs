@@ -680,6 +680,19 @@ impl SolutionSession {
         }
     }
 
+    /// Whether this session may be the Solution band's active dialog.
+    ///
+    /// The band resolves its dialog through `SolutionAgentStore::session`,
+    /// but the tab strip builds its tabs from a narrower set
+    /// (`session_tab_strip::candidates_for`), so selecting a session the
+    /// strip filters out paints a dialog with no tab to switch away from —
+    /// and since the selection is persisted, it comes back that way after a
+    /// restart. Every path that selects a dialog must ask this first; it is
+    /// the same predicate `candidates_for` applies.
+    pub fn can_be_active_dialog(&self) -> bool {
+        !self.is_ephemeral && !self.is_supervisor_ephemeral && self.tab_order.is_some()
+    }
+
     /// `true` when this session was restored from the DB but the agent
     /// subprocess hasn't been spawned yet — so rendering must come
     /// from `entries` (the cold-restored prefix) rather than `acp_thread.entries()`.

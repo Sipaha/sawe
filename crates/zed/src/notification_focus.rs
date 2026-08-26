@@ -118,7 +118,15 @@ pub fn focus_session(session_id: SolutionSessionId, cx: &mut App) {
     // 3. Select the session as the Solution band's active dialog — a store
     // mutation, not a panel lookup, since chat tabs left `ConsolePanel` for
     // the band (phase 2a task 5). `SolutionBand` reads this selection
-    // directly, so there is no dock/panel to reveal any more.
+    // directly, so there is no dock/panel to reveal any more. Gated on
+    // `can_be_active_dialog` for the same reason as the `ShowSession` handler
+    // this path mirrors: a session the tab strip filters out would be painted
+    // with no tab to leave it by, and the selection is persisted. The window
+    // was still raised and its Solution activated above — that part is
+    // correct regardless of which session the notification came from.
+    if !session.read(cx).can_be_active_dialog() {
+        return;
+    }
     SolutionAgentStore::global(cx).update(cx, |store, cx| {
         store.set_active_dialog_session(solution_id, Some(session_id), cx);
     });

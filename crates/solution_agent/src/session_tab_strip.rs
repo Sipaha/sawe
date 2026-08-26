@@ -322,9 +322,11 @@ impl SessionTabStrip {
             .iter()
             .filter_map(|session| {
                 let session = session.read(cx);
-                if session.is_supervisor_ephemeral || session.is_ephemeral {
+                if !session.can_be_active_dialog() {
                     return None;
                 }
+                // Re-asked only to extract the value the predicate above
+                // already established is present.
                 let tab_order = session.tab_order?;
                 Some(TabCandidate {
                     session_id: session.id,
@@ -907,6 +909,28 @@ mod tests {
             })
         });
         assert_eq!(indexed, vec![id_b, id_a, id_child]);
+
+        // The band resolves its dialog through `store.session(..)`, which sees
+        // all three; every path that SELECTS a dialog must instead ask
+        // `can_be_active_dialog`, or it can persist a selection pointing at a
+        // session the strip refuses to draw a tab for — leaving the user a
+        // dialog they cannot leave, across restarts.
+        let selectable = cx.update(|cx| {
+            SolutionAgentStore::global(cx).read_with(cx, |store, cx| {
+                [id_b, id_a, id_child]
+                    .map(|id| {
+                        store
+                            .session(id)
+                            .is_some_and(|session| session.read(cx).can_be_active_dialog())
+                    })
+                    .to_vec()
+            })
+        });
+        assert_eq!(
+            selectable,
+            vec![true, true, false],
+            "the dialog-selection predicate must admit exactly what `candidates_for` tabs"
+        );
 
         assert_eq!(
             *tabs_opened.borrow(),
