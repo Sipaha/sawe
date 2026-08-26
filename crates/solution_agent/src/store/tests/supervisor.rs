@@ -3341,3 +3341,88 @@ async fn successful_turn_does_not_touch_non_quota_siblings(cx: &mut TestAppConte
         });
     });
 }
+
+// ---------------------------------------------------------------------------
+// Defect C: `Stopped(_)` matched ANY stop reason, so a user-cancelled turn
+// (which proves nothing about whether the wall lifted — the cancel can land
+// before any successful API call) was un-parking every Stopped(Quota)
+// session in the store, including itself. Only a stop reason that proves a
+// completed round trip to the model may clear the quota park.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn cancelled_turn_does_not_clear_quota_stop_self_or_sibling(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    let sibling_id = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let (solution_id, agent_id) = {
+                let s = store.session(session_id).unwrap();
+                let s = s.read(cx);
+                (s.solution_id, s.agent_id.clone())
+            };
+            let sibling_id = crate::model::SolutionSessionId::new();
+            crate::store::tests::insert_cold_session(
+                sibling_id,
+                solution_id,
+                agent_id,
+                None,
+                None,
+                store,
+                cx,
+            );
+            // Real terminal-park path for BOTH the reporting session and a
+            // sibling, so this exercises the "does not un-park itself either"
+            // half alongside the sibling-propagation half.
+            store.set_supervision_enabled(session_id, true, cx);
+            store.apply_usage_limit_stop(session_id, "usage limit reached", cx);
+            store.set_supervision_enabled(sibling_id, true, cx);
+            store.apply_usage_limit_stop(sibling_id, "usage limit reached", cx);
+            sibling_id
+        })
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            for id in [session_id, sibling_id] {
+                assert_eq!(
+                    store.supervisor_states.get(&id).unwrap().status,
+                    crate::supervisor::SupervisorStatus::Stopped(
+                        crate::supervisor::StoppedReason::Quota
+                    ),
+                    "sanity: both sessions parked in terminal quota stop"
+                );
+            }
+        });
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::Cancelled,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.supervisor_states.get(&session_id).unwrap().status,
+                crate::supervisor::SupervisorStatus::Stopped(
+                    crate::supervisor::StoppedReason::Quota
+                ),
+                "a cancelled turn must NOT lift its own terminal quota stop — \
+                 the cancel proves nothing about whether the wall lifted"
+            );
+            assert_eq!(
+                store.supervisor_states.get(&sibling_id).unwrap().status,
+                crate::supervisor::SupervisorStatus::Stopped(
+                    crate::supervisor::StoppedReason::Quota
+                ),
+                "a cancelled turn must NOT propagate an un-park to siblings either"
+            );
+        });
+    });
+}

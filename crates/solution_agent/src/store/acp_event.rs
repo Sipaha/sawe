@@ -181,7 +181,7 @@ impl SolutionAgentStore {
                     self.observe_task_notification(session_id, idx, cx);
                 }
             }
-            acp_thread::AcpThreadEvent::Stopped(_) => {
+            acp_thread::AcpThreadEvent::Stopped(stop_reason) => {
                 // A turn that runs to `Stopped` is proof the agent responded —
                 // cancel any pending usage-limit / backoff resume gate so the
                 // session isn't kept waiting (and a stale wake timer doesn't
@@ -189,19 +189,49 @@ impl SolutionAgentStore {
                 // re-hit of the wall arrives as `Error`, not `Stopped`, so the
                 // gate survives that case.
                 self.clear_resume_gate_on_agent_response(session_id, cx);
-                // Stronger still: a completed turn also lifts a TERMINAL
-                // `Stopped(Quota)` stop (the wall parked with no reset time
-                // parsed, which disabled supervision outright) — the round
-                // trip just proved the wall is gone, so re-arm it rather than
-                // leaving the observer dormant until the user notices and
-                // flips the Eye toggle back on themselves.
-                self.clear_terminal_quota_stop(session_id, cx);
-                // A usage wall is account-wide: this same round trip is also
-                // evidence for every OTHER session parked the same way, not
-                // just this one — otherwise a Disabled-by-park sibling (e.g.
-                // a background agent) stays dormant since a disabled session
-                // is never driven by tick_supervisor on its own.
-                self.clear_sibling_quota_stops(session_id, cx);
+                // Not every `Stopped` proves a round trip to the model
+                // actually completed. `StopReason` is `#[non_exhaustive]`
+                // upstream, so this match needs a wildcard arm even though
+                // every current variant is listed explicitly below — that's
+                // deliberate: a future variant should force a conscious
+                // decision here, not silently inherit "wall lifted".
+                let response_proves_wall_lifted = match stop_reason {
+                    // Ordinary end of turn: unambiguous round trip.
+                    acp::StopReason::EndTurn
+                    // The agent kept producing output until it hit a
+                    // token/request cap — still requires a live round trip,
+                    // just a longer one. Not evidence of a wall.
+                    | acp::StopReason::MaxTokens
+                    | acp::StopReason::MaxTurnRequests
+                    // A refusal IS a model response: the API answered and
+                    // the agent chose not to continue. Proves the wall is
+                    // not up, even though the content isn't useful.
+                    | acp::StopReason::Refusal => true,
+                    // The user pressed Stop. This can land before any
+                    // successful API call ever went out, so it proves
+                    // nothing about the wall's state — must NOT un-park.
+                    acp::StopReason::Cancelled => false,
+                    // Unknown/future variant: default to "not proven" —
+                    // un-parking wakes every sibling parked on the same
+                    // wall, so an unrecognized reason should not trigger
+                    // that blast radius until someone reviews it here.
+                    _ => false,
+                };
+                if response_proves_wall_lifted {
+                    // Stronger still: a completed turn also lifts a TERMINAL
+                    // `Stopped(Quota)` stop (the wall parked with no reset time
+                    // parsed, which disabled supervision outright) — the round
+                    // trip just proved the wall is gone, so re-arm it rather than
+                    // leaving the observer dormant until the user notices and
+                    // flips the Eye toggle back on themselves.
+                    self.clear_terminal_quota_stop(session_id, cx);
+                    // A usage wall is account-wide: this same round trip is also
+                    // evidence for every OTHER session parked the same way, not
+                    // just this one — otherwise a Disabled-by-park sibling (e.g.
+                    // a background agent) stays dormant since a disabled session
+                    // is never driven by tick_supervisor on its own.
+                    self.clear_sibling_quota_stops(session_id, cx);
+                }
                 // A completed turn is genuinely-new state: cancel any parked
                 // one-shot `wait`. Otherwise, if the agent self-resumed and
                 // FINISHED before the wait deadline, the mechanism would still
