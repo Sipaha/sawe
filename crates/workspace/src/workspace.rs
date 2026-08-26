@@ -1402,6 +1402,11 @@ pub struct Workspace {
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
     project_toolbar_item: Option<AnyView>,
+    /// The Solution band — a full-width region between the project zone and the
+    /// status bar, hosting the active AI dialog beside the utility section.
+    /// Populated by the crate that owns the band, the same way `title_bar`
+    /// populates `project_toolbar_item`: `workspace` cannot depend on it.
+    solution_band_item: Option<AnyView>,
     run_config_strip: Option<AnyView>,
     run_config_controller: Option<AnyEntity>,
     notifications: Notifications,
@@ -1872,6 +1877,7 @@ impl Workspace {
             toast_layer,
             titlebar_item: None,
             project_toolbar_item: None,
+            solution_band_item: None,
             run_config_strip: None,
             run_config_controller: None,
             notifications: Notifications::default(),
@@ -3138,6 +3144,16 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn set_solution_band_item(
+        &mut self,
+        item: AnyView,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.solution_band_item = Some(item);
+        cx.notify();
+    }
+
     pub fn set_run_config_strip(&mut self, strip: AnyView, cx: &mut Context<Self>) {
         self.run_config_strip = Some(strip);
         cx.notify();
@@ -3305,6 +3321,10 @@ impl Workspace {
 
     pub fn project_toolbar_item(&self) -> Option<AnyView> {
         self.project_toolbar_item.clone()
+    }
+
+    pub fn solution_band_item(&self) -> Option<AnyView> {
+        self.solution_band_item.clone()
     }
 
     /// Call the given callback with a workspace whose project is local or remote via WSL (allowing host access).
@@ -9130,6 +9150,7 @@ impl Render for Workspace {
                             }))
                             .children(self.render_notifications(window, cx)),
                     )
+                    .children(self.solution_band_item.clone())
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())
                     })
@@ -11323,6 +11344,37 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use util::rel_path::rel_path;
+
+    #[gpui::test]
+    async fn solution_band_item_renders_between_the_workspace_area_and_the_status_bar(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, _window, _cx| {
+            assert!(
+                workspace.solution_band_item().is_none(),
+                "a fresh workspace has no band"
+            );
+        });
+
+        let band = cx.new(|_| BandProbe);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_solution_band_item(band.clone().into(), window, cx);
+            assert!(workspace.solution_band_item().is_some());
+        });
+    }
+
+    struct BandProbe;
+    impl Render for BandProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().id("band-probe").h(px(120.))
+        }
+    }
 
     #[test]
     fn test_dock_resize_handle_tracks_cursor() {
