@@ -1,4 +1,3 @@
-use crate::SolutionStore;
 use anyhow::Context as _;
 use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;
@@ -233,82 +232,25 @@ fn enrich_clickables(
     clickables
 }
 
-/// Synthesize what the TitleBar would render for this workspace, without
-/// reaching into the title_bar crate's internals. Mirrors the matching
-/// logic in `crates/title_bar/src/title_bar.rs::TitleBar::active_solution`
-/// + `effective_active_worktree`. Surfacing this here lets autonomous
-/// agents assert on the title bar's semantic content via dump_visual_structure
-/// without needing real-pixel rendering.
-fn build_title_bar_node(workspace: &workspace::Workspace, cx: &App) -> VisualNode {
-    let project = workspace.project().read(cx);
-    let mut children: Vec<VisualNode> = Vec::new();
-
-    // Pick the same worktree the title bar would: the one owning the
-    // active repository, falling back to the first visible worktree.
-    let active_worktree = project
-        .active_repository(cx)
-        .and_then(|repo| {
-            let repo_path = repo.read(cx).work_directory_abs_path.clone();
-            project.visible_worktrees(cx).find(|tree| {
-                let p = tree.read(cx).abs_path();
-                *p == *repo_path || p.starts_with(repo_path.as_ref())
-            })
-        })
-        .or_else(|| project.visible_worktrees(cx).next());
-    let active_worktree_path = active_worktree
-        .as_ref()
-        .map(|tree| tree.read(cx).abs_path());
-
-    if let Some(path) = &active_worktree_path
-        && let Some(store) = SolutionStore::try_global(cx)
-    {
-        let segment = store.read_with(cx, |s, _| {
-            s.solution_for_path(path).map(|sol| sol.name.clone())
-        });
-        if let Some(name) = segment {
-            children.push(VisualNode {
-                kind: "SolutionSegment".to_string(),
-                label: Some(name),
-                visible: true,
-                focused: false,
-                children: Vec::new(),
-            });
-        }
-    }
-
-    if let Some(tree) = active_worktree {
-        let tree = tree.read(cx);
-        let name = tree.root_name_str().to_string();
-        if !name.is_empty() {
-            children.push(VisualNode {
-                kind: "ProjectName".to_string(),
-                label: Some(name),
-                visible: true,
-                focused: false,
-                children: Vec::new(),
-            });
-        }
-    }
-
-    if let Some(repo) = project.active_repository(cx) {
-        let repo = repo.read(cx);
-        if let Some(branch) = repo.branch.as_ref().map(|b| b.name().to_string()) {
-            children.push(VisualNode {
-                kind: "Branch".to_string(),
-                label: Some(branch),
-                visible: true,
-                focused: false,
-                children: Vec::new(),
-            });
-        }
-    }
-
+/// Synthesize the TitleBar node.
+///
+/// Only the bar's presence is reported: this function does not walk the
+/// title bar's real element tree, so it can only describe children it has
+/// been taught about by hand. It used to synthesize `SolutionSegment`,
+/// `ProjectName` and `Branch` from the workspace's active worktree and
+/// repository, mirroring upstream's project-info chain. That chain is no
+/// longer painted — `TitleBar::render` replaced it wholesale with the
+/// solution tab strip, and the branch widget moved to `ProjectToolbar` — and
+/// a hand-written child that no longer matches what is painted is worse than
+/// no child at all (same reasoning as `build_status_bar_node` below). Use
+/// `workspace.screenshot` to see the bar's real contents.
+fn build_title_bar_node(_workspace: &workspace::Workspace, _cx: &App) -> VisualNode {
     VisualNode {
         kind: "TitleBar".to_string(),
         label: None,
         visible: true,
         focused: false,
-        children,
+        children: Vec::new(),
     }
 }
 
