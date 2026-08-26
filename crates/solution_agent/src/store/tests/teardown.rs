@@ -534,11 +534,11 @@ async fn cold_close_solution_keeps_sessions_restorable(cx: &mut gpui::TestAppCon
 /// main_len`. Do not delete this because it looks tautological.
 #[gpui::test]
 async fn cold_close_solution_does_not_rewrite_cold_session_rows(cx: &mut gpui::TestAppContext) {
-    let (store, live_id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (store, seeded_id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
     let (db, sol) = store.update(cx, |store, cx| {
         (
             store.persistence().expect("persistence"),
-            store.session(live_id).expect("session").read(cx).solution_id,
+            store.session(seeded_id).expect("session").read(cx).solution_id,
         )
     });
 

@@ -203,19 +203,42 @@ impl SolutionAgentStore {
     ///   widened that to every transcript on disk: a real database here carries
     ///   ~18 open sessions whose cwd points at long-removed members, and this
     ///   loop purges every orphan it can see on ANY `Changed`, not just ones
-    ///   under the member that was just removed. The liveness gate restores the
-    ///   old blast radius exactly.
+    ///   under the member that was just removed.
     /// * Trust in `cwd`. A cold session's in-memory `cwd` is only as fresh as
     ///   the `metas` snapshot hydration read from the DB. A member/solution
     ///   rename that lands mid-hydration is fixed in the DB by
     ///   `rewrite_session_cwds_for_move`, but that runs on `PathsMoved` and
     ///   finds nothing in `by_solution` yet, so the foreground block goes on to
     ///   build entities from the pre-rename paths — which read as orphans here.
-    ///   A live session cannot have that problem: its `cwd` was either set at
-    ///   create time or rewritten in place by the same helper.
     ///
     /// So the cold backlog stays a decision the maintainer makes from the log,
     /// not a deletion the editor makes on their behalf.
+    ///
+    /// # What this gate does NOT cover
+    ///
+    /// It closes the destructive-**without-user-action** case, which is the one
+    /// that matters here: nothing the editor does on its own — a solution open,
+    /// a member add/remove, any other `Changed` — can now delete a transcript
+    /// the user has not touched this run. It does **not** make a stale `cwd`
+    /// unpurgeable, because a live session's `cwd` is NOT guaranteed fresh:
+    ///
+    /// * `reset_context` (`/clear`) deliberately supports cold sessions — it
+    ///   resolves a headless project rather than bailing — and finishes with
+    ///   `set_acp_thread(Some(..))` without ever assigning `s.cwd`. So it warms
+    ///   the session with its stale path intact.
+    /// * `resume_session` does not guarantee one either. It tries
+    ///   `[meta.cwd, solution.root]` with the persisted path FIRST and on
+    ///   purpose (claude buckets its JSONL by the creation-time cwd), then does
+    ///   `session.cwd = resume_cwd`. A member rename leaves a compat symlink at
+    ///   the old path (`solutions::rename`), so the stale candidate *succeeds* —
+    ///   yielding a live session still holding the pre-rename cwd.
+    ///
+    /// Either way the user has to act on that specific session first. This is
+    /// the pre-existing hazard in
+    /// `docs/findings/2026-07-14-rename-purges-open-sessions.md`, it behaves
+    /// identically before and after cold sessions entered `by_solution`, and
+    /// fixing it means settling the cwd-rewrite question that decision #89
+    /// rules out. Do not read the gate as "stale cwds are now safe".
     pub(crate) fn gc_orphan_members(&mut self, cx: &mut Context<Self>) {
         let Some(store) = SolutionStore::try_global(cx) else {
             return;
