@@ -216,11 +216,26 @@ impl SolutionAgentStore {
     ///
     /// # What this gate does NOT cover
     ///
-    /// It closes the destructive-**without-user-action** case, which is the one
-    /// that matters here: nothing the editor does on its own — a solution open,
-    /// a member add/remove, any other `Changed` — can now delete a transcript
-    /// the user has not touched this run. It does **not** make a stale `cwd`
-    /// unpurgeable, because a live session's `cwd` is NOT guaranteed fresh:
+    /// It closes the destructive-**without-user-action** case *for this loop*:
+    /// no `Changed` the editor raises on its own — a solution open, a member
+    /// add/remove, anything else — can make `gc_orphan_members` delete a
+    /// transcript the user has not touched this run. It does not make that
+    /// true of the editor as a whole. Two things it leaves open.
+    ///
+    /// First, `gc_orphan_solutions` — dispatched one line AHEAD of this one on
+    /// the very same `Changed` — has no liveness gate, and reaches
+    /// `purge_solution_fully` → `purge_session_hard` for every id in
+    /// `by_solution[sid]`, cold ones included. What keeps that harmless today
+    /// is not a gate but its orphan test: "no longer in
+    /// `SolutionStore::solutions()`", a set mutated only by explicit lifecycle
+    /// operations (and a real delete additionally emits the authoritative
+    /// `Deleted`). So the standing invariant is "a solution the user did not
+    /// remove is never seen as an orphan" — anything that could drop a solution
+    /// from the store without user action would hard-purge every cold
+    /// transcript under it with nothing in the way.
+    ///
+    /// Second, it does **not** make a stale `cwd` unpurgeable, because a live
+    /// session's `cwd` is NOT guaranteed fresh:
     ///
     /// * `reset_context` (`/clear`) deliberately supports cold sessions — it
     ///   resolves a headless project rather than bailing — and finishes with
