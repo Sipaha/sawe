@@ -1263,12 +1263,31 @@ impl SolutionAgentStore {
                     let rows = rows_per_session.remove(&meta.id);
                     let migrating = rows.is_none();
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
+                    // Same precedence as `restore_open_tabs`: the metadata
+                    // columns first, the legacy blob only as a fallback for
+                    // rows written before those columns existed. Without this
+                    // a cold tab's status row renders with no model and no
+                    // effort until the user's first send re-derives them --
+                    // which the band now puts on screen at every restart,
+                    // since it reopens straight onto a cold session.
+                    let mut restored_available_models = meta.cached_models.clone();
+                    let mut restored_desired_model = meta.desired_model.clone();
+                    let mut restored_desired_effort = meta.desired_effort.clone();
                     let entries = if let Some(rows) = rows {
                         entries_from_rows(rows)
                     } else {
                         let persisted = blobs.remove(&meta.id).and_then(|bytes| {
                             serde_json::from_slice::<PersistedSession>(&bytes).ok()
                         });
+                        if let Some(persisted) = persisted.as_ref() {
+                            if restored_available_models.is_empty() {
+                                restored_available_models = persisted.available_models.clone();
+                            }
+                            restored_desired_model = restored_desired_model
+                                .or_else(|| persisted.desired_model.clone());
+                            restored_desired_effort = restored_desired_effort
+                                .or_else(|| persisted.desired_effort.clone());
+                        }
                         let restored_created_ms = persisted
                             .as_ref()
                             .map(|p| p.entry_created_ms.clone())
@@ -1311,6 +1330,9 @@ impl SolutionAgentStore {
                         s.cached_total_tokens = meta.total_tokens;
                         s.parent_session_id = meta.parent_session_id;
                         s.tab_order = session_tab_order;
+                        s.cached_models = restored_available_models;
+                        s.desired_model = restored_desired_model;
+                        s.desired_effort = restored_desired_effort;
                         s
                     });
                     // `by_solution` is populated in one pass after the loop —
@@ -1321,6 +1343,11 @@ impl SolutionAgentStore {
                     // rows-empty). Blob kept (model/effort fallback; Task 5).
                     if migrating {
                         this.persist_all_rows(meta.id, cx);
+                        // Flush the model/effort just recovered from the blob
+                        // into the metadata columns, so the next restore --
+                        // which takes the rows branch and never reads the blob
+                        // -- still has them.
+                        this.persist_session_row(meta.id, cx);
                     }
                     hydrated.push(meta.id);
                 }

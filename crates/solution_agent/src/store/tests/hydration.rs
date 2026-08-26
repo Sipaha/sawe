@@ -1060,6 +1060,86 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
 /// must still carry the same `desired_model`. This proves that
 /// `persist_session_row` is called during migration, flushing the recovered
 /// model/effort to the metadata columns before the blob path is bypassed.
+/// The production hydration path must seed the model/effort a cold tab's status
+/// row renders. It used to leave all three at their defaults, which was
+/// invisible while cold tabs were unreachable and self-healed on first use;
+/// the Solution band reopens directly onto a cold session, so the blank label
+/// is now on screen at every restart.
+#[gpui::test]
+async fn hydrate_all_restores_model_and_effort(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id,
+        solution_id,
+        agent_id: SharedString::from("claude-acp"),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        title: SharedString::from("cold"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: Some("opus".into()),
+        desired_effort: Some("high".into()),
+        cached_models: vec![claude_native::ModelInfo {
+            value: "opus".into(),
+            display_name: "Opus".into(),
+            description: String::new(),
+        }],
+        tab_order: None,
+    };
+    db.save_metadata(meta).await.expect("meta");
+    // Rows, not a blob: the branch every non-legacy session takes.
+    db.upsert_entry(id, 0, 1, 1_700_000_000_000, None, b"{}".to_vec())
+        .await
+        .expect("row");
+    db.update_tab_orders(solution_id, vec![id])
+        .await
+        .expect("tab order");
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+    })
+    .await
+    .expect("hydrate");
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).read_with(cx, |store, cx| {
+            let session = store.session(id).expect("hydrated");
+            session.read_with(cx, |s, _| {
+                assert_eq!(s.desired_model.as_deref(), Some("opus"));
+                assert_eq!(s.desired_effort.as_deref(), Some("high"));
+                assert_eq!(
+                    s.cached_models
+                        .iter()
+                        .map(|model| model.value.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["opus"],
+                    "the model picker's options must survive too, or the cold tab \
+                     offers an empty list until the first live capture"
+                );
+            });
+        });
+    });
+}
+
 #[gpui::test]
 async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContext) {
     use crate::cold_persistence::{PersistedEntryV2, PersistedUserMessage};
