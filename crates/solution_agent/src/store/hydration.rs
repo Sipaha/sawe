@@ -1046,19 +1046,6 @@ impl SolutionAgentStore {
         })
     }
 
-    /// Like [`restore_open_tabs`], but loads **every** session row for the
-    /// solution — including ones with `tab_order IS NULL` (closed tabs).
-    /// Sessions already in `self.sessions` are skipped. Each freshly-
-    /// hydrated session gets a `cold_entries` reconstruction from its
-    /// persisted blob, so subsequent `get_session` / `list_sessions`
-    /// calls see the full conversation history without needing the
-    /// subprocess respawned.
-    ///
-    /// Driven by `solution_agent.list_sessions` so an MCP-only consumer
-    /// (the phone) can see closed-tab sessions — the desktop's tab strip
-    /// path was the only thing populating the in-memory store before,
-    /// which left closed sessions invisible to MCP regardless of how
-    /// much data was on disk.
     /// Best-effort GC of on-disk per-session archive dirs
     /// (`<solution_root>/.agents/<sid>/` — compact handoff dumps + the
     /// mid-turn image inbox). Only kicks in once a solution has accumulated
@@ -1144,6 +1131,24 @@ impl SolutionAgentStore {
         .detach();
     }
 
+    /// Like [`restore_open_tabs`], but loads **every** session row for the
+    /// solution — including ones with `tab_order IS NULL` (closed tabs).
+    /// Sessions already in `self.sessions` are skipped. Each freshly-
+    /// hydrated session gets a `cold_entries` reconstruction from its
+    /// persisted blob, so subsequent `get_session` / `list_sessions`
+    /// calls see the full conversation history without needing the
+    /// subprocess respawned.
+    ///
+    /// Driven by `solution_agent.list_sessions` so an MCP-only consumer
+    /// (the phone) can see closed-tab sessions — the desktop's tab strip
+    /// path was the only thing populating the in-memory store before,
+    /// which left closed sessions invisible to MCP regardless of how
+    /// much data was on disk.
+    ///
+    /// Also the production restore path: `SolutionStoreEvent::Opened` runs it,
+    /// so this is what has to leave the store in the state the desktop UI
+    /// expects — `by_solution` indexed in `tab_order ASC`, plus a `TabsChanged`
+    /// so the status-bar `SessionTabStrip` repaints.
     pub fn hydrate_all_for_solution(
         &self,
         solution_id: SolutionId,
@@ -1308,22 +1313,9 @@ impl SolutionAgentStore {
                         s.tab_order = session_tab_order;
                         s
                     });
-                    // Insert into `self.sessions` so the phone's
-                    // list_sessions (via all_sessions()) and get_session
-                    // (via self.sessions.get()) can find it. INTENTIONALLY
-                    // skip `by_solution` and the SessionCreated event —
-                    // those are the desktop navigator's input. The
-                    // navigator's reconcile_open_sessions_with_store
-                    // reads sessions_for() (= by_solution lookup), so
-                    // leaving by_solution alone keeps the navigator
-                    // ignorant of cold-hydrated sessions, which is what
-                    // we want: hydration is read-only metadata exposure
-                    // for the phone, not a 'reopen all closed tabs'
-                    // command. If/when the user genuinely reopens one
-                    // of these via the tab strip, restore_open_tabs's
-                    // contains_key check will skip the re-insert but
-                    // the navigator's own open_session path will add
-                    // it to by_solution at that point.
+                    // `by_solution` is populated in one pass after the loop —
+                    // it has to be ordered by `tab_order`, which is only known
+                    // once every session in this batch has been built.
                     this.sessions.insert(meta.id, entity);
                     // Legacy → rows lazy migration (idempotent; guarded by
                     // rows-empty). Blob kept (model/effort fallback; Task 5).
@@ -1331,6 +1323,57 @@ impl SolutionAgentStore {
                         this.persist_all_rows(meta.id, cx);
                     }
                     hydrated.push(meta.id);
+                }
+                // Index the freshly-hydrated sessions under their solution.
+                // Everything the desktop shows for a Solution's AI sessions —
+                // the status-bar `SessionTabStrip`, the Sparkle badge's
+                // `visible_session_count`, the subagent strip, `gc_orphan_members`,
+                // `cold_close_solution`'s eviction, `unique_session_title`'s dedup
+                // — reads `by_solution`, not `sessions`. Skipping it here (which
+                // this path used to do, to keep a since-deleted "sessions
+                // navigator" ignorant of cold sessions) left every one of those
+                // surfaces blind to a restored session: after a restart the tab
+                // strip painted no tabs at all even though the transcripts,
+                // `tab_order` and the persisted active-dialog selection had all
+                // come back.
+                //
+                // Ordered by `tab_order ASC` — the same insertion contract
+                // `restore_open_tabs` follows — with untabbed sessions (sub-agents,
+                // and rows kept open for "Reopen Closed Chat") appended after, since
+                // they have no position in the strip.
+                let mut ordered_for_index: Vec<(Option<i64>, SolutionSessionId)> = hydrated
+                    .iter()
+                    .map(|id| (tab_order_map.get(id).copied(), *id))
+                    .collect();
+                // `None` sorts before `Some` under `Option`'s own `Ord`, so key on
+                // `is_none()` first to push the untabbed sessions to the back.
+                ordered_for_index.sort_by_key(|(order, _)| (order.is_none(), *order));
+                let by_sol = this.by_solution.entry(solution_id).or_default();
+                for (_, id) in &ordered_for_index {
+                    if !by_sol.contains(id) {
+                        by_sol.push(*id);
+                    }
+                }
+                // Wake the tab strip. It observes store EVENTS, not the store
+                // entity, so the `cx.notify()` at the end of this block does not
+                // reach it. `TabsChanged` rather than `SessionCreated`: the tabbed
+                // set really did go from empty to N for this solution, and unlike
+                // `SessionCreated` it has no wire fan-out (`event_sources` drops it
+                // deliberately) — hydration already emits its own
+                // `workspace.session_opened` deltas below, so `SessionCreated` would
+                // make a connected mobile client see each restored session announced
+                // twice, once as a brand-new session it was never told about.
+                let opened_tabs: Vec<SolutionSessionId> = ordered_for_index
+                    .iter()
+                    .filter(|(order, _)| order.is_some())
+                    .map(|(_, id)| *id)
+                    .collect();
+                if !opened_tabs.is_empty() {
+                    cx.emit(SolutionAgentStoreEvent::TabsChanged {
+                        solution_id,
+                        opened: opened_tabs,
+                        closed: Vec::new(),
+                    });
                 }
                 // Task 13: restore persisted background_agents per session.
                 // Done after the session entities exist so
@@ -1427,11 +1470,13 @@ impl SolutionAgentStore {
     /// solution with many heavy chat tabs paints the strip + the active
     /// tab's content immediately rather than blocking on a serial blob load.
     ///
-    /// Registration mirrors `hydrate_all_for_solution` exactly — sessions
-    /// are inserted into `self.sessions` only (NOT `by_solution`) and a
-    /// `workspace.session_opened` is emitted for tab-pinned rows — so the
-    /// mobile `list_sessions` / navigator stay consistent regardless of
-    /// which restore path ran. Idempotent against `already_open`.
+    /// Sessions are inserted into `self.sessions` only (NOT `by_solution`) and a
+    /// `workspace.session_opened` is emitted for tab-pinned rows, so the mobile
+    /// `list_sessions` stays consistent. Idempotent against `already_open`.
+    /// This no longer mirrors `hydrate_all_for_solution`, which does index
+    /// `by_solution` — a session restored through here would have no desktop tab.
+    /// Nothing in production calls this any more; the queued dead-code sweep
+    /// decides whether it goes or gets the same treatment.
     ///
     /// `priority` is the session id of the tab that will be active when the
     /// panel finishes restoring; pass `None` to load every blob detached
@@ -1506,10 +1551,12 @@ impl SolutionAgentStore {
                         s.tab_order = session_tab_order;
                         s
                     });
-                    // Same intentional partial registration as
-                    // `hydrate_all_for_solution`: `self.sessions` only, skip
-                    // `by_solution` + `SessionCreated` (see that method's
-                    // comment for why).
+                    // Partial registration: `self.sessions` only, no
+                    // `by_solution`. This path has no production caller left
+                    // (`ConsolePanel::restore_from_db` died when chat tabs moved
+                    // to the Solution band), so unlike `hydrate_all_for_solution`
+                    // it was never fixed to index the solution — anything reached
+                    // through here would be invisible to the tab strip.
                     this.sessions.insert(meta.id, entity);
                     hydrated.push(meta.id);
                     // Reload the supervisor row a soft/cold close evicted so a

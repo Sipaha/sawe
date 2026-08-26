@@ -669,6 +669,8 @@ impl StatusItemView for SessionTabStrip {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
 
     // The `+` button dispatches `console_panel::NewChat` *by name* (see the
@@ -777,6 +779,143 @@ mod tests {
         assert_eq!(toggle_selection(None, id), Some(id));
         assert_eq!(toggle_selection(Some(id), id), None);
         assert_eq!(toggle_selection(Some(other), id), Some(id));
+    }
+
+    /// The restart path, end to end: rows on disk, an empty in-memory store,
+    /// and `hydrate_all_for_solution` — the function `SolutionStoreEvent::Opened`
+    /// actually runs — as the only thing that repopulates it. The strip has to
+    /// come back with one tab per restored session, in `tab_order` order.
+    ///
+    /// Every other hydration test drives `restore_open_tabs`, which no production
+    /// code path calls; that blind spot is why a restart shipped with the strip
+    /// empty even though the transcripts, the tab order and the persisted
+    /// active-dialog selection had all been restored.
+    #[gpui::test]
+    async fn cold_hydrated_sessions_come_back_as_tabs(cx: &mut TestAppContext) {
+        use crate::store::SolutionAgentStoreEvent;
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let (solution_id, _tmp, _project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+        let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_persistence(db.clone(), cx);
+            });
+        });
+
+        let id_a = SolutionSessionId::new();
+        let id_b = SolutionSessionId::new();
+        let id_child = SolutionSessionId::new();
+        let now = Utc::now();
+        let meta_a = crate::model::SolutionSessionMetadata {
+            id: id_a,
+            solution_id,
+            agent_id: SharedString::from("claude-acp"),
+            acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+            title: SharedString::from("session A"),
+            created_at: now,
+            last_activity_at: now,
+            preview: None,
+            total_tokens: None,
+            context_count: 1,
+            cwd: PathBuf::new(),
+            parent_session_id: None,
+            desired_model: None,
+            desired_effort: None,
+            cached_models: vec![],
+            tab_order: None,
+        };
+        let meta_b = crate::model::SolutionSessionMetadata {
+            id: id_b,
+            acp_session_id: agent_client_protocol::schema::SessionId::new("acp-b"),
+            title: SharedString::from("session B"),
+            ..meta_a.clone()
+        };
+        // A sub-agent: persisted and hydrated, but never pinned into the strip.
+        let meta_child = crate::model::SolutionSessionMetadata {
+            id: id_child,
+            acp_session_id: agent_client_protocol::schema::SessionId::new("acp-child"),
+            title: SharedString::from("child of A"),
+            parent_session_id: Some(id_a),
+            ..meta_a.clone()
+        };
+        db.save_metadata(meta_a).await.expect("meta a");
+        db.save_metadata(meta_b).await.expect("meta b");
+        db.save_metadata(meta_child).await.expect("meta child");
+        // B sits left of A, so a strip that merely preserved DB row order
+        // would get this backwards.
+        db.update_tab_orders(solution_id, vec![id_b, id_a])
+            .await
+            .expect("tab order");
+
+        let tabs_opened = Rc::new(RefCell::new(Vec::<SolutionSessionId>::new()));
+        let created = Rc::new(RefCell::new(Vec::<SolutionSessionId>::new()));
+        let _subscription = cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let tabs_opened = tabs_opened.clone();
+            let created = created.clone();
+            cx.subscribe(&store, move |_store, event, _cx| match event {
+                SolutionAgentStoreEvent::TabsChanged { opened, .. } => {
+                    tabs_opened.borrow_mut().extend(opened.iter().copied());
+                }
+                SolutionAgentStoreEvent::SessionCreated { id, .. } => {
+                    created.borrow_mut().push(*id);
+                }
+                _ => {}
+            })
+        });
+
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+        })
+        .await
+        .expect("hydrate");
+        cx.run_until_parked();
+
+        let strip = cx.update(|cx| cx.new(|cx| SessionTabStrip::new(None, cx)));
+        let candidates =
+            strip.read_with(cx, |strip, cx| strip.candidates_for(solution_id, cx));
+        let tabbed: Vec<(SolutionSessionId, i64)> = candidates
+            .iter()
+            .map(|candidate| (candidate.session_id, candidate.tab_order))
+            .collect();
+        assert_eq!(
+            tabbed,
+            vec![(id_b, 0), (id_a, 1)],
+            "restored tabs must appear in tab_order, and the un-pinned sub-agent must not"
+        );
+
+        // `by_solution` insertion order is the ordering contract
+        // `restore_open_tabs` already documents: tab_order ASC, untabbed last.
+        let indexed = cx.update(|cx| {
+            SolutionAgentStore::global(cx).read_with(cx, |store, cx| {
+                store
+                    .sessions_for(&solution_id)
+                    .into_iter()
+                    .map(|session| session.read(cx).id)
+                    .collect::<Vec<_>>()
+            })
+        });
+        assert_eq!(indexed, vec![id_b, id_a, id_child]);
+
+        assert_eq!(
+            *tabs_opened.borrow(),
+            vec![id_b, id_a],
+            "the strip observes events, not the store entity — hydration must emit \
+             TabsChanged for the pinned sessions or the restored tabs never paint"
+        );
+        assert!(
+            created.borrow().is_empty(),
+            "hydration must not masquerade as session creation: it already emits its own \
+             workspace.session_opened deltas, so SessionCreated would double-announce"
+        );
     }
 
     #[gpui::test]
