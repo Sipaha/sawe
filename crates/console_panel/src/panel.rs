@@ -4,11 +4,11 @@ use futures::channel::oneshot;
 use futures::future::join_all;
 use gpui::{
     Action, Anchor, App, AppContext as _, AsyncApp, AsyncWindowContext, Context, DismissEvent,
-    Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, Pixels,
-    Point, Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
+    Entity, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, Pixels, Point,
+    Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
 };
-use settings::Settings as _;
 use solution_agent::reopen_session_modal::{ReopenSessionModal, ReopenableSession};
+use solution_agent::solution_band::SolutionBand;
 use solution_agent::store::SolutionAgentStore;
 use solutions::{MemberId, SolutionId, SolutionStore};
 use std::path::PathBuf;
@@ -18,15 +18,10 @@ use terminal_view::TerminalView;
 use terminal_view::terminal_panel::prepare_task_for_spawn;
 use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::{
-    Item, Workspace, WorkspaceDb,
-    dock::{DockPosition, Panel, PanelEvent},
-};
+use workspace::{Item, Workspace, WorkspaceDb};
 
-use crate::actions::{NewChat, ToggleFocus};
-use crate::{ConsolePanelSettings, TerminalProvider};
-
-const CONSOLE_PANEL_KEY: &str = "ConsolePanel";
+use crate::TerminalProvider;
+use crate::actions::NewChat;
 
 /// Resolve the active solution for a workspace by walking its worktrees and
 /// matching against the global `SolutionStore`. Mirrors
@@ -47,6 +42,38 @@ pub fn active_solution_id_for_workspace(workspace: &Workspace, cx: &App) -> Opti
         }
     }
     None
+}
+
+/// Resolve the concrete `Entity<ConsolePanel>` from the type-erased
+/// `Workspace::solution_band_utility_item` slot `zed.rs` installs at
+/// startup (phase 2a task 6). Replaces the old `workspace.panel::<ConsolePanel>(cx)`
+/// dock lookup, which walked the docks and would find nothing now that the
+/// panel isn't registered in one. `None` means either the panel-init task
+/// (`initialize_panels`) hasn't finished yet, or this workspace has no
+/// Solution band installed at all.
+pub fn console_panel_for_workspace(workspace: &Workspace) -> Option<Entity<ConsolePanel>> {
+    workspace
+        .solution_band_utility_item()?
+        .downcast::<ConsolePanel>()
+        .ok()
+}
+
+/// Make the Solution band's utility section visible (without stealing
+/// focus) so a task's terminal output is actually on screen.
+/// `console_panel` already depends on `solution_agent` (for
+/// `SolutionAgentStore`), so unlike `SolutionBand` itself — which cannot
+/// hold a typed `Entity<ConsolePanel>` without creating a crate cycle — this
+/// direction is fine: downcast `Workspace::solution_band_item`'s `AnyView`
+/// straight to the concrete `SolutionBand` type. No-op if the band isn't
+/// installed (headless/test workspaces).
+fn reveal_utility_section(workspace: &Workspace, cx: &mut App) {
+    let Some(band) = workspace
+        .solution_band_item()
+        .and_then(|item| item.downcast::<SolutionBand>().ok())
+    else {
+        return;
+    };
+    band.update(cx, |band, cx| band.set_utility_visible(true, cx));
 }
 
 /// Whether this workspace has a project to run a terminal in — the gate on
@@ -218,7 +245,6 @@ pub struct ConsolePanel {
     workspace: WeakEntity<Workspace>,
     tabs: Vec<ConsoleTab>,
     active_index: Option<usize>,
-    dock_position: DockPosition,
     terminal_provider: Entity<TerminalProvider>,
     focus_handle: FocusHandle,
     tab_context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
@@ -239,7 +265,6 @@ pub struct ConsolePanel {
 
 impl ConsolePanel {
     pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
-        let settings = ConsolePanelSettings::get_global(cx).clone();
         let terminal_provider = cx.new(|_| TerminalProvider::new(workspace.clone()));
         // Re-scope the visible tabs whenever the solution-wide active member
         // flips, so the strip + content swap to that project's own dialogs —
@@ -259,7 +284,6 @@ impl ConsolePanel {
             workspace,
             tabs: Vec::new(),
             active_index: None,
-            dock_position: settings.default_position,
             terminal_provider,
             focus_handle: cx.focus_handle(),
             tab_context_menu: None,
@@ -270,10 +294,6 @@ impl ConsolePanel {
             last_member_path: None,
             _subscriptions: subscriptions,
         }
-    }
-
-    pub fn dock_position(&self) -> DockPosition {
-        self.dock_position
     }
 
     /// Loader. Constructs a fresh `ConsolePanel` and then restores any
@@ -513,8 +533,6 @@ impl ConsolePanel {
         .detach();
     }
 }
-
-impl EventEmitter<PanelEvent> for ConsolePanel {}
 
 impl Focusable for ConsolePanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -923,7 +941,7 @@ impl ConsolePanel {
             return;
         }
 
-        let Some(console_panel) = workspace.panel::<Self>(cx) else {
+        let Some(console_panel) = console_panel_for_workspace(workspace) else {
             return;
         };
 
@@ -970,10 +988,13 @@ impl ConsolePanel {
                 });
                 match reveal_strategy {
                     RevealStrategy::Always => {
-                        workspace.focus_panel::<Self>(window, cx);
+                        reveal_utility_section(workspace, cx);
+                        if let Some(panel) = this.upgrade() {
+                            panel.focus_handle(cx).focus(window, cx);
+                        }
                     }
                     RevealStrategy::NoFocus => {
-                        workspace.open_panel::<Self>(window, cx);
+                        reveal_utility_section(workspace, cx);
                     }
                     RevealStrategy::Never => {}
                 }
@@ -1126,17 +1147,18 @@ impl ConsolePanel {
                         this.activate_tab(existing_tab_index, cx);
                         if let Some(workspace) = this.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
-                                workspace.focus_panel::<Self>(window, cx);
+                                reveal_utility_section(workspace, cx);
                             });
                         }
+                        this.focus_handle(cx).focus(window, cx);
                     })?;
                 }
                 RevealStrategy::NoFocus => {
-                    this.update_in(cx, |this, window, cx| {
+                    this.update_in(cx, |this, _window, cx| {
                         this.activate_tab(existing_tab_index, cx);
                         if let Some(workspace) = this.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
-                                workspace.open_panel::<Self>(window, cx);
+                                reveal_utility_section(workspace, cx);
                             });
                         }
                     })?;
@@ -1396,63 +1418,6 @@ impl ConsolePanel {
 
 }
 
-impl Panel for ConsolePanel {
-    fn persistent_name() -> &'static str {
-        CONSOLE_PANEL_KEY
-    }
-
-    fn panel_key() -> &'static str {
-        CONSOLE_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.dock_position
-    }
-
-    fn position_is_valid(&self, _position: DockPosition) -> bool {
-        true
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.dock_position = position;
-        cx.notify();
-        // Persisting to settings is a B-followup task.
-    }
-
-    fn default_size(&self, window: &Window, cx: &App) -> Pixels {
-        let settings = ConsolePanelSettings::get_global(cx);
-        match self.position(window, cx) {
-            DockPosition::Left | DockPosition::Right => settings.default_width,
-            DockPosition::Bottom => settings.default_height,
-        }
-    }
-
-    fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
-        if ConsolePanelSettings::get_global(cx).button_visible {
-            Some(IconName::Console)
-        } else {
-            None
-        }
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Toggle Console")
-    }
-
-    fn toggle_action(&self) -> Box<dyn gpui::Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        2
-    }
-}
-
 async fn wait_for_terminals_tasks(
     terminals_for_task: Vec<(usize, Entity<TerminalView>)>,
     cx: &mut AsyncApp,
@@ -1624,22 +1589,6 @@ mod tests {
             .unwrap();
 
         (window_handle, panel)
-    }
-
-    #[gpui::test]
-    async fn defaults_to_bottom_position(cx: &mut TestAppContext) {
-        cx.executor().allow_parking();
-        let (window_handle, panel) = bootstrap_panel(cx).await;
-
-        window_handle
-            .update(cx, |_workspace, window, cx| {
-                assert_eq!(
-                    panel.read(cx).position(window, cx),
-                    DockPosition::Bottom,
-                    "default position should be Bottom per ConsolePanelSettings defaults"
-                );
-            })
-            .unwrap();
     }
 
     #[gpui::test]
@@ -2002,11 +1951,14 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn add_panel_registers_for_workspace_lookup(cx: &mut TestAppContext) {
-        // `console_panel::NewTerminal` / `::NewChat` action handlers locate the
-        // panel via `workspace.panel::<ConsolePanel>(cx)`. Verify that the
-        // workspace can in fact retrieve the panel after `add_panel`, so the
-        // action wiring isn't sabotaged at this seam. End-to-end action
+    async fn console_panel_for_workspace_finds_the_installed_panel(cx: &mut TestAppContext) {
+        // `console_panel::NewTerminal` / `::NewChat` action handlers, plus
+        // run-configuration output and the inline assistant, locate the panel
+        // via `console_panel_for_workspace` (phase 2a task 6 — the panel is no
+        // longer dock-registered, so `workspace.panel::<ConsolePanel>(cx)`
+        // would find nothing). Verify the `zed.rs`-style install
+        // (`set_solution_band_utility_item`) round-trips through that lookup,
+        // so the action wiring isn't sabotaged at this seam. End-to-end action
         // dispatch needs a rendered workspace (GPUI attaches workspace
         // `register_action` handlers via the render div) — exercised live in
         // `docs/findings/2026-05-26-console-panel-shipped/`, not here.
@@ -2015,10 +1967,11 @@ mod tests {
 
         window_handle
             .update(cx, |workspace, window, cx| {
-                workspace.add_panel(panel.clone(), window, cx);
+                workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
                 assert!(
-                    workspace.panel::<ConsolePanel>(cx).is_some(),
-                    "ConsolePanel should be retrievable via workspace.panel::<ConsolePanel>(cx) after add_panel"
+                    console_panel_for_workspace(workspace).is_some(),
+                    "ConsolePanel should be retrievable via console_panel_for_workspace(workspace) \
+                     after set_solution_band_utility_item"
                 );
             })
             .unwrap();

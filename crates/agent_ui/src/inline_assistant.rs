@@ -46,7 +46,7 @@ use project::{DisableAiSettings, Project};
 use prompt_store::PromptBuilder;
 use settings::{Settings, SettingsStore};
 
-use console_panel::ConsolePanel;
+use console_panel::console_panel_for_workspace;
 use terminal_view::TerminalView;
 use ui::prelude::*;
 use util::{RangeExt, ResultExt, maybe};
@@ -135,7 +135,7 @@ impl InlineAssistant {
             let Some(workspace) = workspace_weak.upgrade() else {
                 return;
             };
-            let Some(terminal_panel) = workspace.read(cx).panel::<ConsolePanel>(cx) else {
+            let Some(terminal_panel) = console_panel_for_workspace(workspace.read(cx)) else {
                 return;
             };
             let enabled = AgentSettings::get_global(cx).enabled(cx);
@@ -146,7 +146,7 @@ impl InlineAssistant {
         .detach();
 
         cx.observe(workspace, |workspace, cx| {
-            let Some(terminal_panel) = workspace.read(cx).panel::<ConsolePanel>(cx) else {
+            let Some(terminal_panel) = console_panel_for_workspace(workspace.read(cx)) else {
                 return;
             };
             let enabled = AgentSettings::get_global(cx).enabled(cx);
@@ -1463,7 +1463,7 @@ impl InlineAssistant {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<InlineAssistTarget> {
-        if let Some(console_panel) = workspace.panel::<ConsolePanel>(cx)
+        if let Some(console_panel) = console_panel_for_workspace(workspace)
             && console_panel
                 .read(cx)
                 .focus_handle(cx)

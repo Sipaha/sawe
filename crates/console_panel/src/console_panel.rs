@@ -1,30 +1,32 @@
-//! Unified bottom-dock panel hosting terminal tabs. AI-chat sessions used to
-//! live here too; phase 2a task 5 moved them to the Solution band + the
-//! status-bar `solution_agent::session_tab_strip` — `NewChat` and
-//! `ShowSession` below now drive that shared per-solution selection
+//! Terminal tab strip hosted in the Solution band's utility section
+//! (`solution_agent::solution_band`, phase 2a task 6) — NOT a dock panel;
+//! `ConsolePanel` keeps `Render`/`Focusable` but has no `Panel` impl.
+//! `Workspace::solution_band_utility_item` is the type-erased slot `zed.rs`
+//! installs it into and the one other crates resolve it back out of via
+//! `console_panel_for_workspace` (decision 91 in `FORK.md`). AI-chat
+//! sessions used to live here too; phase 2a task 5 moved them to the
+//! Solution band's dialog half + the status-bar
+//! `solution_agent::session_tab_strip` — `NewChat` and `ShowSession` below
+//! now drive that shared per-solution selection
 //! (`SolutionAgentStore::{active_dialog_session,set_active_dialog_session}`)
 //! instead of touching `ConsolePanel`.
 
 mod actions;
-mod console_panel_settings;
 mod panel;
 mod terminal_provider;
 
-use gpui::{Context, SharedString, TaskExt as _, Window};
+use gpui::{Context, Focusable as _, SharedString, TaskExt as _, Window};
 use solution_agent::SolutionSessionId;
 use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
+use solution_agent::solution_band::SolutionBand;
 use solution_agent::store::SolutionAgentStore;
 use workspace::Workspace;
 
 pub use actions::{NewChat, NewTerminal, ShowSession, ToggleFocus};
-pub use console_panel_settings::ConsolePanelSettings;
-pub use panel::{ConsolePanel, ConsoleTab};
+pub use panel::{ConsolePanel, ConsoleTab, console_panel_for_workspace};
 pub use terminal_provider::TerminalProvider;
 
 pub fn init(cx: &mut gpui::App) {
-    use settings::Settings;
-    ConsolePanelSettings::register(cx);
-
     cx.observe_new(|workspace: &mut workspace::Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
             // No project directory to run in (an empty solution has 0 member
@@ -33,18 +35,45 @@ pub fn init(cx: &mut gpui::App) {
             if !panel::workspace_has_project(workspace, cx) {
                 return;
             }
-            if let Some(panel) = workspace.panel::<ConsolePanel>(cx) {
+            if let Some(panel) = console_panel_for_workspace(workspace) {
                 panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
             }
         });
         workspace.register_action(handle_new_chat);
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<ConsolePanel>(window, cx);
-        });
+        workspace.register_action(handle_toggle_focus);
         workspace.register_action(handle_show_session);
         workspace.register_action(ConsolePanel::handle_new_terminal);
     })
     .detach();
+}
+
+/// `ToggleFocus` (`ctrl-\``) handler. `ConsolePanel` no longer lives in a
+/// dock (phase 2a task 6), so this can't go through
+/// `Workspace::toggle_panel_focus` any more — it shows/hides/focuses the
+/// Solution band's utility section instead. Resolves both the concrete
+/// panel (for its `FocusHandle` — the band only holds an `AnyView`, see
+/// `solution_band`'s module doc) and the band itself from `Workspace`'s
+/// type-erased slots; a no-op if either hasn't been installed (e.g. a
+/// workspace with no Solution).
+fn handle_toggle_focus(
+    workspace: &mut Workspace,
+    _: &ToggleFocus,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(console_panel) = console_panel_for_workspace(workspace) else {
+        return;
+    };
+    let Some(band) = workspace
+        .solution_band_item()
+        .and_then(|item| item.downcast::<SolutionBand>().ok())
+    else {
+        return;
+    };
+    let focus_handle = console_panel.focus_handle(cx);
+    band.update(cx, |band, cx| {
+        band.toggle_utility_focus(&focus_handle, window, cx);
+    });
 }
 
 /// `NewChat` handler: creates a session under the workspace's active

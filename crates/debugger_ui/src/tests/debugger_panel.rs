@@ -4,7 +4,7 @@ use crate::{
     tests::{start_debug_session, start_debug_session_with},
     *,
 };
-use console_panel::ConsolePanel;
+use console_panel::console_panel_for_workspace;
 use dap::{
     ErrorResponse, Message, RunInTerminalRequestArguments, SourceBreakpoint,
     StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest,
@@ -556,7 +556,8 @@ async fn test_handle_error_run_in_terminal_reverse_request(
 
     workspace
         .update(cx, |workspace, _window, cx| {
-            let console_panel = workspace.panel::<ConsolePanel>(cx).unwrap();
+            let console_panel =
+                console_panel_for_workspace(workspace.workspace().read(cx)).unwrap();
 
             // ConsolePanel uses a Vec<ConsoleTab> instead of a Pane; assert no
             // tabs (no terminal task was started by the malformed reverse req).

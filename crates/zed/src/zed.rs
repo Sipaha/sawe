@@ -814,10 +814,36 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             }
         }
 
+        // Sawe: `ConsolePanel` hosts the Solution band's utility section
+        // (phase 2a task 6) rather than a dock panel, so it can't go through
+        // `add_panel_when_ready` above (that helper requires `T: Panel`,
+        // which `ConsolePanel` no longer implements — see
+        // `crates/console_panel/src/panel.rs`'s module doc). Installs into
+        // the same type-erased `Workspace::solution_band_utility_item` slot
+        // `SolutionBand::render` reads every frame.
+        async fn add_console_panel_when_ready(
+            panel_task: impl Future<Output = anyhow::Result<Entity<console_panel::ConsolePanel>>>
+            + 'static,
+            workspace_handle: WeakEntity<Workspace>,
+            mut cx: gpui::AsyncWindowContext,
+        ) {
+            if let Some(panel) = panel_task
+                .await
+                .context("failed to load console panel")
+                .log_err()
+            {
+                workspace_handle
+                    .update_in(&mut cx, |workspace, window, cx| {
+                        workspace.set_solution_band_utility_item(panel.into(), window, cx);
+                    })
+                    .log_err();
+            }
+        }
+
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(console_panel, workspace_handle.clone(), cx.clone()),
+            add_console_panel_when_ready(console_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_graph_panel, workspace_handle.clone(), cx.clone()),
             // add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),

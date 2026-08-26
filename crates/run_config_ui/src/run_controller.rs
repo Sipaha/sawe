@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use collections::{HashMap, HashSet};
-use console_panel::ConsolePanel;
+use console_panel::console_panel_for_workspace;
 use dap::client::SessionId;
 use gpui::{
     Action as _, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _, WeakEntity,
@@ -416,7 +416,7 @@ impl RunController {
                 };
 
                 let poller =
-                    if let Some(terminal_panel) = workspace.read(cx).panel::<ConsolePanel>(cx) {
+                    if let Some(terminal_panel) = console_panel_for_workspace(workspace.read(cx)) {
                         // Real path: the terminal panel hands back the task
                         // terminal so Stop can kill it.
                         let spawn_task = terminal_panel.update(cx, |terminal_panel, cx| {
@@ -746,6 +746,7 @@ fn debug_launch_timed_out(
 mod tests {
     use super::*;
     use anyhow::Result;
+    use console_panel::ConsolePanel;
     use gpui::{App, AppContext as _, TestAppContext};
     use project::Project;
     use run_config::{ConfigScope, RunConfigProvider, RunConfiguration};
@@ -1013,6 +1014,67 @@ mod tests {
                 detached_before + 1,
                 "the completion poller is kept alive (not dropped) so it can still kill the \
                  terminal once the handle resolves"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn run_reaches_a_real_console_panel_via_solution_band_utility_item(
+        cx: &mut TestAppContext,
+    ) {
+        // Regression guard for phase 2a task 6: this Terminal branch used to
+        // find the terminal panel via `workspace.panel::<ConsolePanel>(cx)` (a
+        // dock lookup). `ConsolePanel` no longer lives in a dock, so that was
+        // re-pointed at `console_panel::console_panel_for_workspace`, which
+        // downcasts `Workspace::solution_band_utility_item` — the same
+        // type-erased slot `zed.rs` installs the real panel into. Every other
+        // test in this file uses `PendingTerminalProvider` and never
+        // populates that slot, so they only ever exercise the *fallback*
+        // branch (`workspace.spawn_in_terminal`) — a broken re-point here
+        // would have shipped invisibly. This test installs a REAL
+        // `ConsolePanel` (mirroring `console_panel::panel::tests::bootstrap_panel`)
+        // and asserts a tab actually lands in it.
+        cx.executor().allow_parking();
+        let workspace = setup(cx, &["a"]).await;
+        let window = cx
+            .update(|cx| cx.windows().first().copied())
+            .expect("a window exists");
+
+        // `window.update` hands back a plain `&mut App` (no entity lease) —
+        // the same shape `dispatch_run_command`'s caller has — so
+        // `workspace.update(cx, ..)` here is a fresh, uncontested lease, not
+        // the double-lease `RunController::run` itself must avoid below.
+        let console_panel = window
+            .update(cx, |_, window, cx| {
+                let panel = cx.new(|cx| ConsolePanel::new(workspace.downgrade(), cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
+                });
+                panel
+            })
+            .unwrap();
+
+        let controller = workspace.update(cx, |workspace, cx| {
+            cx.new(|cx| RunController::new(workspace, cx))
+        });
+        cx.run_until_parked();
+
+        let id = RunConfigId::from_raw("mock:a");
+        window
+            .update(cx, |_, window, cx| {
+                controller.update(cx, |controller, cx| {
+                    controller.run(id.clone(), Executor::Run, window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        console_panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tab_count(),
+                1,
+                "console_panel_for_workspace should have found the real ConsolePanel, and \
+                 RunController::run should have spawned a terminal tab into it"
             );
         });
     }

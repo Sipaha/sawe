@@ -1000,16 +1000,6 @@
     // Default width of the collaboration panel.
     "default_width": 240,
   },
-  "console_panel": {
-    // Where to dock the console panel. Can be 'left', 'bottom', or 'right'.
-    "default_position": "bottom",
-    // Default width of the console panel when docked left or right.
-    "default_width": 360,
-    // Default height of the console panel when docked bottom.
-    "default_height": 240,
-    // Whether to show the console panel button in the status bar.
-    "button_visible": true,
-  },
   "git_panel": {
     // Whether to show the git panel button in the status bar.
     "button": true,

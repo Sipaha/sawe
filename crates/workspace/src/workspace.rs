@@ -1407,6 +1407,18 @@ pub struct Workspace {
     /// Populated by the crate that owns the band, the same way `title_bar`
     /// populates `project_toolbar_item`: `workspace` cannot depend on it.
     solution_band_item: Option<AnyView>,
+    /// The band's utility section content (the terminal panel, phase 2a task
+    /// 6) — a second, independent slot from `solution_band_item` because the
+    /// crate that owns the band (`solution_agent`) cannot depend on the
+    /// crate that owns the terminal panel (`console_panel`; the edge already
+    /// runs the other way — see `console_panel`'s own dependency on
+    /// `solution_agent` for `SolutionAgentStore`). `zed.rs`, which depends on
+    /// both, sets this alongside `solution_band_item`; `SolutionBand::render`
+    /// reads it fresh each frame instead of caching a copy. Any other crate
+    /// that needs the concrete `Entity<ConsolePanel>` (run-configuration
+    /// output, the inline assistant) downcasts this `AnyView` — mirrors
+    /// `run_config_controller`'s `AnyEntity` downcast below.
+    solution_band_utility_item: Option<AnyView>,
     run_config_strip: Option<AnyView>,
     run_config_controller: Option<AnyEntity>,
     notifications: Notifications,
@@ -1878,6 +1890,7 @@ impl Workspace {
             titlebar_item: None,
             project_toolbar_item: None,
             solution_band_item: None,
+            solution_band_utility_item: None,
             run_config_strip: None,
             run_config_controller: None,
             notifications: Notifications::default(),
@@ -3154,6 +3167,16 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn set_solution_band_utility_item(
+        &mut self,
+        item: AnyView,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.solution_band_utility_item = Some(item);
+        cx.notify();
+    }
+
     pub fn set_run_config_strip(&mut self, strip: AnyView, cx: &mut Context<Self>) {
         self.run_config_strip = Some(strip);
         cx.notify();
@@ -3325,6 +3348,10 @@ impl Workspace {
 
     pub fn solution_band_item(&self) -> Option<AnyView> {
         self.solution_band_item.clone()
+    }
+
+    pub fn solution_band_utility_item(&self) -> Option<AnyView> {
+        self.solution_band_utility_item.clone()
     }
 
     /// Call the given callback with a workspace whose project is local or remote via WSL (allowing host access).

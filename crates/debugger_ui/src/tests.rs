@@ -90,7 +90,11 @@ pub async fn init_test_workspace(
         .update(cx, |multi, window, cx| {
             multi.workspace().update(cx, |workspace, cx| {
                 workspace.add_panel(debugger_panel, window, cx);
-                workspace.add_panel(terminal_panel, window, cx);
+                // `ConsolePanel` hosts the Solution band's utility section
+                // (phase 2a task 6), not a dock panel — install it into the
+                // same type-erased slot `zed.rs` uses in production so tests
+                // exercise the real lookup path (`console_panel_for_workspace`).
+                workspace.set_solution_band_utility_item(terminal_panel.into(), window, cx);
             });
         })
         .unwrap();
