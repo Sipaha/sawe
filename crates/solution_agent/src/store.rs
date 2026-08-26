@@ -564,7 +564,11 @@ pub use crate::model_catalog::EFFORT_LEVELS;
 /// Which state to seed a debug `background_agent` in (`seed_cold_session`).
 /// The three outcomes are mutually exclusive — an enum instead of a pile of
 /// bools, so `(killed, usage_limited) = (true, true)` is unrepresentable.
-/// Debug/screenshot-only.
+/// Debug/screenshot-only: both consumers (`seed_cold_session` below and
+/// `mcp::debug`) are `#[cfg(debug_assertions)]`, so this must be too — a
+/// `--release` build (as `script/clippy --deny warnings` compiles) would
+/// otherwise see it as dead code and fail the build.
+#[cfg(debug_assertions)]
 pub(crate) enum SeededAgentState {
     Running,
     Killed,
