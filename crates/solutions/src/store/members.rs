@@ -41,7 +41,8 @@ impl SolutionStore {
 
     /// Path of the solution's active member, falling back to the solution root
     /// when no member is selected. The one place that answers "where do new
-    /// terminals / chats start".
+    /// terminals start" (chats are solution-scoped and always root at
+    /// `solution.root` — see `console_panel::panel::new_chat_cwd`).
     pub fn active_member_path(&self, solution: SolutionId) -> Option<std::path::PathBuf> {
         let sol = self.find_solution(solution).ok()?;
         if let Some(member) = self.active_member(solution).and_then(|id| sol.member(id)) {

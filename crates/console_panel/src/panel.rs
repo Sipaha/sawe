@@ -57,18 +57,17 @@ pub fn active_solution_id_for_workspace(workspace: &Workspace, cx: &App) -> Opti
 
 /// Whether this workspace has a project to run a terminal in — the gate on
 /// terminal creation ("+" menu state, `NewTerminal`). AI chats are
-/// solution-scoped (spec 2026-08-26: a chat roots at `solution.root` when
-/// there is no active member) and no longer use this gate — only a terminal
-/// needs a directory to `cd` into.
+/// solution-scoped (spec 2026-08-26: a chat always roots at `solution.root`,
+/// see [`new_chat_cwd`]) and never use this gate — only a terminal needs a
+/// directory to `cd` into.
 ///
 /// For a **Solution** workspace the authoritative answer is its member list, not
 /// its worktrees: `solutions_ui::open` opens an EMPTY solution with the solution
-/// root as an *invisible* worktree (`OpenVisible::None`), and the old
-/// `project.worktrees()` check counted invisible worktrees — so the guard passed
-/// for exactly the case it existed to block, and a chat created there fell back
-/// to `solution.root` and rendered as `ROOT`. `Solution::members` is the single
-/// source of truth for "which projects are in this solution" (plan 1's numeric
-/// `MemberId`s), so ask it directly.
+/// root as an *invisible* worktree (`OpenVisible::None`), and a naive
+/// `project.worktrees()` check counts invisible worktrees too — so it would pass
+/// for exactly the case this gate exists to block. `Solution::members` is the
+/// single source of truth for "which projects are in this solution" (plan 1's
+/// numeric `MemberId`s), so ask it directly.
 ///
 /// A plain folder workspace (not a Solution) has no member list; there the
 /// question really is "is a project directory open", which means a VISIBLE
@@ -98,12 +97,29 @@ pub fn workspace_has_project(workspace: &Workspace, cx: &App) -> bool {
 
 /// Folder of the solution's *active* project — the one selected in the
 /// project tab strip — falling back to the solution root when there is no
-/// active member. Used as the `cwd` for new terminals / AI chats started
-/// from the "+" menu (one project per solution drives both surfaces).
+/// active member. Used as the `cwd` for new terminals started from the "+"
+/// menu; a chat never uses this (see [`new_chat_cwd`]) — it is
+/// solution-scoped and always roots at `solution.root` (spec 2026-08-26).
 fn active_member_path(solution_id: SolutionId, cx: &App) -> Option<PathBuf> {
     let store = SolutionStore::try_global(cx)?;
     let store = store.read(cx);
     store.active_member_path(solution_id)
+}
+
+/// The cwd for a freshly created chat session, given the solution's active
+/// member path (the same value a new terminal uses). Chats are
+/// solution-scoped (spec 2026-08-26): the active member path is accepted
+/// only so both creation entry points (the "+" menu and
+/// [`ConsolePanel::add_chat_tab`]) can share one lookup with the terminal
+/// path, but it is deliberately never returned here — a chat always roots
+/// at `solution.root` (`create_session_with_cwd` treats `None` as "use the
+/// solution root"). Regression guard for Critical 1 (2026-08-26 final
+/// review): the "+" menu used to pass the active member path straight
+/// through as the chat cwd, silently re-binding a "solution-scoped" session
+/// — and its `~/.claude/projects/<cwd>/` transcript bucket — to whichever
+/// member happened to be selected.
+fn new_chat_cwd(_active_member_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    None
 }
 
 /// Which project a console tab belongs to.
@@ -899,10 +915,11 @@ impl ConsolePanel {
     fn render_plus_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_solution_id = self.active_solution_id(cx);
         let has_active_solution = active_solution_id.is_some();
-        // New terminals and new chats both open in the active project's
-        // folder (the project selected in the project tab strip). Model and
-        // effort are no longer chosen here — they're picked in the status bar
-        // after the chat is created, before the first message is sent.
+        // New terminals open in the active project's folder (the project
+        // selected in the project tab strip); new chats never do — see
+        // `new_chat_cwd`. Model and effort are no longer chosen here — they're
+        // picked in the status bar after the chat is created, before the
+        // first message is sent.
         let active_path = active_solution_id.and_then(|id| active_member_path(id, cx));
         // A terminal needs a project directory to run in. An empty solution has
         // no member project, so grey out "New Terminal" (the action handlers
@@ -966,16 +983,16 @@ impl ConsolePanel {
                                     }),
                             )
                         };
-                        // New AI Chat in the active project's folder, unlike New
-                        // Terminal above: a chat is solution-scoped and roots at
-                        // `solution.root` when there is no active member (spec
-                        // 2026-08-26), so it needs only an active solution, not a
-                        // member project.
+                        // New AI Chat, unlike New Terminal above: a chat is
+                        // solution-scoped and always roots at `solution.root`
+                        // (spec 2026-08-26; `new_chat_cwd` never returns the
+                        // active member path), so it needs only an active
+                        // solution, not a member project.
                         let menu = if let (Some(solution_id), Some(project)) =
                             (active_solution_id, project.clone())
                         {
                             let weak_self = weak_self.clone();
-                            let cwd = active_path.clone();
+                            let cwd = new_chat_cwd(active_path.as_deref());
                             menu.entry("New AI Chat", None, move |window, cx| {
                                 if let Some(panel) = weak_self.upgrade() {
                                     panel.update(cx, |panel, cx| {
@@ -992,7 +1009,7 @@ impl ConsolePanel {
                         } else {
                             menu.action_disabled_when(
                                 true,
-                                "New AI Chat (no project)",
+                                "New AI Chat (no solution)",
                                 NewChat.boxed_clone(),
                             )
                         };
@@ -1036,33 +1053,22 @@ impl ConsolePanel {
         active_member_path(solution_id, cx)
     }
 
-    /// Working directory a terminal tab is anchored to, used to decide which
-    /// member project owns it — its *immutable* creation-time `origin_cwd`.
-    /// Deliberately NOT the terminal's live working directory — that wanders
-    /// with `cd` and goes unreadable under a foreign-user foreground process
-    /// (`sudo su`), which would drop the tab out of scope and make it
-    /// disappear from the strip. Chats have no cwd-based scope (spec
-    /// 2026-08-26: solution-scoped, always `Unscoped` — see `tab_scope`), so
-    /// this returns `None` for `ConsoleTab::Chat`.
-    fn tab_cwd(&self, tab: &ConsoleTab, _cx: &App) -> Option<PathBuf> {
-        let ConsoleTab::Terminal { origin_cwd, .. } = tab else {
-            return None;
-        };
-        origin_cwd.clone()
-    }
-
     /// Chats are solution-scoped, not project-scoped (spec 2026-08-26): a
     /// chat tab is always `Unscoped`, so it is never filtered by the active
-    /// member. A terminal has no such binding, so it is placed by its cwd
-    /// (longest matching member wins; anything under the root but in no
-    /// member is `Root`).
+    /// member. A terminal has no such binding, so it is placed by its
+    /// *immutable* creation-time `origin_cwd` (longest matching member wins;
+    /// anything under the root but in no member is `Root`) — deliberately
+    /// NOT the terminal's live working directory, which wanders with `cd`
+    /// and goes unreadable under a foreign-user foreground process (`sudo
+    /// su`), which would drop the tab out of scope and make it disappear
+    /// from the strip.
     fn tab_scope(&self, tab: &ConsoleTab, cx: &App) -> TabScope {
-        if let ConsoleTab::Chat { .. } = tab {
+        let ConsoleTab::Terminal { origin_cwd, .. } = tab else {
             // Chats are solution-scoped (spec 2026-08-26): never filtered by
             // the active member. Unscoped = always visible.
             return TabScope::Unscoped;
-        }
-        let Some(cwd) = self.tab_cwd(tab, cx) else {
+        };
+        let Some(cwd) = origin_cwd.clone() else {
             return TabScope::Unscoped;
         };
         let Some(solution_id) = self.active_solution_id(cx) else {
@@ -1496,10 +1502,12 @@ impl ConsolePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Sessions are solution-scoped now (spec 2026-08-26): `None` roots the
-        // new session at the solution root rather than inferring an active
-        // member's folder.
-        self.add_chat_tab_with_cwd(solution_id, project, None, window, cx);
+        // Routes through the same `new_chat_cwd` decision as the "+" menu
+        // (see `render_plus_popover`) so the two chat-creation entry points
+        // cannot diverge on the active member path the way they did before
+        // (Critical 1, 2026-08-26 final review).
+        let cwd = new_chat_cwd(self.active_member_path(cx).as_deref());
+        self.add_chat_tab_with_cwd(solution_id, project, cwd, window, cx);
     }
 
     /// Create a chat session (create-implies-open) under `solution_id` rooted
@@ -2155,6 +2163,21 @@ mod tests {
     }
 
     #[test]
+    fn new_chat_cwd_ignores_the_active_member_path() {
+        // Regression for Critical 1 (2026-08-26 final review): the "+" menu's
+        // "New AI Chat" entry used to pass the active member's folder
+        // straight through as the new session's cwd, silently re-binding a
+        // "solution-scoped" chat (and its `~/.claude/projects/<cwd>/`
+        // transcript bucket) to whichever project happened to be selected —
+        // while the keyboard/MCP path (`add_chat_tab`) correctly passed
+        // `None`. Both entry points now route through this one function, so
+        // a chat's cwd can no longer depend on which member is active.
+        let member_path = std::path::Path::new("/solutions/demo/member-a");
+        assert_eq!(new_chat_cwd(Some(member_path)), None);
+        assert_eq!(new_chat_cwd(None), None);
+    }
+
+    #[test]
     fn effective_active_index_prefers_in_scope_active() {
         // Stored active tab is in scope → it stays active.
         assert_eq!(
@@ -2415,7 +2438,8 @@ mod tests {
         // live working directory — the latter wanders with `cd` and goes
         // unreadable when the foreground process is another user's (`sudo su`),
         // which would drop the tab out of scope and make it vanish. Here we
-        // assert the creation cwd is recorded and is what `tab_cwd` reports.
+        // assert the creation cwd is recorded as `origin_cwd`, which is what
+        // `tab_scope` reads (see that function's `ConsoleTab::Terminal` arm).
         cx.executor().allow_parking();
         let (window_handle, panel) = bootstrap_panel(cx).await;
 
@@ -2429,7 +2453,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        panel.read_with(cx, |p, cx| {
+        panel.read_with(cx, |p, _cx| {
             assert_eq!(p.tabs.len(), 1);
             let ConsoleTab::Terminal { origin_cwd, .. } = &p.tabs[0] else {
                 panic!("expected a terminal tab");
@@ -2438,11 +2462,6 @@ mod tests {
                 origin_cwd.as_deref(),
                 Some(origin.as_path()),
                 "creation cwd must be recorded as origin_cwd"
-            );
-            assert_eq!(
-                p.tab_cwd(&p.tabs[0], cx).as_deref(),
-                Some(origin.as_path()),
-                "tab_cwd must report origin_cwd, not the live working directory"
             );
         });
     }
