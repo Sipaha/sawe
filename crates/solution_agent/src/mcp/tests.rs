@@ -3385,47 +3385,16 @@ fn user_anchored_filter_since_ms_all_old_keeps_resting_turn() {
     );
 }
 
-/// The UI cannot create a chat in a member-less Solution
-/// (`console_panel::workspace_has_project`); the MCP tool must not be a way
-/// around that guard, or an agent lands in exactly the broken, cwd-less
-/// session the UI refuses to make.
+/// The member guard is gone (spec 2026-08-26): a member-less Solution is a
+/// legitimate session root (`solution.root` always exists). This harness
+/// opens no workspace window, so the call still fails — but now on the
+/// workspace lookup, not on the member list, proving the guard that used to
+/// key on `solution.members.is_empty()` no longer runs.
 #[gpui::test]
-async fn create_session_in_a_member_less_solution_is_rejected(cx: &mut gpui::TestAppContext) {
+async fn create_session_in_a_member_less_solution_clears_the_member_guard(
+    cx: &mut gpui::TestAppContext,
+) {
     let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
-
-    let err = CreateSessionTool
-        .run(
-            CreateSessionParams {
-                solution_id: solution_id.0,
-                agent_id: "mock-agent".into(),
-                initial_message: None,
-                parent_session_id: None,
-                title: None,
-                cwd: None,
-            },
-            &mut cx.to_async(),
-        )
-        .await
-        .expect_err("a member-less solution cannot host a session");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("solution_has_no_members"),
-        "expected solution_has_no_members in {msg:?}"
-    );
-}
-
-/// …and the guard keys on the *member list*, not on "no window is open": a
-/// Solution that has a member gets past it and fails later, on the workspace
-/// lookup (this test opens no window).
-#[gpui::test]
-async fn create_session_with_a_member_clears_the_member_guard(cx: &mut gpui::TestAppContext) {
-    let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
-    let store = cx.update(|cx| solutions::SolutionStore::global(cx));
-    store
-        .update(cx, |store, cx| {
-            store.add_empty_member(solution_id, "member", cx)
-        })
-        .expect("add_empty_member");
 
     let err = CreateSessionTool
         .run(
@@ -3444,7 +3413,7 @@ async fn create_session_with_a_member_clears_the_member_guard(cx: &mut gpui::Tes
     let msg = err.to_string();
     assert!(
         !msg.contains("solution_has_no_members"),
-        "a solution with a member must clear the member guard; got {msg:?}"
+        "the member guard must be gone; got {msg:?}"
     );
     assert!(
         msg.contains("no_active_workspace_for_solution"),

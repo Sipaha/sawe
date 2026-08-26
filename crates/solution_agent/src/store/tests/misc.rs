@@ -180,6 +180,61 @@ async fn create_session_roots_cwd_at_solution_root(cx: &mut TestAppContext) {
     });
 }
 
+/// The store layer never gated session creation on the member list — that
+/// guard lived only in the MCP tool and the console UI (both removed, spec
+/// 2026-08-26). Prove it directly: a solution with zero members registered
+/// must still produce a session, rooted at the solution root.
+#[gpui::test]
+async fn create_session_in_a_member_less_solution_roots_at_solution_root(
+    cx: &mut TestAppContext,
+) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let solution_root = cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::new(connect_count.clone())),
+            );
+        });
+
+        let solution_store = solutions::SolutionStore::global(cx);
+        let solution = solution_store.read(cx).find_solution(solution_id).expect("solution");
+        assert!(
+            solution.members.is_empty(),
+            "precondition: no members registered"
+        );
+        solution.root.clone()
+    });
+
+    let session_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session must succeed with zero members");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            let session = session.read(cx);
+            assert_eq!(
+                session.cwd, solution_root,
+                "a member-less solution's session must root at the solution root"
+            );
+        });
+    });
+}
+
 #[gpui::test]
 async fn parallel_create_session_for_same_pair_spawns_only_once(cx: &mut TestAppContext) {
     let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;

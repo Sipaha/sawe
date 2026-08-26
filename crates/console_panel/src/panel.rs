@@ -55,9 +55,11 @@ pub fn active_solution_id_for_workspace(workspace: &Workspace, cx: &App) -> Opti
     None
 }
 
-/// Whether this workspace has a project to run a terminal / AI chat in — the
-/// gate on both console tab kinds ("+" menu state, `NewTerminal`, `NewChat`,
-/// reopen-session).
+/// Whether this workspace has a project to run a terminal in — the gate on
+/// terminal creation ("+" menu state, `NewTerminal`). AI chats are
+/// solution-scoped (spec 2026-08-26: a chat roots at `solution.root` when
+/// there is no active member) and no longer use this gate — only a terminal
+/// needs a directory to `cd` into.
 ///
 /// For a **Solution** workspace the authoritative answer is its member list, not
 /// its worktrees: `solutions_ui::open` opens an EMPTY solution with the solution
@@ -964,15 +966,13 @@ impl ConsolePanel {
                                     }),
                             )
                         };
-                        // New AI Chat in the active project's folder. Gated on
-                        // `has_project` exactly like New Terminal above: an EMPTY
-                        // solution still resolves an `active_solution_id` (it is
-                        // the active solution — it just has no members), so the
-                        // `if let` alone let the chat entry stay enabled with no
-                        // worktree for the agent to work in, while the terminal
-                        // next to it was correctly disabled.
-                        let menu = if let (true, Some(solution_id), Some(project)) =
-                            (has_project, active_solution_id, project.clone())
+                        // New AI Chat in the active project's folder, unlike New
+                        // Terminal above: a chat is solution-scoped and roots at
+                        // `solution.root` when there is no active member (spec
+                        // 2026-08-26), so it needs only an active solution, not a
+                        // member project.
+                        let menu = if let (Some(solution_id), Some(project)) =
+                            (active_solution_id, project.clone())
                         {
                             let weak_self = weak_self.clone();
                             let cwd = active_path.clone();
@@ -997,14 +997,13 @@ impl ConsolePanel {
                             )
                         };
                         // Reopen a chat that was closed but still lives on disk.
-                        // Needs a worktree for the same reason New AI Chat does —
-                        // the reopened session resumes an agent that has to run
-                        // somewhere.
+                        // Solution-scoped like New AI Chat above — needs an
+                        // active solution, not a member project.
                         let menu = {
                             let weak_self = weak_self.clone();
                             menu.item(
                                 ui::ContextMenuEntry::new("Reopen Closed Chat…")
-                                    .disabled(!has_active_solution || !has_project)
+                                    .disabled(!has_active_solution)
                                     .handler(move |window, cx| {
                                         if let Some(panel) = weak_self.upgrade() {
                                             panel.update(cx, |panel, cx| {
@@ -1766,14 +1765,6 @@ impl ConsolePanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        // Defense in depth, mirroring the `NewChat` action: the menu entry is
-        // disabled without a project, but the handler must refuse too — a
-        // reopened session resumes an agent, and an empty solution gives it
-        // nowhere to run. An EMPTY solution still resolves an `active_solution_id`
-        // (it IS the active solution), so the guard above does not cover this.
-        if !workspace_has_project(workspace.read(cx), cx) {
-            return;
-        }
         // Closed sessions live only on disk (close_session evicts them from
         // memory), so the picker reads them straight from the DB. The query
         // already returns top-level closed rows ordered most-recently-active
@@ -2311,9 +2302,8 @@ mod tests {
     /// `project.worktrees()`, which COUNTS INVISIBLE worktrees — and
     /// `solutions_ui::open` opens an empty solution with its root as an
     /// *invisible* worktree (`OpenVisible::None`). So the guard passed for
-    /// exactly the case it existed to block: "New AI Chat" / "New Terminal"
-    /// stayed enabled in a solution with no projects, and the chat it created
-    /// fell back to `solution.root` and rendered as `ROOT`.
+    /// exactly the case it existed to block: "New Terminal" stayed enabled in
+    /// a solution with no projects, with nowhere to `cd` into.
     ///
     /// The guard now asks the authoritative thing — the Solution's member list.
     #[gpui::test]
@@ -2367,7 +2357,7 @@ mod tests {
                 );
                 assert!(
                     !workspace_has_project(workspace, cx),
-                    "a Solution with zero members has no project to run a chat/terminal in, \
+                    "a Solution with zero members has no project to run a terminal in, \
                      however many invisible worktrees its workspace carries"
                 );
             })
@@ -2384,7 +2374,7 @@ mod tests {
             .update(cx, |workspace, _window, cx| {
                 assert!(
                     workspace_has_project(workspace, cx),
-                    "a Solution with a member project must allow a chat/terminal"
+                    "a Solution with a member project must allow a terminal"
                 );
             })
             .unwrap();
