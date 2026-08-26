@@ -1073,8 +1073,8 @@ impl SolutionAgentStore {
                             if restored_available_models.is_empty() {
                                 restored_available_models = persisted.available_models.clone();
                             }
-                            restored_desired_model = restored_desired_model
-                                .or_else(|| persisted.desired_model.clone());
+                            restored_desired_model =
+                                restored_desired_model.or_else(|| persisted.desired_model.clone());
                             restored_desired_effort = restored_desired_effort
                                 .or_else(|| persisted.desired_effort.clone());
                         }

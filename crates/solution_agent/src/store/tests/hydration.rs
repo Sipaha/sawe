@@ -79,8 +79,9 @@ async fn hydrate_all_hydrates_cold_sessions(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("restore");
@@ -368,8 +369,9 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("restore");
@@ -630,8 +632,9 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("restore");
@@ -750,8 +753,9 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("restore");
@@ -879,8 +883,9 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
         .expect("tab order");
 
     cx.update(|cx| {
-        SolutionAgentStore::global(cx)
-            .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.hydrate_all_for_solution(solution_id, cx)
+        })
     })
     .await
     .expect("restore");
@@ -982,8 +987,9 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("restore");
@@ -1026,8 +1032,9 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
     });
     let ordered2 = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("restore 2");
@@ -1111,8 +1118,9 @@ async fn hydrate_all_restores_model_and_effort(cx: &mut TestAppContext) {
         .expect("tab order");
 
     cx.update(|cx| {
-        SolutionAgentStore::global(cx)
-            .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.hydrate_all_for_solution(solution_id, cx)
+        })
     })
     .await
     .expect("hydrate");
@@ -1211,8 +1219,9 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     // First restore — MIGRATE branch: recovers desired_model from blob.
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("first restore");
@@ -1259,8 +1268,9 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
     // Second restore — ROWS branch: no blob deserialization, reads columns only.
     let ordered2 = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("second restore");
@@ -1344,8 +1354,9 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
 
     let ordered = cx
         .update(|cx| {
-            SolutionAgentStore::global(cx)
-                .update(cx, |store, cx| store.hydrate_all_for_solution(solution_id, cx))
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
         })
         .await
         .expect("restore");
