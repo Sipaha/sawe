@@ -87,7 +87,11 @@ fn dirty_target_session(
         | SessionBackgroundAgentsChanged(id)
         | SessionBackgroundShellsChanged(id) => Some(*id),
         SessionContextReset { id, .. } => Some(*id),
-        SessionCreated { .. } | SessionClosed(_) | SessionNotified(..) | TabsChanged { .. } => None,
+        SessionCreated { .. }
+        | SessionClosed(_)
+        | SessionNotified(..)
+        | TabsChanged { .. }
+        | ActiveDialogSessionChanged { .. } => None,
     }
 }
 
@@ -203,9 +207,14 @@ fn emit_event_notification(event: &SolutionAgentStoreEvent, cx: &mut App) {
         // event itself still fires for those GPUI subscribers; this coordinator
         // just doesn't mirror it onto MCP. (The `agent_session_dirty`
         // convergence signal still covers these via `dirty_target_session`.)
+        //
+        // `ActiveDialogSessionChanged` is desktop-local UI state (which
+        // session the Solution band shows) with no mobile-client analogue —
+        // same treatment as the background-agents/-shells events above.
         SolutionAgentStoreEvent::TabsChanged { .. }
         | SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(_)
-        | SolutionAgentStoreEvent::SessionBackgroundShellsChanged(_) => {}
+        | SolutionAgentStoreEvent::SessionBackgroundShellsChanged(_)
+        | SolutionAgentStoreEvent::ActiveDialogSessionChanged { .. } => {}
     }
 }
 

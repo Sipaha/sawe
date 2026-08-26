@@ -6302,3 +6302,139 @@ async fn restart_and_watchdog_respawn_report_differently(cx: &mut TestAppContext
         });
     });
 }
+
+/// The Solution band and the status-bar tab strip are two separate views
+/// that must agree on which session's dialog is showing (spec 2026-08-26
+/// phase 2a task 2). `active_dialog_session` is that shared piece of state:
+/// per-solution, defaults to `None` (collapsed), and cleared automatically
+/// when its session is closed so the band never renders a dangling id.
+#[gpui::test]
+async fn active_dialog_session_is_per_solution_and_defaults_to_none(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::new(connect_count.clone())),
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.active_dialog_session(solution_id), None);
+        });
+    });
+
+    let session_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, Some(session_id), cx)
+        });
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.active_dialog_session(solution_id), Some(session_id));
+            assert_eq!(
+                store.active_dialog_session(SolutionId(9999)),
+                None,
+                "another solution's dialog selection is independent"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store
+            .update(cx, |store, cx| store.close_session(session_id, cx))
+            .expect("close_session");
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                None,
+                "closing the active dialog's session clears the selection"
+            );
+        });
+    });
+}
+
+/// `purge_session_hard` is a second, independent removal path from
+/// `close_session` (member-removal / solution-delete GC, not a user tab
+/// close) that funnels through the same in-memory teardown primitive. It
+/// must clear the active-dialog selection exactly like `close_session` does
+/// — otherwise a GC sweep would strand the band on a purged session.
+#[gpui::test]
+async fn active_dialog_session_cleared_by_purge_session_hard(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::new(connect_count.clone())),
+            );
+        });
+    });
+
+    let session_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, Some(session_id), cx)
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.purge_session_hard(session_id, None, cx)
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                None,
+                "hard-purging the active dialog's session clears the selection"
+            );
+        });
+    });
+}

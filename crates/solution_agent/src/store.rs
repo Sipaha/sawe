@@ -347,6 +347,14 @@ pub struct SolutionAgentStore {
     /// transcripts from before the restart are then left in place), but new
     /// growth stays bounded for the whole life of a running session.
     raw_transcript_history: HashMap<SolutionSessionId, VecDeque<String>>,
+    /// Which session's dialog the Solution band shows, per solution (spec
+    /// 2026-08-26 phase 2a). `None` (the default / absent entry) means the
+    /// band is collapsed. Two separate views — the band that renders the
+    /// dialog and the status-bar tab strip that lists sessions — read this
+    /// so they agree on which session is showing without reaching into each
+    /// other. In-memory only: persisting the selection across restarts is
+    /// phase 2a task 7, not this field.
+    active_dialog: HashMap<SolutionId, SolutionSessionId>,
 }
 
 /// Metadata captured by [`SolutionAgentStore::teardown_session_runtime`] while
@@ -451,6 +459,14 @@ pub enum SolutionAgentStoreEvent {
         id: SolutionSessionId,
         context_count: SessionContextCount,
     },
+    /// `active_dialog_session(solution_id)` changed — either the user
+    /// selected a different session's dialog in the Solution band / the
+    /// status-bar tab strip, or the previously-active session was removed
+    /// from the store (closed / hard-purged) and the selection was cleared
+    /// to avoid the band rendering a dangling id. Both the band (Task 4) and
+    /// the tab strip (Task 3) subscribe to this so either view can drive the
+    /// selection and the other stays in sync.
+    ActiveDialogSessionChanged { solution_id: SolutionId },
 }
 
 impl EventEmitter<SolutionAgentStoreEvent> for SolutionAgentStore {}
@@ -702,6 +718,7 @@ impl SolutionAgentStore {
             auditor_sessions: HashMap::new(),
             backoff_timers: HashMap::new(),
             raw_transcript_history: HashMap::new(),
+            active_dialog: HashMap::new(),
         }
     }
 
@@ -1275,6 +1292,67 @@ impl SolutionAgentStore {
 
     pub fn session(&self, id: SolutionSessionId) -> Option<Entity<SolutionSession>> {
         self.sessions.get(&id).cloned()
+    }
+
+    /// The session whose dialog the Solution band currently shows for
+    /// `solution_id`, or `None` when the band is collapsed. Independent per
+    /// solution.
+    pub fn active_dialog_session(&self, solution_id: SolutionId) -> Option<SolutionSessionId> {
+        self.active_dialog.get(&solution_id).copied()
+    }
+
+    /// Set which session's dialog the Solution band shows for `solution_id`.
+    /// `None` collapses the band. Called by the tab strip (Task 3) when the
+    /// user picks a tab, and by teardown paths (see
+    /// `clear_active_dialog_for_session`) when the previously-active session
+    /// is removed from the store.
+    pub fn set_active_dialog_session(
+        &mut self,
+        solution_id: SolutionId,
+        session_id: Option<SolutionSessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        match session_id {
+            Some(id) => {
+                self.active_dialog.insert(solution_id, id);
+            }
+            None => {
+                self.active_dialog.remove(&solution_id);
+            }
+        }
+        cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged { solution_id });
+        cx.notify();
+    }
+
+    /// If `id` is the active dialog for its solution, clear the selection so
+    /// the band never renders a session that's gone. Called from every path
+    /// that removes a session from `self.sessions` for good (`close_session`,
+    /// `purge_session_hard`'s hydrated AND never-hydrated branches — the
+    /// latter via `id` alone since there's no live entity to read
+    /// `solution_id` from). Deliberately NOT called from
+    /// `cold_close_solution`: that path evicts sessions from memory for a
+    /// closed window without deleting their persisted rows or `tab_order`,
+    /// and `restore_open_tabs` re-hydrates the same ids on reopen, so the
+    /// selection stays valid across that round-trip.
+    fn clear_active_dialog_for_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        let affected: Vec<SolutionId> = self
+            .active_dialog
+            .iter()
+            .filter(|(_, active_id)| **active_id == id)
+            .map(|(solution_id, _)| *solution_id)
+            .collect();
+        if affected.is_empty() {
+            return;
+        }
+        for solution_id in affected {
+            self.active_dialog.remove(&solution_id);
+            cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged { solution_id });
+        }
+        // Self-contained rather than relying on the caller's own `cx.notify()`:
+        // `purge_session_hard`'s never-hydrated branch returns before reaching
+        // its own notify, so without this the cleared selection wouldn't
+        // repaint until some unrelated store mutation happened to notify.
+        cx.notify();
     }
 
     /// Models to offer for `session_id`: the cached list (live-captured or

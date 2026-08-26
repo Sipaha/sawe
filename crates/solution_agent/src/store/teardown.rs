@@ -82,7 +82,11 @@ impl SolutionAgentStore {
             .map(|root| root.join(".agents").join(id.to_string()));
         let Some(teardown) = self.teardown_session_runtime(id, cx) else {
             // Nothing hydrated for this id — purge the persisted rows + disk
-            // tree anyway so a never-loaded orphan is still cleaned up.
+            // tree anyway so a never-loaded orphan is still cleaned up. Also
+            // clear it as an active dialog: a never-hydrated id can't
+            // normally be selected, but this stays a no-op guard rather than
+            // an assumption.
+            self.clear_active_dialog_for_session(id, cx);
             if let Some(db) = &self.persistence {
                 db.purge_session(id).detach_and_log_err(cx);
             }
@@ -416,6 +420,11 @@ impl SolutionAgentStore {
         // parent-jsonl cursor) — each holds a live `Task` and/or grows one entry
         // per closed session, so leaving them leaks for the process lifetime.
         self.evict_session_runtime_maps(id);
+        // This is the single in-memory teardown primitive shared by
+        // `close_session` and `purge_session_hard` — clearing here (rather
+        // than in each caller) guarantees neither can leave the band
+        // pointed at a session that no longer exists.
+        self.clear_active_dialog_for_session(id, cx);
         Some(SessionTeardown {
             solution_id,
             agent_id,
