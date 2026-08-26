@@ -6349,13 +6349,24 @@ async fn active_dialog_session_is_per_solution_and_defaults_to_none(cx: &mut Tes
             store.set_active_dialog_session(solution_id, Some(session_id), cx)
         });
     });
+    // Independence is only really tested by giving the *other* solution a
+    // different non-`None` selection: an unset key reading `None` would also
+    // pass against a single shared slot.
+    let other_solution = SolutionId(9999);
+    let other_session = crate::model::SolutionSessionId::new();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(other_solution, Some(other_session), cx)
+        });
+    });
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.read_with(cx, |store, _| {
             assert_eq!(store.active_dialog_session(solution_id), Some(session_id));
             assert_eq!(
-                store.active_dialog_session(SolutionId(9999)),
-                None,
+                store.active_dialog_session(other_solution),
+                Some(other_session),
                 "another solution's dialog selection is independent"
             );
         });

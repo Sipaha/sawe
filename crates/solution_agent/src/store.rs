@@ -19,8 +19,8 @@ use crate::adapter::AdapterRegistry;
 use crate::db::SolutionAgentDb;
 use crate::metrics_emitter::MetricsEmitter;
 use crate::model::{
-    AgentServerId, SessionContextCount, SessionState, SolutionSession, SolutionSessionId,
-    SolutionSessionMetadata,
+    AgentServerId, BandState, SessionContextCount, SessionState, SolutionSession,
+    SolutionSessionId, SolutionSessionMetadata, clamp_divider_ratio,
 };
 use crate::model_catalog::ModelCatalog;
 use crate::notifier;
@@ -347,14 +347,19 @@ pub struct SolutionAgentStore {
     /// transcripts from before the restart are then left in place), but new
     /// growth stays bounded for the whole life of a running session.
     raw_transcript_history: HashMap<SolutionSessionId, VecDeque<String>>,
-    /// Which session's dialog the Solution band shows, per solution (spec
-    /// 2026-08-26 phase 2a). `None` (the default / absent entry) means the
-    /// band is collapsed. Two separate views — the band that renders the
-    /// dialog and the status-bar tab strip that lists sessions — read this
-    /// so they agree on which session is showing without reaching into each
-    /// other. In-memory only: persisting the selection across restarts is
-    /// phase 2a task 7, not this field.
-    active_dialog: HashMap<SolutionId, SolutionSessionId>,
+    /// The Solution band's geometry per solution (spec 2026-08-26 phase 2a):
+    /// divider position, utility-section visibility, and which session's
+    /// dialog is showing. An absent entry means `BandState::default()`.
+    /// Three separate views — the band, the status-bar tab strip, and the
+    /// console panel's reveal path — read this so they agree without
+    /// reaching into each other. Mirrored into `solution_band_state` rows so
+    /// the band reopens the way the user left it.
+    band_state: HashMap<SolutionId, BandState>,
+    /// In-flight debounced `solution_band_state` writes, keyed by solution so
+    /// a newer drag position replaces (and thereby cancels) the pending write
+    /// for the same band. `on_drag_move` fires continuously for the whole
+    /// drag; without this every mouse move would queue a SQLite round-trip.
+    band_state_writes: HashMap<SolutionId, Task<()>>,
 }
 
 /// Metadata captured by [`SolutionAgentStore::teardown_session_runtime`] while
@@ -467,6 +472,11 @@ pub enum SolutionAgentStoreEvent {
     /// the tab strip (Task 3) subscribe to this so either view can drive the
     /// selection and the other stays in sync.
     ActiveDialogSessionChanged { solution_id: SolutionId },
+    /// The band's divider position or utility-section visibility changed for
+    /// `solution_id`. Separate from `ActiveDialogSessionChanged` so the tab
+    /// strip — which only cares about the selection — isn't repainted on
+    /// every frame of a divider drag.
+    BandStateChanged { solution_id: SolutionId },
 }
 
 impl EventEmitter<SolutionAgentStoreEvent> for SolutionAgentStore {}
@@ -485,6 +495,13 @@ fn tool_name_is_agent(name: Option<&str>) -> bool {
 
 /// Don't GC session archives until a solution has more than this many sessions
 /// (closed ones included) — small workspaces keep their full history on disk.
+/// How long the band's divider must sit still before its position is
+/// written to SQLite. `on_drag_move` fires per mouse move, so an
+/// undebounced write would be a DB round-trip per frame of the drag; the
+/// in-memory value is updated synchronously regardless, so the delay is
+/// invisible unless the editor is killed mid-drag.
+const BAND_STATE_WRITE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+
 const ARCHIVE_REAP_MIN_SESSIONS: usize = 10;
 /// A session's `.agents/<sid>/` archive is eligible for GC once its last
 /// activity is older than this.
@@ -718,7 +735,8 @@ impl SolutionAgentStore {
             auditor_sessions: HashMap::new(),
             backoff_timers: HashMap::new(),
             raw_transcript_history: HashMap::new(),
-            active_dialog: HashMap::new(),
+            band_state: HashMap::new(),
+            band_state_writes: HashMap::new(),
         }
     }
 
@@ -743,6 +761,34 @@ impl SolutionAgentStore {
 
     pub fn set_persistence(&mut self, db: Arc<SolutionAgentDb>, cx: &mut Context<Self>) {
         self.persistence = Some(db.clone());
+        // One-time load: merge persisted band geometry into the in-memory map.
+        // `or_insert` for the same reason as the supervisor states below — the
+        // band may already have been touched before the DB finished opening,
+        // and the live value is the newer of the two.
+        cx.spawn({
+            let db = db.clone();
+            async move |this, cx| {
+                let bands = db.load_band_states().await.log_err().unwrap_or_default();
+                this.update(cx, |this, cx| {
+                    let mut changed = false;
+                    for (solution_id, state) in bands {
+                        if this.band_state.get(&solution_id).is_none() {
+                            this.band_state.insert(solution_id, state);
+                            cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
+                            cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged {
+                                solution_id,
+                            });
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
         // One-time load: merge persisted supervisor states into the in-memory
         // map. Uses `or_insert` semantics so any states already toggled before
         // the DB was ready are not clobbered.
@@ -1294,11 +1340,21 @@ impl SolutionAgentStore {
         self.sessions.get(&id).cloned()
     }
 
+    /// The Solution band's geometry for `solution_id` — the defaults for a
+    /// solution the user has never touched the band in. Independent per
+    /// solution.
+    pub fn band_state(&self, solution_id: SolutionId) -> BandState {
+        self.band_state
+            .get(&solution_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// The session whose dialog the Solution band currently shows for
     /// `solution_id`, or `None` when the band is collapsed. Independent per
     /// solution.
     pub fn active_dialog_session(&self, solution_id: SolutionId) -> Option<SolutionSessionId> {
-        self.active_dialog.get(&solution_id).copied()
+        self.band_state(solution_id).active_dialog_session
     }
 
     /// Set which session's dialog the Solution band shows for `solution_id`.
@@ -1312,16 +1368,95 @@ impl SolutionAgentStore {
         session_id: Option<SolutionSessionId>,
         cx: &mut Context<Self>,
     ) {
-        match session_id {
-            Some(id) => {
-                self.active_dialog.insert(solution_id, id);
-            }
-            None => {
-                self.active_dialog.remove(&solution_id);
-            }
-        }
+        self.band_state
+            .entry(solution_id)
+            .or_default()
+            .active_dialog_session = session_id;
+        self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged { solution_id });
         cx.notify();
+    }
+
+    /// Show or hide the band's utility (terminal) section for `solution_id`.
+    /// Returns without touching the DB when nothing changed, so the
+    /// terminal-spawn paths that call this defensively on every reveal don't
+    /// each queue a write.
+    pub fn set_band_utility_visible(
+        &mut self,
+        solution_id: SolutionId,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self.band_state.entry(solution_id).or_default();
+        if entry.utility_visible == visible {
+            return;
+        }
+        entry.utility_visible = visible;
+        self.persist_band_state_now(solution_id, cx);
+        cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
+        cx.notify();
+    }
+
+    /// Move the band's divider. The in-memory value lands synchronously so
+    /// the dragged divider tracks the cursor on the very next frame; the row
+    /// is written behind a debounce (see `band_state_writes`).
+    pub fn set_band_divider_ratio(
+        &mut self,
+        solution_id: SolutionId,
+        ratio: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let ratio = clamp_divider_ratio(ratio);
+        let entry = self.band_state.entry(solution_id).or_default();
+        if entry.divider_ratio == ratio {
+            return;
+        }
+        entry.divider_ratio = ratio;
+        self.persist_band_state_debounced(solution_id, cx);
+        cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
+        cx.notify();
+    }
+
+    /// Drop a solution's in-memory band geometry (and any pending write for
+    /// it). The matching row is deleted by `delete_by_solution` on the same
+    /// `purge_solution_fully` path — see the call site there.
+    pub(crate) fn forget_band_state(&mut self, solution_id: SolutionId) {
+        self.band_state.remove(&solution_id);
+        self.band_state_writes.remove(&solution_id);
+    }
+
+    fn persist_band_state_now(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
+        // Drop any pending debounced write for this band first: it holds an
+        // older snapshot and would otherwise land *after* this one and undo it.
+        self.band_state_writes.remove(&solution_id);
+        let Some(db) = self.persistence.clone() else {
+            return;
+        };
+        let state = self.band_state(solution_id);
+        db.save_band_state(solution_id, state)
+            .detach_and_log_err(cx);
+    }
+
+    fn persist_band_state_debounced(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
+        if self.persistence.is_none() {
+            return;
+        }
+        let write = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(BAND_STATE_WRITE_DEBOUNCE)
+                .await;
+            // Re-read the state after the wait rather than capturing it up
+            // front, so the write reflects wherever the drag actually ended.
+            let Ok(Some((db, state))) = this.read_with(cx, |this, _| {
+                this.persistence
+                    .clone()
+                    .map(|db| (db, this.band_state(solution_id)))
+            }) else {
+                return;
+            };
+            db.save_band_state(solution_id, state).await.log_err();
+        });
+        self.band_state_writes.insert(solution_id, write);
     }
 
     /// If `id` is the active dialog for its solution, clear the selection so
@@ -1336,16 +1471,20 @@ impl SolutionAgentStore {
     /// selection stays valid across that round-trip.
     fn clear_active_dialog_for_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
         let affected: Vec<SolutionId> = self
-            .active_dialog
+            .band_state
             .iter()
-            .filter(|(_, active_id)| **active_id == id)
+            .filter(|(_, state)| state.active_dialog_session == Some(id))
             .map(|(solution_id, _)| *solution_id)
             .collect();
         if affected.is_empty() {
             return;
         }
         for solution_id in affected {
-            self.active_dialog.remove(&solution_id);
+            self.band_state
+                .entry(solution_id)
+                .or_default()
+                .active_dialog_session = None;
+            self.persist_band_state_now(solution_id, cx);
             cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged { solution_id });
         }
         // Self-contained rather than relying on the caller's own `cx.notify()`:

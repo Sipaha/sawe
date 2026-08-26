@@ -1156,3 +1156,55 @@ pub struct SolutionSessionMetadata {
 
 #[cfg(test)]
 mod tests;
+
+/// Narrowest share of the Solution band's width the dialog half may occupy,
+/// and its mirror for the utility half. Same bounds as the split-diff
+/// divider (`editor::split_editor_view`): a drag all the way to an edge must
+/// still leave the other half wide enough to grab and drag back, otherwise
+/// the only recovery is a double-click the user has no reason to guess at.
+pub const MIN_DIVIDER_RATIO: f32 = 0.1;
+pub const MAX_DIVIDER_RATIO: f32 = 0.9;
+/// Even split — what a band with no persisted row opens at, and what
+/// double-clicking the divider restores.
+pub const DEFAULT_DIVIDER_RATIO: f32 = 0.5;
+
+/// Clamp a proposed divider position into the usable range. Applied both to
+/// live drag positions and to values read back out of the DB, so a
+/// hand-edited or truncated row can't paint a half at zero width.
+pub fn clamp_divider_ratio(ratio: f32) -> f32 {
+    // `f32::clamp` propagates NaN rather than folding it into the range, and a
+    // NaN `flex_basis` fraction lays out as garbage, so reject it up front.
+    if ratio.is_nan() {
+        return DEFAULT_DIVIDER_RATIO;
+    }
+    ratio.clamp(MIN_DIVIDER_RATIO, MAX_DIVIDER_RATIO)
+}
+
+/// The Solution band's geometry for one Solution: where the divider sits,
+/// whether the utility (terminal) section is shown, and which session's
+/// dialog fills the other half. Persisted as a single `solution_band_state`
+/// row so the band reopens the way the user left it.
+///
+/// There is deliberately no separate "dialog collapsed" flag:
+/// `active_dialog_session == None` *is* the collapsed state, which is what
+/// `session_tab_strip::toggle_selection` already produces when the user
+/// re-clicks the active tab. A second boolean for the same bit could only
+/// ever disagree with it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BandState {
+    pub divider_ratio: f32,
+    pub utility_visible: bool,
+    pub active_dialog_session: Option<SolutionSessionId>,
+}
+
+impl Default for BandState {
+    fn default() -> Self {
+        Self {
+            divider_ratio: DEFAULT_DIVIDER_RATIO,
+            // Mirrors `Dock::new`'s `is_open: false`, the default the console
+            // dock had before the band took the terminal over.
+            utility_visible: false,
+            active_dialog_session: None,
+        }
+    }
+}

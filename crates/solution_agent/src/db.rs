@@ -329,6 +329,25 @@ impl SolutionAgentDb {
         "})?()
         .map_err(|e| anyhow!("Failed to create idx_attachment_by_solution: {}", e))?;
 
+        // Phase 2a task 7: the Solution band's persisted geometry — one row
+        // per Solution. `solution_id` is INTEGER here, unlike
+        // `solution_sessions.solution_id`, which is TEXT only because it
+        // predates the identity migration and still holds the decimal text of
+        // the numeric id; this table is new, so it stores the id in its
+        // natural type. `active_dialog_session` is NULL when the dialog half
+        // is collapsed, and carries no FK: a row pointing at a session that
+        // was since purged degrades to "collapsed" on load rather than
+        // blocking the delete.
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS solution_band_state (
+                solution_id           INTEGER PRIMARY KEY,
+                divider_ratio         REAL    NOT NULL,
+                utility_visible       INTEGER NOT NULL,
+                active_dialog_session TEXT
+            )
+        "})?()
+        .map_err(|e| anyhow!("Failed to create solution_band_state table: {}", e))?;
+
         Ok(Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
@@ -590,6 +609,7 @@ fn delete_by_solution(connection: &Connection, solution_id: SolutionId) -> Resul
     // migration); the migration rewrites it to the *decimal text* of the numeric
     // id rather than retyping the column, so every read/write of it binds the
     // stringified counter.
+    let band_solution_id = solution_id.0;
     let solution_id = solution_id.0.to_string();
     // One savepoint so the solution can't be left half-purged. Only
     // `solution_sessions` and `solution_session_attachment` carry a
@@ -619,6 +639,11 @@ fn delete_by_solution(connection: &Connection, solution_id: SolutionId) -> Resul
             let mut stmt = connection.exec_bound::<String>(sql)?;
             stmt(solution_id.clone())?;
         }
+        // Bound separately from the loop above because `solution_band_state`
+        // keys on an INTEGER `solution_id` rather than the legacy TEXT one.
+        let mut band = connection
+            .exec_bound::<i64>("DELETE FROM solution_band_state WHERE solution_id = ?")?;
+        band(band_solution_id)?;
         Ok(())
     });
     tx.map_err(|e| anyhow!("delete_by_solution failed: {e}"))
@@ -648,6 +673,7 @@ fn rewrite_session_cwds_by_solution(
 
 mod attachments;
 mod background;
+mod band;
 mod entries;
 mod sessions;
 mod supervisor;

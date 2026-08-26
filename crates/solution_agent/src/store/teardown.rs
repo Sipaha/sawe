@@ -132,6 +132,14 @@ impl SolutionAgentStore {
             .get(&solution_id)
             .cloned()
             .unwrap_or_default();
+        // Forget the band's geometry BEFORE the per-session purges, not after:
+        // `purge_session_hard` → `clear_active_dialog_for_session` would
+        // otherwise re-persist a row for this solution, and that write races
+        // the `delete_by_solution` below with no ordering guarantee between
+        // two detached background writes. With the entry already gone,
+        // `clear_active_dialog_for_session` finds nothing to clear and writes
+        // nothing. `delete_by_solution` drops the persisted row.
+        self.forget_band_state(solution_id);
         for id in session_ids {
             self.purge_session_hard(id, root.clone(), cx);
         }

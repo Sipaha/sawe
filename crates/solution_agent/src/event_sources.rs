@@ -91,7 +91,8 @@ fn dirty_target_session(
         | SessionClosed(_)
         | SessionNotified(..)
         | TabsChanged { .. }
-        | ActiveDialogSessionChanged { .. } => None,
+        | ActiveDialogSessionChanged { .. }
+        | BandStateChanged { .. } => None,
     }
 }
 
@@ -208,13 +209,15 @@ fn emit_event_notification(event: &SolutionAgentStoreEvent, cx: &mut App) {
         // just doesn't mirror it onto MCP. (The `agent_session_dirty`
         // convergence signal still covers these via `dirty_target_session`.)
         //
-        // `ActiveDialogSessionChanged` is desktop-local UI state (which
-        // session the Solution band shows) with no mobile-client analogue —
-        // same treatment as the background-agents/-shells events above.
+        // `ActiveDialogSessionChanged` and `BandStateChanged` are
+        // desktop-local UI state (which session the Solution band shows, and
+        // the band's own geometry) with no mobile-client analogue — same
+        // treatment as the background-agents/-shells events above.
         SolutionAgentStoreEvent::TabsChanged { .. }
         | SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(_)
         | SolutionAgentStoreEvent::SessionBackgroundShellsChanged(_)
-        | SolutionAgentStoreEvent::ActiveDialogSessionChanged { .. } => {}
+        | SolutionAgentStoreEvent::ActiveDialogSessionChanged { .. }
+        | SolutionAgentStoreEvent::BandStateChanged { .. } => {}
     }
 }
 
