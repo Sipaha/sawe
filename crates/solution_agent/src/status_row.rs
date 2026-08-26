@@ -1202,11 +1202,16 @@ fn supervisor_popover_menu(
 /// Color for the per-session state indicator, shared between this row's own
 /// state badge (above) and `session_tab_strip`'s per-tab dot so the two
 /// surfaces can never disagree about the same session's color. Priority
-/// mirrors the badge exactly: an error always wins, then "doing something"
-/// (running / stopping — the caller folds a view-local `is_resuming` into
-/// `is_running` since resuming isn't part of `SessionState` itself), then
-/// cold (restored from disk but not yet spawned), else the default (idle)
-/// text color.
+/// mirrors the badge exactly: an error always wins, then "actively running"
+/// (`is_running` here means exactly `SessionState::Running` — NOT
+/// `Stopping`, matching this file's own `is_running` at line 228 above; the
+/// caller ORs in a view-local `is_resuming` since that flag isn't part of
+/// `SessionState` at all), then cold (restored from disk but not yet
+/// spawned), else the default (idle — and, deliberately, `Stopping` too)
+/// text color. Both callers must keep excluding `Stopping` from
+/// `is_running` — folding it in (it looks tempting; `Stopping` IS "doing
+/// something") makes the dot disagree with this row's badge for the ~40s a
+/// cancelled turn takes to wind down.
 pub(crate) fn state_dot_color(is_errored: bool, is_running: bool, is_cold: bool) -> Color {
     if is_errored {
         Color::Error

@@ -48,7 +48,6 @@ pub const MAX_VISIBLE_TABS: usize = 5;
 /// `SolutionSession` entity so ordering/overflow can be decided as pure
 /// functions over plain data (no GPUI entity access) — see
 /// `split_visible_overflow` and its test.
-#[derive(Clone)]
 struct TabCandidate {
     session_id: SolutionSessionId,
     tab_order: i64,
@@ -171,6 +170,13 @@ impl SessionTabStrip {
         cx: &mut Context<Self>,
     ) {
         let store = SolutionAgentStore::global(cx);
+        // Deliberately includes `Stopping` — unlike `candidates_for`'s
+        // `is_running` (which feeds the dot color and must match
+        // `status_row.rs` exactly), this is a different question: "would
+        // closing right now abandon in-flight agent work?" A cancel is
+        // still winding down during `Stopping`, so it's just as much a
+        // reason to confirm as `Running` is. Mirrors
+        // `console_panel::close_tab_at`'s own busy check.
         let busy = store
             .read(cx)
             .session(session_id)
@@ -228,10 +234,17 @@ impl SessionTabStrip {
                     title: session.title.clone(),
                     is_cold: session.is_cold(),
                     is_errored: matches!(session.state, SessionState::Errored(_)),
-                    is_running: matches!(
-                        session.state,
-                        SessionState::Running { .. } | SessionState::Stopping { .. }
-                    ),
+                    // `Stopping` is deliberately NOT folded in here, even though
+                    // `close_tab`'s busy-check below treats it the same as
+                    // `Running` — the two questions are different ("is the agent
+                    // doing something, for the dot" vs "would closing abandon
+                    // work, for the confirm prompt"). `status_row.rs`'s own
+                    // `is_running` (the thing `state_dot_color`'s other caller
+                    // feeds) is `matches!(s.state, Running { .. }) && !is_resuming`
+                    // — it does NOT include `Stopping` either. Matching that
+                    // exactly is what keeps the two surfaces' dots from
+                    // disagreeing while a cancelled turn winds down.
+                    is_running: matches!(session.state, SessionState::Running { .. }),
                 })
             })
             .collect();
@@ -410,6 +423,18 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use std::sync::Arc;
+
+    // The `+` button dispatches `console_panel::NewChat` *by name* (see the
+    // module doc) rather than importing its type — a real dev-dependency on
+    // `console_panel` here would create a Cargo dev-dependency CYCLE
+    // (`console_panel` depends on `solution_agent` normally) that duplicates
+    // this crate's own compilation for the test binary, which then panics
+    // at startup on `inventory`-based action registration ("Action with name
+    // `solution_agent::FindClose` already registered" — verified by trying
+    // it). So the guard against a silent rename lives in
+    // `console_panel::panel::tests::new_chat_action_matches_the_status_bar_strips_dispatch_string`
+    // instead, where `console_panel` is linked exactly once and can assert
+    // `NewChat.name()` directly (no registry round-trip needed).
 
     #[test]
     fn tabs_beyond_the_visible_cap_spill_into_the_overflow_list() {

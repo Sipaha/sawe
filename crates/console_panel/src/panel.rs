@@ -2229,6 +2229,23 @@ mod tests {
         assert!(!restore_may_reconcile(5, 0));
     }
 
+    /// `solution_agent::session_tab_strip`'s trailing `+` button dispatches
+    /// this action *by name* (`cx.build_action("console_panel::NewChat", ..)`)
+    /// rather than importing the type — `solution_agent` cannot depend on
+    /// `console_panel` (the reverse dependency already exists). That string
+    /// literal lives three files away from this one with nothing the
+    /// compiler checks tying them together, so a rename of `NewChat` or of
+    /// this crate's name would otherwise only surface as a `log::error!` at
+    /// runtime — the `+` button would silently do nothing. This test can't
+    /// see that literal directly (still no cross-crate dependency), but it
+    /// pins the registered name so a rename fails HERE, in CI, instead of
+    /// silently in the shipped `+` button: `cargo test -p console_panel` is
+    /// exactly the kind of check a rename's author is expected to run.
+    #[test]
+    fn new_chat_action_matches_the_status_bar_strips_dispatch_string() {
+        assert_eq!(NewChat.name(), "console_panel::NewChat");
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
