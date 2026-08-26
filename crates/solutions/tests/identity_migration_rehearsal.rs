@@ -184,31 +184,30 @@ async fn real_agent_db_migrates_without_losing_sessions(cx: &mut gpui::TestAppCo
         .select::<(String, i64)>("SELECT old_id, new_id FROM solution_legacy_ids")
         .expect("prepare legacy map")()
     .expect("legacy map");
-    let members = solutions_connection
-        .select::<(i64, i64, String)>("SELECT id, solution_id, local_path FROM solution_members")
-        .expect("prepare members")()
-    .expect("members");
-    println!(
-        "cross-db map: {} slug(s), {} member(s)",
-        legacy_solution_ids.len(),
-        members.len()
-    );
+    println!("cross-db map: {} slug(s)", legacy_solution_ids.len());
 
     let agent_copy = copy_aside(&agent_source(), dir.path(), "solution_agent.db");
     let probe = Connection::open_file(&agent_copy.to_string_lossy());
     let sessions_before = count(&probe, "solution_sessions");
     let entries_before = count(&probe, "solution_session_entries");
     let attachments_before = count(&probe, "solution_session_attachment");
+    let members_bound_before = probe
+        .select::<i64>("SELECT COUNT(*) FROM solution_sessions WHERE member_id IS NOT NULL")
+        .expect("prepare member_id count")()
+    .expect("member_id count")
+    .into_iter()
+    .next()
+    .unwrap_or(0);
     println!(
         "agent db before: {sessions_before} session(s), {entries_before} entrie(s), \
-         {attachments_before} attachment(s)"
+         {attachments_before} attachment(s), {members_bound_before} member-bound"
     );
     drop(probe);
 
     let db = solution_agent::SolutionAgentDb::open_at_path(cx.executor(), &agent_copy)
         .expect("open the agent DB copy");
     let report = db
-        .migrate_identity(legacy_solution_ids.clone(), members)
+        .migrate_identity(legacy_solution_ids.clone())
         .await
         .expect("agent identity migration");
     println!("IdentityMigrationReport: {report:?}");
@@ -267,8 +266,12 @@ async fn real_agent_db_migrates_without_losing_sessions(cx: &mut gpui::TestAppCo
 
     let bound = rows.iter().filter(|r| r.2.is_some()).count() as i64;
     assert_eq!(
-        bound, report.member_ids_backfilled,
-        "member_id backfill count must match the rows actually bound"
+        bound, 0,
+        "every session must leave the migration with member_id cleared"
+    );
+    assert_eq!(
+        report.member_ids_cleared, members_bound_before,
+        "the report's clear count must match the rows that carried a binding before migration"
     );
     let unmapped_sessions = rows.iter().filter(|r| r.1.parse::<i64>().is_err()).count() as i64;
     assert_eq!(
@@ -279,13 +282,10 @@ async fn real_agent_db_migrates_without_losing_sessions(cx: &mut gpui::TestAppCo
 
     // Re-running must be a no-op: no row is remapped or rebound twice.
     let second = db
-        .migrate_identity(legacy_solution_ids, Vec::new())
+        .migrate_identity(legacy_solution_ids)
         .await
         .expect("second agent identity migration");
     assert_eq!(second.sessions_remapped, 0, "remap must be idempotent");
-    assert_eq!(
-        second.member_ids_backfilled, 0,
-        "backfill must be idempotent"
-    );
+    assert_eq!(second.member_ids_cleared, 0, "clear must be idempotent");
     assert_eq!(second.sessions_total, sessions_before);
 }

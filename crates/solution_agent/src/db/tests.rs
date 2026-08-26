@@ -1190,15 +1190,12 @@ fn seed_legacy_sessions(db: &SolutionAgentDb) {
 }
 
 #[gpui::test]
-async fn migrate_identity_remaps_slugs_and_backfills_member_ids(cx: &mut gpui::TestAppContext) {
+async fn migrate_identity_remaps_slugs(cx: &mut gpui::TestAppContext) {
     let db = SolutionAgentDb::open(cx.executor()).expect("open db");
     seed_legacy_sessions(&db);
 
     let report = db
-        .migrate_identity(
-            vec![("spk-solutions".to_string(), 7)],
-            vec![(42, 7, "/home/u/sol/spk-solutions/sawe".to_string())],
-        )
+        .migrate_identity(vec![("spk-solutions".to_string(), 7)])
         .await
         .expect("migrate identity");
 
@@ -1209,7 +1206,10 @@ async fn migrate_identity_remaps_slugs_and_backfills_member_ids(cx: &mut gpui::T
         vec!["ghost".to_string()],
         "a session whose solution no longer exists must be reported, not silently dropped"
     );
-    assert_eq!(report.member_ids_backfilled, 1);
+    assert_eq!(
+        report.member_ids_cleared, 0,
+        "seed_legacy_sessions carries no member_id, so there is nothing to clear"
+    );
 
     let rows = {
         let connection = db.connection.lock();
@@ -1222,15 +1222,11 @@ async fn migrate_identity_remaps_slugs_and_backfills_member_ids(cx: &mut gpui::T
     };
     assert_eq!(rows[0].1, "7", "the slug is replaced by the numeric id");
     assert_eq!(
-        rows[0].2,
-        Some(42),
-        "cwd == member.local_path binds member_id"
+        rows[0].2, None,
+        "sessions are Solution-scoped now — no session carries a member_id"
     );
     assert_eq!(rows[1].1, "7");
-    assert_eq!(
-        rows[1].2, None,
-        "a session at the solution root keeps a NULL member_id (the ROOT label)"
-    );
+    assert_eq!(rows[1].2, None);
     assert_eq!(
         rows[2].1, "ghost",
         "an unmapped session's id is left alone so the row is still inspectable"
@@ -1238,17 +1234,73 @@ async fn migrate_identity_remaps_slugs_and_backfills_member_ids(cx: &mut gpui::T
 }
 
 #[gpui::test]
+async fn migration_clears_member_ids(cx: &mut gpui::TestAppContext) {
+    let db = SolutionAgentDb::open(cx.executor()).expect("open db");
+    seed_legacy_sessions(&db);
+
+    // Simulate rows a pre-Task-3 build already bound to a member — the case
+    // the migration must now undo rather than perpetuate.
+    {
+        let connection = db.connection.lock();
+        connection
+            .exec(
+                "UPDATE solution_sessions SET member_id = 42
+                 WHERE id = '11111111-1111-4111-8111-111111111111'",
+            )
+            .expect("prepare member_id seed")()
+        .expect("seed member_id");
+    }
+
+    let report = db
+        .migrate_identity(vec![("spk-solutions".to_string(), 7)])
+        .await
+        .expect("migrate identity");
+    assert_eq!(report.member_ids_cleared, 1);
+
+    let remaining = {
+        let connection = db.connection.lock();
+        connection
+            .select::<i64>("SELECT COUNT(*) FROM solution_sessions WHERE member_id IS NOT NULL")
+            .expect("prepare remaining count")()
+        .expect("remaining count")
+    };
+    assert_eq!(remaining, vec![0], "no session may keep a member binding");
+
+    let cwds = {
+        let connection = db.connection.lock();
+        connection
+            .select::<Option<String>>("SELECT cwd FROM solution_sessions ORDER BY id")
+            .expect("prepare select cwd")()
+        .expect("select cwd")
+    };
+    assert_eq!(
+        cwds,
+        vec![
+            Some("/home/u/sol/spk-solutions/sawe".to_string()),
+            Some("/home/u/sol/spk-solutions".to_string()),
+            Some("/home/u/sol/ghost".to_string()),
+        ],
+        "the migration must not rewrite cwd — claude-acp buckets transcripts by it"
+    );
+
+    let second = db
+        .migrate_identity(vec![("spk-solutions".to_string(), 7)])
+        .await
+        .expect("second run");
+    assert_eq!(second.member_ids_cleared, 0, "nothing left to clear");
+}
+
+#[gpui::test]
 async fn migrate_identity_is_idempotent(cx: &mut gpui::TestAppContext) {
     let db = SolutionAgentDb::open(cx.executor()).expect("open db");
     seed_legacy_sessions(&db);
     let mapping = vec![("spk-solutions".to_string(), 7)];
-    let members = vec![(42, 7, "/home/u/sol/spk-solutions/sawe".to_string())];
 
-    db.migrate_identity(mapping.clone(), members.clone())
+    db.migrate_identity(mapping.clone())
         .await
         .expect("first run");
     let second = db
-        .migrate_identity(mapping, members)
+        .migrate_identity(mapping)
         .await
         .expect("second run");
 
@@ -1257,8 +1309,8 @@ async fn migrate_identity_is_idempotent(cx: &mut gpui::TestAppContext) {
         "already-numeric rows must not be touched again"
     );
     assert_eq!(
-        second.member_ids_backfilled, 0,
-        "already-bound sessions must not be rewritten"
+        second.member_ids_cleared, 0,
+        "a second run finds nothing left to clear"
     );
     let count = {
         let connection = db.connection.lock();

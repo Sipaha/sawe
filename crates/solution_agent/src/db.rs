@@ -376,40 +376,26 @@ impl SolutionAgentDb {
 
     /// Rewrite `solution_sessions.solution_id` / `solution_session_attachment
     /// .solution_id` from the pre-identity TEXT slug to the numeric counter id
-    /// the solutions DB now uses, and bind each session to the member whose
-    /// `local_path` equals its `cwd`.
+    /// the solutions DB now uses, and clear any `member_id` binding a session
+    /// still carries. AI sessions are purely Solution-scoped now (no longer
+    /// bound to a member project), so a lingering binding from an older build
+    /// is stale state nothing reads any more — this un-does the backfill an
+    /// earlier version of this migration performed.
     ///
     /// Idempotent: rows whose `solution_id` already parses as an integer are
-    /// skipped, and `member_id` is only written where it is still NULL.
+    /// skipped, and the `member_id` clear is a no-op once every row is
+    /// already NULL.
     ///
     /// `legacy_solution_ids` is `(old_slug, new_id)` from
-    /// `SolutionsDb::load_solution_legacy_ids`; `members` is
-    /// `(member_id, solution_id, local_path)`.
+    /// `SolutionsDb::load_solution_legacy_ids`.
     pub fn migrate_identity(
         &self,
         legacy_solution_ids: Vec<(String, i64)>,
-        members: Vec<(i64, i64, String)>,
     ) -> Task<Result<IdentityMigrationReport>> {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
             let connection = connection.lock();
-            migrate_identity_fn(&connection, &legacy_solution_ids, &members)
-        })
-    }
-
-    pub fn set_session_member(
-        &self,
-        id: SolutionSessionId,
-        member_id: Option<solutions::MemberId>,
-    ) -> Task<Result<()>> {
-        let connection = self.connection.clone();
-        self.executor.spawn(async move {
-            let connection = connection.lock();
-            let mut update = connection.exec_bound::<(Option<i64>, String)>(indoc! {"
-                UPDATE solution_sessions SET member_id = ?1 WHERE id = ?2
-            "})?;
-            update((member_id.map(|m| m.0), id.to_string()))?;
-            Ok(())
+            migrate_identity_fn(&connection, &legacy_solution_ids)
         })
     }
 }
@@ -422,17 +408,15 @@ pub struct IdentityMigrationReport {
     /// left untouched so the operator can inspect them. Non-empty means a
     /// solution was deleted from `solutions.db` while its sessions survived.
     pub sessions_unmapped: Vec<String>,
-    pub member_ids_backfilled: i64,
+    pub member_ids_cleared: i64,
 }
 
 fn migrate_identity_fn(
     connection: &Connection,
     legacy_solution_ids: &[(String, i64)],
-    members: &[(i64, i64, String)],
 ) -> Result<IdentityMigrationReport> {
-    let sessions =
-        connection.select::<(String, String, Option<String>, Option<i64>)>(indoc! {"
-        SELECT id, solution_id, cwd, member_id FROM solution_sessions
+    let sessions = connection.select::<(String, String)>(indoc! {"
+        SELECT id, solution_id FROM solution_sessions
     "})?()?;
 
     let mut report = IdentityMigrationReport {
@@ -446,51 +430,42 @@ fn migrate_identity_fn(
     let mut remap_attachments = connection.exec_bound::<(String, String)>(indoc! {"
         UPDATE solution_session_attachment SET solution_id = ?1 WHERE solution_id = ?2
     "})?;
-    let mut bind_member = connection.exec_bound::<(i64, String)>(indoc! {"
-        UPDATE solution_sessions SET member_id = ?1 WHERE id = ?2
-    "})?;
 
     let mut unmapped: Vec<String> = Vec::new();
-    for (session_id, solution_id, cwd, member_id) in &sessions {
+    for (session_id, solution_id) in &sessions {
         // Already-numeric rows were migrated by an earlier run.
-        let numeric_solution: i64 = match solution_id.parse::<i64>() {
-            Ok(numeric) => numeric,
-            Err(_) => {
-                let Some((_, new_id)) = legacy_solution_ids
-                    .iter()
-                    .find(|(old, _)| old == solution_id)
-                else {
-                    if !unmapped.contains(solution_id) {
-                        unmapped.push(solution_id.clone());
-                    }
-                    continue;
-                };
-                remap((new_id.to_string(), session_id.clone()))?;
-                remap_attachments((new_id.to_string(), solution_id.clone()))?;
-                report.sessions_remapped += 1;
-                *new_id
-            }
-        };
-
-        if member_id.is_some() {
+        if solution_id.parse::<i64>().is_ok() {
             continue;
         }
-        let Some(cwd) = cwd.as_deref().filter(|c| !c.is_empty()) else {
-            continue;
-        };
-        // Exact match only: `cwd` is the member root at spawn time. A cwd that is
-        // the solution root (or anything else) stays NULL — that IS the ROOT label.
-        let Some((matched_member, _, _)) = members
-            .iter()
-            .find(|(_, solution, path)| *solution == numeric_solution && path == cwd)
+        let Some((_, new_id)) = legacy_solution_ids.iter().find(|(old, _)| old == solution_id)
         else {
+            if !unmapped.contains(solution_id) {
+                unmapped.push(solution_id.clone());
+            }
             continue;
         };
-        bind_member((*matched_member, session_id.clone()))?;
-        report.member_ids_backfilled += 1;
+        remap((new_id.to_string(), session_id.clone()))?;
+        remap_attachments((new_id.to_string(), solution_id.clone()))?;
+        report.sessions_remapped += 1;
     }
-
     report.sessions_unmapped = unmapped;
+
+    // AI sessions are purely Solution-scoped now — no reader binds a session
+    // to a member project any more. Clear whatever a pre-Task-3 build wrote so
+    // no stale binding survives an upgrade. Count first (rather than relying
+    // on a driver-specific rows-affected return) so the report is unambiguous.
+    let bound_before = connection
+        .select::<i64>(indoc! {"
+            SELECT COUNT(*) FROM solution_sessions WHERE member_id IS NOT NULL
+        "})?()?
+        .first()
+        .copied()
+        .unwrap_or(0);
+    connection.exec(indoc! {"
+        UPDATE solution_sessions SET member_id = NULL WHERE member_id IS NOT NULL
+    "})?()?;
+    report.member_ids_cleared = bound_before;
+
     Ok(report)
 }
 

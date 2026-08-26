@@ -159,29 +159,13 @@ pub fn init(cx: &mut App) {
 }
 
 /// Remap `solution_sessions.solution_id` from the pre-identity slug to the
-/// numeric counter the solutions DB now uses, and backfill `member_id` from each
-/// session's cwd. Never fatal: a failure here leaves the rows untouched and is
-/// logged, so a busted map degrades to "sessions don't show up" instead of
+/// numeric counter the solutions DB now uses, and clear any `member_id`
+/// binding a session still carries from before AI sessions became purely
+/// Solution-scoped. Never fatal: a failure here leaves the rows untouched and
+/// is logged, so a busted map degrades to "sessions don't show up" instead of
 /// destroying them.
 async fn run_identity_migration(db: &db::SolutionAgentDb, cx: &mut AsyncApp) {
-    let (solutions_db, members) = cx.update(|cx| {
-        let solutions_db = solutions::db::SolutionsDb::global(cx);
-        let members: Vec<(i64, i64, String)> = solutions::SolutionStore::global(cx)
-            .read(cx)
-            .solutions()
-            .iter()
-            .flat_map(|solution| {
-                solution.members.iter().map(|member| {
-                    (
-                        member.id.0,
-                        solution.id.0,
-                        member.local_path.to_string_lossy().into_owned(),
-                    )
-                })
-            })
-            .collect();
-        (solutions_db, members)
-    });
+    let solutions_db = cx.update(|cx| solutions::db::SolutionsDb::global(cx));
     let legacy = match solutions_db.load_solution_legacy_ids().await {
         Ok(legacy) => legacy,
         Err(err) => {
@@ -189,7 +173,7 @@ async fn run_identity_migration(db: &db::SolutionAgentDb, cx: &mut AsyncApp) {
             return;
         }
     };
-    match db.migrate_identity(legacy, members).await {
+    match db.migrate_identity(legacy).await {
         Ok(report) => {
             if !report.sessions_unmapped.is_empty() {
                 log::error!(
@@ -200,10 +184,10 @@ async fn run_identity_migration(db: &db::SolutionAgentDb, cx: &mut AsyncApp) {
             }
             log::info!(
                 "solution_agent: identity migration — {} of {} session(s) remapped, {} member \
-                 binding(s) backfilled",
+                 binding(s) cleared",
                 report.sessions_remapped,
                 report.sessions_total,
-                report.member_ids_backfilled
+                report.member_ids_cleared
             );
         }
         Err(err) => log::error!("solution_agent: identity migration failed: {err}"),
