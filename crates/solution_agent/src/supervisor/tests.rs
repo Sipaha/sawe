@@ -546,3 +546,69 @@ fn parse_clock_forms() {
     assert_eq!(parse_clock("13pm"), None);
     assert_eq!(parse_clock("8:99"), None);
 }
+
+// `format_usage_limit_eta` is exercised entirely through `chrono::Local` (the
+// same zone `apply_usage_limit_stop` converts into), built consistently for
+// both `now` and `resume` in each case — so these assertions hold under
+// whatever timezone the test runner's machine is in, without needing a named
+// IANA zone like the parse-side tests above.
+
+#[test]
+fn eta_same_local_day_is_time_only() {
+    use chrono::TimeZone as _;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 8, 26, 10, 0, 0)
+        .unwrap();
+    let resume = chrono::Local
+        .with_ymd_and_hms(2026, 8, 26, 21, 0, 0)
+        .unwrap();
+    let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
+    assert_eq!(eta.log, "21:00");
+    assert_eq!(eta.user, "21:00");
+}
+
+#[test]
+fn eta_next_local_day_carries_date() {
+    use chrono::TimeZone as _;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 8, 26, 22, 0, 0)
+        .unwrap();
+    let resume = chrono::Local
+        .with_ymd_and_hms(2026, 8, 27, 9, 0, 0)
+        .unwrap();
+    let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
+    assert_eq!(eta.log, "Aug 27 09:00");
+    assert_eq!(eta.user, "27 авг, 09:00");
+}
+
+/// The weekly-limit case that motivated this fix: a reset days out must not
+/// read like "a few hours from now".
+#[test]
+fn eta_days_out_carries_date() {
+    use chrono::TimeZone as _;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
+        .unwrap();
+    let resume = chrono::Local
+        .with_ymd_and_hms(2026, 8, 29, 21, 0, 0)
+        .unwrap();
+    let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
+    assert_eq!(eta.log, "Aug 29 21:00");
+    assert_eq!(eta.user, "29 авг, 21:00");
+}
+
+/// The naive-24h-delta trap: resume is under an hour away but crosses local
+/// midnight, so it's a different calendar day and the date must still show.
+#[test]
+fn eta_just_after_midnight_is_different_day_despite_short_delta() {
+    use chrono::TimeZone as _;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 8, 26, 23, 50, 0)
+        .unwrap();
+    let resume = chrono::Local
+        .with_ymd_and_hms(2026, 8, 27, 0, 30, 0)
+        .unwrap();
+    let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
+    assert_eq!(eta.log, "Aug 27 00:30");
+    assert_eq!(eta.user, "27 авг, 00:30");
+}

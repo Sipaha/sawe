@@ -1130,13 +1130,12 @@ impl SolutionAgentStore {
                         // transient-failure backoff exhaustion.
                         state.backoff_attempt = 0;
                     }
-                    let eta = chrono::DateTime::from_timestamp_millis(resume_ms)
-                        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                        .unwrap_or_else(|| "?".into());
+                    let eta = crate::supervisor::format_usage_limit_eta(resume_ms, now_ms);
                     self.append_supervisor_diary_note(
                             id,
                             &format!(
-                                "usage limit hit; auto-resume scheduled ~{eta} local (reset + 2-15min jitter)"
+                                "usage limit hit; auto-resume scheduled ~{} local (reset + 2-15min jitter)",
+                                eta.log
                             ),
                             cx,
                         );
@@ -1144,7 +1143,8 @@ impl SolutionAgentStore {
                             id,
                             acp_thread::SystemNoteLevel::Info,
                             format!(
-                                "Достигнут лимит claude. Наблюдатель продолжит сессию автоматически примерно в {eta}."
+                                "Достигнут лимит claude. Наблюдатель продолжит сессию автоматически примерно в {}.",
+                                eta.user
                             ),
                             cx,
                         );

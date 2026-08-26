@@ -642,6 +642,75 @@ pub fn parse_usage_limit_reset_ms(message: &str, now_ms: i64) -> Option<i64> {
     }
 }
 
+/// The two renderings of a usage-limit resume moment that
+/// `apply_usage_limit_stop` needs: an English one for its diary/log line and
+/// a Russian one for the user-facing note. Built together (rather than as one
+/// shared string) because a Russian month abbreviation stitched into an
+/// English log sentence — or vice versa — reads oddly; the two callers are
+/// different audiences even though they describe the same instant.
+pub struct UsageLimitEta {
+    pub log: String,
+    pub user: String,
+}
+
+/// Russian month abbreviations for [`UsageLimitEta::user`]. `chrono`'s `%b`
+/// only knows English month names ("Aug"), and this fork deliberately
+/// hand-rolls its handful of Russian UI strings rather than pull in a
+/// localisation framework for them (see `console_panel`/`solution_agent`).
+const RU_MONTH_ABBREV: [&str; 12] = [
+    "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек",
+];
+
+/// Formats `resume_ms` for `apply_usage_limit_stop`'s two auto-resume
+/// messages. Bare time when `resume_ms` falls on the same LOCAL calendar day
+/// as `now_ms` (the common session-limit case, where a redundant date is
+/// noise); the date is prefixed otherwise, because a weekly limit can now
+/// park a session days out (see `parse_usage_limit_reset_ms`'s month-day
+/// form) and a bare "21:00" then misreads as "a few hours from now" instead
+/// of "in three days".
+///
+/// "Today" is a LOCAL calendar-date comparison, not a 24h delta: a resume at
+/// 00:30 is a different day from a "now" of 23:50 even though it's under an
+/// hour away, and that is exactly the case where the date matters most.
+///
+/// Falls back to "?" placeholders (matching the pre-existing behavior) when
+/// `resume_ms` doesn't convert to a valid instant.
+pub fn format_usage_limit_eta(resume_ms: i64, now_ms: i64) -> UsageLimitEta {
+    use chrono::{Datelike, TimeZone, Utc};
+
+    let Some(resume_local) = chrono::DateTime::from_timestamp_millis(resume_ms)
+        .map(|dt: chrono::DateTime<Utc>| dt.with_timezone(&chrono::Local))
+    else {
+        return UsageLimitEta {
+            log: "?".into(),
+            user: "?".into(),
+        };
+    };
+    let now_local = Utc
+        .timestamp_millis_opt(now_ms)
+        .single()
+        .map(|dt| dt.with_timezone(&chrono::Local));
+
+    let same_day = now_local.is_some_and(|now| now.date_naive() == resume_local.date_naive());
+    let time = resume_local.format("%H:%M").to_string();
+    if same_day {
+        return UsageLimitEta {
+            log: time.clone(),
+            user: time,
+        };
+    }
+
+    let month_idx = (resume_local.month() as usize).saturating_sub(1).min(11);
+    UsageLimitEta {
+        log: format!("{} {time}", resume_local.format("%b %d")),
+        user: format!(
+            "{} {}, {time}",
+            resume_local.day(),
+            RU_MONTH_ABBREV[month_idx]
+        ),
+    }
+}
+
 /// Parse a 3+ letter weekday prefix (`mon`, `tuesday`, …) — lowercase input.
 pub(crate) fn parse_weekday(token: &str) -> Option<chrono::Weekday> {
     use chrono::Weekday::*;
