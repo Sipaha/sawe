@@ -793,21 +793,9 @@ impl SolutionAgentStore {
         project: Entity<project::Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<SolutionSessionId>> {
-        // "New chat from the + menu" means "a chat in the solution's active
-        // member" — the cwd this used to pass was `active_member_path`, so the
-        // member binding is the same choice, just recorded as a fact.
-        let member_id = SolutionStore::try_global(cx)
-            .and_then(|store| store.read(cx).active_member(solution_id));
-        self.create_session_with_cwd(
-            solution_id,
-            agent_id,
-            project,
-            None,
-            member_id,
-            None,
-            None,
-            cx,
-        )
+        // Sessions are solution-scoped: they start at the solution root and
+        // the agent walks wherever it needs (spec 2026-08-26).
+        self.create_session_with_cwd(solution_id, agent_id, project, None, None, None, cx)
     }
 
     /// Create a hidden one-shot session for an internal AI helper (commit-message
@@ -826,7 +814,6 @@ impl SolutionAgentStore {
             agent_id,
             project,
             None,  // cwd
-            None,  // member_id
             None,  // parent_session_id
             None,  // model
             None,  // effort
@@ -849,7 +836,6 @@ impl SolutionAgentStore {
         agent_id: AgentServerId,
         project: Entity<project::Project>,
         cwd: Option<PathBuf>,
-        member_id: Option<solutions::MemberId>,
         model: Option<String>,
         effort: Option<String>,
         cx: &mut Context<Self>,
@@ -859,7 +845,6 @@ impl SolutionAgentStore {
             agent_id,
             project,
             cwd,
-            member_id,
             None,
             model,
             effort,
@@ -881,10 +866,6 @@ impl SolutionAgentStore {
         agent_id: AgentServerId,
         project: Entity<project::Project>,
         cwd: Option<PathBuf>,
-        // The member the session is bound to (`None` = solution root). Kept
-        // adjacent to `cwd`: the cwd is where the subprocess is spawned, this is
-        // the durable fact the label / tab scoping read.
-        member_id: Option<solutions::MemberId>,
         parent_session_id: Option<SolutionSessionId>,
         model: Option<String>,
         effort: Option<String>,
@@ -943,22 +924,8 @@ impl SolutionAgentStore {
             let connection = connection_task.await?;
 
             // 3. Create an ACP session on that connection. An explicit `cwd`
-            //    wins; otherwise the bound member's folder is where the
-            //    subprocess is spawned, falling back to the solution root.
-            let work_dir = match cwd {
-                Some(cwd) => cwd,
-                None => cx
-                    .update(|cx| {
-                        member_id.and_then(|id| {
-                            SolutionStore::try_global(cx)?
-                                .read(cx)
-                                .find_member(id)
-                                .ok()
-                                .map(|m| m.local_path.clone())
-                        })
-                    })
-                    .unwrap_or_else(|| solution.root.clone()),
-            };
+            //    wins; otherwise the session is rooted at the solution root.
+            let work_dir = cwd.unwrap_or_else(|| solution.root.clone());
             log::info!(
                 target: "solution_agent::resume",
                 "creating session in solution={:?} agent={} cwd={} (solution_root={})",
@@ -1011,13 +978,10 @@ impl SolutionAgentStore {
                     }
                 }
                 let session_id = SolutionSessionId::new();
-                // Default tab title = name of the member the session is bound
-                // to, else the Solution name (covers the "Solution root"
-                // choice). Dedup'd against existing sessions in the same
-                // Solution so successive same-member opens land as `name`,
-                // `name 2`, `name 3`, …
-                let title_base: SharedString = project_label(&solution, member_id, cx)
-                    .unwrap_or_else(|| SharedString::from(solution.name.clone()));
+                // Default tab title = the Solution name. Dedup'd against
+                // existing sessions in the same Solution so successive opens
+                // land as `name`, `name 2`, `name 3`, …
+                let title_base: SharedString = SharedString::from(solution.name.clone());
                 let title = unique_session_title(&title_base, store, &solution_id, cx);
                 let entity = cx.new(|cx| {
                     let mut s = SolutionSession::new_idle(
@@ -1029,7 +993,6 @@ impl SolutionAgentStore {
                     s.title = title;
                     s.project = Some(project.clone());
                     s.cwd = session_cwd.clone();
-                    s.member_id = member_id;
                     s.parent_session_id = parent_session_id;
                     s.is_supervisor_ephemeral = ephemeral_supervisor;
                     s.is_ephemeral = ephemeral;

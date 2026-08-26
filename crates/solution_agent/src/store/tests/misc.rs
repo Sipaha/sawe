@@ -122,6 +122,64 @@ async fn create_session_spawns_subprocess_once_per_pair(cx: &mut TestAppContext)
     assert_eq!(connect_count.load(Ordering::SeqCst), 1);
 }
 
+/// `create_session` is the "+" / keyboard `NewChat` path. It must root the
+/// new session's cwd at the solution root even when the solution has an
+/// active member selected — sessions are solution-scoped now (spec
+/// 2026-08-26), not bound to whichever project happens to be active.
+#[gpui::test]
+async fn create_session_roots_cwd_at_solution_root(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let solution_root = cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::new(connect_count.clone())),
+            );
+        });
+
+        let solution_store = solutions::SolutionStore::global(cx);
+        let solution_root = solution_store
+            .read(cx)
+            .find_solution(solution_id)
+            .expect("solution")
+            .root
+            .clone();
+        let member_id = solution_store.update(cx, |s, _| {
+            s.test_add_member_with_path(solution_id, "member", solution_root.join("member"))
+        });
+        solution_store.update(cx, |s, cx| s.set_active_member(solution_id, member_id, cx));
+        solution_root
+    });
+
+    let session_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session");
+            let session = session.read(cx);
+            assert_eq!(
+                session.cwd, solution_root,
+                "cwd must be the solution root, not the active member's folder"
+            );
+        });
+    });
+}
+
 #[gpui::test]
 async fn parallel_create_session_for_same_pair_spawns_only_once(cx: &mut TestAppContext) {
     let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
@@ -4183,7 +4241,6 @@ async fn create_child_session_is_not_pinned(cx: &mut TestAppContext) {
                     solution_id,
                     agent_id,
                     project,
-                    None,
                     None,
                     Some(parent),
                     None,

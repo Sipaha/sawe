@@ -1499,13 +1499,10 @@ impl ConsolePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Scope the new chat to the active project's folder, exactly like the
-        // "+" → "New AI Chat" menu entry. Passing `None` here would default
-        // the session cwd to the solution root, so the keyboard `NewChat`
-        // action (and any other caller of this convenience wrapper) would land
-        // the agent in "ROOT" instead of the selected project.
-        let cwd = active_member_path(solution_id, cx);
-        self.add_chat_tab_with_cwd(solution_id, project, cwd, window, cx);
+        // Sessions are solution-scoped now (spec 2026-08-26): `None` roots the
+        // new session at the solution root rather than inferring an active
+        // member's folder.
+        self.add_chat_tab_with_cwd(solution_id, project, None, window, cx);
     }
 
     /// Create a chat session (create-implies-open) under `solution_id` rooted
@@ -1533,11 +1530,6 @@ impl ConsolePanel {
         // Model and effort are chosen in the status bar after the chat is
         // created (and applied before the first message starts the session),
         // so the create call no longer carries them.
-        // Bind the new session to the active project up-front. The session's
-        // `member_id` is what scopes its tab from now on — inferring the member
-        // from the cwd would break the moment the member's folder is renamed.
-        let member_id = SolutionStore::try_global(cx)
-            .and_then(|store| store.read(cx).active_member(solution_id));
         let store = SolutionAgentStore::global(cx);
         let task = store.update(cx, |store, cx| {
             store.create_session_with_cwd(
@@ -1545,7 +1537,6 @@ impl ConsolePanel {
                 SharedString::from(CLAUDE_ACP_AGENT_ID),
                 project,
                 cwd,
-                member_id,
                 None,
                 None,
                 cx,

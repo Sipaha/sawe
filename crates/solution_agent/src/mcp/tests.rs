@@ -1105,7 +1105,6 @@ async fn create_child_session(
                 agent_id,
                 project,
                 None,
-                None,
                 Some(parent_id),
                 None,
                 None,
