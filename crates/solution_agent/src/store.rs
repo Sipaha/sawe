@@ -480,9 +480,9 @@ pub enum SolutionAgentStoreEvent {
     /// so it is kept separate from `ActiveDialogSessionChanged` to keep
     /// `SessionTabStrip` — which filters on an explicit event list and only
     /// cares about the selection — out of the drag's repaint path. Note this
-    /// buys nothing for the catch-all subscribers that notify on ANY store
-    /// event (`SolutionAgentStatusItem`, `solutions_ui::SolutionTabStrip`);
-    /// they repaint per move regardless, which is free only because GPUI
+    /// buys nothing for `solutions_ui::SolutionTabStrip`, which notifies on
+    /// ANY store event; it repaints per move regardless, which is free only
+    /// because GPUI
     /// coalesces `Effect::Notify` per entity per frame and the window is
     /// already repainting for the drag. A future subscriber that does real
     /// work on this event needs to debounce it itself.

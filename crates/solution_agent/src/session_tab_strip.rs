@@ -661,9 +661,9 @@ impl StatusItemView for SessionTabStrip {
     }
 
     fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
-        // Self-hiding, like `SolutionAgentStatusItem`: renders empty outside
-        // a Solution window (no active_solution_id), so a user-facing "hide
-        // this button" setting would have nothing stable to toggle.
+        // Self-hiding: renders empty outside a Solution window (no
+        // active_solution_id), so a user-facing "hide this button" setting
+        // would have nothing stable to toggle.
         None
     }
 }

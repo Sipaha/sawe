@@ -62,3 +62,6 @@ crates/docs_preprocessor/actions.json
 
 # Personal agent plans / specs (kept locally, not committed)
 /docs/superpowers/
+# SDD workspace: per-task briefs, reports, review diffs and screenshots.
+# Working notes for one plan, deleted when it closes — never committed.
+/.superpowers/
