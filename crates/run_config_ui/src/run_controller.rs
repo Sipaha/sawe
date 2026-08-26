@@ -2,20 +2,22 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use collections::{HashMap, HashSet};
-use console_panel::console_panel_for_workspace;
+use console_panel::{ConsolePanel, console_panel_for_workspace};
 use dap::client::SessionId;
 use gpui::{
-    Action as _, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _, WeakEntity,
-    Window,
+    Action as _, App, Context, Entity, EventEmitter, SharedString, Subscription, Task,
+    TaskExt as _, WeakEntity, Window,
 };
-use project::Project;
 use project::debugger::dap_store::{DapStore, DapStoreEvent};
+use project::{Project, WorktreeId};
 use run_config::{
     BeforeLaunchStep, Executor, RunConfigId, RunConfigStore, RunConfigStoreEvent, RunRequest,
     RunResolveContext,
 };
+use std::process::ExitStatus;
+use task::SpawnInTerminal;
 use terminal::Terminal;
 use workspace::Workspace;
 
@@ -66,6 +68,16 @@ pub struct RunController {
     /// grows by one per run for the life of the workspace window (negligible).
     _detached_tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Everything `run` resolves under the controller's own lease, handed to the
+/// workspace-side half of the launch so the two never need overlapping leases.
+struct PreparedRun {
+    request: RunRequest,
+    task_context: task::TaskContext,
+    worktree_id: Option<WorktreeId>,
+    launch_token: u64,
+    config_name: SharedString,
 }
 
 pub struct ActiveRun {
@@ -317,40 +329,118 @@ impl RunController {
 
     // --- run / stop ---
 
+    /// Launch `config_id`.
+    ///
+    /// Takes the caller's `&mut Workspace` + `Context<Workspace>` rather than
+    /// re-deriving an `Entity<Workspace>` from `self.workspace`: every entry
+    /// point already holds a `Workspace` lease (GPUI hands one to a
+    /// `workspace.register_action` handler; `dispatch_run_command` opens one
+    /// explicitly), and a second lease on the same entity aborts the process
+    /// (FORK.md #93). For the same reason the console panel's `spawn_task` —
+    /// which reads its own `Workspace` handle — is started from inside the
+    /// completion poller's async body, where no lease is held.
     pub fn run(
-        &mut self,
+        controller: &Entity<Self>,
+        workspace: &mut Workspace,
         config_id: RunConfigId,
         executor: Executor,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<Workspace>,
     ) {
-        if self.is_running(&config_id) {
-            self.stop(&config_id, cx);
+        let prepared = controller.update(cx, |this, cx| {
+            this.prepare_run(&config_id, executor, window, cx)
+        });
+        let PreparedRun {
+            request,
+            task_context,
+            worktree_id,
+            launch_token,
+            config_name,
+        } = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                log::error!("run configuration error: {error:#}");
+                workspace.show_error(error, cx);
+                return;
+            }
+        };
+
+        match request {
+            RunRequest::Terminal(spawn) => match console_panel_for_workspace(workspace) {
+                Some(console_panel) => controller.update(cx, |this, cx| {
+                    this.track_console_panel_launch(
+                        config_id,
+                        executor,
+                        launch_token,
+                        spawn,
+                        console_panel,
+                        window,
+                        cx,
+                    );
+                }),
+                None => {
+                    // Fallback (no console panel, e.g. headless tests): we get
+                    // only an exit-status future, no killable handle.
+                    let spawn_task = workspace.spawn_in_terminal(spawn, window, cx);
+                    controller.update(cx, |this, cx| {
+                        this.track_fallback_launch(
+                            config_id,
+                            executor,
+                            launch_token,
+                            spawn_task,
+                            cx,
+                        )
+                    })
+                }
+            },
+            RunRequest::Debug(scenario) => {
+                // Snapshot the sessions that already exist so we can later
+                // recognise the one this launch creates as "the new one".
+                let prior_sessions = controller.read(cx).existing_debug_sessions(cx);
+                workspace.start_debug_session(
+                    scenario,
+                    task_context.into(),
+                    None,
+                    worktree_id,
+                    window,
+                    cx,
+                );
+                controller.update(cx, |this, cx| {
+                    this.track_debug_launch(config_id, executor, config_name, prior_sessions, cx);
+                });
+            }
+        }
+    }
+
+    /// Validate `config_id`, run its before-launch steps and resolve it into a
+    /// `RunRequest`. Everything here needs only the controller's own lease, so
+    /// `run` can take it and release it before touching the workspace.
+    fn prepare_run(
+        &mut self,
+        config_id: &RunConfigId,
+        executor: Executor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<PreparedRun> {
+        if self.is_running(config_id) {
+            self.stop(config_id, cx);
         }
 
-        let Some(store) = RunConfigStore::try_global(cx) else {
-            self.notify_error("Run configurations are not available".into(), cx);
-            return;
-        };
-        let Some(config) = store.read(cx).config(&config_id) else {
-            self.notify_error("That run configuration no longer exists".into(), cx);
-            return;
-        };
-        let Some(provider) = store.read(cx).provider(&config.provider_type) else {
-            self.notify_error(
-                format!("No provider for type `{}`", config.provider_type),
-                cx,
-            );
-            return;
-        };
-        if !config.executors.contains(&executor) {
-            self.notify_error(
-                format!("`{}` does not support {executor:?}", config.name),
-                cx,
-            );
-            return;
-        }
-        let config_name = config.name.clone();
+        let store =
+            RunConfigStore::try_global(cx).context("Run configurations are not available")?;
+        let config = store
+            .read(cx)
+            .config(config_id)
+            .context("That run configuration no longer exists")?;
+        let provider = store
+            .read(cx)
+            .provider(&config.provider_type)
+            .with_context(|| format!("No provider for type `{}`", config.provider_type))?;
+        anyhow::ensure!(
+            config.executors.contains(&executor),
+            "`{}` does not support {executor:?}",
+            config.name
+        );
 
         for step in &config.before_launch {
             match step {
@@ -398,250 +488,262 @@ impl RunController {
             task_context: task_context.clone(),
         };
 
-        let request = match provider.resolve(&config, executor, &mut resolve_context, cx) {
-            Ok(request) => request,
-            Err(err) => {
-                self.notify_error(format!("{err:#}"), cx);
-                return;
-            }
-        };
+        // Flatten the provider's error chain now: `Workspace::show_error`
+        // renders only the outermost message.
+        let request = provider
+            .resolve(&config, executor, &mut resolve_context, cx)
+            .map_err(|error| anyhow!("{error:#}"))?;
 
         self.launch_counter += 1;
-        let launch_token = self.launch_counter;
 
-        match request {
-            RunRequest::Terminal(spawn) => {
-                let Some(workspace) = self.workspace.upgrade() else {
-                    return;
-                };
-
-                let poller =
-                    if let Some(terminal_panel) = console_panel_for_workspace(workspace.read(cx)) {
-                        // Real path: the terminal panel hands back the task
-                        // terminal so Stop can kill it.
-                        let spawn_task = terminal_panel.update(cx, |terminal_panel, cx| {
-                            terminal_panel.spawn_task(&spawn, window, cx)
-                        });
-                        let poller_config_id = config_id.clone();
-                        cx.spawn(async move |this, cx| {
-                            match spawn_task.await {
-                                Ok(terminal) => {
-                                    // If Stop was pressed while the handle was in
-                                    // flight, kill the terminal now and don't track
-                                    // it (the `ActiveRun` was already removed by
-                                    // `stop()`).
-                                    let killed = this
-                                        .update(cx, |this, cx| {
-                                            if !this
-                                                .terminal_launches_pending_kill
-                                                .remove(&launch_token)
-                                            {
-                                                return false;
-                                            }
-                                            if let Some(terminal) = terminal.upgrade() {
-                                                terminal.update(cx, |terminal, _| {
-                                                    terminal.kill_active_task()
-                                                });
-                                            }
-                                            true
-                                        })
-                                        .unwrap_or(false);
-                                    if killed {
-                                        return;
-                                    }
-                                    this.update(cx, |this, _| {
-                                        if let Some(ActiveRun {
-                                            kind: ActiveRunKind::Terminal { terminal: slot, .. },
-                                            ..
-                                        }) = this.active.get_mut(&poller_config_id)
-                                        {
-                                            *slot = Some(terminal.clone());
-                                        }
-                                    })
-                                    .ok();
-                                    let completion = terminal
-                                        .read_with(cx, |terminal, cx| {
-                                            terminal.wait_for_completed_task(cx)
-                                        })
-                                        .ok();
-                                    if let Some(completion) = completion {
-                                        completion.await;
-                                    }
-                                }
-                                Err(err) => {
-                                    this.update(cx, |this, _| {
-                                        this.terminal_launches_pending_kill.remove(&launch_token);
-                                    })
-                                    .ok();
-                                    log::warn!(
-                                        "run_config: terminal task `{}` failed to launch: {err:#}",
-                                        poller_config_id.as_str()
-                                    );
-                                    this.update(cx, |this, cx| {
-                                        this.notify_error(
-                                            format!("Failed to launch run configuration: {err:#}"),
-                                            cx,
-                                        );
-                                    })
-                                    .ok();
-                                }
-                            }
-                            this.update(cx, |this, cx| {
-                                if this.active.remove(&poller_config_id).is_some() {
-                                    cx.emit(RunControllerEvent::ActiveRunsChanged);
-                                    this.publish_running(cx);
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        })
-                    } else {
-                        // Fallback (no terminal panel, e.g. headless tests): we get
-                        // only an exit-status future, no killable handle.
-                        let spawn_task = workspace.update(cx, |workspace, cx| {
-                            workspace.spawn_in_terminal(spawn, window, cx)
-                        });
-                        let poller_config_id = config_id.clone();
-                        cx.spawn(async move |this, cx| {
-                            // `Some(_)` => the process actually exited or failed to
-                            // launch; `None` => the spawn was cancelled / no
-                            // terminal provider — leave the run tracked so the user
-                            // can Stop it explicitly.
-                            let result = spawn_task.await;
-                            // Drain any pending-kill token recorded by `stop()`;
-                            // there's no killable handle on this path, so this just
-                            // keeps the set from growing.
-                            this.update(cx, |this, _| {
-                                this.terminal_launches_pending_kill.remove(&launch_token);
-                            })
-                            .ok();
-                            let Some(result) = result else {
-                                return;
-                            };
-                            if let Err(err) = &result {
-                                log::warn!(
-                                    "run_config: terminal task `{}` failed to launch: {err:#}",
-                                    poller_config_id.as_str()
-                                );
-                                this.update(cx, |this, cx| {
-                                    this.notify_error(
-                                        format!("Failed to launch run configuration: {err:#}"),
-                                        cx,
-                                    );
-                                })
-                                .ok();
-                            }
-                            this.update(cx, |this, cx| {
-                                if this.active.remove(&poller_config_id).is_some() {
-                                    cx.emit(RunControllerEvent::ActiveRunsChanged);
-                                    this.publish_running(cx);
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        })
-                    };
-
-                self.active.insert(
-                    config_id.clone(),
-                    ActiveRun {
-                        config_id,
-                        executor,
-                        kind: ActiveRunKind::Terminal {
-                            terminal: None,
-                            launch_token,
-                            _poller: Some(poller),
-                        },
-                    },
-                );
-                cx.emit(RunControllerEvent::ActiveRunsChanged);
-                self.publish_running(cx);
-                cx.notify();
-            }
-            RunRequest::Debug(scenario) => {
-                let Some(workspace) = self.workspace.upgrade() else {
-                    return;
-                };
-                // Snapshot the sessions that already exist so we can later
-                // recognise the one this launch creates as "the new one".
-                let prior_sessions: HashSet<SessionId> = self
-                    .project
-                    .read(cx)
-                    .dap_store()
-                    .read(cx)
-                    .sessions()
-                    .map(|session| session.read(cx).session_id())
-                    .collect();
-                workspace.update(cx, |workspace, cx| {
-                    workspace.start_debug_session(
-                        scenario,
-                        task_context.into(),
-                        None,
-                        worktree_id,
-                        window,
-                        cx,
-                    );
-                });
-                self.pending_debug_launches
-                    .push_back((config_id.clone(), prior_sessions));
-                self.active.insert(
-                    config_id.clone(),
-                    ActiveRun {
-                        config_id: config_id.clone(),
-                        executor,
-                        kind: ActiveRunKind::Debug { session_id: None },
-                    },
-                );
-
-                // If the adapter dies before `DapStoreEvent::DebugClientStarted`
-                // ever fires, no `DebugClientShutdown` will follow either, so
-                // the entry would be stuck "running" forever. Clear it after a
-                // grace period if it never got a session id (i.e. is still in
-                // `pending_debug_launches`). A run that *did* start a session,
-                // or was already stopped, makes this a no-op.
-                let timeout_config_id = config_id.clone();
-                let timer = cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(DEBUG_LAUNCH_TIMEOUT).await;
-                    this.update(cx, |this, cx| {
-                        if !debug_launch_timed_out(
-                            &this.active,
-                            &this.pending_debug_launches,
-                            &timeout_config_id,
-                        ) {
-                            return;
-                        }
-                        this.active.remove(&timeout_config_id);
-                        this.pending_debug_launches
-                            .retain(|(pending, _)| pending != &timeout_config_id);
-                        log::warn!(
-                            "run_config: debug config `{config_name}` did not start a session \
-                             within {}s; clearing",
-                            DEBUG_LAUNCH_TIMEOUT.as_secs()
-                        );
-                        cx.emit(RunControllerEvent::ActiveRunsChanged);
-                        this.publish_running(cx);
-                        cx.notify();
-                    })
-                    .ok();
-                });
-                self._detached_tasks.push(timer);
-
-                cx.emit(RunControllerEvent::ActiveRunsChanged);
-                self.publish_running(cx);
-                cx.notify();
-            }
-        }
+        Ok(PreparedRun {
+            request,
+            task_context,
+            worktree_id,
+            launch_token: self.launch_counter,
+            config_name: config.name,
+        })
     }
 
-    pub fn rerun(
+    /// Terminal launch into the real `ConsolePanel`: the panel hands back the
+    /// task terminal so `stop` can kill it.
+    fn track_console_panel_launch(
         &mut self,
         config_id: RunConfigId,
         executor: Executor,
+        launch_token: u64,
+        spawn: SpawnInTerminal,
+        console_panel: Entity<ConsolePanel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.stop(&config_id, cx);
-        self.run(config_id, executor, window, cx);
+        let poller_config_id = config_id.clone();
+        let poller = cx.spawn_in(window, async move |this, cx| {
+            // Deliberately inside the poller: `ConsolePanel::spawn_task` reads
+            // the `Workspace` entity, which `run`'s caller is still borrowing
+            // at the point this task was created.
+            let spawned = console_panel.update_in(cx, |console_panel, window, cx| {
+                console_panel.spawn_task(&spawn, window, cx)
+            });
+            let spawned = match spawned {
+                Ok(spawn_task) => spawn_task.await,
+                Err(error) => Err(error),
+            };
+            match spawned {
+                Ok(terminal) => {
+                    // If Stop was pressed while the handle was in
+                    // flight, kill the terminal now and don't track
+                    // it (the `ActiveRun` was already removed by
+                    // `stop()`).
+                    let killed = this
+                        .update(cx, |this, cx| {
+                            if !this.terminal_launches_pending_kill.remove(&launch_token) {
+                                return false;
+                            }
+                            if let Some(terminal) = terminal.upgrade() {
+                                terminal.update(cx, |terminal, _| terminal.kill_active_task());
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if killed {
+                        return;
+                    }
+                    this.update(cx, |this, _| {
+                        if let Some(ActiveRun {
+                            kind: ActiveRunKind::Terminal { terminal: slot, .. },
+                            ..
+                        }) = this.active.get_mut(&poller_config_id)
+                        {
+                            *slot = Some(terminal.clone());
+                        }
+                    })
+                    .ok();
+                    let completion = terminal
+                        .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+                        .ok();
+                    if let Some(completion) = completion {
+                        completion.await;
+                    }
+                }
+                Err(err) => {
+                    this.update(cx, |this, _| {
+                        this.terminal_launches_pending_kill.remove(&launch_token);
+                    })
+                    .ok();
+                    log::warn!(
+                        "run_config: terminal task `{}` failed to launch: {err:#}",
+                        poller_config_id.as_str()
+                    );
+                    this.update(cx, |this, cx| {
+                        this.notify_error(
+                            format!("Failed to launch run configuration: {err:#}"),
+                            cx,
+                        );
+                    })
+                    .ok();
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.clear_finished_run(&poller_config_id, cx)
+            })
+            .ok();
+        });
+        self.insert_terminal_run(config_id, executor, launch_token, poller, cx);
+    }
+
+    /// Terminal launch through `Workspace::spawn_in_terminal`: only an
+    /// exit-status future, no killable handle.
+    fn track_fallback_launch(
+        &mut self,
+        config_id: RunConfigId,
+        executor: Executor,
+        launch_token: u64,
+        spawn_task: Task<Option<anyhow::Result<ExitStatus>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let poller_config_id = config_id.clone();
+        let poller = cx.spawn(async move |this, cx| {
+            // `Some(_)` => the process actually exited or failed to
+            // launch; `None` => the spawn was cancelled / no
+            // terminal provider — leave the run tracked so the user
+            // can Stop it explicitly.
+            let result = spawn_task.await;
+            // Drain any pending-kill token recorded by `stop()`;
+            // there's no killable handle on this path, so this just
+            // keeps the set from growing.
+            this.update(cx, |this, _| {
+                this.terminal_launches_pending_kill.remove(&launch_token);
+            })
+            .ok();
+            let Some(result) = result else {
+                return;
+            };
+            if let Err(err) = &result {
+                log::warn!(
+                    "run_config: terminal task `{}` failed to launch: {err:#}",
+                    poller_config_id.as_str()
+                );
+                this.update(cx, |this, cx| {
+                    this.notify_error(format!("Failed to launch run configuration: {err:#}"), cx);
+                })
+                .ok();
+            }
+            this.update(cx, |this, cx| {
+                this.clear_finished_run(&poller_config_id, cx)
+            })
+            .ok();
+        });
+        self.insert_terminal_run(config_id, executor, launch_token, poller, cx);
+    }
+
+    fn insert_terminal_run(
+        &mut self,
+        config_id: RunConfigId,
+        executor: Executor,
+        launch_token: u64,
+        poller: Task<()>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active.insert(
+            config_id.clone(),
+            ActiveRun {
+                config_id,
+                executor,
+                kind: ActiveRunKind::Terminal {
+                    terminal: None,
+                    launch_token,
+                    _poller: Some(poller),
+                },
+            },
+        );
+        cx.emit(RunControllerEvent::ActiveRunsChanged);
+        self.publish_running(cx);
+        cx.notify();
+    }
+
+    fn clear_finished_run(&mut self, config_id: &RunConfigId, cx: &mut Context<Self>) {
+        if self.active.remove(config_id).is_some() {
+            cx.emit(RunControllerEvent::ActiveRunsChanged);
+            self.publish_running(cx);
+            cx.notify();
+        }
+    }
+
+    fn existing_debug_sessions(&self, cx: &App) -> HashSet<SessionId> {
+        self.project
+            .read(cx)
+            .dap_store()
+            .read(cx)
+            .sessions()
+            .map(|session| session.read(cx).session_id())
+            .collect()
+    }
+
+    fn track_debug_launch(
+        &mut self,
+        config_id: RunConfigId,
+        executor: Executor,
+        config_name: SharedString,
+        prior_sessions: HashSet<SessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_debug_launches
+            .push_back((config_id.clone(), prior_sessions));
+        self.active.insert(
+            config_id.clone(),
+            ActiveRun {
+                config_id: config_id.clone(),
+                executor,
+                kind: ActiveRunKind::Debug { session_id: None },
+            },
+        );
+
+        // If the adapter dies before `DapStoreEvent::DebugClientStarted`
+        // ever fires, no `DebugClientShutdown` will follow either, so
+        // the entry would be stuck "running" forever. Clear it after a
+        // grace period if it never got a session id (i.e. is still in
+        // `pending_debug_launches`). A run that *did* start a session,
+        // or was already stopped, makes this a no-op.
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DEBUG_LAUNCH_TIMEOUT).await;
+            this.update(cx, |this, cx| {
+                if !debug_launch_timed_out(&this.active, &this.pending_debug_launches, &config_id) {
+                    return;
+                }
+                this.active.remove(&config_id);
+                this.pending_debug_launches
+                    .retain(|(pending, _)| pending != &config_id);
+                log::warn!(
+                    "run_config: debug config `{config_name}` did not start a session \
+                     within {}s; clearing",
+                    DEBUG_LAUNCH_TIMEOUT.as_secs()
+                );
+                cx.emit(RunControllerEvent::ActiveRunsChanged);
+                this.publish_running(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self._detached_tasks.push(timer);
+
+        cx.emit(RunControllerEvent::ActiveRunsChanged);
+        self.publish_running(cx);
+        cx.notify();
+    }
+
+    /// Stop `config_id` if it is running, then start it again. Same
+    /// workspace-borrow contract as [`RunController::run`].
+    pub fn rerun(
+        controller: &Entity<Self>,
+        workspace: &mut Workspace,
+        config_id: RunConfigId,
+        executor: Executor,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        controller.update(cx, |this, cx| this.stop(&config_id, cx));
+        Self::run(controller, workspace, config_id, executor, window, cx);
     }
 
     pub fn stop(&mut self, id: &RunConfigId, cx: &mut Context<Self>) {
@@ -699,6 +801,11 @@ impl RunController {
         }
     }
 
+    /// Surface `message` as a workspace notification. Only safe from an async
+    /// context (the completion pollers): it opens a `Workspace` lease, so
+    /// calling it from a path that already holds one aborts the process. The
+    /// synchronous error paths of `run` go through `Workspace::show_error` on
+    /// the caller's borrow instead.
     fn notify_error(&self, message: String, cx: &mut Context<Self>) {
         log::error!("run configuration error: {message}");
         if let Some(workspace) = self.workspace.upgrade() {
@@ -749,7 +856,7 @@ mod tests {
     use console_panel::ConsolePanel;
     use gpui::{App, AppContext as _, TestAppContext};
     use project::Project;
-    use run_config::{ConfigScope, RunConfigProvider, RunConfiguration};
+    use run_config::{ConfigScope, RunCommand, RunConfigProvider, RunConfiguration};
     use std::future;
     use std::process::ExitStatus;
     use ui::IconName;
@@ -940,17 +1047,7 @@ mod tests {
         cx.run_until_parked();
 
         let id = RunConfigId::from_raw("mock:a");
-        let window = cx
-            .update(|cx| cx.windows().first().copied())
-            .expect("a window exists");
-
-        window
-            .update(cx, |_, window, cx| {
-                controller.update(cx, |controller, cx| {
-                    controller.run(id.clone(), Executor::Run, window, cx)
-                })
-            })
-            .unwrap();
+        run_under_workspace_lease(&workspace, &controller, id.clone(), Executor::Run, cx);
         cx.run_until_parked();
 
         controller.read_with(cx, |controller, _| {
@@ -986,16 +1083,7 @@ mod tests {
         cx.run_until_parked();
 
         let id = RunConfigId::from_raw("mock:a");
-        let window = cx
-            .update(|cx| cx.windows().first().copied())
-            .expect("a window exists");
-        window
-            .update(cx, |_, window, cx| {
-                controller.update(cx, |controller, cx| {
-                    controller.run(id.clone(), Executor::Run, window, cx)
-                })
-            })
-            .unwrap();
+        run_under_workspace_lease(&workspace, &controller, id.clone(), Executor::Run, cx);
         cx.run_until_parked();
 
         let detached_before =
@@ -1019,67 +1107,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn run_reaches_a_real_console_panel_via_solution_band_utility_item(
-        cx: &mut TestAppContext,
-    ) {
-        // Regression guard for phase 2a task 6: this Terminal branch used to
-        // find the terminal panel via `workspace.panel::<ConsolePanel>(cx)` (a
-        // dock lookup). `ConsolePanel` no longer lives in a dock, so that was
-        // re-pointed at `console_panel::console_panel_for_workspace`, which
-        // downcasts `Workspace::solution_band_utility_item` — the same
-        // type-erased slot `zed.rs` installs the real panel into. Every other
-        // test in this file uses `PendingTerminalProvider` and never
-        // populates that slot, so they only ever exercise the *fallback*
-        // branch (`workspace.spawn_in_terminal`) — a broken re-point here
-        // would have shipped invisibly. This test installs a REAL
-        // `ConsolePanel` (mirroring `console_panel::panel::tests::bootstrap_panel`)
-        // and asserts a tab actually lands in it.
-        cx.executor().allow_parking();
-        let workspace = setup(cx, &["a"]).await;
-        let window = cx
-            .update(|cx| cx.windows().first().copied())
-            .expect("a window exists");
-
-        // `window.update` hands back a plain `&mut App` (no entity lease) —
-        // the same shape `dispatch_run_command`'s caller has — so
-        // `workspace.update(cx, ..)` here is a fresh, uncontested lease, not
-        // the double-lease `RunController::run` itself must avoid below.
-        let console_panel = window
-            .update(cx, |_, window, cx| {
-                let panel = cx.new(|cx| ConsolePanel::new(workspace.downgrade(), cx));
-                workspace.update(cx, |workspace, cx| {
-                    workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
-                });
-                panel
-            })
-            .unwrap();
-
-        let controller = workspace.update(cx, |workspace, cx| {
-            cx.new(|cx| RunController::new(workspace, cx))
-        });
-        cx.run_until_parked();
-
-        let id = RunConfigId::from_raw("mock:a");
-        window
-            .update(cx, |_, window, cx| {
-                controller.update(cx, |controller, cx| {
-                    controller.run(id.clone(), Executor::Run, window, cx)
-                })
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        console_panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                panel.tab_count(),
-                1,
-                "console_panel_for_workspace should have found the real ConsolePanel, and \
-                 RunController::run should have spawned a terminal tab into it"
-            );
-        });
-    }
-
-    #[gpui::test]
     async fn debug_launch_clears_after_timeout(cx: &mut TestAppContext) {
         // No `debugger_provider` is wired up, so `start_debug_session` is a
         // no-op and `DebugClientStarted` never fires. The run should clear
@@ -1093,16 +1120,7 @@ mod tests {
         cx.run_until_parked();
 
         let id = RunConfigId::from_raw("mock_debug:d");
-        let window = cx
-            .update(|cx| cx.windows().first().copied())
-            .expect("a window exists");
-        window
-            .update(cx, |_, window, cx| {
-                controller.update(cx, |controller, cx| {
-                    controller.run(id.clone(), Executor::Debug, window, cx)
-                })
-            })
-            .unwrap();
+        run_under_workspace_lease(&workspace, &controller, id.clone(), Executor::Debug, cx);
         cx.run_until_parked();
         controller.read_with(cx, |controller, _| {
             assert!(
@@ -1122,6 +1140,133 @@ mod tests {
             assert!(
                 controller.pending_debug_launches.is_empty(),
                 "the pending-launch bookkeeping is dropped too"
+            );
+        });
+    }
+
+    /// Install a `RunController` on the workspace the way `toolbar_strip::install`
+    /// does, so `apply_run_command` can find it.
+    fn install_controller(
+        workspace: &Entity<Workspace>,
+        cx: &mut TestAppContext,
+    ) -> Entity<RunController> {
+        workspace.update(cx, |workspace, cx| {
+            let controller = cx.new(|cx| RunController::new(workspace, cx));
+            workspace.set_run_config_controller(controller.clone().into());
+            controller
+        })
+    }
+
+    /// Call `RunController::run` with an **active `Workspace` lease** around it,
+    /// the way both production entry points do — GPUI hands a
+    /// `workspace.register_action` handler `&mut Workspace`, and
+    /// `dispatch_run_command` opens `workspace.update` explicitly. The
+    /// `window.update(|_, window, cx| controller.update(..))` shape these tests
+    /// used to use hands back a bare `&mut App` with no lease at all, which is
+    /// why they never caught the nested-lease crash (FORK.md #93).
+    fn run_under_workspace_lease(
+        workspace: &Entity<Workspace>,
+        controller: &Entity<RunController>,
+        config_id: RunConfigId,
+        executor: Executor,
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx
+            .update(|cx| cx.windows().first().copied())
+            .expect("a window exists");
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    RunController::run(controller, workspace, config_id, executor, window, cx);
+                });
+            })
+            .expect("window is still open");
+    }
+
+    /// Like `run_under_workspace_lease`, but entering through the real
+    /// `apply_run_command` seam that `dispatch_run_command` (and therefore the
+    /// `run_config.run` MCP tool) uses.
+    fn dispatch_under_workspace_lease(
+        workspace: &Entity<Workspace>,
+        command: RunCommand,
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx
+            .update(|cx| cx.windows().first().copied())
+            .expect("a window exists");
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    crate::toolbar_strip::apply_run_command(workspace, command, window, cx);
+                });
+            })
+            .expect("window is still open");
+    }
+
+    #[gpui::test]
+    async fn run_under_workspace_lease_reaches_a_real_console_panel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let workspace = setup(cx, &["a"]).await;
+        let window = cx
+            .update(|cx| cx.windows().first().copied())
+            .expect("a window exists");
+        let console_panel = window
+            .update(cx, |_, window, cx| {
+                let panel = cx.new(|cx| ConsolePanel::new(workspace.downgrade(), cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
+                });
+                panel
+            })
+            .expect("window is still open");
+        install_controller(&workspace, cx);
+        cx.run_until_parked();
+
+        dispatch_under_workspace_lease(
+            &workspace,
+            RunCommand::Run {
+                id: RunConfigId::from_raw("mock:a"),
+                executor: Executor::Run,
+            },
+            cx,
+        );
+        cx.run_until_parked();
+
+        console_panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tab_count(),
+                1,
+                "the real ConsolePanel path must spawn its task tab without re-reading the \
+                 leased Workspace entity"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn run_of_a_missing_config_under_workspace_lease_reports_an_error(
+        cx: &mut TestAppContext,
+    ) {
+        // The early-return error paths of `run` surface through
+        // `Workspace::show_error`, which is just as much a second lease on the
+        // workspace as the launch paths are.
+        let workspace = setup(cx, &["a"]).await;
+        install_controller(&workspace, cx);
+        cx.run_until_parked();
+
+        dispatch_under_workspace_lease(
+            &workspace,
+            RunCommand::Run {
+                id: RunConfigId::from_raw("mock:gone"),
+                executor: Executor::Run,
+            },
+            cx,
+        );
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace.notification_ids().is_empty(),
+                "a run of a deleted config should surface a workspace error notification"
             );
         });
     }
@@ -1216,16 +1361,7 @@ mod tests {
         cx.run_until_parked();
 
         let id = RunConfigId::from_raw("mock:a");
-        let window = cx
-            .update(|cx| cx.windows().first().copied())
-            .expect("a window exists");
-        window
-            .update(cx, |_, window, cx| {
-                controller.update(cx, |controller, cx| {
-                    controller.run(id.clone(), Executor::Run, window, cx)
-                })
-            })
-            .unwrap();
+        run_under_workspace_lease(&workspace, &controller, id.clone(), Executor::Run, cx);
         cx.run_until_parked();
 
         let store = cx.update(|cx| RunConfigStore::global(cx));

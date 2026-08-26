@@ -1167,9 +1167,13 @@ How to apply:
   `Workspace` lease, so `workspace.read(cx)` / `workspace.update(cx, …)` from band content (or from anything a
   `workspace.register_action` handler reaches) is a double-lease panic — see decision 22's call-site rule and
   decision 92's `Entity<Project>` resolution. Take `&Workspace` / `Entity<Project>` as a constructor parameter
-  instead. This fork has been bitten by it repeatedly; `run_config_ui::run_controller::RunController::run`'s
-  `workspace.read(cx)` under `with_controller`'s lease is a live, pre-existing instance (it aborts the process
-  on `run_config::Run`), and it is exactly the shape to look for.
+  instead. This fork has been bitten by it repeatedly. `run_config_ui::run_controller::RunController::run` was
+  a live instance until 2026-08-27 (it aborted the process on every `run_config::Run` of a Terminal config) and
+  is now the worked example of the fix: `run` is an associated function taking the caller's `&mut Workspace` +
+  `Context<Workspace>`, and anything further down that reads the workspace on its own (here
+  `ConsolePanel::spawn_task`, which holds a `WeakEntity<Workspace>`) is started from inside an async task
+  instead of synchronously — see `docs/findings/2026-08-26-run-controller-terminal-double-lease-crash.md`.
+  Threading `&mut Workspace` alone is **not** sufficient when a callee re-derives the workspace itself.
 
 Correction to an earlier claim (this file asserted the opposite until 2026-08-26): the bottom dock does **not**
 span the window. `BottomDockLayout` still exists in `crates/settings_content/src/workspace.rs` with `#[default]

@@ -134,31 +134,78 @@ pub fn dispatch_run_command(command: RunCommand, cx: &mut App) {
     log::warn!("run_config: no window with a RunController to handle {command:?}");
 }
 
-fn apply_run_command(
+pub(crate) fn apply_run_command(
     workspace: &mut Workspace,
     command: RunCommand,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    with_controller(workspace, cx, |controller, cx| match command {
-        RunCommand::Run { id, executor } => controller.run(id, executor, window, cx),
-        RunCommand::Stop { id } => controller.stop(&id, cx),
-        RunCommand::Select { id } => controller.select(id, cx),
-    });
+    match command {
+        RunCommand::Run { id, executor } => run_by_id(workspace, id, executor, window, cx),
+        RunCommand::Stop { id } => {
+            with_controller(workspace, cx, |controller, cx| controller.stop(&id, cx))
+        }
+        RunCommand::Select { id } => {
+            with_controller(workspace, cx, |controller, cx| controller.select(id, cx))
+        }
+    }
 }
 
-/// Run `f` against the workspace's `RunController`, if one is installed.
+/// The workspace's `RunController`, if `install` ran on this workspace.
+pub(crate) fn controller_for(workspace: &Workspace) -> Option<Entity<RunController>> {
+    workspace
+        .run_config_controller()
+        .cloned()?
+        .downcast::<RunController>()
+        .ok()
+}
+
+/// Start `config_id` on this workspace's `RunController`, handing it the
+/// caller's `&mut Workspace` (see `RunController::run` for why it must not
+/// re-derive one from its own weak handle).
+pub(crate) fn run_by_id(
+    workspace: &mut Workspace,
+    config_id: RunConfigId,
+    executor: Executor,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(controller) = controller_for(workspace) else {
+        return;
+    };
+    RunController::run(&controller, workspace, config_id, executor, window, cx);
+}
+
+/// Start whatever config the toolbar dropdown currently shows.
+pub(crate) fn run_selected_config(
+    workspace: &mut Workspace,
+    executor: Executor,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(controller) = controller_for(workspace) else {
+        return;
+    };
+    let Some(config_id) = controller.read(cx).selected_id().cloned() else {
+        return;
+    };
+    RunController::run(&controller, workspace, config_id, executor, window, cx);
+}
+
+/// Run `f` against the workspace's `RunController`, if one is installed. Only
+/// for operations that do not touch the workspace itself — the closure runs
+/// under a `RunController` lease nested inside the caller's `Workspace` lease,
+/// so anything that reads or updates `Workspace` from in there aborts the
+/// process. Launching a config goes through `run_by_id` instead.
 pub fn with_controller(
     workspace: &mut Workspace,
     cx: &mut Context<Workspace>,
     f: impl FnOnce(&mut RunController, &mut Context<RunController>),
 ) {
-    let Some(any) = workspace.run_config_controller().cloned() else {
+    let Some(controller) = controller_for(workspace) else {
         return;
     };
-    if let Ok(controller) = any.downcast::<RunController>() {
-        controller.update(cx, |controller, cx| f(controller, cx));
-    }
+    controller.update(cx, |controller, cx| f(controller, cx));
 }
 
 impl RunConfigStrip {

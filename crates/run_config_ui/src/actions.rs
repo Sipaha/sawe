@@ -28,18 +28,20 @@ fn register(
 ) {
     workspace
         .register_action(|workspace, _: &Run, window, cx| {
-            crate::toolbar_strip::with_controller(workspace, cx, |controller, cx| {
-                if let Some(id) = controller.selected_id().cloned() {
-                    controller.run(id, run_config::Executor::Run, window, cx);
-                }
-            });
+            crate::toolbar_strip::run_selected_config(
+                workspace,
+                run_config::Executor::Run,
+                window,
+                cx,
+            );
         })
         .register_action(|workspace, _: &Debug, window, cx| {
-            crate::toolbar_strip::with_controller(workspace, cx, |controller, cx| {
-                if let Some(id) = controller.selected_id().cloned() {
-                    controller.run(id, run_config::Executor::Debug, window, cx);
-                }
-            });
+            crate::toolbar_strip::run_selected_config(
+                workspace,
+                run_config::Executor::Debug,
+                window,
+                cx,
+            );
         })
         .register_action(|workspace, _: &Stop, _window, cx| {
             crate::toolbar_strip::with_controller(workspace, cx, |controller, cx| {
