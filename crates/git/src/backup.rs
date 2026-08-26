@@ -111,7 +111,7 @@ pub fn list(
             before_sha: sha.to_string(),
         });
     }
-    entries.sort_by(|a, b| b.timestamp_unix.cmp(&a.timestamp_unix));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_unix));
     Ok(entries)
 }
 
