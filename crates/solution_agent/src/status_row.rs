@@ -143,21 +143,6 @@ pub(crate) fn render_status_row(
     // immutable borrow of `s` through `cx`.
     let s = session.read(cx);
     let agent_id = s.agent_id.clone();
-    // Project label: the member the session is bound to ("Solution root" /
-    // no member → "ROOT"). Lookup needs the live `Solution` to resolve the
-    // member id to its name.
-    let cwd_label: SharedString = solutions::SolutionStore::try_global(cx)
-        .and_then(|store| {
-            store.read_with(cx, |store, _| {
-                store
-                    .solutions()
-                    .iter()
-                    .find(|sol| sol.id == s.solution_id)
-                    .cloned()
-            })
-        })
-        .and_then(|solution| crate::store::project_label(&solution, s.member_id, cx))
-        .unwrap_or_else(|| SharedString::from("ROOT"));
     // For most states the short label ("Idle", "Running", …) is
     // the right thing to show. For `Errored(msg)` we surface the
     // full message inline so the user actually learns *what* went
@@ -843,12 +828,6 @@ pub(crate) fn render_status_row(
             })
             .child(
                 Label::new(agent_id)
-                    .color(Color::Muted)
-                    .size(LabelSize::Small),
-            )
-            .child(Label::new("·").color(Color::Muted).size(LabelSize::Small))
-            .child(
-                Label::new(cwd_label)
                     .color(Color::Muted)
                     .size(LabelSize::Small),
             )

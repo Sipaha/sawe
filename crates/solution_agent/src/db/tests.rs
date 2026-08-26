@@ -88,7 +88,6 @@ fn make_meta(seq: u32, sol: i64) -> SolutionSessionMetadata {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     }
 }
 

@@ -353,11 +353,6 @@ pub struct SolutionSession {
     /// `solution.root`" — used for legacy DB rows that pre-date the
     /// column.
     pub cwd: PathBuf,
-    /// The member this session belongs to; `None` = solution root. Persisted in
-    /// `solution_sessions.member_id`. This — not `cwd` — is what the project
-    /// label and the console tab scoping read, so a folder rename (which moves
-    /// `cwd` out from under the member's `local_path`) can't orphan a session.
-    pub member_id: Option<solutions::MemberId>,
     /// 1-based count of how many context-windows this session has
     /// burned through. `1` for a fresh session, `2` after one
     /// compact, etc. The compact dump dir for the *current* context
@@ -642,7 +637,6 @@ impl SolutionSession {
             last_activity_at: Utc::now(),
             state: SessionState::Idle,
             cwd: PathBuf::new(),
-            member_id: None,
             context_count: 1,
             project: None,
             _acp_subscription: None,
@@ -1158,10 +1152,6 @@ pub struct SolutionSessionMetadata {
     /// lost-update race at create time that left idle never-touched sessions
     /// with `tab_order = NULL`, so `restore_open_tabs` never re-hydrated them).
     pub tab_order: Option<i64>,
-    /// The member this session belongs to. `None` = the solution root (the
-    /// "ROOT" label). Source of truth for the project label and console-tab
-    /// scoping — replaces the old cwd-equality inference.
-    pub member_id: Option<solutions::MemberId>,
 }
 
 #[cfg(test)]

@@ -556,26 +556,6 @@ fn is_session_gone_error(err_str: &str) -> bool {
         || err_str.contains("No conversation found")
 }
 
-/// The project label for a session: the name of the member it is bound to.
-/// `None` means the session runs at the solution root — the status row renders
-/// that as "ROOT" and the default title falls back to `solution.name`.
-///
-/// This is a lookup, not an inference. The previous implementation compared the
-/// session's `cwd` to each member's `local_path` with exact equality, so any
-/// path drift (which a folder rename produces by construction) silently degraded
-/// every session in the renamed project to ROOT.
-pub(crate) fn project_label(
-    solution: &Solution,
-    member_id: Option<solutions::MemberId>,
-    _cx: &App,
-) -> Option<SharedString> {
-    let member_id = member_id?;
-    // A dangling member_id (member removed while a session survived) degrades to
-    // ROOT — `solution_agent.db` has no FK into the solutions DB by design.
-    let member = solution.member(member_id)?;
-    Some(SharedString::from(member.name.clone()))
-}
-
 /// Re-export so the historical `crate::store::EFFORT_LEVELS` path (used by
 /// `status_row` and the crate-root re-export) keeps resolving after the const
 /// moved into `model_catalog`.
@@ -1216,7 +1196,6 @@ impl SolutionAgentStore {
             // `update_tab_orders`; this is the live in-memory value (usually
             // None at create time, before the strip pin lands).
             tab_order: s.tab_order,
-            member_id: s.member_id,
         };
         db.save_metadata(meta).detach_and_log_err(cx);
     }
@@ -1994,7 +1973,6 @@ impl SolutionAgentStore {
                 desired_effort: s.desired_effort.clone(),
                 cached_models: s.cached_models.clone(),
                 tab_order: s.tab_order,
-                member_id: s.member_id,
             }
         };
         let pair = (meta.solution_id, meta.agent_id.clone());
@@ -2842,20 +2820,15 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) -> SolutionSessionId {
         let session_id = SolutionSessionId::new();
-        // Bind the seed to the first member (cwd AND `member_id`): a chat tab is
-        // scoped by its `member_id` (`ConsolePanel::tab_scope`), so a seed with
-        // none lands in `TabScope::Root` and is filtered out of the strip
-        // whenever a member project is active — i.e. it would never be visible.
-        let (root, member_id) = SolutionStore::try_global(cx)
+        // Seed at the solution root — chats are solution-scoped and never filtered,
+        // so no member binding is needed for the seed to be visible.
+        let root = SolutionStore::try_global(cx)
             .and_then(|store| {
                 store.read_with(cx, |s, _| {
                     s.solutions()
                         .iter()
                         .find(|sol| sol.id == solution_id)
-                        .map(|sol| match sol.members.first() {
-                            Some(member) => (member.local_path.clone(), Some(member.id)),
-                            None => (sol.root.clone(), None),
-                        })
+                        .map(|sol| sol.root.clone())
                 })
             })
             .unwrap_or_default();
@@ -2868,7 +2841,6 @@ impl SolutionAgentStore {
             );
             s.title = title;
             s.cwd = root;
-            s.member_id = member_id;
             s.set_entries(entries, cx);
             if live_teammates {
                 // Capture a friendly label for each distinct teammate id (from the

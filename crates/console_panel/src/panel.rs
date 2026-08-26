@@ -1037,21 +1037,19 @@ impl ConsolePanel {
         active_member_path(solution_id, cx)
     }
 
-    /// Working directory a tab is anchored to, used to decide which member
-    /// project owns it. Both tab kinds use an *immutable* creation-time cwd:
-    /// chats use the session's `cwd` (set to the active member path at
-    /// creation, the same value `claude-acp` keys its transcript bucket on),
-    /// terminals use their `origin_cwd`. Deliberately NOT the terminal's live
-    /// working directory — that wanders with `cd` and goes unreadable under a
-    /// foreign-user foreground process (`sudo su`), which would drop the tab
-    /// out of scope and make it disappear from the strip.
-    fn tab_cwd(&self, tab: &ConsoleTab, cx: &App) -> Option<PathBuf> {
-        match tab {
-            ConsoleTab::Terminal { origin_cwd, .. } => origin_cwd.clone(),
-            ConsoleTab::Chat { session_id, .. } => SolutionAgentStore::try_global(cx)
-                .and_then(|store| store.read(cx).session(*session_id))
-                .map(|session| session.read(cx).cwd.clone()),
-        }
+    /// Working directory a terminal tab is anchored to, used to decide which
+    /// member project owns it — its *immutable* creation-time `origin_cwd`.
+    /// Deliberately NOT the terminal's live working directory — that wanders
+    /// with `cd` and goes unreadable under a foreign-user foreground process
+    /// (`sudo su`), which would drop the tab out of scope and make it
+    /// disappear from the strip. Chats have no cwd-based scope (spec
+    /// 2026-08-26: solution-scoped, always `Unscoped` — see `tab_scope`), so
+    /// this returns `None` for `ConsoleTab::Chat`.
+    fn tab_cwd(&self, tab: &ConsoleTab, _cx: &App) -> Option<PathBuf> {
+        let ConsoleTab::Terminal { origin_cwd, .. } = tab else {
+            return None;
+        };
+        origin_cwd.clone()
     }
 
     /// Chats are solution-scoped, not project-scoped (spec 2026-08-26): a

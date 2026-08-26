@@ -283,16 +283,15 @@ pub(crate) fn insert_or_update_metadata(
             Option<String>,
             Option<String>,
             Option<i64>,
-            Option<i64>,
         ),
     )>(indoc! {"
         INSERT INTO solution_sessions (
             id, solution_id, agent_id, acp_session_id, title,
             created_at, last_activity_at, preview, total_tokens,
             context_count, cwd, parent_session_id,
-            desired_model, desired_effort, cached_models, tab_order, member_id
+            desired_model, desired_effort, cached_models, tab_order
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(id) DO UPDATE SET
             solution_id        = excluded.solution_id,
             agent_id           = excluded.agent_id,
@@ -308,8 +307,7 @@ pub(crate) fn insert_or_update_metadata(
             desired_model      = COALESCE(excluded.desired_model, desired_model),
             desired_effort     = COALESCE(excluded.desired_effort, desired_effort),
             cached_models      = COALESCE(excluded.cached_models, cached_models),
-            tab_order          = COALESCE(excluded.tab_order, solution_sessions.tab_order),
-            member_id          = COALESCE(excluded.member_id, solution_sessions.member_id)
+            tab_order          = COALESCE(excluded.tab_order, solution_sessions.tab_order)
     "})?;
 
     let cwd_str = if meta.cwd.as_os_str().is_empty() {
@@ -346,7 +344,6 @@ pub(crate) fn insert_or_update_metadata(
             meta.desired_effort.clone(),
             cached_models_json,
             meta.tab_order,
-            meta.member_id.map(|m| m.0),
         ),
     ))?;
 
@@ -592,7 +589,7 @@ pub(crate) fn select_metadata_for_solution(
     solution_id: SolutionId,
 ) -> Result<Vec<SolutionSessionMetadata>> {
     // Same nested-tuple shape as the INSERT side — `sqlez::Column` only
-    // implements tuples up to size 10; we have 17 columns now (5 + 7 + 5).
+    // implements tuples up to size 10; we have 16 columns now (5 + 7 + 4).
     let mut select = connection.select_bound::<i64, (
         (String, i64, String, Arc<str>, String),
         (
@@ -609,13 +606,12 @@ pub(crate) fn select_metadata_for_solution(
             Option<String>,
             Option<String>,
             Option<i64>,
-            Option<i64>,
         ),
     )>(indoc! {"
         SELECT id, solution_id, agent_id, acp_session_id, title,
                created_at, last_activity_at, preview, total_tokens,
                context_count, cwd, parent_session_id,
-               desired_model, desired_effort, cached_models, tab_order, member_id
+               desired_model, desired_effort, cached_models, tab_order
         FROM solution_sessions
         WHERE solution_id = ?
         ORDER BY last_activity_at DESC
@@ -634,7 +630,7 @@ pub(crate) fn select_metadata_for_solution(
             cwd,
             parent_session_id,
         ),
-        (desired_model, desired_effort, cached_models_json, tab_order, member_id),
+        (desired_model, desired_effort, cached_models_json, tab_order),
     ) in rows
     {
         let id = SolutionSessionId::parse(&id)
@@ -682,7 +678,6 @@ pub(crate) fn select_metadata_for_solution(
             desired_effort,
             cached_models,
             tab_order,
-            member_id: member_id.map(solutions::MemberId),
         });
     }
     Ok(out)

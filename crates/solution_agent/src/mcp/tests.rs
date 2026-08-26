@@ -2467,7 +2467,6 @@ async fn read_session_history_closed_row_native_returns_entries(cx: &mut gpui::T
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     db.save_metadata(meta).await.expect("save metadata");
 

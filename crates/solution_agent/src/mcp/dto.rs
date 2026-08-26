@@ -62,11 +62,8 @@ impl SessionStateDto {
 pub struct SessionSummary {
     pub id: String,
     pub solution_id: i64,
-    /// The solution member (project) this session belongs to. The single
-    /// source of truth for the session's project label — clients must render
-    /// it from here rather than re-deriving it by matching `cwd` against the
-    /// members' `local_path`s. `None` for solution-root sessions and for the
-    /// hidden one-shot helper sessions that carry no project.
+    /// Sessions are solution-scoped since 2026-08-26; the field is kept on the
+    /// wire so older mobile clients keep deserializing, but it is always null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_id: Option<i64>,
     pub agent_id: String,
@@ -272,7 +269,9 @@ pub fn session_summary(session: &SolutionSession, cx: &App) -> SessionSummary {
     SessionSummary {
         id: session.id.to_string(),
         solution_id: session.solution_id.0,
-        member_id: session.member_id.map(|id| id.0),
+        // Sessions are solution-scoped since 2026-08-26; the field is kept on the
+        // wire so older mobile clients keep deserializing, but it is always null.
+        member_id: None,
         agent_id: session.agent_id.to_string(),
         title: session.title.to_string(),
         state: SessionStateDto::from_state(

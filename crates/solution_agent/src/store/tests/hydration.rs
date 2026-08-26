@@ -47,7 +47,6 @@ async fn restore_open_tabs_hydrates_cold_sessions(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     let meta_b = crate::model::SolutionSessionMetadata {
         id: id_b,
@@ -335,7 +334,6 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -587,7 +585,6 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -703,7 +700,6 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -840,7 +836,6 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -948,7 +943,6 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -1102,7 +1096,6 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -1242,7 +1235,6 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         desired_effort: None,
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
     db.save_metadata(meta_a).await.expect("meta a");
 
@@ -1661,7 +1653,6 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
         desired_effort: Some("high".to_string()),
         cached_models: vec![],
         tab_order: None,
-        member_id: None,
     };
 
     // Build the entity exactly as the fixed fresh-entity branch does.

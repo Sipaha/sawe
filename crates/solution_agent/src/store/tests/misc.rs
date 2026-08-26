@@ -6114,46 +6114,6 @@ async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(cx: &mut T
     );
 }
 
-/// The project label is a stored fact (`member_id`), not a cwd comparison.
-/// A session whose cwd has drifted from the member's `local_path` — exactly
-/// what a folder rename produces — must still show its project.
-#[gpui::test]
-async fn project_label_reads_member_id_not_cwd(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let store = cx.update(|cx| solutions::SolutionStore::for_test(dir.path().join("s.json"), cx));
-    cx.update(|cx| solutions::install_global_for_test(store.clone(), cx));
-
-    let solution_id = store
-        .update(cx, |s, cx| {
-            s.create_solution("Sol", dir.path().to_path_buf(), cx)
-        })
-        .expect("create solution");
-    let member_id = store.update(cx, |s, _| {
-        s.test_add_member_with_path(solution_id, "sawe", dir.path().join("sol/sawe"))
-    });
-    let solution = store.read_with(cx, |s, _| {
-        s.find_solution(solution_id).expect("solution").clone()
-    });
-
-    cx.update(|cx| {
-        assert_eq!(
-            crate::store::project_label(&solution, Some(member_id), cx).as_deref(),
-            Some("sawe"),
-            "the label comes from the member row"
-        );
-        assert_eq!(
-            crate::store::project_label(&solution, None, cx),
-            None,
-            "no member = the solution root, which callers render as ROOT"
-        );
-        assert_eq!(
-            crate::store::project_label(&solution, Some(solutions::MemberId(9999)), cx),
-            None,
-            "a dangling member_id degrades to ROOT rather than panicking"
-        );
-    });
-}
-
 /// Restart used to close the session and create a blank one, which is what the
 /// "+" button is for — pressing Restart is never a request to lose the
 /// conversation. It must keep the same `SolutionSessionId` and the entries, so
