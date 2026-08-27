@@ -34,7 +34,7 @@ use workspace::{ModalView, Workspace, notifications::DetachAndPromptErr, pane};
 
 use crate::{
     attach_modal::{AttachModal, ModalIntent},
-    debugger_panel::DebugPanel,
+    debugger_panel::{DebugPanel, debug_panel_for_workspace},
 };
 
 actions!(
@@ -85,7 +85,7 @@ impl NewProcessModal {
         reveal_target: Option<RevealTarget>,
         cx: &mut Context<Workspace>,
     ) {
-        let Some(debug_panel) = workspace.panel::<DebugPanel>(cx) else {
+        let Some(debug_panel) = debug_panel_for_workspace(workspace) else {
             return;
         };
         let task_store = workspace.project().read(cx).task_store().clone();

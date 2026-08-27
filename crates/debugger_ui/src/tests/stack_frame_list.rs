@@ -1,6 +1,5 @@
 #![expect(clippy::result_large_err)]
 use crate::{
-    debugger_panel::DebugPanel,
     session::running::stack_frame_list::{
         StackFrameEntry, StackFrameFilter, stack_frame_filter_key,
     },
@@ -359,7 +358,7 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
 
     let stack_frame_list = workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_debug_panel_item = debug_panel
                 .update(cx, |this, _| this.active_session())
                 .unwrap();

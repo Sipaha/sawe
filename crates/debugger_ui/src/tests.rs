@@ -4,13 +4,45 @@ use anyhow::{Context as _, Result};
 use console_panel::ConsolePanel;
 use dap::adapters::DebugTaskDefinition;
 use dap::client::DebugAdapterClient;
-use gpui::{Entity, TestAppContext, WindowHandle};
+use gpui::{AppContext as _, Entity, TestAppContext, WindowHandle};
 use project::{Project, debugger::session::Session};
 use settings::SettingsStore;
+use solution_agent::solution_band::SolutionBand;
 use task::SharedTaskContext;
 use workspace::{MultiWorkspace, UtilityKind};
 
-use crate::{debugger_panel::DebugPanel, session::DebugSession};
+use crate::{
+    debugger_panel::{DebugPanel, debug_panel_for_workspace},
+    session::DebugSession,
+};
+
+/// The `DebugPanel` of a test window, resolved the way production does —
+/// out of the Solution band's utility slot (phase 2b task 5), not out of a
+/// dock. Takes the `MultiWorkspace` because that is what
+/// `WindowHandle::update` hands the test closures.
+#[track_caller]
+pub(crate) fn debug_panel(multi_workspace: &MultiWorkspace, cx: &gpui::App) -> Entity<DebugPanel> {
+    debug_panel_for_workspace(multi_workspace.workspace().read(cx))
+        .expect("debug panel installed in the solution band utility slot")
+}
+
+/// Focus the debug panel. It no longer lives in a dock (phase 2b task 5), so
+/// `Workspace::focus_panel::<DebugPanel>` cannot find it; focus its handle
+/// directly, which is what `SolutionBand::toggle_utility_focus` does in
+/// production.
+pub(crate) fn focus_debug_panel(
+    multi_workspace: &mut MultiWorkspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<MultiWorkspace>,
+) {
+    multi_workspace.workspace().update(cx, |workspace, cx| {
+        crate::debugger_panel::reveal_debug_panel(workspace, cx);
+        let Some(panel) = debug_panel_for_workspace(workspace) else {
+            return;
+        };
+        gpui::Focusable::focus_handle(panel.read(cx), cx).focus(window, cx);
+    });
+}
 
 #[cfg(test)]
 mod attach_modal;
@@ -89,11 +121,27 @@ pub async fn init_test_workspace(
     workspace_handle
         .update(cx, |multi, window, cx| {
             multi.workspace().update(cx, |workspace, cx| {
-                workspace.add_panel(debugger_panel, window, cx);
-                // `ConsolePanel` hosts the Solution band's utility section
-                // (phase 2a task 6), not a dock panel — install it into the
-                // same type-erased slot `zed.rs` uses in production so tests
-                // exercise the real lookup path (`console_panel_for_workspace`).
+                // The band is what actually renders the debugger now, so a
+                // test workspace needs one or the panel is never drawn (and
+                // `reveal_debug_panel` — the replacement for
+                // `Workspace::open_panel` on a breakpoint hit — is a no-op).
+                // Same construction as `zed::initialize_panels`.
+                let band = cx.new(|cx| {
+                    SolutionBand::new(workspace.weak_handle(), workspace.project().clone(), cx)
+                });
+                workspace.set_solution_band_item(band.into(), window, cx);
+                // Neither panel is a dock panel any more — the Solution
+                // band's utility section hosts them (phase 2a task 6 for the
+                // terminal, phase 2b task 5 for the debugger). Install both
+                // into the same type-erased slot `zed.rs` uses in production
+                // so tests exercise the real lookup paths
+                // (`console_panel_for_workspace`, `debug_panel_for_workspace`).
+                workspace.set_solution_band_utility_item(
+                    UtilityKind::Debug,
+                    debugger_panel.into(),
+                    window,
+                    cx,
+                );
                 workspace.set_solution_band_utility_item(
                     UtilityKind::Terminal,
                     terminal_panel.into(),
@@ -114,7 +162,7 @@ pub fn active_debug_session_panel(
     workspace
         .update(cx, |multi, _window, cx| {
             multi.workspace().update(cx, |workspace, cx| {
-                let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+                let debug_panel = debug_panel_for_workspace(workspace).unwrap();
                 debug_panel
                     .update(cx, |this, _| this.active_session())
                     .unwrap()
@@ -144,10 +192,7 @@ pub fn start_debug_session_with<T: Fn(&Arc<DebugAdapterClient>) + 'static>(
     })?;
     cx.run_until_parked();
     let session = workspace.read_with(cx, |workspace, cx| {
-        workspace
-            .workspace()
-            .read(cx)
-            .panel::<DebugPanel>(cx)
+        debug_panel_for_workspace(workspace.workspace().read(cx))
             .and_then(|panel| {
                 panel
                     .read(cx)

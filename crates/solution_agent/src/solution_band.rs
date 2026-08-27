@@ -33,10 +33,11 @@
 //! instead of caching a copy, so it never goes stale relative to whatever
 //! `zed.rs` last installed there. As of phase 2b task 1 the slot holds one
 //! entry per kind (terminal / git graph / debug); `render` asks for
-//! whichever kind `BandState::utility_kind` (task 2) holds. Nothing yet
-//! writes a non-Terminal value — the buttons that call
-//! `SolutionAgentStore::set_band_utility_kind` arrive in a later task — so
-//! observed behaviour is still always the terminal.
+//! whichever kind `BandState::utility_kind` (task 2) holds. The buttons that
+//! let a user pick a kind arrive in a later task; until then the only writer
+//! is `debugger_ui` (task 5), whose `debug_panel::ToggleFocus` and
+//! breakpoint-hit reveal call `set_utility_kind` because "open my dock and
+//! activate me" has no other translation into the band.
 //!
 //! Installed from `crates/zed/src/zed.rs` (NOT `title_bar`, which cannot
 //! depend on `solution_agent` — see the `SessionTabStrip` install a few
@@ -185,6 +186,31 @@ impl SolutionBand {
                     return;
                 }
                 self.local_state.utility_visible = visible;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Which content the utility section is currently showing.
+    pub fn utility_kind(&self, cx: &App) -> UtilityKind {
+        self.band_state(cx).utility_kind
+    }
+
+    /// Choose which content the utility section shows. The buttons that let
+    /// a user pick arrive in a later task; the first caller is
+    /// `debugger_ui`, whose `debug_panel::ToggleFocus` (`ctrl-shift-d`) and
+    /// breakpoint-hit reveal both used to mean "open the dock this panel
+    /// lives in and activate it" — in the band, "activate it" is this.
+    pub fn set_utility_kind(&mut self, kind: UtilityKind, cx: &mut Context<Self>) {
+        match self.solution_id(cx) {
+            Some(solution_id) => SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_band_utility_kind(solution_id, kind, cx);
+            }),
+            None => {
+                if self.local_state.utility_kind == kind {
+                    return;
+                }
+                self.local_state.utility_kind = kind;
             }
         }
         cx.notify();
@@ -453,10 +479,7 @@ impl Render for SolutionBand {
         // a lone half takes the whole band regardless of the stored ratio, so
         // hiding the other side never leaves a dead gutter.
         let half = |content: AnyView, fraction: f32| {
-            let half = div()
-                .min_w_0()
-                .overflow_hidden()
-                .bg(half_background);
+            let half = div().min_w_0().overflow_hidden().bg(half_background);
             if split {
                 half.flex_shrink_1()
                     .flex_basis(DefiniteLength::Fraction(fraction))

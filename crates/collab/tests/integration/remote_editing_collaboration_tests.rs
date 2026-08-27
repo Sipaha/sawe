@@ -3,7 +3,7 @@ use call::ActiveCall;
 use collections::{HashMap, HashSet};
 
 use dap::{Capabilities, adapters::DebugTaskDefinition, transport::RequestHandling};
-use debugger_ui::debugger_panel::DebugPanel;
+use debugger_ui::debugger_panel::{DebugPanel, debug_panel_for_workspace};
 use editor::{Editor, EditorMode, LSP_REQUEST_DEBOUNCE_TIMEOUT, MultiBuffer};
 use extension::ExtensionHostProxy;
 use fs::{FakeFs, Fs as _, RemoveOptions};
@@ -1052,13 +1052,21 @@ async fn test_remote_server_debugger(
         .await
         .unwrap();
 
+    // The debugger occupies the Solution band's utility section rather than a
+    // dock (phase 2b task 5), so it is installed into the type-erased slot and
+    // looked up with `debug_panel_for_workspace`, not `Workspace::panel`.
     workspace.update_in(cx_a, |workspace, window, cx| {
-        workspace.add_panel(debugger_panel, window, cx);
+        workspace.set_solution_band_utility_item(
+            workspace::UtilityKind::Debug,
+            debugger_panel.into(),
+            window,
+            cx,
+        );
     });
 
     cx_a.run_until_parked();
     let debug_panel = workspace
-        .update(cx_a, |workspace, cx| workspace.panel::<DebugPanel>(cx))
+        .update(cx_a, |workspace, _cx| debug_panel_for_workspace(workspace))
         .unwrap();
 
     let workspace_window = cx_a
@@ -1165,13 +1173,21 @@ async fn test_slow_adapter_startup_retries(
         .await
         .unwrap();
 
+    // The debugger occupies the Solution band's utility section rather than a
+    // dock (phase 2b task 5), so it is installed into the type-erased slot and
+    // looked up with `debug_panel_for_workspace`, not `Workspace::panel`.
     workspace.update_in(cx_a, |workspace, window, cx| {
-        workspace.add_panel(debugger_panel, window, cx);
+        workspace.set_solution_band_utility_item(
+            workspace::UtilityKind::Debug,
+            debugger_panel.into(),
+            window,
+            cx,
+        );
     });
 
     cx_a.run_until_parked();
     let debug_panel = workspace
-        .update(cx_a, |workspace, cx| workspace.panel::<DebugPanel>(cx))
+        .update(cx_a, |workspace, _cx| debug_panel_for_workspace(workspace))
         .unwrap();
 
     let workspace_window = cx_a

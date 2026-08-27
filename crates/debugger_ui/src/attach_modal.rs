@@ -16,7 +16,7 @@ use ui::{Context, Tooltip, prelude::*};
 use ui::{ListItem, ListItemSpacing};
 use workspace::{ModalView, Workspace};
 
-use crate::debugger_panel::DebugPanel;
+use crate::debugger_panel::debug_panel_for_workspace;
 
 #[derive(Debug, Clone)]
 pub(super) struct Candidate {
@@ -250,7 +250,7 @@ impl PickerDelegate for AttachModalDelegate {
 
                 let workspace = self.workspace.clone();
                 let Some(panel) = workspace
-                    .update(cx, |workspace, cx| workspace.panel::<DebugPanel>(cx))
+                    .read_with(cx, |workspace, _| debug_panel_for_workspace(workspace))
                     .ok()
                     .flatten()
                 else {

@@ -1,3 +1,37 @@
+//! `DebugPanel` — the debugger as an occupant of the Solution band's
+//! utility section (phase 2b task 5), NOT a dock panel: it keeps `Render`
+//! and `Focusable` but has no `Panel` impl, exactly like
+//! `console_panel::ConsolePanel` (phase 2a task 6) and
+//! `git_graph::GitGraphPanel` (task 4). `zed.rs` installs it into
+//! `Workspace::solution_band_utility_item` under `UtilityKind::Debug`;
+//! `SolutionBand::render` draws it in the utility half whenever the
+//! Solution's persisted `utility_kind` is `debug`.
+//!
+//! Consequences of losing the `Panel` impl, all of them deliberate:
+//!
+//! * `Workspace::panel::<DebugPanel>` walked the docks and now finds
+//!   nothing, so every lookup goes through [`debug_panel_for_workspace`],
+//!   which downcasts the band's type-erased slot instead.
+//! * `Panel::position` is gone. It used to read `DebuggerSettings::dock`
+//!   and drove three things: the controls strip's row/column direction, the
+//!   `dock_axis` a new `RunningState` is built with, and the empty state's
+//!   layout. The band's utility half is a wide, short region shaped exactly
+//!   like a bottom dock, so all three now read the fixed
+//!   [`BAND_DOCK_POSITION`]. `DebuggerSettings::dock` stays in the settings
+//!   schema (removing it is a migration this plan does not want) but steers
+//!   nothing. A session whose layout was serialised under a *different*
+//!   axis is reconciled on load by `RunningState::new`, which passes
+//!   `dock_axis != serialized_layout.dock_axis` to
+//!   `persistence::deserialize_pane_layout` and inverts the restored panes
+//!   — the same mechanism `invert_axies` used to drive from `set_position`.
+//! * Panel-level zoom is gone; see the `ToggleZoom` handler in `render` for
+//!   what zoom would have to mean in the band.
+//! * The panel's dock-strip button is gone. Task 6 gives the band's three
+//!   utility contents status-bar buttons; until then the debugger is
+//!   reachable through `debug_panel::ToggleFocus` (`ctrl-shift-d`), which
+//!   selects `UtilityKind::Debug` and reveals the section, and it reveals
+//!   itself when a session stops on a breakpoint (`session::running`).
+
 use crate::persistence::DebuggerPaneItem;
 use crate::session::DebugSession;
 use crate::session::running::RunningState;
@@ -12,24 +46,23 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow};
 use collections::IndexMap;
 use dap::adapters::DebugAdapterName;
+use dap::client::SessionId;
 use dap::{DapRegistry, StartDebuggingRequestArguments};
-use dap::{client::SessionId, debugger_settings::DebuggerSettings};
 use editor::{Editor, MultiBufferOffset, ToPoint};
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_feature_flag};
 use gpui::{
     Action, Anchor, App, AsyncWindowContext, ClipboardItem, Context, DismissEvent, Entity,
-    EntityId, EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, Point,
-    Subscription, Task, TaskExt, WeakEntity, anchored, deferred,
+    EntityId, FocusHandle, Focusable, MouseButton, MouseDownEvent, Point, Subscription, Task,
+    TaskExt, WeakEntity, anchored, deferred,
 };
 
 use itertools::Itertools as _;
 use language::Buffer;
 use project::debugger::session::{Session, SessionQuirks, SessionState, SessionStateEvent};
-use project::{DebugScenarioContext, Fs, ProjectPath, TaskSourceKind, WorktreeId};
+use project::{DebugScenarioContext, ProjectPath, TaskSourceKind, WorktreeId};
 use project::{Project, debugger::session::ThreadStatus};
-use rpc::proto::{self};
-use settings::Settings;
-use std::sync::{Arc, LazyLock};
+use solution_agent::solution_band::SolutionBand;
+use std::sync::LazyLock;
 use task::{DebugScenario, SharedTaskContext};
 use tree_sitter::{Query, StreamingIterator as _};
 use ui::{
@@ -40,11 +73,7 @@ use util::rel_path::RelPath;
 use util::{ResultExt, debug_panic, maybe};
 use workspace::SplitDirection;
 use workspace::item::SaveOptions;
-use workspace::{
-    Item, Pane, Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
-};
-use zed_actions::debug_panel::ToggleFocus;
+use workspace::{Item, UtilityKind, Workspace, dock::DockPosition};
 
 pub struct DebuggerHistoryFeatureFlag;
 
@@ -54,7 +83,15 @@ impl FeatureFlag for DebuggerHistoryFeatureFlag {
 }
 register_feature_flag!(DebuggerHistoryFeatureFlag);
 
-const DEBUG_PANEL_KEY: &str = "DebugPanel";
+/// The debugger's fixed position now that it occupies the Solution band's
+/// utility half instead of a dock (phase 2b task 5). The half is a wide,
+/// short region shaped exactly like a bottom dock, so every layout decision
+/// that used to branch on `Panel::position` (itself
+/// `DebuggerSettings::dock`) reads this constant: the controls strip stays a
+/// row, a new `RunningState` is always built with `Axis::Vertical` (panes
+/// side by side), and the empty state uses the wide variant. See the module
+/// doc for what happens to a session serialised under the other axis.
+const BAND_DOCK_POSITION: DockPosition = DockPosition::Bottom;
 
 pub struct DebugPanel {
     active_session: Option<Entity<DebugSession>>,
@@ -67,8 +104,6 @@ pub struct DebugPanel {
         IndexMap<Entity<DebugSession>, Vec<WeakEntity<DebugSession>>>,
     pub(crate) thread_picker_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub(crate) session_picker_menu_handle: PopoverMenuHandle<ContextMenu>,
-    fs: Arc<dyn Fs>,
-    is_zoomed: bool,
     _subscriptions: [Subscription; 1],
     breakpoint_list: Entity<BreakpointList>,
 }
@@ -107,10 +142,8 @@ impl DebugPanel {
                 project,
                 workspace: workspace.weak_handle(),
                 context_menu: None,
-                fs: workspace.app_state().fs.clone(),
                 thread_picker_menu_handle,
                 session_picker_menu_handle,
-                is_zoomed: false,
                 _subscriptions: [focus_subscription],
                 debug_scenario_scheduled_last: true,
             }
@@ -359,7 +392,13 @@ impl DebugPanel {
             this.workspace.clone()
         })?;
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.focus_panel::<Self>(window, cx);
+            // Was `focus_panel::<Self>` — open the dock, activate this panel
+            // and focus it. In the band that is: point the utility section
+            // at the debugger, show it, focus it.
+            reveal_debug_panel(workspace, cx);
+            if let Some(panel) = debug_panel_for_workspace(workspace) {
+                panel.focus_handle(cx).focus(window, cx);
+            }
         })?;
         Ok(debug_session)
     }
@@ -613,7 +652,7 @@ impl DebugPanel {
     ) -> Option<Div> {
         let active_session = self.active_session.clone();
         let focus_handle = self.focus_handle.clone();
-        let is_side = self.position(window, cx).axis() == gpui::Axis::Horizontal;
+        let is_side = BAND_DOCK_POSITION.axis() == gpui::Axis::Horizontal;
         let div = if is_side { v_flex() } else { h_flex() };
 
         let new_session_button = || {
@@ -664,8 +703,20 @@ impl DebugPanel {
             h_flex().pl_0p5().gap_1().child(Divider::vertical()).child(
                 IconButton::new("debug-close-panel", IconName::Close)
                     .icon_size(IconSize::Small)
-                    .on_click(move |_, window, cx| {
-                        window.dispatch_action(workspace::ToggleBottomDock.boxed_clone(), cx)
+                    .on_click({
+                        // Used to dispatch `workspace::ToggleBottomDock`.
+                        // The debugger has no dock now (phase 2b task 5), so
+                        // that would toggle an empty dock and look like a
+                        // dead button; closing means hiding the band's
+                        // utility section.
+                        let workspace = self.workspace.clone();
+                        move |_, _window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    hide_utility_section(workspace, cx);
+                                })
+                                .ok();
+                        }
                     })
                     .tooltip(Tooltip::text("Close Panel")),
             )
@@ -1302,22 +1353,6 @@ impl DebugPanel {
         self.session_picker_menu_handle.toggle(window, cx);
     }
 
-    fn toggle_zoom(
-        &mut self,
-        _: &workspace::ToggleZoom,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.is_zoomed {
-            cx.emit(PanelEvent::ZoomOut);
-        } else {
-            if !self.focus_handle(cx).contains_focused(window, cx) {
-                cx.focus_self(window);
-            }
-            cx.emit(PanelEvent::ZoomIn);
-        }
-    }
-
     fn label_for_child_session(
         &self,
         parent_session: &Entity<Session>,
@@ -1491,7 +1526,7 @@ async fn register_session_inner(
                 .map(|p| p.read(cx).running_state().read(cx).debug_terminal.clone()),
             session,
             serialized_layout,
-            this.position(window, cx).axis(),
+            BAND_DOCK_POSITION.axis(),
             window,
             cx,
         );
@@ -1527,101 +1562,96 @@ async fn register_session_inner(
     Ok(debug_session)
 }
 
-impl EventEmitter<PanelEvent> for DebugPanel {}
-
 impl Focusable for DebugPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Panel for DebugPanel {
-    fn persistent_name() -> &'static str {
-        "DebugPanel"
-    }
+/// Resolve the concrete `Entity<DebugPanel>` from the type-erased
+/// `Workspace::solution_band_utility_item` slot `zed.rs` installs at startup
+/// (phase 2b task 5). Replaces the old `workspace.panel::<DebugPanel>(cx)`
+/// dock lookup, which walked the docks and would find nothing now that the
+/// panel isn't registered in one. `None` means either the panel-init task
+/// (`initialize_panels`) hasn't finished yet, or this workspace has no
+/// Solution band installed at all (headless / test workspaces that skip it).
+///
+/// Takes `&Workspace` rather than `Entity<Workspace>` on purpose: most
+/// callers already hold the workspace leased (they run inside
+/// `workspace.register_action` or `workspace.update`), and re-reading the
+/// entity there is GPUI's double-lease panic.
+pub fn debug_panel_for_workspace(workspace: &Workspace) -> Option<Entity<DebugPanel>> {
+    workspace
+        .solution_band_utility_item(UtilityKind::Debug)?
+        .downcast::<DebugPanel>()
+        .ok()
+}
 
-    fn panel_key() -> &'static str {
-        DEBUG_PANEL_KEY
-    }
+/// The Solution band, if this workspace has one. `console_panel` does the
+/// same downcast for the same reason: `solution_agent` cannot depend on the
+/// crates that own the band's occupants, so the slot is type-erased and the
+/// occupant's own crate is the one that knows the concrete type.
+fn solution_band(workspace: &Workspace) -> Option<Entity<SolutionBand>> {
+    workspace
+        .solution_band_item()
+        .and_then(|item| item.downcast::<SolutionBand>().ok())
+}
 
-    fn position(&self, _window: &Window, cx: &App) -> DockPosition {
-        DebuggerSettings::get_global(cx).dock.into()
-    }
+/// Select the debugger as the band's utility content and make the section
+/// visible, without stealing focus. The band replacement for
+/// `Workspace::open_panel::<DebugPanel>`: "open the dock and activate this
+/// panel" is, in the band, "point the utility section at
+/// `UtilityKind::Debug` and show it". No-op when the band isn't installed.
+///
+/// Reads the workspace through a plain reference so it is safe to call from
+/// inside a live `&mut Workspace` borrow.
+pub fn reveal_debug_panel(workspace: &Workspace, cx: &mut App) {
+    let Some(band) = solution_band(workspace) else {
+        return;
+    };
+    band.update(cx, |band, cx| {
+        band.set_utility_kind(UtilityKind::Debug, cx);
+        band.set_utility_visible(true, cx);
+    });
+}
 
-    fn position_is_valid(&self, _: DockPosition) -> bool {
-        true
-    }
+/// Hide the band's utility section — what the panel's own "Close Panel"
+/// button means now that there is no bottom dock to toggle shut.
+fn hide_utility_section(workspace: &Workspace, cx: &mut App) {
+    let Some(band) = solution_band(workspace) else {
+        return;
+    };
+    band.update(cx, |band, cx| band.set_utility_visible(false, cx));
+}
 
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if position.axis() != self.position(window, cx).axis() {
-            self.sessions_with_children.keys().for_each(|session_item| {
-                session_item.update(cx, |item, cx| {
-                    item.running_state()
-                        .update(cx, |state, cx| state.invert_axies(cx))
-                })
-            });
-        }
-
-        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
-            settings.debugger.get_or_insert_default().dock = Some(position.into());
-        });
-    }
-
-    fn default_size(&self, _window: &Window, _: &App) -> Pixels {
-        px(300.)
-    }
-
-    fn remote_id() -> Option<proto::PanelId> {
-        Some(proto::PanelId::DebugPanel)
-    }
-
-    fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
-        DebuggerSettings::get_global(cx)
-            .button
-            .then_some(IconName::Debug)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, cx: &App) -> Option<&'static str> {
-        if DebuggerSettings::get_global(cx).button {
-            Some("Debug Panel")
+/// `debug_panel::ToggleFocus`'s (`ctrl-shift-d`) handler, replacing
+/// `Workspace::toggle_panel_focus::<DebugPanel>`. Tri-state, mirroring both
+/// that helper and `console_panel::handle_toggle_focus`: the section hidden
+/// **or showing something else** → select the debugger, show it, focus it;
+/// already showing and focused → hide; showing but unfocused → just focus.
+/// The "showing something else" arm is what `toggle_panel_focus` used to get
+/// for free by activating this panel within its dock.
+pub(crate) fn handle_toggle_focus(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = debug_panel_for_workspace(workspace) else {
+        return;
+    };
+    let Some(band) = solution_band(workspace) else {
+        return;
+    };
+    let focus_handle = panel.focus_handle(cx);
+    band.update(cx, |band, cx| {
+        if band.utility_kind(cx) != UtilityKind::Debug {
+            band.set_utility_kind(UtilityKind::Debug, cx);
+            band.set_utility_visible(true, cx);
+            focus_handle.focus(window, cx);
         } else {
-            None
+            band.toggle_utility_focus(&focus_handle, window, cx);
         }
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn pane(&self) -> Option<Entity<Pane>> {
-        None
-    }
-
-    fn activation_priority(&self) -> u32 {
-        7
-    }
-
-    fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
-        Some(workspace::HideStatusItem::new(|settings| {
-            settings.debugger.get_or_insert_default().button = Some(false);
-        }))
-    }
-
-    fn set_active(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) {}
-
-    fn is_zoomed(&self, _window: &Window, _cx: &App) -> bool {
-        self.is_zoomed
-    }
-
-    fn set_zoomed(&mut self, zoomed: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        self.is_zoomed = zoomed;
-        cx.notify();
-    }
+    });
 }
 
 impl Render for DebugPanel {
@@ -1759,7 +1789,25 @@ impl Render for DebugPanel {
                     .ok();
                 }
             })
-            .on_action(cx.listener(Self::toggle_zoom))
+            // Panel-level zoom is a deliberate no-op here, not an
+            // oversight. It used to mean "make the dock this panel lives in
+            // fill the workspace": `PanelEvent::ZoomIn`/`ZoomOut` emitted
+            // from here, `Workspace`'s dock subscription doing the work.
+            // There is no dock any more (phase 2b task 5) and no listener
+            // for those events, and the band's geometry is not this panel's
+            // to change — `SolutionBand` owns it as one persisted row
+            // (height + divider ratio) shared by all three utility
+            // contents, with no full-viewport mode for any of them. Swallow
+            // the action rather than let it propagate: the debugger's panes
+            // set `can_toggle_zoom(false)` and `cx.propagate()`, so without
+            // this handler `shift-escape` pressed inside the debugger would
+            // travel on and zoom whichever centre pane happened to be
+            // active. The zoom a user can actually see in the band is the
+            // per-pane expand button inside the session
+            // (`session::running`, also bound to `ToggleExpandItem`), which
+            // is self-contained and still works. If the band ever grows a
+            // maximise mode, this is its entry point.
+            .on_action(|_: &workspace::ToggleZoom, _window, _cx| {})
             .on_action(cx.listener(|panel, _: &ToggleExpandItem, _, cx| {
                 let Some(session) = panel.active_session() else {
                     return;
@@ -1808,14 +1856,15 @@ impl Render for DebugPanel {
                 if let Some(active_session) = self.active_session.clone() {
                     this.child(active_session)
                 } else {
-                    let docked_to_bottom = self.position(window, cx) == DockPosition::Bottom;
-
+                    // The band's utility half is always the wide, short
+                    // shape (`BAND_DOCK_POSITION`), so the side-dock variant
+                    // of this empty state (`w_full().h_1_3()`) is
+                    // unreachable and has been dropped rather than left as a
+                    // branch nothing can take.
                     let welcome_experience = v_flex()
-                        .when_else(
-                            docked_to_bottom,
-                            |this| this.w_2_3().h_full().pr_8(),
-                            |this| this.w_full().h_1_3(),
-                        )
+                        .w_2_3()
+                        .h_full()
+                        .pr_8()
                         .items_center()
                         .justify_center()
                         .gap_2()
@@ -1886,13 +1935,12 @@ impl Render for DebugPanel {
                         .values()
                         .any(|breakpoints| !breakpoints.is_empty());
 
+                    // Fixed to the wide, short layout — see the comment on
+                    // `welcome_experience` above.
                     let breakpoint_list = v_flex()
                         .group("base-breakpoint-list")
-                        .when_else(
-                            docked_to_bottom,
-                            |this| this.min_w_1_3().h_full(),
-                            |this| this.size_full().h_2_3(),
-                        )
+                        .min_w_1_3()
+                        .h_full()
                         .child(
                             h_flex()
                                 .track_focus(&self.breakpoint_list.focus_handle(cx))
@@ -1929,26 +1977,14 @@ impl Render for DebugPanel {
                             .gap_1()
                             .items_center()
                             .justify_center()
-                            .map(|this| {
-                                if docked_to_bottom {
-                                    this.child(
-                                        h_flex()
-                                            .size_full()
-                                            .child(breakpoint_list)
-                                            .child(Divider::vertical())
-                                            .child(welcome_experience)
-                                            .child(Divider::vertical()),
-                                    )
-                                } else {
-                                    this.child(
-                                        v_flex()
-                                            .size_full()
-                                            .child(welcome_experience)
-                                            .child(Divider::horizontal())
-                                            .child(breakpoint_list),
-                                    )
-                                }
-                            }),
+                            .child(
+                                h_flex()
+                                    .size_full()
+                                    .child(breakpoint_list)
+                                    .child(Divider::vertical())
+                                    .child(welcome_experience)
+                                    .child(Divider::vertical()),
+                            ),
                     )
                 }
             })

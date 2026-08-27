@@ -1,6 +1,5 @@
 #![expect(clippy::result_large_err)]
 use crate::{
-    debugger_panel::DebugPanel,
     persistence::DebuggerPaneItem,
     tests::{active_debug_session_panel, init_test, init_test_workspace, start_debug_session},
 };
@@ -26,7 +25,7 @@ async fn test_module_list(executor: BackgroundExecutor, cx: &mut TestAppContext)
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);

@@ -838,11 +838,17 @@ impl RunningState {
             cx.subscribe_in(&session, window, |this, _, event, window, cx| {
                 match event {
                     SessionEvent::Stopped(thread_id) => {
+                        // Was `open_panel::<DebugPanel>` — "open the dock
+                        // this panel lives in and activate it". The debugger
+                        // occupies the Solution band's utility section now
+                        // (phase 2b task 5), where the same intent is
+                        // "point the section at `UtilityKind::Debug` and
+                        // show it". `window` is no longer needed for that.
                         let panel = this
                             .workspace
                             .update(cx, |workspace, cx| {
-                                workspace.open_panel::<crate::DebugPanel>(window, cx);
-                                workspace.panel::<crate::DebugPanel>(cx)
+                                crate::debugger_panel::reveal_debug_panel(workspace, cx);
+                                crate::debugger_panel::debug_panel_for_workspace(workspace)
                             })
                             .log_err()
                             .flatten();
@@ -1963,11 +1969,6 @@ impl RunningState {
 
         Member::Axis(group_root)
     }
-
-    pub(crate) fn invert_axies(&mut self, cx: &mut App) {
-        self.dock_axis = self.dock_axis.invert();
-        self.panes.invert_axies(cx);
-    }
 }
 
 impl Focusable for RunningState {
@@ -1980,7 +1981,7 @@ impl Focusable for RunningState {
 mod tests {
     use super::*;
     use crate::{
-        debugger_panel::DebugPanel,
+        debugger_panel::debug_panel_for_workspace,
         tests::{init_test, init_test_workspace, start_debug_session},
     };
     use gpui::{BackgroundExecutor, TestAppContext, VisualTestContext};
@@ -2014,7 +2015,7 @@ mod tests {
         let running_state = workspace
             .update(cx, |multi_workspace, _window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
-                    let debug_panel = workspace.panel::<DebugPanel>(cx).expect("debug panel");
+                    let debug_panel = debug_panel_for_workspace(workspace).expect("debug panel");
                     let active_session = debug_panel
                         .read(cx)
                         .active_session()

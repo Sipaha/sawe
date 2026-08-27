@@ -5,7 +5,6 @@ use std::sync::{
 };
 
 use crate::{
-    DebugPanel,
     persistence::DebuggerPaneItem,
     session::running::variable_list::{
         AddWatch, CollapseSelectedEntry, ExpandSelectedEntry, RemoveWatch,
@@ -55,7 +54,7 @@ async fn test_basic_fetch_initial_scope_and_variables(
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
@@ -256,7 +255,7 @@ async fn test_fetch_variables_for_multiple_scopes(
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
@@ -509,7 +508,7 @@ async fn test_keyboard_navigation(executor: BackgroundExecutor, cx: &mut TestApp
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
@@ -1518,7 +1517,7 @@ async fn test_it_fetches_scopes_variables_when_you_select_a_stack_frame(
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
@@ -1856,7 +1855,7 @@ async fn test_add_and_remove_watcher(executor: BackgroundExecutor, cx: &mut Test
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
@@ -2108,7 +2107,7 @@ async fn test_refresh_watchers(executor: BackgroundExecutor, cx: &mut TestAppCon
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);

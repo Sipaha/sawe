@@ -30,7 +30,7 @@ async fn test_handle_output_event(executor: BackgroundExecutor, cx: &mut TestApp
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
 
@@ -97,7 +97,7 @@ async fn test_handle_output_event(executor: BackgroundExecutor, cx: &mut TestApp
     // assert we have output from before the thread stopped
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_debug_session_panel = debug_panel
                 .update(cx, |this, _| this.active_session())
                 .unwrap();
@@ -146,7 +146,7 @@ async fn test_handle_output_event(executor: BackgroundExecutor, cx: &mut TestApp
     // assert we have output from before and after the thread stopped
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_session_panel = debug_panel
                 .update(cx, |this, _| this.active_session())
                 .unwrap();
@@ -178,7 +178,7 @@ async fn test_escape_code_processing(executor: BackgroundExecutor, cx: &mut Test
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
 
@@ -304,7 +304,7 @@ async fn test_escape_code_processing(executor: BackgroundExecutor, cx: &mut Test
 
     workspace
         .update(cx, |workspace, window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_debug_session_panel = debug_panel
                 .update(cx, |this, _| this.active_session())
                 .unwrap();

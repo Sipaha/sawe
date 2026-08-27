@@ -80,7 +80,7 @@ async fn test_basic_show_debug_panel(executor: BackgroundExecutor, cx: &mut Test
     // assert we have a debug panel item before the session has stopped
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_session =
                 debug_panel.update(cx, |debug_panel, _| debug_panel.active_session().unwrap());
 
@@ -111,7 +111,7 @@ async fn test_basic_show_debug_panel(executor: BackgroundExecutor, cx: &mut Test
 
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_session = debug_panel
                 .update(cx, |this, _| this.active_session())
                 .unwrap();
@@ -139,7 +139,7 @@ async fn test_basic_show_debug_panel(executor: BackgroundExecutor, cx: &mut Test
     // assert we still have a debug panel item after the client shutdown
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
 
             let active_session = debug_panel
                 .update(cx, |this, _| this.active_session())
@@ -205,7 +205,7 @@ async fn test_we_can_only_have_one_panel_per_debug_session(
     // assert we have a debug panel item before the session has stopped
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
 
             debug_panel.update(cx, |this, _| {
                 assert!(this.active_session().is_some());
@@ -230,7 +230,7 @@ async fn test_we_can_only_have_one_panel_per_debug_session(
     // assert we added a debug panel item
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_session = debug_panel
                 .update(cx, |this, _| this.active_session())
                 .unwrap();
@@ -263,7 +263,7 @@ async fn test_we_can_only_have_one_panel_per_debug_session(
 
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_session = debug_panel
                 .update(cx, |this, _| this.active_session())
                 .unwrap();
@@ -291,7 +291,7 @@ async fn test_we_can_only_have_one_panel_per_debug_session(
     // assert we still have a debug panel item after the client shutdown
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let active_session = debug_panel
                 .update(cx, |this, _| this.active_session())
                 .unwrap();
@@ -371,7 +371,7 @@ async fn test_handle_successful_run_in_terminal_reverse_request(
 
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             let session = debug_panel.read(cx).active_session().unwrap();
             let running = session.read(cx).running_state();
             assert_eq!(
@@ -430,7 +430,7 @@ async fn test_handle_start_debugging_request(
 
     let sessions = workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
             debug_panel.read(cx).sessions().collect::<Vec<_>>()
         })
         .unwrap();
@@ -446,7 +446,7 @@ async fn test_handle_start_debugging_request(
 
     workspace
         .update(cx, |workspace, _window, cx| {
-            let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
 
             // Active session changes on spawn, as the parent has never stopped.
             let active_session = debug_panel
@@ -1796,7 +1796,7 @@ async fn test_debug_adapters_shutdown_on_app_quit(
 
     workspace
         .update(cx, |workspace, _, cx| {
-            let panel = workspace.panel::<DebugPanel>(cx).unwrap();
+            let panel = crate::tests::debug_panel(workspace, cx);
             panel.read_with(cx, |panel, _| {
                 assert!(
                     panel.sessions().next().is_some(),

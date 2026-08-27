@@ -803,6 +803,9 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         // Collab panel disabled in sawe (no Zed Industries collab server access).
         // let channels_panel =
         //     collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
+        // Sawe: the debugger is an occupant of the Solution band's
+        // utility section (phase 2b task 5), no longer a dock panel — see
+        // `crates/debugger_ui/src/debugger_panel.rs`'s module doc.
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -822,11 +825,13 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
 
         // Sawe: the Solution band's utility section hosts its contents
         // itself rather than a dock (phase 2a task 6 for the terminal, phase
-        // 2b task 4 for the git graph), so they can't go through
+        // 2b task 4 for the git graph, task 5 for the debugger), so they
+        // can't go through
         // `add_panel_when_ready` above — that helper requires `T: Panel`,
         // which these types deliberately no longer implement (see
-        // `crates/console_panel/src/panel.rs` and
-        // `crates/git_graph/src/git_graph_panel.rs` module docs). Installs
+        // `crates/console_panel/src/panel.rs`,
+        // `crates/git_graph/src/git_graph_panel.rs` and
+        // `crates/debugger_ui/src/debugger_panel.rs` module docs). Installs
         // into the type-erased, `UtilityKind`-keyed
         // `Workspace::solution_band_utility_item` map that
         // `SolutionBand::render` reads every frame.
@@ -871,7 +876,12 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
                 cx.clone()
             ),
             // add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
+            add_utility_item_when_ready(
+                UtilityKind::Debug,
+                debug_panel,
+                workspace_handle.clone(),
+                cx.clone()
+            ),
             // Sawe: agent_panel disabled — this fork's AI story is the
             // solution_agent crate (per-Solution Claude Code sessions). Leaving
             // upstream's AgentPanel registered creates a parallel, unconfigured

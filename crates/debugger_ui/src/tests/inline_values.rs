@@ -13,9 +13,8 @@ use serde_json::json;
 use unindent::Unindent as _;
 use util::{path, rel_path::rel_path};
 
-use crate::{
-    debugger_panel::DebugPanel,
-    tests::{active_debug_session_panel, init_test, init_test_workspace, start_debug_session},
+use crate::tests::{
+    active_debug_session_panel, init_test, init_test_workspace, start_debug_session,
 };
 
 #[gpui::test]
@@ -86,7 +85,7 @@ fn main() {
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
@@ -1551,7 +1550,7 @@ def process_data(untyped_param, typed_param: int, another_typed: str):
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
@@ -1895,7 +1894,7 @@ async fn test_inline_values_util(
     let workspace = init_test_workspace(&project, cx).await;
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_panel::<DebugPanel>(window, cx);
+            crate::tests::focus_debug_panel(workspace, window, cx);
         })
         .unwrap();
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
