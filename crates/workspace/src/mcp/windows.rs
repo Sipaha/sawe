@@ -1,10 +1,11 @@
-//! `windows.*` MCP tools — list/focus/close/dispatch_action plus programmatic
-//! input (keystrokes, text, mouse click, hover) for autonomous UI testing.
+//! `windows.*` MCP tools — list/focus/close/resize/dispatch_action plus
+//! programmatic input (keystrokes, text, mouse click, hover) for autonomous
+//! UI testing.
 use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;
 use gpui::{
     App, AsyncApp, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, px,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, Size, TouchPhase, px,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -320,6 +321,103 @@ impl McpServerTool for CloseWindowTool {
                 text: format!("closed: {closed}"),
             }],
             structured_content: CloseWindowResult { closed },
+        })
+    }
+}
+
+/// Resize the editor window with the given window_id to `width` x `height`
+/// logical pixels.
+///
+/// Exists so an agent can exercise layout that only misbehaves at a
+/// particular window size — the headless window is created at a fixed
+/// 1920x1080, which hides every "does this still fit on a short window"
+/// bug. Sizes are content size (what `windows.list` reports as bounds and
+/// what `Window::viewport_size` returns), not outer frame size.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct ResizeWindowParams {
+    pub window_id: String,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl<'de> Deserialize<'de> for ResizeWindowParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            window_id: String,
+            width: f32,
+            height: f32,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(ResizeWindowParams {
+            window_id: inner.window_id,
+            width: inner.width,
+            height: inner.height,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ResizeWindowResult {
+    pub resized: bool,
+    /// The window's content size after the resize, read back from the
+    /// platform. A window manager may refuse or adjust the request, so this
+    /// is not necessarily what was asked for.
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone)]
+pub struct ResizeWindowTool;
+
+impl McpServerTool for ResizeWindowTool {
+    type Input = ResizeWindowParams;
+    type Output = ResizeWindowResult;
+    const NAME: &'static str = "windows.resize";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            input.width.is_finite() && input.height.is_finite(),
+            "width and height must be finite numbers"
+        );
+        anyhow::ensure!(
+            input.width >= 1.0 && input.height >= 1.0,
+            "width and height must be at least 1 logical pixel (got {} x {})",
+            input.width,
+            input.height
+        );
+        let size = gpui::size(px(input.width), px(input.height));
+        let content_size = cx.update(|cx| -> anyhow::Result<Size<Pixels>> {
+            let handle = find_window_by_id(&input.window_id, cx)?;
+            handle
+                .update(cx, |_view, window, cx| {
+                    window.resize(size);
+                    // The headless platform window mutates its bounds without
+                    // firing the platform resize callback, so nothing would
+                    // otherwise refresh `viewport_size` / relayout. A real
+                    // platform fires the callback too; `bounds_changed` just
+                    // re-reads the platform state, so running it twice is
+                    // harmless.
+                    window.bounds_changed(cx);
+                    window.viewport_size()
+                })
+                .map_err(|err| anyhow::anyhow!("resize failed: {err}"))
+        })?;
+        let (width, height) = (f32::from(content_size.width), f32::from(content_size.height));
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: format!("resized: {width} x {height}"),
+            }],
+            structured_content: ResizeWindowResult {
+                resized: true,
+                width,
+                height,
+            },
         })
     }
 }
@@ -1408,6 +1506,38 @@ mod tests {
         }))
         .expect("parse");
         assert_eq!(p.window_id, "window:7");
+    }
+
+    #[test]
+    fn resize_params_round_trip() {
+        let p: ResizeWindowParams = serde_json::from_value(serde_json::json!({
+            "window_id": "window:3",
+            "width": 1024.0,
+            "height": 384.0
+        }))
+        .expect("parse");
+        assert_eq!(p.window_id, "window:3");
+        assert_eq!(p.width, 1024.0);
+        assert_eq!(p.height, 384.0);
+    }
+
+    #[test]
+    fn resize_params_accept_integer_json_numbers() {
+        let p: ResizeWindowParams = serde_json::from_value(serde_json::json!({
+            "window_id": "window:3",
+            "width": 1024,
+            "height": 384
+        }))
+        .expect("integers coerce to f32");
+        assert_eq!(p.height, 384.0);
+    }
+
+    #[test]
+    fn resize_params_accepts_null() {
+        let p: ResizeWindowParams =
+            serde_json::from_value(serde_json::Value::Null).expect("null accepted");
+        assert!(p.window_id.is_empty());
+        assert_eq!(p.width, 0.0);
     }
 
     #[test]

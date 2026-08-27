@@ -221,6 +221,7 @@ const GLOBAL_TOOLS: &[&str] = &[
     "windows.list",
     "windows.focus",
     "windows.close",
+    "windows.resize",
     "windows.dispatch_action",
     "windows.send_keystroke",
     "windows.send_text",

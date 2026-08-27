@@ -27,6 +27,9 @@ pub fn register(cx: &mut App) {
         server.add_tool(windows::CloseWindowTool);
     });
     editor_mcp::register_tool(cx, |server| {
+        server.add_tool(windows::ResizeWindowTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
         server.add_tool(windows::DispatchActionTool);
     });
     editor_mcp::register_tool(cx, |server| {
