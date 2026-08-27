@@ -114,6 +114,11 @@ impl Render for StatusBar {
         h_flex()
             .w_full()
             .h(px(30.))
+            // The status bar is a fixed-height row and must never be the thing
+            // that yields when the workspace column overflows — without this it
+            // shrinks silently (default `flex-shrink: 1`) and an over-tall
+            // Solution band ate it a few pixels at a time.
+            .flex_none()
             .justify_between()
             .gap(DynamicSpacing::Base08.rems(cx))
             .p(DynamicSpacing::Base04.rems(cx))

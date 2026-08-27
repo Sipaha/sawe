@@ -9014,6 +9014,18 @@ impl Render for Workspace {
                     .size_full()
                     .relative()
                     .flex_1()
+                    // `min_h_0` defeats this column's *automatic minimum
+                    // size*. Its `overflow` is visible, so without it taffy
+                    // floors the column at its own min-content — which
+                    // includes the project zone's docks, tab bars and
+                    // toolbars (~120px) on top of the Solution band's fixed
+                    // height. On a short window that floor is larger than the
+                    // window, the column silently overflows downward, and the
+                    // last row in it — the status bar — is pushed clean off
+                    // the bottom. With the floor gone the deficit lands on the
+                    // project zone, which clips (`#workspace` is
+                    // `overflow_hidden`) instead of shoving the chrome away.
+                    .min_h_0()
                     .flex()
                     .flex_col()
                     .child(

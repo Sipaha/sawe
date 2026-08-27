@@ -1218,11 +1218,17 @@ pub const MAX_BAND_HEIGHT_FRACTION: f32 = 0.8;
 /// but *shrinkable*, not `flex_none`), so an over-tall band zeroes the
 /// project zone and then eats into the status bar.
 ///
-/// Derivation: ~92px of chrome the band never gets — title bar 30
-/// (`title_bar::fork_height`), project toolbar 30, status bar 30, plus the
-/// two 1px workspace borders — and ~58px more so the project zone is still
-/// an editor rather than a hairline. Re-derive this if any of those chrome
-/// heights change.
+/// Derivation: ~92px of chrome the band never gets — measured live at
+/// 1280x384 as 61px above the band (the platform title bar plus the member
+/// tab row) and the 30px status bar below — and ~58px more so the project
+/// zone is still an editor rather than a hairline. Re-derive this if any of
+/// those chrome heights change.
+///
+/// This is a *coarse* guard, not the safety net: it cannot know the project
+/// zone's own content minimum. The layout invariant that actually keeps the
+/// status bar on screen is the `min_h_0` on the workspace column in
+/// `Workspace::render` plus the band being shrinkable — see the comments
+/// there.
 pub const BAND_RESERVED_HEIGHT: f32 = 150.0;
 
 /// Clamp a stored band height into the range a row may hold. Mirrors

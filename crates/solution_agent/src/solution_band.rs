@@ -454,7 +454,20 @@ impl Render for SolutionBand {
             .relative()
             .w_full()
             .h(px(height))
-            .flex_none()
+            // Shrinkable, NOT `flex_none`. `effective_band_height` reserves a
+            // fixed slice of the viewport for the chrome, but it cannot know
+            // the project zone's *content* minimum (tab bars, toolbars, panel
+            // headers — measured at ~124px in a normal window and not a
+            // constant). When the column overflows anyway, a `flex_none` band
+            // keeps its full height and the deficit lands on the status bar,
+            // which is squeezed and then pushed out of the window entirely.
+            // Shrinking here puts the deficit on the band instead: the project
+            // zone has `flex_basis: 0`, so its scaled shrink factor is 0 and
+            // the band absorbs all of it. `min_h_0` is required — the default
+            // automatic minimum size would otherwise refuse to shrink the band
+            // below its own content.
+            .flex_shrink(1.)
+            .min_h_0()
             // `h_flex` centres its children; the halves and the divider must
             // instead fill the band's height.
             .items_stretch()
