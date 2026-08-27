@@ -7,7 +7,14 @@
 //! project zone reclaims the space. When both are shown a draggable divider
 //! sits between them; its position, the utility section's visibility, and
 //! the active dialog are one persisted `BandState` row per Solution
-//! (task 7), so the band reopens the way the user left it.
+//! (task 7), so the band reopens the way the user left it. The band's
+//! height is the same kind of persisted geometry: `render` paints the root
+//! at `effective_band_height(state.height, viewport_height)` — the stored
+//! height clamped against the live window so the band can never eat the
+//! whole viewport — and a draggable top-edge handle (mirroring the
+//! divider's own drag/double-click-reset pattern) lets the user resize it.
+//! The handle paints no visible line of its own; the band's row boundary
+//! above it is what a user currently has to find the edge by.
 //!
 //! **The band owns no geometry of its own for a Solution workspace** — it
 //! reads and writes `SolutionAgentStore::band_state`. `local_state` is the
@@ -60,7 +67,10 @@ use ui::h_flex;
 use ui::prelude::ActiveTheme as _;
 use workspace::Workspace;
 
-use crate::model::{BandState, DEFAULT_DIVIDER_RATIO, SolutionSessionId, clamp_divider_ratio};
+use crate::model::{
+    BandState, DEFAULT_BAND_HEIGHT, DEFAULT_DIVIDER_RATIO, SolutionSessionId, clamp_band_height,
+    clamp_divider_ratio, effective_band_height,
+};
 use crate::session_view::SolutionSessionView;
 use crate::store::{SolutionAgentStore, SolutionAgentStoreEvent};
 
@@ -69,10 +79,21 @@ use crate::store::{SolutionAgentStore, SolutionAgentStoreEvent};
 #[derive(Debug, Clone)]
 struct DraggedBandDivider;
 
+/// Drag payload for the band's top-edge resize handle. Carries nothing, same
+/// as `DraggedBandDivider` — the height comes from `DragMoveEvent::bounds`
+/// (the band root's hitbox) and the cursor's `event.position`.
+#[derive(Debug, Clone)]
+struct DraggedBandEdge;
+
 /// Half-width of the divider's grab area, in logical pixels either side of
 /// the 1px line it paints. Widening the hitbox without widening the paint is
 /// what makes a hairline divider actually draggable.
 const DIVIDER_HIT_SLOP: f32 = 3.;
+
+/// Half-height of the top-edge handle's grab area, in logical pixels either
+/// side of the band's top edge. The edge paints no line of its own (module
+/// doc / band's own row boundary), so this only widens the hitbox.
+const BAND_EDGE_HIT_SLOP: f32 = 3.;
 
 pub struct SolutionBand {
     workspace: WeakEntity<Workspace>,
@@ -230,6 +251,50 @@ impl SolutionBand {
         self.set_divider_ratio(solution_id, ratio, cx);
     }
 
+    /// Move the band's top edge. `solution_id` is passed in for the same
+    /// reason as `set_divider_ratio`: the render pass that installed this
+    /// callback already resolved it for the same frame.
+    fn set_band_height(
+        &mut self,
+        solution_id: Option<SolutionId>,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) {
+        match solution_id {
+            Some(solution_id) => SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_band_height(solution_id, height, cx);
+            }),
+            None => {
+                let height = clamp_band_height(height);
+                if self.local_state.height == height {
+                    return;
+                }
+                self.local_state.height = height;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Track the top edge under the cursor for the whole drag. Committed
+    /// continuously here rather than on drop for the same reason as
+    /// `on_divider_drag_move`: the handle sets `block_mouse_except_scroll`
+    /// under `deferred()`, which truncates the hover stack so no ancestor's
+    /// `on_drop` ever fires (FORK.md #84). Do not "fix" this back to
+    /// `on_drop`.
+    fn on_edge_drag_move(
+        &mut self,
+        solution_id: Option<SolutionId>,
+        event: &DragMoveEvent<DraggedBandEdge>,
+        cx: &mut Context<Self>,
+    ) {
+        // `event.bounds` is the band root's hitbox from the last paint. Its
+        // BOTTOM edge is what's anchored (the status bar sits directly under
+        // it), so the dragged height is measured from there up to the cursor
+        // — measuring from the top edge would chase the value being changed.
+        let height = event.bounds.bottom() - event.event.position.y;
+        self.set_band_height(solution_id, f32::from(height), cx);
+    }
+
     /// Walk the project's worktrees for the Solution that owns them. Mirrors
     /// `solutions_ui::project_tab_strip::solution_id_for_workspace` and
     /// `session_tab_strip::SessionTabStrip::active_solution_id` — duplicated
@@ -255,6 +320,14 @@ impl SolutionBand {
     #[cfg(test)]
     fn active_view(&self, cx: &App) -> Option<SolutionSessionId> {
         self.band_state(cx).active_dialog_session
+    }
+
+    /// Test-only mirror of the height `render` would use, without needing a
+    /// live `Window` to drive a draw. See `active_view`'s doc for why this
+    /// re-resolves fresh from the store rather than caching.
+    #[cfg(test)]
+    fn band_height(&self, cx: &App) -> f32 {
+        self.band_state(cx).height
     }
 
     /// The 1px rule between the halves plus its oversized grab handle.
@@ -292,6 +365,36 @@ impl SolutionBand {
                     }))
                     .on_drag(DraggedBandDivider, |_, _, _, cx| cx.new(|_| gpui::Empty)),
             ))
+    }
+
+    /// The band's top-edge grab handle. Modelled on `render_divider`'s
+    /// deferred grab area, but horizontal and along the band root's top
+    /// edge rather than between the two halves. Paints no visible line of
+    /// its own — see the module doc's note on this and the brief's caveat
+    /// about verifying the edge is discoverable.
+    fn render_top_edge_handle(
+        &self,
+        solution_id: Option<SolutionId>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        deferred(
+            div()
+                .id("solution-band-edge-handle")
+                .absolute()
+                .top(px(-BAND_EDGE_HIT_SLOP))
+                .left_0()
+                .right_0()
+                .h(px(BAND_EDGE_HIT_SLOP * 2.))
+                .cursor_row_resize()
+                .block_mouse_except_scroll()
+                .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                    if event.click_count() >= 2 {
+                        this.set_band_height(solution_id, DEFAULT_BAND_HEIGHT, cx);
+                    }
+                    cx.stop_propagation();
+                }))
+                .on_drag(DraggedBandEdge, |_, _, _, cx| cx.new(|_| gpui::Empty)),
+        )
     }
 }
 
@@ -344,9 +447,14 @@ impl Render for SolutionBand {
             .child(content)
         };
 
+        let height = effective_band_height(state.height, f32::from(window.viewport_size().height));
+
         h_flex()
             .id("solution-band")
+            .relative()
             .w_full()
+            .h(px(height))
+            .flex_none()
             // `h_flex` centres its children; the halves and the divider must
             // instead fill the band's height.
             .items_stretch()
@@ -355,6 +463,12 @@ impl Render for SolutionBand {
                     this.on_divider_drag_move(solution_id, event, cx);
                 },
             ))
+            .on_drag_move::<DraggedBandEdge>(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedBandEdge>, _window, cx| {
+                    this.on_edge_drag_move(solution_id, event, cx);
+                },
+            ))
+            .child(self.render_top_edge_handle(solution_id, cx))
             .children(dialog.map(|view| half(view.into(), state.divider_ratio)))
             .children(split.then(|| self.render_divider(solution_id, cx).into_any_element()))
             .children(utility_panel.map(|panel| half(panel, 1.0 - state.divider_ratio)))
@@ -849,6 +963,138 @@ mod tests {
         store.read_with(cx, |store, _| {
             assert_eq!(store.band_state(SolutionId(3)), BandState::default());
         });
+    }
+
+    /// The band's own view of its height, for a Solution window, comes from
+    /// the store rather than `local_state` — mirrors how `active_view` reads
+    /// through `band_state` rather than a cached field.
+    #[gpui::test]
+    async fn band_height_for_a_solution_window_comes_from_the_store(cx: &mut TestAppContext) {
+        let (solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        cx.update(|_window, cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_band_height(solution_id, 777.0, cx);
+            });
+        });
+
+        assert_eq!(
+            band.read_with(cx, |band, cx| band.band_height(cx)),
+            777.0,
+            "the band's view of its height comes from the store, not local_state"
+        );
+    }
+
+    /// A plain-folder window that resolves to no Solution is a supported
+    /// case (module doc) — its height must round-trip through `local_state`
+    /// and never reach the DB. Mirrors console_panel's
+    /// `toggle_focus_works_in_a_workspace_with_no_solution` regression, one
+    /// crate over, for `utility_visible`.
+    #[gpui::test]
+    async fn band_height_round_trips_through_local_state_for_a_window_with_no_solution(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, db, _tmp) = store_with_persistence(cx).await;
+        let solution_id = SolutionId(1);
+
+        let plain_dir = tempfile::tempdir().expect("plain-folder tempdir");
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(plain_dir.path(), serde_json::json!({ ".keep": "" }))
+            .await;
+        let project = project::Project::test(fs, [plain_dir.path()], cx).await;
+
+        cx.update(|cx| theme_settings::init(theme::LoadThemes::JustBase, cx));
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        band.update(cx, |band, cx| {
+            assert_eq!(
+                band.solution_id(cx),
+                None,
+                "the plain-folder worktree must not resolve to the Solution \
+                 `store_with_persistence` set up"
+            );
+            band.set_band_height(None, 500.0, cx);
+        });
+        assert_eq!(
+            band.read_with(cx, |band, cx| band.band_height(cx)),
+            500.0,
+            "the height lands in the window-local fallback"
+        );
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            persisted(&db, solution_id).await,
+            None,
+            "a window with no Solution must never write the band_state row — \
+             set_band_height(None, ..) stays entirely in local_state"
+        );
+    }
+
+    /// Double-lease guard for the new setter, in the shape of
+    /// `console_panel`'s `toggle_focus_action_does_not_double_lease_the_workspace`:
+    /// call `set_band_height` while a `&mut Workspace` borrow is live (the
+    /// shape a real drag callback runs under once GPUI's dispatch reaches
+    /// through an action handler), proving it never resolves
+    /// `self.workspace.upgrade()?.read(cx)` the way `utility_panel` does.
+    #[gpui::test]
+    async fn set_band_height_does_not_double_lease_the_workspace(cx: &mut TestAppContext) {
+        let (solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        // `workspace.update`'s closure leases the root view (`Workspace`)
+        // exactly the way real action dispatch does; calling into the band
+        // from inside it is what would panic if `set_band_height` ever
+        // upgraded and read `self.workspace`.
+        workspace.update(cx, |_workspace, cx| {
+            band.update(cx, |band, cx| {
+                band.set_band_height(Some(solution_id), 900.0, cx);
+            });
+        });
+
+        assert_eq!(
+            band.read_with(cx, |band, cx| band.band_height(cx)),
+            900.0,
+            "the height landed even though the setter ran under a live \
+             &mut Workspace borrow"
+        );
     }
 
     #[gpui::test]
