@@ -120,7 +120,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/terminal_view/src/terminal_panel.rs` | Dropped the now-unused `TerminalDockPosition` import (a local edit had removed its only use, leaving a dead import that failed `clippy -D warnings`). | upstream-fix |
 | `crates/ui/src/components/scrollbar.rs`, `crates/gpui/src/elements/div.rs` | **(decision #82)** `track_anchor` / `tracks_scroll_handle` + `nested_in_scroll_container`; gpui gains `Interactivity::tracked_scroll_handle()` and `PartialEq` for `ScrollHandle`. | `ui` / `gpui` |
 | `crates/git_ui/src/rollback_modal.rs` | **New.** IDEA's Rollback Changes dialog: checkbox tree over the affected files (reusing the git panel's `TreeViewState::build_tree_entries`), "N modified" summary, "Delete local copies of added files", Rollback / Close. Only checked files are rolled back. | `git_ui` |
-| `crates/workspace/src/mcp/windows.rs` | `windows.click_at` gained a `clicks` parameter — two separate calls are not a double click, so a handler branching on `click_count()` was untestable. | `workspace` |
+| `crates/workspace/src/mcp/windows.rs` | `windows.click_at` gained a `clicks` parameter — two separate calls are not a double click, so a handler branching on `click_count()` was untestable. Also `windows.resize` (content size in logical pixels): the headless window is fixed at 1920x1080, which hid the Solution band's status-bar overflow from every agent-driven check. It calls `Window::bounds_changed` after `Window::resize` because the headless platform window mutates its bounds without firing the resize callback. | `workspace` |
+| `crates/workspace/src/status_bar.rs` | `flex_none` on the 30px row — it silently absorbed the workspace column's overflow (default `flex-shrink: 1`) and an over-tall Solution band ate it. | `workspace` |
 | `crates/editor/src/split_connectors.rs` | Connector ribbons for the side-by-side diff. **(decision #62)** `ribbon_edges` gives a collapsed insertion edge the insertion rule's real 2px extent so the ribbon and the rule join flush. | `editor` |
 | `crates/editor/src/split.rs` | **(decision #79)** The left pane mirrors the right pane's `show_headers()` instead of guessing from `is_singleton()`. | `editor` |
 | `crates/git_ui/src/solo_diff_view.rs`, `crates/git_ui/src/project_diff.rs`, `crates/git_ui/src/commit_view.rs` | **(decision #78)** Diff toolbars lost every staging/commit button and gained the `N difference(s)` count (`difference_count_label` + `HunkCountCache`). | `git_ui` |
@@ -1251,6 +1252,20 @@ WM, projector, split screen) would permanently destroy the user's saved geometry
 takes the stored value and the viewport and returns what to paint; `model::clamp_band_height` is the only thing
 that touches what gets stored. Verified live at 1920x1080: stored 990 painted 864 (= 0.8 x 1080) with the status
 bar intact, and the row still read 990 afterwards.
+
+**The cap alone does NOT keep the status bar on screen — the layout invariant does.** No pure function of
+(stored, viewport) can, because it cannot know the project zone's *content* minimum. The workspace column in
+`Workspace::render` (the `flex_col` holding `#workspace`, the band and the status bar) has visible overflow, so
+taffy floors it at its own min-content: the project zone's docks, tab bars and toolbars (~120px measured) on top
+of the band's fixed height. On a short window that floor exceeds the window, the column overflows *downward*, and
+the last row in it — the status bar — leaves the screen entirely. Three things hold the invariant together, and
+removing any one of them re-breaks it: `min_h_0` on that column (kills the floor; the deficit lands on the
+project zone, which clips, since `#workspace` is `overflow_hidden`), `flex_none` on the status bar (it is a fixed
+30px row and must never be the thing that yields — it used to shrink silently, a few pixels at a time), and a
+*shrinkable* band with `min_h_0` (the last-resort yielder, for windows so short that even the chrome does not
+fit). Measured before/after at 1280x384 with the `windows.resize` MCP tool: before, band 307 (= 0.8 x 384),
+project zone 47, status bar **0 visible pixels**; after, band 234, project zone 59, status bar a full 30 — and
+30 at every height from 200 to 1080.
 
 **The top-edge handle commits from `on_drag_move`, not `on_drop`.** The handle is `deferred()` +
 `block_mouse_except_scroll()`, which truncates the hover stack so no ancestor's `on_drop` ever fires — the same
