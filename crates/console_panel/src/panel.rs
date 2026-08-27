@@ -76,7 +76,7 @@ pub fn console_panel_for_workspace(workspace: &Workspace) -> Option<Entity<Conso
 /// only `utility_visible` would pop the band open on whatever was last
 /// shown — for a `RevealStrategy::Always` task that means focusing a
 /// terminal the user cannot see.
-pub fn reveal_utility_section(workspace: &Workspace, kind: UtilityKind, cx: &mut App) {
+fn reveal_utility_section(workspace: &Workspace, kind: UtilityKind, cx: &mut App) {
     let Some(band) = workspace
         .solution_band_item()
         .and_then(|item| item.downcast::<SolutionBand>().ok())

@@ -1474,6 +1474,13 @@ pub struct Workspace {
     /// assistant) downcasts the `AnyView` for `UtilityKind::Terminal` —
     /// mirrors `run_config_controller`'s `AnyEntity` downcast below.
     solution_band_utility_item: HashMap<UtilityKind, AnyView>,
+    /// Kinds whose install was attempted and *failed*. `zed.rs` loads the
+    /// three occupants concurrently (`futures::join!`), so "not in
+    /// `solution_band_utility_item`" is ambiguous between "still loading" and
+    /// "gave up": the band would otherwise tell the user a kind failed to
+    /// load during the window in which its sibling had merely resolved first.
+    /// Only a resolved failure lands here, so it is an unambiguous answer.
+    solution_band_utility_unavailable: HashSet<UtilityKind>,
     run_config_strip: Option<AnyView>,
     run_config_controller: Option<AnyEntity>,
     notifications: Notifications,
@@ -1946,6 +1953,7 @@ impl Workspace {
             project_toolbar_item: None,
             solution_band_item: None,
             solution_band_utility_item: HashMap::default(),
+            solution_band_utility_unavailable: HashSet::default(),
             run_config_strip: None,
             run_config_controller: None,
             notifications: Notifications::default(),
@@ -3230,6 +3238,20 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.solution_band_utility_item.insert(kind, item);
+        self.solution_band_utility_unavailable.remove(&kind);
+        cx.notify();
+    }
+
+    /// Record that `kind`'s occupant will never arrive in this window (its
+    /// load task resolved with an error). Called from the same installer that
+    /// calls `set_solution_band_utility_item`; see the field's doc for why the
+    /// band cannot infer this from the map's absence alone.
+    pub fn mark_solution_band_utility_unavailable(
+        &mut self,
+        kind: UtilityKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.solution_band_utility_unavailable.insert(kind);
         cx.notify();
     }
 
@@ -3408,6 +3430,10 @@ impl Workspace {
 
     pub fn solution_band_utility_item(&self, kind: UtilityKind) -> Option<AnyView> {
         self.solution_band_utility_item.get(&kind).cloned()
+    }
+
+    pub fn solution_band_utility_unavailable(&self, kind: UtilityKind) -> bool {
+        self.solution_band_utility_unavailable.contains(&kind)
     }
 
     /// Call the given callback with a workspace whose project is local or remote via WSL (allowing host access).
@@ -11531,6 +11557,57 @@ mod tests {
                     .is_none(),
                 "an unset kind still reads None even once other kinds are populated"
             );
+        });
+
+    }
+
+    /// The "unavailable" flag the band's placeholder is gated on (phase 2b
+    /// task 6). It must be **per kind** and must mean *resolved failure*, not
+    /// *not yet arrived*: `zed.rs` loads the three occupants concurrently, so
+    /// a band that inferred failure from an empty slot would tell the user a
+    /// kind failed to load during the interval in which a sibling had merely
+    /// resolved first.
+    #[gpui::test]
+    async fn solution_band_utility_unavailable_is_per_kind_and_means_resolved_failure(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, _window, _cx| {
+            for kind in UtilityKind::ALL {
+                assert!(
+                    !workspace.solution_band_utility_unavailable(kind),
+                    "a kind whose load task has not resolved yet is NOT unavailable \
+                     — this is the whole point of the flag ({kind:?})"
+                );
+            }
+        });
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.mark_solution_band_utility_unavailable(UtilityKind::GitGraph, cx);
+            assert!(workspace.solution_band_utility_unavailable(UtilityKind::GitGraph));
+            assert!(
+                !workspace.solution_band_utility_unavailable(UtilityKind::Terminal),
+                "one kind's failure must not indict its siblings"
+            );
+            assert!(!workspace.solution_band_utility_unavailable(UtilityKind::Debug));
+        });
+
+        // A later successful install clears it, so a retry/reinstall path can
+        // never leave a live occupant flagged as broken.
+        let probe = cx.new(|_| BandProbe);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_solution_band_utility_item(
+                UtilityKind::GitGraph,
+                probe.clone().into(),
+                window,
+                cx,
+            );
+            assert!(!workspace.solution_band_utility_unavailable(UtilityKind::GitGraph));
         });
     }
 

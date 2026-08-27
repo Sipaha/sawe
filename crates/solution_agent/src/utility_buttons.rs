@@ -60,6 +60,12 @@ pub fn toggle_action_name(kind: UtilityKind) -> Option<&'static str> {
 
 fn icon(kind: UtilityKind) -> IconName {
     match kind {
+        // Deliberately NOT `IconName::Console`, which is what the old
+        // `ConsolePanel::icon()` returned — `console.svg` was the icon of the
+        // merged Terminal + AI-chat panel, and the chat half moved out to the
+        // band's dialog side in phase 2a. The occupant is terminal-only now
+        // and the button is labelled "Terminal", so `terminal.svg` is the
+        // honest glyph. `GitGraph` and `Debug` do reuse their old dock icons.
         UtilityKind::Terminal => IconName::Terminal,
         UtilityKind::GitGraph => IconName::GitGraph,
         UtilityKind::Debug => IconName::Debug,
@@ -91,7 +97,7 @@ impl UtilityButtons {
     }
 
     fn render_button(&self, kind: UtilityKind, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.band.read(cx).band_state_snapshot(cx);
+        let state = self.band.read(cx).band_state(cx);
         let selected = utility_button_selected(kind, &state);
         let label = kind.label();
         let action_name = toggle_action_name(kind);
@@ -109,7 +115,23 @@ impl UtilityButtons {
                 } else {
                     format!("Show {label}")
                 };
-                match action_name.and_then(|name| cx.build_action(name, None).ok()) {
+                // A build failure here means the action's crate did not
+                // register it (a rename, or an `init` that never ran). Log it
+                // and fall back to a keybinding-less tooltip rather than
+                // losing the whole tooltip: a button whose hotkey hint is
+                // missing is still a working button. Renames are caught at
+                // test time by the two `toggle_focus_action_matches_the_\
+                // utility_button_tooltip_lookup` pins in `console_panel` and
+                // `debugger_ui`, which is why this is a log and not an error
+                // surfaced to the user.
+                let action = action_name.and_then(|name| match cx.build_action(name, None) {
+                    Ok(action) => Some(action),
+                    Err(err) => {
+                        log::error!("utility_buttons: {name} unavailable for tooltip: {err}");
+                        None
+                    }
+                });
+                match action {
                     Some(action) => Tooltip::for_action(title, action.as_ref(), cx),
                     None => Tooltip::text(title)(window, cx),
                 }

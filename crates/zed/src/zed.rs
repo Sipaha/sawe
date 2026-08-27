@@ -651,10 +651,16 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         });
         workspace.set_solution_band_item(solution_band.into(), window, cx);
         workspace.status_bar().update(cx, |status_bar, cx| {
-            status_bar.add_left_item(session_tab_strip, window, cx);
-            // Mirrors the band's own layout: dialog tabs on the left, the
-            // utility picker to their right.
+            // Ahead of the session tab strip on purpose, even though the band
+            // paints the dialog half left of the utility half. The left group
+            // is `min_w_0().overflow_x_hidden()` (`status_bar.rs`), so on a
+            // narrow window whatever sits last gets clipped: the tab strip is
+            // variable-width and already absorbs a squeeze through its
+            // overflow popover, while these three fixed icons are the ONLY
+            // way to reach the git graph (it has no keybinding). Clipping has
+            // to land on the surface that can handle it.
             status_bar.add_left_item(utility_buttons, window, cx);
+            status_bar.add_left_item(session_tab_strip, window, cx);
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
@@ -852,22 +858,22 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             workspace_handle: WeakEntity<Workspace>,
             mut cx: gpui::AsyncWindowContext,
         ) {
-            if let Some(item) = item_task
+            // Record the failure as well as the success: these three load
+            // concurrently, so the band cannot tell "still loading" from
+            // "gave up" by absence alone, and it must not claim a kind is
+            // unavailable while a sibling has merely resolved first.
+            let item = item_task
                 .await
                 .context("failed to load solution band utility item")
-                .log_err()
-            {
-                workspace_handle
-                    .update_in(&mut cx, |workspace, window, cx| {
-                        workspace.set_solution_band_utility_item(
-                            kind,
-                            item.into(),
-                            window,
-                            cx,
-                        );
-                    })
-                    .log_err();
-            }
+                .log_err();
+            workspace_handle
+                .update_in(&mut cx, |workspace, window, cx| match item {
+                    Some(item) => {
+                        workspace.set_solution_band_utility_item(kind, item.into(), window, cx)
+                    }
+                    None => workspace.mark_solution_band_utility_unavailable(kind, cx),
+                })
+                .log_err();
         }
 
         futures::join!(

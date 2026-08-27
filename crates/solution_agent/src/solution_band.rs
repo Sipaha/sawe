@@ -202,32 +202,28 @@ impl SolutionBand {
             .solution_band_utility_item(kind)
     }
 
-    /// Has `zed.rs` installed *any* utility occupant yet? Distinguishes
-    /// "still starting up" from "this kind genuinely failed to load" — see
-    /// `render`. Reads the Workspace entity, so this is `render`-only.
-    fn any_utility_panel_registered(&self, cx: &App) -> bool {
-        UtilityKind::ALL
-            .iter()
-            .any(|kind| self.utility_panel(*kind, cx).is_some())
+    /// Did `kind`'s occupant resolve with an error, as opposed to simply not
+    /// having landed yet? The three load concurrently, so absence from the
+    /// slot map alone cannot answer this — see `render` and
+    /// `Workspace::solution_band_utility_unavailable`. Reads the Workspace
+    /// entity, so this is `render`-only.
+    fn utility_panel_unavailable(&self, kind: UtilityKind, cx: &App) -> bool {
+        self.workspace
+            .upgrade()
+            .is_some_and(|workspace| workspace.read(cx).solution_band_utility_unavailable(kind))
     }
 
     /// This band's geometry: the owning Solution's persisted row, or the
-    /// window-local fallback when there is no Solution.
-    fn band_state(&self, cx: &App) -> BandState {
+    /// window-local fallback when there is no Solution. Reads the Project
+    /// entity (never the Workspace), so it is safe under a live
+    /// `&mut Workspace` borrow — see the module doc.
+    pub fn band_state(&self, cx: &App) -> BandState {
         match self.solution_id(cx) {
             Some(solution_id) => SolutionAgentStore::global(cx)
                 .read(cx)
                 .band_state(solution_id),
             None => self.local_state,
         }
-    }
-
-    /// The whole `BandState` in one read, for callers that need more than
-    /// one field of it and would otherwise resolve the Solution once per
-    /// getter. Reads the Project entity (never the Workspace), so it is safe
-    /// under a live `&mut Workspace` borrow — see the module doc.
-    pub fn band_state_snapshot(&self, cx: &App) -> BandState {
-        self.band_state(cx)
     }
 
     /// Whether the utility section is currently shown, regardless of dialog
@@ -523,12 +519,12 @@ impl Render for SolutionBand {
         let utility_panel = if state.utility_visible {
             match self.utility_panel(state.utility_kind, cx) {
                 Some(view) => Some(view.into_any_element()),
-                // Nothing registered *at all* means `initialize_panels` has
-                // not finished yet — every window open would otherwise flash
-                // the placeholder before the occupants land. Stay silent for
-                // that frame; once any kind is installed, a missing one is a
-                // real failure worth showing.
-                None if self.any_utility_panel_registered(cx) => {
+                // Only once the install has actually FAILED. The three
+                // occupants load concurrently, so "not in the slot map" alone
+                // would make every window open flash "…is unavailable" for
+                // whichever kind happened to resolve last — a false statement
+                // shown to the user, not merely an ugly one.
+                None if self.utility_panel_unavailable(state.utility_kind, cx) => {
                     Some(render_missing_occupant(state.utility_kind))
                 }
                 None => None,
@@ -1343,7 +1339,7 @@ mod tests {
         });
 
         band.read_with(cx, |band, cx| {
-            let state = band.band_state_snapshot(cx);
+            let state = band.band_state(cx);
             assert!(
                 !state.utility_visible,
                 "the default band starts with the section hidden"
@@ -1368,7 +1364,7 @@ mod tests {
             band.activate_utility_kind(UtilityKind::Debug, cx)
         });
         band.read_with(cx, |band, cx| {
-            let state = band.band_state_snapshot(cx);
+            let state = band.band_state(cx);
             assert_eq!(state.utility_kind, UtilityKind::Debug);
             assert!(state.utility_visible);
             assert!(!utility_button_selected(UtilityKind::GitGraph, &state));
@@ -1510,6 +1506,55 @@ mod tests {
             "the height landed even though the setter ran under a live \
              &mut Workspace borrow"
         );
+    }
+
+    /// The band's placeholder gate. A kind whose occupant has simply not
+    /// landed yet must NOT read as unavailable — `zed.rs` loads the three
+    /// concurrently, so inferring failure from an empty slot would paint
+    /// "…is unavailable" over a kind that was still loading.
+    #[gpui::test]
+    async fn a_kind_reads_unavailable_only_once_its_install_has_failed(cx: &mut TestAppContext) {
+        let (_solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        band.read_with(cx, |band, cx| {
+            for kind in UtilityKind::ALL {
+                assert!(
+                    band.utility_panel(kind, cx).is_none(),
+                    "precondition: nothing is installed in this test workspace"
+                );
+                assert!(
+                    !band.utility_panel_unavailable(kind, cx),
+                    "…and an uninstalled kind is still not *unavailable* ({kind:?})"
+                );
+            }
+        });
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.mark_solution_band_utility_unavailable(UtilityKind::GitGraph, cx);
+        });
+
+        band.read_with(cx, |band, cx| {
+            assert!(band.utility_panel_unavailable(UtilityKind::GitGraph, cx));
+            assert!(
+                !band.utility_panel_unavailable(UtilityKind::Terminal, cx),
+                "a sibling's failure must not make the terminal render as broken"
+            );
+        });
     }
 
     /// Same guard for the button group's entry point. A status item's click

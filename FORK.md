@@ -1286,6 +1286,49 @@ unambiguous: the project zone's own 1px `border` row sits directly above the ban
 with a tonal step from the pane background to the band background beneath it. Adding a second rule there would
 have been a double border.
 
+### 95. The band's utility content is picked from a status-bar button group, which never moves focus and never falls back to a kind that loaded
+
+Phase 2b gave the band's utility section three possible occupants (terminal, git graph, debugger) keyed by
+`workspace::UtilityKind`, but de-docking the git graph and the debugger deleted their dock buttons and gave the
+git graph *no* way in at all — it has no keybinding either. `solution_agent::utility_buttons::UtilityButtons`
+is the replacement affordance: three `IconButton`s in the status bar's left group.
+
+**It drives `SolutionBand`, not `SolutionAgentStore`.** The store only knows Solutions; a plain-folder window
+resolves to none and falls back to `SolutionBand::local_state`, so buttons wired to the store would be inert in
+exactly that window (`ctrl-\`` works there today). Going through the band also keeps the click handler off the
+`Workspace` entity — the band resolves its Solution off `Entity<Project>` precisely so its mutators are safe
+under a live `&mut Workspace` borrow, which a status item's click handler must be assumed to run under
+(decision 92). It lives in `solution_agent` because that is the only crate that owns the band and depends on
+none of its occupants (`workspace` must not depend on them; all three already depend on `solution_agent`), so
+the tooltips' keybindings are resolved by *action name* via `cx.build_action` — pinned by a test in each
+occupant's own crate, since a rename would otherwise only cost a silently missing hotkey hint.
+
+**Buttons and hotkeys agree on "the active content" but not on what a click does.** Active content is
+`utility_kind` while `utility_visible`, for both. `ctrl-\`` / `ctrl-shift-d` stay tri-state (show+focus /
+focus / hide) and are the only focus path; a button is a two-state content switch that never moves focus.
+The single cell where they diverge is *visible && kind == mine && unfocused*: the hotkey focuses, the button
+hides. That is deliberate — a mouse click on a status bar should not steal focus out of the editor, and a
+button that did nothing visible when clicked would read as broken.
+
+**Order in the status bar is buttons-then-tab-strip, inverting the band's own left-to-right layout.** The left
+group is `min_w_0().overflow_x_hidden()`, so on a narrow window whatever sits last is clipped. The session tab
+strip is variable-width and already absorbs a squeeze through its overflow popover; these three fixed icons are
+the only route to the git graph. Clipping has to land on the surface that can handle it.
+
+**A selected kind whose occupant failed to load renders a placeholder — it never falls back to a kind that
+did.** A fallback would silently rewrite the user's persisted `utility_kind` and desynchronise the button group
+from it, turning a load failure into a permanent, invisible preference change. The placeholder is gated on
+`Workspace::solution_band_utility_unavailable(kind)`, a per-kind flag set only when the load task *resolves
+with an error* — not on the slot simply being empty. `zed.rs` loads the three concurrently (`futures::join!`),
+so absence is ambiguous between "still loading" and "gave up", and the weaker gate would tell the user a kind
+had failed during the interval in which a sibling had merely resolved first.
+
+**Icon note:** the Terminal button uses `IconName::Terminal`, NOT the `IconName::Console` that
+`ConsolePanel::icon()` returned before it was de-docked. `console.svg` was the icon of the merged
+Terminal + AI-chat panel; the chat half moved to the band's dialog side in phase 2a, so the occupant is
+terminal-only now and the button is labelled "Terminal". `GitGraph` and `Debug` do reuse their old dock icons,
+so the affordance those two users learned survives verbatim.
+
 
 ## Where specs and plans live
 
