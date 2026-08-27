@@ -77,9 +77,9 @@ DB column: `band_height REAL NOT NULL DEFAULT 320` on `solution_band_state`.
 - Produces: `BandState.height: f32`; `model::{MIN_BAND_HEIGHT, DEFAULT_BAND_HEIGHT, MAX_BAND_HEIGHT, MAX_BAND_HEIGHT_FRACTION, clamp_band_height, effective_band_height}`; `SolutionAgentStore::set_band_height(&mut self, solution_id: SolutionId, height: f32, cx: &mut Context<Self>)`.
 - Consumed by: Task 2 (`SolutionBand`).
 
-- [ ] **Step 1: Read the precedent.** `divider_ratio` end to end — `model.rs` (`clamp_divider_ratio`, `BandState`, `Default`), `db.rs` (the table), `db/band.rs` (upsert + select), `store.rs` (`set_band_divider_ratio`, `BandStateTouched`, `persist_band_state_debounced`). Your field is the same shape at every one of those sites. Deviating from that shape needs a reason in the report.
+- [x] **Step 1: Read the precedent.** `divider_ratio` end to end — `model.rs` (`clamp_divider_ratio`, `BandState`, `Default`), `db.rs` (the table), `db/band.rs` (upsert + select), `store.rs` (`set_band_divider_ratio`, `BandStateTouched`, `persist_band_state_debounced`). Your field is the same shape at every one of those sites. Deviating from that shape needs a reason in the report.
 
-- [ ] **Step 2: `model.rs`.** Add the four constants above with their doc comments verbatim. Add:
+- [x] **Step 2: `model.rs`.** Add the four constants above with their doc comments verbatim. Add:
 
 ```rust
 /// Clamp a stored band height into the range a row may hold. Mirrors
@@ -106,11 +106,11 @@ pub fn effective_band_height(stored: f32, viewport_height: f32) -> f32 {
 
 Add `height: f32` to `BandState` and `height: DEFAULT_BAND_HEIGHT` to its `Default`. Extend the `BandState` doc comment with one sentence on what the height is and that its window-relative cap lives at render.
 
-- [ ] **Step 3: The schema.** Add `band_height REAL NOT NULL DEFAULT 320` to the `CREATE TABLE IF NOT EXISTS solution_band_state` statement, **and** call the existing `apply_idempotent_add_column_to(&connection, "solution_band_state", "band_height REAL NOT NULL DEFAULT 320")` right after it — the table already exists on every install that has run phase 2a, so `CREATE TABLE IF NOT EXISTS` alone would never add the column. Comment *why* both are needed. Follow whatever ordering the surrounding migration code uses for its other `apply_idempotent_add_column*` calls.
+- [x] **Step 3: The schema.** Add `band_height REAL NOT NULL DEFAULT 320` to the `CREATE TABLE IF NOT EXISTS solution_band_state` statement, **and** call the existing `apply_idempotent_add_column_to(&connection, "solution_band_state", "band_height REAL NOT NULL DEFAULT 320")` right after it — the table already exists on every install that has run phase 2a, so `CREATE TABLE IF NOT EXISTS` alone would never add the column. Comment *why* both are needed. Follow whatever ordering the surrounding migration code uses for its other `apply_idempotent_add_column*` calls.
 
-- [ ] **Step 4: `db/band.rs`.** Widen the bound tuple in `upsert_band_state` and the selected tuple in `select_band_states` to carry `band_height`, passing it through `clamp_band_height` on the way in *and* on the way out (`select_band_states` already clamps `divider_ratio` on read for the hand-edited-row case).
+- [x] **Step 4: `db/band.rs`.** Widen the bound tuple in `upsert_band_state` and the selected tuple in `select_band_states` to carry `band_height`, passing it through `clamp_band_height` on the way in *and* on the way out (`select_band_states` already clamps `divider_ratio` on read for the hand-edited-row case).
 
-- [ ] **Step 5: `store.rs`.** Add `height: bool` to `BandStateTouched` and its arm to `overlay`. Add:
+- [x] **Step 5: `store.rs`.** Add `height: bool` to `BandStateTouched` and its arm to `overlay`. Add:
 
 ```rust
 /// Set the Solution band's height. The in-memory value lands synchronously
@@ -123,7 +123,7 @@ pub fn set_band_height(&mut self, solution_id: SolutionId, height: f32, cx: &mut
 
 Body mirrors `set_band_divider_ratio` exactly: clamp via `clamp_band_height`, no-op check read through `band_state(solution_id)` (not `entry().or_default()` — see the comment there), write through `entry().or_default()`, set the touched bit when `!self.band_states_hydrated`, `persist_band_state_debounced`, emit `BandStateChanged`, `cx.notify()`.
 
-- [ ] **Step 6: Tests.** Write these before or alongside the code; all must fail against the unmodified tree for the right reason.
+- [x] **Step 6: Tests.** Write these before or alongside the code; all must fail against the unmodified tree for the right reason.
 
 1. `clamp_band_height` folds NaN to `DEFAULT_BAND_HEIGHT` and clamps both ends (mirror `divider_ratio_is_clamped_to_a_usable_range`).
 2. `effective_band_height` caps against a small viewport (`effective_band_height(600.0, 400.0) == 320.0`), returns the stored value under a large one, and never returns less than `MIN_BAND_HEIGHT` even when the viewport is absurdly short (`effective_band_height(300.0, 10.0) == MIN_BAND_HEIGHT`).
@@ -132,7 +132,7 @@ Body mirrors `set_band_divider_ratio` exactly: clamp via `clamp_band_height`, no
 5. Pre-hydration touched-mask: with a persisted row holding a non-default height *and* a non-default ratio, call `set_band_height` before `set_persistence`'s load lands, then let it land — the height is the live value and the ratio is still the persisted one. (The existing band-hydration tests show the shape.)
 6. A DB written by phase 2a — a row with no `band_height` column value, i.e. one inserted before the migration — loads as `DEFAULT_BAND_HEIGHT`. Construct it by inserting through a raw connection or by asserting the column default; state in the report which you did and why.
 
-- [ ] **Step 7: Verify.** `set -o pipefail; cargo check -p solution_agent --all-targets` then `cargo test -p solution_agent`. Both must be clean. Commit as `solution_agent: Persist a per-Solution band height`.
+- [x] **Step 7: Verify.** `set -o pipefail; cargo check -p solution_agent --all-targets` then `cargo test -p solution_agent`. Both must be clean. Commit as `solution_agent: Persist a per-Solution band height`.
 
 ---
 
@@ -145,11 +145,11 @@ Body mirrors `set_band_divider_ratio` exactly: clamp via `clamp_band_height`, no
 - Consumes: everything Task 1 produced.
 - Produces: a band that paints at `effective_band_height(...)` and a top-edge drag handle.
 
-- [ ] **Step 1: Read.** `SolutionBand::render`, `render_divider`, `on_divider_drag_move`, `set_divider_ratio` — your additions are their horizontal twins. Then `crates/workspace/src/dock.rs:1131-1190` for the dock's handle, which is what this should feel like to the user.
+- [x] **Step 1: Read.** `SolutionBand::render`, `render_divider`, `on_divider_drag_move`, `set_divider_ratio` — your additions are their horizontal twins. Then `crates/workspace/src/dock.rs:1131-1190` for the dock's handle, which is what this should feel like to the user.
 
-- [ ] **Step 2: The setter.** Add `fn set_band_height(&mut self, solution_id: Option<SolutionId>, height: f32, cx: &mut Context<Self>)` alongside `set_divider_ratio`, with the same `Some` → store / `None` → `local_state` split and the same `clamp_band_height` on the local branch.
+- [x] **Step 2: The setter.** Add `fn set_band_height(&mut self, solution_id: Option<SolutionId>, height: f32, cx: &mut Context<Self>)` alongside `set_divider_ratio`, with the same `Some` → store / `None` → `local_state` split and the same `clamp_band_height` on the local branch.
 
-- [ ] **Step 3: The drag.** Add `struct DraggedBandEdge;` beside `DraggedBandDivider` and a second `on_drag_move::<DraggedBandEdge>` listener on the band root:
+- [x] **Step 3: The drag.** Add `struct DraggedBandEdge;` beside `DraggedBandDivider` and a second `on_drag_move::<DraggedBandEdge>` listener on the band root:
 
 ```rust
 fn on_edge_drag_move(
@@ -169,7 +169,7 @@ fn on_edge_drag_move(
 
 Both `on_drag_move` listeners coexist on the same element: each is filtered by its own drag payload type in the capture phase, so only one fires per drag.
 
-- [ ] **Step 4: The handle.** Add `render_top_edge_handle`, modelled on `render_divider`'s deferred grab area but horizontal:
+- [x] **Step 4: The handle.** Add `render_top_edge_handle`, modelled on `render_divider`'s deferred grab area but horizontal:
 
 - painted only when the band has content (i.e. not on the collapsed early-return path);
 - the band root needs `.relative()` for the absolute handle to anchor to it;
@@ -177,16 +177,16 @@ Both `on_drag_move` listeners coexist on the same element: each is filtered by i
 - double-click (`event.click_count() >= 2`) resets to `DEFAULT_BAND_HEIGHT` and `cx.stop_propagation()`, mirroring the divider's double-click reset;
 - unlike the divider, this handle paints **no** visible line of its own — the band already has the workspace's row boundary above it. If verification shows the edge is invisible and unguessable, say so in the report rather than inventing a border here.
 
-- [ ] **Step 5: The height.** In `render`, after the collapsed early-return, set the root's height to `effective_band_height(state.height, f32::from(window.viewport_size().height))` and mark it `flex_none()` so the workspace's column flex cannot shrink it. `window` is already a parameter of `render`. Do not clamp-and-store; do not `cx.notify()` from here.
+- [x] **Step 5: The height.** In `render`, after the collapsed early-return, set the root's height to `effective_band_height(state.height, f32::from(window.viewport_size().height))` and mark it `flex_none()` so the workspace's column flex cannot shrink it. `window` is already a parameter of `render`. Do not clamp-and-store; do not `cx.notify()` from here.
 
-- [ ] **Step 6: Tests.** In `solution_band.rs`'s `mod tests`:
+- [x] **Step 6: Tests.** In `solution_band.rs`'s `mod tests`:
 
 1. The band's height for a Solution window comes from the store: set a height through the store, and `SolutionBand`'s view of it (add a `#[cfg(test)]` accessor mirroring the existing `active_view` helper) reports it.
 2. A non-Solution window's height round-trips through `local_state` and writes **nothing** to the DB (mirror the existing plain-folder/non-Solution regression test for `utility_visible`).
 3. A double-lease guard for the new setter, in the shape of the existing `ctrl-\`` guard test — the new path must be safe to call while a `&mut Workspace` borrow is live.
 4. `effective_band_height` is what `render` would use: assert the clamped value directly rather than trying to measure a drawn element.
 
-- [ ] **Step 7: Verify.** `set -o pipefail; cargo check -p solution_agent --all-targets`, `cargo test -p solution_agent`. Commit as `solution_agent: Let the Solution band's top edge be dragged`.
+- [x] **Step 7: Verify.** `set -o pipefail; cargo check -p solution_agent --all-targets`, `cargo test -p solution_agent`. Commit as `solution_agent: Let the Solution band's top edge be dragged`.
 
 ---
 
@@ -197,18 +197,18 @@ Both `on_drag_move` listeners coexist on the same element: each is filtered by i
 - Modify: `docs/plans/2026-08-27-solution-band-height.md` (this file — mark the tasks done)
 - Modify: `docs/INDEX.md` if the plans table needs the new row
 
-- [ ] **Step 1: Build and launch your own editor.** `cargo build --bin sawe` first (mandatory — `script/run-mcp` only compiles a *missing* binary), then `script/run-mcp --debug --headless`. Drive its socket directly with newline-delimited JSON-RPC; `crates/editor_mcp/tests/solutions_add_member_e2e_test.rs::call_tool` has a 10-line client that filters the interleaved `editor/notification` frames. Solution-scoped tools (`workspace.*`, `project.*`) live on the **per-solution** socket, whose path comes back in `solutions.get`'s `mcp_socket`.
+- [x] **Step 1: Build and launch your own editor.** `cargo build --bin sawe` first (mandatory — `script/run-mcp` only compiles a *missing* binary), then `script/run-mcp --debug --headless`. Drive its socket directly with newline-delimited JSON-RPC; `crates/editor_mcp/tests/solutions_add_member_e2e_test.rs::call_tool` has a 10-line client that filters the interleaved `editor/notification` frames. Solution-scoped tools (`workspace.*`, `project.*`) live on the **per-solution** socket, whose path comes back in `solutions.get`'s `mcp_socket`.
 
-- [ ] **Step 2: Paint a real conversation.** `solution_agent.seed_cold_session` is a `#[cfg(debug_assertions)]` verification-only tool that paints an arbitrary render state without a live subprocess — use it to put enough entries in a session that the transcript is genuinely scrollable, select that session in the band, and screenshot. **The screenshot must show a conversation occupying most of the band**, not a status row and a compose box. Read the PNG back yourself.
+- [x] **Step 2: Paint a real conversation.** `solution_agent.seed_cold_session` is a `#[cfg(debug_assertions)]` verification-only tool that paints an arbitrary render state without a live subprocess — use it to put enough entries in a session that the transcript is genuinely scrollable, select that session in the band, and screenshot. **The screenshot must show a conversation occupying most of the band**, not a status row and a compose box. Read the PNG back yourself.
 
-- [ ] **Step 3: Exercise the drag.** `windows.drag_at {from_x, from_y, to_x, to_y}` on the band's top edge (`workspace.dump_visual_structure` / a screenshot gives you the coordinate). Screenshot before and after; the band must be visibly taller/shorter and the project zone correspondingly smaller/larger. Note that `windows.drag_at` rests the cursor on the start point first because GPUI only arms a drag from a MouseDown on an already-hovered hitbox.
+- [x] **Step 3: Exercise the drag.** `windows.drag_at {from_x, from_y, to_x, to_y}` on the band's top edge (`workspace.dump_visual_structure` / a screenshot gives you the coordinate). Screenshot before and after; the band must be visibly taller/shorter and the project zone correspondingly smaller/larger. Note that `windows.drag_at` rests the cursor on the start point first because GPUI only arms a drag from a MouseDown on an already-hovered hitbox.
 
-- [ ] **Step 4: Prove persistence across a restart.** Drag to a distinctly non-default height, wait past the 400ms debounce, quit the editor, relaunch it, reopen the same Solution, screenshot. The band comes back at the dragged height. If it does not, that is a real defect — report it, do not paper over it.
+- [x] **Step 4: Prove persistence across a restart.** Drag to a distinctly non-default height, wait past the 400ms debounce, quit the editor, relaunch it, reopen the same Solution, screenshot. The band comes back at the dragged height. If it does not, that is a real defect — report it, do not paper over it.
 
-- [ ] **Step 5: Prove the clamp.** With a stored height larger than 80% of the window, confirm the band paints capped and the status bar is still visible. A very small window is the cheap way to produce this.
+- [x] **Step 5: Prove the clamp.** With a stored height larger than 80% of the window, confirm the band paints capped and the status bar is still visible. A very small window is the cheap way to produce this.
 
-- [ ] **Step 6: Gates.** `cargo test -p solution_agent -p solutions -p workspace -p console_panel -p solutions_ui`, `cargo fmt --all --check`, and `./script/clippy -p solution_agent -p console_panel -p solutions_ui -p solutions -p workspace`. All three green. (`cargo fmt --all --check` catches slips the per-crate gates do not — it was RED at the end of phase 2a while every crate check was green.)
+- [x] **Step 6: Gates.** `cargo test -p solution_agent -p solutions -p workspace -p console_panel -p solutions_ui`, `cargo fmt --all --check`, and `./script/clippy -p solution_agent -p console_panel -p solutions_ui -p solutions -p workspace`. All three green. (`cargo fmt --all --check` catches slips the per-crate gates do not — it was RED at the end of phase 2a while every crate check was green.)
 
-- [ ] **Step 7: Document.** Add one `FORK.md` decision entry after #93 covering: the band owns a persisted per-Solution height; it is absolute pixels, not a window fraction; the window-relative cap is computed at render and never written back, and *why* (the draw-phase notify trap); and the handle commits from `on_drag_move`, not `on_drop` (FORK.md #84). Mark this plan's tasks complete. Do not touch `.rules`.
+- [x] **Step 7: Document.** Add one `FORK.md` decision entry after #93 covering: the band owns a persisted per-Solution height; it is absolute pixels, not a window fraction; the window-relative cap is computed at render and never written back, and *why* (the draw-phase notify trap); and the handle commits from `on_drag_move`, not `on_drop` (FORK.md #84). Mark this plan's tasks complete. Do not touch `.rules`.
 
-- [ ] **Step 8: Commit** as `solution_agent,FORK.md: Record the band-height decision` (docs) — verification artifacts are not committed.
+- [x] **Step 8: Commit** as `solution_agent,FORK.md: Record the band-height decision` (docs) — verification artifacts are not committed.

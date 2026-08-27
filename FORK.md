@@ -1217,6 +1217,48 @@ user-visible but inert; wiring it up (or removing it) is its own task.
   as the closing window — i.e. it holds under one-window-per-Solution. Break that invariant and this silently
   leaks editor-bearing views.
 
+### 94. The Solution band owns a persisted per-Solution height in absolute pixels; the window-relative cap is a render-time function that is never written back
+
+Why: phase 2a shipped the band as a *content-driven* row (decision 93). With an empty session it measured
+~128px, of which the transcript region was ~30px — the primary surface of the whole redesign painted a status
+row and a compose box and no conversation at all. The band therefore needs a height of its own, and three
+sub-decisions were not obvious.
+
+**Absolute logical pixels, not a fraction of the window.** The band's content has an intrinsic pixel floor
+(status row + compose box; `MIN_BAND_HEIGHT = 140`), which a fraction cannot express — on a short window a
+"25% band" is unusable and on a tall one it is absurd. Every dock in this editor already persists an absolute
+size, so a fraction would also make the band the odd one out. The cost is the one every dock already pays: move
+the window from a laptop panel to an external monitor and the band keeps its pixel height rather than its
+proportion. `DEFAULT_BAND_HEIGHT = 320` (also what double-clicking the top edge restores), `MAX_BAND_HEIGHT =
+4096` guards only a corrupt or hand-edited row.
+
+**The window-relative ceiling (`MAX_BAND_HEIGHT_FRACTION = 0.8`) is applied at render, as a pure function of
+(stored height, live viewport height), and never persisted.** The tempting shape — notice during layout that the
+band no longer fits, clamp it, and save the clamped value — cannot work here: `Window::invalidate_view` returns
+`false` and pushes no `Effect::Notify` while `draw_phase != DrawPhase::None`, so a `cx.notify()` raised from
+`request_layout` / `prepaint` / `paint` is silently *discarded*, not deferred (`docs/findings/2026-08-17-gpui-
+draw-phase-invalidation.md`). Hopping out with `cx.defer` to make the write stick would then re-derive from the
+new bounds on the next frame and spin. It is also wrong on its own terms: a window temporarily shrunk (tiling
+WM, projector, split screen) would permanently destroy the user's saved geometry. So `model::effective_band_height`
+takes the stored value and the viewport and returns what to paint; `model::clamp_band_height` is the only thing
+that touches what gets stored. Verified live at 1920x1080: stored 990 painted 864 (= 0.8 x 1080) with the status
+bar intact, and the row still read 990 afterwards.
+
+**The top-edge handle commits from `on_drag_move`, not `on_drop`.** The handle is `deferred()` +
+`block_mouse_except_scroll()`, which truncates the hover stack so no ancestor's `on_drop` ever fires — the same
+trap decision 84 records for the split-diff divider and decision 92 for the band's own vertical divider. Do not
+"fix" this back to `on_drop`. The height is measured as `event.bounds.bottom() - cursor.y`: the band's *bottom*
+is the anchored edge (the status bar sits directly under it), so measuring down from the top would chase the
+value being changed. Writes ride the same 400ms cancel-on-replace debounce and the same per-Solution
+`band_state_writes` slot as `divider_ratio` (decision 92) — one SQLite round-trip per mouse move is not
+acceptable, and the two are never dragged concurrently.
+
+The handle deliberately paints **no line of its own**. Live verification confirmed the boundary is already
+unambiguous: the project zone's own 1px `border` row sits directly above the band across the full window width,
+with a tonal step from the pane background to the band background beneath it. Adding a second rule there would
+have been a double border.
+
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.
