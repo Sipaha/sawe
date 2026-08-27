@@ -58,8 +58,8 @@ pub fn console_panel_for_workspace(workspace: &Workspace) -> Option<Entity<Conso
         .ok()
 }
 
-/// Make the Solution band's utility section show **the terminal** (without
-/// stealing focus) so a task's output is actually on screen.
+/// Make the Solution band's utility section show `kind` (without stealing
+/// focus) so whatever the caller just produced is actually on screen.
 /// `console_panel` already depends on `solution_agent` (for
 /// `SolutionAgentStore`), so unlike `SolutionBand` itself — which cannot
 /// hold a typed `Entity<ConsolePanel>` without creating a crate cycle — this
@@ -67,14 +67,16 @@ pub fn console_panel_for_workspace(workspace: &Workspace) -> Option<Entity<Conso
 /// straight to the concrete `SolutionBand` type. No-op if the band isn't
 /// installed (headless/test workspaces).
 ///
-/// Selecting the kind is load-bearing, not belt-and-braces: `utility_kind`
-/// is persisted per Solution and the debugger writes it too (phase 2b task
-/// 5), so revealing only `utility_visible` would pop the band open on
-/// whatever was last shown. For a `RevealStrategy::Always` task that means
-/// focusing a terminal the user cannot see; for the debugger's own DAP
-/// `runInTerminal` request it would mean opening the band on the debugger
-/// instead of the terminal the adapter needs shown.
-fn reveal_utility_section(workspace: &Workspace, cx: &mut App) {
+/// `kind` is a parameter, not `UtilityKind::Terminal` baked in, because
+/// "reveal the section" and "reveal *the terminal*" are different intents
+/// and only the caller knows which it means. Every caller in this file
+/// passes `Terminal` and must keep doing so: selecting the kind is
+/// load-bearing, not belt-and-braces. `utility_kind` is persisted per
+/// Solution and the debugger writes it too (phase 2b task 5), so revealing
+/// only `utility_visible` would pop the band open on whatever was last
+/// shown — for a `RevealStrategy::Always` task that means focusing a
+/// terminal the user cannot see.
+pub fn reveal_utility_section(workspace: &Workspace, kind: UtilityKind, cx: &mut App) {
     let Some(band) = workspace
         .solution_band_item()
         .and_then(|item| item.downcast::<SolutionBand>().ok())
@@ -82,7 +84,7 @@ fn reveal_utility_section(workspace: &Workspace, cx: &mut App) {
         return;
     };
     band.update(cx, |band, cx| {
-        band.set_utility_kind(UtilityKind::Terminal, cx);
+        band.set_utility_kind(kind, cx);
         band.set_utility_visible(true, cx);
     });
 }
@@ -999,13 +1001,13 @@ impl ConsolePanel {
                 });
                 match reveal_strategy {
                     RevealStrategy::Always => {
-                        reveal_utility_section(workspace, cx);
+                        reveal_utility_section(workspace, UtilityKind::Terminal, cx);
                         if let Some(panel) = this.upgrade() {
                             panel.focus_handle(cx).focus(window, cx);
                         }
                     }
                     RevealStrategy::NoFocus => {
-                        reveal_utility_section(workspace, cx);
+                        reveal_utility_section(workspace, UtilityKind::Terminal, cx);
                     }
                     RevealStrategy::Never => {}
                 }
@@ -1175,7 +1177,7 @@ impl ConsolePanel {
                         this.activate_tab(existing_tab_index, cx);
                         if let Some(workspace) = this.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
-                                reveal_utility_section(workspace, cx);
+                                reveal_utility_section(workspace, UtilityKind::Terminal, cx);
                             });
                         }
                         this.focus_handle(cx).focus(window, cx);
@@ -1186,7 +1188,7 @@ impl ConsolePanel {
                         this.activate_tab(existing_tab_index, cx);
                         if let Some(workspace) = this.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
-                                reveal_utility_section(workspace, cx);
+                                reveal_utility_section(workspace, UtilityKind::Terminal, cx);
                             });
                         }
                     })?;
@@ -1555,6 +1557,19 @@ mod tests {
     #[test]
     fn new_chat_action_matches_the_status_bar_strips_dispatch_string() {
         assert_eq!(NewChat.name(), "console_panel::NewChat");
+    }
+
+    /// Same pinning for the band's utility button group (phase 2b task 6),
+    /// which builds this action by name for its Terminal button's tooltip
+    /// keybinding. `solution_agent` cannot import the action type (cycle), so
+    /// a rename would silently strip the keybinding from the tooltip rather
+    /// than fail to compile — this test is what makes it fail loudly.
+    #[test]
+    fn toggle_focus_action_matches_the_utility_button_tooltip_lookup() {
+        assert_eq!(
+            solution_agent::utility_buttons::toggle_action_name(UtilityKind::Terminal),
+            Some(crate::ToggleFocus.name())
+        );
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -1969,7 +1984,7 @@ mod tests {
 
         window_handle
             .update(cx, |workspace, _window, cx| {
-                reveal_utility_section(workspace, cx);
+                reveal_utility_section(workspace, UtilityKind::Terminal, cx);
             })
             .unwrap();
         cx.run_until_parked();

@@ -70,8 +70,8 @@ use gpui::{
 };
 use project::Project;
 use solutions::{SolutionId, SolutionStore};
-use ui::h_flex;
-use ui::prelude::ActiveTheme as _;
+use ui::prelude::*;
+use ui::{Color, Label, LabelSize, h_flex, v_flex};
 use workspace::{UtilityKind, Workspace};
 
 use crate::model::{
@@ -96,6 +96,49 @@ struct DraggedBandEdge;
 /// the 1px line it paints. Widening the hitbox without widening the paint is
 /// what makes a hairline divider actually draggable.
 const DIVIDER_HIT_SLOP: f32 = 3.;
+
+/// Whether the status-bar button for `kind` renders selected. A hidden
+/// utility section has **no** selected button even though `utility_kind`
+/// still remembers what it was showing (spec §3) — that memory is what makes
+/// re-showing return to the same content, and surfacing it as a lit button
+/// over an invisible section would be a lie.
+pub fn utility_button_selected(kind: UtilityKind, state: &BandState) -> bool {
+    state.utility_visible && state.utility_kind == kind
+}
+
+/// What clicking the utility button for `kind` must produce, as a pure
+/// function of the current band state: `(utility_kind, utility_visible)`.
+///
+/// Clicking the **selected** button hides the section and deliberately
+/// leaves `utility_kind` at its current value, so the next reveal — by
+/// button, by `ctrl-\``, or by a task that reveals the terminal — returns to
+/// the same content. Clicking any other button switches to it and shows the
+/// section, which also covers "the section is hidden, so nothing is
+/// selected": every button then reads as inactive and one click shows it.
+pub fn utility_button_click(kind: UtilityKind, state: &BandState) -> (UtilityKind, bool) {
+    if utility_button_selected(kind, state) {
+        (state.utility_kind, false)
+    } else {
+        (kind, true)
+    }
+}
+
+/// The utility half when the selected kind has no registered occupant. See
+/// the call site in `render` for why this exists rather than an empty half.
+fn render_missing_occupant(kind: UtilityKind) -> gpui::AnyElement {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .child(Label::new(format!("{} is unavailable", kind.label())).color(Color::Muted))
+        .child(
+            Label::new("It failed to load in this window.")
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
 
 /// Half-height of the top-edge handle's grab area, in logical pixels either
 /// side of the band's top edge. The edge paints no line of its own (module
@@ -159,6 +202,15 @@ impl SolutionBand {
             .solution_band_utility_item(kind)
     }
 
+    /// Has `zed.rs` installed *any* utility occupant yet? Distinguishes
+    /// "still starting up" from "this kind genuinely failed to load" — see
+    /// `render`. Reads the Workspace entity, so this is `render`-only.
+    fn any_utility_panel_registered(&self, cx: &App) -> bool {
+        UtilityKind::ALL
+            .iter()
+            .any(|kind| self.utility_panel(*kind, cx).is_some())
+    }
+
     /// This band's geometry: the owning Solution's persisted row, or the
     /// window-local fallback when there is no Solution.
     fn band_state(&self, cx: &App) -> BandState {
@@ -168,6 +220,14 @@ impl SolutionBand {
                 .band_state(solution_id),
             None => self.local_state,
         }
+    }
+
+    /// The whole `BandState` in one read, for callers that need more than
+    /// one field of it and would otherwise resolve the Solution once per
+    /// getter. Reads the Project entity (never the Workspace), so it is safe
+    /// under a live `&mut Workspace` borrow — see the module doc.
+    pub fn band_state_snapshot(&self, cx: &App) -> BandState {
+        self.band_state(cx)
     }
 
     /// Whether the utility section is currently shown, regardless of dialog
@@ -196,11 +256,12 @@ impl SolutionBand {
         self.band_state(cx).utility_kind
     }
 
-    /// Choose which content the utility section shows. The buttons that let
-    /// a user pick arrive in a later task; the first caller is
-    /// `debugger_ui`, whose `debug_panel::ToggleFocus` (`ctrl-shift-d`) and
-    /// breakpoint-hit reveal both used to mean "open the dock this panel
-    /// lives in and activate it" — in the band, "activate it" is this.
+    /// Choose which content the utility section shows. Callers are the two
+    /// reveal/keybinding paths (`console_panel::handle_toggle_focus`,
+    /// `debugger_ui::debugger_panel::{handle_toggle_focus, reveal_debug_panel}`,
+    /// `console_panel::panel::reveal_utility_section`) and
+    /// `activate_utility_kind` below, which is what the status-bar button
+    /// group drives.
     pub fn set_utility_kind(&mut self, kind: UtilityKind, cx: &mut Context<Self>) {
         match self.solution_id(cx) {
             Some(solution_id) => SolutionAgentStore::global(cx).update(cx, |store, cx| {
@@ -214,6 +275,21 @@ impl SolutionBand {
             }
         }
         cx.notify();
+    }
+
+    /// Apply [`utility_button_click`] — the status-bar button group's rule.
+    /// Never touches focus: the keybindings (`ctrl-\``, `ctrl-shift-d`) are
+    /// the focus path, a button click is only ever "show this content" or
+    /// "hide the section". Both layers agree that *the active content* is
+    /// `utility_kind` while `utility_visible`, so a button and its hotkey
+    /// can never disagree about which content is current.
+    pub fn activate_utility_kind(&mut self, kind: UtilityKind, cx: &mut Context<Self>) {
+        let (next_kind, next_visible) = utility_button_click(kind, &self.band_state(cx));
+        // Order matters only for the switch case, and only cosmetically:
+        // setting the kind first means a single frame never paints the old
+        // content in a newly-shown section.
+        self.set_utility_kind(next_kind, cx);
+        self.set_utility_visible(next_visible, cx);
     }
 
     /// `console_panel::ToggleFocus`'s (`ctrl-\``) handler. Mirrors
@@ -435,8 +511,28 @@ impl Render for SolutionBand {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let solution_id = self.solution_id(cx);
         let state = self.band_state(cx);
+        // A shown section whose kind has no registered occupant used to
+        // render as *nothing at all* — the utility half simply vanished, and
+        // with no dialog either the whole band collapsed, leaving a lit
+        // status-bar button pointing at empty space. Now that three kinds
+        // exist and any of them can fail to load (`add_utility_item_when_ready`
+        // logs and gives up), the section says so instead. Falling back to a
+        // kind that *is* registered was the alternative and is worse: it
+        // would silently rewrite the user's persisted choice and desynchronise
+        // the button group from `utility_kind`.
         let utility_panel = if state.utility_visible {
-            self.utility_panel(state.utility_kind, cx)
+            match self.utility_panel(state.utility_kind, cx) {
+                Some(view) => Some(view.into_any_element()),
+                // Nothing registered *at all* means `initialize_panels` has
+                // not finished yet — every window open would otherwise flash
+                // the placeholder before the occupants land. Stay silent for
+                // that frame; once any kind is installed, a missing one is a
+                // real failure worth showing.
+                None if self.any_utility_panel_registered(cx) => {
+                    Some(render_missing_occupant(state.utility_kind))
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -478,7 +574,7 @@ impl Render for SolutionBand {
         // `flex_basis` fractions only when there are two halves to divide;
         // a lone half takes the whole band regardless of the stored ratio, so
         // hiding the other side never leaves a dead gutter.
-        let half = |content: AnyView, fraction: f32| {
+        let half = |content: gpui::AnyElement, fraction: f32| {
             let half = div().min_w_0().overflow_hidden().bg(half_background);
             if split {
                 half.flex_shrink_1()
@@ -524,7 +620,7 @@ impl Render for SolutionBand {
                 },
             ))
             .child(self.render_top_edge_handle(solution_id, cx))
-            .children(dialog.map(|view| half(view.into(), state.divider_ratio)))
+            .children(dialog.map(|view| half(view.into_any_element(), state.divider_ratio)))
             .children(split.then(|| self.render_divider(solution_id, cx).into_any_element()))
             .children(utility_panel.map(|panel| half(panel, 1.0 - state.divider_ratio)))
             .into_any_element()
@@ -1223,6 +1319,156 @@ mod tests {
         );
     }
 
+    /// The status-bar button group's rule end-to-end through the *persisted*
+    /// layer (spec §3): switch, hide-on-re-click, and — the load-bearing
+    /// half — a hide that leaves `utility_kind` alone so the next click
+    /// returns to the same content rather than to the default.
+    #[gpui::test]
+    async fn activating_a_utility_kind_switches_shows_and_hides(cx: &mut TestAppContext) {
+        let (solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        band.read_with(cx, |band, cx| {
+            let state = band.band_state_snapshot(cx);
+            assert!(
+                !state.utility_visible,
+                "the default band starts with the section hidden"
+            );
+            for kind in UtilityKind::ALL {
+                assert!(
+                    !utility_button_selected(kind, &state),
+                    "{kind:?} must render unselected while the section is hidden"
+                );
+            }
+        });
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::GitGraph, cx)
+        });
+        band.read_with(cx, |band, cx| {
+            assert_eq!(band.utility_kind(cx), UtilityKind::GitGraph);
+            assert!(band.utility_visible(cx), "an inactive button reveals");
+        });
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Debug, cx)
+        });
+        band.read_with(cx, |band, cx| {
+            let state = band.band_state_snapshot(cx);
+            assert_eq!(state.utility_kind, UtilityKind::Debug);
+            assert!(state.utility_visible);
+            assert!(!utility_button_selected(UtilityKind::GitGraph, &state));
+        });
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Debug, cx)
+        });
+        band.read_with(cx, |band, cx| {
+            assert!(!band.utility_visible(cx), "the active button hides");
+            assert_eq!(
+                band.utility_kind(cx),
+                UtilityKind::Debug,
+                "hiding must leave the remembered kind untouched"
+            );
+        });
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Debug, cx)
+        });
+        band.read_with(cx, |band, cx| {
+            assert!(band.utility_visible(cx));
+            assert_eq!(
+                band.utility_kind(cx),
+                UtilityKind::Debug,
+                "re-showing comes back to the same content"
+            );
+        });
+
+        cx.update(|_window, cx| {
+            assert_eq!(
+                SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .band_state(solution_id)
+                    .utility_kind,
+                UtilityKind::Debug,
+                "a Solution window's buttons write the persisted row, not \
+                 local_state"
+            );
+        });
+    }
+
+    /// The same rule for a plain-folder window that resolves to no Solution.
+    /// It has no `BandState` row to write, so the whole switch/hide cycle has
+    /// to round-trip through `local_state` — the case a button group wired
+    /// straight to `SolutionAgentStore` would have left inert.
+    #[gpui::test]
+    async fn activating_a_utility_kind_round_trips_through_local_state_with_no_solution(
+        cx: &mut TestAppContext,
+    ) {
+        let (_store, db, _tmp) = store_with_persistence(cx).await;
+        let solution_id = SolutionId(1);
+
+        let plain_dir = tempfile::tempdir().expect("plain-folder tempdir");
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(plain_dir.path(), serde_json::json!({ ".keep": "" }))
+            .await;
+        let project = project::Project::test(fs, [plain_dir.path()], cx).await;
+
+        cx.update(|cx| theme_settings::init(theme::LoadThemes::JustBase, cx));
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        band.update(cx, |band, cx| {
+            assert_eq!(band.solution_id(cx), None);
+            band.activate_utility_kind(UtilityKind::GitGraph, cx);
+        });
+        band.read_with(cx, |band, cx| {
+            assert_eq!(band.utility_kind(cx), UtilityKind::GitGraph);
+            assert!(band.utility_visible(cx));
+        });
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::GitGraph, cx)
+        });
+        band.read_with(cx, |band, cx| {
+            assert!(!band.utility_visible(cx));
+            assert_eq!(
+                band.utility_kind(cx),
+                UtilityKind::GitGraph,
+                "the window-local fallback remembers the kind across a hide too"
+            );
+        });
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            persisted(&db, solution_id).await,
+            None,
+            "a window with no Solution must never write the band_state row"
+        );
+    }
+
     /// Double-lease guard for the new setter, in the shape of
     /// `console_panel`'s `toggle_focus_action_does_not_double_lease_the_workspace`:
     /// call `set_band_height` while a `&mut Workspace` borrow is live (the
@@ -1264,6 +1510,42 @@ mod tests {
             "the height landed even though the setter ran under a live \
              &mut Workspace borrow"
         );
+    }
+
+    /// Same guard for the button group's entry point. A status item's click
+    /// handler must be assumed to run under a live `&mut Workspace` borrow,
+    /// and `activate_utility_kind` reads `band_state` (which resolves the
+    /// Solution) before writing — the exact shape that would panic if any of
+    /// it went through `self.workspace`.
+    #[gpui::test]
+    async fn activate_utility_kind_does_not_double_lease_the_workspace(cx: &mut TestAppContext) {
+        let (_solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        workspace.update(cx, |_workspace, cx| {
+            band.update(cx, |band, cx| {
+                band.activate_utility_kind(UtilityKind::GitGraph, cx);
+            });
+        });
+
+        band.read_with(cx, |band, cx| {
+            assert_eq!(band.utility_kind(cx), UtilityKind::GitGraph);
+            assert!(band.utility_visible(cx));
+        });
     }
 
     #[gpui::test]

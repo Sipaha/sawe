@@ -37,6 +37,7 @@ pub mod supervisor;
 pub mod supervisor_instruction_modal;
 pub(crate) mod teammate_watchers;
 pub mod upload;
+pub mod utility_buttons;
 
 pub use claude_native::ModelInfo;
 pub use metrics_emitter::MetricsEmitter;

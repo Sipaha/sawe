@@ -24,7 +24,7 @@ use solution_agent::store::SolutionAgentStore;
 use workspace::{UtilityKind, Workspace};
 
 pub use actions::{NewChat, NewTerminal, ShowSession, ToggleFocus};
-pub use panel::{ConsolePanel, ConsoleTab, console_panel_for_workspace};
+pub use panel::{ConsolePanel, ConsoleTab, console_panel_for_workspace, reveal_utility_section};
 pub use terminal_provider::TerminalProvider;
 
 pub fn init(cx: &mut gpui::App) {

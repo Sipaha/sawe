@@ -2555,3 +2555,17 @@ async fn test_restart_request_is_not_sent_more_than_once_until_response(
         "A second restart should be allowed after the first one completes"
     );
 }
+
+/// Pins the action name the band's utility button group (phase 2b task 6)
+/// builds by string for the Debug button's tooltip keybinding.
+/// `solution_agent` cannot import `zed_actions` (it would not see this
+/// crate's registration anyway), so a rename would silently strip the
+/// keybinding from the tooltip instead of failing to compile.
+#[test]
+fn toggle_focus_action_matches_the_utility_button_tooltip_lookup() {
+    use gpui::Action as _;
+    assert_eq!(
+        solution_agent::utility_buttons::toggle_action_name(workspace::UtilityKind::Debug),
+        Some(zed_actions::debug_panel::ToggleFocus.name())
+    );
+}

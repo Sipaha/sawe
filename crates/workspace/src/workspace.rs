@@ -1386,6 +1386,28 @@ pub enum UtilityKind {
 }
 
 impl UtilityKind {
+    /// Every kind, in the order the status-bar button group paints them.
+    /// Iteration order is part of the UI, so it lives with the enum rather
+    /// than being re-spelled at each call site.
+    pub const ALL: [UtilityKind; 3] = [
+        UtilityKind::Terminal,
+        UtilityKind::GitGraph,
+        UtilityKind::Debug,
+    ];
+
+    /// Human-readable name, shown in the button group's tooltips and in the
+    /// band's "nothing registered for this kind" placeholder. Kept in sync
+    /// with the tooltips the de-docked panels used to carry on their dock
+    /// buttons (phase 2b tasks 4 and 5) so the affordance a user learned
+    /// survives the strip's deletion.
+    pub fn label(self) -> &'static str {
+        match self {
+            UtilityKind::Terminal => "Terminal",
+            UtilityKind::GitGraph => "Git Graph",
+            UtilityKind::Debug => "Debug Panel",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             UtilityKind::Terminal => "terminal",

@@ -641,9 +641,20 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 cx,
             )
         });
+        // Sawe: the band's utility half is picked from the status bar (phase
+        // 2b task 6) — the only way in for the git graph, and the mouse path
+        // for the terminal and the debugger now that none of the three is
+        // dock-registered. Built from the band entity directly (not resolved
+        // back off `Workspace`) so the buttons never read the Workspace.
+        let utility_buttons = cx.new(|cx| {
+            solution_agent::utility_buttons::UtilityButtons::new(solution_band.clone(), cx)
+        });
         workspace.set_solution_band_item(solution_band.into(), window, cx);
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(session_tab_strip, window, cx);
+            // Mirrors the band's own layout: dialog tabs on the left, the
+            // utility picker to their right.
+            status_bar.add_left_item(utility_buttons, window, cx);
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
