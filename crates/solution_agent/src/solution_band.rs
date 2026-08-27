@@ -32,8 +32,11 @@
 //! otherwise need would cycle. This band reads the slot fresh every render
 //! instead of caching a copy, so it never goes stale relative to whatever
 //! `zed.rs` last installed there. As of phase 2b task 1 the slot holds one
-//! entry per kind (terminal / git graph / debug), but `render` still always
-//! asks for `UtilityKind::Terminal` — the switch between kinds is task 2.
+//! entry per kind (terminal / git graph / debug); `render` asks for
+//! whichever kind `BandState::utility_kind` (task 2) holds. Nothing yet
+//! writes a non-Terminal value — the buttons that call
+//! `SolutionAgentStore::set_band_utility_kind` arrive in a later task — so
+//! observed behaviour is still always the terminal.
 //!
 //! Installed from `crates/zed/src/zed.rs` (NOT `title_bar`, which cannot
 //! depend on `solution_agent` — see the `SessionTabStrip` install a few
@@ -407,10 +410,7 @@ impl Render for SolutionBand {
         let solution_id = self.solution_id(cx);
         let state = self.band_state(cx);
         let utility_panel = if state.utility_visible {
-            // Phase 2b task 1: the slot is keyed by kind now, but the
-            // switch between kinds arrives in task 2 — always ask for the
-            // terminal, so end-to-end behaviour is unchanged.
-            self.utility_panel(UtilityKind::Terminal, cx)
+            self.utility_panel(state.utility_kind, cx)
         } else {
             None
         };
@@ -714,6 +714,42 @@ mod tests {
         assert_eq!(persisted(&db, solution_id).await, Some(written));
     }
 
+    /// `set_band_utility_kind` round-trips immediately, like
+    /// `set_band_utility_visible` (switching content is a discrete click, not
+    /// a drag — see the setter's doc comment), without disturbing the row's
+    /// other fields.
+    #[gpui::test]
+    async fn band_utility_kind_round_trips_and_leaves_other_fields_alone(cx: &mut TestAppContext) {
+        let (store, db, _tmp) = store_with_persistence(cx).await;
+        let solution_id = SolutionId(1);
+        let dialog = SolutionSessionId::new();
+
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, Some(dialog), cx);
+            store.set_band_utility_visible(solution_id, true, cx);
+            store.set_band_divider_ratio(solution_id, 0.7, cx);
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+
+        store.update(cx, |store, cx| {
+            store.set_band_utility_kind(solution_id, UtilityKind::GitGraph, cx)
+        });
+        cx.run_until_parked();
+
+        let written = persisted(&db, solution_id)
+            .await
+            .expect("the immediate write lands without waiting on a debounce");
+        assert_eq!(written.utility_kind, UtilityKind::GitGraph);
+        assert_eq!(
+            written.divider_ratio, 0.7,
+            "the kind write must not clobber the divider ratio set earlier"
+        );
+        assert!(written.utility_visible);
+        assert_eq!(written.active_dialog_session, Some(dialog));
+    }
+
     /// `set_band_height` round-trips through the debounce like the divider
     /// ratio does, without disturbing the row's other fields.
     #[gpui::test]
@@ -828,6 +864,7 @@ mod tests {
         let saved = BandState {
             divider_ratio: 0.7,
             utility_visible: false,
+            utility_kind: UtilityKind::GitGraph,
             active_dialog_session: Some(SolutionSessionId::new()),
             height: 500.0,
         };
@@ -935,6 +972,50 @@ mod tests {
                 expected,
                 "height is the live value the user set; divider_ratio is still \
                  whatever the persisted row held"
+            );
+        });
+        assert_eq!(persisted(&db, solution_id).await, Some(expected));
+    }
+
+    /// Field-wise touched-mask discipline for `utility_kind` specifically: a
+    /// pre-hydration `set_band_utility_kind` must win for `utility_kind`
+    /// while the persisted row's `divider_ratio` (also non-default here)
+    /// survives untouched, proving the overlay is per-field and not
+    /// all-or-nothing.
+    #[gpui::test]
+    async fn a_utility_kind_touch_before_the_db_opens_keeps_the_persisted_ratio(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, db, saved, _tmp) = store_with_a_saved_row_and_no_persistence_yet(cx).await;
+        let solution_id = SolutionId(1);
+        assert_ne!(
+            saved.divider_ratio, DEFAULT_DIVIDER_RATIO,
+            "the persisted ratio must be distinguishable from the default for \
+             this test to prove anything"
+        );
+        assert_ne!(
+            saved.utility_kind,
+            UtilityKind::Terminal,
+            "same for utility_kind, or a bug that always fell back to the \
+             default would pass unnoticed"
+        );
+
+        store.update(cx, |store, cx| {
+            store.set_band_utility_kind(solution_id, UtilityKind::Debug, cx)
+        });
+        store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+        cx.run_until_parked();
+
+        let expected = BandState {
+            utility_kind: UtilityKind::Debug,
+            ..saved
+        };
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.band_state(solution_id),
+                expected,
+                "utility_kind is the live value the user set; divider_ratio is \
+                 still whatever the persisted row held"
             );
         });
         assert_eq!(persisted(&db, solution_id).await, Some(expected));

@@ -5,6 +5,8 @@ use chrono::{TimeZone, Utc};
 use gpui::SharedString;
 use solutions::SolutionId;
 
+use workspace::UtilityKind;
+
 use crate::model::{DEFAULT_BAND_HEIGHT, SolutionSessionId, SolutionSessionMetadata};
 
 #[gpui::test]
@@ -1401,6 +1403,102 @@ async fn a_pre_migration_band_table_gains_band_height_on_open(cx: &mut gpui::Tes
     assert_eq!(
         state.height, DEFAULT_BAND_HEIGHT,
         "ADD COLUMN … NOT NULL DEFAULT 320 must backfill the existing row"
+    );
+    assert_eq!(
+        state.divider_ratio, 0.35,
+        "the migration must not disturb the row's persisted divider position"
+    );
+    assert!(
+        state.utility_visible,
+        "the migration must not disturb the row's persisted utility visibility"
+    );
+}
+
+/// A row written before `utility_kind` existed loads as `UtilityKind::Terminal`.
+/// Constructed by inserting through the raw connection with `utility_kind`
+/// omitted from the column list, so SQLite applies the column's own
+/// `DEFAULT 'terminal'` — the exact mechanism `apply_idempotent_add_column_to`'s
+/// `NOT NULL DEFAULT 'terminal'` backfill relies on for a row that predates
+/// the migration on a real user's DB. Mirrors
+/// `a_band_row_without_band_height_loads_as_the_default`.
+#[gpui::test]
+async fn a_band_row_without_utility_kind_loads_as_terminal(cx: &mut gpui::TestAppContext) {
+    let db = SolutionAgentDb::open(cx.executor()).expect("open db");
+    {
+        let connection = db.connection.lock();
+        connection
+            .exec(
+                "INSERT INTO solution_band_state
+                    (solution_id, divider_ratio, utility_visible, active_dialog_session)
+                 VALUES (1, 0.7, 1, NULL)",
+            )
+            .expect("prepare pre-migration row insert")()
+        .expect("insert pre-migration row");
+    }
+
+    let bands = db.load_band_states().await.expect("load band states");
+    let (_, state) = bands
+        .into_iter()
+        .find(|(id, _)| *id == SolutionId(1))
+        .expect("row exists");
+    assert_eq!(
+        state.utility_kind,
+        UtilityKind::Terminal,
+        "a row that never had an explicit utility_kind must load as the \
+         terminal, not some other kind or a parse failure's fallback"
+    );
+    assert_eq!(
+        state.divider_ratio, 0.7,
+        "the column omission must not disturb the row's other fields"
+    );
+    assert!(state.utility_visible);
+}
+
+/// The shape the migration actually runs against: a phase-2a-plus-band-height
+/// `solution_band_state` table with five columns (including `band_height`,
+/// which shipped before `utility_kind`) but no `utility_kind`, holding a real
+/// row. Mirrors `a_pre_migration_band_table_gains_band_height_on_open`, one
+/// column further along.
+#[gpui::test]
+async fn a_pre_migration_band_table_gains_utility_kind_on_open(cx: &mut gpui::TestAppContext) {
+    let connection = Connection::open_memory(Some("SOLUTION_AGENT_UTILITY_KIND_MIGRATION_TEST"));
+    connection
+        .exec(
+            "CREATE TABLE solution_band_state (
+                solution_id           INTEGER PRIMARY KEY,
+                divider_ratio         REAL    NOT NULL,
+                utility_visible       INTEGER NOT NULL,
+                active_dialog_session TEXT,
+                band_height           REAL    NOT NULL DEFAULT 320
+            )",
+        )
+        .expect("prepare pre-migration table")()
+    .expect("create pre-migration table");
+    connection
+        .exec(
+            "INSERT INTO solution_band_state
+                (solution_id, divider_ratio, utility_visible, active_dialog_session, band_height)
+             VALUES (42, 0.35, 1, NULL, 450)",
+        )
+        .expect("prepare pre-migration row")()
+    .expect("insert pre-migration row");
+
+    let db = SolutionAgentDb::open_connection(cx.executor(), connection)
+        .expect("open over the pre-migration schema");
+
+    let bands = db.load_band_states().await.expect("load band states");
+    let (_, state) = bands
+        .into_iter()
+        .find(|(id, _)| *id == SolutionId(42))
+        .expect("the pre-migration row survives the migration");
+    assert_eq!(
+        state.utility_kind,
+        UtilityKind::Terminal,
+        "ADD COLUMN … NOT NULL DEFAULT 'terminal' must backfill the existing row"
+    );
+    assert_eq!(
+        state.height, 450.0,
+        "the migration must not disturb the row's persisted band height"
     );
     assert_eq!(
         state.divider_ratio, 0.35,

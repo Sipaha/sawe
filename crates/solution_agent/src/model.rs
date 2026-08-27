@@ -9,6 +9,7 @@ use gpui::{Context, Entity, EventEmitter, SharedString, Subscription, Task};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use solutions::SolutionId;
+use workspace::UtilityKind;
 
 use crate::background_agent;
 use crate::background_shell;
@@ -1259,9 +1260,10 @@ pub fn effective_band_height(stored: f32, viewport_height: f32) -> f32 {
 }
 
 /// The Solution band's geometry for one Solution: where the divider sits,
-/// whether the utility (terminal) section is shown, which session's dialog
-/// fills the other half, and how tall the band is. Persisted as a single
-/// `solution_band_state` row so the band reopens the way the user left it.
+/// whether the utility section is shown, which kind of content occupies it
+/// (terminal / git graph / debug), which session's dialog fills the other
+/// half, and how tall the band is. Persisted as a single `solution_band_state`
+/// row so the band reopens the way the user left it.
 ///
 /// `height` is stored in absolute logical pixels, not a fraction of the
 /// window — the window-relative cap that keeps the band from eating the
@@ -1277,6 +1279,7 @@ pub fn effective_band_height(stored: f32, viewport_height: f32) -> f32 {
 pub struct BandState {
     pub divider_ratio: f32,
     pub utility_visible: bool,
+    pub utility_kind: UtilityKind,
     pub active_dialog_session: Option<SolutionSessionId>,
     pub height: f32,
 }
@@ -1288,6 +1291,7 @@ impl Default for BandState {
             // Mirrors `Dock::new`'s `is_open: false`, the default the console
             // dock had before the band took the terminal over.
             utility_visible: false,
+            utility_kind: UtilityKind::Terminal,
             active_dialog_session: None,
             height: DEFAULT_BAND_HEIGHT,
         }

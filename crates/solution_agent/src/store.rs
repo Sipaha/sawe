@@ -14,6 +14,7 @@ use gpui::{
 };
 use solutions::{Solution, SolutionId, SolutionStore, SolutionStoreEvent};
 use util::ResultExt;
+use workspace::UtilityKind;
 
 use crate::adapter::AdapterRegistry;
 use crate::db::SolutionAgentDb;
@@ -378,6 +379,7 @@ pub struct SolutionAgentStore {
 struct BandStateTouched {
     divider_ratio: bool,
     utility_visible: bool,
+    utility_kind: bool,
     active_dialog_session: bool,
     height: bool,
 }
@@ -395,6 +397,11 @@ impl BandStateTouched {
                 live.utility_visible
             } else {
                 persisted.utility_visible
+            },
+            utility_kind: if self.utility_kind {
+                live.utility_kind
+            } else {
+                persisted.utility_kind
             },
             active_dialog_session: if self.active_dialog_session {
                 live.active_dialog_session
@@ -1511,6 +1518,36 @@ impl SolutionAgentStore {
                 .entry(solution_id)
                 .or_default()
                 .utility_visible = true;
+        }
+        self.persist_band_state_now(solution_id, cx);
+        cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
+        cx.notify();
+    }
+
+    /// Switch which content occupies the band's utility section (terminal /
+    /// git graph / debug) for `solution_id`. Written immediately, like
+    /// `set_band_utility_visible` and unlike the divider ratio / height:
+    /// switching content is a discrete click, not a drag, so there is no
+    /// stream of intermediate values to debounce.
+    pub fn set_band_utility_kind(
+        &mut self,
+        solution_id: SolutionId,
+        kind: UtilityKind,
+        cx: &mut Context<Self>,
+    ) {
+        // Reads through `band_state` rather than `entry(..).or_default()` for
+        // the same reason as `set_band_utility_visible` — see the comment
+        // there, including why this check is not what makes pre-hydration
+        // mutations safe.
+        if self.band_state(solution_id).utility_kind == kind {
+            return;
+        }
+        self.band_state.entry(solution_id).or_default().utility_kind = kind;
+        if !self.band_states_hydrated {
+            self.band_state_touched
+                .entry(solution_id)
+                .or_default()
+                .utility_kind = true;
         }
         self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });

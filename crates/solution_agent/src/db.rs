@@ -345,7 +345,8 @@ impl SolutionAgentDb {
                 divider_ratio         REAL    NOT NULL,
                 utility_visible       INTEGER NOT NULL,
                 active_dialog_session TEXT,
-                band_height           REAL    NOT NULL DEFAULT 320
+                band_height           REAL    NOT NULL DEFAULT 320,
+                utility_kind          TEXT    NOT NULL DEFAULT 'terminal'
             )
         "})?()
         .map_err(|e| anyhow!("Failed to create solution_band_state table: {}", e))?;
@@ -361,6 +362,20 @@ impl SolutionAgentDb {
             &connection,
             "solution_band_state",
             "band_height REAL NOT NULL DEFAULT 320",
+        );
+
+        // Utility kind (2026-08-27 phase 2b task 2, same reasoning as
+        // `band_height` immediately above): every install that ran phase 2a
+        // or the `band_height` follow-up already has this table without the
+        // column, so `CREATE TABLE IF NOT EXISTS` never touches it — the
+        // idempotent `ADD COLUMN` is what actually widens those rows.
+        // `NOT NULL DEFAULT 'terminal'` backfills every pre-existing row to
+        // `UtilityKind::Terminal`, the only occupant the utility section ever
+        // held before this column existed.
+        apply_idempotent_add_column_to(
+            &connection,
+            "solution_band_state",
+            "utility_kind TEXT NOT NULL DEFAULT 'terminal'",
         );
 
         Ok(Self {
