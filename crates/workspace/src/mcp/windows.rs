@@ -408,7 +408,10 @@ impl McpServerTool for ResizeWindowTool {
                 })
                 .map_err(|err| anyhow::anyhow!("resize failed: {err}"))
         })?;
-        let (width, height) = (f32::from(content_size.width), f32::from(content_size.height));
+        let (width, height) = (
+            f32::from(content_size.width),
+            f32::from(content_size.height),
+        );
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: format!("resized: {width} x {height}"),
