@@ -1,43 +1,27 @@
-//! `GitGraphPanel` — the commit-log graph as a bottom-docked panel
-//! (IDEA-style "Git" tool window) with a toggle button in the left rail.
+//! `GitGraphPanel` — the commit-log graph as an occupant of the Solution
+//! band's utility section (phase 2b task 4), NOT a dock panel: it keeps
+//! `Render`/`Focusable` but has no `Panel` impl, exactly like
+//! `console_panel::ConsolePanel` (the worked example). `zed.rs` installs it
+//! into `Workspace::solution_band_utility_item` under
+//! `UtilityKind::GitGraph`; `SolutionBand::render` reads that slot for
+//! whichever kind the Solution's persisted `utility_kind` names.
 //!
 //! It hosts an inner [`GitGraph`] view for the workspace's active
-//! repository and re-creates it when the active repo changes. The graph
-//! is still also openable as a pane item (file-history / open-at-commit
-//! flows use it that way) — this is purely an additional, dock-anchored
-//! way to get at it.
+//! repository and re-creates it when the active repo changes. The graph is
+//! independently openable as a pane item (`git_ui::git_panel::Open`,
+//! `git::FileHistory` → `open_or_reuse_graph` in `git_graph.rs`); that path
+//! never went through this type and is unaffected.
 
 use anyhow::Result;
 use gpui::{
-    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, Styled, Subscription, WeakEntity, Window, actions,
-    div, px,
+    App, AsyncWindowContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
+    Render, Styled, Subscription, WeakEntity, Window, div,
 };
 use project::git_store::{GitStore, GitStoreEvent, RepositoryId};
 use ui::prelude::*;
-use workspace::{
-    Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
-};
+use workspace::Workspace;
 
 use crate::GitGraph;
-
-actions!(
-    git_graph,
-    [
-        /// Toggles focus on the bottom-docked Git Graph panel.
-        ToggleGraphPanel,
-    ]
-);
-
-pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|workspace, _: &ToggleGraphPanel, window, cx| {
-            workspace.toggle_panel_focus::<GitGraphPanel>(window, cx);
-        });
-    })
-    .detach();
-}
 
 pub struct GitGraphPanel {
     workspace: WeakEntity<Workspace>,
@@ -159,8 +143,6 @@ impl Focusable for GitGraphPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for GitGraphPanel {}
-
 impl Render for GitGraphPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         match &self.graph {
@@ -173,49 +155,5 @@ impl Render for GitGraphPanel {
                 .child(Label::new("No active repository").color(Color::Muted))
                 .into_any_element(),
         }
-    }
-}
-
-impl Panel for GitGraphPanel {
-    fn persistent_name() -> &'static str {
-        "GitGraphPanel"
-    }
-
-    fn panel_key() -> &'static str {
-        "GitGraphPanel"
-    }
-
-    fn position(&self, _: &Window, _: &App) -> DockPosition {
-        DockPosition::Bottom
-    }
-
-    fn position_is_valid(&self, _: DockPosition) -> bool {
-        true
-    }
-
-    fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {
-        // Not persisted — the graph panel defaults to the bottom dock.
-    }
-
-    fn default_size(&self, _: &Window, _: &App) -> Pixels {
-        px(320.)
-    }
-
-    fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
-        Some(IconName::GitGraph)
-    }
-
-    fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
-        Some("Git Graph")
-    }
-
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleGraphPanel)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        // Must be unique across all panels (the dock asserts it). 1=project,
-        // 2=terminal, 3=git, 6=outline, 7=debug, 0=agent — 4 sits next to git.
-        4
     }
 }

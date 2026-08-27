@@ -1346,7 +1346,6 @@ impl GraphData {
 
 pub fn init(cx: &mut App) {
     workspace::register_serializable_item::<GitGraph>(cx);
-    git_graph_panel::init(cx);
     mcp::register(cx);
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {

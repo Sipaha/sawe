@@ -790,8 +790,11 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let console_panel = console_panel::ConsolePanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
-        // Sawe: the commit-log graph as a bottom-docked panel
-        // (IDEA-style "Git" tool window); still also openable as a pane item.
+        // Sawe: the commit-log graph as an occupant of the Solution band's
+        // utility section (phase 2b task 4), no longer a dock panel. Opening
+        // it as a pane item (`git_ui::git_panel::Open`, `git::FileHistory`)
+        // is a separate path through `git_graph::open_or_reuse_graph` and is
+        // unaffected.
         let git_graph_panel =
             git_graph::git_graph_panel::GitGraphPanel::load(workspace_handle.clone(), cx.clone());
         // Sawe: the upstream-style left-dock SolutionsPanel was
@@ -817,29 +820,32 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             }
         }
 
-        // Sawe: `ConsolePanel` hosts the Solution band's utility section
-        // (phase 2a task 6) rather than a dock panel, so it can't go through
-        // `add_panel_when_ready` above (that helper requires `T: Panel`,
-        // which `ConsolePanel` no longer implements — see
-        // `crates/console_panel/src/panel.rs`'s module doc). Installs into
-        // the same type-erased `Workspace::solution_band_utility_item` slot
+        // Sawe: the Solution band's utility section hosts its contents
+        // itself rather than a dock (phase 2a task 6 for the terminal, phase
+        // 2b task 4 for the git graph), so they can't go through
+        // `add_panel_when_ready` above — that helper requires `T: Panel`,
+        // which these types deliberately no longer implement (see
+        // `crates/console_panel/src/panel.rs` and
+        // `crates/git_graph/src/git_graph_panel.rs` module docs). Installs
+        // into the type-erased, `UtilityKind`-keyed
+        // `Workspace::solution_band_utility_item` map that
         // `SolutionBand::render` reads every frame.
-        async fn add_console_panel_when_ready(
-            panel_task: impl Future<Output = anyhow::Result<Entity<console_panel::ConsolePanel>>>
-            + 'static,
+        async fn add_utility_item_when_ready<T: Render>(
+            kind: UtilityKind,
+            item_task: impl Future<Output = anyhow::Result<Entity<T>>> + 'static,
             workspace_handle: WeakEntity<Workspace>,
             mut cx: gpui::AsyncWindowContext,
         ) {
-            if let Some(panel) = panel_task
+            if let Some(item) = item_task
                 .await
-                .context("failed to load console panel")
+                .context("failed to load solution band utility item")
                 .log_err()
             {
                 workspace_handle
                     .update_in(&mut cx, |workspace, window, cx| {
                         workspace.set_solution_band_utility_item(
-                            UtilityKind::Terminal,
-                            panel.into(),
+                            kind,
+                            item.into(),
                             window,
                             cx,
                         );
@@ -851,9 +857,19 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
-            add_console_panel_when_ready(console_panel, workspace_handle.clone(), cx.clone()),
+            add_utility_item_when_ready(
+                UtilityKind::Terminal,
+                console_panel,
+                workspace_handle.clone(),
+                cx.clone()
+            ),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(git_graph_panel, workspace_handle.clone(), cx.clone()),
+            add_utility_item_when_ready(
+                UtilityKind::GitGraph,
+                git_graph_panel,
+                workspace_handle.clone(),
+                cx.clone()
+            ),
             // add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             // Sawe: agent_panel disabled — this fork's AI story is the
