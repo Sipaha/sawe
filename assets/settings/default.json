@@ -2851,9 +2851,15 @@
     "stepping_granularity": "line",
     "save_breakpoints": true,
     "timeout": 2000,
+    // INERT in this fork. The debugger is hosted in the Solution band's
+    // utility section, not a dock, so it has no dock position to set.
+    // Kept in the schema so existing settings files stay valid.
     "dock": "bottom",
     "log_dap_communications": true,
     "format_dap_log_messages": true,
+    // INERT in this fork. This gated the debugger's dock-strip icon; the
+    // dock strips are gone and the band's utility contents get their own
+    // buttons. Kept in the schema so existing settings files stay valid.
     "button": true,
   },
   // Configures any number of settings profiles that are temporarily applied

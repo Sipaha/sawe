@@ -185,6 +185,11 @@ The settings for the debugger are grouped under the `debugger` key in `settings.
 
 ### Dock
 
+> **Inert in Sawe.** The debugger is hosted in the Solution band's utility
+> section rather than a dock, so it has no dock position to set. The setting
+> is still accepted (so existing settings files stay valid) but changing it
+> has no effect.
+
 - Description: The position of the debug panel in the UI.
 - Default: `bottom`
 - Setting: debugger.dock
@@ -260,6 +265,10 @@ The settings for the debugger are grouped under the `debugger` key in `settings.
 ```
 
 ### Button
+
+> **Inert in Sawe.** This gated the debugger's icon in the vertical dock
+> strips, which this fork no longer has. The setting is still accepted (so
+> existing settings files stay valid) but changing it has no effect.
 
 - Description: Whether the button should be displayed in the debugger toolbar.
 - Default: `true`

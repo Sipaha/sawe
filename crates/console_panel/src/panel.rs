@@ -58,14 +58,22 @@ pub fn console_panel_for_workspace(workspace: &Workspace) -> Option<Entity<Conso
         .ok()
 }
 
-/// Make the Solution band's utility section visible (without stealing
-/// focus) so a task's terminal output is actually on screen.
+/// Make the Solution band's utility section show **the terminal** (without
+/// stealing focus) so a task's output is actually on screen.
 /// `console_panel` already depends on `solution_agent` (for
 /// `SolutionAgentStore`), so unlike `SolutionBand` itself — which cannot
 /// hold a typed `Entity<ConsolePanel>` without creating a crate cycle — this
 /// direction is fine: downcast `Workspace::solution_band_item`'s `AnyView`
 /// straight to the concrete `SolutionBand` type. No-op if the band isn't
 /// installed (headless/test workspaces).
+///
+/// Selecting the kind is load-bearing, not belt-and-braces: `utility_kind`
+/// is persisted per Solution and the debugger writes it too (phase 2b task
+/// 5), so revealing only `utility_visible` would pop the band open on
+/// whatever was last shown. For a `RevealStrategy::Always` task that means
+/// focusing a terminal the user cannot see; for the debugger's own DAP
+/// `runInTerminal` request it would mean opening the band on the debugger
+/// instead of the terminal the adapter needs shown.
 fn reveal_utility_section(workspace: &Workspace, cx: &mut App) {
     let Some(band) = workspace
         .solution_band_item()
@@ -73,7 +81,10 @@ fn reveal_utility_section(workspace: &Workspace, cx: &mut App) {
     else {
         return;
     };
-    band.update(cx, |band, cx| band.set_utility_visible(true, cx));
+    band.update(cx, |band, cx| {
+        band.set_utility_kind(UtilityKind::Terminal, cx);
+        band.set_utility_visible(true, cx);
+    });
 }
 
 /// Whether this workspace has a project to run a terminal in — the gate on
@@ -1896,6 +1907,79 @@ mod tests {
             !band.read_with(cx, |band, cx| band.utility_visible(cx)),
             "a second ctrl-` on the focused section hides it again"
         );
+    }
+
+    /// Regression (phase 2b task 5 review, Critical 1): `utility_kind` is
+    /// PERSISTED per Solution, and the debugger became its first non-terminal
+    /// writer. If `ctrl-\`` only flipped `utility_visible`, a user who had
+    /// opened the debugger and then closed the band would reopen it **on the
+    /// debugger** while focus went to an unrendered `ConsolePanel` — leaving
+    /// the terminal unreachable by its own keybinding for the rest of that
+    /// Solution's life. The toggle must select `Terminal`, not merely reveal.
+    #[gpui::test]
+    async fn toggle_focus_selects_the_terminal_when_the_band_shows_another_kind(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (window_handle, _panel, _solution_id) = bootstrap_band_and_panel(cx, true).await;
+        let band = band_of(&window_handle, cx);
+
+        // Stand in for the debugger having claimed the section.
+        band.update(cx, |band, cx| {
+            band.set_utility_kind(UtilityKind::Debug, cx);
+            band.set_utility_visible(false, cx);
+        });
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            band.read_with(cx, |band, cx| band.utility_kind(cx)),
+            UtilityKind::Terminal,
+            "ctrl-` must point the utility section back at the terminal, not \
+             reopen it on whatever the debugger left behind"
+        );
+        assert!(
+            band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "and it must be visible"
+        );
+    }
+
+    /// Same hazard on the non-focusing path: `RevealStrategy::Always` /
+    /// `NoFocus` (task terminals, and the debugger's own DAP `runInTerminal`)
+    /// go through `reveal_utility_section`, which must also select the kind —
+    /// otherwise "reveal the terminal so the user can see the output" opens
+    /// the band on the debugger instead.
+    #[gpui::test]
+    async fn revealing_a_task_terminal_selects_the_terminal_kind(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, _panel, _solution_id) = bootstrap_band_and_panel(cx, true).await;
+        let band = band_of(&window_handle, cx);
+
+        band.update(cx, |band, cx| {
+            band.set_utility_kind(UtilityKind::Debug, cx);
+            band.set_utility_visible(false, cx);
+        });
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |workspace, _window, cx| {
+                reveal_utility_section(workspace, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            band.read_with(cx, |band, cx| band.utility_kind(cx)),
+            UtilityKind::Terminal,
+            "a revealed task terminal must actually be the thing on screen"
+        );
+        assert!(band.read_with(cx, |band, cx| band.utility_visible(cx)));
     }
 
     /// Regression: the empty-solution guard used to ask

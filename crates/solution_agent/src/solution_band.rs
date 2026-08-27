@@ -466,8 +466,8 @@ impl Render for SolutionBand {
         }
 
         let split = dialog.is_some() && utility_panel.is_some();
-        // Every occupant (terminal today; git graph and debug arrive in later
-        // tasks) inherits this instead of painting its own copy — neither
+        // Every occupant (terminal, git graph, debugger — all three have
+        // landed) inherits this instead of painting its own copy — neither
         // `Workspace::render` nor this element's parent paints a background,
         // so an occupant whose own content is empty (e.g. `ConsolePanel` with
         // no terminal in scope for the active member) must still read as an

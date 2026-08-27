@@ -21,7 +21,7 @@ use solution_agent::SolutionSessionId;
 use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
 use solution_agent::solution_band::SolutionBand;
 use solution_agent::store::SolutionAgentStore;
-use workspace::Workspace;
+use workspace::{UtilityKind, Workspace};
 
 pub use actions::{NewChat, NewTerminal, ShowSession, ToggleFocus};
 pub use panel::{ConsolePanel, ConsoleTab, console_panel_for_workspace};
@@ -56,6 +56,15 @@ pub fn init(cx: &mut gpui::App) {
 /// `solution_band`'s module doc) and the band itself from `Workspace`'s
 /// type-erased slots; a no-op if either hasn't been installed (e.g. a
 /// workspace with no Solution).
+///
+/// The "showing another kind" arm is not optional. `utility_kind` is
+/// persisted per Solution, and since phase 2b task 5 the debugger writes it
+/// (`debug_panel::ToggleFocus`, and the reveal when a session stops on a
+/// breakpoint). Without selecting `Terminal` here, a user who opened the
+/// debugger and then pressed `ctrl-\`` would reopen the band **on the
+/// debugger** while focus went to an unrendered `ConsolePanel`, and the
+/// terminal would be unreachable by its own keybinding for the rest of that
+/// Solution's life.
 fn handle_toggle_focus(
     workspace: &mut Workspace,
     _: &ToggleFocus,
@@ -73,7 +82,13 @@ fn handle_toggle_focus(
     };
     let focus_handle = console_panel.focus_handle(cx);
     band.update(cx, |band, cx| {
-        band.toggle_utility_focus(&focus_handle, window, cx);
+        if band.utility_kind(cx) != UtilityKind::Terminal {
+            band.set_utility_kind(UtilityKind::Terminal, cx);
+            band.set_utility_visible(true, cx);
+            focus_handle.focus(window, cx);
+        } else {
+            band.toggle_utility_focus(&focus_handle, window, cx);
+        }
     });
 }
 

@@ -1797,16 +1797,25 @@ impl Render for DebugPanel {
             // for those events, and the band's geometry is not this panel's
             // to change — `SolutionBand` owns it as one persisted row
             // (height + divider ratio) shared by all three utility
-            // contents, with no full-viewport mode for any of them. Swallow
-            // the action rather than let it propagate: the debugger's panes
-            // set `can_toggle_zoom(false)` and `cx.propagate()`, so without
-            // this handler `shift-escape` pressed inside the debugger would
-            // travel on and zoom whichever centre pane happened to be
-            // active. The zoom a user can actually see in the band is the
-            // per-pane expand button inside the session
-            // (`session::running`, also bound to `ToggleExpandItem`), which
-            // is self-contained and still works. If the band ever grows a
-            // maximise mode, this is its entry point.
+            // contents, with no full-viewport mode for any of them.
+            //
+            // Keeping an explicit empty handler rather than no handler is a
+            // readability choice, not a correctness one: dropping it would
+            // also be inert, because GPUI dispatches along the focus path to
+            // the root and no ancestor of the band handles `ToggleZoom`
+            // (`workspace.rs` only *declares* the action; the handlers are
+            // `Pane::toggle_zoom` — the debugger's own panes are
+            // descendants, and they `cx.propagate()` because
+            // `set_can_toggle_zoom(false)` — plus `agent_panel` and
+            // `terminal_panel`, neither an ancestor here). The handler
+            // exists so the answer to "what does zoom do in the band?" is
+            // written down at the point someone will look for it.
+            //
+            // The zoom a user can actually see in the band is the per-pane
+            // expand button inside the session (`session::running`, also
+            // bound to `ToggleExpandItem`), which is self-contained and
+            // still works. If the band ever grows a maximise mode, this is
+            // its entry point.
             .on_action(|_: &workspace::ToggleZoom, _window, _cx| {})
             .on_action(cx.listener(|panel, _: &ToggleExpandItem, _, cx| {
                 let Some(session) = panel.active_session() else {

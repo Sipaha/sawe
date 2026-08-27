@@ -3717,7 +3717,13 @@ fn search_and_files_page() -> SettingsPage {
 }
 
 fn window_and_layout_page() -> SettingsPage {
-    fn status_bar_section() -> [SettingsPageItem; 11] {
+    // Sawe: 11 items minus "Debugger Button". `debugger.button` gated the
+    // debugger's dock-strip icon; the debugger is hosted in the Solution
+    // band's utility section now (phase 2b task 5) and nothing reads the
+    // setting, so rendering a working-looking switch for it was a control
+    // that did nothing. The setting itself stays in the schema — deleting it
+    // is a migration this plan does not want.
+    fn status_bar_section() -> [SettingsPageItem; 10] {
         [
             SettingsPageItem::SectionHeader("Status Bar"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -3874,20 +3880,6 @@ fn window_and_layout_page() -> SettingsPage {
                             .search
                             .get_or_insert_default()
                             .button = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Debugger Button",
-                description: "Show the debugger button in the status bar.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("debugger.button"),
-                    pick: |settings_content| settings_content.debugger.as_ref()?.button.as_ref(),
-                    write: |settings_content, value, _| {
-                        settings_content.debugger.get_or_insert_default().button = value;
                     },
                 }),
                 metadata: None,
@@ -6083,26 +6075,6 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn debugger_panel_section() -> [SettingsPageItem; 2] {
-        [
-            SettingsPageItem::SectionHeader("Debugger Panel"),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Debugger Panel Dock",
-                description: "The dock position of the debug panel.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("debugger.dock"),
-                    pick: |settings_content| settings_content.debugger.as_ref()?.dock.as_ref(),
-                    write: |settings_content, value, _| {
-                        settings_content.debugger.get_or_insert_default().dock = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-        ]
-    }
-
     fn collaboration_panel_section() -> [SettingsPageItem; 4] {
         [
             SettingsPageItem::SectionHeader("Collaboration Panel"),
@@ -6319,7 +6291,9 @@ fn panels_page() -> SettingsPage {
             terminal_panel_section(),
             outline_panel_section(),
             git_panel_section(),
-            debugger_panel_section(),
+            // Sawe: no "Debugger Panel" section — the debugger is not a dock
+            // panel (phase 2b task 5), so `debugger.dock` steers nothing and
+            // a dock-position picker for it was a dead control.
             collaboration_panel_section(),
             agent_panel_section(),
         ],

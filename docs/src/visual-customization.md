@@ -107,7 +107,8 @@ To disable this behavior use:
   // "git_panel": {"button": false },
 
   // "agent": {"button": false },
-  // "debugger": {"button": false },
+  // "debugger": {"button": false },  // inert in Sawe: the debugger lives in
+                                      // the Solution band, not a dock strip
   // "diagnostics": {"button": false },
   // "search": {"button": false },
 }
