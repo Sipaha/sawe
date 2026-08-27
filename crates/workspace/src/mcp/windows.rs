@@ -1,12 +1,18 @@
 //! `windows.*` MCP tools — list/focus/close/resize/dispatch_action plus
 //! programmatic input (keystrokes, text, mouse click, hover) for autonomous
-//! UI testing.
+//! UI testing. `resize` is `#[cfg(debug_assertions)]`-gated (see its doc
+//! comment) — it never exists in a release binary.
 use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;
 use gpui::{
     App, AsyncApp, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, Size, TouchPhase, px,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, px,
 };
+// `Size` backs only `windows.resize` (`ResizeWindowTool::run`'s
+// `content_size`), which is `#[cfg(debug_assertions)]`-gated — importing it
+// unconditionally trips an unused-import warning in release builds.
+#[cfg(debug_assertions)]
+use gpui::Size;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -333,6 +339,17 @@ impl McpServerTool for CloseWindowTool {
 /// 1920x1080, which hides every "does this still fit on a short window"
 /// bug. Sizes are content size (what `windows.list` reports as bounds and
 /// what `Window::viewport_size` returns), not outer frame size.
+///
+/// `#[cfg(debug_assertions)]`-gated, same shape as
+/// `solution_agent.seed_cold_session`: `window.resize` fans out through
+/// `bounds_changed` to `Workspace`'s bounds observer, which debounces and
+/// then persists the new geometry via `save_window_bounds` — so this tool
+/// would otherwise let an agent overwrite the *live* window-bounds DB row
+/// on a release editor (e.g. resize to 1280x200 to repro a layout bug, and
+/// the next open of that workspace restores a 200px-tall window). Compiling
+/// it out of release builds closes that at the root rather than trying to
+/// suppress the persistence side-effect.
+#[cfg(debug_assertions)]
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ResizeWindowParams {
     pub window_id: String,
@@ -340,6 +357,7 @@ pub struct ResizeWindowParams {
     pub height: f32,
 }
 
+#[cfg(debug_assertions)]
 impl<'de> Deserialize<'de> for ResizeWindowParams {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         #[derive(Deserialize, Default)]
@@ -358,8 +376,14 @@ impl<'de> Deserialize<'de> for ResizeWindowParams {
     }
 }
 
+#[cfg(debug_assertions)]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ResizeWindowResult {
+    /// Whether the window's actual post-resize content size matches the
+    /// requested `width` x `height` exactly. A window manager may refuse or
+    /// clamp the request, so `false` here means the platform didn't honor it
+    /// — check `width`/`height` (the verified, read-back values) for what
+    /// actually happened.
     pub resized: bool,
     /// The window's content size after the resize, read back from the
     /// platform. A window manager may refuse or adjust the request, so this
@@ -368,9 +392,39 @@ pub struct ResizeWindowResult {
     pub height: f32,
 }
 
+/// Validates `windows.resize` input ahead of touching the platform window.
+/// Split out from `ResizeWindowTool::run` so the bounds can be unit-tested
+/// without spinning up an `AsyncApp`/window.
+#[cfg(debug_assertions)]
+fn validate_resize_dimensions(width: f32, height: f32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        width.is_finite() && height.is_finite(),
+        "width and height must be finite numbers"
+    );
+    anyhow::ensure!(
+        width >= 1.0 && height >= 1.0,
+        "width and height must be at least 1 logical pixel (got {} x {})",
+        width,
+        height
+    );
+    // 8192 is comfortably under the common 16384 max-texture-dimension limit
+    // on typical wgpu adapters, and far past any real window — without this
+    // a `windows.screenshot` after an oversized resize hits a wgpu
+    // validation failure instead of a clean `bail!` here.
+    anyhow::ensure!(
+        width <= 8192.0 && height <= 8192.0,
+        "width and height must be at most 8192 logical pixels (got {} x {})",
+        width,
+        height
+    );
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 #[derive(Clone)]
 pub struct ResizeWindowTool;
 
+#[cfg(debug_assertions)]
 impl McpServerTool for ResizeWindowTool {
     type Input = ResizeWindowParams;
     type Output = ResizeWindowResult;
@@ -381,16 +435,7 @@ impl McpServerTool for ResizeWindowTool {
         input: Self::Input,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<ToolResponse<Self::Output>> {
-        anyhow::ensure!(
-            input.width.is_finite() && input.height.is_finite(),
-            "width and height must be finite numbers"
-        );
-        anyhow::ensure!(
-            input.width >= 1.0 && input.height >= 1.0,
-            "width and height must be at least 1 logical pixel (got {} x {})",
-            input.width,
-            input.height
-        );
+        validate_resize_dimensions(input.width, input.height)?;
         let size = gpui::size(px(input.width), px(input.height));
         let content_size = cx.update(|cx| -> anyhow::Result<Size<Pixels>> {
             let handle = find_window_by_id(&input.window_id, cx)?;
@@ -412,12 +457,13 @@ impl McpServerTool for ResizeWindowTool {
             f32::from(content_size.width),
             f32::from(content_size.height),
         );
+        let resized = width == input.width && height == input.height;
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: format!("resized: {width} x {height}"),
             }],
             structured_content: ResizeWindowResult {
-                resized: true,
+                resized,
                 width,
                 height,
             },
@@ -1511,6 +1557,7 @@ mod tests {
         assert_eq!(p.window_id, "window:7");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn resize_params_round_trip() {
         let p: ResizeWindowParams = serde_json::from_value(serde_json::json!({
@@ -1524,6 +1571,7 @@ mod tests {
         assert_eq!(p.height, 384.0);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn resize_params_accept_integer_json_numbers() {
         let p: ResizeWindowParams = serde_json::from_value(serde_json::json!({
@@ -1535,12 +1583,47 @@ mod tests {
         assert_eq!(p.height, 384.0);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn resize_params_accepts_null() {
         let p: ResizeWindowParams =
             serde_json::from_value(serde_json::Value::Null).expect("null accepted");
         assert!(p.window_id.is_empty());
         assert_eq!(p.width, 0.0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn resize_validate_accepts_in_range_dimensions() {
+        validate_resize_dimensions(1.0, 1.0).expect("min bound accepted");
+        validate_resize_dimensions(8192.0, 8192.0).expect("max bound accepted");
+        validate_resize_dimensions(1280.0, 200.0).expect("typical size accepted");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn resize_validate_rejects_below_lower_bound() {
+        let err = validate_resize_dimensions(0.5, 100.0).unwrap_err();
+        assert!(err.to_string().contains("at least 1 logical pixel"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn resize_validate_rejects_above_upper_bound() {
+        let err = validate_resize_dimensions(20000.0, 20000.0).unwrap_err();
+        assert!(err.to_string().contains("at most 8192 logical pixels"));
+
+        let err = validate_resize_dimensions(100.0, 8192.1).unwrap_err();
+        assert!(err.to_string().contains("at most 8192 logical pixels"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn resize_validate_rejects_non_finite() {
+        let err = validate_resize_dimensions(f32::NAN, 100.0).unwrap_err();
+        assert!(err.to_string().contains("finite"));
+        let err = validate_resize_dimensions(f32::INFINITY, 100.0).unwrap_err();
+        assert!(err.to_string().contains("finite"));
     }
 
     #[test]

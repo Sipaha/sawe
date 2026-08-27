@@ -221,7 +221,11 @@ const GLOBAL_TOOLS: &[&str] = &[
     "windows.list",
     "windows.focus",
     "windows.close",
-    "windows.resize",
+    // "windows.resize" is deliberately absent here: it's
+    // `#[cfg(debug_assertions)]`-gated (crates/workspace/src/mcp/windows.rs)
+    // and doesn't exist as a tool at all in a release build, so it can't be
+    // an unconditional entry in this const list — see `is_global_tool` below
+    // for the debug-only branch that adds it back.
     "windows.dispatch_action",
     "windows.send_keystroke",
     "windows.send_text",
@@ -285,6 +289,15 @@ const GLOBAL_TOOLS: &[&str] = &[
 /// exactly this against `is_global_tool` to stop a forwarded-but-not-global
 /// tool ("Tool not found" on the phone) from shipping again.
 pub fn is_global_tool(name: &str) -> bool {
+    // "windows.resize" only exists as a registered tool in debug builds
+    // (`#[cfg(debug_assertions)]` in crates/workspace/src/mcp/windows.rs and
+    // its registration site) — a release editor never has a tool by that
+    // name for this to even match against, so gating the check the same way
+    // just keeps the two in sync rather than changing any release behavior.
+    #[cfg(debug_assertions)]
+    if name == "windows.resize" {
+        return true;
+    }
     GLOBAL_TOOLS.contains(&name)
 }
 
