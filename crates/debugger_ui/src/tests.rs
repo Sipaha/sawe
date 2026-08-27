@@ -8,7 +8,7 @@ use gpui::{Entity, TestAppContext, WindowHandle};
 use project::{Project, debugger::session::Session};
 use settings::SettingsStore;
 use task::SharedTaskContext;
-use workspace::MultiWorkspace;
+use workspace::{MultiWorkspace, UtilityKind};
 
 use crate::{debugger_panel::DebugPanel, session::DebugSession};
 
@@ -94,7 +94,12 @@ pub async fn init_test_workspace(
                 // (phase 2a task 6), not a dock panel — install it into the
                 // same type-erased slot `zed.rs` uses in production so tests
                 // exercise the real lookup path (`console_panel_for_workspace`).
-                workspace.set_solution_band_utility_item(terminal_panel.into(), window, cx);
+                workspace.set_solution_band_utility_item(
+                    UtilityKind::Terminal,
+                    terminal_panel.into(),
+                    window,
+                    cx,
+                );
             });
         })
         .unwrap();

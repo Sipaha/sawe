@@ -25,12 +25,15 @@
 //! the window.
 //!
 //! The utility section's content comes from `Workspace::solution_band_utility_item`,
-//! a type-erased `AnyView` slot set by `zed.rs` — NOT a typed
-//! `Entity<ConsolePanel>` field on this struct, because `console_panel`
-//! already depends on `solution_agent` (for `SolutionAgentStore`); the
-//! reverse dependency this struct would otherwise need would cycle. This
-//! band reads the slot fresh every render instead of caching a copy, so it
-//! never goes stale relative to whatever `zed.rs` last installed there.
+//! a type-erased `AnyView` slot keyed by `UtilityKind` and set by `zed.rs`
+//! — NOT a typed `Entity<ConsolePanel>` field on this struct, because
+//! `console_panel` already depends on `solution_agent` (for
+//! `SolutionAgentStore`); the reverse dependency this struct would
+//! otherwise need would cycle. This band reads the slot fresh every render
+//! instead of caching a copy, so it never goes stale relative to whatever
+//! `zed.rs` last installed there. As of phase 2b task 1 the slot holds one
+//! entry per kind (terminal / git graph / debug), but `render` still always
+//! asks for `UtilityKind::Terminal` — the switch between kinds is task 2.
 //!
 //! Installed from `crates/zed/src/zed.rs` (NOT `title_bar`, which cannot
 //! depend on `solution_agent` — see the `SessionTabStrip` install a few
@@ -65,7 +68,7 @@ use project::Project;
 use solutions::{SolutionId, SolutionStore};
 use ui::h_flex;
 use ui::prelude::ActiveTheme as _;
-use workspace::Workspace;
+use workspace::{UtilityKind, Workspace};
 
 use crate::model::{
     BandState, DEFAULT_BAND_HEIGHT, DEFAULT_DIVIDER_RATIO, SolutionSessionId, clamp_band_height,
@@ -141,14 +144,15 @@ impl SolutionBand {
         }
     }
 
-    /// The utility section's content, fresh off `Workspace::solution_band_utility_item`
-    /// — see the module doc for why this isn't a typed field on `Self`.
-    /// Reads the Workspace entity, so this is `render`-only.
-    fn utility_panel(&self, cx: &App) -> Option<AnyView> {
+    /// The utility section's content for `kind`, fresh off
+    /// `Workspace::solution_band_utility_item` — see the module doc for why
+    /// this isn't a typed field on `Self`. Reads the Workspace entity, so
+    /// this is `render`-only.
+    fn utility_panel(&self, kind: UtilityKind, cx: &App) -> Option<AnyView> {
         self.workspace
             .upgrade()?
             .read(cx)
-            .solution_band_utility_item()
+            .solution_band_utility_item(kind)
     }
 
     /// This band's geometry: the owning Solution's persisted row, or the
@@ -403,7 +407,10 @@ impl Render for SolutionBand {
         let solution_id = self.solution_id(cx);
         let state = self.band_state(cx);
         let utility_panel = if state.utility_visible {
-            self.utility_panel(cx)
+            // Phase 2b task 1: the slot is keyed by kind now, but the
+            // switch between kinds arrives in task 2 — always ask for the
+            // terminal, so end-to-end behaviour is unchanged.
+            self.utility_panel(UtilityKind::Terminal, cx)
         } else {
             None
         };

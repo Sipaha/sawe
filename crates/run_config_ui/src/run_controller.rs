@@ -1175,7 +1175,12 @@ mod tests {
             .update(cx, |_, window, cx| {
                 let panel = cx.new(|cx| ConsolePanel::new(workspace.downgrade(), cx));
                 workspace.update(cx, |workspace, cx| {
-                    workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
+                    workspace.set_solution_band_utility_item(
+                        workspace::UtilityKind::Terminal,
+                        panel.clone().into(),
+                        window,
+                        cx,
+                    );
                 });
                 panel
             })

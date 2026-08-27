@@ -18,7 +18,7 @@ use terminal_view::TerminalView;
 use terminal_view::terminal_panel::prepare_task_for_spawn;
 use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::{Item, Workspace, WorkspaceDb};
+use workspace::{Item, UtilityKind, Workspace, WorkspaceDb};
 
 use crate::TerminalProvider;
 use crate::actions::NewChat;
@@ -53,7 +53,7 @@ pub fn active_solution_id_for_workspace(workspace: &Workspace, cx: &App) -> Opti
 /// Solution band installed at all.
 pub fn console_panel_for_workspace(workspace: &Workspace) -> Option<Entity<ConsolePanel>> {
     workspace
-        .solution_band_utility_item()?
+        .solution_band_utility_item(UtilityKind::Terminal)?
         .downcast::<ConsolePanel>()
         .ok()
 }
@@ -1780,7 +1780,12 @@ mod tests {
                     SolutionBand::new(workspace.weak_handle(), workspace.project().clone(), cx)
                 });
                 workspace.set_solution_band_item(band.into(), window, cx);
-                workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
+                workspace.set_solution_band_utility_item(
+                    UtilityKind::Terminal,
+                    panel.clone().into(),
+                    window,
+                    cx,
+                );
                 panel
             })
             .unwrap();
@@ -2183,7 +2188,12 @@ mod tests {
 
         window_handle
             .update(cx, |workspace, window, cx| {
-                workspace.set_solution_band_utility_item(panel.clone().into(), window, cx);
+                workspace.set_solution_band_utility_item(
+                    UtilityKind::Terminal,
+                    panel.clone().into(),
+                    window,
+                    cx,
+                );
                 assert!(
                     console_panel_for_workspace(workspace).is_some(),
                     "ConsolePanel should be retrievable via console_panel_for_workspace(workspace) \

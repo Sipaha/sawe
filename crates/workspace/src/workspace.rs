@@ -1373,6 +1373,37 @@ struct DispatchingKeystrokes {
     task: Option<Shared<Task<()>>>,
 }
 
+/// Which content currently occupies the Solution band's utility section
+/// (`Workspace::solution_band_utility_item`). Defined here, not in the
+/// crate that owns each occupant (`console_panel`, `git_graph`,
+/// `debugger_ui`), because `workspace` must not depend on any of them —
+/// see that field's doc comment for the dependency-cycle reasoning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UtilityKind {
+    Terminal,
+    GitGraph,
+    Debug,
+}
+
+impl UtilityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UtilityKind::Terminal => "terminal",
+            UtilityKind::GitGraph => "git_graph",
+            UtilityKind::Debug => "debug",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "terminal" => Some(UtilityKind::Terminal),
+            "git_graph" => Some(UtilityKind::GitGraph),
+            "debug" => Some(UtilityKind::Debug),
+            _ => None,
+        }
+    }
+}
+
 /// Collects everything project-related for a certain window opened.
 /// In some way, is a counterpart of a window, as the [`WindowHandle`] could be downcast into `Workspace`.
 ///
@@ -1407,18 +1438,20 @@ pub struct Workspace {
     /// Populated by the crate that owns the band, the same way `title_bar`
     /// populates `project_toolbar_item`: `workspace` cannot depend on it.
     solution_band_item: Option<AnyView>,
-    /// The band's utility section content (the terminal panel, phase 2a task
-    /// 6) — a second, independent slot from `solution_band_item` because the
+    /// The band's utility section content, keyed by `UtilityKind` — a
+    /// second, independent slot set from `solution_band_item` because the
     /// crate that owns the band (`solution_agent`) cannot depend on the
-    /// crate that owns the terminal panel (`console_panel`; the edge already
-    /// runs the other way — see `console_panel`'s own dependency on
-    /// `solution_agent` for `SolutionAgentStore`). `zed.rs`, which depends on
-    /// both, sets this alongside `solution_band_item`; `SolutionBand::render`
-    /// reads it fresh each frame instead of caching a copy. Any other crate
-    /// that needs the concrete `Entity<ConsolePanel>` (run-configuration
-    /// output, the inline assistant) downcasts this `AnyView` — mirrors
-    /// `run_config_controller`'s `AnyEntity` downcast below.
-    solution_band_utility_item: Option<AnyView>,
+    /// crates that own each occupant (`console_panel`, `git_graph`,
+    /// `debugger_ui`; the edge already runs the other way — see
+    /// `console_panel`'s own dependency on `solution_agent` for
+    /// `SolutionAgentStore`). `zed.rs`, which depends on all of them, sets
+    /// entries here alongside `solution_band_item`; `SolutionBand::render`
+    /// reads the entry for the kind it wants to show fresh each frame
+    /// instead of caching a copy. Any other crate that needs the concrete
+    /// `Entity<ConsolePanel>` (run-configuration output, the inline
+    /// assistant) downcasts the `AnyView` for `UtilityKind::Terminal` —
+    /// mirrors `run_config_controller`'s `AnyEntity` downcast below.
+    solution_band_utility_item: HashMap<UtilityKind, AnyView>,
     run_config_strip: Option<AnyView>,
     run_config_controller: Option<AnyEntity>,
     notifications: Notifications,
@@ -1890,7 +1923,7 @@ impl Workspace {
             titlebar_item: None,
             project_toolbar_item: None,
             solution_band_item: None,
-            solution_band_utility_item: None,
+            solution_band_utility_item: HashMap::default(),
             run_config_strip: None,
             run_config_controller: None,
             notifications: Notifications::default(),
@@ -3169,11 +3202,12 @@ impl Workspace {
 
     pub fn set_solution_band_utility_item(
         &mut self,
+        kind: UtilityKind,
         item: AnyView,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.solution_band_utility_item = Some(item);
+        self.solution_band_utility_item.insert(kind, item);
         cx.notify();
     }
 
@@ -3350,8 +3384,8 @@ impl Workspace {
         self.solution_band_item.clone()
     }
 
-    pub fn solution_band_utility_item(&self) -> Option<AnyView> {
-        self.solution_band_utility_item.clone()
+    pub fn solution_band_utility_item(&self, kind: UtilityKind) -> Option<AnyView> {
+        self.solution_band_utility_item.get(&kind).cloned()
     }
 
     /// Call the given callback with a workspace whose project is local or remote via WSL (allowing host access).
@@ -11412,6 +11446,69 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.set_solution_band_item(band.clone().into(), window, cx);
             assert!(workspace.solution_band_item().is_some());
+        });
+    }
+
+    // Round-trips `set_solution_band_utility_item`/`solution_band_utility_item`
+    // now that the slot is keyed by `UtilityKind` (phase 2b task 1): each
+    // kind is an independent entry, so setting one does not populate — or
+    // clobber — another, and an unset kind reads back `None`.
+    #[gpui::test]
+    async fn solution_band_utility_item_is_keyed_by_kind(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, _window, _cx| {
+            assert!(
+                workspace
+                    .solution_band_utility_item(UtilityKind::Terminal)
+                    .is_none(),
+                "a fresh workspace has no utility item for any kind"
+            );
+            assert!(
+                workspace
+                    .solution_band_utility_item(UtilityKind::GitGraph)
+                    .is_none()
+            );
+        });
+
+        let terminal_probe = cx.new(|_| BandProbe);
+        let git_graph_probe = cx.new(|_| BandProbe);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_solution_band_utility_item(
+                UtilityKind::Terminal,
+                terminal_probe.clone().into(),
+                window,
+                cx,
+            );
+            workspace.set_solution_band_utility_item(
+                UtilityKind::GitGraph,
+                git_graph_probe.clone().into(),
+                window,
+                cx,
+            );
+
+            assert!(
+                workspace
+                    .solution_band_utility_item(UtilityKind::Terminal)
+                    .is_some(),
+                "terminal entry reads back independently"
+            );
+            assert!(
+                workspace
+                    .solution_band_utility_item(UtilityKind::GitGraph)
+                    .is_some(),
+                "git-graph entry reads back independently"
+            );
+            assert!(
+                workspace
+                    .solution_band_utility_item(UtilityKind::Debug)
+                    .is_none(),
+                "an unset kind still reads None even once other kinds are populated"
+            );
         });
     }
 

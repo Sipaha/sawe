@@ -93,7 +93,7 @@ use vim_mode_setting::VimModeSetting;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 
 use workspace::{
-    AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, Toast, Workspace,
+    AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, Toast, UtilityKind, Workspace,
     WorkspaceSettings, create_and_open_local_file,
     notifications::simple_message_notification::MessageNotification, open_new,
 };
@@ -837,7 +837,12 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             {
                 workspace_handle
                     .update_in(&mut cx, |workspace, window, cx| {
-                        workspace.set_solution_band_utility_item(panel.into(), window, cx);
+                        workspace.set_solution_band_utility_item(
+                            UtilityKind::Terminal,
+                            panel.into(),
+                            window,
+                            cx,
+                        );
                     })
                     .log_err();
             }
