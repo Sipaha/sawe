@@ -1232,8 +1232,16 @@ the window from a laptop panel to an external monitor and the band keeps its pix
 proportion. `DEFAULT_BAND_HEIGHT = 320` (also what double-clicking the top edge restores), `MAX_BAND_HEIGHT =
 4096` guards only a corrupt or hand-edited row.
 
-**The window-relative ceiling (`MAX_BAND_HEIGHT_FRACTION = 0.8`) is applied at render, as a pure function of
-(stored height, live viewport height), and never persisted.** The tempting shape — notice during layout that the
+**The window-relative ceiling (`MAX_BAND_HEIGHT_FRACTION = 0.8`, floored by `viewport - BAND_RESERVED_HEIGHT`)
+is applied at render, as a pure function of (stored height, live viewport height), and never persisted.**
+The fraction alone is not enough, because it is a fraction of the *whole window* while the band only competes
+for what is left after the chrome: title bar 30 + project toolbar 30 + status bar 30 + two 1px workspace
+borders. The band is `flex_none`; the project zone is `flex_1` with basis 0 (shrinks to 0 first) and the status
+bar is a plain 30px row with the default `flex-shrink: 1` — so an over-tall band zeroes the editor and then eats
+the status bar. That happens for every window shorter than ~460px (`0.8H + 30 > H - 62`), which is reachable:
+`window_min_size` is 240. Hence `BAND_RESERVED_HEIGHT = 150` (~92px of chrome + ~58px so the project zone is
+still an editor rather than a hairline); re-derive it if any chrome height changes. Below ~290px of window the
+reserve and `MIN_BAND_HEIGHT` cannot both hold and the floor deliberately wins. The tempting shape — notice during layout that the
 band no longer fits, clamp it, and save the clamped value — cannot work here: `Window::invalidate_view` returns
 `false` and pushes no `Effect::Notify` while `draw_phase != DrawPhase::None`, so a `cx.notify()` raised from
 `request_layout` / `prepaint` / `paint` is silently *discarded*, not deferred (`docs/findings/2026-08-17-gpui-

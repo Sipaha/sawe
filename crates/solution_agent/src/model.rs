@@ -1206,11 +1206,24 @@ pub const MIN_BAND_HEIGHT: f32 = 140.0;
 pub const DEFAULT_BAND_HEIGHT: f32 = 320.0;
 /// Hard ceiling applied to a stored value, independent of any window. Only
 /// guards a corrupt or hand-edited row; the real ceiling is the viewport
-/// fraction below, applied at render.
+/// fraction / reserve below, applied at render.
 pub const MAX_BAND_HEIGHT: f32 = 4096.0;
 /// Most of the window the band may occupy, leaving the project zone
 /// something to be. Applied at render against the live viewport.
 pub const MAX_BAND_HEIGHT_FRACTION: f32 = 0.8;
+/// Window height the band must leave behind, in logical pixels, on top of
+/// the fraction cap. A pure fraction of the viewport is not enough on a
+/// short window: the band is a `flex_none` sibling of the project zone
+/// (`flex_1`, basis 0 — shrinks to 0 first) and of the status bar (30px
+/// but *shrinkable*, not `flex_none`), so an over-tall band zeroes the
+/// project zone and then eats into the status bar.
+///
+/// Derivation: ~92px of chrome the band never gets — title bar 30
+/// (`title_bar::fork_height`), project toolbar 30, status bar 30, plus the
+/// two 1px workspace borders — and ~58px more so the project zone is still
+/// an editor rather than a hairline. Re-derive this if any of those chrome
+/// heights change.
+pub const BAND_RESERVED_HEIGHT: f32 = 150.0;
 
 /// Clamp a stored band height into the range a row may hold. Mirrors
 /// `clamp_divider_ratio`, including the NaN fold: `f32::clamp` propagates
@@ -1229,7 +1242,13 @@ pub fn clamp_band_height(height: f32) -> f32 {
 /// plan's Global Constraints) and because a temporarily-shrunk window must
 /// not permanently shrink the user's saved geometry.
 pub fn effective_band_height(stored: f32, viewport_height: f32) -> f32 {
-    let ceiling = (viewport_height * MAX_BAND_HEIGHT_FRACTION).max(MIN_BAND_HEIGHT);
+    // The `.max(MIN_BAND_HEIGHT)` is a deliberate floor, not an oversight:
+    // below roughly 290px of window (150 reserved + a 140px band) the two
+    // constraints cannot both hold, and a usable band wins over a usable
+    // project zone. At that size the window is unusable either way.
+    let ceiling = (viewport_height * MAX_BAND_HEIGHT_FRACTION)
+        .min(viewport_height - BAND_RESERVED_HEIGHT)
+        .max(MIN_BAND_HEIGHT);
     clamp_band_height(stored).min(ceiling)
 }
 
