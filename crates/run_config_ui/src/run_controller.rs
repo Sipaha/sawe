@@ -1159,8 +1159,9 @@ mod tests {
         })
     }
 
-    /// Install a real `ConsolePanel` into `Workspace::solution_band_utility_item`
-    /// — the type-erased slot `zed.rs` uses — so `console_panel_for_workspace`
+    /// Install a real `ConsolePanel` under `UtilityKind::Terminal` in
+    /// `Workspace::solution_band_utility_item` — the type-erased map keyed by
+    /// content kind that `zed.rs` uses — so `console_panel_for_workspace`
     /// finds it and `run` takes the real-panel branch instead of the headless
     /// `spawn_in_terminal` fallback. Mirrors
     /// `console_panel::panel::tests::bootstrap_panel`.

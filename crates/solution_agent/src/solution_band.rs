@@ -440,11 +440,23 @@ impl Render for SolutionBand {
         }
 
         let split = dialog.is_some() && utility_panel.is_some();
+        // Every occupant (terminal today; git graph and debug arrive in later
+        // tasks) inherits this instead of painting its own copy — neither
+        // `Workspace::render` nor this element's parent paints a background,
+        // so an occupant whose own content is empty (e.g. `ConsolePanel` with
+        // no terminal in scope for the active member) must still read as an
+        // opaque half rather than a transparent slab over whatever is behind
+        // the band. Read out of `cx` before the closure below borrows it
+        // mutably via `cx.listener` further down in this render call.
+        let half_background = cx.theme().colors().panel_background;
         // `flex_basis` fractions only when there are two halves to divide;
         // a lone half takes the whole band regardless of the stored ratio, so
         // hiding the other side never leaves a dead gutter.
         let half = |content: AnyView, fraction: f32| {
-            let half = div().min_w_0().overflow_hidden();
+            let half = div()
+                .min_w_0()
+                .overflow_hidden()
+                .bg(half_background);
             if split {
                 half.flex_shrink_1()
                     .flex_basis(DefiniteLength::Fraction(fraction))

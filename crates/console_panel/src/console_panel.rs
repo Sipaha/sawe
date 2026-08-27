@@ -1,8 +1,9 @@
 //! Terminal tab strip hosted in the Solution band's utility section
 //! (`solution_agent::solution_band`, phase 2a task 6) — NOT a dock panel;
 //! `ConsolePanel` keeps `Render`/`Focusable` but has no `Panel` impl.
-//! `Workspace::solution_band_utility_item` is the type-erased slot `zed.rs`
-//! installs it into and the one other crates resolve it back out of via
+//! `Workspace::solution_band_utility_item` is the type-erased map, keyed by
+//! `UtilityKind`, that `zed.rs` installs it into under `UtilityKind::Terminal`
+//! and the one other crates resolve it back out of via
 //! `console_panel_for_workspace` (decision 91 in `FORK.md`). AI-chat
 //! sessions used to live here too; phase 2a task 5 moved them to the
 //! Solution band's dialog half + the status-bar
