@@ -1358,3 +1358,56 @@ async fn a_band_row_without_band_height_loads_as_the_default(cx: &mut gpui::Test
     );
     assert!(state.utility_visible);
 }
+
+/// The shape the migration actually runs against: a phase-2a
+/// `solution_band_state` table with only four columns, holding a real row.
+/// `a_band_row_without_band_height_loads_as_the_default` above inserts into a
+/// *fresh* table whose `band_height` came from `CREATE TABLE`, so it proves
+/// the column default, not the `ALTER TABLE … ADD COLUMN` backfill — and the
+/// 4-column shape is exactly what every existing install (including the
+/// maintainer's) has on disk. Built on a raw connection, following the
+/// `seed_legacy_sessions` / `migrate_identity_*` precedent.
+#[gpui::test]
+async fn a_pre_migration_band_table_gains_band_height_on_open(cx: &mut gpui::TestAppContext) {
+    let connection = Connection::open_memory(Some("SOLUTION_AGENT_BAND_MIGRATION_TEST"));
+    connection
+        .exec(
+            "CREATE TABLE solution_band_state (
+                solution_id           INTEGER PRIMARY KEY,
+                divider_ratio         REAL    NOT NULL,
+                utility_visible       INTEGER NOT NULL,
+                active_dialog_session TEXT
+            )",
+        )
+        .expect("prepare pre-migration table")()
+    .expect("create pre-migration table");
+    connection
+        .exec(
+            "INSERT INTO solution_band_state
+                (solution_id, divider_ratio, utility_visible, active_dialog_session)
+             VALUES (42, 0.35, 1, NULL)",
+        )
+        .expect("prepare pre-migration row")()
+    .expect("insert pre-migration row");
+
+    let db = SolutionAgentDb::open_connection(cx.executor(), connection)
+        .expect("open over the pre-migration schema");
+
+    let bands = db.load_band_states().await.expect("load band states");
+    let (_, state) = bands
+        .into_iter()
+        .find(|(id, _)| *id == SolutionId(42))
+        .expect("the pre-migration row survives the migration");
+    assert_eq!(
+        state.height, DEFAULT_BAND_HEIGHT,
+        "ADD COLUMN … NOT NULL DEFAULT 320 must backfill the existing row"
+    );
+    assert_eq!(
+        state.divider_ratio, 0.35,
+        "the migration must not disturb the row's persisted divider position"
+    );
+    assert!(
+        state.utility_visible,
+        "the migration must not disturb the row's persisted utility visibility"
+    );
+}
