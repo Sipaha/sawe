@@ -25,15 +25,21 @@ use time::{UtcOffset, format_description::BorrowedFormatItem};
 
 /// Left step of a Commit tab file row, measured from its directory header.
 ///
-/// The graph sidebar this tab replaced stepped its file rows in by
-/// `18px + ProjectPanelSettings::indent_size` (38px at the shipped default).
-/// `git_ui` cannot read that setting — `project_panel` depends on `git_ui`, so
-/// the reverse is a dependency cycle — so the panel's own `TREE_INDENT` stands
-/// in for the project panel's step. The leading 18px is the directory header's
-/// chevron (14px) plus its gap (4px), which a file row has no equivalent of;
-/// dropping it and using a bare `TREE_INDENT` would be a 22px regression
-/// against the tree that shipped before.
-const COMMIT_TREE_INDENT: f32 = 18.0 + TREE_INDENT;
+/// The number is chosen so the file row's *painted* content edge — the status
+/// glyph — lands on the same column as the Changes tab's, which is what the
+/// eye actually tracks. Matching the two padding boxes is not enough: a
+/// Changes row spends a 14px chevron slot and a 6px gap between its padding
+/// edge and its first glyph, while a Commit row paints straight at its own.
+/// So the step is the Changes tab's content edge, less the 4px `ButtonLike`
+/// puts inside every Commit row:
+///
+/// `1px row border + content_row_padding(0) + 14px chevron + 6px gap - 4px`.
+///
+/// The `ButtonLike` 4px is `DynamicSpacing::Base04`, which is rems-based, so
+/// the two trees line up exactly on stock density and font size and drift a
+/// couple of pixels otherwise. `content_row_padding(0)` rather than `(1)`:
+/// `tree_view` ships `false`, so every Changes file row is at depth 0.
+const COMMIT_TREE_INDENT: f32 = 1.0 + ROW_LEFT_PADDING + SECTION_CONTENT_INDENT + 14.0 + 6.0 - 4.0;
 
 /// Cap on the Commit tab's message block *when there is room for it*.
 ///
