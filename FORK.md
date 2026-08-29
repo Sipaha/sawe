@@ -1331,6 +1331,104 @@ terminal-only now and the button is labelled "Terminal". `GitGraph` and `Debug` 
 so the affordance those two users learned survives verbatim.
 
 
+### 96. The band's utility slot is a `HashMap<UtilityKind, AnyView>` on `Workspace`, and `UtilityKind` is defined in `workspace`
+
+Phase 2a gave the band a single `solution_band_utility_item: Option<AnyView>` holding the terminal.
+Phase 2b needed three interchangeable occupants, so the slot became keyed:
+`HashMap<UtilityKind, AnyView>` plus a `HashSet<UtilityKind>` of kinds whose load *resolved with an error*
+(decision 95 explains why absence is not the same as failure).
+
+**Why the map lives on `Workspace` rather than on `SolutionBand`, which is the thing that renders it.**
+The band lives in `solution_agent`, which cannot depend on `console_panel` / `git_graph` / `debugger_ui` —
+the edge already runs the other way, since all three depend on `solution_agent` for `SolutionAgentStore`.
+So the band can never be handed a typed occupant. `Workspace` can hold them only because they are erased to
+`AnyView`, and `zed.rs` — the one crate that depends on all of them — is the only place that can do the
+erasing. The map is therefore on `Workspace` for the same reason `project_toolbar_item` is: it is the shared
+surface both the producer and the consumer can already see. `SolutionBand::render` looks up the selected
+kind fresh every frame rather than caching a handle, so an occupant that installs late is picked up with no
+invalidation plumbing at all.
+
+**`UtilityKind` is defined in `workspace`, not in a new shared crate and not in `solution_agent`.** It is
+the map's key, so `workspace` must name it; and `workspace` must not depend on the occupant crates, so it
+cannot be re-exported from any of them. Putting it in `solution_agent` would make `workspace` depend on
+`solution_agent`, inverting the existing edge. It is a three-variant enum with a string form for the DB
+(`as_str` / `from_str`) and an `ALL` iteration order that is deliberately part of the type, because that
+order is the order the status-bar buttons paint in and re-spelling it per call site is how the two drift.
+
+Anything needing a *typed* occupant downcasts the `AnyView` at its own key —
+`console_panel::console_panel_for_workspace` (run-config output, the inline assistant) and
+`debugger_ui::debugger_panel::debug_panel_for_workspace`. That downcast is the replacement for every former
+`Workspace::panel::<T>(cx)` call, which is what a de-docked occupant loses.
+
+### 97. The git graph and the debugger are band occupants with no `Panel` impl at all, which is what makes the debugger's orientation deterministic
+
+`GitGraphPanel` (task 4) and `DebugPanel` (task 5) were dock panels; both now install into the keyed slot
+from `zed.rs` and neither implements `Panel` any more. The `Panel` impls were **removed, not left inert** —
+the fork keeps disabled *subsystems* in tree, but a `Panel` impl on a type no dock ever holds is not a
+disabled subsystem, it is a trait impl with no caller whose methods lie about where the type lives.
+
+**The debugger is the case worth reading.** Its `Panel::position` read `DebuggerSettings::dock`, and
+`RunningState` branched on that position to lay its sub-panes out horizontally or vertically. The band's
+utility half is one shape — wide and short — so the position is now a `BAND_DOCK_POSITION: DockPosition =
+Bottom` constant and the side-dock layout branches are deleted. Keeping `Panel::position` would have left a
+user-settable `debugger.dock: "left"` silently re-orienting a panel that is not in a dock: the orientation
+is deterministic *because* the impl went, not merely as a side effect. The setting stays in the schema
+(deleting it is a migration) but steers nothing, pinned by
+`test_new_sessions_ignore_the_debugger_dock_setting`, and `settings_ui` no longer renders a control for it —
+a working-looking dropdown over an inert setting is the dead-control trap.
+
+Two more consequences fall out of having no dock: panel-level zoom became an explicit swallow-the-action
+no-op (there is no dock to zoom, and the band owns its own geometry), and the panel's "Close Panel" button,
+which dispatched `workspace::ToggleBottomDock`, now hides the band's utility section instead. `RunningState`'s
+test bootstrap has to install a real `SolutionBand` — with no band, nothing paints the panel at all.
+
+### 98. Deleting the vertical dock strips also deleted a 40px correction term from the dock-resize math
+
+The two 40px vertical strips that flanked the workspace hosted the ProjectPanel / OutlinePanel / GitPanel
+toggles. Once those toggles moved into the project toolbar (task 7) the strips had nothing left to host, so
+task 8 deleted them — **in that order, which is load-bearing**: deleting the strips first would have left the
+project-zone panels with no affordance at all.
+
+The subtle part is `DOCK_STRIP_WIDTH`. It was not only the strips' width: `dock_resize_target_size`
+subtracted it when converting a pointer position into a dock size, precisely because the strips sat between
+each side dock and the window edge. With the strips gone every dock is flush with its edge, so the
+subtraction had to go with the constant — leaving it would have made every horizontal dock drag lag the
+cursor by exactly 40px. `test_dock_resize_handle_tracks_cursor` now asserts the handle lands on the cursor
+with no inset term, which is the assertion that catches a reintroduced offset.
+
+`PanelButtons` shed everything only the strips used: the `vertical` flag, `new_vertical`, the 24px icon
+size, the per-dock divider and the right-dock button reversal. The divider and the reversal existed to
+separate dock buttons from the rest of the status bar and to mirror the right dock against the window edge;
+all three docks' buttons now sit together at the toolbar's leading edge, where the toolbar draws the single
+separator — and draws it only when there is a button group to separate, since all three toggles can be
+hidden at once and are all absent while the panels load.
+
+### 99. `ctrl-shift-a` toggles the band's dialog half, and is bound only in the `Workspace` context
+
+The band's utility half had `ctrl-\`` from phase 2a; its dialog half had no hotkey. `console_panel::ToggleDialog`
+is it, bound on all three platforms **only in the `"Workspace"` keymap context**. That scoping is the whole
+design: `ctrl-shift-a` is already `editor::SelectAll` in the `"Terminal"` context, and on macOS
+`editor::SelectToBeginningOfLine` in the broad `"Editor"` context. Binding it more widely would shadow both.
+The consequence is deliberate and worth knowing before "fixing" it: the hotkey does **not** fire while the
+terminal is focused. Collapsing the dialog from inside the terminal is not worth silently breaking select-all
+in a shell.
+
+Reopening a collapsed band needs a session to reopen *onto*, and that memory is a per-Solution
+`last_dialog_session` map that is deliberately **not persisted**: the persisted `active_dialog_session`
+already restores the non-collapsed case across a restart, so a second column for the same bit buys nothing.
+The fallback chain is remembered session -> first entry in `tab_order` -> do nothing (a Solution with no
+sessions has nothing to show).
+
+**The trap the remembered id creates.** A remembered session that is later closed or purged leaves a dangling
+id, and reopening onto it renders nothing while persisting the dead id into `solution_band_state` — after
+which the next press "collapses" a dialog that was never showing, and the press after repeats the dead
+reopen. Two independent guards, because either alone leaves a hole: `clear_active_dialog_for_session` scrubs
+`last_dialog_session` *unconditionally* rather than only when the `band_state` scan matches (a Solution
+already collapsed when its session disappears is otherwise never touched), and the toggle re-validates
+whatever it reads with `session_can_be_active_dialog` — the same predicate `session_tab_strip` uses to decide
+whether to draw a tab — before trusting it. The second guard is what holds against a teardown path that never
+routes through the first.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.

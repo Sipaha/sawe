@@ -69,11 +69,11 @@ Workspace::set_solution_band_utility_item(kind: UtilityKind, item: AnyView, wind
 Workspace::solution_band_utility_item(kind: UtilityKind) -> Option<AnyView>
 ```
 
-- [ ] Replace the `Option<AnyView>` field with `HashMap<UtilityKind, AnyView>`; keep the setter's existing `cx.notify()` behaviour.
-- [ ] `SolutionBand::utility_panel` takes the kind to show. For this task it always asks for `UtilityKind::Terminal`, so behaviour is unchanged end to end — the switch arrives in Task 2.
-- [ ] Update `zed.rs`'s `add_console_panel_when_ready` to pass `UtilityKind::Terminal`, and the four test bootstraps likewise.
-- [ ] Tests: the workspace round-trip test for the slot (`workspace.rs:11375-11402` is the phase-2a precedent) becomes per-kind — two kinds set, each reads back independently, an unset kind reads `None`.
-- [ ] Gate: `set -o pipefail; cargo check -p workspace -p solution_agent -p console_panel -p zed --all-targets`; `cargo test -p workspace -p solution_agent`.
+- [x] Replace the `Option<AnyView>` field with `HashMap<UtilityKind, AnyView>`; keep the setter's existing `cx.notify()` behaviour.
+- [x] `SolutionBand::utility_panel` takes the kind to show. For this task it always asks for `UtilityKind::Terminal`, so behaviour is unchanged end to end — the switch arrives in Task 2.
+- [x] Update `zed.rs`'s `add_console_panel_when_ready` to pass `UtilityKind::Terminal`, and the four test bootstraps likewise.
+- [x] Tests: the workspace round-trip test for the slot (`workspace.rs:11375-11402` is the phase-2a precedent) becomes per-kind — two kinds set, each reads back independently, an unset kind reads `None`.
+- [x] Gate: `set -o pipefail; cargo check -p workspace -p solution_agent -p console_panel -p zed --all-targets`; `cargo test -p workspace -p solution_agent`.
 
 ### Task 2: Persist which content the utility section shows
 
@@ -81,29 +81,29 @@ Workspace::solution_band_utility_item(kind: UtilityKind) -> Option<AnyView>
 
 Add `utility_kind: UtilityKind` to `BandState`, defaulting to `Terminal`. Follow the 12 sites in fact 13 exactly — the `height` field's own commits (`8c00d8845c`) are the template, and the persist choice is **immediate** (`persist_band_state_now`), like `utility_visible`, not debounced: switching content is a discrete click, not a drag.
 
-- [ ] Column: `utility_kind TEXT NOT NULL DEFAULT 'terminal'`, added to `CREATE TABLE` **and** via `apply_idempotent_add_column_to` — the table already exists on every install. An unparseable value loads as `Terminal` with a `log::warn!`, mirroring how `active_dialog_session` degrades.
-- [ ] `SolutionAgentStore::set_band_utility_kind(solution_id, kind, cx)` + the `BandStateTouched` bit + the `overlay` arm.
-- [ ] `SolutionBand::render` shows `band_state(cx).utility_kind`, and the view-local `local_state` branch handles it for non-Solution windows.
-- [ ] Tests: clone both `db/tests.rs` migration tests for the new column (fresh-table default; pre-migration table backfills to `'terminal'` with the other columns intact); a store round-trip; a pre-hydration touched-mask test.
-- [ ] Gate: `cargo test -p solution_agent`.
+- [x] Column: `utility_kind TEXT NOT NULL DEFAULT 'terminal'`, added to `CREATE TABLE` **and** via `apply_idempotent_add_column_to` — the table already exists on every install. An unparseable value loads as `Terminal` with a `log::warn!`, mirroring how `active_dialog_session` degrades.
+- [x] `SolutionAgentStore::set_band_utility_kind(solution_id, kind, cx)` + the `BandStateTouched` bit + the `overlay` arm.
+- [x] `SolutionBand::render` shows `band_state(cx).utility_kind`, and the view-local `local_state` branch handles it for non-Solution windows.
+- [x] Tests: clone both `db/tests.rs` migration tests for the new column (fresh-table default; pre-migration table backfills to `'terminal'` with the other columns intact); a store round-trip; a pre-hydration touched-mask test.
+- [x] Gate: `cargo test -p solution_agent`.
 
 ### Task 3: Paint the band's half, not the occupant
 
 **Files:** `crates/solution_agent/src/solution_band.rs`, `crates/console_panel/src/panel.rs`
 
-- [ ] Move `.bg(cx.theme().colors().panel_background)` from `ConsolePanel`'s root onto `SolutionBand::half()`, so every occupant inherits it (ruling above). Keep `ConsolePanel`'s `size_full`, `key_context` and `track_focus` — those are per-occupant identity, not band layout.
-- [ ] Verify by screenshot that the terminal half looks unchanged, and that a band whose occupant is missing (a kind with no registered view) paints an opaque half rather than a transparent slab.
-- [ ] Gate: `cargo test -p solution_agent -p console_panel` + a screenshot.
+- [x] Move `.bg(cx.theme().colors().panel_background)` from `ConsolePanel`'s root onto `SolutionBand::half()`, so every occupant inherits it (ruling above). Keep `ConsolePanel`'s `size_full`, `key_context` and `track_focus` — those are per-occupant identity, not band layout.
+- [x] Verify by screenshot that the terminal half looks unchanged, and that a band whose occupant is missing (a kind with no registered view) paints an opaque half rather than a transparent slab.
+- [x] Gate: `cargo test -p solution_agent -p console_panel` + a screenshot.
 
 ### Task 4: Host the git graph in the utility section
 
 **Files:** `crates/git_graph/src/git_graph_panel.rs`, `crates/zed/src/zed.rs`
 
-- [ ] Drop `GitGraphPanel`'s `Panel` impl (its dock methods are already stubs — fact 4) and everything that exists only to satisfy it, keeping `Render` + `Focusable`. `ConsolePanel` is the worked example of a de-docked occupant.
-- [ ] Load it into the keyed slot under `UtilityKind::GitGraph` instead of `add_panel_when_ready` (`zed.rs:849`).
-- [ ] Anything that referenced it as a dock panel — its `toggle_action`, any `add_panel` call, the panel-button path — either moves to Task 6's button group or goes away. Name in the report what you deleted and what still references it.
-- [ ] It must be able to open as a pane item still if it could before (`zed.rs:791-793` claims it can) — verify that claim and say which way it went.
-- [ ] Gate: `cargo test -p git_graph -p workspace -p zed` + a screenshot of the graph inside the band.
+- [x] Drop `GitGraphPanel`'s `Panel` impl (its dock methods are already stubs — fact 4) and everything that exists only to satisfy it, keeping `Render` + `Focusable`. `ConsolePanel` is the worked example of a de-docked occupant.
+- [x] Load it into the keyed slot under `UtilityKind::GitGraph` instead of `add_panel_when_ready` (`zed.rs:849`).
+- [x] Anything that referenced it as a dock panel — its `toggle_action`, any `add_panel` call, the panel-button path — either moves to Task 6's button group or goes away. Name in the report what you deleted and what still references it.
+- [x] It must be able to open as a pane item still if it could before (`zed.rs:791-793` claims it can) — verify that claim and say which way it went.
+- [x] Gate: `cargo test -p git_graph -p workspace -p zed` + a screenshot of the graph inside the band.
 
 ### Task 5: Host the debugger in the utility section
 
@@ -111,22 +111,22 @@ Add `utility_kind: UtilityKind` to `BandState`, defaulting to `Terminal`. Follow
 
 The coupled one — budget accordingly, and read fact 5 before starting.
 
-- [ ] Per the ruling: `position()` hardcodes `DockPosition::Bottom` and `set_position()` becomes a documented no-op. Keep the `Panel` impl itself if other machinery still needs it; say in the report which parts are now vestigial.
-- [ ] Ensure the persisted `dock_axis` on a running session agrees with the forced Bottom orientation on first render — `invert_axies` (`running.rs:1967`) is the existing mechanism; a session restored with a vertical axis must not paint sideways inside the band.
-- [ ] Load it into the keyed slot under `UtilityKind::Debug`.
-- [ ] Zoom (`:1617-1624`): decide and document what zoom means for a band occupant. If it cannot work there, make it a no-op explicitly rather than leaving a control that does nothing visible.
-- [ ] Gate: `cargo test -p debugger_ui -p workspace` + a screenshot of a debug session inside the band.
+- [x] Per the ruling: `position()` hardcodes `DockPosition::Bottom` and `set_position()` becomes a documented no-op. Keep the `Panel` impl itself if other machinery still needs it; say in the report which parts are now vestigial.
+- [x] Ensure the persisted `dock_axis` on a running session agrees with the forced Bottom orientation on first render — `invert_axies` (`running.rs:1967`) is the existing mechanism; a session restored with a vertical axis must not paint sideways inside the band.
+- [x] Load it into the keyed slot under `UtilityKind::Debug`.
+- [x] Zoom (`:1617-1624`): decide and document what zoom means for a band occupant. If it cannot work there, make it a no-op explicitly rather than leaving a control that does nothing visible.
+- [x] Gate: `cargo test -p debugger_ui -p workspace` + a screenshot of a debug session inside the band.
 
 ### Task 6: The utility button group in the status bar
 
 **Files:** a new status-bar item (crate choice is the implementer's — justify it against the cycle in fact 1), `crates/zed/src/zed.rs`, `crates/console_panel/src/panel.rs`
 
-- [ ] Three buttons (Terminal / Git graph / Debug), registered with `StatusBar::add_left_item` following `run_config_ui/src/toolbar_strip.rs:52-61`. Icons: reuse each panel's existing `icon()` value where one exists so the affordance the user learned survives the strip's deletion.
-- [ ] Behaviour, per spec §3: clicking an inactive button switches the content **and** shows the section; clicking the **active** button hides the section. `utility_visible == false` renders all three unselected.
-- [ ] Re-point the four defensive reveal sites (fact 9) at `UtilityKind::Terminal` explicitly — `reveal_utility_section` grows a kind parameter. Run-configuration output must still land in the terminal even when the user last left the section on Debug.
-- [ ] `console_panel::ToggleFocus` (`ctrl-\``) keeps its tri-state but now also selects `Terminal` when it reveals — otherwise the hotkey shows the section with the debugger in it.
-- [ ] Tests: the show/switch/hide rule as a unit test over the store's state, including "hide leaves `utility_kind` untouched so re-showing returns to the same content".
-- [ ] Gate: `cargo test` over the touched crates + screenshots of all three contents and of the hidden state.
+- [x] Three buttons (Terminal / Git graph / Debug), registered with `StatusBar::add_left_item` following `run_config_ui/src/toolbar_strip.rs:52-61`. Icons: reuse each panel's existing `icon()` value where one exists so the affordance the user learned survives the strip's deletion.
+- [x] Behaviour, per spec §3: clicking an inactive button switches the content **and** shows the section; clicking the **active** button hides the section. `utility_visible == false` renders all three unselected.
+- [x] Re-point the four defensive reveal sites (fact 9) at `UtilityKind::Terminal` explicitly — `reveal_utility_section` grows a kind parameter. Run-configuration output must still land in the terminal even when the user last left the section on Debug.
+- [x] `console_panel::ToggleFocus` (`ctrl-\``) keeps its tri-state but now also selects `Terminal` when it reveals — otherwise the hotkey shows the section with the debugger in it.
+- [x] Tests: the show/switch/hide rule as a unit test over the store's state, including "hide leaves `utility_kind` untouched so re-showing returns to the same content".
+- [x] Gate: `cargo test` over the touched crates + screenshots of all three contents and of the hidden state.
 
 ### Task 7: Relocate the project-zone toggles, then delete the strips
 
@@ -134,26 +134,26 @@ The coupled one — budget accordingly, and read fact 5 before starting.
 
 Order inside the task matters (ruling above): add the new home first, delete second, in two commits.
 
-- [ ] Add toggles for ProjectPanel, OutlinePanel and GitPanel to `ProjectToolbar` (fact 8 — it is not a registry; either extend `Render` directly or add an `AnyView` slot mirroring `run_config_strip`). Each button dispatches the same `toggle_action()` the strip button dispatched, so behaviour is identical.
-- [ ] Then delete `render_left_dock_strip` / `render_right_dock_strip`, their call sites (`workspace.rs:9122`, `:9165`), the three `Entity<PanelButtons>` fields and their construction, and whatever in `PanelButtons` is only reachable from `new_vertical`. Do not delete `PanelButtons` wholesale without checking for other callers.
-- [ ] Do not disturb the layout invariant (Global Constraints) while editing `Workspace::render`.
-- [ ] Tests: whatever exists for the strips must be updated rather than deleted silently — say in the report what coverage was lost.
-- [ ] Gate: `cargo test -p workspace -p title_bar` + before/after screenshots showing no vertical strip and working toggles.
+- [x] Add toggles for ProjectPanel, OutlinePanel and GitPanel to `ProjectToolbar` (fact 8 — it is not a registry; either extend `Render` directly or add an `AnyView` slot mirroring `run_config_strip`). Each button dispatches the same `toggle_action()` the strip button dispatched, so behaviour is identical.
+- [x] Then delete `render_left_dock_strip` / `render_right_dock_strip`, their call sites (`workspace.rs:9122`, `:9165`), the three `Entity<PanelButtons>` fields and their construction, and whatever in `PanelButtons` is only reachable from `new_vertical`. Do not delete `PanelButtons` wholesale without checking for other callers.
+- [x] Do not disturb the layout invariant (Global Constraints) while editing `Workspace::render`.
+- [x] Tests: whatever exists for the strips must be updated rather than deleted silently — say in the report what coverage was lost.
+- [x] Gate: `cargo test -p workspace -p title_bar` + before/after screenshots showing no vertical strip and working toggles.
 
 ### Task 8: `ctrl-shift-a` toggles the dialog
 
 **Files:** `crates/solution_agent/src/{store.rs,session_tab_strip.rs}`, wherever the action is defined and registered, `assets/keymaps/default-{linux,macos,windows}.json`
 
-- [ ] `last_dialog_session: HashMap<SolutionId, SolutionSessionId>` on the store, written whenever a non-`None` active dialog is set (ruling above). Not persisted.
-- [ ] The action: collapsed → re-open on `last_dialog_session`, else the first session in `tab_order`, else do nothing (no sessions). Expanded → collapse (`set_active_dialog_session(None)`).
-- [ ] Bind in the `"Workspace"` context of all three default keymaps. Do **not** override `"Terminal"` or macOS `"Editor"` (ruling + fact 11); document the macOS limitation where the binding lives.
-- [ ] Follow `console_panel::ToggleFocus`'s full path (fact 7 in the other recon: `actions!` → `workspace.register_action` in `zed.rs`'s `observe_new` closure → handler resolving the band).
-- [ ] Tests: toggle from expanded, toggle from collapsed with a remembered session, toggle from collapsed with none remembered but tabs present, and toggle with no sessions at all.
-- [ ] Gate: `cargo test -p solution_agent` + a screenshot of the collapsed and re-expanded band.
+- [x] `last_dialog_session: HashMap<SolutionId, SolutionSessionId>` on the store, written whenever a non-`None` active dialog is set (ruling above). Not persisted.
+- [x] The action: collapsed → re-open on `last_dialog_session`, else the first session in `tab_order`, else do nothing (no sessions). Expanded → collapse (`set_active_dialog_session(None)`).
+- [x] Bind in the `"Workspace"` context of all three default keymaps. Do **not** override `"Terminal"` or macOS `"Editor"` (ruling + fact 11); document the macOS limitation where the binding lives.
+- [x] Follow `console_panel::ToggleFocus`'s full path (fact 7 in the other recon: `actions!` → `workspace.register_action` in `zed.rs`'s `observe_new` closure → handler resolving the band).
+- [x] Tests: toggle from expanded, toggle from collapsed with a remembered session, toggle from collapsed with none remembered but tabs present, and toggle with no sessions at all.
+- [x] Gate: `cargo test -p solution_agent` + a screenshot of the collapsed and re-expanded band.
 
 ### Task 9: Verify live, then document
 
-- [ ] Drive a real editor (`cargo build --bin sawe`, then `script/run-mcp --debug --headless`): switch between all three contents from the status bar, hide by re-clicking the active button, confirm run-configuration output still lands in the terminal from a non-terminal selection, confirm `ctrl-\`` and `ctrl-shift-a`, and confirm the selection survives a restart. Screenshot each state and read the PNGs back.
-- [ ] Check a short window with `windows.resize` — the status bar must stay visible with the new button group in it.
-- [ ] Gates: `cargo test` over every touched crate; `cargo fmt --all --check`; the scoped `./script/clippy` from Global Constraints.
-- [ ] Docs: `FORK.md` entries for the keyed slot, the de-docked occupants, the deleted strips and the hotkey; update the `.rules` MCP catalog only if a tool changed; mark this plan's checkboxes; add the `docs/INDEX.md` row.
+- [x] Drive a real editor (`cargo build --bin sawe`, then `script/run-mcp --debug --headless`): switch between all three contents from the status bar, hide by re-clicking the active button, confirm run-configuration output still lands in the terminal from a non-terminal selection, confirm `ctrl-\`` and `ctrl-shift-a`, and confirm the selection survives a restart. Screenshot each state and read the PNGs back.
+- [x] Check a short window with `windows.resize` — the status bar must stay visible with the new button group in it.
+- [x] Gates: `cargo test` over every touched crate; `cargo fmt --all --check`; the scoped `./script/clippy` from Global Constraints.
+- [x] Docs: `FORK.md` entries for the keyed slot, the de-docked occupants, the deleted strips and the hotkey; update the `.rules` MCP catalog only if a tool changed; mark this plan's checkboxes; add the `docs/INDEX.md` row.
