@@ -228,6 +228,41 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
     Commit tab is new scope beyond spec §5. Recorded in the deferred backlog, not
     a Task 6 decision round.
 
+### Corrections established while executing Task 5
+
+62. **Fact 26 did not come true.** It said to keep `_repo_subscriptions` because
+    "the Commit tab wants exactly this". Task 2 did not use it — the Commit tab
+    has its own `_details_task` / `_diff_task`. After Task 5 the field is never
+    pushed to: only the declaration, the `Vec::new()` init and a `.clear()` in
+    `set_active_repository` that is a no-op remain. The `_` prefix means
+    `dead_code` will never surface it. **Task 6 deletes it or rules explicitly.**
+63. **Fact 24 was incomplete.** It missed `drop_history_state` (which
+    `commit_tab.rs::activate_commit_tab_without_focus` called — a Task-2
+    dependency on History that had to be unwound), the two History redirects in
+    `git_panel/changes_list.rs::select_previous` / `select_next`, the
+    `set_active_tab` match arms, and a `commit_tab.rs` intra-doc link to
+    `GitPanel::git_remote` that would have dangled. It also undercounted the
+    History tests: three, not one — two of them added by Tasks 2/3
+    (`test_activating_the_commit_tab_drops_history_state`,
+    `test_close_commit_tab_leaves_another_tab_alone`), both deleted as stale.
+64. **`close_commit_tab`'s `if self.active_tab == GitPanelTab::Commit` guard is
+    now dead logic.** With Changes the only alternative tab it is provably
+    indistinguishable from an unconditional assignment. Left in place (no
+    drive-by); Task 6 rules on it.
+65. **The palette guard is applied at registration, not per handler.** One
+    `let shows_changes_list = self.active_tab == GitPanelTab::Changes;` and two
+    `.when(shows_changes_list, …)` blocks cover **20 actions across 13 handlers**
+    (staging / restore / gitignore / expand-collapse / all eight selection
+    movers / `open_diff` / `open_accordion_diff` / `jump_to_source`). Verified
+    safe to unregister rather than guard: nothing between the panel element and
+    the window root handles any of them — the other `git::ToggleStaged` /
+    `RestoreFile` handlers live on `editor` and `project_panel` elements, which
+    are not ancestors. Repository-wide actions (`stage_all`, `commit`, `amend`,
+    `stash_*`, …) are deliberately NOT guarded: they target the repository, not
+    the invisible selection. `git_panel::FocusChanges` is also unguarded and is
+    now a half-no-op from the palette on the Commit tab — it focuses and selects
+    but does not switch tabs. **Task 6 rules on that one.**
+
 ---
 
 ## Rulings made up front (binding; a reviewer judges against these)
@@ -379,13 +414,13 @@ impl GitGraph {
 
 **Interfaces produced:** `enum GitPanelTab { Changes, Commit }`.
 
-- [ ] Delete everything in fact 24. Before removing `git_remote` (`:5542-5551`), grep the crate and **confirm** it has no other caller; if it does, keep it and say so.
-- [ ] Edit — do not delete — every site in fact 25. In particular `schedule_update` must stop calling `preload_commit_history` **unconditionally**, or the panel keeps issuing `graph_data` calls for a tab that no longer exists.
-- [ ] Rebind `ctrl-2` / `cmd-2` from `git_panel::ActivateHistoryTab` to `git_panel::ActivateCommitTab` in all three keymaps (fact 23). Do not leave a binding pointing at a deleted action.
-- [ ] **Close the command-palette hole the Task 2 fix wave left open.** Narrowing `dispatch_context` makes the Commit tab inert to the *keymap*, but the panel's `.on_action` registrations are still live, so palette-dispatching `git::ToggleStaged` / `git::RestoreFile` / `menu::Confirm` while the Commit tab shows still acts on the hidden Changes selection. That hole was identical on History and was left alone while History existed; once History is gone, Commit is the only other tab and it becomes the whole exposure. Guard the staging / restore / open-diff handlers on `active_tab == GitPanelTab::Changes`, with a test.
-- [ ] Delete `test_history_drops_previous_repository_commits` (`:9097-9160`). Its repo-switch invariant is now covered by the Commit-tab test added in Task 3.
-- [ ] Confirm the surviving tests still pass, especially `test_open_diff` (`:8238`) and `test_dispatch_context_with_focus_states` (`:8690`).
-- [ ] Gate: `set -o pipefail; cargo check -p git_ui -p git_graph --all-targets`; `cargo test -p git_ui`; `cargo test -p zed test_action_namespaces` (deleting an action can move that pin).
+- [x] Delete everything in fact 24. Before removing `git_remote` (`:5542-5551`), grep the crate and **confirm** it has no other caller; if it does, keep it and say so.
+- [x] Edit — do not delete — every site in fact 25. In particular `schedule_update` must stop calling `preload_commit_history` **unconditionally**, or the panel keeps issuing `graph_data` calls for a tab that no longer exists.
+- [x] Rebind `ctrl-2` / `cmd-2` from `git_panel::ActivateHistoryTab` to `git_panel::ActivateCommitTab` in all three keymaps (fact 23). Do not leave a binding pointing at a deleted action.
+- [x] **Close the command-palette hole the Task 2 fix wave left open.** Narrowing `dispatch_context` makes the Commit tab inert to the *keymap*, but the panel's `.on_action` registrations are still live, so palette-dispatching `git::ToggleStaged` / `git::RestoreFile` / `menu::Confirm` while the Commit tab shows still acts on the hidden Changes selection. That hole was identical on History and was left alone while History existed; once History is gone, Commit is the only other tab and it becomes the whole exposure. Guard the staging / restore / open-diff handlers on `active_tab == GitPanelTab::Changes`, with a test.
+- [x] Delete `test_history_drops_previous_repository_commits` (`:9097-9160`). Its repo-switch invariant is now covered by the Commit-tab test added in Task 3.
+- [x] Confirm the surviving tests still pass, especially `test_open_diff` (`:8238`) and `test_dispatch_context_with_focus_states` (`:8690`).
+- [x] Gate: `set -o pipefail; cargo check -p git_ui -p git_graph --all-targets`; `cargo test -p git_ui`; `cargo test -p zed test_action_namespaces` (deleting an action can move that pin).
 
 ### Task 6: Live verification, gates and docs
 
@@ -399,5 +434,6 @@ impl GitGraph {
 - [ ] `docs/INDEX.md`: mark this plan complete in the plans table with its commit chain.
 - [ ] **Visibility sweep — bigger than originally scoped.** Task 1 made `commit_tab` a `pub mod` with ~10 `pub` items (`ChangedFileRowHandlers`, `ChangedFileEntry` + `from_commit_file`/`render`, `ChangedFileRow`, `build_changed_file_rows`, `render_changed_directory_row`, `split_commit_message`, `commit_identity_source`, `detail_text_style`, `compute_diff_stats`) *solely* so `git_graph` could import them. After Task 4 nothing outside `crates/git_ui/src/git_panel/` names `commit_tab::` at all — and `pub` inside a `pub mod` raises no `dead_code` warning, so this will never surface on its own. Take it back to `mod commit_tab` plus a `pub` → `pub(super)`/private pass; `git_panel.rs`'s `pub use commit_tab::{CommitSelection, CommitSelectionSource};` is the only export any other crate still needs. Include `ChangedFileEntry`'s three reader-less `pub` fields and `GitGraph::selected_commit_shas`.
 - [ ] Fix `render_chip`'s doc comment, which still explains its `truncate` flag through the wrapping ref-chip row that died with the sidebar (fact 59).
+- [ ] Rule on the three dead remnants Task 5 left deliberately: `_repo_subscriptions` (fact 62), `close_commit_tab`'s now-tautological guard (fact 64), and `git_panel::FocusChanges` being a half-no-op from the palette on the Commit tab (fact 65).
 - [ ] Record the standing coverage gap the Task 3 review named: **no test drives `select_entry` under a live `Context<Workspace>` lease** (the `open_or_reuse_graph` / deserialize path). That is the one place removing `cx.defer_in` would panic rather than merely misbehave, so the defer is protected only by reasoning. Either add the test or put it in the deferred backlog explicitly.
 - [ ] Tick every checkbox in this document and record the deferred items: the `affected_files`/commit-tree extraction (FORK.md #55), the two defects in fact 37, and the graph's column fractions in a compact band (fact 38).
