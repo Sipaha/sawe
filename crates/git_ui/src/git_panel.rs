@@ -85,7 +85,7 @@ use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFon
 mod changes_list;
 pub mod commit_tab;
 
-pub use commit_tab::CommitSelection;
+pub use commit_tab::{CommitSelection, CommitSelectionSource};
 
 actions!(
     git_panel,
@@ -422,9 +422,10 @@ pub fn register(workspace: &mut Workspace) {
 #[derive(Debug, Clone)]
 pub enum Event {
     Focus,
-    /// The Commit tab was closed. The git graph clears the row selection that
-    /// opened it when it sees this.
-    CommitTabClosed,
+    /// The Commit tab was closed, carrying the shas it was describing. The git
+    /// graph clears the row selection that opened it when it sees its own shas
+    /// come back — anyone else's tab closing is not its business.
+    CommitTabClosed(Vec<Oid>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -9238,6 +9239,7 @@ mod tests {
                     repository: repository.clone(),
                     shas: vec![sha],
                 },
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
@@ -9274,6 +9276,7 @@ mod tests {
                     repository: repository.clone(),
                     shas: shas.clone(),
                 },
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
@@ -9299,7 +9302,7 @@ mod tests {
             cx.subscribe(&panel, {
                 let closed = closed.clone();
                 move |_, event: &Event, _| {
-                    if matches!(event, Event::CommitTabClosed) {
+                    if matches!(event, Event::CommitTabClosed(_)) {
                         closed.set(closed.get() + 1);
                     }
                 }
@@ -9312,6 +9315,7 @@ mod tests {
                     repository: repository.clone(),
                     shas: vec![test_sha("823a3f8a")],
                 },
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
@@ -9367,10 +9371,16 @@ mod tests {
         cx.update_window_entity(&panel, |panel, window, cx| {
             panel.show_commit_selection(
                 commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
-            panel.show_commit_selection(commit_selection(&repository, Vec::new()), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, Vec::new()),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
 
         panel.read_with(cx, |panel, _| {
@@ -9395,7 +9405,12 @@ mod tests {
         let second = test_sha("1a2b3c4d");
 
         cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(commit_selection(&repository, vec![first]), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![first]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
             panel
                 .commit_tab
                 .as_mut()
@@ -9429,7 +9444,12 @@ mod tests {
 
         let sha = test_sha("823a3f8a");
         cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
         cx.executor().run_until_parked();
 
@@ -9444,7 +9464,12 @@ mod tests {
         });
 
         cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
 
         panel.read_with(cx, |panel, _| {
@@ -9472,7 +9497,12 @@ mod tests {
 
         let sha = test_sha("823a3f8a");
         cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
         cx.executor().run_until_parked();
 
@@ -9484,7 +9514,12 @@ mod tests {
         });
 
         cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
 
         panel.read_with(cx, |panel, _| {
@@ -9519,7 +9554,12 @@ mod tests {
 
         let sha = test_sha("823a3f8a");
         cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
             panel.set_active_tab(GitPanelTab::Changes, window, cx);
         });
         panel.read_with(cx, |panel, _| {
@@ -9528,11 +9568,92 @@ mod tests {
         });
 
         cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
         panel.read_with(cx, |panel, _| {
             assert_eq!(panel.active_tab, GitPanelTab::Commit);
             assert_eq!(panel.commit_tab_shas(), [sha]);
+        });
+    }
+
+    /// A repository event the user never asked for (a `git fetch` landing in a
+    /// terminal, a branch checked out elsewhere) makes the graph refetch and
+    /// re-anchor its selection, which pushes it here again. That must not swap
+    /// the panel body out from under someone who went back to Changes to stage
+    /// files and type a commit message.
+    #[gpui::test]
+    async fn test_a_background_re_anchor_leaves_the_active_tab_alone(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let sha = test_sha("823a3f8a");
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+            panel.set_active_tab(GitPanelTab::Changes, window, cx);
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::Background,
+                window,
+                cx,
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+            assert!(
+                panel.commit_tab_is_open(),
+                "the tab itself survives the re-anchor; only the activation is refused"
+            );
+        });
+
+        // A re-anchor that lands on a different commit still refreshes what the
+        // open tab describes — it just does it in the background.
+        let other = test_sha("f01dab1e");
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![other]),
+                CommitSelectionSource::Background,
+                window,
+                cx,
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+            assert_eq!(panel.commit_tab_shas(), [other]);
+        });
+    }
+
+    /// …and a background push with no tab to refresh opens nothing: a Commit
+    /// tab appearing on its own after a fetch is the same surprise seen from
+    /// the other side.
+    #[gpui::test]
+    async fn test_a_background_push_does_not_open_a_closed_tab(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::Background,
+                window,
+                cx,
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.commit_tab_is_open());
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
         });
     }
 
@@ -9546,6 +9667,7 @@ mod tests {
         cx.update_window_entity(&panel, |panel, window, cx| {
             panel.show_commit_selection(
                 commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
@@ -9592,6 +9714,7 @@ mod tests {
         cx.update_window_entity(&panel, |panel, window, cx| {
             panel.show_commit_selection(
                 commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
@@ -9638,6 +9761,7 @@ mod tests {
         cx.update_window_entity(&panel, |panel, window, cx| {
             panel.show_commit_selection(
                 commit_selection(&repository, vec![test_sha("1a2b3c4d")]),
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
@@ -9684,7 +9808,7 @@ mod tests {
             cx.subscribe(&panel, {
                 let closed = closed.clone();
                 move |_, event: &Event, _| {
-                    if matches!(event, Event::CommitTabClosed) {
+                    if matches!(event, Event::CommitTabClosed(_)) {
                         closed.set(closed.get() + 1);
                     }
                 }
@@ -9696,6 +9820,7 @@ mod tests {
             panel.refresh_active_repository_for_selector(window, cx);
             panel.show_commit_selection(
                 commit_selection(&member_repo, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );

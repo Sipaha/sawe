@@ -145,7 +145,7 @@ use git_ui::{
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
     git_panel::{
-        CommitSelection, Event as GitPanelEvent, GitPanel,
+        CommitSelection, CommitSelectionSource, Event as GitPanelEvent, GitPanel,
         commit_tab::{
             ChangedFileEntry, ChangedFileRow, ChangedFileRowHandlers, build_changed_file_rows,
             commit_identity_source, compute_diff_stats, detail_text_style,
@@ -1145,7 +1145,12 @@ fn open_or_reuse_graph(
     if let Some(existing) = existing {
         if let Some(sha) = sha {
             existing.update(cx, |graph, cx| {
-                graph.select_commit_by_sha(sha.as_str(), window, cx);
+                graph.select_commit_by_sha(
+                    sha.as_str(),
+                    CommitSelectionSource::UserGesture,
+                    window,
+                    cx,
+                );
             });
         }
         workspace.activate_item(&existing, true, true, window, cx);
@@ -1163,7 +1168,12 @@ fn open_or_reuse_graph(
             cx,
         );
         if let Some(sha) = sha {
-            graph.select_commit_by_sha(sha.as_str(), window, cx);
+            graph.select_commit_by_sha(
+                sha.as_str(),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         }
         graph
     });
@@ -1376,6 +1386,12 @@ impl GitGraph {
     /// commit's file list, and clicking one of those files opened an empty
     /// tab. An explicit pending request (`select_commit_by_sha` for a commit
     /// that isn't loaded yet) wins over the re-anchor.
+    ///
+    /// Nothing is pushed at the git panel from here — the clear is a transient
+    /// step of the refetch, not a deselection. The Commit tab is left standing
+    /// until the re-anchor lands ([`CommitSelectionSource::Background`], so it
+    /// cannot yank a user who has moved on to Changes) or gives up, which
+    /// closes the tab through [`Self::close_vanished_commit_tab`].
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         if self.pending_select_sha.is_none() {
             self.pending_select_sha = self.selected_commit_sha();
@@ -1429,8 +1445,13 @@ impl GitGraph {
     /// panic; and the deferred closure re-reads the selection after the whole
     /// gesture has settled, so `apply_row_click_selection` writing its
     /// multi-row set back after `select_entry` returns is seen, not missed.
-    fn push_selection_to_git_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.defer_in(window, |this, window, cx| {
+    fn push_selection_to_git_panel(
+        &self,
+        source: CommitSelectionSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.defer_in(window, move |this, window, cx| {
             let Some(workspace) = this.workspace.upgrade() else {
                 return;
             };
@@ -1443,9 +1464,42 @@ impl GitGraph {
             let repository = this.get_repository(cx);
             panel.update(cx, |panel, cx| match repository {
                 Some(repository) if !shas.is_empty() => {
-                    panel.show_commit_selection(CommitSelection { repository, shas }, window, cx);
+                    panel.show_commit_selection(
+                        CommitSelection { repository, shas },
+                        source,
+                        window,
+                        cx,
+                    );
                 }
                 _ => panel.close_commit_tab(window, cx),
+            });
+        });
+    }
+
+    /// Close the git panel's Commit tab when the commit it was opened for has
+    /// vanished from the refetched log.
+    ///
+    /// `git commit --amend` or a rebase run in a terminal rewrites the sha, so
+    /// the re-anchor in [`Self::on_repository_event`] finds nothing to select
+    /// and pushes nothing. The graph then shows no selection while the tab
+    /// still describes the old commit and its file rows still ask
+    /// [`CommitView`] for diffs of a sha that no longer resolves.
+    ///
+    /// Scoped to a tab describing exactly that one commit: a pending sha can
+    /// also come from a [`Self::select_commit_by_sha`] request for a commit
+    /// that never loaded, which says nothing about whatever tab is open.
+    fn close_vanished_commit_tab(&self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        cx.defer_in(window, move |this, window, cx| {
+            let Some(workspace) = this.workspace.upgrade() else {
+                return;
+            };
+            let Some(panel) = workspace.read(cx).panel::<GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                if panel.commit_tab_shas() == [sha] {
+                    panel.close_commit_tab(window, cx);
+                }
             });
         });
     }
@@ -1471,12 +1525,15 @@ impl GitGraph {
             panel,
             window,
             |this, _panel, event, _window, cx| match event {
-                GitPanelEvent::CommitTabClosed => {
-                    // Only a selection the tab could have been describing is
-                    // dropped. Selecting the synthetic local-changes row also
-                    // closes the tab (it is not a commit), and clearing here
-                    // would deselect the row the user just clicked.
-                    if this.selected_commit_shas().is_empty() {
+                GitPanelEvent::CommitTabClosed(closed_shas) => {
+                    // Only the graph whose own selection the tab was describing
+                    // drops it. Another graph in the window — one pinned to a
+                    // different repository, or just holding a different row —
+                    // keeps what it had. This also covers the local-changes
+                    // row, which closes the tab (it is not a commit) while the
+                    // graph's own shas are empty: the mismatch stops the close
+                    // bouncing back and deselecting the row just clicked.
+                    if *closed_shas != this.selected_commit_shas() {
                         return;
                     }
                     this.clear_selection();
@@ -1599,7 +1656,7 @@ impl GitGraph {
                 self.set_query_filter(None, cx);
             }
             if let Some(oid) = self.find_loaded_commit_by_prefix(trimmed) {
-                self.select_commit_by_sha(oid, window, cx);
+                self.select_commit_by_sha(oid, CommitSelectionSource::UserGesture, window, cx);
             }
             return;
         }
@@ -2052,21 +2109,30 @@ impl GitGraph {
                             self.graph_data.add_commits(commits);
                         });
 
-                        if let Some(pending_sha_data_index) =
-                            self.pending_select_sha.take().and_then(|oid| {
-                                repository
-                                    .read(cx)
-                                    .get_graph_data(
-                                        source.clone(),
-                                        *order,
-                                        &extra_args,
-                                        &extra_paths,
-                                    )
-                                    .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
-                            })
-                        {
-                            let view_index = self.data_to_view_idx(pending_sha_data_index);
-                            self.select_entry(view_index, ScrollStrategy::Nearest, window, cx);
+                        let pending_sha = self.pending_select_sha.take();
+                        let pending_sha_data_index = pending_sha.and_then(|oid| {
+                            repository
+                                .read(cx)
+                                .get_graph_data(source.clone(), *order, &extra_args, &extra_paths)
+                                .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
+                        });
+                        match (pending_sha, pending_sha_data_index) {
+                            (_, Some(data_index)) => {
+                                let view_index = self.data_to_view_idx(data_index);
+                                self.select_entry(
+                                    view_index,
+                                    ScrollStrategy::Nearest,
+                                    CommitSelectionSource::Background,
+                                    window,
+                                    cx,
+                                );
+                            }
+                            // The log finished loading without the commit we
+                            // were holding a place for: it is gone.
+                            (Some(vanished), None) => {
+                                self.close_vanished_commit_tab(vanished, window, cx);
+                            }
+                            (None, None) => {}
                         }
                         cx.notify();
                     }
@@ -2075,6 +2141,10 @@ impl GitGraph {
                     }
                     GitGraphEvent::CountUpdated(commit_count) => {
                         let old_count = self.graph_data.commits.len();
+                        // Kept to spot the give-up below: the closure clears
+                        // `pending_select_sha` once the load has finished
+                        // without producing the commit it was holding.
+                        let pending_sha = self.pending_select_sha;
 
                         if let Some(pending_selection_index) =
                             repository.update(cx, |repository, cx| {
@@ -2113,8 +2183,18 @@ impl GitGraph {
                             })
                         {
                             let view_index = self.data_to_view_idx(pending_selection_index);
-                            self.select_entry(view_index, ScrollStrategy::Nearest, window, cx);
+                            self.select_entry(
+                                view_index,
+                                ScrollStrategy::Nearest,
+                                CommitSelectionSource::Background,
+                                window,
+                                cx,
+                            );
                             self.pending_select_sha.take();
+                        } else if let Some(vanished) =
+                            pending_sha.filter(|_| self.pending_select_sha.is_none())
+                        {
+                            self.close_vanished_commit_tab(vanished, window, cx);
                         }
 
                         cx.notify();
@@ -2525,7 +2605,7 @@ impl GitGraph {
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection();
-        self.push_selection_to_git_panel(window, cx);
+        self.push_selection_to_git_panel(CommitSelectionSource::UserGesture, window, cx);
         cx.emit(ItemEvent::Edit);
         cx.notify();
     }
@@ -2546,7 +2626,13 @@ impl GitGraph {
     }
 
     fn select_first(&mut self, _: &SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
-        self.select_entry(0, ScrollStrategy::Nearest, window, cx);
+        self.select_entry(
+            0,
+            ScrollStrategy::Nearest,
+            CommitSelectionSource::UserGesture,
+            window,
+            cx,
+        );
     }
 
     fn select_prev(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
@@ -2554,6 +2640,7 @@ impl GitGraph {
             self.select_entry(
                 selected_entry_idx.saturating_sub(1),
                 ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
@@ -2569,6 +2656,7 @@ impl GitGraph {
                     .saturating_add(1)
                     .min(self.view_row_count().saturating_sub(1)),
                 ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
                 window,
                 cx,
             );
@@ -2581,6 +2669,7 @@ impl GitGraph {
         self.select_entry(
             self.view_row_count().saturating_sub(1),
             ScrollStrategy::Nearest,
+            CommitSelectionSource::UserGesture,
             window,
             cx,
         );
@@ -2618,6 +2707,7 @@ impl GitGraph {
         &mut self,
         idx: usize,
         scroll_strategy: ScrollStrategy,
+        source: CommitSelectionSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2643,7 +2733,7 @@ impl GitGraph {
         // on the already-active row still has to re-activate the panel's
         // Commit tab, and `apply_row_click_selection` writes the multi-row set
         // back on top of this call after it returns.
-        self.push_selection_to_git_panel(window, cx);
+        self.push_selection_to_git_panel(source, window, cx);
 
         // Re-selecting the same row is a no-op only while the diff we hold (or
         // are loading) still belongs to the commit living at that row — after a
@@ -2852,7 +2942,7 @@ impl GitGraph {
             // A selection belongs to the repository it was made in — don't let
             // `invalidate_state` re-anchor it onto the incoming one.
             self.clear_selection();
-            self.push_selection_to_git_panel(window, cx);
+            self.push_selection_to_git_panel(CommitSelectionSource::UserGesture, window, cx);
             self.pending_select_sha = None;
             self.invalidate_state(cx);
         }
@@ -2861,10 +2951,17 @@ impl GitGraph {
     pub fn select_commit_by_sha(
         &mut self,
         sha: impl TryInto<Oid>,
+        source: CommitSelectionSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        fn inner(this: &mut GitGraph, oid: Oid, window: &mut Window, cx: &mut Context<GitGraph>) {
+        fn inner(
+            this: &mut GitGraph,
+            oid: Oid,
+            source: CommitSelectionSource,
+            window: &mut Window,
+            cx: &mut Context<GitGraph>,
+        ) {
             let Some(selected_repository) = this.get_repository(cx) else {
                 return;
             };
@@ -2894,11 +2991,11 @@ impl GitGraph {
             } else {
                 data_index
             };
-            this.select_entry(view_index, ScrollStrategy::Center, window, cx);
+            this.select_entry(view_index, ScrollStrategy::Center, source, window, cx);
         }
 
         if let Ok(oid) = sha.try_into() {
-            inner(self, oid, window, cx);
+            inner(self, oid, source, window, cx);
         }
     }
 
@@ -3002,7 +3099,13 @@ impl GitGraph {
             anchor,
             self.has_local_changes_row(),
         );
-        self.select_entry(selection.active, ScrollStrategy::Center, window, cx);
+        self.select_entry(
+            selection.active,
+            ScrollStrategy::Center,
+            CommitSelectionSource::UserGesture,
+            window,
+            cx,
+        );
         self.selected_entry_idxs = selection.selected;
         self.selection_anchor_idx = selection.anchor;
         cx.notify();
@@ -3678,7 +3781,11 @@ impl GitGraph {
                                 .icon_size(IconSize::Small)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.clear_selection();
-                                    this.push_selection_to_git_panel(window, cx);
+                                    this.push_selection_to_git_panel(
+                                        CommitSelectionSource::UserGesture,
+                                        window,
+                                        cx,
+                                    );
                                     cx.notify();
                                 })),
                         ),
@@ -4396,6 +4503,7 @@ impl Render for GitGraph {
                                                     this.select_entry(
                                                         index,
                                                         ScrollStrategy::Center,
+                                                        CommitSelectionSource::UserGesture,
                                                         window,
                                                         cx,
                                                     );
@@ -4757,7 +4865,15 @@ impl workspace::SerializableItem for GitGraph {
                     graph.fetch_initial_graph_data(cx);
 
                     if let Some(sha) = &state.selected_sha {
-                        graph.select_commit_by_sha(sha.as_str(), window, cx);
+                        // Restoring a persisted selection is not a gesture: the
+                        // Commit tab is ephemeral and the panel boots on
+                        // Changes, so a restore must not open one.
+                        graph.select_commit_by_sha(
+                            sha.as_str(),
+                            CommitSelectionSource::Background,
+                            window,
+                            cx,
+                        );
                     }
 
                     graph
@@ -7998,7 +8114,13 @@ mod tests {
             setup_graph_with_commits(&fs, vec![head_entry.clone(), parent_entry.clone()], cx).await;
 
         git_graph.update_in(cx, |graph, window, cx| {
-            graph.select_entry(0, ScrollStrategy::Nearest, window, cx);
+            graph.select_entry(
+                0,
+                ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
@@ -8425,12 +8547,19 @@ mod tests {
     }
 
     /// As [`setup_graph_with_workspace`], but the workspace also carries a git
-    /// panel, so the graph's selection push has somewhere to land.
+    /// panel, so the graph's selection push has somewhere to land. The project
+    /// comes back too, for tests that let commits land from outside the editor
+    /// and wait on `git_scans_complete`.
     async fn setup_graph_with_git_panel(
         fs: &Arc<FakeFs>,
         commits: Vec<Arc<InitialGraphCommitData>>,
         cx: &mut TestAppContext,
-    ) -> (Entity<GitGraph>, Entity<GitPanel>, gpui::VisualTestContext) {
+    ) -> (
+        Entity<Project>,
+        Entity<GitGraph>,
+        Entity<GitPanel>,
+        gpui::VisualTestContext,
+    ) {
         fs.insert_tree(
             Path::new("/project"),
             json!({
@@ -8493,7 +8622,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        (git_graph, git_panel, cx)
+        (project, git_graph, git_panel, cx)
     }
 
     fn three_commits() -> Vec<Arc<InitialGraphCommitData>> {
@@ -8526,7 +8655,7 @@ mod tests {
 
         let fs = FakeFs::new(cx.executor());
         let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
-        let (git_graph, git_panel, mut cx) =
+        let (_project, git_graph, git_panel, mut cx) =
             setup_graph_with_git_panel(&fs, three_commits(), cx).await;
         let cx = &mut cx;
         draw_graph(&git_graph, cx);
@@ -8574,7 +8703,7 @@ mod tests {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
-        let (git_graph, git_panel, mut cx) =
+        let (_project, git_graph, git_panel, mut cx) =
             setup_graph_with_git_panel(&fs, three_commits(), cx).await;
         let cx = &mut cx;
         draw_graph(&git_graph, cx);
@@ -8601,7 +8730,7 @@ mod tests {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
-        let (git_graph, git_panel, mut cx) =
+        let (_project, git_graph, git_panel, mut cx) =
             setup_graph_with_git_panel(&fs, three_commits(), cx).await;
         let cx = &mut cx;
         draw_graph(&git_graph, cx);
@@ -8648,7 +8777,7 @@ mod tests {
 
         let fs = FakeFs::new(cx.executor());
         let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
-        let (git_graph, git_panel, mut cx) =
+        let (_project, git_graph, git_panel, mut cx) =
             setup_graph_with_git_panel(&fs, three_commits(), cx).await;
         let cx = &mut cx;
 
@@ -8657,7 +8786,13 @@ mod tests {
             graph.file_history_options.with_local_changes = true;
             assert!(graph.has_local_changes_row());
             // View row 1 is data row 0 once the synthetic row takes view 0.
-            graph.select_entry(1, ScrollStrategy::Nearest, window, cx);
+            graph.select_entry(
+                1,
+                ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
         git_panel.read_with(&*cx, |panel, _| {
@@ -8665,7 +8800,13 @@ mod tests {
         });
 
         git_graph.update_in(cx, |graph, window, cx| {
-            graph.select_entry(0, ScrollStrategy::Nearest, window, cx);
+            graph.select_entry(
+                0,
+                ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
@@ -8681,6 +8822,274 @@ mod tests {
                 graph.selected_entry_idx,
                 Some(0),
                 "closing the tab for a non-commit row must not deselect that row"
+            );
+        });
+    }
+
+    /// Re-clicking the row that is already selected takes `select_entry`'s
+    /// no-op early return, so the only thing that can bring the panel back to
+    /// the Commit tab is the push scheduled ABOVE that return. With the push
+    /// below it every other test here stays green while "select a commit, read
+    /// the Changes tab, click that row again" silently stops working.
+    #[gpui::test]
+    async fn test_reclicking_the_selected_row_reactivates_the_commit_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
+        let (_project, git_graph, git_panel, mut cx) =
+            setup_graph_with_git_panel(&fs, three_commits(), cx).await;
+        let cx = &mut cx;
+        draw_graph(&git_graph, cx);
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.apply_row_click_selection(1, RowSelectionGesture::Replace, window, cx);
+        });
+        cx.run_until_parked();
+        git_panel.read_with(&*cx, |panel, _| {
+            assert!(panel.commit_tab_is_active());
+            assert_eq!(panel.commit_tab_shas(), [oid(2)]);
+        });
+
+        cx.update_window_entity(&git_panel, |panel, window, cx| {
+            panel.activate_changes_tab_for_test(window, cx);
+        });
+        cx.run_until_parked();
+        git_panel.read_with(&*cx, |panel, _| assert!(!panel.commit_tab_is_active()));
+
+        git_graph.read_with(&*cx, |graph, _| {
+            // Both halves of the early return's condition: the row is still
+            // the selected one, and the diff it holds still belongs to it.
+            assert_eq!(graph.selected_entry_idx, Some(1));
+            assert_eq!(
+                graph.selected_commit_diff.as_ref().map(|state| state.sha),
+                Some(oid(2))
+            );
+        });
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.apply_row_click_selection(1, RowSelectionGesture::Replace, window, cx);
+        });
+        cx.run_until_parked();
+        git_panel.read_with(&*cx, |panel, _| {
+            assert!(
+                panel.commit_tab_is_active(),
+                "re-clicking the selected row is the way back to the Commit tab"
+            );
+            assert_eq!(panel.commit_tab_shas(), [oid(2)]);
+        });
+    }
+
+    /// A commit landing from outside the editor makes the graph refetch and
+    /// re-anchor its selection, which pushes it at the panel again. That push
+    /// must not drag a user who has gone back to Changes — staging files, a
+    /// commit message half typed — onto the Commit tab.
+    #[gpui::test]
+    async fn test_an_external_commit_does_not_yank_the_panel_onto_the_commit_tab(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let head = Oid::from_bytes(&[1; 20]).expect("valid oid");
+        let parent = Oid::from_bytes(&[2; 20]).expect("valid oid");
+        let external = Oid::from_bytes(&[3; 20]).expect("valid oid");
+        let parent_entry = Arc::new(InitialGraphCommitData {
+            sha: parent,
+            parents: smallvec![],
+            ref_names: vec![],
+        });
+
+        let (project, git_graph, git_panel, mut cx) = setup_graph_with_git_panel(
+            &fs,
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head,
+                    parents: smallvec![parent],
+                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+                }),
+                parent_entry.clone(),
+            ],
+            cx,
+        )
+        .await;
+        let cx = &mut cx;
+        draw_graph(&git_graph, cx);
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.apply_row_click_selection(0, RowSelectionGesture::Replace, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update_window_entity(&git_panel, |panel, window, cx| {
+            panel.activate_changes_tab_for_test(window, cx);
+        });
+        cx.run_until_parked();
+
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: external,
+                    parents: smallvec![head],
+                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: head,
+                    parents: smallvec![parent],
+                    ref_names: vec![],
+                }),
+                parent_entry,
+            ],
+        );
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.refs.insert("HEAD".into(), external.to_string());
+        })
+        .expect("fake git state should be writable");
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        draw_graph(&git_graph, cx);
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.selected_commit_shas(),
+                vec![head],
+                "the selection should have been re-anchored onto its new row"
+            );
+        });
+        git_panel.read_with(&*cx, |panel, _| {
+            assert!(
+                !panel.commit_tab_is_active(),
+                "a background refetch must leave the user on the tab they chose"
+            );
+            assert!(panel.commit_tab_is_open());
+            assert_eq!(panel.commit_tab_shas(), [head]);
+        });
+    }
+
+    /// `git commit --amend` in a terminal rewrites the sha, so the re-anchor
+    /// finds nothing and the graph ends up with no selection. The Commit tab
+    /// must not be left describing the commit that no longer exists — its file
+    /// rows would ask `CommitView` for diffs of a sha git cannot resolve.
+    #[gpui::test]
+    async fn test_an_amended_commit_closes_the_commit_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let head = Oid::from_bytes(&[1; 20]).expect("valid oid");
+        let parent = Oid::from_bytes(&[2; 20]).expect("valid oid");
+        let amended = Oid::from_bytes(&[3; 20]).expect("valid oid");
+        let parent_entry = Arc::new(InitialGraphCommitData {
+            sha: parent,
+            parents: smallvec![],
+            ref_names: vec![],
+        });
+
+        let (project, git_graph, git_panel, mut cx) = setup_graph_with_git_panel(
+            &fs,
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head,
+                    parents: smallvec![parent],
+                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+                }),
+                parent_entry.clone(),
+            ],
+            cx,
+        )
+        .await;
+        let cx = &mut cx;
+        draw_graph(&git_graph, cx);
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.apply_row_click_selection(0, RowSelectionGesture::Replace, window, cx);
+        });
+        cx.run_until_parked();
+        git_panel.read_with(&*cx, |panel, _| {
+            assert_eq!(panel.commit_tab_shas(), [head]);
+        });
+
+        // The amend replaces `head` outright: nothing in the refetched log
+        // carries that sha any more.
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: amended,
+                    parents: smallvec![parent],
+                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+                }),
+                parent_entry,
+            ],
+        );
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.refs.insert("HEAD".into(), amended.to_string());
+        })
+        .expect("fake git state should be writable");
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        draw_graph(&git_graph, cx);
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.selected_entry_idx, None);
+            assert!(graph.selected_commit_shas().is_empty());
+        });
+        git_panel.read_with(&*cx, |panel, _| {
+            assert!(
+                !panel.commit_tab_is_open(),
+                "the tab was describing a commit that no longer exists"
+            );
+        });
+    }
+
+    /// `CommitTabClosed` reaches every graph in the window, so it carries the
+    /// shas the closing tab was describing. A graph holding a different row —
+    /// a pane-item graph on another repository, or simply a second graph — must
+    /// keep its selection when somebody else's tab closes.
+    #[gpui::test]
+    async fn test_closing_a_tab_for_other_commits_keeps_this_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
+        let (project, git_graph, git_panel, mut cx) =
+            setup_graph_with_git_panel(&fs, three_commits(), cx).await;
+        let cx = &mut cx;
+        draw_graph(&git_graph, cx);
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.apply_row_click_selection(1, RowSelectionGesture::Replace, window, cx);
+        });
+        cx.run_until_parked();
+
+        let repository = project.read_with(&*cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        // Stand in for a second graph pushing its own row at the shared panel.
+        cx.update_window_entity(&git_panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository,
+                    shas: vec![oid(9)],
+                },
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+            panel.close_commit_tab(window, cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.selected_entry_idx,
+                Some(1),
+                "the close described another graph's commit"
             );
         });
     }
@@ -8729,7 +9138,13 @@ mod tests {
         });
 
         git_graph.update_in(cx, |graph, window, cx| {
-            graph.select_entry(1, ScrollStrategy::Nearest, window, cx);
+            graph.select_entry(
+                1,
+                ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
@@ -8752,7 +9167,13 @@ mod tests {
         });
 
         git_graph.update_in(cx, |graph, window, cx| {
-            graph.select_entry(0, ScrollStrategy::Nearest, window, cx);
+            graph.select_entry(
+                0,
+                ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
         git_graph.read_with(&*cx, |graph, _| {

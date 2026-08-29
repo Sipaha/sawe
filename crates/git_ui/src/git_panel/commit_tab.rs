@@ -462,6 +462,27 @@ pub struct CommitSelection {
     pub shas: Vec<Oid>,
 }
 
+/// What made the git graph push a selection at the Commit tab.
+///
+/// The graph re-anchors its selection by sha after every refetch, and a
+/// refetch is triggered by repository events the user never asked for — a
+/// `git fetch` landing in a terminal, a branch checked out elsewhere. Those
+/// re-anchors reach [`GitPanel::show_commit_selection`] through exactly the
+/// same call as a click does, so without this distinction one of them would
+/// swap the panel body out from under a user who had gone back to Changes to
+/// stage files and write a commit message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommitSelectionSource {
+    /// A click, a keyboard selection, or another gesture the user made in the
+    /// graph. Brings the Commit tab back to the front, which is what makes
+    /// "select a commit, switch to Changes, click that same row again" work.
+    UserGesture,
+    /// A re-anchor after a refetch. Refreshes what an already-open Commit tab
+    /// is describing and does nothing at all when the tab is closed; never
+    /// changes which tab is active.
+    Background,
+}
+
 /// Where one of the Commit tab's two background loads has got to.
 ///
 /// `Failed` exists so that a diff which errored is not indistinguishable from
@@ -566,9 +587,13 @@ impl GitPanel {
     /// panel would break the graph's own keyboard navigation. The user-driven
     /// routes into the tab (its tab-bar row, `git_panel::ActivateCommitTab`) go
     /// through `set_active_tab`, which does focus.
+    ///
+    /// A [`CommitSelectionSource::Background`] push refreshes an open tab in
+    /// place and stops there — see that variant for why.
     pub fn show_commit_selection(
         &mut self,
         selection: CommitSelection,
+        source: CommitSelectionSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -579,6 +604,10 @@ impl GitPanel {
             self.close_commit_tab(window, cx);
             return;
         };
+
+        if source == CommitSelectionSource::Background && !self.commit_tab_is_open() {
+            return;
+        }
 
         let already_showing = self.commit_tab.as_ref().is_some_and(|state| {
             state.selection.repository.entity_id() == selection.repository.entity_id()
@@ -591,7 +620,9 @@ impl GitPanel {
             // gesture that reaches back here, so refusing it too would make the
             // error permanent until the user picks some other commit.
             self.retry_failed_commit_loads(sha, cx);
-            self.activate_commit_tab_without_focus();
+            if source == CommitSelectionSource::UserGesture {
+                self.activate_commit_tab_without_focus();
+            }
             cx.notify();
             return;
         }
@@ -605,7 +636,9 @@ impl GitPanel {
             self.load_commit_tab_diff(sha, &repository, cx);
         }
 
-        self.activate_commit_tab_without_focus();
+        if source == CommitSelectionSource::UserGesture {
+            self.activate_commit_tab_without_focus();
+        }
         cx.notify();
     }
 
@@ -748,20 +781,41 @@ impl GitPanel {
     /// [`Event::CommitTabClosed`] so the git graph can clear the row selection
     /// that opened it.
     ///
+    /// The event carries the shas the tab was describing: the event reaches
+    /// every git graph in the window, and one pinned to another repository (or
+    /// a second graph with its own selection) must not lose its rows because
+    /// somebody else's tab closed.
+    ///
     /// Focus is left alone on the way out for the same reason
     /// [`Self::show_commit_selection`] does not take it: the close can arrive
     /// from the graph.
     pub fn close_commit_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.commit_tab.take().is_none() {
+        let Some(closed) = self.commit_tab.take() else {
             return;
-        }
+        };
         // Only the Commit tab itself is yanked back to Changes; a user parked
         // on another tab keeps the tab they chose.
         if self.active_tab == GitPanelTab::Commit {
             self.active_tab = GitPanelTab::Changes;
         }
-        cx.emit(Event::CommitTabClosed);
+        cx.emit(Event::CommitTabClosed(closed.selection.shas));
         cx.notify();
+    }
+
+    /// Whether the Commit tab is the one being rendered, as opposed to merely
+    /// open in the tab bar. The git graph's tests assert against it: a
+    /// background re-anchor has to leave the active tab alone, and only the
+    /// panel knows which tab that is.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_tab_is_active(&self) -> bool {
+        self.active_tab == GitPanelTab::Commit
+    }
+
+    /// Leave the Commit tab for Changes the way clicking the Changes tab
+    /// would, for tests that live outside this crate.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn activate_changes_tab_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_active_tab(GitPanelTab::Changes, window, cx);
     }
 
     /// The sha whose details the Commit tab is showing, if it is showing a

@@ -155,6 +155,44 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
     (which would move the graph's still-live sidebar too) or a magic negative
     margin, and the file rows are the edge the eye tracks.
 
+### Corrections established by the Task 3 review fixes (authoritative)
+
+54. **`show_commit_selection` grew a source argument — this is the contract
+    Tasks 4/5/6 build on.**
+    ```rust
+    pub enum CommitSelectionSource { UserGesture, Background }
+    pub fn show_commit_selection(&mut self, selection: CommitSelection,
+        source: CommitSelectionSource, window: &mut Window, cx: &mut Context<Self>);
+    ```
+    `GitGraph::select_entry` and `GitGraph::select_commit_by_sha` carry the same
+    argument through from their call sites. `UserGesture` re-activates the
+    Commit tab (what makes "select a commit, switch to Changes, click that row
+    again" work); `Background` refreshes an already-open tab in place, never
+    changes `active_tab`, and does nothing at all when the tab is closed. The
+    `Background` callers are exactly the two re-anchors in `on_repository_event`
+    and the deserialize path's `select_commit_by_sha`; everything else is a
+    gesture. Without the split a `git fetch` landing in a terminal re-anchored
+    the selection and swapped the panel body out from under a user who had gone
+    back to Changes to stage files and type a commit message.
+55. **`Event::CommitTabClosed` carries `Vec<Oid>`** — the shas the closing tab
+    was describing. The event reaches every `GitGraph` in the window, so the
+    handler clears only when the payload equals its own `selected_commit_shas()`.
+    This **subsumes** the old `is_empty()` bounce guard: with the synthetic
+    local-changes row selected the graph's shas are `[]` while the event carries
+    the outgoing commit, so the mismatch already stops the bounce (verified by
+    mutation — dropping the payload check fails
+    `test_local_changes_row_is_never_pushed_as_a_commit`).
+56. **A failed re-anchor closes the tab.** `invalidate_state` clears the
+    selection silently and parks the sha in `pending_select_sha`; when the
+    refetched log no longer contains it (`git commit --amend` in a terminal) no
+    push ever happens, so `on_repository_event` calls
+    `GitGraph::close_vanished_commit_tab`, which closes the panel's tab only
+    while it describes exactly that one sha. `invalidate_state`'s doc comment
+    now carries that story; `clear_selection`'s is unchanged (it is not on this
+    path).
+
+---
+
 ---
 
 ## Rulings made up front (binding; a reviewer judges against these)

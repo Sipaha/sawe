@@ -59,6 +59,7 @@ workspace.workspace = true
 
 [dev-dependencies]
 db = { workspace = true, features = ["test-support"] }
+git_ui = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 git = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
