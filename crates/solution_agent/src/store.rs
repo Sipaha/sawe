@@ -1565,7 +1565,11 @@ impl SolutionAgentStore {
     /// (private to `session_tab_strip`, and pulling a full tab-strip type
     /// into the store for one field would invert the dependency this
     /// module doc already explains `session_tab_strip` exists to avoid).
-    fn first_tab_order_session(&self, solution_id: SolutionId, cx: &App) -> Option<SolutionSessionId> {
+    fn first_tab_order_session(
+        &self,
+        solution_id: SolutionId,
+        cx: &App,
+    ) -> Option<SolutionSessionId> {
         self.sessions_for(&solution_id)
             .iter()
             .filter_map(|session| {
@@ -1803,7 +1807,8 @@ impl SolutionAgentStore {
     /// the hotkey and a dangling id — but it is what keeps the map itself
     /// honest for anything else that might read it later.
     fn clear_active_dialog_for_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
-        self.last_dialog_session.retain(|_, remembered| *remembered != id);
+        self.last_dialog_session
+            .retain(|_, remembered| *remembered != id);
 
         let affected: Vec<SolutionId> = self
             .band_state

@@ -36,7 +36,9 @@
 //! differ on what a click does when the content is already shown but
 //! unfocused.
 
-use gpui::{App, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window};
+use gpui::{
+    App, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
+};
 use ui::{IconButton, IconName, IconSize, Tooltip, prelude::*};
 use workspace::item::ItemHandle;
 use workspace::{HideStatusItem, StatusItemView, UtilityKind};
