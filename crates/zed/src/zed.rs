@@ -5454,6 +5454,7 @@ mod tests {
                 "encoding_selector",
                 "feedback",
                 "file_finder",
+                "find_in_path",
                 "git",
                 "git_graph",
                 "git_onboarding",
