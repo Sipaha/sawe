@@ -10,14 +10,16 @@
 //!
 //! Verbatim: the in-memory teardown primitive (`teardown_session_runtime`) and
 //! its runtime-map evictor (`evict_session_runtime_maps`) keep their exact set
-//! of map `.remove(...)`/reap calls, and the savepoint/cascade DELETE ordering
-//! in `purge_session_hard` / `purge_solution_fully` is unchanged.
+//! of map `.remove(...)`/reap calls — with the one deliberate exception of
+//! `entries_persist_chain`, which a soft close leaves in place (see
+//! [`ChainDisposition`]) — and the savepoint/cascade DELETE ordering in
+//! `purge_session_hard` / `purge_solution_fully` is unchanged.
 
 use super::*;
 
 /// What a teardown path does with the session's `entries_persist_chain` link.
 ///
-/// The chain is a single `Task<()>` per session in which every link moved the
+/// The chain is a single [`PersistChain`] per session whose every link moved the
 /// PREVIOUS link into its own future, so dropping the map entry cancels the
 /// whole chain, not just its last hop — every entry-row write still queued
 /// behind sqlite is discarded. That is right for exactly one kind of caller and
@@ -32,11 +34,24 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ChainDisposition {
     /// The session's rows are being KEPT (soft close, cold solution close), so
-    /// let the queued writes finish: hand the chain off by value with
-    /// `.detach()`. Safe because a chain link captures no entity — its rows,
-    /// length, epoch and change_seq are snapshotted synchronously before the
-    /// spawn and its `db` is an `Arc` — so a detached link can neither touch a
-    /// dropped entity nor read stale in-memory state.
+    /// let the queued writes finish: leave the chain in
+    /// `entries_persist_chain`, where it keeps running because the map owns it.
+    /// Safe because a chain link captures no entity — its rows, length, epoch
+    /// and change_seq are snapshotted synchronously before the spawn and its
+    /// `db` is an `Arc` — so a link that outlives its session can neither touch
+    /// a dropped entity nor read stale in-memory state.
+    ///
+    /// It must stay under its KEY, not merely stay alive. Close→reopen is a
+    /// normal action and `hydrate_all_for_solution` re-keys the same
+    /// `SolutionSessionId`; freeing the key (as a `.detach()` does) lets the
+    /// reopened session build a second chain with nothing ordering it against
+    /// the first, so the close flush's `delete_entries_from(old_main_len)` can
+    /// land after the new chain's tail upsert and delete the user's new message
+    /// — the phase-6b keystone bug, reintroduced at the close/reopen seam.
+    /// Keeping the chain in place makes it the reopened session's `prev` instead.
+    /// The key is reclaimed by
+    /// [`retire_finished_persist_chains`](SolutionAgentStore::retire_finished_persist_chains),
+    /// which only ever removes a chain that has already run.
     Drain,
     /// The session's rows are being DELETED (hard purge), so the queued writes
     /// must not land: drop the chain, cancelling it.
@@ -126,6 +141,13 @@ impl SolutionAgentStore {
             // normally be selected, but this stays a no-op guard rather than
             // an assumption.
             self.clear_active_dialog_for_session(id, cx);
+            // Not hydrated does not mean no queued writes: a session soft-closed
+            // moments ago left its drained chain under this key on purpose, and
+            // a link that outlives the `purge_session` below re-inserts rows for
+            // a session row that no longer exists. `teardown_session_runtime`
+            // reaches `abandon_persist_chain` on the hydrated path; this branch
+            // has to do it itself.
+            self.abandon_persist_chain(id);
             if let Some(db) = &self.persistence {
                 db.purge_session(id).detach_and_log_err(cx);
             }
@@ -182,6 +204,13 @@ impl SolutionAgentStore {
         for id in session_ids {
             self.purge_session_hard(id, root.clone(), cx);
         }
+        // The loop above only reaches HYDRATED sessions. A session this solution
+        // soft-closed earlier is gone from `by_solution` but its drained chain
+        // is still keyed in `entries_persist_chain` by design, and a link that
+        // survives the `delete_for_solution` below leaves entry rows whose
+        // parent `solution_sessions` row is gone — orphans nothing enumerates
+        // and no GC reaps.
+        self.abandon_persist_chains_for_solution(solution_id);
         // Sweep any non-hydrated rows (sessions persisted but never loaded this
         // process) across all six tables. The attachment files are deleted first
         // while their paths are still queryable.
@@ -401,11 +430,12 @@ impl SolutionAgentStore {
         //
         // The flush is queued on `entries_persist_chain` and only reaches disk
         // because the eviction below passes `ChainDisposition::Drain`: a cold
-        // solution close KEEPS every row, so its queued writes are handed off by
-        // value rather than cancelled. Cancelling them loses them permanently —
-        // `persist_all_rows` advances `persisted_main_seq` synchronously before
-        // spawning and every persist filters `mod_seq > watermark`, so no later
-        // persist re-picks the rows a discarded flush was covering.
+        // solution close KEEPS every row, so its queued writes stay in the map
+        // (which owns them) rather than being cancelled. Cancelling them loses
+        // them permanently — `persist_all_rows` advances `persisted_main_seq`
+        // synchronously before spawning and every persist filters
+        // `mod_seq > watermark`, so no later persist re-picks the rows a
+        // discarded flush was covering.
         //
         // Why the liveness gate. `persist_all_rows` is a full rewrite, not an
         // append: it upserts the Main stream at Main-local indices and then
@@ -414,13 +444,23 @@ impl SolutionAgentStore {
         // so an executed flush DELETES those teammate rows. That one-time
         // realign is defensible for a session the user actually worked in (cold
         // load arms exactly the same realign, deliberately). It is not
-        // defensible for a cold-hydrated one, which cannot have changed since
-        // hydration (every ingest path needs an `acp_thread`; even
-        // `push_system_note` bails without one) and which only became reachable
-        // here at all once cold sessions started being indexed into
+        // defensible for a cold-hydrated one, whose in-memory transcript is
+        // whatever hydration built (every ingest path needs an `acp_thread`;
+        // even `push_system_note` bails without one) and which only became
+        // reachable here at all once cold sessions started being indexed into
         // `by_solution`. Without this gate, "user closed a Solution window"
         // would mean "editor truncated the transcripts of every chat it had
         // merely restored". `close_session` carries the identical gate.
+        //
+        // One state the gate reads as cold without being restored-from-disk: the
+        // stuck-turn watchdog cold-izes a wedged session with
+        // `set_acp_thread(None, ..)` before it reconnects, so a close landing in
+        // that window skips the flush for a session that HAS accumulated
+        // entries this process. It costs nothing measurable — every entry was
+        // already persisted by the per-ingest `persist_main_stream`, which
+        // writes `save_epoch`/`save_change_seq` too — and erring toward "write
+        // nothing" is the safe direction here, since the alternative is
+        // truncating a legacy layout. Do not "fix" it by widening the gate.
         for id in &session_ids {
             let is_live = self
                 .sessions
@@ -498,25 +538,17 @@ impl SolutionAgentStore {
         self.teammate_watchers.forget_session(id);
         self.backoff_timers.remove(&id);
         self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
-        // Take the persist-serialization chain out of the map either way: the
-        // key must free SYNCHRONOUSLY here, because close→reopen is a normal
-        // action and `hydrate_all_for_solution` can re-key the same
-        // `SolutionSessionId` and install a fresh chain. Deferring the eviction
-        // until the chain drains would then evict a live chain.
-        if let Some(chain_task) = self.entries_persist_chain.remove(&id) {
-            match chain {
-                ChainDisposition::Drain => chain_task.detach(),
-                // Loud rather than silent: the discarded writes are gone for
-                // good (`persist_all_rows`/`persist_main_stream` advance
-                // `persisted_main_seq` synchronously before spawning, so no
-                // later persist re-picks those rows), mirroring the
-                // dropped-`pending_messages` warning in
-                // `teardown_session_runtime`.
-                ChainDisposition::Abandon => log::warn!(
-                    target: "solution_agent::store",
-                    "session={id} abandoned in-flight entry-row write(s) on hard purge",
-                ),
-            }
+        // The persist chain is the one runtime map that does NOT get evicted
+        // with the session. A `Drain` leaves it under its key so that it both
+        // finishes and keeps ordering a reopen that re-keys the same
+        // `SolutionSessionId`; see [`ChainDisposition::Drain`] for why freeing
+        // the key here would resurrect the phase-6b delete/upsert inversion.
+        // The sweep is what stops the map growing one dead key per closed
+        // session — it drops only chains that have already run, which is the
+        // only removal that can neither cancel nor reorder anything.
+        match chain {
+            ChainDisposition::Drain => self.retire_finished_persist_chains(),
+            ChainDisposition::Abandon => self.abandon_persist_chain(id),
         }
         // The metrics throttle map is keyed by session id and is otherwise
         // never pruned — one entry would leak per closed session for the
@@ -541,9 +573,9 @@ impl SolutionAgentStore {
     /// [`evict_session_runtime_maps`](Self::evict_session_runtime_maps). The
     /// eviction deliberately happens near the END of this function: the
     /// `cancel_turn` below can emit further ACP events, and those can issue one
-    /// more persist onto the chain. Evicting first would leave that link
-    /// unowned; evicting after it means a `Drain` hands off the cancel's write
-    /// too, in issue order.
+    /// more persist onto the chain. Disposing first would decide the fate of a
+    /// chain the cancel then appends to; disposing after it covers the cancel's
+    /// write too, in issue order.
     fn teardown_session_runtime(
         &mut self,
         id: SolutionSessionId,
@@ -678,11 +710,13 @@ impl SolutionAgentStore {
         // persist. The flush is queued on `entries_persist_chain` and only
         // reaches disk because `teardown_session_runtime` below tears down with
         // `ChainDisposition::Drain` — a soft close keeps the rows, so its queued
-        // writes must be handed off, not cancelled. There is no second chance
-        // if they are: `persist_all_rows` advances `persisted_main_seq`
-        // SYNCHRONOUSLY before spawning and every persist filters on
-        // `entry.mod_seq > old_watermark`, so a discarded flush's rows are lost
-        // for good rather than merely deferred.
+        // writes stay in `entries_persist_chain` under this session's key rather
+        // than being cancelled (and rather than being detached, which would let
+        // a reopen of this same id build a second, unordered chain). There is no
+        // second chance if they are cancelled: `persist_all_rows` advances
+        // `persisted_main_seq` SYNCHRONOUSLY before spawning and every persist
+        // filters on `entry.mod_seq > old_watermark`, so a discarded flush's
+        // rows are lost for good rather than merely deferred.
         //
         // The liveness gate is the same one `cold_close_solution` carries, for
         // the same reason — read the long note there before touching either.
@@ -691,13 +725,13 @@ impl SolutionAgentStore {
         // and on a legacy pre-6b row layout `entries.len() > main_len`, so it
         // deletes the teammate-tagged rows. That realign is defensible for a
         // session the user actually worked in; it is not defensible for one the
-        // editor had merely restored from disk, which cannot have changed since
-        // hydration (every ingest path needs an `acp_thread`). Closing a
-        // restored, never-resumed tab must therefore write nothing.
+        // editor had merely restored from disk, whose in-memory transcript is
+        // whatever hydration built (every ingest path needs an `acp_thread`).
+        // Closing a restored, never-resumed tab must therefore write nothing.
         //
         // The in-flight-turn cancel + entity drop happen inside
-        // `teardown_session_runtime`, and the chain hand-off happens after them
-        // — so a persist issued by the cancel's ACP events is drained too.
+        // `teardown_session_runtime`, and the chain disposition is applied after
+        // them — so a persist issued by the cancel's ACP events is drained too.
         let is_live = self
             .sessions
             .get(&id)

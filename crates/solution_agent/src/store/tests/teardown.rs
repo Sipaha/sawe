@@ -522,7 +522,7 @@ async fn cold_close_solution_keeps_sessions_restorable(cx: &mut gpui::TestAppCon
 ///
 /// (2) is gone: the cold close now evicts with `ChainDisposition::Drain`, so a
 /// LIVE session's flush does run (see
-/// `close_session_flushes_the_persist_chain_to_disk`). Only (1) stands between
+/// `cold_close_solution_flushes_persist_chain_to_disk`). Only (1) stands between
 /// this transcript and a rewrite, which is exactly what the test now pins: drop
 /// the gate and it fails, because the failure mode is live — "closing a
 /// Solution window truncates the transcript of every chat the editor had merely
@@ -637,9 +637,10 @@ async fn close_session_flushes_persist_chain_to_disk(cx: &mut gpui::TestAppConte
         store.persist_main_stream(id, cx);
         store.close_session(id, cx).expect("close_session");
         assert!(
-            !store.entries_persist_chain.contains_key(&id),
-            "the chain must leave the map synchronously — a deferred eviction \
-             would drop the chain a close→reopen had already re-keyed"
+            store.entries_persist_chain.contains_key(&id),
+            "the drained chain must STAY under its key — the map owns it (so it \
+             runs at all) and a reopen that re-keys this id has to find it as \
+             its `prev`"
         );
     });
     cx.run_until_parked();
@@ -1360,5 +1361,455 @@ async fn rewrite_session_cwds_rewrites_cold_db_rows(cx: &mut TestAppContext) {
         cwd,
         new_root.join("member").join("sub"),
         "the cold session's persisted cwd must be rewritten to the new root"
+    );
+}
+
+/// The `cold_close_solution` twin of `close_session_flushes_persist_chain_to_disk`,
+/// and the higher-volume half of the pair: closing a Solution window flushes
+/// EVERY live session at once, where a tab close flushes one.
+///
+/// Without it that half of the disposition split is untested — flipping this
+/// path back to `ChainDisposition::Abandon` leaves the whole suite green while
+/// silently restoring "closing a Solution window discards every open chat's
+/// transcript tail".
+///
+/// Three stale rows on disk, a two-entry Main stream in memory: an executed
+/// flush rewrites idx 0..1 and `delete_entries_from(2)` trims idx 2. A cancelled
+/// one leaves all three stale rows.
+#[gpui::test]
+async fn cold_close_solution_flushes_persist_chain_to_disk(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    for idx in 0..3 {
+        db.upsert_entry(id, idx, 0, 1_700_000_000_000 + idx, None, b"stale".to_vec())
+            .await
+            .expect("seed stale row");
+    }
+
+    let message = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = vec![message(1, "alpha"), message(2, "bravo")];
+            s.rebuild_streams();
+            cx.notify();
+        });
+        // Two links deep, both issued before the executor is pumped: the second
+        // link owns the first, so the whole chain has to survive the close.
+        store.persist_main_stream(id, cx);
+        let solution_id = session.read(cx).solution_id;
+        store.cold_close_solution(&solution_id, cx);
+    });
+    cx.run_until_parked();
+
+    let texts: Vec<String> = db
+        .load_entries(id)
+        .await
+        .expect("load rows")
+        .iter()
+        .map(
+            |row| match crate::session_entry::kind_from_payload(&row.payload).expect("decode") {
+                SessionEntryKind::UserMessage { content_md, .. } => content_md,
+                other => panic!("unexpected persisted kind: {other:?}"),
+            },
+        )
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["alpha".to_string(), "bravo".to_string()],
+        "the cold close's flush must reach disk: idx 0..1 rewritten from the \
+         in-memory Main stream and the stale idx 2 trimmed by \
+         delete_entries_from(main_len)"
+    );
+    assert!(
+        store.update(cx, |store, _| store.session(id).is_none()),
+        "precondition: the cold close really did evict the session"
+    );
+}
+
+/// Close→reopen must not produce two chains racing each other.
+///
+/// A drained chain is still running when the tab is reopened, and reopening
+/// re-keys the SAME `SolutionSessionId` (`hydrate_all_for_solution` restores it
+/// under its persisted id). If the close had freed the key — which is what
+/// handing the chain off with `.detach()` does — the reopened session's first
+/// persist would find no `prev` and build a second, independent chain. The two
+/// are then unordered, and the close flush's trailing
+/// `delete_entries_from(old_main_len)` can land AFTER the new chain's upsert and
+/// delete the message the user just typed: the phase-6b keystone bug, back at
+/// the close/reopen seam.
+///
+/// Three rows on disk and a three-entry transcript, closed and reopened with one
+/// new message appended. Ordered: four rows. Unordered: three, with the new
+/// message silently absent from disk and gone at the next cold load.
+#[gpui::test]
+async fn close_then_reopen_orders_the_new_chain_behind_the_drained_flush(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    let message = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+
+    for idx in 0..3i64 {
+        db.upsert_entry(
+            id,
+            idx,
+            idx + 1,
+            1_700_000_000_000 + idx,
+            None,
+            message(idx as u64 + 1, "old").to_payload(),
+        )
+        .await
+        .expect("seed row");
+    }
+
+    let sol = store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = vec![message(1, "old"), message(2, "old"), message(3, "old")];
+            s.rebuild_streams();
+            cx.notify();
+        });
+        session.read(cx).solution_id
+    });
+
+    // One synchronous block: the executor is never pumped between the close and
+    // the reopen, so the close's flush is unambiguously still in flight. That is
+    // the window the ordering has to cover.
+    store.update(cx, |store, cx| {
+        store.close_session(id, cx).expect("close_session");
+        insert_cold_session(
+            id,
+            sol,
+            SharedString::from("claude-acp"),
+            None,
+            None,
+            store,
+            cx,
+        );
+        let session = store.session(id).expect("reopened session");
+        session.update(cx, |s, cx| {
+            s.entries = vec![
+                message(1, "old"),
+                message(2, "old"),
+                message(3, "old"),
+                message(4, "brand new"),
+            ];
+            s.rebuild_streams();
+            // What hydration derives from the rows it read back: only the tail
+            // entry is above the watermark, so the reopened session's first
+            // persist writes exactly one row and then trims past it.
+            s.persisted_main_seq = 3;
+            cx.notify();
+        });
+        store.persist_main_stream(id, cx);
+    });
+    cx.run_until_parked();
+
+    let texts: Vec<String> = db
+        .load_entries(id)
+        .await
+        .expect("load rows")
+        .iter()
+        .map(
+            |row| match crate::session_entry::kind_from_payload(&row.payload).expect("decode") {
+                SessionEntryKind::UserMessage { content_md, .. } => content_md,
+                other => panic!("unexpected persisted kind: {other:?}"),
+            },
+        )
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "old".to_string(),
+            "old".to_string(),
+            "old".to_string(),
+            "brand new".to_string(),
+        ],
+        "the reopened session's new message must survive — an unordered close \
+         flush deletes it with delete_entries_from(3)"
+    );
+}
+
+/// The same ordering, over a transcript long enough that the close flush cannot
+/// have finished by the time the reopen runs.
+///
+/// `persist_all_rows` awaits one background round trip PER ROW, so a 200-entry
+/// chat's flush stays in flight across 200+ yields — comfortably longer than
+/// `reopen_closed_session`'s `db.reopen_session().await` plus
+/// `hydrate_all_for_solution().await`, which is why this is a real user-visible
+/// sequence ("close a long chat, reopen it, type") and not a synthetic
+/// same-tick race. The reopen here is separated from the close by real
+/// background round trips, so the ordering cannot be an artifact of everything
+/// happening inside one synchronous block.
+#[gpui::test]
+async fn close_then_reopen_orders_a_long_flush_before_the_new_message(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    const ENTRIES: u64 = 200;
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    let message = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+
+    for idx in 0..ENTRIES as i64 {
+        db.upsert_entry(
+            id,
+            idx,
+            idx + 1,
+            1_700_000_000_000 + idx,
+            None,
+            b"seed".to_vec(),
+        )
+        .await
+        .expect("seed row");
+    }
+
+    let sol = store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = (1..=ENTRIES).map(|n| message(n, "old")).collect();
+            s.rebuild_streams();
+            cx.notify();
+        });
+        session.read(cx).solution_id
+    });
+
+    store.update(cx, |store, cx| {
+        store.close_session(id, cx).expect("close_session");
+    });
+    // Stand in for the reopen's own latency: `reopen_closed_session` awaits
+    // `db.reopen_session` and then a whole `hydrate_all_for_solution` before the
+    // reopened tab can persist anything.
+    for _ in 0..5 {
+        db.load_entries(id).await.expect("reopen-path read");
+    }
+
+    store.update(cx, |store, cx| {
+        insert_cold_session(
+            id,
+            sol,
+            SharedString::from("claude-acp"),
+            None,
+            None,
+            store,
+            cx,
+        );
+        let session = store.session(id).expect("reopened session");
+        session.update(cx, |s, cx| {
+            let mut entries: Vec<_> = (1..=ENTRIES).map(|n| message(n, "old")).collect();
+            entries.push(message(ENTRIES + 1, "brand new"));
+            s.entries = entries;
+            s.rebuild_streams();
+            s.persisted_main_seq = ENTRIES;
+            cx.notify();
+        });
+        store.persist_main_stream(id, cx);
+    });
+    cx.run_until_parked();
+
+    let rows = db.load_entries(id).await.expect("load rows");
+    assert_eq!(
+        rows.len() as u64,
+        ENTRIES + 1,
+        "the long close flush must be ordered BEFORE the reopened session's \
+         append — otherwise its delete_entries_from({ENTRIES}) deletes the new \
+         message"
+    );
+}
+
+/// A chain that has already run must not stay keyed in `entries_persist_chain`
+/// forever. Retiring it is what bounds the map: a soft close deliberately leaves
+/// its chain behind (a reopen has to be able to order behind it), so without a
+/// sweep the editor would accumulate one dead key per closed session for the
+/// whole process lifetime.
+///
+/// Retiring only ever removes a SPENT chain, which is why it cannot reintroduce
+/// the close→reopen inversion: a link that has finished orders nothing.
+#[gpui::test]
+async fn a_finished_persist_chain_is_retired_from_the_map(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = vec![SessionEntry {
+                created_ms: 1_700_000_000_000,
+                mod_seq: 1,
+                subagent_id: None,
+                kind: SessionEntryKind::UserMessage {
+                    id: None,
+                    content_md: "alpha".into(),
+                    chunks: vec![],
+                },
+            }];
+            s.rebuild_streams();
+            cx.notify();
+        });
+        store.close_session(id, cx).expect("close_session");
+    });
+    cx.run_until_parked();
+
+    store.update(cx, |store, _| {
+        assert!(
+            store
+                .entries_persist_chain
+                .get(&id)
+                .is_some_and(|chain| chain.is_finished()),
+            "the drained chain must have run to completion and said so"
+        );
+        store.retire_finished_persist_chains();
+        assert!(
+            !store.entries_persist_chain.contains_key(&id),
+            "a spent chain must be reclaimed — otherwise the map grows one \
+             entry per closed session for the process's lifetime"
+        );
+    });
+}
+
+/// A session soft-closed and THEN hard-purged must not resurrect its rows.
+///
+/// The soft close leaves a drained chain under the session's key on purpose, and
+/// `purge_session_hard` cannot reach it through `teardown_session_runtime` —
+/// the session is no longer hydrated, so that path early-returns. Without an
+/// explicit abandon in that branch the surviving link writes entry rows whose
+/// parent `solution_sessions` row the purge has just deleted: orphans no UI
+/// enumerates and no GC reaps.
+#[gpui::test]
+async fn purge_after_soft_close_abandons_the_drained_chain(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    let message = |n: u64| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: "row".into(),
+            chunks: vec![],
+        },
+    };
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = (1..=8).map(message).collect();
+            s.rebuild_streams();
+            cx.notify();
+        });
+        // Close (chain retained, still in flight) and purge in the same
+        // synchronous block, so the purge lands while the flush is queued.
+        store.close_session(id, cx).expect("close_session");
+        store.purge_session_hard(id, None, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        db.load_entries(id).await.expect("load").is_empty(),
+        "the purge must abandon the soft close's retained chain — a surviving \
+         link re-inserts rows for a session that no longer exists"
+    );
+}
+
+/// The solution-level twin of `purge_after_soft_close_abandons_the_drained_chain`.
+///
+/// `purge_solution_fully` only iterates HYDRATED sessions, so a session the
+/// solution soft-closed earlier is invisible to its per-session purge loop while
+/// its drained chain is still keyed. `delete_for_solution` then sweeps that
+/// session's rows — and a surviving link writes them straight back, this time
+/// with no `solution_sessions` parent at all.
+#[gpui::test]
+async fn purge_solution_after_soft_close_abandons_the_drained_chain(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        let solution_id = session.read(cx).solution_id;
+        session.update(cx, |s, cx| {
+            s.entries = (1..=8)
+                .map(|n| SessionEntry {
+                    created_ms: 1_700_000_000_000 + n,
+                    mod_seq: n as u64,
+                    subagent_id: None,
+                    kind: SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: "row".into(),
+                        chunks: vec![],
+                    },
+                })
+                .collect();
+            s.rebuild_streams();
+            cx.notify();
+        });
+        // The soft close drops the session from `by_solution`, so the purge's
+        // per-session loop below never sees it — only the solution-wide abandon
+        // can reach its retained chain.
+        store.close_session(id, cx).expect("close_session");
+        store.purge_solution_fully(solution_id, None, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        db.load_entries(id).await.expect("load").is_empty(),
+        "a solution purge must abandon the retained chains of its already \
+         soft-closed sessions"
     );
 }

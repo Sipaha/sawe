@@ -236,6 +236,33 @@ fn reconnect_attempt_error(outcome: Result<Result<SolutionSessionId>>) -> String
     }
 }
 
+/// One session's serialized entry-row write chain: the OUTERMOST link, which
+/// transitively owns every earlier one (each link moves its predecessor into its
+/// own future), plus the two facts teardown needs about it without awaiting it.
+struct PersistChain {
+    task: Task<()>,
+    /// Flipped by the outermost link's future as its very last act, so the store
+    /// can tell a spent chain from a live one SYNCHRONOUSLY. That distinction is
+    /// what makes retiring a chain safe: removing a link that has already run
+    /// cannot reorder anything, while removing a live one cancels it.
+    ///
+    /// The flag is set and the future returns within the same poll, and the
+    /// chain runs on the foreground executor — the same thread that reads the
+    /// flag — so no store code can observe `true` while the future still has
+    /// work left to do.
+    finished: Arc<std::sync::atomic::AtomicBool>,
+    /// The owning solution. A soft-closed session is gone from `by_solution`, so
+    /// this is the only way `purge_solution_fully` can find (and abandon) the
+    /// chains of the sessions it is about to delete rows for.
+    solution_id: SolutionId,
+}
+
+impl PersistChain {
+    fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 pub struct SolutionAgentStore {
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
@@ -289,10 +316,16 @@ pub struct SolutionAgentStore {
     ///
     /// Because each link moves the PREVIOUS link into its own future, dropping
     /// a session's entry cancels the ENTIRE chain, not just its last hop. So
-    /// teardown must state what it wants: soft closes hand the chain off with
-    /// `.detach()`, hard purges drop it. See `ChainDisposition` in
-    /// `store/teardown.rs`.
-    entries_persist_chain: HashMap<SolutionSessionId, Task<()>>,
+    /// teardown must state what it wants: soft closes KEEP the chain here so
+    /// that it both finishes and keeps ordering a possible reopen, hard purges
+    /// drop it. See `ChainDisposition` in `store/teardown.rs`.
+    ///
+    /// The map is keyed by session, never by session *incarnation*: close→reopen
+    /// re-keys the same `SolutionSessionId`, and the reopened session's first
+    /// persist must chain behind the close's flush rather than race it. That is
+    /// why a drained chain stays under its key instead of being detached — see
+    /// [`Self::retire_finished_persist_chains`] for how the key is reclaimed.
+    entries_persist_chain: HashMap<SolutionSessionId, PersistChain>,
     /// When the stuck-turn watchdog last auto-reconnected each session, as
     /// epoch-millis. A fresh `claude --resume` must re-ingest the whole
     /// transcript before it emits anything, and on a large context that easily
@@ -2518,8 +2551,11 @@ impl SolutionAgentStore {
                 )));
             }
         };
-        // Flush any un-debounced tail so the cold entry set + transcript replay
-        // are complete before we drop the live thread.
+        // Flush the tail the ingest-driven persists have not reached yet (there
+        // is no persist debounce — `persist_main_stream` runs on every ingest
+        // event — but the event stream routinely outruns sqlite), so the cold
+        // entry set + transcript replay are complete before we drop the live
+        // thread.
         self.persist_all_rows(session_id, cx);
         let meta = {
             let s = session.read(cx);
@@ -3703,6 +3739,55 @@ impl SolutionAgentStore {
         )
     }
 
+    /// Drop every `entries_persist_chain` entry whose chain has already run to
+    /// completion. This is the ONLY safe way to reclaim a key: a spent link
+    /// orders nothing, so removing it cannot let a later persist overtake an
+    /// earlier one, and it cannot cancel work that has not happened yet.
+    ///
+    /// It is what bounds the map. A drained chain deliberately outlives its
+    /// session's teardown (a reopen must be able to chain behind it), so without
+    /// this sweep every closed session would leave a key behind for the
+    /// process's lifetime. Called wherever the map is already being touched, so
+    /// the residue is at most the chains still in flight.
+    fn retire_finished_persist_chains(&mut self) {
+        self.entries_persist_chain
+            .retain(|_, chain| !chain.is_finished());
+    }
+
+    /// Take a session's chain out of the map and drop it, cancelling every link
+    /// still queued behind sqlite. Only for callers that are DELETING the rows:
+    /// a surviving link would re-insert entry rows for a session that no longer
+    /// has a `solution_sessions` row. Loud rather than silent — the discarded
+    /// writes are gone for good, because `persist_all_rows` / `persist_main_stream`
+    /// advance `persisted_main_seq` synchronously before spawning, so no later
+    /// persist re-picks those rows.
+    fn abandon_persist_chain(&mut self, session_id: SolutionSessionId) {
+        if let Some(chain) = self.entries_persist_chain.remove(&session_id)
+            && !chain.is_finished()
+        {
+            log::warn!(
+                target: "solution_agent::store",
+                "session={session_id} abandoned in-flight entry-row write(s) on hard purge",
+            );
+        }
+    }
+
+    /// Abandon the queued entry-row writes of every session belonging to
+    /// `solution_id`, including ones already soft-closed (those are gone from
+    /// `by_solution`, so the per-session purge loop never reaches them, but their
+    /// drained chain can still be in flight).
+    fn abandon_persist_chains_for_solution(&mut self, solution_id: SolutionId) {
+        let doomed: Vec<SolutionSessionId> = self
+            .entries_persist_chain
+            .iter()
+            .filter(|(_, chain)| chain.solution_id == solution_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in doomed {
+            self.abandon_persist_chain(id);
+        }
+    }
+
     /// Flush the WHOLE Main stream as rows: upsert every current
     /// `streams[StreamId::Main]` entry (keyed by Main-LOCAL index, subagent_id
     /// always `None`), delete any stale trailing rows beyond the Main length, and
@@ -3726,7 +3811,7 @@ impl SolutionAgentStore {
         // event order), so a concurrent `persist_main_stream` doesn't re-upsert
         // the rows this flush covers, and so the plan can't drift before the
         // chained DB task runs.
-        let (rows, len, epoch, change_seq) = session.update(cx, |s, _| {
+        let (rows, len, epoch, change_seq, solution_id) = session.update(cx, |s, _| {
             let main = s.streams.get(&crate::stream::StreamId::Main);
             let main_entries = main.map(|stream| stream.entries.as_slice()).unwrap_or(&[]);
             let rows: Vec<_> = main_entries
@@ -3736,33 +3821,55 @@ impl SolutionAgentStore {
                 .collect();
             let len = main_entries.len() as i64;
             s.persisted_main_seq = main.map(|stream| stream.seq).unwrap_or(0);
-            (rows, len, s.epoch as i64, s.change_seq as i64)
+            (
+                rows,
+                len,
+                s.epoch as i64,
+                s.change_seq as i64,
+                s.solution_id,
+            )
         });
         // Serialize behind this session's prior persist link (see
         // `persist_main_stream`) — a full flush's `delete_entries_from(len)` must
         // not race a concurrent incremental append's upsert.
-        let prev = self.entries_persist_chain.remove(&session_id);
-        let task = cx.spawn(async move |_this, _cx: &mut AsyncApp| {
-            if let Some(prev) = prev {
-                prev.await;
-            }
-            for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
-                if payload.is_empty() {
-                    log::warn!(
-                        target: "solution_agent::store",
-                        "skipping empty-payload upsert for session={session_id} idx={idx}",
-                    );
-                    continue;
+        self.retire_finished_persist_chains();
+        let prev = self
+            .entries_persist_chain
+            .remove(&session_id)
+            .map(|chain| chain.task);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = cx.spawn({
+            let finished = finished.clone();
+            async move |_this, _cx: &mut AsyncApp| {
+                if let Some(prev) = prev {
+                    prev.await;
                 }
-                db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
-                    .await
-                    .log_err();
+                for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
+                    if payload.is_empty() {
+                        log::warn!(
+                            target: "solution_agent::store",
+                            "skipping empty-payload upsert for session={session_id} idx={idx}",
+                        );
+                        continue;
+                    }
+                    db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
+                        .await
+                        .log_err();
+                }
+                db.delete_entries_from(session_id, len).await.log_err();
+                db.save_epoch(session_id, epoch).await.log_err();
+                db.save_change_seq(session_id, change_seq).await.log_err();
+                finished.store(true, std::sync::atomic::Ordering::Release);
             }
-            db.delete_entries_from(session_id, len).await.log_err();
-            db.save_epoch(session_id, epoch).await.log_err();
-            db.save_change_seq(session_id, change_seq).await.log_err();
         });
-        self.entries_persist_chain.insert(session_id, task);
+        self.entries_persist_chain.insert(
+            session_id,
+            PersistChain {
+                task,
+                finished,
+                solution_id,
+            },
+        );
     }
 
     /// Incremental persist of the Main stream (phase 6b's persist authority).
@@ -3789,7 +3896,7 @@ impl SolutionAgentStore {
         // Capture the persist plan + advance the watermark synchronously, so
         // concurrent detached tasks can't each re-read the pre-advance value and
         // redundantly upsert the same rows.
-        let (rows, main_len, epoch, change_seq) = session.update(cx, |s, _| {
+        let (rows, main_len, epoch, change_seq, solution_id) = session.update(cx, |s, _| {
             let old_watermark = s.persisted_main_seq;
             let main = s.streams.get(&crate::stream::StreamId::Main);
             let main_entries = main.map(|stream| stream.entries.as_slice()).unwrap_or(&[]);
@@ -3802,36 +3909,63 @@ impl SolutionAgentStore {
                 .collect();
             let main_len = main_entries.len() as i64;
             s.persisted_main_seq = watermark;
-            (rows, main_len, s.epoch as i64, s.change_seq as i64)
+            (
+                rows,
+                main_len,
+                s.epoch as i64,
+                s.change_seq as i64,
+                s.solution_id,
+            )
         });
         // SERIALIZE behind this session's prior persist link: the plan above is
         // captured in event order, but `delete_entries_from(main_len)` carries a
         // point-in-time length — if a later append's upsert lands before an
         // earlier link's stale delete runs (detached tasks are NOT FIFO), the
         // just-appended row is deleted. Chaining `prev.await` first makes the
-        // upsert+delete pairs apply in issue order.
-        let prev = self.entries_persist_chain.remove(&session_id);
-        let task = cx.spawn(async move |_this, _cx: &mut AsyncApp| {
-            if let Some(prev) = prev {
-                prev.await;
-            }
-            for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
-                if payload.is_empty() {
-                    log::warn!(
-                        target: "solution_agent::store",
-                        "skipping empty-payload upsert for session={session_id} idx={idx}",
-                    );
-                    continue;
+        // upsert+delete pairs apply in issue order. This is also what makes a
+        // close→reopen safe: the reopened session re-keys the same
+        // `SolutionSessionId`, so the close's drained flush is still under that
+        // key and becomes THIS link's `prev` — without which the flush's stale
+        // `delete_entries_from` could land after the reopened session's first
+        // upsert and delete the user's new message.
+        self.retire_finished_persist_chains();
+        let prev = self
+            .entries_persist_chain
+            .remove(&session_id)
+            .map(|chain| chain.task);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = cx.spawn({
+            let finished = finished.clone();
+            async move |_this, _cx: &mut AsyncApp| {
+                if let Some(prev) = prev {
+                    prev.await;
                 }
-                db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
-                    .await
-                    .log_err();
+                for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
+                    if payload.is_empty() {
+                        log::warn!(
+                            target: "solution_agent::store",
+                            "skipping empty-payload upsert for session={session_id} idx={idx}",
+                        );
+                        continue;
+                    }
+                    db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
+                        .await
+                        .log_err();
+                }
+                db.delete_entries_from(session_id, main_len).await.log_err();
+                db.save_epoch(session_id, epoch).await.log_err();
+                db.save_change_seq(session_id, change_seq).await.log_err();
+                finished.store(true, std::sync::atomic::Ordering::Release);
             }
-            db.delete_entries_from(session_id, main_len).await.log_err();
-            db.save_epoch(session_id, epoch).await.log_err();
-            db.save_change_seq(session_id, change_seq).await.log_err();
         });
-        self.entries_persist_chain.insert(session_id, task);
+        self.entries_persist_chain.insert(
+            session_id,
+            PersistChain {
+                task,
+                finished,
+                solution_id,
+            },
+        );
     }
 
     /// Subscribe to a session's `AcpThread` event stream so that ACP-level
