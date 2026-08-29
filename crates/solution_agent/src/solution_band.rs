@@ -279,6 +279,15 @@ impl SolutionBand {
     /// "hide the section". Both layers agree that *the active content* is
     /// `utility_kind` while `utility_visible`, so a button and its hotkey
     /// can never disagree about which content is current.
+    ///
+    /// That includes the case where the occupant being switched away from (or
+    /// hidden) is the thing holding focus: it does not need releasing here.
+    /// Unmounting it empties the rendered frame's focus path, which fires the
+    /// window's focus-lost listeners, and `Workspace`'s re-focuses the active
+    /// pane — the same target the dock path's `focus_or_unfocus_panel` used.
+    /// Pinned by `console_panel`'s
+    /// `switching_the_utility_kind_leaves_focus_on_the_centre_pane`, which
+    /// also records why adding a release here would cost more than it buys.
     pub fn activate_utility_kind(&mut self, kind: UtilityKind, cx: &mut Context<Self>) {
         let (next_kind, next_visible) = utility_button_click(kind, &self.band_state(cx));
         // Order matters only for the switch case, and only cosmetically:

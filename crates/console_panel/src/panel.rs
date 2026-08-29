@@ -1997,6 +1997,72 @@ mod tests {
         assert!(band.read_with(cx, |band, cx| band.utility_visible(cx)));
     }
 
+    /// Switching the band's utility content away from the occupant that holds
+    /// focus does NOT strand focus on the panel that just stopped being
+    /// rendered — and the band deliberately owns no focus logic to make that
+    /// true. GPUI's `Window::draw` sees the rendered frame's focus path go
+    /// empty (the focused handle is no longer in the dispatch tree) and fires
+    /// the window's focus-lost listeners; `Workspace::new` registers one that
+    /// re-focuses `Workspace::focus_handle`, which is `active_pane`'s handle.
+    /// That is the same target `Workspace::focus_or_unfocus_panel` picked on
+    /// the dock path this band replaced, so the transition already lands
+    /// where the dock left it.
+    ///
+    /// Pinned because reading the band in isolation says the opposite —
+    /// `activate_utility_kind` never touches focus, and `Window::focus`
+    /// really does keep pointing at the departed handle for the rest of that
+    /// frame — and the fix that reading suggests (a focus-tracking wrapper
+    /// around the utility half so the band can release focus itself) would
+    /// also start capturing focus on every click over an occupant that is not
+    /// itself focusable, e.g. the git graph. Verified against a live editor
+    /// too: typing into the band's terminal, clicking Git Graph, then typing
+    /// again puts the characters in the centre pane's buffer.
+    #[gpui::test]
+    async fn switching_the_utility_kind_leaves_focus_on_the_centre_pane(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, _solution_id) = bootstrap_band_and_panel(cx, true).await;
+        let band = band_of(&window_handle, cx);
+
+        // `ctrl-\``: show the terminal occupant and focus it.
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                assert!(
+                    panel.focus_handle(cx).is_focused(window),
+                    "precondition: the band's terminal owns the window's focus"
+                );
+            })
+            .unwrap();
+
+        // What a click on the status bar's Git Graph button does. The kind has
+        // no occupant registered in this test, so the half unmounts outright —
+        // the worst case for the focus path.
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::GitGraph, cx)
+        });
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                assert!(
+                    !panel.focus_handle(cx).is_focused(window),
+                    "the terminal is gone from the frame; it must not still hold \
+                     the window's focus"
+                );
+                assert!(
+                    workspace.active_pane().focus_handle(cx).is_focused(window),
+                    "and focus must have landed on the centre pane, so the next \
+                     keystroke goes somewhere the user can see"
+                );
+            })
+            .unwrap();
+    }
+
     /// Regression: the empty-solution guard used to ask
     /// `project.worktrees()`, which COUNTS INVISIBLE worktrees — and
     /// `solutions_ui::open` opens an empty solution with its root as an
