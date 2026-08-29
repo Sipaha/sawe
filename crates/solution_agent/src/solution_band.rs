@@ -980,6 +980,27 @@ mod tests {
         BandState,
         tempfile::TempDir,
     ) {
+        let saved = BandState {
+            divider_ratio: 0.7,
+            utility_visible: false,
+            utility_kind: UtilityKind::GitGraph,
+            active_dialog_session: Some(SolutionSessionId::new()),
+            height: 500.0,
+        };
+        store_with_this_saved_row_and_no_persistence_yet(cx, saved).await
+    }
+
+    /// As above, for the tests that need a specific persisted value to
+    /// distinguish from the in-memory default.
+    async fn store_with_this_saved_row_and_no_persistence_yet(
+        cx: &mut TestAppContext,
+        saved: BandState,
+    ) -> (
+        Entity<SolutionAgentStore>,
+        Arc<SolutionAgentDb>,
+        BandState,
+        tempfile::TempDir,
+    ) {
         let (_solution_id, tmp, _project) =
             crate::store::tests::setup_solution_and_project(cx).await;
         cx.update(|cx| {
@@ -988,13 +1009,6 @@ mod tests {
         });
         let store = cx.update(|cx| SolutionAgentStore::global(cx));
         let db = Arc::new(SolutionAgentDb::open(cx.executor()).expect("open db"));
-        let saved = BandState {
-            divider_ratio: 0.7,
-            utility_visible: false,
-            utility_kind: UtilityKind::GitGraph,
-            active_dialog_session: Some(SolutionSessionId::new()),
-            height: 500.0,
-        };
         db.save_band_state(SolutionId(1), saved)
             .await
             .expect("seed the saved row");
@@ -1143,6 +1157,96 @@ mod tests {
                 expected,
                 "utility_kind is the live value the user set; divider_ratio is \
                  still whatever the persisted row held"
+            );
+        });
+        assert_eq!(persisted(&db, solution_id).await, Some(expected));
+    }
+
+    /// The touched mask records the user's *request*, not a change of value.
+    /// Before hydration the in-memory value IS the default, so a request for
+    /// the default — `ctrl-\`` asking for `UtilityKind::Terminal`, the
+    /// default kind — is indistinguishable from never having asked, and the
+    /// setters' no-op check returns before any bookkeeping. Marking the field
+    /// after that check (as it used to) let hydration's overlay pull
+    /// `utility_kind` back off disk: `ctrl-\`` pressed inside the DB-open
+    /// window reopened the band on the *persisted* content while focus had
+    /// already been sent to the unrendered terminal — the exact failure the
+    /// task-5 fix round removed from the post-hydration path.
+    #[gpui::test]
+    async fn asking_for_the_default_utility_kind_before_the_db_opens_still_wins(
+        cx: &mut TestAppContext,
+    ) {
+        let saved = BandState {
+            divider_ratio: 0.7,
+            utility_visible: false,
+            utility_kind: UtilityKind::Debug,
+            active_dialog_session: Some(SolutionSessionId::new()),
+            height: 500.0,
+        };
+        let (store, db, saved, _tmp) =
+            store_with_this_saved_row_and_no_persistence_yet(cx, saved).await;
+        let solution_id = SolutionId(1);
+        let default_kind = BandState::default().utility_kind;
+        assert_ne!(
+            saved.utility_kind, default_kind,
+            "the persisted kind must differ from the default the store starts \
+             on, or the request below could not be a no-op against memory"
+        );
+
+        store.update(cx, |store, cx| {
+            store.set_band_utility_kind(solution_id, default_kind, cx)
+        });
+        store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+        cx.run_until_parked();
+
+        let expected = BandState {
+            utility_kind: default_kind,
+            ..saved
+        };
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.band_state(solution_id),
+                expected,
+                "the user asked for the terminal; hydration must not hand them \
+                 back the debugger the row remembered"
+            );
+        });
+        assert_eq!(persisted(&db, solution_id).await, Some(expected));
+    }
+
+    /// The same hazard on `utility_visible`, whose default (`false`) a user
+    /// asks for every time they click the lit utility button or the
+    /// debugger's Close Panel. `divider_ratio` and `height` have the same
+    /// reachable path (double-clicking either handle resets to the default),
+    /// which is why all four setters mark before their no-op check.
+    #[gpui::test]
+    async fn hiding_the_section_before_the_db_opens_survives_hydration(cx: &mut TestAppContext) {
+        let saved = BandState {
+            divider_ratio: 0.7,
+            utility_visible: true,
+            utility_kind: UtilityKind::GitGraph,
+            active_dialog_session: Some(SolutionSessionId::new()),
+            height: 500.0,
+        };
+        let (store, db, saved, _tmp) =
+            store_with_this_saved_row_and_no_persistence_yet(cx, saved).await;
+        let solution_id = SolutionId(1);
+
+        store.update(cx, |store, cx| {
+            store.set_band_utility_visible(solution_id, false, cx)
+        });
+        store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+        cx.run_until_parked();
+
+        let expected = BandState {
+            utility_visible: false,
+            ..saved
+        };
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.band_state(solution_id),
+                expected,
+                "the user hid the section; hydration must not re-show it"
             );
         });
         assert_eq!(persisted(&db, solution_id).await, Some(expected));

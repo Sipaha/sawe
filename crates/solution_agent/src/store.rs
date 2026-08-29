@@ -382,9 +382,12 @@ pub struct SolutionAgentStore {
     band_states_hydrated: bool,
 }
 
-/// Which of [`BandState`]'s fields a setter has explicitly changed this run.
-/// Only meaningful in the window between process start and the persisted rows
-/// being merged — see `SolutionAgentStore::band_state_touched`.
+/// Which of [`BandState`]'s fields a setter was asked to set this run —
+/// asked, not necessarily changed: a request that matches the value already
+/// in memory still records the user's intent (see
+/// `SolutionAgentStore::mark_band_state_touched`). Only meaningful in the
+/// window between process start and the persisted rows being merged — see
+/// `SolutionAgentStore::band_state_touched`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BandStateTouched {
     divider_ratio: bool,
@@ -1491,12 +1494,10 @@ impl SolutionAgentStore {
         if let Some(session_id) = session_id {
             self.last_dialog_session.insert(solution_id, session_id);
         }
-        if !self.band_states_hydrated {
-            self.band_state_touched
-                .entry(solution_id)
-                .or_default()
-                .active_dialog_session = true;
-        }
+        // No no-op check on this setter, so the order does not matter here —
+        // it goes through the same helper only so all five band fields mark
+        // themselves one way.
+        self.mark_band_state_touched(solution_id, |touched| touched.active_dialog_session = true);
         self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged { solution_id });
         cx.notify();
@@ -1583,6 +1584,34 @@ impl SolutionAgentStore {
             .map(|(_, id)| id)
     }
 
+    /// Record that a band field was explicitly set this run, so hydration's
+    /// `overlay` keeps the live value for it instead of taking the persisted
+    /// one. Called by every `set_band_*` setter **before** its no-op check,
+    /// which is load-bearing: that check compares the request against the
+    /// *in-memory* value, and before hydration the in-memory value is the
+    /// default — so any request that happens to equal the default returns
+    /// early, and marking the field after the return would never happen for
+    /// exactly the case the mask exists to cover. Every field has a reachable
+    /// request-equals-default path: `ctrl-\`` asks for `UtilityKind::Terminal`
+    /// (the default kind) and the button group's second click asks for
+    /// `utility_visible = false` (the default), while a double-click on the
+    /// divider or the band's top edge asks for `DEFAULT_DIVIDER_RATIO` /
+    /// `DEFAULT_BAND_HEIGHT`. Marking a field the setter then no-ops on is
+    /// harmless: the value hydration keeps is the one already in memory.
+    ///
+    /// After hydration the mask is dead (`set_persistence` drains it and every
+    /// mutation writes through), so this is a no-op then.
+    fn mark_band_state_touched(
+        &mut self,
+        solution_id: SolutionId,
+        mark: impl FnOnce(&mut BandStateTouched),
+    ) {
+        if self.band_states_hydrated {
+            return;
+        }
+        mark(self.band_state_touched.entry(solution_id).or_default());
+    }
+
     /// Show or hide the band's utility (terminal) section for `solution_id`.
     /// Returns without touching the DB when nothing changed, so the
     /// terminal-spawn paths that call this defensively on every reveal don't
@@ -1593,14 +1622,16 @@ impl SolutionAgentStore {
         visible: bool,
         cx: &mut Context<Self>,
     ) {
+        // Marked before the no-op check, never after — see
+        // `mark_band_state_touched` for why that order is what protects the
+        // user's pre-hydration choice.
+        self.mark_band_state_touched(solution_id, |touched| touched.utility_visible = true);
         // The no-op check reads through `band_state`, NOT through
         // `entry(..).or_default()`, so a defensive reveal on an untouched
-        // Solution neither materialises a map entry nor queues a write. It is
-        // only an optimisation: what protects the persisted row from a
-        // pre-hydration mutation is `band_state_touched` (see
-        // `set_persistence`), because this check can't fire for the case that
-        // matters — before hydration the in-memory value is the *default*,
-        // which is exactly what a saved row differs from.
+        // Solution neither materialises a `band_state` entry nor queues a
+        // write. It is only an optimisation: what protects the persisted row
+        // from a pre-hydration mutation is `band_state_touched` (see
+        // `set_persistence`).
         if self.band_state(solution_id).utility_visible == visible {
             return;
         }
@@ -1608,12 +1639,6 @@ impl SolutionAgentStore {
             .entry(solution_id)
             .or_default()
             .utility_visible = visible;
-        if !self.band_states_hydrated {
-            self.band_state_touched
-                .entry(solution_id)
-                .or_default()
-                .utility_visible = true;
-        }
         self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();
@@ -1630,20 +1655,15 @@ impl SolutionAgentStore {
         kind: UtilityKind,
         cx: &mut Context<Self>,
     ) {
+        self.mark_band_state_touched(solution_id, |touched| touched.utility_kind = true);
         // Reads through `band_state` rather than `entry(..).or_default()` for
         // the same reason as `set_band_utility_visible` — see the comment
-        // there, including why this check is not what makes pre-hydration
-        // mutations safe.
+        // there, and `mark_band_state_touched` for why the mark above the
+        // check is what makes pre-hydration mutations safe.
         if self.band_state(solution_id).utility_kind == kind {
             return;
         }
         self.band_state.entry(solution_id).or_default().utility_kind = kind;
-        if !self.band_states_hydrated {
-            self.band_state_touched
-                .entry(solution_id)
-                .or_default()
-                .utility_kind = true;
-        }
         self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();
@@ -1659,10 +1679,11 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         let ratio = clamp_divider_ratio(ratio);
+        self.mark_band_state_touched(solution_id, |touched| touched.divider_ratio = true);
         // Reads through `band_state` rather than `entry(..).or_default()` for
         // the same reason as `set_band_utility_visible` — see the comment
-        // there, including why this check is not what makes pre-hydration
-        // mutations safe.
+        // there, and `mark_band_state_touched` for why the mark above the
+        // check is what makes pre-hydration mutations safe.
         if self.band_state(solution_id).divider_ratio == ratio {
             return;
         }
@@ -1670,12 +1691,6 @@ impl SolutionAgentStore {
             .entry(solution_id)
             .or_default()
             .divider_ratio = ratio;
-        if !self.band_states_hydrated {
-            self.band_state_touched
-                .entry(solution_id)
-                .or_default()
-                .divider_ratio = true;
-        }
         self.persist_band_state_debounced(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();
@@ -1693,20 +1708,15 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) {
         let height = clamp_band_height(height);
+        self.mark_band_state_touched(solution_id, |touched| touched.height = true);
         // Reads through `band_state` rather than `entry(..).or_default()` for
         // the same reason as `set_band_utility_visible` — see the comment
-        // there, including why this check is not what makes pre-hydration
-        // mutations safe.
+        // there, and `mark_band_state_touched` for why the mark above the
+        // check is what makes pre-hydration mutations safe.
         if self.band_state(solution_id).height == height {
             return;
         }
         self.band_state.entry(solution_id).or_default().height = height;
-        if !self.band_states_hydrated {
-            self.band_state_touched
-                .entry(solution_id)
-                .or_default()
-                .height = true;
-        }
         self.persist_band_state_debounced(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::BandStateChanged { solution_id });
         cx.notify();
