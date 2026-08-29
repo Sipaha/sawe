@@ -1401,8 +1401,8 @@ impl ConsolePanel {
 
     /// Hand focus that landed on the panel itself to the terminal the strip
     /// is actually showing, so `ctrl-\`` (and every other caller that focuses
-    /// this panel: the task / `runInTerminal` reveal paths, a click on the
-    /// tab strip) leaves the caret where the user can type.
+    /// this panel: `RevealStrategy::Always` task terminals, a click on the tab
+    /// strip) leaves the caret where the user can type.
     ///
     /// Driven from `render` rather than from a `cx.on_focus` subscription —
     /// the shape `DebugPanel` uses — because `ConsolePanel::new` is handed
