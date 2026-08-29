@@ -2,12 +2,14 @@
 
 Supersedes `findings/2026-08-27-session-handoff.md` for everything after
 `c14a18328c`. That file remains the record for phase 2a and the Run-crash
-fix; this one covers the band's own height (complete) and phase 2b
-(in progress, 6 of 9 tasks).
+fix; this one covers the band's own height and **phase 2b, which is now
+COMPLETE** — all nine tasks, the final whole-branch review and its fix wave,
+through `92e7e27f93`. Continued on 2026-08-29.
 
 Plans: `docs/plans/2026-08-27-solution-band-height.md` (done),
-`docs/plans/2026-08-27-solution-band-utility-section.md` (tasks 7–9 open).
+`docs/plans/2026-08-27-solution-band-utility-section.md` (done).
 Spec: `docs/plans/2026-08-26-solution-band-ai-dialogs-design.md` §3–§4.
+**Phase 2 is finished. The next unstarted phase is 3 — the git panel, spec §5.**
 
 ---
 
@@ -21,16 +23,26 @@ contents.** Both were the top two items in the previous handoff's pool.
   clamped at render against the live viewport. Verified live: 320px of real
   transcript, dragged to 550/670, floored at 140, capped, double-click
   reset, and 480px restored across a real process restart.
-- **Phase 2b (tasks 1–6 of 9).** `Workspace`'s single type-erased utility
-  slot became a `HashMap<UtilityKind, AnyView>`; which kind a Solution shows
-  is persisted; the git graph and the debugger are both de-docked and hosted
-  in the band; a three-button group in the status bar switches between them
-  and hides the section.
+- **Phase 2b (complete).** `Workspace`'s single type-erased utility slot
+  became a `HashMap<UtilityKind, AnyView>`; which kind a Solution shows is
+  persisted; the git graph and the debugger are both de-docked and hosted in
+  the band; a three-button group in the status bar switches between them and
+  hides the section; the project-zone toggles moved into the project toolbar
+  and **both vertical dock strips are gone**; `ctrl-shift-a` toggles the
+  dialog half.
 
-**Tasks 1-6 are complete, reviewed and pushed.** Task 6's fix round
-(`57e30ff613`) closed all seven of its review items and its scoped re-review
-found no new breakage. Nothing is in flight; the working tree is clean.
-Resume at **Task 7**.
+**All nine tasks are complete, reviewed and pushed**, as is the final
+whole-branch review's fix wave. Nothing is in flight; the working tree is
+clean. Final gates at `92e7e27f93`: **1459 tests passed / 0 failed** across
+the ten touched crates, `cargo fmt --all --check` clean, and scoped
+`./script/clippy` naming **only** the seven pre-existing `git_ui` findings —
+zero from any crate this work owns.
+
+Phase 2b's own commits: `134a51bc05` `c180820740` `850712d29d` `009aefddd3`
+`628ab25064` `8561f3b461` `d66a2fb9da` `57e30ff613` `1f72092462`
+`84dd8ef2a1` `3ceb6f433d` `be2265c6d4`, then task 9's seven cleanup/doc
+commits `752490b760`…`565f1a9520`, `59874812e9`, and the final fix wave
+`195152a012` + `92e7e27f93`.
 
 ---
 
@@ -102,30 +114,13 @@ on the maintainer's behalf.
 
 ## Open pool, in priority order
 
-1. **Finish phase 2b — tasks 7, 8, 9** of
-   `docs/plans/2026-08-27-solution-band-utility-section.md`:
-   - **Task 7** relocates the project-zone toggles (ProjectPanel,
-     OutlinePanel, GitPanel) into `ProjectToolbar` and *then* deletes
-     `render_left_dock_strip` / `render_right_dock_strip` and their
-     `PanelButtons`. Order inside the task is load-bearing — deleting first
-     ships a commit where the project panel cannot be toggled at all.
-     `ProjectToolbar` is **not** a registry: it composes fixed children and
-     pulls one `AnyView` slot (`run_config_strip`) — copy that idiom.
-   - **Task 8** is the `ctrl-shift-a` dialog toggle. Two facts settled by
-     recon: the binding **collides** (`"Terminal"` → `editor::SelectAll` on
-     Linux/Windows; macOS `"Editor"` → `editor::SelectToBeginningOfLine`),
-     and **nothing in the codebase remembers the last-selected session** —
-     `tab_order` is a manual display order, `Solution::last_opened_at` is
-     per-Solution. Rulings already made: bind in `"Workspace"` context only,
-     do not override the more specific contexts, document the macOS
-     limitation; and keep the re-open target in memory
-     (`last_dialog_session` on the store, falling back to the first tab)
-     rather than adding a persisted column.
-   - **Task 9** is live verification + docs, and must also fix the
-     pre-existing `cargo test -p zed test_action_namespaces` failure as its
-     own commit (its expected list lacks `"find_in_path"`, added
-     2026-08-19 by `6217672762`) — confirmed failing at `c14a18328c`, so it
-     is not this work's regression, but it blocks that task's gate.
+1. **Phase 3 — the git panel** (spec §5): the panel becomes
+   `Changes | Commit`, History is removed, and the git graph loses its inline
+   commit-details subpanel — which is what makes it viable in the compact
+   utility section it now lives in. Selecting a commit in the graph opens the
+   closable Commit tab; clicking a file opens its diff in the centre.
+   Multi-select shows "N commits selected" and a combined file list is
+   explicitly out of scope. No plan written yet.
 2. **`entries_persist_chain` is cancelled wholesale on every teardown** —
    unchanged from the previous handoff, and still the item whose naive fix
    is dangerous (letting the flush run is what arms
@@ -135,6 +130,18 @@ on the maintainer's behalf.
    §5 exists; no plan yet. Note phase 2b makes the graph viable in the
    compact utility section, which was its prerequisite.
 4. **Smaller, tracked here so they are not lost:**
+   - **`ctrl-\`` focuses the `ConsolePanel` ROOT, not the active terminal**,
+     so typing after the hotkey alone goes nowhere until the user clicks into
+     the terminal. `impl Focusable for ConsolePanel` returns the root handle
+     and `render` tracks focus on it with no forwarding into the active tab.
+     **Pre-existing** — it dates to the panel's creation and the dock path it
+     replaced focused the same handle, so phase 2b neither caused nor
+     worsened it. Sized by review as small and one-crate: an
+     `cx.on_focus_in(&self.focus_handle, …)` redirecting to the active tab's
+     view handle, ~20-30 lines with a test. **The trap:**
+     `toggle_utility_focus`'s tri-state uses `focus_handle.contains_focused`,
+     which keeps working with `on_focus_in` redirection but **breaks** if you
+     instead change `Focusable::focus_handle` to return the child's handle.
    - **The git graph now has no keybinding at all** — its dock toggle action
      died with its `Panel` impl in `009aefddd3`. The status-bar button is
      its only path. Deliberate for now.
