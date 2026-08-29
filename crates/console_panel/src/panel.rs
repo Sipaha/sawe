@@ -662,7 +662,9 @@ impl ConsolePanel {
                 .child(
                     IconButton::new(("console-close", ix), IconName::Close)
                         .icon_size(IconSize::Small)
-                        .on_click(cx.listener(move |this, _, _, cx| this.close_tab(ix, cx))),
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.close_tab(ix, window, cx)),
+                        ),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1282,9 +1284,9 @@ impl ConsolePanel {
             let weak_reveal = weak.clone();
             let view_rename = view.clone();
             let view_reveal = view;
-            menu.entry("Close", None, move |_, cx| {
+            menu.entry("Close", None, move |window, cx| {
                 if let Some(this) = weak_close.upgrade() {
-                    this.update(cx, |this, cx| this.close_tab(tab_index, cx));
+                    this.update(cx, |this, cx| this.close_tab(tab_index, window, cx));
                 }
             })
             .entry("Rename Tab", None, move |window, cx| {
@@ -1404,17 +1406,25 @@ impl ConsolePanel {
     /// this panel: `RevealStrategy::Always` task terminals, a click on the tab
     /// strip) leaves the caret where the user can type.
     ///
-    /// Driven from `render` rather than from a `cx.on_focus` subscription —
-    /// the shape `DebugPanel` uses — because `ConsolePanel::new` is handed
-    /// only a `Context` (every construction site builds it inside `cx.new`,
-    /// including one in another crate's tests) and `cx.on_focus` needs a
-    /// `Window`. Installing the subscription from the first render is one
-    /// frame too late for the case that matters: `ctrl-\`` on a hidden
-    /// section shows the panel and focuses it in the same effect cycle, so
-    /// the subscription's deferred activation misses that frame's focus
-    /// event and focus stays stranded. Redirecting during render also lands
-    /// in the frame being built, so the terminal's own focus-in listener
-    /// runs at the end of *this* draw instead of waiting for another one.
+    /// Driven from `render` — a state check re-evaluated every frame — and
+    /// not from the `cx.on_focus_in` subscription `DebugPanel` uses, because
+    /// `Window::on_focus_in` is EDGE-triggered: `FocusEvent::is_focus_in` is
+    /// `!previous_focus_path.contains(id) && current_focus_path.contains(id)`.
+    /// While the terminal holds focus, the panel's handle is its ANCESTOR and
+    /// is therefore already in the previous path, so moving focus from the
+    /// terminal *up* to the panel root — which is exactly what a click on the
+    /// tab strip does — never crosses that edge. No listener would run, and
+    /// focus would strand on a container with no key handling, reproducing
+    /// the very bug this exists to prevent. A state-based redirect catches
+    /// that transition; an edge-triggered subscription cannot.
+    ///
+    /// The constructor's signature is not the obstacle, despite appearances:
+    /// `ConsolePanel::load` already sits inside a `workspace.update_in` that
+    /// hands it a `&mut Window` it discards, so a subscription installed in
+    /// `new` could be armed long before the first `ctrl-\``. Do not "restore"
+    /// the subscription on that basis — the tab-strip case above is what
+    /// rules it out, and it regresses silently (a `ctrl-\`` test still passes,
+    /// because that path *is* a genuine focus-in).
     ///
     /// This must stay a redirect rather than the shorter-looking fix of
     /// returning the terminal's handle from [`Focusable::focus_handle`]: the
@@ -1478,11 +1488,33 @@ impl ConsolePanel {
         self.persist(cx);
     }
 
-    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.tabs.len() {
+    /// Closing the tab that holds focus has to re-home focus explicitly. The
+    /// closed `TerminalView`'s handle leaves the dispatch tree, so the
+    /// window's focus points at a dead id, [`focus_active_terminal`]'s
+    /// `is_focused` guard is false and the redirect cannot fire — and
+    /// `Workspace`'s focus-lost listener then yanks focus out to the centre
+    /// pane, so the user's next keystroke edits a buffer instead of a
+    /// console.
+    ///
+    /// Focus goes to the panel's own handle rather than straight to the
+    /// surviving terminal so the redirect stays the single place that decides
+    /// *which* tab receives focus (it applies the same scope filter
+    /// `render_active_tab` paints with). When the closed tab was the last
+    /// one there is nothing to redirect to, and focus deliberately rests on
+    /// the panel root: it is still in the frame (the tab strip and its "new
+    /// terminal" button survive an empty panel) and still carries the
+    /// `ConsolePanel` key context, so a stray keystroke is absorbed by the
+    /// console instead of silently editing whatever buffer the centre pane
+    /// happens to show.
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ConsoleTab::Terminal { view, .. }) = self.tabs.get(index) else {
             return;
-        }
+        };
+        let closed_tab_held_focus = view.focus_handle(cx).contains_focused(window, cx);
         self.tabs.remove(index);
+        if closed_tab_held_focus {
+            self.focus_handle.focus(window, cx);
+        }
         self.active_index = if self.tabs.is_empty() {
             None
         } else {
@@ -2015,11 +2047,16 @@ mod tests {
         );
     }
 
-    /// Same hazard on the non-focusing path: `RevealStrategy::Always` /
-    /// `NoFocus` (task terminals, and the debugger's own DAP `runInTerminal`)
-    /// go through `reveal_utility_section`, which must also select the kind —
-    /// otherwise "reveal the terminal so the user can see the output" opens
-    /// the band on the debugger instead.
+    /// Same hazard on the spawn path: a task terminal with
+    /// `RevealStrategy::Always` (which reveals AND focuses) or
+    /// `RevealStrategy::NoFocus` (reveals only) goes through
+    /// `reveal_utility_section`, which must also select the kind — otherwise
+    /// "reveal the terminal so the user can see the output" opens the band on
+    /// the debugger instead. The debugger's own DAP `runInTerminal` is NOT on
+    /// this path: `debugger_ui::session::running::handle_run_in_terminal`
+    /// builds its own `TerminalView` and installs it via
+    /// `ensure_pane_item(DebuggerPaneItem::Terminal)`, so it creates no
+    /// `ConsoleTab` and never calls `reveal_utility_section`.
     #[gpui::test]
     async fn revealing_a_task_terminal_selects_the_terminal_kind(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -2088,17 +2125,26 @@ mod tests {
                     terminal.focus_handle(cx).is_focused(window),
                     "ctrl-` must focus the terminal itself, not the panel around it"
                 );
+                // Non-regression guard only: this stays true whether or not
+                // the redirect ran (without it focus rests ON the panel's own
+                // handle, which `contains_focused` also reports). It does NOT
+                // prove the band's tri-state survives the redirect — the
+                // second `handle_toggle_focus` at the end of this test does.
                 assert!(
                     panel.focus_handle(cx).contains_focused(window, cx),
                     "and the panel must still count as focused, or the band's \
                      tri-state loses its 'visible and focused' leg"
                 );
-                let terminal_action_reachable = window
-                    .available_actions(cx)
-                    .iter()
-                    .any(|action| action.name().starts_with("terminal"));
+                // `terminal::RerunTask` is registered on `TerminalView`'s own
+                // element and nowhere else in the tree, so reachability is a
+                // true discriminator. `Window::is_action_available` walks only
+                // the dispatch path to the focused node; `available_actions`
+                // would also union in every GLOBAL action listener, and a
+                // `starts_with("terminal")` prefix over that set is vacuous —
+                // `terminal_panel::{Toggle,ToggleFocus}` are registered on
+                // `Workspace` itself and their names match that prefix.
                 assert!(
-                    terminal_action_reachable,
+                    window.is_action_available(&terminal_view::RerunTask, cx),
                     "a keystroke dispatched now must travel through the \
                      terminal's element"
                 );
@@ -2155,9 +2201,18 @@ mod tests {
         cx.run_until_parked();
         window_handle
             .update(cx, |_workspace, window, cx| {
+                // This test spawns no terminal tab, so the render redirect in
+                // `focus_active_terminal` early-returns and focus stops on
+                // the panel's OWN handle. The realistic shape — focus resting
+                // on a terminal inside the panel — is
+                // `switching_the_utility_kind_away_from_a_focused_terminal_
+                // lands_on_the_centre_pane` below; both must reach the centre
+                // pane, and an empty panel is the harsher case because there
+                // is no descendant to blur first.
                 assert!(
                     panel.focus_handle(cx).is_focused(window),
-                    "precondition: the band's terminal owns the window's focus"
+                    "precondition: the band's (empty) console panel owns the \
+                     window's focus"
                 );
             })
             .unwrap();
@@ -2181,6 +2236,162 @@ mod tests {
                     workspace.active_pane().focus_handle(cx).is_focused(window),
                     "and focus must have landed on the centre pane, so the next \
                      keystroke goes somewhere the user can see"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The realistic companion to
+    /// `switching_the_utility_kind_leaves_focus_on_the_centre_pane`: with a
+    /// terminal tab present, `ctrl-\`` lands focus on the TERMINAL, so the
+    /// handle that leaves the frame when the band switches kind is a
+    /// descendant of the panel rather than the panel's own. The focus-lost
+    /// path has to reach the centre pane from there too — and the sibling
+    /// test above cannot show that, because the render redirect it relies on
+    /// early-returns when there is no tab to redirect to.
+    #[gpui::test]
+    async fn switching_the_utility_kind_away_from_a_focused_terminal_lands_on_the_centre_pane(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, _solution_id) = bootstrap_band_and_panel(cx, true).await;
+        let band = band_of(&window_handle, cx);
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let terminal = panel
+            .read_with(cx, |panel, cx| panel.active_terminal_view(cx))
+            .expect("the panel has one terminal tab");
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                assert!(
+                    terminal.focus_handle(cx).is_focused(window),
+                    "precondition: the redirect put focus on the terminal itself"
+                );
+            })
+            .unwrap();
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::GitGraph, cx)
+        });
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                assert!(
+                    !terminal.focus_handle(cx).is_focused(window),
+                    "the terminal is gone from the frame; it must not still \
+                     hold the window's focus"
+                );
+                assert!(
+                    workspace.active_pane().focus_handle(cx).is_focused(window),
+                    "and focus must have landed on the centre pane, so the \
+                     next keystroke goes somewhere the user can see"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Closing the tab that holds focus must not eject the user to the centre
+    /// pane. The hazard predates the render redirect but the redirect makes it
+    /// the DEFAULT path: `ctrl-\`` used to leave focus on the panel root,
+    /// where closing a tab moved nothing, and now it really does put focus on
+    /// the terminal. That handle leaves the dispatch tree when the tab
+    /// closes, so `Workspace`'s focus-lost listener pulls focus to
+    /// `active_pane` unless `close_tab` re-homes it first — and the redirect
+    /// cannot repair it, because its `is_focused` guard is false once focus
+    /// points at a dead id.
+    #[gpui::test]
+    async fn closing_the_focused_tab_keeps_focus_in_the_console(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, _solution_id) = bootstrap_band_and_panel(cx, true).await;
+
+        for _ in 0..3 {
+            window_handle
+                .update(cx, |_workspace, window, cx| {
+                    panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+        let terminals = panel.read_with(cx, |panel, _| {
+            panel
+                .tabs
+                .iter()
+                .map(|ConsoleTab::Terminal { view, .. }| view.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(terminals.len(), 3);
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                assert!(
+                    terminals[2].focus_handle(cx).is_focused(window),
+                    "precondition: ctrl-` focuses the active (last-added) terminal"
+                );
+            })
+            .unwrap();
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| panel.close_tab(2, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                assert!(
+                    terminals[1].focus_handle(cx).is_focused(window),
+                    "closing the focused tab must hand focus to the terminal \
+                     that takes its place"
+                );
+                assert!(
+                    !workspace.active_pane().focus_handle(cx).is_focused(window),
+                    "and must not eject the user to the centre-pane editor"
+                );
+            })
+            .unwrap();
+
+        // The last tab is the interesting edge: nothing is left to redirect
+        // to, and focus still must not leave the console.
+        for index in (0..2).rev() {
+            window_handle
+                .update(cx, |_workspace, window, cx| {
+                    panel.update(cx, |panel, cx| panel.close_tab(index, window, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                assert!(panel.read(cx).tabs.is_empty(), "all three tabs closed");
+                assert!(
+                    panel.focus_handle(cx).is_focused(window),
+                    "with no terminal left, focus rests on the panel root — \
+                     still rendered, still carrying the ConsolePanel key \
+                     context, so a stray keystroke is absorbed by the console"
+                );
+                assert!(
+                    !workspace.active_pane().focus_handle(cx).is_focused(window),
+                    "closing the last terminal must not eject focus to the \
+                     centre-pane editor either"
                 );
             })
             .unwrap();
@@ -2347,12 +2558,12 @@ mod tests {
         // Activate the middle tab and close it. The active index should land
         // on the tab that shifted down from index 2 → 1.
         window_handle
-            .update(cx, |_workspace, _window, cx| {
+            .update(cx, |_workspace, window, cx| {
                 panel.update(cx, |p, cx| {
                     p.activate_tab(1, cx);
                     assert_eq!(p.tabs.len(), 3);
                     assert_eq!(p.active_index, Some(1));
-                    p.close_tab(1, cx);
+                    p.close_tab(1, window, cx);
                 });
             })
             .unwrap();
@@ -2435,10 +2646,10 @@ mod tests {
         cx.run_until_parked();
 
         window_handle
-            .update(cx, |_workspace, _window, cx| {
+            .update(cx, |_workspace, window, cx| {
                 panel.update(cx, |p, cx| {
                     assert_eq!(p.tabs.len(), 1);
-                    p.close_tab(0, cx);
+                    p.close_tab(0, window, cx);
                 });
             })
             .unwrap();
