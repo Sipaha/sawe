@@ -263,6 +263,20 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
     now a half-no-op from the palette on the Commit tab — it focuses and selects
     but does not switch tabs. **Task 6 rules on that one.**
 
+66. **`git::FileHistory` escaped Task 5's palette guard**, because the read is on
+    the *caller's* side of the seam: `git_graph` registers it on the **Workspace**
+    element and resolves its target through
+    `GitPanel::selected_file_history_target`, which had no `active_tab` check. The
+    conditional registration also leaked whether a hidden file was selected. Fixed
+    in Task 5's review wave. The class to watch: any cross-crate reader of the
+    panel's selection bypasses a guard that lives on the panel's own
+    registrations.
+67. **`commit_editor_expanded` is orthogonal to `active_tab` and reachable from
+    the palette on any tab** (`git::ToggleFillCommitEditor` is registered at the
+    workspace level). It hides the changes list while `active_tab` stays
+    `Changes`, so the 20 guarded actions stay registered with nothing on screen —
+    and expanded + Commit tab rendered no tab bar, no ✕ and no commit editor.
+
 ---
 
 ## Rulings made up front (binding; a reviewer judges against these)
