@@ -401,11 +401,6 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_tab == GitPanelTab::History {
-            self.select_previous_history_entry(cx);
-            return;
-        }
-
         let Some(selected_entry) = self.selected_entry else {
             return;
         };
@@ -429,11 +424,6 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_tab == GitPanelTab::History {
-            self.select_next_history_entry(cx);
-            return;
-        }
-
         let Some(selected_entry) = self.selected_entry else {
             return;
         };

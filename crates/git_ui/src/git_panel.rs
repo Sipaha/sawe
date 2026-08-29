@@ -21,9 +21,9 @@ use futures::channel::oneshot::Canceled;
 use git::Oid;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
-    Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
-    GitCommitTemplate, GitCommitter, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
-    ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus, get_git_committer,
+    Branch, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions, GitCommitTemplate,
+    GitCommitter, PushOptions, Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking,
+    UpstreamTrackingStatus, get_git_committer,
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
@@ -48,9 +48,7 @@ use panel::PanelHeader;
 use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
-    git_store::{
-        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
-    },
+    git_store::{GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op},
     project_settings::{GitPathStyle, ProjectSettings},
 };
 use prompt_store::RULES_FILE_NAMES;
@@ -62,7 +60,6 @@ use solutions;
 use std::future::Future;
 use std::ops::Range;
 use std::path::Path;
-use std::str::FromStr as _;
 use std::{sync::Arc, time::Duration, usize};
 use strum::{IntoEnumIterator, VariantNames};
 use theme_settings::ThemeSettings;
@@ -122,8 +119,6 @@ actions!(
         CollapseSelectedEntry,
         /// Activates the Changes tab.
         ActivateChangesTab,
-        /// Activates the History tab.
-        ActivateHistoryTab,
         /// Activates the Commit tab, when a commit is open in it.
         ActivateCommitTab,
         /// Opens the selected file itself in an editor tab (IDEA's "Jump to
@@ -439,7 +434,6 @@ struct SerializedGitPanel {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum GitPanelTab {
     Changes,
-    History,
     /// Only reachable while `GitPanel::commit_tab` is `Some` — the tab is not
     /// in the tab bar otherwise.
     Commit,
@@ -853,10 +847,6 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     /// `Some` exactly while the closable Commit tab is in the tab bar.
     commit_tab: Option<commit_tab::CommitTabState>,
-    commit_history_scroll_handle: UniformListScrollHandle,
-    commit_history_shas: Option<Vec<Oid>>,
-    focused_history_entry: Option<usize>,
-    history_keyboard_nav: bool,
     _repo_subscriptions: Vec<Subscription>,
 
     _settings_subscription: Subscription,
@@ -1085,10 +1075,6 @@ impl GitPanel {
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
                 commit_tab: None,
-                commit_history_scroll_handle: UniformListScrollHandle::new(),
-                commit_history_shas: None,
-                focused_history_entry: None,
-                history_keyboard_nav: false,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
                 git_access: GitAccess::Yes,
@@ -1265,10 +1251,6 @@ impl GitPanel {
         if !self.focus_handle.contains_focused(window, cx) {
             cx.emit(Event::Focus);
         }
-        if self.active_tab == GitPanelTab::History && self.focused_history_entry.is_some() {
-            self.history_keyboard_nav = true;
-            cx.notify();
-        }
     }
 
     fn scroll_to_selected_entry(&mut self, cx: &mut Context<Self>) {
@@ -1437,10 +1419,6 @@ impl GitPanel {
     /// file's single-file diff as a pinned tab. IntelliJ-IDEA model — one file at
     /// a time, not the stacked accordion.
     fn open_diff(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_tab == GitPanelTab::History {
-            self.open_selected_history_commit(window, cx);
-            return;
-        }
         if let Some(GitListEntry::Directory(dir_entry)) = self
             .selected_entry
             .and_then(|i| self.entries.get(i))
@@ -1461,10 +1439,6 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_tab == GitPanelTab::History {
-            self.open_selected_history_commit(window, cx);
-            return;
-        }
         if let Some(GitListEntry::Directory(dir_entry)) = self
             .selected_entry
             .and_then(|i| self.entries.get(i))
@@ -3948,12 +3922,9 @@ impl GitPanel {
     /// Swap the repository every panel surface reads from, dropping everything
     /// derived from the old one.
     ///
-    /// The History rows in particular: `commit_history_shas` and
-    /// `_repo_subscriptions` used to be cleared only on a tab switch, and
-    /// `fetch_commit_history_shas` bails out early for a repository with no
-    /// branch, so flipping the active repository — especially to a
-    /// detached-HEAD one — left the *previous* repository's commits rendered
-    /// under the new repository's header.
+    /// Anything cached here outlives the swap unless it is cleared on this one
+    /// seam: the retired History tab kept the *previous* repository's commits on
+    /// screen precisely because its rows were dropped on a tab switch instead.
     fn set_active_repository(
         &mut self,
         repository: Option<Entity<Repository>>,
@@ -3972,23 +3943,13 @@ impl GitPanel {
         // rows would open diffs against a repository the user has left.
         self.close_commit_tab(window, cx);
         self.entries.clear();
-        self.commit_history_shas.take();
-        self.focused_history_entry = None;
         self._repo_subscriptions.clear();
-        if self.active_tab == GitPanelTab::History {
-            self.focused_history_entry = Some(0);
-            self.load_commit_history(cx);
-        }
         cx.notify();
     }
 
     fn schedule_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = cx.entity().downgrade();
         self.reopen_commit_buffer(window, cx);
-        self.preload_commit_history(cx);
-        if self.active_tab == GitPanelTab::History {
-            self.load_commit_history(cx);
-        }
         self.update_visible_entries_task = cx.spawn_in(window, async move |_, cx| {
             cx.background_executor().timer(UPDATE_DEBOUNCE).await;
             if let Some(git_panel) = handle.upgrade() {
@@ -5400,16 +5361,6 @@ impl GitPanel {
                 GitPanelTab::Changes,
                 ActivateChangesTab.boxed_clone(),
             ))
-            .child(Divider::vertical().color(ui::DividerColor::BorderFaded))
-            .child(tab(
-                ElementId::Name("history-tab".into()),
-                active_tab == GitPanelTab::History,
-                false,
-                false,
-                "History".into(),
-                GitPanelTab::History,
-                ActivateHistoryTab.boxed_clone(),
-            ))
             .when(self.commit_tab_is_open(), |this| {
                 this.child(Divider::vertical().color(ui::DividerColor::BorderFaded))
                     .child(tab(
@@ -5424,74 +5375,6 @@ impl GitPanel {
             })
     }
 
-    fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-            if let Some(history) = self.render_commit_history(window, cx) {
-                this.child(history)
-            } else {
-                this.child(
-                    h_flex()
-                        .flex_1()
-                        .justify_center()
-                        .child(Label::new("Loading Commit History…").color(Color::Muted)),
-                )
-            }
-        })
-    }
-
-    fn select_next_history_entry(&mut self, cx: &mut Context<Self>) {
-        let count = self.commit_history_shas.as_ref().map_or(0, Vec::len);
-        if count == 0 {
-            return;
-        }
-        let new_index = match self.focused_history_entry {
-            None => 0,
-            Some(i) => (i + 1).min(count - 1),
-        };
-        self.focused_history_entry = Some(new_index);
-        self.history_keyboard_nav = true;
-        self.commit_history_scroll_handle
-            .scroll_to_item(new_index, ScrollStrategy::Top);
-        cx.notify();
-    }
-
-    fn select_previous_history_entry(&mut self, cx: &mut Context<Self>) {
-        let count = self.commit_history_shas.as_ref().map_or(0, Vec::len);
-        if count == 0 {
-            return;
-        }
-        let new_index = match self.focused_history_entry {
-            None => 0,
-            Some(i) => i.saturating_sub(1),
-        };
-        self.focused_history_entry = Some(new_index);
-        self.history_keyboard_nav = true;
-        self.commit_history_scroll_handle
-            .scroll_to_item(new_index, ScrollStrategy::Top);
-        cx.notify();
-    }
-
-    fn open_selected_history_commit(&self, window: &mut Window, cx: &mut App) {
-        let Some(index) = self.focused_history_entry else {
-            return;
-        };
-        let Some(sha) = self.commit_history_shas.as_ref().and_then(|s| s.get(index)) else {
-            return;
-        };
-        let Some(active_repository) = self.active_repository.as_ref() else {
-            return;
-        };
-        CommitView::open(
-            sha.to_string(),
-            active_repository.downgrade(),
-            self.workspace.clone(),
-            None,
-            None,
-            window,
-            cx,
-        );
-    }
-
     fn activate_changes_tab(
         &mut self,
         _: &ActivateChangesTab,
@@ -5499,15 +5382,6 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         self.set_active_tab(GitPanelTab::Changes, window, cx);
-    }
-
-    fn activate_history_tab(
-        &mut self,
-        _: &ActivateHistoryTab,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -5521,346 +5395,11 @@ impl GitPanel {
             return;
         }
         self.active_tab = tab;
-        match tab {
-            GitPanelTab::History => {
-                self.focus_handle.focus(window, cx);
-                self.load_commit_history(cx);
-                self.focused_history_entry = Some(0);
-            }
-            GitPanelTab::Changes => {
-                self.focus_handle.focus(window, cx);
-                self.drop_history_state();
-            }
-            // Only reached from a user gesture; `show_commit_selection`
-            // activates the tab without taking focus, because its caller is the
-            // git graph mid-interaction.
-            GitPanelTab::Commit => {
-                self.focus_handle.focus(window, cx);
-                self.drop_history_state();
-            }
-        }
+        // Only reached from a user gesture; `show_commit_selection` activates
+        // the Commit tab without taking focus, because its caller is the git
+        // graph mid-interaction.
+        self.focus_handle.focus(window, cx);
         cx.notify();
-    }
-
-    /// Drop what the History tab was holding on the way out of it: its rows are
-    /// worth nothing to another tab, and its repository subscription keeps
-    /// re-rendering the panel — and re-fetching, the moment History is active
-    /// again — for a list nobody is looking at. Dies with the History tab.
-    fn drop_history_state(&mut self) {
-        self.commit_history_shas.take();
-        self.focused_history_entry = None;
-        self._repo_subscriptions.clear();
-    }
-
-    /// Where the History tab reads commits from.
-    ///
-    /// A detached HEAD has no branch to name. Bailing out there is what let the
-    /// previous repository's commits stay on screen, so walk from the head
-    /// commit instead — which is what the user is actually looking at. Only a
-    /// repository with neither a branch nor a head commit (unborn HEAD) falls
-    /// through to `LogSource::All`, where `--ignore-missing` keeps `git log`
-    /// from erroring on the missing ref.
-    fn history_log_source(repository: &Repository) -> LogSource {
-        match repository.branch.as_ref() {
-            Some(branch) => LogSource::Branch(branch.name().to_string().into()),
-            None => match repository
-                .head_commit
-                .as_ref()
-                .and_then(|head| Oid::from_str(&head.sha).ok())
-            {
-                Some(sha) => LogSource::Sha(sha),
-                None => LogSource::All,
-            },
-        }
-    }
-
-    fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
-            return;
-        };
-
-        let log_source = Self::history_log_source(active_repository.read(cx));
-        let log_order = LogOrder::DateOrder;
-
-        // Kick off the git log fetch so data is ready when the user switches to History.
-        // graph_data() is idempotent — if already loading/loaded, this is a no-op.
-        active_repository.update(cx, |repository, cx| {
-            repository.graph_data(log_source, log_order, Vec::new(), Vec::new(), 0..0, cx);
-        });
-    }
-
-    fn load_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.as_ref() else {
-            return;
-        };
-
-        if self._repo_subscriptions.is_empty() {
-            self._repo_subscriptions.push(cx.subscribe(
-                active_repository,
-                |this, _repo, event, cx| {
-                    if let RepositoryEvent::GraphEvent(_, _) = event {
-                        if this.active_tab == GitPanelTab::History {
-                            this.fetch_commit_history_shas(cx);
-                        }
-                    }
-                },
-            ));
-            self._repo_subscriptions
-                .push(cx.observe(active_repository, |_this, _repo, cx| {
-                    cx.notify();
-                }));
-        }
-
-        self.fetch_commit_history_shas(cx);
-    }
-
-    fn fetch_commit_history_shas(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
-            return;
-        };
-
-        let log_source = Self::history_log_source(active_repository.read(cx));
-        let log_order = LogOrder::DateOrder;
-
-        self.commit_history_shas = Some(active_repository.update(cx, |repository, cx| {
-            let response = repository.graph_data(
-                log_source,
-                log_order,
-                Vec::new(),
-                Vec::new(),
-                0..usize::MAX,
-                cx,
-            );
-            response.commits.iter().map(|commit| commit.sha).collect()
-        }));
-    }
-
-    fn git_remote(&self, cx: &mut App) -> Option<GitRemote> {
-        let repo = self.active_repository.as_ref()?;
-        let remote_url = repo.read(cx).default_remote_url()?;
-        let provider_registry = GitHostingProviderRegistry::default_global(cx);
-        let (provider, parsed) = parse_git_remote_url(provider_registry, &remote_url)?;
-        Some(GitRemote {
-            host: provider,
-            owner: parsed.owner.into(),
-            repo: parsed.repo.into(),
-        })
-    }
-
-    fn render_commit_history(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        let shas = self.commit_history_shas.clone()?;
-        let active_repository = self.active_repository.as_ref()?;
-        let workspace = self.workspace.clone();
-        let repo_weak = active_repository.downgrade();
-        let item_count = shas.len();
-        let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
-        let remote = self.git_remote(cx);
-
-        let focused_history_entry = self.focused_history_entry;
-        let is_panel_focused = self.focus_handle.is_focused(window);
-        let show_focus_border = self.history_keyboard_nav;
-
-        let ahead_count = active_repository
-            .read(cx)
-            .branch
-            .as_ref()
-            .and_then(|b| b.upstream.as_ref())
-            .and_then(|u| u.tracking.status())
-            .map(|s| s.ahead as usize)
-            .unwrap_or(0);
-
-        Some(
-            v_flex()
-                .flex_1()
-                .size_full()
-                .overflow_hidden()
-                .child(
-                    uniform_list("commit_history_list", item_count, {
-                        let workspace = workspace;
-                        let repo_weak = repo_weak;
-                        let git_panel = cx.weak_entity();
-                        move |range, window, cx| {
-                            let local_offset = time::UtcOffset::current_local_offset()
-                                .unwrap_or(time::UtcOffset::UTC);
-                            let now = time::OffsetDateTime::now_utc();
-
-                            let visible_data: Vec<Option<Arc<CommitData>>> = repo_weak
-                                .update(cx, |repository, cx| {
-                                    shas[range.clone()]
-                                        .iter()
-                                        .map(|sha| {
-                                            match repository.fetch_commit_data(*sha, false, cx) {
-                                                CommitDataState::Loaded(data) => Some(data.clone()),
-                                                CommitDataState::Loading(_) => None,
-                                            }
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-
-                            shas[range.clone()]
-                                .iter()
-                                .zip(visible_data)
-                                .enumerate()
-                                .map(|(ix, (sha, data))| {
-                                    let index = range.start + ix;
-                                    let sha_string = sha.to_string();
-                                    let sha_shared: SharedString = sha_string.clone().into();
-                                    let short_sha: SharedString =
-                                        sha_string[..7.min(sha_string.len())].to_string().into();
-
-                                    let (subject, author_name, author_email, timestamp): (
-                                        SharedString,
-                                        SharedString,
-                                        Option<SharedString>,
-                                        Option<i64>,
-                                    ) = match &data {
-                                        Some(data) => (
-                                            data.subject.clone(),
-                                            data.author_name.clone(),
-                                            Some(data.author_email.clone()),
-                                            Some(data.commit_timestamp),
-                                        ),
-                                        None => ("Loading…".into(), "".into(), None, None),
-                                    };
-
-                                    let relative_time: SharedString = timestamp
-                                        .and_then(|ts| {
-                                            time::OffsetDateTime::from_unix_timestamp(ts).ok()
-                                        })
-                                        .map(|dt| {
-                                            time_format::format_localized_timestamp(
-                                                dt,
-                                                now,
-                                                local_offset,
-                                                time_format::TimestampFormat::Relative,
-                                            )
-                                            .into()
-                                        })
-                                        .unwrap_or_else(|| "".into());
-
-                                    let avatar = CommitAvatar::new(
-                                        &sha_shared,
-                                        author_email,
-                                        remote.as_ref(),
-                                    )
-                                    .size(px(14.))
-                                    .render(window, cx);
-
-                                    let is_unpushed = index < ahead_count;
-                                    let is_focused = focused_history_entry == Some(index);
-                                    let workspace = workspace.clone();
-                                    let repo = repo_weak.clone();
-                                    let sha_for_click = sha_string;
-
-                                    let dot_separator = || {
-                                        Label::new("•")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .alpha(0.5)
-                                    };
-
-                                    v_flex()
-                                        .id(("commit-history-item", index))
-                                        .cursor_pointer()
-                                        .w_full()
-                                        .py_1()
-                                        .px_2()
-                                        .gap_0p5()
-                                        .border_1()
-                                        .border_color(gpui::transparent_black())
-                                        .when(
-                                            is_focused && is_panel_focused && show_focus_border,
-                                            |this| {
-                                                this.border_color(
-                                                    cx.theme().colors().panel_focused_border,
-                                                )
-                                            },
-                                        )
-                                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                        .child(
-                                            h_flex()
-                                                .gap_1()
-                                                .w_full()
-                                                .child(Label::new(subject).truncate())
-                                                .when(is_unpushed, |this| {
-                                                    this.child(
-                                                        Icon::new(IconName::ArrowUp)
-                                                            .size(IconSize::XSmall),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_1p5()
-                                                .child(avatar)
-                                                .when(!author_name.is_empty(), |this| {
-                                                    this.child(
-                                                        Label::new(author_name)
-                                                            .size(LabelSize::Small)
-                                                            .color(Color::Muted),
-                                                    )
-                                                    .child(dot_separator())
-                                                })
-                                                .when(!relative_time.is_empty(), |this| {
-                                                    this.child(
-                                                        Label::new(relative_time)
-                                                            .size(LabelSize::Small)
-                                                            .color(Color::Muted),
-                                                    )
-                                                    .child(dot_separator())
-                                                })
-                                                .child(
-                                                    Label::new(short_sha.clone())
-                                                        .size(LabelSize::Small)
-                                                        .color(Color::Muted),
-                                                ),
-                                        )
-                                        .tooltip(move |_, cx| {
-                                            Tooltip::with_meta(
-                                                "View Commit",
-                                                None,
-                                                short_sha.clone(),
-                                                cx,
-                                            )
-                                        })
-                                        .on_mouse_down(gpui::MouseButton::Left, {
-                                            let git_panel = git_panel.clone();
-                                            move |_, _, cx| {
-                                                git_panel
-                                                    .update(cx, |panel, cx| {
-                                                        panel.focused_history_entry = Some(index);
-                                                        panel.history_keyboard_nav = false;
-                                                        cx.notify();
-                                                    })
-                                                    .ok();
-                                            }
-                                        })
-                                        .on_click(move |_, window, cx| {
-                                            CommitView::open(
-                                                sha_for_click.clone(),
-                                                repo.clone(),
-                                                workspace.clone(),
-                                                None,
-                                                None,
-                                                window,
-                                                cx,
-                                            );
-                                        })
-                                        .into_any_element()
-                                })
-                                .collect()
-                        }
-                    })
-                    .size_full()
-                    .track_scroll(&commit_history_scroll_handle),
-                )
-                .vertical_scrollbar_for(&commit_history_scroll_handle, window, cx),
-        )
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6672,7 +6211,6 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
-            .on_action(cx.listener(Self::activate_history_tab))
             .on_action(cx.listener(Self::activate_commit_tab))
             .size_full()
             .overflow_hidden()
@@ -6721,7 +6259,6 @@ impl Render for GitPanel {
                             .when(!self.amend_pending, |this| {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
-                        GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
                         GitPanelTab::Commit => this.child(self.render_commit_tab(window, cx)),
                     })
                     .into_any_element(),
@@ -9657,30 +9194,6 @@ mod tests {
         });
     }
 
-    /// Closing the Commit tab from the graph while the user is reading another
-    /// tab must not yank them somewhere they did not ask to be.
-    #[gpui::test]
-    async fn test_close_commit_tab_leaves_another_tab_alone(cx: &mut TestAppContext) {
-        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
-        let cx = &mut cx;
-
-        cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(
-                commit_selection(&repository, vec![test_sha("823a3f8a")]),
-                CommitSelectionSource::UserGesture,
-                window,
-                cx,
-            );
-            panel.set_active_tab(GitPanelTab::History, window, cx);
-            panel.close_commit_tab(window, cx);
-        });
-
-        panel.read_with(cx, |panel, _| {
-            assert!(!panel.commit_tab_is_open());
-            assert_eq!(panel.active_tab, GitPanelTab::History);
-        });
-    }
-
     /// The Commit tab renders no changes list and navigates with no keys of its
     /// own, so the `ChangesList` bindings must not resolve while it is showing:
     /// `space` would stage the hidden Changes selection (`git::ToggleStaged`),
@@ -9734,46 +9247,6 @@ mod tests {
                 commit_tab_bindings.eval(&[context]),
                 "the Commit tab still needs the bindings that are not about the \
                  changes list — `escape` returns focus to the editor"
-            );
-        });
-    }
-
-    /// Leaving History for the Commit tab has to tear History down: its rows are
-    /// worth nothing to another tab and its subscription keeps the panel
-    /// re-rendering for a list nobody is looking at.
-    #[gpui::test]
-    async fn test_activating_the_commit_tab_drops_history_state(cx: &mut TestAppContext) {
-        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
-        let cx = &mut cx;
-
-        cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.set_active_tab(GitPanelTab::History, window, cx);
-            panel.commit_history_shas = Some(vec![test_sha("823a3f8a")]);
-            panel.focused_history_entry = Some(0);
-        });
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                !panel._repo_subscriptions.is_empty(),
-                "precondition: History subscribed to the repository"
-            );
-        });
-
-        cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(
-                commit_selection(&repository, vec![test_sha("1a2b3c4d")]),
-                CommitSelectionSource::UserGesture,
-                window,
-                cx,
-            );
-        });
-
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.active_tab, GitPanelTab::Commit);
-            assert!(panel.commit_history_shas.is_none());
-            assert_eq!(panel.focused_history_entry, None);
-            assert!(
-                panel._repo_subscriptions.is_empty(),
-                "History's repository subscription must not outlive the tab"
             );
         });
     }
@@ -9859,73 +9332,5 @@ mod tests {
             1,
             "the graph has to hear about the close so it can clear its row"
         );
-    }
-
-    // `commit_history_shas` / `_repo_subscriptions` used to be cleared only on a
-    // tab switch, so once the active repository changed the History tab kept the
-    // PREVIOUS repository's rows — and `fetch_commit_history_shas` bails out for
-    // a repo with no branch, so a flip to a detached-HEAD repo had nothing to
-    // overwrite them with. The resolution is re-driven synchronously here, with
-    // no executor turn in between, so only the invalidation can clear the rows.
-    #[gpui::test]
-    async fn test_history_drops_previous_repository_commits(cx: &mut TestAppContext) {
-        let NestedRepoSolution {
-            project,
-            nested_root,
-            ..
-        } = setup_nested_repo_solution(cx).await;
-
-        let window_handle =
-            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = window_handle
-            .read_with(cx, |mw, _| mw.workspace().clone())
-            .unwrap();
-        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
-        cx.executor().run_until_parked();
-
-        let panel = workspace.update_in(cx, GitPanel::new);
-        cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.update_visible_entries(window, cx)
-        });
-        cx.executor().run_until_parked();
-
-        // Stand in for a History tab already loaded against the member's own repo.
-        let stale_sha: Oid = "823a3f8a".parse().expect("valid abbreviated sha");
-        cx.update_window_entity(&panel, |panel, _window, cx| {
-            panel.active_tab = GitPanelTab::History;
-            panel.load_commit_history(cx);
-            panel.commit_history_shas = Some(vec![stale_sha]);
-            panel.focused_history_entry = Some(0);
-        });
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                !panel._repo_subscriptions.is_empty(),
-                "History must be subscribed to the repository it loaded from"
-            );
-        });
-
-        let nested_repo = repo_with_work_directory(&project, &nested_root, cx);
-        cx.update_window_entity(&panel, |panel, window, cx| {
-            solutions::set_active_member_repository(&project, &nested_repo, cx);
-            panel.refresh_active_repository_for_selector(window, cx);
-
-            assert_eq!(
-                panel
-                    .active_repository
-                    .as_ref()
-                    .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
-                    .as_deref(),
-                Some(nested_root.as_path()),
-                "precondition: the active repository actually changed"
-            );
-            assert!(
-                !panel
-                    .commit_history_shas
-                    .clone()
-                    .unwrap_or_default()
-                    .contains(&stale_sha),
-                "History kept the previous repository's commits after the repo changed"
-            );
-        });
     }
 }

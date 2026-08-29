@@ -551,8 +551,9 @@ impl CommitTabState {
 }
 
 /// The hosting provider of the repository the Commit tab is showing — used for
-/// the author avatar. Deliberately not [`GitPanel::git_remote`], which resolves
-/// against `active_repository`; see [`CommitSelection`].
+/// the author avatar. Deliberately resolved from the pushed repository rather
+/// than the panel's own `active_repository`, which can transiently disagree;
+/// see [`CommitSelection`].
 fn commit_remote(repository: &Entity<Repository>, cx: &mut App) -> Option<GitRemote> {
     let remote_url = repository.read(cx).default_remote_url()?;
     let provider_registry = GitHostingProviderRegistry::default_global(cx);
@@ -643,11 +644,9 @@ impl GitPanel {
 
     /// Activate the Commit tab without taking focus — see
     /// [`Self::show_commit_selection`] for why the graph's push must not steal
-    /// it. Leaving History also drops what History was holding, because
-    /// `set_active_tab` (the focusing, user-driven route) is bypassed here.
+    /// it.
     fn activate_commit_tab_without_focus(&mut self) {
         self.active_tab = GitPanelTab::Commit;
-        self.drop_history_state();
     }
 
     /// Restart whichever of the Commit tab's two loads failed. A multi-commit

@@ -987,7 +987,7 @@
     "context": "GitPanel",
     "bindings": {
       "ctrl-1": "git_panel::ActivateChangesTab",
-      "ctrl-2": "git_panel::ActivateHistoryTab",
+      "ctrl-2": "git_panel::ActivateCommitTab",
     },
   },
   {

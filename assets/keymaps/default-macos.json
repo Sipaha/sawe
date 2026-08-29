@@ -1074,7 +1074,7 @@
     "context": "GitPanel",
     "bindings": {
       "cmd-1": "git_panel::ActivateChangesTab",
-      "cmd-2": "git_panel::ActivateHistoryTab",
+      "cmd-2": "git_panel::ActivateCommitTab",
     },
   },
   {
