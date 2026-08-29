@@ -3931,13 +3931,17 @@ impl GitPanel {
     /// member's repository, which is the divergence the shared resolver exists
     /// to remove. Outside a Solution there is no member scope, so the project
     /// default stands.
-    fn refresh_active_repository_for_selector(&mut self, cx: &mut Context<Self>) {
+    fn refresh_active_repository_for_selector(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let repository = if solutions::active_member_context(&self.project, cx).is_some() {
             solutions::active_member_repository(&self.project, cx)
         } else {
             self.project.read(cx).active_repository(cx)
         };
-        self.set_active_repository(repository, cx);
+        self.set_active_repository(repository, window, cx);
     }
 
     /// Swap the repository every panel surface reads from, dropping everything
@@ -3952,6 +3956,7 @@ impl GitPanel {
     fn set_active_repository(
         &mut self,
         repository: Option<Entity<Repository>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if repository.as_ref().map(|repo| repo.entity_id())
@@ -3960,6 +3965,11 @@ impl GitPanel {
             return;
         }
         self.active_repository = repository;
+        // A commit belongs to the repository it was read from, so the Commit
+        // tab cannot survive the swap: leaving it up would describe the old
+        // repository's commit under the new repository's panel, and its file
+        // rows would open diffs against a repository the user has left.
+        self.close_commit_tab(window, cx);
         self.entries.clear();
         self.commit_history_shas.take();
         self.focused_history_entry = None;
@@ -9496,6 +9506,36 @@ mod tests {
         });
     }
 
+    /// Re-clicking the graph row that is already selected re-pushes the same
+    /// selection. That push is the only way back to the Commit tab after the
+    /// user has switched to Changes, so the already-showing branch has to
+    /// re-activate the tab instead of treating the push as a no-op.
+    #[gpui::test]
+    async fn test_re_pushing_the_same_selection_reactivates_the_commit_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let sha = test_sha("823a3f8a");
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+            panel.set_active_tab(GitPanelTab::Changes, window, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+            assert!(panel.commit_tab_is_open());
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::Commit);
+            assert_eq!(panel.commit_tab_shas(), [sha]);
+        });
+    }
+
     /// Closing the Commit tab from the graph while the user is reading another
     /// tab must not yank them somewhere they did not ask to be.
     #[gpui::test]
@@ -9614,6 +9654,88 @@ mod tests {
         });
     }
 
+    /// A commit belongs to the repository it was read from, so a repository
+    /// swap under the Commit tab has to close it: the file rows would otherwise
+    /// open diffs against a repository the user has left, and the header would
+    /// describe a commit the new repository may not even contain. The graph is
+    /// told through `CommitTabClosed` so it can drop the row that opened it.
+    #[gpui::test]
+    async fn test_repository_switch_closes_the_commit_tab(cx: &mut TestAppContext) {
+        let NestedRepoSolution {
+            project,
+            member_root,
+            nested_root,
+        } = setup_nested_repo_solution(cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+        let member_repo = repo_with_work_directory(&project, &member_root, cx);
+        let nested_repo = repo_with_work_directory(&project, &nested_root, cx);
+
+        let closed = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let _subscription = cx.update(|_window, cx| {
+            cx.subscribe(&panel, {
+                let closed = closed.clone();
+                move |_, event: &Event, _| {
+                    if matches!(event, Event::CommitTabClosed) {
+                        closed.set(closed.get() + 1);
+                    }
+                }
+            })
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            solutions::set_active_member_repository(&project, &member_repo, cx);
+            panel.refresh_active_repository_for_selector(window, cx);
+            panel.show_commit_selection(
+                commit_selection(&member_repo, vec![test_sha("823a3f8a")]),
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.commit_tab_is_open());
+            assert_eq!(closed.get(), 0);
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            solutions::set_active_member_repository(&project, &nested_repo, cx);
+            panel.refresh_active_repository_for_selector(window, cx);
+
+            assert_eq!(
+                panel
+                    .active_repository
+                    .as_ref()
+                    .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
+                    .as_deref(),
+                Some(nested_root.as_path()),
+                "precondition: the active repository actually changed"
+            );
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel.commit_tab_is_open(),
+                "the Commit tab must not survive the repository it was read from"
+            );
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+        });
+        assert_eq!(
+            closed.get(),
+            1,
+            "the graph has to hear about the close so it can clear its row"
+        );
+    }
+
     // `commit_history_shas` / `_repo_subscriptions` used to be cleared only on a
     // tab switch, so once the active repository changed the History tab kept the
     // PREVIOUS repository's rows — and `fetch_commit_history_shas` bails out for
@@ -9658,9 +9780,9 @@ mod tests {
         });
 
         let nested_repo = repo_with_work_directory(&project, &nested_root, cx);
-        cx.update_window_entity(&panel, |panel, _window, cx| {
+        cx.update_window_entity(&panel, |panel, window, cx| {
             solutions::set_active_member_repository(&project, &nested_repo, cx);
-            panel.refresh_active_repository_for_selector(cx);
+            panel.refresh_active_repository_for_selector(window, cx);
 
             assert_eq!(
                 panel

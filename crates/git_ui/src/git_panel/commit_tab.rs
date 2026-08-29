@@ -550,6 +550,14 @@ impl GitPanel {
         self.commit_tab.is_some()
     }
 
+    /// The commits the Commit tab is describing, in the order the git graph
+    /// pushed them. Empty while the tab is closed.
+    pub fn commit_tab_shas(&self) -> &[Oid] {
+        self.commit_tab
+            .as_ref()
+            .map_or(&[], |state| state.selection.shas.as_slice())
+    }
+
     /// Show a git-graph selection in the Commit tab, opening the tab if it is
     /// closed. One sha renders that commit's details; more render a bare count.
     ///

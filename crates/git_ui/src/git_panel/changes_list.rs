@@ -57,7 +57,7 @@ impl GitPanel {
         // Phase 3: inside a Solution the active member's repository wins over
         // the project-wide default (which follows whichever buffer was focused
         // last); outside one this still lands on the project default.
-        self.refresh_active_repository_for_selector(cx);
+        self.refresh_active_repository_for_selector(window, cx);
         // S-PCH-HK — pick up the per-repo pre-commit config when the
         // active repository changes (cheap no-op when unchanged).
         self.ensure_pre_commit_config_loaded(cx);
