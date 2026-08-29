@@ -1232,7 +1232,18 @@ impl GitPanel {
 
         if self.commit_editor.read(cx).is_focused(window) {
             dispatch_context.add("CommitEditor");
-        } else if self.focus_handle.contains_focused(window, cx) {
+        } else if self.active_tab != GitPanelTab::Commit
+            && self.focus_handle.contains_focused(window, cx)
+        {
+            // The Commit tab renders no changes list and has no keyboard
+            // navigation of its own, yet `set_active_tab` focuses the panel. The
+            // `ChangesList` bindings would then act on the hidden Changes
+            // selection with nothing on screen to show for it — `space` staging
+            // an unseen file (`git::ToggleStaged`), `enter` opening an unrelated
+            // diff (`menu::Confirm`), `delete` reaching `git::RestoreFile`.
+            // Withholding the context is what makes the whole keymap inert;
+            // guarding each handler would have to be repeated for every binding
+            // added later.
             dispatch_context.add("menu");
             dispatch_context.add("ChangesList");
         }
@@ -5330,9 +5341,16 @@ impl GitPanel {
                             .color(Color::Muted),
                     )
                 })
-                // The row's own `on_click` fires too, but `set_active_tab`
-                // refuses `Commit` once the tab is gone, so the two land on
-                // Changes either way and no propagation dance is needed.
+                // The row's own `on_click` does NOT fire when the ✕ is hit:
+                // `ButtonLike`'s click wrapper calls `cx.stop_propagation()`
+                // before its handler (`ui/src/components/button/button_like.rs`),
+                // and GPUI's bubble phase runs the innermost listener first and
+                // breaks as soon as propagation stops (`gpui/src/window.rs`,
+                // `Interactivity::paint` registers a parent's listeners before
+                // painting its children). Swapping this `IconButton` for an
+                // element that does not stop propagation would re-activate the
+                // tab the click just closed — survivable only because
+                // `set_active_tab` refuses `Commit` while it is closed.
                 .when(closable, |this| {
                     this.child(
                         IconButton::new("close-commit-tab", IconName::Close)
@@ -5495,18 +5513,27 @@ impl GitPanel {
             }
             GitPanelTab::Changes => {
                 self.focus_handle.focus(window, cx);
-                self.commit_history_shas.take();
-                self.focused_history_entry = None;
-                self._repo_subscriptions.clear();
+                self.drop_history_state();
             }
             // Only reached from a user gesture; `show_commit_selection`
             // activates the tab without taking focus, because its caller is the
             // git graph mid-interaction.
             GitPanelTab::Commit => {
                 self.focus_handle.focus(window, cx);
+                self.drop_history_state();
             }
         }
         cx.notify();
+    }
+
+    /// Drop what the History tab was holding on the way out of it: its rows are
+    /// worth nothing to another tab, and its repository subscription keeps
+    /// re-rendering the panel — and re-fetching, the moment History is active
+    /// again — for a list nobody is looking at. Dies with the History tab.
+    fn drop_history_state(&mut self) {
+        self.commit_history_shas.take();
+        self.focused_history_entry = None;
+        self._repo_subscriptions.clear();
     }
 
     /// Where the History tab reads commits from.
@@ -9144,12 +9171,6 @@ mod tests {
         );
     }
 
-    // `commit_history_shas` / `_repo_subscriptions` used to be cleared only on a
-    // tab switch, so once the active repository changed the History tab kept the
-    // PREVIOUS repository's rows — and `fetch_commit_history_shas` bails out for
-    // a repo with no branch, so a flip to a detached-HEAD repo had nothing to
-    // overwrite them with. The resolution is re-driven synchronously here, with
-    // no executor turn in between, so only the invalidation can clear the rows.
     async fn commit_tab_fixture(
         cx: &mut TestAppContext,
     ) -> (Entity<GitPanel>, Entity<Repository>, VisualTestContext) {
@@ -9174,6 +9195,13 @@ mod tests {
 
     fn test_sha(hex: &str) -> Oid {
         hex.parse().expect("valid abbreviated sha")
+    }
+
+    fn commit_selection(repository: &Entity<Repository>, shas: Vec<Oid>) -> CommitSelection {
+        CommitSelection {
+            repository: repository.clone(),
+            shas,
+        }
     }
 
     #[gpui::test]
@@ -9314,6 +9342,268 @@ mod tests {
         });
     }
 
+    /// An empty selection is a deselection: the tab must go rather than sit
+    /// there describing nothing.
+    #[gpui::test]
+    async fn test_show_commit_selection_without_shas_closes_the_tab(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                window,
+                cx,
+            );
+            panel.show_commit_selection(commit_selection(&repository, Vec::new()), window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.commit_tab_is_open());
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+        });
+    }
+
+    /// A load that resolves after the selection moved on must be dropped, not
+    /// pasted onto the commit now on screen.
+    ///
+    /// The selection is moved underneath the in-flight loads rather than by a
+    /// second `show_commit_selection`, which would both cancel them (their tab
+    /// state is replaced) and install a second pair whose results land last —
+    /// either one masks a missing guard.
+    #[gpui::test]
+    async fn test_commit_tab_drops_a_stale_load(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let first = test_sha("823a3f8a");
+        let second = test_sha("1a2b3c4d");
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(commit_selection(&repository, vec![first]), window, cx);
+            panel
+                .commit_tab
+                .as_mut()
+                .expect("the tab is open")
+                .selection
+                .shas = vec![second];
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert_eq!(state.selection.shas, vec![second]);
+            assert!(
+                matches!(state.details, commit_tab::LoadState::Loading),
+                "the first commit's details were pasted onto the second"
+            );
+            assert!(
+                matches!(state.diff, commit_tab::LoadState::Loading),
+                "the first commit's changed files were pasted onto the second"
+            );
+        });
+    }
+
+    /// Re-pushing the selection the tab already shows is the git graph
+    /// re-reporting an unchanged row; it must not restart a load that worked or
+    /// throw away the tree's collapsed directories.
+    #[gpui::test]
+    async fn test_reselecting_the_same_commit_keeps_the_loaded_tab(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let sha = test_sha("823a3f8a");
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        cx.update_window_entity(&panel, |panel, _window, _cx| {
+            let state = panel.commit_tab.as_mut().expect("the tab is open");
+            state.details = commit_tab::LoadState::Loaded(git::repository::CommitDetails {
+                sha: sha.to_string().into(),
+                message: "Subject".into(),
+                ..Default::default()
+            });
+            state.collapsed_dirs.insert("crates/git_ui".into());
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert!(
+                matches!(state.details, commit_tab::LoadState::Loaded(_)),
+                "a successful load must survive a same-selection re-push"
+            );
+            assert!(
+                state
+                    .collapsed_dirs
+                    .contains(&SharedString::from("crates/git_ui")),
+                "the tree's collapsed directories must survive a same-selection re-push"
+            );
+        });
+    }
+
+    /// …but a load that FAILED has no other way back: the same selection is the
+    /// only gesture that reaches `show_commit_selection` with it, so a re-push
+    /// has to retry rather than re-show the error forever.
+    #[gpui::test]
+    async fn test_reselecting_a_failed_commit_retries_the_loads(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let sha = test_sha("823a3f8a");
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        cx.update_window_entity(&panel, |panel, _window, _cx| {
+            let state = panel.commit_tab.as_mut().expect("the tab is open");
+            state.details = commit_tab::LoadState::Failed("boom".into());
+            state.diff = commit_tab::LoadState::Failed("boom".into());
+            state.collapsed_dirs.insert("crates/git_ui".into());
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(commit_selection(&repository, vec![sha]), window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert!(
+                matches!(state.details, commit_tab::LoadState::Loading),
+                "the failed details load must restart"
+            );
+            assert!(
+                matches!(state.diff, commit_tab::LoadState::Loading),
+                "the failed diff load must restart"
+            );
+            assert!(
+                state
+                    .collapsed_dirs
+                    .contains(&SharedString::from("crates/git_ui")),
+                "retrying must not reset the tree"
+            );
+        });
+    }
+
+    /// Closing the Commit tab from the graph while the user is reading another
+    /// tab must not yank them somewhere they did not ask to be.
+    #[gpui::test]
+    async fn test_close_commit_tab_leaves_another_tab_alone(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                window,
+                cx,
+            );
+            panel.set_active_tab(GitPanelTab::History, window, cx);
+            panel.close_commit_tab(window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.commit_tab_is_open());
+            assert_eq!(panel.active_tab, GitPanelTab::History);
+        });
+    }
+
+    /// The Commit tab renders no changes list and navigates with no keys of its
+    /// own, so the `ChangesList` bindings must not resolve while it is showing:
+    /// `space` would stage the hidden Changes selection (`git::ToggleStaged`),
+    /// `enter` would open an unrelated diff (`menu::Confirm`), `delete` would
+    /// reach `git::RestoreFile` — none of it visible on screen.
+    #[gpui::test]
+    async fn test_commit_tab_withholds_the_changes_list_key_context(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let changes_list_bindings = gpui::KeyBindingContextPredicate::parse(
+            "GitPanel && ChangesList && !GitBranchSelector",
+        )
+        .expect("the shipped keymap's predicate parses");
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.focus_handle.focus(window, cx);
+            let context = panel.dispatch_context(window, cx);
+            assert!(
+                changes_list_bindings.eval(&[context]),
+                "precondition: the Changes tab does bind the changes list keymap"
+            );
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                window,
+                cx,
+            );
+            panel.focus_handle.focus(window, cx);
+            let context = panel.dispatch_context(window, cx);
+            assert!(
+                context.contains("GitPanel"),
+                "the panel keeps its own context"
+            );
+            assert!(!context.contains("ChangesList"));
+            assert!(!context.contains("menu"));
+            assert!(
+                !changes_list_bindings.eval(&[context]),
+                "no changes-list binding may resolve while the Commit tab is showing"
+            );
+        });
+    }
+
+    /// Leaving History for the Commit tab has to tear History down: its rows are
+    /// worth nothing to another tab and its subscription keeps the panel
+    /// re-rendering for a list nobody is looking at.
+    #[gpui::test]
+    async fn test_activating_the_commit_tab_drops_history_state(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_tab(GitPanelTab::History, window, cx);
+            panel.commit_history_shas = Some(vec![test_sha("823a3f8a")]);
+            panel.focused_history_entry = Some(0);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel._repo_subscriptions.is_empty(),
+                "precondition: History subscribed to the repository"
+            );
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("1a2b3c4d")]),
+                window,
+                cx,
+            );
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::Commit);
+            assert!(panel.commit_history_shas.is_none());
+            assert_eq!(panel.focused_history_entry, None);
+            assert!(
+                panel._repo_subscriptions.is_empty(),
+                "History's repository subscription must not outlive the tab"
+            );
+        });
+    }
+
+    // `commit_history_shas` / `_repo_subscriptions` used to be cleared only on a
+    // tab switch, so once the active repository changed the History tab kept the
+    // PREVIOUS repository's rows — and `fetch_commit_history_shas` bails out for
+    // a repo with no branch, so a flip to a detached-HEAD repo had nothing to
+    // overwrite them with. The resolution is re-driven synchronously here, with
+    // no executor turn in between, so only the invalidation can clear the rows.
     #[gpui::test]
     async fn test_history_drops_previous_repository_commits(cx: &mut TestAppContext) {
         let NestedRepoSolution {

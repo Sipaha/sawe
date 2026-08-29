@@ -507,7 +507,7 @@ pub(super) struct CommitTabState {
     pub(super) details: LoadState<CommitDetails>,
     pub(super) diff: LoadState<LoadedCommitDiff>,
     text: Option<CommitDetailText>,
-    collapsed_dirs: HashSet<SharedString>,
+    pub(super) collapsed_dirs: HashSet<SharedString>,
     scroll_handle: UniformListScrollHandle,
     selected_file: Option<RepoPath>,
     _details_task: Option<Task<()>>,
@@ -577,108 +577,163 @@ impl GitPanel {
                 && state.selection.shas == selection.shas
         });
         if already_showing {
-            // Re-selecting the same row must not restart the loads or throw
-            // away the tree's scroll position and collapsed directories.
-            self.active_tab = GitPanelTab::Commit;
+            // Re-selecting the same row must not restart a load that worked, or
+            // throw away the tree's scroll position and collapsed directories.
+            // A load that FAILED is the exception: this selection is the only
+            // gesture that reaches back here, so refusing it too would make the
+            // error permanent until the user picks some other commit.
+            self.retry_failed_commit_loads(sha, cx);
+            self.activate_commit_tab_without_focus();
             cx.notify();
             return;
         }
 
         let repository = selection.repository.clone();
         let is_single_commit = selection.shas.len() == 1;
-        let mut state = CommitTabState::new(selection);
+        self.commit_tab = Some(CommitTabState::new(selection));
 
         if is_single_commit {
-            state.details = LoadState::Loading;
-            state.diff = LoadState::Loading;
-
-            let details = repository.update(cx, |repository, _| repository.show(sha.to_string()));
-            state._details_task = Some(cx.spawn(async move |this, cx| {
-                let loaded = details.await;
-                this.update(cx, |this, cx| {
-                    // Drop a load that resolved after the selection moved on,
-                    // rather than pairing it with whatever is shown now.
-                    if this.commit_tab_sha() != Some(sha) {
-                        return;
-                    }
-                    let loaded = match loaded {
-                        Ok(Ok(details)) => {
-                            let (subject, body) = split_commit_message(&details.message);
-                            let identity = commit_identity_source(
-                                &details.short_sha(),
-                                &details.author_name,
-                                &details.author_email,
-                                Some(details.commit_timestamp),
-                            );
-                            let text = CommitDetailText {
-                                subject: cx.new(|cx| Markdown::new_text(subject, cx)),
-                                body: cx.new(|cx| Markdown::new_text(body, cx)),
-                                identity: cx.new(|cx| Markdown::new(identity, None, None, cx)),
-                            };
-                            Ok((details, text))
-                        }
-                        Ok(Err(error)) => Err(SharedString::from(format!(
-                            "Couldn't load commit {}: {error:#}",
-                            sha.display_short()
-                        ))),
-                        Err(_) => Err(SharedString::from(format!(
-                            "Loading commit {} was cancelled.",
-                            sha.display_short()
-                        ))),
-                    };
-                    if let Some(state) = this.commit_tab.as_mut() {
-                        match loaded {
-                            Ok((details, text)) => {
-                                state.text = Some(text);
-                                state.details = LoadState::Loaded(details);
-                            }
-                            Err(message) => state.details = LoadState::Failed(message),
-                        }
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }));
-
-            let diff = repository.update(cx, |repository, _| {
-                repository.load_commit_diff(sha.to_string())
-            });
-            state._diff_task = Some(cx.spawn(async move |this, cx| {
-                let loaded = diff.await;
-                this.update(cx, |this, cx| {
-                    if this.commit_tab_sha() != Some(sha) {
-                        return;
-                    }
-                    let loaded = match loaded {
-                        Ok(Ok(diff)) => {
-                            let (lines_added, lines_removed) = compute_diff_stats(&diff);
-                            LoadState::Loaded(LoadedCommitDiff {
-                                diff,
-                                lines_added,
-                                lines_removed,
-                            })
-                        }
-                        Ok(Err(error)) => LoadState::Failed(SharedString::from(format!(
-                            "Couldn't load the changes of commit {}: {error:#}",
-                            sha.display_short()
-                        ))),
-                        Err(_) => LoadState::Failed(SharedString::from(format!(
-                            "Loading the changes of commit {} was cancelled.",
-                            sha.display_short()
-                        ))),
-                    };
-                    if let Some(state) = this.commit_tab.as_mut() {
-                        state.diff = loaded;
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }));
+            self.load_commit_tab_details(sha, &repository, cx);
+            self.load_commit_tab_diff(sha, &repository, cx);
         }
 
-        self.commit_tab = Some(state);
-        self.active_tab = GitPanelTab::Commit;
+        self.activate_commit_tab_without_focus();
         cx.notify();
+    }
+
+    /// Activate the Commit tab without taking focus — see
+    /// [`Self::show_commit_selection`] for why the graph's push must not steal
+    /// it. Leaving History also drops what History was holding, because
+    /// `set_active_tab` (the focusing, user-driven route) is bypassed here.
+    fn activate_commit_tab_without_focus(&mut self) {
+        self.active_tab = GitPanelTab::Commit;
+        self.drop_history_state();
+    }
+
+    /// Restart whichever of the Commit tab's two loads failed. A multi-commit
+    /// selection loads nothing, so neither state can be `Failed` and `sha` —
+    /// the first of several — is never used as a commit to reload.
+    fn retry_failed_commit_loads(&mut self, sha: Oid, cx: &mut Context<Self>) {
+        let Some(state) = self.commit_tab.as_ref() else {
+            return;
+        };
+        let repository = state.selection.repository.clone();
+        let retry_details = matches!(state.details, LoadState::Failed(_));
+        let retry_diff = matches!(state.diff, LoadState::Failed(_));
+        if retry_details {
+            self.load_commit_tab_details(sha, &repository, cx);
+        }
+        if retry_diff {
+            self.load_commit_tab_diff(sha, &repository, cx);
+        }
+    }
+
+    /// Load the commit's message and identity into the open Commit tab.
+    /// Assigning the task also cancels whatever load it replaces.
+    fn load_commit_tab_details(
+        &mut self,
+        sha: Oid,
+        repository: &Entity<Repository>,
+        cx: &mut Context<Self>,
+    ) {
+        let details = repository.update(cx, |repository, _| repository.show(sha.to_string()));
+        let task = cx.spawn(async move |this, cx| {
+            let loaded = details.await;
+            this.update(cx, |this, cx| {
+                // Drop a load that resolved after the selection moved on,
+                // rather than pairing it with whatever is shown now.
+                if this.commit_tab_sha() != Some(sha) {
+                    return;
+                }
+                let loaded = match loaded {
+                    Ok(Ok(details)) => {
+                        let (subject, body) = split_commit_message(&details.message);
+                        let identity = commit_identity_source(
+                            &details.short_sha(),
+                            &details.author_name,
+                            &details.author_email,
+                            Some(details.commit_timestamp),
+                        );
+                        let text = CommitDetailText {
+                            subject: cx.new(|cx| Markdown::new_text(subject, cx)),
+                            body: cx.new(|cx| Markdown::new_text(body, cx)),
+                            identity: cx.new(|cx| Markdown::new(identity, None, None, cx)),
+                        };
+                        Ok((details, text))
+                    }
+                    Ok(Err(error)) => Err(SharedString::from(format!(
+                        "Couldn't load commit {}: {error:#}",
+                        sha.display_short()
+                    ))),
+                    Err(_) => Err(SharedString::from(format!(
+                        "Loading commit {} was cancelled.",
+                        sha.display_short()
+                    ))),
+                };
+                if let Some(state) = this.commit_tab.as_mut() {
+                    match loaded {
+                        Ok((details, text)) => {
+                            state.text = Some(text);
+                            state.details = LoadState::Loaded(details);
+                        }
+                        Err(message) => state.details = LoadState::Failed(message),
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(state) = self.commit_tab.as_mut() {
+            state.details = LoadState::Loading;
+            state._details_task = Some(task);
+        }
+    }
+
+    /// Load the commit's changed files into the open Commit tab.
+    fn load_commit_tab_diff(
+        &mut self,
+        sha: Oid,
+        repository: &Entity<Repository>,
+        cx: &mut Context<Self>,
+    ) {
+        let diff = repository.update(cx, |repository, _| {
+            repository.load_commit_diff(sha.to_string())
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let loaded = diff.await;
+            this.update(cx, |this, cx| {
+                if this.commit_tab_sha() != Some(sha) {
+                    return;
+                }
+                let loaded = match loaded {
+                    Ok(Ok(diff)) => {
+                        let (lines_added, lines_removed) = compute_diff_stats(&diff);
+                        LoadState::Loaded(LoadedCommitDiff {
+                            diff,
+                            lines_added,
+                            lines_removed,
+                        })
+                    }
+                    Ok(Err(error)) => LoadState::Failed(SharedString::from(format!(
+                        "Couldn't load the changes of commit {}: {error:#}",
+                        sha.display_short()
+                    ))),
+                    Err(_) => LoadState::Failed(SharedString::from(format!(
+                        "Loading the changes of commit {} was cancelled.",
+                        sha.display_short()
+                    ))),
+                };
+                if let Some(state) = this.commit_tab.as_mut() {
+                    state.diff = loaded;
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(state) = self.commit_tab.as_mut() {
+            state.diff = LoadState::Loading;
+            state._diff_task = Some(task);
+        }
     }
 
     /// Close the Commit tab and drop everything it was showing, emitting
