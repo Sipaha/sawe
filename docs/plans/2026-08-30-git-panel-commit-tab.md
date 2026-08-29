@@ -276,14 +276,14 @@ impl GitGraph {
 }
 ```
 
-- [ ] Add a private `push_selection_to_git_panel(&self, window, cx)` that resolves `self.workspace.upgrade()` → `workspace.panel::<GitPanel>(cx)` (fact 2) and calls `show_commit_selection` (non-empty selection) or `close_commit_tab` (empty). **Go through `cx.defer_in`** (fact 18) — `select_entry` is reachable from `invalidate_state` and the deserialize path, and a synchronous `workspace.update` there is a re-entrancy panic waiting to happen.
-- [ ] Call it from `select_entry` (after the selection sets settle) and from every `clear_selection` caller — note `clear_selection` itself takes no `cx` (fact 16), so either give it one or push from the call sites; pick one and be consistent.
-- [ ] Convert view indices to data indices with `view_to_data_idx` (fact 14) — the synthetic "Local Changes" row must never be pushed as a commit. `fold_row_click` already refuses to multi-select it (`test_fold_row_click_never_multi_selects_the_local_changes_row`, `:8710`); make sure the single-select path is equally safe.
-- [ ] Subscribe to the panel in `GitGraph::new` (fact 4 — `GitGraphPanel` rebuilds the graph on repo switch, so this re-installs itself): on `git_ui::git_panel::Event::CommitTabClosed`, call `clear_selection` + notify. **Guard against a feedback loop**: closing the tab clears the graph, which must not push another close.
-- [ ] `GitPanel::set_active_repository` closes the Commit tab (ruling above), reusing the seam at `:3922`.
-- [ ] **Verify and report:** does `apply_row_click_selection` still reach `select_entry` when the user re-clicks the row that is already selected? If it early-returns, say so — the ✕-then-reclick path depends on it and the design may need adjusting.
-- [ ] Tests: selecting a graph row opens the Commit tab with that sha; Ctrl-clicking a second row shows "2 commits selected"; `menu::Cancel` (Escape) closes the tab; closing the tab via ✕ clears `selected_entry_idx` and does not re-enter; switching the active repository closes the tab.
-- [ ] Gate: `set -o pipefail; cargo check -p git_ui -p git_graph --all-targets`; `cargo test -p git_ui -p git_graph`.
+- [x] Add a private `push_selection_to_git_panel(&self, window, cx)` that resolves `self.workspace.upgrade()` → `workspace.panel::<GitPanel>(cx)` (fact 2) and calls `show_commit_selection` (non-empty selection) or `close_commit_tab` (empty). **Go through `cx.defer_in`** (fact 18) — `select_entry` is reachable from `invalidate_state` and the deserialize path, and a synchronous `workspace.update` there is a re-entrancy panic waiting to happen.
+- [x] Call it from `select_entry` (after the selection sets settle) and from every `clear_selection` caller — note `clear_selection` itself takes no `cx` (fact 16), so either give it one or push from the call sites; pick one and be consistent.
+- [x] Convert view indices to data indices with `view_to_data_idx` (fact 14) — the synthetic "Local Changes" row must never be pushed as a commit. `fold_row_click` already refuses to multi-select it (`test_fold_row_click_never_multi_selects_the_local_changes_row`, `:8710`); make sure the single-select path is equally safe.
+- [x] Subscribe to the panel in `GitGraph::new` (fact 4 — `GitGraphPanel` rebuilds the graph on repo switch, so this re-installs itself): on `git_ui::git_panel::Event::CommitTabClosed`, call `clear_selection` + notify. **Guard against a feedback loop**: closing the tab clears the graph, which must not push another close.
+- [x] `GitPanel::set_active_repository` closes the Commit tab (ruling above), reusing the seam at `:3922`.
+- [x] **Verify and report:** does `apply_row_click_selection` still reach `select_entry` when the user re-clicks the row that is already selected? If it early-returns, say so — the ✕-then-reclick path depends on it and the design may need adjusting.
+- [x] Tests: selecting a graph row opens the Commit tab with that sha; Ctrl-clicking a second row shows "2 commits selected"; `menu::Cancel` (Escape) closes the tab; closing the tab via ✕ clears `selected_entry_idx` and does not re-enter; switching the active repository closes the tab.
+- [x] Gate: `set -o pipefail; cargo check -p git_ui -p git_graph --all-targets`; `cargo test -p git_ui -p git_graph`.
 
 ### Task 4: Delete the graph's inline commit-details sidebar
 
