@@ -847,7 +847,6 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     /// `Some` exactly while the closable Commit tab is in the tab bar.
     commit_tab: Option<commit_tab::CommitTabState>,
-    _repo_subscriptions: Vec<Subscription>,
 
     _settings_subscription: Subscription,
     git_access: GitAccess,
@@ -1075,7 +1074,6 @@ impl GitPanel {
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
                 commit_tab: None,
-                _repo_subscriptions: Vec::new(),
                 _settings_subscription,
                 git_access: GitAccess::Yes,
                 _store_subscription,
@@ -1401,12 +1399,20 @@ impl GitPanel {
         }
     }
 
+    /// Focus the changes list, switching to the Changes tab if some other tab
+    /// is showing.
+    ///
+    /// The tab switch is not a nicety: this is a direct call, so the
+    /// Changes-tab guard on the panel's action registrations does not cover it.
+    /// Without the switch, running this from the Commit tab moved the *hidden*
+    /// selection to the first entry and scrolled a list nobody could see.
     fn focus_changes_list(
         &mut self,
         _: &FocusChanges,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.set_active_tab(GitPanelTab::Changes, window, cx);
         self.focus_handle.focus(window, cx);
         self.select_first_entry_if_none(window, cx);
     }
@@ -3943,7 +3949,6 @@ impl GitPanel {
         // rows would open diffs against a repository the user has left.
         self.close_commit_tab(window, cx);
         self.entries.clear();
-        self._repo_subscriptions.clear();
         cx.notify();
     }
 
@@ -4612,12 +4617,21 @@ impl GitPanel {
         }
     }
 
+    /// Expanding is a Changes-tab gesture: the editor it grows lives in that
+    /// tab's footer. The action is registered on the *workspace*, so the
+    /// command palette reaches it from any tab — hence the switch, without
+    /// which expanding from the Commit tab flipped a flag with nothing on
+    /// screen to show for it. Collapsing leaves the active tab alone: there is
+    /// no expanded editor to walk the user over to.
     fn toggle_fill_commit_editor(
         &mut self,
         _: &ToggleFillCommitEditor,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.commit_editor_expanded {
+            self.set_active_tab(GitPanelTab::Changes, window, cx);
+        }
         self.commit_editor_expanded = !self.commit_editor_expanded;
         self.commit_editor.update(cx, |editor, _cx| {
             if self.commit_editor_expanded {
@@ -5384,6 +5398,19 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::Changes, window, cx);
     }
 
+    /// Whether the expanded commit editor is taking the whole panel, tab bar
+    /// included.
+    ///
+    /// It can only do that where the editor actually is, which is the Changes
+    /// tab's footer. Hiding the bar on the Commit tab as well — reachable while
+    /// expanded, since the git graph can push a selection at any time — left
+    /// that tab with no ✕, no way back to Changes, and no commit editor
+    /// either: a state only `ctrl-1` or the command palette got the user out
+    /// of.
+    fn commit_editor_fills_panel(&self) -> bool {
+        self.commit_editor_expanded && self.active_tab == GitPanelTab::Changes
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         // The Commit tab has no tab-bar row while it is closed, so every
         // user-facing route into it — the row itself, `ActivateCommitTab`, the
@@ -6114,7 +6141,20 @@ impl GitPanel {
 }
 
 impl GitPanel {
+    /// The file `git::FileHistory` should open a graph for, when the git panel
+    /// is the focused surface.
+    ///
+    /// The caller is `git_graph`'s workspace-level action renderer, which lives
+    /// *outside* the panel element — so the Changes-tab action guard in
+    /// `GitPanel`'s `Render` impl cannot reach it. Answering while the Commit tab
+    /// is showing would open a file history for a file nowhere on screen, and
+    /// because that registration is conditional it would also leak whether a
+    /// hidden file is selected at all: the action's mere presence in the
+    /// command palette is the tell.
     pub fn selected_file_history_target(&self) -> Option<(Entity<Repository>, RepoPath)> {
+        if self.active_tab != GitPanelTab::Changes {
+            return None;
+        }
         let entry = self.get_selected_entry()?.status_entry()?;
         let repository = self.active_repository.clone()?;
         if entry.status.is_created() {
@@ -6145,14 +6185,20 @@ impl Render for GitPanel {
         let has_entries = !self.entries.is_empty();
         let has_write_access = self.has_write_access(cx);
         // Every action below whose target is the Changes selection is only
-        // registered while that selection is on screen. `dispatch_context`
+        // registered while the Changes tab is the active one. `dispatch_context`
         // withholds the `ChangesList` key context on the Commit tab, but the
         // command palette dispatches by action name and never consults the
         // keymap — without this it could stage, restore or diff a file the user
         // cannot see. Nothing between this element and the window root handles
         // these actions, so unregistering them makes them inert rather than
         // handing them to somebody else.
-        let shows_changes_list = self.active_tab == GitPanelTab::Changes;
+        //
+        // Note this is the active *tab*, not "the list is painted": an expanded
+        // commit editor covers the Changes tab's list while these stay
+        // registered. That is the milder case — the selection is the one the
+        // user last saw in this very tab, and collapsing the editor brings it
+        // back — so it is deliberately not guarded here.
+        let on_changes_tab = self.active_tab == GitPanelTab::Changes;
 
         #[cfg(feature = "call")]
         let has_co_authors = self
@@ -6186,7 +6232,7 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::generate_commit_message_action))
                     .on_action(cx.listener(Self::stash_all))
                     .on_action(cx.listener(Self::stash_pop))
-                    .when(shows_changes_list, |this| {
+                    .when(on_changes_tab, |this| {
                         this.on_action(cx.listener(Self::toggle_staged_for_selected))
                             .on_action(cx.listener(Self::stage_range))
                             .on_action(cx.listener(Self::stage_selected))
@@ -6196,7 +6242,7 @@ impl Render for GitPanel {
                             .on_action(cx.listener(Self::add_to_git_info_exclude))
                     })
             })
-            .when(shows_changes_list, |this| {
+            .when(on_changes_tab, |this| {
                 this.on_action(cx.listener(Self::collapse_selected_entry))
                     .on_action(cx.listener(Self::expand_selected_entry))
                     .on_action(cx.listener(Self::select_first))
@@ -6231,7 +6277,7 @@ impl Render for GitPanel {
             .child(
                 v_flex()
                     .size_full()
-                    .when(!self.commit_editor_expanded, |this| {
+                    .when(!self.commit_editor_fills_panel(), |this| {
                         this.child(self.render_tab_bar(cx))
                     })
                     .map(|this| match self.active_tab {
@@ -9228,7 +9274,7 @@ mod tests {
             panel.focus_handle.focus(window, cx);
             let context = panel.dispatch_context(window, cx);
             assert!(
-                changes_list_bindings.eval(&[context.clone()]),
+                changes_list_bindings.eval(std::slice::from_ref(&context)),
                 "precondition: the Changes tab does bind the changes list keymap"
             );
             assert!(
@@ -9253,13 +9299,170 @@ mod tests {
             assert!(!context.contains("ChangesList"));
             assert!(!context.contains("menu"));
             assert!(
-                !changes_list_bindings.eval(&[context.clone()]),
+                !changes_list_bindings.eval(std::slice::from_ref(&context)),
                 "no changes-list binding may resolve while the Commit tab is showing"
             );
             assert!(
                 commit_tab_bindings.eval(&[context]),
                 "the Commit tab still needs the bindings that are not about the \
                  changes list — `escape` returns focus to the editor"
+            );
+        });
+    }
+
+    /// `git::FileHistory` walks around the Changes-tab action guard: `git_graph`
+    /// registers it on the *workspace* element and gates that registration on
+    /// asking this panel for its selected file. So the read happens on the
+    /// caller's side of the seam, and unregistering the panel's own actions
+    /// does nothing for it. Left answering, it opened a file history for a file
+    /// nowhere on screen — and, because the registration is conditional, the
+    /// action's mere presence in the palette leaked that a hidden file was
+    /// selected.
+    #[gpui::test]
+    async fn test_the_commit_tab_withholds_the_file_history_target(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, _, _| {
+            panel.active_repository = Some(repository.clone());
+            panel.entries = vec![GitListEntry::Status(GitStatusEntry {
+                repo_path: repo_path("src/main.rs"),
+                status: StatusCode::Modified.worktree(),
+                staging: StageStatus::Unstaged,
+                diff_stat: None,
+            })];
+            panel.selected_entry = Some(0);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            let (_, path) = panel
+                .selected_file_history_target()
+                .expect("precondition: the Changes tab offers the file it is showing");
+            assert_eq!(path, repo_path("src/main.rs"));
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::Commit);
+            assert!(
+                panel.selected_file_history_target().is_none(),
+                "the Commit tab hides the Changes selection, so no file history \
+                 may be opened for it"
+            );
+            assert!(
+                panel.selected_entry.is_some(),
+                "the selection is hidden, not dropped — the Changes tab has to \
+                 come back to the same row"
+            );
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.close_commit_tab(window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+            assert!(
+                panel.selected_file_history_target().is_some(),
+                "back on Changes the file is on screen again"
+            );
+        });
+    }
+
+    /// `git_panel::FocusChanges` is a direct call, so the Changes-tab guard on
+    /// the panel's action registrations never sees it. From the Commit tab it
+    /// used to focus the panel and move the *hidden* selection to the first
+    /// entry, scrolling a list nobody could see. It has to bring the list it
+    /// focuses along with it.
+    #[gpui::test]
+    async fn test_focus_changes_switches_to_the_changes_tab(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+            assert_eq!(panel.active_tab, GitPanelTab::Commit);
+            panel.focus_changes_list(&FocusChanges, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.active_tab,
+                GitPanelTab::Changes,
+                "focusing the changes list must put it on screen first"
+            );
+            assert!(
+                panel.commit_tab_is_open(),
+                "switching tabs is not closing the Commit tab — the graph's row \
+                 stays selected and its tab stays in the bar"
+            );
+        });
+    }
+
+    /// `git::ToggleFillCommitEditor` is registered on the workspace, so the
+    /// palette reaches it from either tab, and the editor it expands lives only
+    /// in the Changes tab's footer. Expanding from the Commit tab used to hide
+    /// the tab bar over a tab that has no commit editor and no ✕ — a state only
+    /// `ctrl-1` or the palette got the user out of.
+    #[gpui::test]
+    async fn test_expanding_the_commit_editor_leaves_no_dead_end(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+            panel.toggle_fill_commit_editor(&ToggleFillCommitEditor, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.commit_editor_expanded);
+            assert_eq!(
+                panel.active_tab,
+                GitPanelTab::Changes,
+                "the editor being expanded is on the Changes tab, so that is \
+                 where the gesture has to land"
+            );
+        });
+
+        // The graph can push a selection at any time, including while the
+        // editor is expanded — the tab bar has to survive that.
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("f00dcafe")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.active_tab, GitPanelTab::Commit);
+            assert!(
+                panel.commit_editor_expanded,
+                "the expansion is remembered for when Changes comes back"
+            );
+            assert!(
+                !panel.commit_editor_fills_panel(),
+                "with no commit editor on this tab the bar must stay, or the ✕ \
+                 and the Changes row go with it"
             );
         });
     }
@@ -9295,6 +9498,21 @@ mod tests {
             "menu::Confirm",
             "menu::SecondaryConfirm",
             "git_panel::JumpToSource",
+        ];
+        // The counterweight: these target the repository, not the invisible
+        // selection, so the guard must leave them alone. Without asserting it,
+        // widening the guard to swallow them would still pass this test.
+        const REPOSITORY_SCOPED: &[&str] = &[
+            "git::StageAll",
+            "git::UnstageAll",
+            "git::RestoreTrackedFiles",
+            "git::TrashUntrackedFiles",
+            "git::StashAll",
+            "git::StashPop",
+            "git::Commit",
+            "git::Amend",
+            "git::Signoff",
+            "git::GenerateCommitMessage",
         ];
 
         let NestedRepoSolution {
@@ -9337,7 +9555,7 @@ mod tests {
         };
 
         let on_changes = available(cx);
-        for name in SELECTION_SCOPED {
+        for name in SELECTION_SCOPED.iter().chain(REPOSITORY_SCOPED) {
             assert!(
                 on_changes.iter().any(|available| available == name),
                 "precondition: `{name}` is palette-reachable on the Changes tab"
@@ -9368,6 +9586,13 @@ mod tests {
                 !on_commit.iter().any(|available| available == name),
                 "`{name}` acts on the hidden Changes selection and must not be \
                  palette-reachable while the Commit tab is showing"
+            );
+        }
+        for name in REPOSITORY_SCOPED {
+            assert!(
+                on_commit.iter().any(|available| available == name),
+                "`{name}` targets the repository, not the hidden selection, so \
+                 the Commit tab must keep offering it"
             );
         }
     }

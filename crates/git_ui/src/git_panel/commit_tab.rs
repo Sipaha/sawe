@@ -621,7 +621,7 @@ impl GitPanel {
             // error permanent until the user picks some other commit.
             self.retry_failed_commit_loads(sha, cx);
             if source == CommitSelectionSource::UserGesture {
-                self.activate_commit_tab_without_focus();
+                self.activate_commit_tab_without_focus(cx);
             }
             cx.notify();
             return;
@@ -637,7 +637,7 @@ impl GitPanel {
         }
 
         if source == CommitSelectionSource::UserGesture {
-            self.activate_commit_tab_without_focus();
+            self.activate_commit_tab_without_focus(cx);
         }
         cx.notify();
     }
@@ -645,8 +645,14 @@ impl GitPanel {
     /// Activate the Commit tab without taking focus — see
     /// [`Self::show_commit_selection`] for why the graph's push must not steal
     /// it.
-    fn activate_commit_tab_without_focus(&mut self) {
+    ///
+    /// It notifies for itself rather than trusting callers to: the panel's
+    /// action registrations now depend on the active tab, so a missed notify
+    /// leaves the *old* tab's actions palette-reachable, not merely a stale
+    /// frame. Callers that notify anyway cost nothing — GPUI coalesces.
+    fn activate_commit_tab_without_focus(&mut self, cx: &mut Context<Self>) {
         self.active_tab = GitPanelTab::Commit;
+        cx.notify();
     }
 
     /// Restart whichever of the Commit tab's two loads failed. A multi-commit
@@ -792,7 +798,9 @@ impl GitPanel {
             return;
         };
         // Only the Commit tab itself is yanked back to Changes; a user parked
-        // on another tab keeps the tab they chose.
+        // on another tab keeps the tab they chose. With Changes the only other
+        // tab today the check is tautological — it is kept so that adding a
+        // third tab does not silently start stealing it.
         if self.active_tab == GitPanelTab::Commit {
             self.active_tab = GitPanelTab::Changes;
         }
