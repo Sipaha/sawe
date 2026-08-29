@@ -9502,17 +9502,18 @@ mod tests {
         // The counterweight: these target the repository, not the invisible
         // selection, so the guard must leave them alone. Without asserting it,
         // widening the guard to swallow them would still pass this test.
+        //
+        // Only actions registered *nowhere but* this panel element can serve:
+        // `git::StageAll`, `git::UnstageAll`, `git::StashAll`, `git::StashPop`,
+        // `git::GenerateCommitMessage`, `git::Commit` and `git::Amend` are also
+        // workspace-registered (`git_ui::init`, `git_panel::register`,
+        // `commit_modal::register`), so they stay palette-visible however much
+        // this panel withholds — a control that cannot fail. The lost-set
+        // assertion below is what covers those.
         const REPOSITORY_SCOPED: &[&str] = &[
-            "git::StageAll",
-            "git::UnstageAll",
+            "git::Signoff",
             "git::RestoreTrackedFiles",
             "git::TrashUntrackedFiles",
-            "git::StashAll",
-            "git::StashPop",
-            "git::Commit",
-            "git::Amend",
-            "git::Signoff",
-            "git::GenerateCommitMessage",
         ];
 
         let NestedRepoSolution {
@@ -9595,6 +9596,20 @@ mod tests {
                  the Commit tab must keep offering it"
             );
         }
+        let lost = on_changes
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !on_commit.iter().any(|available| available == name))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            lost,
+            SELECTION_SCOPED
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "switching to the Commit tab must cost exactly the selection-scoped \
+             actions and nothing else"
+        );
     }
 
     /// A commit belongs to the repository it was read from, so a repository
