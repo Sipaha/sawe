@@ -1240,6 +1240,25 @@ impl PanelButtons {
             _settings_subscription: settings_subscription,
         }
     }
+
+    /// Whether this group renders anything at all — `render` drops an entry
+    /// whose `Panel::icon` is `None`, which is how each panel honours its own
+    /// `"button": false` setting, and the dock starts with no entries while
+    /// the panels are still loading asynchronously.
+    ///
+    /// Exists so a caller can decide whether to draw chrome *around* the
+    /// group (the project toolbar's divider) without duplicating that filter.
+    /// Such a caller must also observe this entity: `PanelButtons` derives its
+    /// own invalidation from the dock and the `SettingsStore`, and chrome
+    /// gated on this predicate has to be invalidated by exactly the same
+    /// events or it goes stale.
+    pub fn has_visible_buttons(&self, window: &Window, cx: &App) -> bool {
+        self.dock
+            .read(cx)
+            .panel_entries
+            .iter()
+            .any(|entry| entry.panel.icon(window, cx).is_some())
+    }
 }
 
 impl Render for PanelButtons {

@@ -86,6 +86,17 @@ impl ProjectToolbar {
             cx.new(|cx| PanelButtons::new(workspace.right_dock().clone(), cx)),
         ];
 
+        // The divider after the group is gated on the group having any button
+        // (`has_visible_buttons`), so this view must re-render on every event
+        // that can change that answer: a panel loading into a dock, and a
+        // `"button": false` settings edit. Observing the `PanelButtons` rather
+        // than the docks and the `SettingsStore` separately means the two
+        // cannot drift — those are exactly the two sources `PanelButtons`
+        // itself subscribes to.
+        for buttons in &dock_buttons {
+            subscriptions.push(cx.observe(buttons, |_, _, cx| cx.notify()));
+        }
+
         Self {
             workspace: workspace.weak_handle(),
             multi_workspace,
@@ -339,7 +350,7 @@ impl ProjectToolbar {
 }
 
 impl Render for ProjectToolbar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Late-bind `multi_workspace` if it was not available at construction
         // (mirrors `TitleBar::render`).
         if self.multi_workspace.is_none() {
@@ -362,6 +373,11 @@ impl Render for ProjectToolbar {
             .workspace
             .upgrade()
             .and_then(|workspace| workspace.read(cx).run_config_strip().cloned());
+
+        let has_dock_buttons = self
+            .dock_buttons
+            .iter()
+            .any(|buttons| buttons.read(cx).has_visible_buttons(window, cx));
 
         h_flex()
             .w_full()
@@ -390,14 +406,21 @@ impl Render for ProjectToolbar {
             )
             // The one separator between the dock toggles and the project tabs;
             // `PanelButtons` deliberately draws none of its own so the three
-            // per-dock groups read as a single group here.
-            .child(
-                div()
-                    .px_1p5()
-                    .h_full()
-                    .py_1()
-                    .child(Divider::vertical().color(DividerColor::Border)),
-            )
+            // per-dock groups read as a single group here. Drawn only when
+            // there is in fact a group to separate: all three toggles can be
+            // hidden at once (`"project_panel": {"button": false}` and friends)
+            // and are all absent while the panels load asynchronously at
+            // startup, and a divider with nothing to its left is just a stray
+            // vertical rule.
+            .when(has_dock_buttons, |this| {
+                this.child(
+                    div()
+                        .px_1p5()
+                        .h_full()
+                        .py_1()
+                        .child(Divider::vertical().color(DividerColor::Border)),
+                )
+            })
             .when_some(project_tab_strip, |this, strip| this.child(strip))
             .child(div().flex_1())
             .child(
@@ -659,5 +682,35 @@ mod tests {
             .update(|cx| super::ProjectToolbar::resolve_repository(&project, cx))
             .expect("outside a Solution the plain project's repository must still resolve");
         assert_eq!(work_directory(&repository, cx), PathBuf::from("/plain"));
+    }
+
+    /// The divider between the dock toggles and the project tabs is gated on
+    /// the toggles existing. A workspace with no panel loaded into any dock is
+    /// both the startup state (the panels load asynchronously) and the state
+    /// with all three `"button": false`; drawing the divider there leaves a
+    /// vertical rule with nothing to its left.
+    #[gpui::test]
+    async fn test_no_dock_buttons_means_no_divider(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (project, _) = setup_solution_member("Divider", single_repo_tree(), cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let toolbar = workspace.update(cx, |workspace, cx| {
+            cx.new(|cx| super::ProjectToolbar::new(workspace, None, cx))
+        });
+
+        let dock_buttons = toolbar.read_with(cx, |toolbar, _| toolbar.dock_buttons.clone());
+        let has_dock_buttons = cx.update(|window, cx| {
+            dock_buttons
+                .iter()
+                .any(|buttons| buttons.read(cx).has_visible_buttons(window, cx))
+        });
+        assert!(
+            !has_dock_buttons,
+            "no panel is loaded into any dock, so the toggle group is empty \
+             and the divider must not draw"
+        );
     }
 }
