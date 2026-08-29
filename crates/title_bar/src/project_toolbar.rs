@@ -5,7 +5,7 @@ use gpui::{
 use project::Project;
 use solutions_ui::project_tab_strip::ProjectTabStrip;
 use ui::{ContextMenu, IconPosition, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
-use workspace::{MultiWorkspace, Workspace};
+use workspace::{MultiWorkspace, Workspace, dock::PanelButtons};
 
 /// Sawe fork: a full-width toolbar row mounted by `Workspace` directly
 /// below the title bar (see `Workspace::project_toolbar_item`). It hosts the
@@ -22,6 +22,12 @@ pub struct ProjectToolbar {
     // Created lazily once both `workspace` and `multi_workspace` are
     // resolved (mirrors `TitleBar::ensure_solution_tab_strip`).
     project_tab_strip: Option<Entity<ProjectTabStrip>>,
+    /// Toggles for the project-zone docks (ProjectPanel / OutlinePanel /
+    /// GitPanel), one `PanelButtons` per dock so a panel moved between docks
+    /// keeps exactly one button. They live here, at the leading edge of the
+    /// project toolbar, instead of in the vertical edge strips this fork used
+    /// to flank the workspace with.
+    dock_buttons: [Entity<PanelButtons>; 3],
     branch_popover_handle: PopoverMenuHandle<git_ui::branch_picker::BranchesPopup>,
     repository_popover_handle: PopoverMenuHandle<ContextMenu>,
     _subscriptions: Vec<Subscription>,
@@ -66,11 +72,23 @@ impl ProjectToolbar {
             }));
         }
 
+        // Built from the `&Workspace` parameter rather than by upgrading the
+        // weak handle: `ProjectToolbar::new` runs under a live `&mut Workspace`
+        // borrow, so reading the Workspace entity here would double-lease.
+        // The three dock entities live as long as the workspace does, so the
+        // buttons can hold them directly.
+        let dock_buttons = [
+            cx.new(|cx| PanelButtons::new(workspace.left_dock().clone(), cx)),
+            cx.new(|cx| PanelButtons::new(workspace.bottom_dock().clone(), cx)),
+            cx.new(|cx| PanelButtons::new(workspace.right_dock().clone(), cx)),
+        ];
+
         Self {
             workspace: workspace.weak_handle(),
             multi_workspace,
             project,
             project_tab_strip: None,
+            dock_buttons,
             branch_popover_handle: PopoverMenuHandle::default(),
             repository_popover_handle: PopoverMenuHandle::default(),
             _subscriptions: subscriptions,
@@ -360,6 +378,14 @@ impl Render for ProjectToolbar {
             // `pl_2` (8px) + 32px = 40px from the body's left, matching where
             // the project tree content begins.
             .child(div().w(px(32.)))
+            .child(
+                h_flex().gap_1().children(
+                    self.dock_buttons
+                        .iter()
+                        .cloned()
+                        .map(IntoElement::into_any_element),
+                ),
+            )
             .when_some(project_tab_strip, |this, strip| this.child(strip))
             .child(div().flex_1())
             .child(
