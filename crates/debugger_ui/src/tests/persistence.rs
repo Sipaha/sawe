@@ -1,4 +1,3 @@
-#![expect(clippy::result_large_err)]
 use crate::tests::{init_test, init_test_workspace, start_debug_session};
 use gpui::{BackgroundExecutor, BorrowAppContext as _, TestAppContext, VisualTestContext};
 use project::{FakeFs, Project};

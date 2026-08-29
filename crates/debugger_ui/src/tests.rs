@@ -20,6 +20,14 @@ use crate::{
 /// out of the Solution band's utility slot (phase 2b task 5), not out of a
 /// dock. Takes the `MultiWorkspace` because that is what
 /// `WindowHandle::update` hands the test closures.
+///
+/// `#[cfg(test)]`, not just `#[cfg(any(test, feature = "test-support"))]`
+/// like the module around it: every caller is one of the `#[cfg(test)]`
+/// submodules below, so in a `test-support`-without-`cfg(test)` build (what
+/// `./script/clippy` compiles, and what external crates get from this
+/// crate's `test-support` feature) this would be genuinely dead code. The
+/// `pub` helpers above it are the ones other crates call and stay ungated.
+#[cfg(test)]
 #[track_caller]
 pub(crate) fn debug_panel(multi_workspace: &MultiWorkspace, cx: &gpui::App) -> Entity<DebugPanel> {
     debug_panel_for_workspace(multi_workspace.workspace().read(cx))
@@ -29,7 +37,8 @@ pub(crate) fn debug_panel(multi_workspace: &MultiWorkspace, cx: &gpui::App) -> E
 /// Focus the debug panel. It no longer lives in a dock (phase 2b task 5), so
 /// `Workspace::focus_panel::<DebugPanel>` cannot find it; focus its handle
 /// directly, which is what `SolutionBand::toggle_utility_focus` does in
-/// production.
+/// production. `#[cfg(test)]` for the same reason as `debug_panel` above.
+#[cfg(test)]
 pub(crate) fn focus_debug_panel(
     multi_workspace: &mut MultiWorkspace,
     window: &mut gpui::Window,
