@@ -14,10 +14,10 @@ A read-only recon pass answered the question that had blocked this item for two 
 
 ### The chain
 
-1. `entries_persist_chain: HashMap<SolutionSessionId, Task<()>>` (`store.rs:289`, init `:806`) serialises entry-row writes per session so each `upsert…` + `delete_entries_from(main_len)` pair applies in issue order — GPUI detached tasks have no FIFO guarantee (the "phase-6b keystone bug").
+1. `entries_persist_chain: HashMap<SolutionSessionId, PersistChain>` (was `Task<()>` at recon time; the value now also carries the chain's `finished` flag and its `solution_id` — see fact 16's correction) serialises entry-row writes per session so each `upsert…` + `delete_entries_from(main_len)` pair applies in issue order — GPUI detached tasks have no FIFO guarantee (the "phase-6b keystone bug").
 2. Two append sites: `persist_all_rows` (`store.rs:3709`, remove `:3738`, insert `:3759`) and `persist_main_stream` (`store.rs:3775`, remove `:3807`, insert `:3828`).
 3. **Dropping the map entry cancels the WHOLE chain, not just the last link.** `prev` is moved *into* the new task's future, so dropping the newest `Task` drops its future, which drops `prev`, recursively. A `Task` in a field is cancel-on-drop (`crates/scheduler/src/executor.rs:288-295`).
-4. **The flush future captures no entity.** `rows` / `len` / `epoch` / `change_seq` are snapshotted synchronously before the spawn (`store.rs:3724-3735`, `:3789-3801`); `db` is an `Arc<SolutionAgentDb>`; `_this` / `_cx` are unused. **This is what makes `.detach()` viable at all** — a detached link cannot touch a dropped entity or read stale in-memory state.
+4. **The flush future captures no entity.** `rows` / `len` / `epoch` / `change_seq` are snapshotted synchronously before the spawn (`store.rs:3724-3735`, `:3789-3801`); `db` is an `Arc<SolutionAgentDb>`; `_this` / `_cx` are unused. **This is what makes a link that outlives its session viable at all** — it cannot touch a dropped entity or read stale in-memory state. (Recon wrote this as "what makes `.detach()` viable"; the property is the same, but the chain is retained in the map rather than detached — fact 16's correction.)
 
 ### The drop site and its two incompatible callers
 
@@ -38,7 +38,45 @@ A read-only recon pass answered the question that had blocked this item for two 
 
 14. **`purge_session_hard` orders `evict` (`:83`) BEFORE `db.purge_session` (`:104`)**, both unordered background tasks over the same connection. Detach the chain generically and a persist link can execute **after** the purge DELETE and **re-insert rows for a session that no longer exists in `solution_sessions`** — permanent orphan rows, invisible to every UI (nothing enumerates entry rows without a session row) and never GC'd. The current `drop` is what prevents this. Same hazard at `purge_solution_fully` → `db.delete_for_solution` (`:160`). **Any fix that changes `evict` generically ships this bug.**
 15. **`close_session` lacks `cold_close_solution`'s `is_live` gate** (`teardown.rs:387-395`) and calls `persist_all_rows` unconditionally at `:636`. Today that is unobservable because the flush is cancelled either way. **The moment the chain is repaired it becomes a live second bug** — and it points the opposite way: bug 1 is *loss of writes that should happen*, bug 2 is *execution of a rewrite that should not*. Concretely: closing a restored, never-resumed chat tab would run `delete_entries_from(main_len)` against a legacy row set.
-16. **Deferred eviction is unsound.** "Spawn a task that awaits the chain, then evicts" races a re-open: `hydrate_all_for_solution` can re-key the same `SolutionSessionId` (close→reopen is a normal action, `teardown.rs:345-350`) and insert a *new* chain before the deferred evict runs, which would then drop a live chain. Hand the `Task` off **by value with `.detach()` at the synchronous eviction point** so the map key frees immediately.
+16. **Deferred eviction is unsound.** "Spawn a task that awaits the chain, then evicts" races a re-open: `hydrate_all_for_solution` can re-key the same `SolutionSessionId` (close→reopen is a normal action, `teardown.rs:345-350`) and insert a *new* chain before the deferred evict runs, which would then drop a live chain.
+
+    > **CORRECTED after implementation + review.** The conclusion drawn from this
+    > fact — "hand the `Task` off by value with `.detach()` so the key frees
+    > immediately" — was **wrong, and it shipped a Critical regression in
+    > `76be3e00fa`.** The re-key hazard cuts both ways and fact 16 only looked at
+    > one direction. Freeing the key lets the reopened session build a **second
+    > chain with nothing ordering it against the first**, so the close flush's
+    > trailing `delete_entries_from(old_main_len)` can land *after* the new
+    > chain's tail upsert and delete it — the phase-6b keystone bug, at the
+    > close/reopen seam. Measured A/B on the same fixture: 3-entry transcript,
+    > close → reopen → one new message = **4 rows on `53d8acb420`, 3 rows on
+    > `76be3e00fa`** (the new message deleted); 200-entry transcript with five
+    > real reopen round trips = **201 vs 200**. The same wrong reasoning was
+    > written into `evict_session_runtime_maps`'s own doc comment.
+    >
+    > **The fix (this plan's follow-up commit): the drained chain STAYS under its
+    > key.** `Drain` no longer removes anything; `Abandon` still removes + drops
+    > + warns. A reopen then finds the flush as its `prev` for free, and fact
+    > 16's deferred-eviction race never arises because nothing is deferred.
+    >
+    > The map is bounded by `retire_finished_persist_chains`, which drops only
+    > chains that have **already run** (each link flips an `AtomicBool` as its
+    > last act; the flag is read synchronously on the same foreground thread the
+    > chain runs on). Removing a spent link can neither cancel work nor reorder
+    > anything, so it is the one removal that is unconditionally safe — no
+    > generation counter needed. It is called wherever the map is already being
+    > touched (both persist sites, and the `Drain` arm), so the residue is at
+    > most the chains still in flight.
+    >
+    > Two consequences of retention that the `.detach()` design did not have, and
+    > that the fix handles explicitly: a chain now outlives its session's
+    > teardown, so `purge_session_hard`'s **not-hydrated early-return branch**
+    > (`teardown.rs:121-137`, which never reaches `teardown_session_runtime`) and
+    > `purge_solution_fully` (which only iterates *hydrated* sessions) must
+    > abandon retained chains themselves, or a soft-close-then-purge writes rows
+    > for a session the purge just deleted. `PersistChain` therefore carries its
+    > `solution_id` — a soft-closed session is gone from `by_solution` and is
+    > otherwise unreachable from a solution-level purge.
 17. **Ordering detail, the fiddliest part of the change:** `close_session` calls `persist_all_rows` at `:636` and *then* `teardown_session_runtime` at `:638`, which evicts internally at `:548`. But `teardown_session_runtime` also calls `cancel_turn` (`:498-501`), which can emit further ACP events and therefore issue **another** persist. The chain preserves their order, so it is safe — but the detach must happen **after** `teardown_session_runtime`'s cancel work, or the cancel-induced link is orphaned.
 18. **`persisted_main_seq` is advanced synchronously before the spawn** (`store.rs:3731`, `:3800`) and every persist filters `mod_seq > watermark`. So "skip the flush, a later persist catches up" is unsound — there is no later persist that re-picks those rows. **The flush must run or the data is gone.**
 
@@ -49,7 +87,11 @@ A read-only recon pass answered the question that had blocked this item for two 
 
 ### Out of scope, recorded so it is not lost
 
-21. **App quit loses everything in flight with no flush attempt at all.** There is no `on_app_quit` hook in `solution_agent`; the store global drops with the process. This is a *separate, larger* bug than the one this plan fixes — adding a quit-time drain is new scope (and the chain runs on the **foreground** executor, so a detached link needs the app to keep pumping, which quit does not). Recorded as a new pool item.
+21. **Orphan entry rows survive a hard purge, and nothing ever reaps them.** Independently confirmed by review on the parent commit `53d8acb420` with an identical probe (same 1 orphan row from an 8-link chain), so it is **genuinely pre-existing** and not introduced by the disposition split: dropping the map entry does not cancel a deeper chain promptly (only the outermost handle is in the map; the inner ones sit inside their successors' futures), so the innermost links keep writing while the cancellation walks inward. The detail worth keeping: `purge_session_hard` deletes the parent `solution_sessions` row, and `delete_by_solution` sweeps entries via `session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)` — so **the solution-level sweep in `purge_solution_fully` cannot reach the orphans either**, and there is no orphan reaper anywhere in the crate. Closing it means sequencing the purge DELETE after the abandoned writes (a change to purge ordering), or adding a reaper. **Do not change purge ordering as a drive-by.**
+
+22. **A reopen can still read a half-written flush.** Now that the close flush actually runs, `hydrate_all_for_solution`'s `db.load_entries` (`store/hydration.rs:1011`) can interleave with it: every DB op is its own `executor.spawn` + connection lock (`db/entries.rs:19-50`), and `persist_all_rows` awaits one round trip **per row**, so a read issued mid-flush sees a prefix. Hydration then derives `persisted_main_seq` from that short row set (`model.rs:1018-1046`) and the session's next persist trims the rest with `delete_entries_from(main_len)`. This is **inherent to making the flush run at all** — it is equally present under the `.detach()` design and under any epoch-stamped-delete variant — and it needs a reopen within the flush window (tens of ms of scheduling for a big transcript), so it is much narrower than the bug this plan fixes. Two candidate fixes, neither taken here: order hydration behind the chain (`reopen_closed_session` is `&mut self` and could await it; `hydrate_all_for_solution` is `&self`, so it would need a cloneable completion handle instead of the `AtomicBool`), or add a **batched** `upsert_entries` that writes the whole flush under one connection lock — which would also shrink the close→reopen window by ~200x and cost no schema change.
+
+23. **App quit loses everything in flight with no flush attempt at all.** There is no `on_app_quit` hook in `solution_agent`; the store global drops with the process. This is a *separate, larger* bug than the one this plan fixes — adding a quit-time drain is new scope (and the chain runs on the **foreground** executor, so a detached link needs the app to keep pumping, which quit does not). Recorded as a new pool item.
 
 ---
 
@@ -57,7 +99,7 @@ A read-only recon pass answered the question that had blocked this item for two 
 
 - **Disposition is chosen per caller, never inferred inside `evict`.** `evict_session_runtime_maps` takes an explicit `ChainDisposition::{Drain, Abandon}`. *Rules out:* fact 14's orphan-row resurrection, which is what a generic detach ships.
 - **`close_session` gets the `is_live` gate in the SAME change as the drain.** Fixing the cancellation without it makes fact 15 fire. Two commits are fine; two *plans* are not.
-- **Detach by value at the synchronous eviction point.** Never defer the eviction (fact 16).
+- **Dispose synchronously at the eviction point.** Never defer the eviction (fact 16). ~~Detach by value~~ — **superseded**: `Drain` keeps the chain under its key (see fact 16's correction); only `Abandon` removes it.
 - **Do not touch the realign itself.** The legacy truncation is intended behaviour with a green test (fact 12). The gate protects *untouched* sessions, not the layout.
 
 ## Global constraints
@@ -86,7 +128,7 @@ fn teardown_session_runtime(&mut self, …, chain: ChainDisposition) -> …;
 - [ ] `evict_session_runtime_maps` takes the disposition. `Drain` ⇒ `task.detach()`; `Abandon` ⇒ today's remove-and-drop, plus a `log::warn!` naming the session (there is none today — mirror the `pending_messages` precedent at `teardown.rs:513-524`).
 - [ ] `close_session` → `Drain`; `cold_close_solution` (`:407`) → `Drain`; `purge_session_hard` (`:83`) and `purge_solution_fully` → `Abandon`.
 - [ ] Gate `close_session`'s `persist_all_rows` (`:636`) on `acp_thread().is_some()`, mirroring `teardown.rs:387-395`.
-- [ ] Respect fact 17's ordering: the detach must land after `teardown_session_runtime`'s `cancel_turn` work has issued whatever persist it is going to issue. Verify this by reading the call order, and say in your report which order you ended up with and why.
+- [ ] Respect fact 17's ordering: the disposition must land after `teardown_session_runtime`'s `cancel_turn` work has issued whatever persist it is going to issue. Verify this by reading the call order, and say in your report which order you ended up with and why.
 - [ ] Correct the four stale doc comments that assert the cancellation as permanent fact: `teardown.rs:461-463`, `:356-386`, `:610-632` (this one claims `close_session` "is not more dangerous" than `cold_close_solution` — true only while neither executes), and `store/tests/teardown.rs:511-534`.
 - [ ] Test A — **the one that fails today**: live session, chain issued, `close_session`, `run_until_parked`, assert the rows on disk reflect the flush.
 - [ ] Test B: legacy-shaped **cold** session (seed with the `store/tests/hydration.rs:1481-1512` recipe — `db.upsert_entry(id, idx, mod_seq, created_ms, Some("T1"), payload)` then `s.entries = …; s.hydrate_streams_main_only();`), `close_session`, assert the teammate rows **survive** — the `close_session` twin of `cold_close_solution_does_not_rewrite_cold_session_rows`.
@@ -98,6 +140,6 @@ fn teardown_session_runtime(&mut self, …, chain: ChainDisposition) -> …;
 
 ### Task 2: Docs
 
-- [ ] FORK.md: a numbered decision entry — what the chain is, why disposition is per-caller (fact 14), why `close_session` needed the gate in the same change (fact 15), and that the legacy realign is intended rather than avoided (fact 12).
+- [ ] FORK.md: a numbered decision entry — what the chain is, why disposition is per-caller (fact 14), **why a drained chain stays under its key rather than being detached** (fact 16's correction — this is the non-obvious part), why `close_session` needed the gate in the same change (fact 15), and that the legacy realign is intended rather than avoided (fact 12).
 - [ ] `docs/INDEX.md`: a row for this plan.
-- [ ] Record fact 21 (app quit) as an open pool item with the recon detail, so the next session does not re-derive it.
+- [ ] Record facts 21-23 (orphan entry rows with no reaper; the torn read a reopen can still do; app quit) as open pool items with the recon detail, so the next session does not re-derive them.
