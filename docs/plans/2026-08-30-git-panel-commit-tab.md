@@ -1,6 +1,6 @@
 # Git Panel `Changes | Commit` (phase 3) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** the git panel's tabs become **Changes | Commit**. **History is deleted outright.** The git graph loses its inline commit-details surface entirely; selecting a commit in the graph instead opens a **closable Commit tab** in the git panel, and clicking one of that commit's files opens the file's diff *for that commit* in the centre pane. A multi-row graph selection shows a bare "N commits selected" summary.
 
@@ -492,14 +492,143 @@ impl GitGraph {
 
 **Files:** `FORK.md`, `docs/INDEX.md`, this plan.
 
-- [ ] `cargo build --bin sawe`, then `script/run-mcp --debug --headless`, and drive **that** socket (never `mcp__sawe__*`). Open the standing fixture Solution 33 (`WideGraph`, a real multi-branch repo in `~/.spk/sawe-dev/`).
-- [ ] Screenshot each state, driving a real event before every capture (the retained-scene trap): git panel showing **Changes | (no Commit tab)**; a commit selected in the band's graph → **Changes | Commit ✕** with message, `hash · author · date`, +/− totals and the file tree; a file double-clicked → its commit diff in the centre pane; a Ctrl-click multi-selection → "N commits selected"; ✕ pressed → back to Changes **and the graph row deselected**; and the graph itself with **no sidebar**, filling the band's utility half.
-- [ ] Confirm the band's three-part layout invariant still holds — run a `windows.resize` to something short (e.g. 1280×384, debug-only tool) and check the status bar still has visible pixels.
-- [ ] Full gates: `cargo test -p git_ui -p git_graph -p zed -p workspace`; `cargo fmt --all --check`; `./script/clippy -p git_ui -p git_graph` with the honest reading from fact 36 — zero findings naming code this plan wrote or moved.
-- [ ] `FORK.md`: a numbered decision entry for phase 3 (what moved, why the graph→panel/panel→graph split, what was dropped and where it still lives), touched-files rows for `crates/git_ui/src/git_panel/commit_tab.rs` and any first-time-modified upstream file, and an amendment to #55 noting that its three-trees extraction trigger has now fired and is deferred.
-- [ ] `docs/INDEX.md`: mark this plan complete in the plans table with its commit chain.
-- [ ] **Visibility sweep — bigger than originally scoped.** Task 1 made `commit_tab` a `pub mod` with ~10 `pub` items (`ChangedFileRowHandlers`, `ChangedFileEntry` + `from_commit_file`/`render`, `ChangedFileRow`, `build_changed_file_rows`, `render_changed_directory_row`, `split_commit_message`, `commit_identity_source`, `detail_text_style`, `compute_diff_stats`) *solely* so `git_graph` could import them. After Task 4 nothing outside `crates/git_ui/src/git_panel/` names `commit_tab::` at all — and `pub` inside a `pub mod` raises no `dead_code` warning, so this will never surface on its own. Take it back to `mod commit_tab` plus a `pub` → `pub(super)`/private pass; `git_panel.rs`'s `pub use commit_tab::{CommitSelection, CommitSelectionSource};` is the only export any other crate still needs. Include `ChangedFileEntry`'s three reader-less `pub` fields and `GitGraph::selected_commit_shas`.
-- [ ] Fix `render_chip`'s doc comment, which still explains its `truncate` flag through the wrapping ref-chip row that died with the sidebar (fact 59).
-- [ ] Rule on the three dead remnants Task 5 left deliberately: `_repo_subscriptions` (fact 62), `close_commit_tab`'s now-tautological guard (fact 64), and `git_panel::FocusChanges` being a half-no-op from the palette on the Commit tab (fact 65).
-- [ ] Record the standing coverage gap the Task 3 review named: **no test drives `select_entry` under a live `Context<Workspace>` lease** (the `open_or_reuse_graph` / deserialize path). That is the one place removing `cx.defer_in` would panic rather than merely misbehave, so the defer is protected only by reasoning. Either add the test or put it in the deferred backlog explicitly.
-- [ ] Tick every checkbox in this document and record the deferred items: the `affected_files`/commit-tree extraction (FORK.md #55), the two defects in fact 37, and the graph's column fractions in a compact band (fact 38).
+- [x] `cargo build --bin sawe`, then `script/run-mcp --debug --headless`, and drive **that** socket (never `mcp__sawe__*`). Open the standing fixture Solution 33 (`WideGraph`, a real multi-branch repo in `~/.spk/sawe-dev/`).
+- [x] Screenshot each state, driving a real event before every capture (the retained-scene trap): git panel showing **Changes | (no Commit tab)**; a commit selected in the band's graph → **Changes | Commit ✕** with message, `hash · author · date`, +/− totals and the file tree; a file double-clicked → its commit diff in the centre pane; a Ctrl-click multi-selection → "N commits selected"; ✕ pressed → back to Changes **and the graph row deselected**; and the graph itself with **no sidebar**, filling the band's utility half.
+- [x] Confirm the band's three-part layout invariant still holds — run a `windows.resize` to something short (e.g. 1280×384, debug-only tool) and check the status bar still has visible pixels.
+- [x] Full gates: `cargo test -p git_ui -p git_graph -p zed -p workspace`; `cargo fmt --all --check`; `./script/clippy -p git_ui -p git_graph` with the honest reading from fact 36 — zero findings naming code this plan wrote or moved.
+- [x] `FORK.md`: a numbered decision entry for phase 3 (what moved, why the graph→panel/panel→graph split, what was dropped and where it still lives), touched-files rows for `crates/git_ui/src/git_panel/commit_tab.rs` and any first-time-modified upstream file, and an amendment to #55 noting that its three-trees extraction trigger has now fired and is deferred.
+- [x] `docs/INDEX.md`: mark this plan complete in the plans table with its commit chain.
+- [x] **Visibility sweep — bigger than originally scoped.** Task 1 made `commit_tab` a `pub mod` with ~10 `pub` items (`ChangedFileRowHandlers`, `ChangedFileEntry` + `from_commit_file`/`render`, `ChangedFileRow`, `build_changed_file_rows`, `render_changed_directory_row`, `split_commit_message`, `commit_identity_source`, `detail_text_style`, `compute_diff_stats`) *solely* so `git_graph` could import them. After Task 4 nothing outside `crates/git_ui/src/git_panel/` names `commit_tab::` at all — and `pub` inside a `pub mod` raises no `dead_code` warning, so this will never surface on its own. Take it back to `mod commit_tab` plus a `pub` → `pub(super)`/private pass; `git_panel.rs`'s `pub use commit_tab::{CommitSelection, CommitSelectionSource};` is the only export any other crate still needs. Include `ChangedFileEntry`'s three reader-less `pub` fields and `GitGraph::selected_commit_shas`.
+- [x] Fix `render_chip`'s doc comment, which still explains its `truncate` flag through the wrapping ref-chip row that died with the sidebar (fact 59).
+- [x] Rule on the three dead remnants Task 5 left deliberately: `_repo_subscriptions` (fact 62), `close_commit_tab`'s now-tautological guard (fact 64), and `git_panel::FocusChanges` being a half-no-op from the palette on the Commit tab (fact 65).
+- [x] Record the standing coverage gap the Task 3 review named: **no test drives `select_entry` under a live `Context<Workspace>` lease** (the `open_or_reuse_graph` / deserialize path). That is the one place removing `cx.defer_in` would panic rather than merely misbehave, so the defer is protected only by reasoning. Either add the test or put it in the deferred backlog explicitly.
+- [x] Tick every checkbox in this document and record the deferred items: the `affected_files`/commit-tree extraction (FORK.md #55), the two defects in fact 37, and the graph's column fractions in a compact band (fact 38).
+
+
+---
+
+## Deferred backlog (recorded, not done)
+
+Everything below was found while executing this plan and deliberately left
+alone. Each is a real item; none blocks the phase.
+
+1. **The third changed-files tree, and the extraction that is now due.**
+   FORK.md #55 named the trigger — "if a third changed-files tree ever
+   appears, that's the trigger to extract a shared `RepoPath`-keyed tree
+   module". It has fired: `git_panel`'s working-changes tree,
+   `commit_view/affected_files.rs`, and now
+   `git_panel/commit_tab.rs::build_changed_file_rows`. Deferred on purpose —
+   the three still differ in what a leaf *is* (a `GitStatusEntry` with staging
+   semantics, a filtered/windowed `&CommitFile`, a `ChangedFileEntry`) and in
+   what a row *does* (stage, scroll, open a per-commit diff), so unifying them
+   is a design job, not a move. FORK.md #55 carries the amendment.
+
+2. **The graph's `0.13` Date-column fraction** (fact 38). In the band's
+   compact utility half every row truncates to `15 Nov 2023 06…` while the
+   Author column is mostly whitespace. Retuning the `0.74 / 0.13 / 0.13` split
+   was out of scope for this plan and still is; note there is no horizontal
+   scroll and no table min-width to fall back on.
+
+3. **`SerializableItem::serialize` indexes `graph_data.commits` with the VIEW
+   index** and never calls `view_to_data_idx` (fact 37a) — an off-by-one
+   whenever the synthetic local-changes row is present, so a restart can
+   restore the wrong commit's sha. Pre-existing; predates this plan.
+
+4. **Four keymap entries name actions that exist nowhere in `crates/`**
+   (fact 37b): `git_graph::{FocusNextTabStop,FocusPreviousTabStop,ScrollDown,ScrollUp}`
+   in the `GitGraph` context of `default-macos.json`, `default-windows.json`
+   and `vim.json`. Pre-existing. This plan deliberately avoided adding a fifth
+   instance, which is why `ctrl-2` was rebound to a real
+   `git_panel::ActivateCommitTab` rather than left pointing at the deleted
+   `ActivateHistoryTab`.
+
+5. **No test drives `select_entry` under a live `Context<Workspace>` lease.**
+   The `open_or_reuse_graph` / deserialize path is the one place where
+   removing the `cx.defer_in` in `push_selection_to_git_panel` would *panic*
+   rather than merely misbehave, so that defer is currently protected by
+   reasoning alone. The existing tests exercise `select_entry` from outside a
+   workspace lease and would stay green if the defer were deleted. Writing the
+   test needs a fixture that builds the graph from inside
+   `workspace.update(...)`, which no test in either crate does today.
+
+6. **`GitGraph::set_repo_id` has no production caller.** Left in place rather
+   than deleted: it is a coherent piece of the graph's public control surface
+   and deleting it is not this phase's call.
+
+7. **`close_commit_tab`'s `if self.active_tab == GitPanelTab::Commit` guard is
+   tautological** while Changes is the only other tab (fact 64). Kept
+   deliberately, with a comment saying so, precisely so that adding a third tab
+   does not silently start stealing it.
+
+8. **The commit body wraps at its authored 72-column hard line breaks.** The
+   Commit tab renders the message verbatim, so a body written for a terminal
+   shows its own hard wraps at a dock's width instead of reflowing. Reflowing
+   would mean rewriting the author's text, which is worse; a horizontal-scroll
+   or soft-wrap toggle is the real answer and is out of scope for spec §5.
+
+9. **Pre-existing and unrelated: an untracked file bumps the Changes tab's
+   count but never renders a row.** Noticed by the Task 6 verification agent
+   while driving the live editor. Nothing in this phase touches the Changes
+   list's entry building; recorded here only so the next person does not
+   attribute it to the tab rework.
+
+## Rulings closed in Task 6
+
+- **The visibility sweep landed as briefed and then some.** Nothing outside
+  `crates/git_ui/src/git_panel/` names a `commit_tab::` path, so the module is
+  `mod commit_tab` again and `ChangedFileRowHandlers`, `ChangedFileEntry` (and
+  its four fields), `ChangedFileRow`, `build_changed_file_rows`,
+  `render_changed_directory_row`, `split_commit_message`, `detail_text_style`
+  and `compute_diff_stats` are all private. `git_graph`'s remaining reach is
+  inherent `GitPanel` methods — whose visibility does not depend on the
+  module's — plus the `CommitSelection` / `CommitSelectionSource` re-export.
+  `GitGraph::selected_commit_shas` had no consumer outside its own file and is
+  private too. `commit_identity_source` was already gone: defect 69 replaced it
+  with plain `Label`s.
+
+- **`_repo_subscriptions` (fact 62) was already deleted** by the time Task 6
+  looked — zero occurrences in `crates/`. Fact 62's "Task 6 deletes it or rules
+  explicitly" is closed as already-done, not as a ruling.
+
+- **`git_panel::FocusChanges` (fact 65) was already fixed** in Task 5's review
+  wave: `focus_changes_list` now calls `set_active_tab(GitPanelTab::Changes,…)`
+  before focusing, with `test_focus_changes_switches_to_the_changes_tab`
+  pinning it. It is the same class as fact 66 — a *direct call* that the
+  registration-site guard never sees.
+
+- **`GitPanel::select_entry_by_path` stays unguarded, deliberately.** It is
+  `pub` and `project_diff` calls it on every
+  `EditorEvent::SelectionsChanged { local: true }` with no tab / focus /
+  visibility check, so from the Commit tab it moves the hidden Changes
+  selection, expands collapsed sections and scrolls an unrendered list. That is
+  a *sync*, not a command: it changes no repository state, opens nothing, leaks
+  nothing, and the state it leaves is exactly what the user would have seen had
+  they stayed on Changes. Guarding it would make the Changes list stale the
+  moment the tab closes. The method now carries a doc comment saying so, so the
+  next reader does not file it as the tab-guard bug it resembles.
+
+- **`render_chip`'s `truncate` parameter is kept, its doc comment fixed**
+  (fact 59). The comment explained the flag through the sidebar's wrapping
+  ref-chip row, which no longer exists; it now says that the single remaining
+  caller always passes `true` and why the flag is still the caller's to set.
+
+## Task 6 gates
+
+- `cargo check -p git_ui -p git_graph -p zed --all-targets` — exit 0. Warnings:
+  only the pre-existing `panel_buttons.rs` set and
+  `git_panel.rs::build_commit_message_prompt`. The sweep produced **no** new
+  `dead_code` warnings, which is the evidence that every narrowed item is still
+  live inside its module.
+- `cargo test -p git_ui -p git_graph` — **381 passed, 0 failed** (`git_ui` 320,
+  `git_graph` 61).
+- `cargo fmt --all -- --check` — clean.
+- `./script/clippy -p git_ui -p git_graph` — 9 findings, **zero naming code
+  this plan wrote or moved**: `panel_buttons.rs` (unused `IntoElement` import +
+  `panel_button` / `panel_filled_button` / `panel_icon_button` never used),
+  `git_panel.rs:3038 build_commit_message_prompt` never used,
+  `commit_view/affected_files.rs:308` `Iterator::last` on a
+  `DoubleEndedIterator`, `stashes.rs:195` explicit `.into_iter()`, and
+  `log_toolbar/branch_popover.rs:190-191` `sort_by_key` ×2. Note the script
+  runs with `--deny warnings`, so `git_ui`'s findings abort the build before
+  `git_graph` is reached; the two `branch_popover.rs` findings come from a
+  second run without the deny. This is fact 36's honest reading.

@@ -98,7 +98,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/workspace/src/pane.rs` | **(decision #41)** Tab-bar New/Split/Zoom button visibility no longer gates purely on keyboard focus: `should_show_tab_bar_buttons` also shows them on `Workspace::active_pane` so they don't vanish/flicker when focus is in a dock panel. | `solutions` / dock-focus UX |
 | `crates/welcome/src/welcome.rs` | Recent Solutions section + buttons. | `solutions_ui` |
 | `crates/project_panel/src/project_panel.rs` | **(2026-06-23, decision #27)** No longer hosts a project dropdown; filters `state.visible_entries` to worktrees under the **solution-wide active member's** `local_path` (resolved via a private `active_solution` helper + `SolutionStore::active_member`) after each `update_visible_entries`, and subscribes to `ActiveMemberChanged`; resets `max_width_item_index` and recomputes `last_worktree_root_id` post-filter. | `solutions_ui` / `solutions` |
-| `crates/git_ui/src/git_panel.rs` | **(2026-06-23, decision #27)** No longer hosts a project dropdown; `refresh_active_repository_for_selector` overrides `active_repository` with the active member's matching repo; subscribes to `ActiveMemberChanged`. (Per-member dropdown-badge change-count map retired with the selector.) **(decision #75)** That override now resolves through `solutions::active_member_repository`, and `set_active_repository` is the single seam that also clears the History tab's rows and subscriptions; the footer's repo switcher was removed. | `solutions_ui` / `solutions` |
+| `crates/git_ui/src/git_panel.rs` | **(2026-06-23, decision #27)** No longer hosts a project dropdown; `refresh_active_repository_for_selector` overrides `active_repository` with the active member's matching repo; subscribes to `ActiveMemberChanged`. (Per-member dropdown-badge change-count map retired with the selector.) **(decision #75)** That override now resolves through `solutions::active_member_repository`, and `set_active_repository` is the single seam every piece of per-repository panel state hangs off — the History tab's rows and subscriptions used to be cleared there, and since decision #100 the Commit tab is closed there for the same reason. **(decision #100)** The tab set is now `Changes \| Commit`; History is deleted. | `solutions_ui` / `solutions` |
+| `crates/git_ui/src/git_panel/commit_tab.rs` | **New (decision #100).** The git panel's Commit tab: `CommitSelection` / `CommitSelectionSource`, the `CommitTabState` the panel hangs off an `Option`, the two guarded background loads (`Repository::show` / `load_commit_diff`), and the changed-files tree / message split / markdown style / client-side +/− fold **relocated verbatim** from the git graph's deleted commit-details sidebar. A private `mod`: `git_panel.rs` re-exports only `CommitSelection` and `CommitSelectionSource`, which is all `git_graph` needs to name. | `git_ui` / `git_graph` |
 | `crates/git/Cargo.toml` | `test-support` feature now also activates `db/test-support` — the `db::static_connection!` macro's expansion references `db::open_test_db`, which only exists under that feature; without it, crates that enable `git/test-support` but not `db/test-support` fail to compile. Pre-existing latent workspace bug, fixed in-tree. | build / upstream-fix |
 | `crates/git/src/repository.rs` | Adds `branches_containing` / `tags_containing` / `load_commit_against_parent` methods on `GitRepository` (default no-op impls + real impls in `RealGitRepository`) for the S-DET commit-view metadata surface. Adds module-level `parse_contains_output` parser. Also: `load_commit_template` special-cases `ErrorKind::NotFound` on the `git config --get` spawn — treats "cwd disappeared" (e.g. an open repo whose underlying directory was removed mid-session via `git worktree remove`) as "no template available" with a debug log, instead of propagating ENOENT through to `detach_and_log_err`. | `git_ui` (S-DET) / general robustness |
 | `crates/git/src/blame.rs` | `Blame::for_path_at_revision` + a `BlameTarget` enum, so `git blame` can annotate a commit-ish instead of only working-tree content piped on stdin (decision #58). | `editor` (diff-pane blame) |
@@ -802,11 +803,11 @@ How to apply: to add a custom `workspace::Item` view as a replaceable preview, d
 
 ### 55. A commit's changed files render as an IDEA-style collapsible directory tree, with its own local tree builder (not the git-panel one)
 
-What: the commit-detail "affected files" list (`crates/git_ui/src/commit_view/affected_files.rs`, shown in `CommitView` / the git-log History tab) changed from a flat list of full repo paths to a collapsible **directory tree**: folder rows (open/closed icon + name + muted "N file(s)" count) that toggle on click, file leaves with a status icon, single-child directory chains compacted onto one row (`src/main/java/ru/citeck/ecos/apps/domain`), and a root file shown at top level. Collapse state lives in `CommitAffectedFiles.collapsed_dirs: HashSet<String>` (default absent = expanded, matching IDEA); toggled via a `cx.listener` on `CommitView`. The existing fuzzy filter + lazy "Load more" window is preserved — the tree is built from the already-filtered/windowed `Vec<&CommitFile>` slice.
+What: the commit-detail "affected files" list (`crates/git_ui/src/commit_view/affected_files.rs`, shown in `CommitView`) changed from a flat list of full repo paths to a collapsible **directory tree**: folder rows (open/closed icon + name + muted "N file(s)" count) that toggle on click, file leaves with a status icon, single-child directory chains compacted onto one row (`src/main/java/ru/citeck/ecos/apps/domain`), and a root file shown at top level. Collapse state lives in `CommitAffectedFiles.collapsed_dirs: HashSet<String>` (default absent = expanded, matching IDEA); toggled via a `cx.listener` on `CommitView`. The existing fuzzy filter + lazy "Load more" window is preserved — the tree is built from the already-filtered/windowed `Vec<&CommitFile>` slice.
 
 Why: the maintainer finds IDEA's git changed-files tree much nicer than a flat truncated-path list. The git panel already has a working-changes tree (`GitPanelViewMode::Tree`, `build_tree_entries`/`flatten_tree`), but that one is private to `git_panel.rs` and coupled to `GitStatusEntry` + `Section` + staging checkboxes — extracting/generalizing it risked destabilizing the heavily-used working-changes list for no real gain here. A read-only commit-file tree is a genuinely separate, smaller concern, so `affected_files.rs` grows its own ~90-line builder (`Node { dirs: BTreeMap, files }` → compact single-child chains → `flatten` to `TreeRow::{Dir,File}` honoring `collapsed_dirs`). Per-folder counts come from subtree file aggregation; indent uses a local `INDENT = 16.0` mirroring `git_panel::TREE_INDENT`.
 
-Deliberately out of scope (there was no data / the ask didn't need it): per-file +/- counts (`git::repository::CommitFile` carries only `path`/`old_text`/`new_text`/`is_binary` — no numstat; adding them needs a diff-stat load path), click-a-file-to-scroll-the-commit-diff, and log-row branch/tag chips. The two tree builders (working-changes vs commit-detail) are intentionally NOT unified yet; if a third changed-files tree ever appears, that's the trigger to extract a shared `RepoPath`-keyed tree module.
+Deliberately out of scope (there was no data / the ask didn't need it): per-file +/- counts (`git::repository::CommitFile` carries only `path`/`old_text`/`new_text`/`is_binary` — no numstat; adding them needs a diff-stat load path), click-a-file-to-scroll-the-commit-diff, and log-row branch/tag chips. The two tree builders (working-changes vs commit-detail) are intentionally NOT unified yet; if a third changed-files tree ever appears, that's the trigger to extract a shared `RepoPath`-keyed tree module. **Amendment (decision #100): that trigger has now fired and the extraction is deliberately deferred.** The git panel's Commit tab is the third tree — `git_panel/commit_tab.rs`'s `build_changed_file_rows` — and it was relocated wholesale from the git graph's sidebar rather than merged into either existing builder, because phase 3 had to leave `main` with a working commit-details surface at every intermediate commit. The three still differ in what a leaf *is* (a `GitStatusEntry` with staging semantics, a filtered/windowed `&CommitFile`, a `ChangedFileEntry`) and in what a row *does* (stage, scroll, open a per-commit diff), so the extraction is a real design job, not a move. Do it as its own change, not as a rider.
 
 How to apply: when you need a directory tree over `RepoPath`-bearing leaves, this local builder is the lightweight template; only reach for extracting the git-panel one if the leaf really needs staging/section semantics. Plan: `docs/superpowers/plans/2026-07-15-idea-commit-changed-files-tree.md`.
 
@@ -1024,7 +1025,7 @@ How to apply:
 - **The explicit pick is keyed by `(SolutionId, MemberId)` → work-directory path, not by `RepositoryId`.** Ids are minted fresh on every rescan; the path is stable.
 - **Choosing also sets the project-wide active repository.** `set_active_member_repository` writes the pick *and* calls `set_as_active_repository`, so surfaces that only know `GitStore` follow along and everyone re-renders off the existing `ActiveRepositoryChanged` event rather than a new one. The reverse is deliberately not true: `set_active_repo_for_path` on buffer focus still moves the global, but it cannot move a member that has an explicit pick — which is what stops the header drifting as you click through files.
 - **The repository selector lives in the header, not in a panel.** `ProjectToolbar::render_repository_selector` renders to the LEFT of the branch widget and **only** when the active member owns ≥2 repositories; with one there is nothing to choose and nothing renders — no placeholder, no disabled button. Its appearance is itself the signal that a nested repository got registered. The git panel's footer repo switcher was removed: two switchers that could disagree is the bug this decision closes. `repository_selector.rs`'s `SelectRepo` modal stays.
-- **A detached HEAD is a legitimate state, not a fallback.** The title bar's short-sha branch label and the History tab both handle it; they were only ever showing the *wrong repository's* detached HEAD. The History tab now clears its rows and subscriptions whenever the active repository changes (`GitPanel::set_active_repository` is the single seam) and reads from `LogSource::Sha(head)` when there is no branch.
+- **A detached HEAD is a legitimate state, not a fallback.** The title bar's short-sha branch label and the git log both handle it; they were only ever showing the *wrong repository's* detached HEAD, and a log with no branch reads from `LogSource::Sha(head)`. The general lesson outlived the surface that taught it: **every piece of panel state that is about one repository must be dropped at `GitPanel::set_active_repository`, which is the single seam.** The git panel's History tab (deleted in decision #100) cleared its rows and subscriptions there; the Commit tab is closed there now, for exactly the same reason.
 
 ### 76. `LogSource::Sha` had never worked
 
@@ -1428,6 +1429,123 @@ already collapsed when its session disappears is otherwise never touched), and t
 whatever it reads with `session_can_be_active_dialog` — the same predicate `session_tab_strip` uses to decide
 whether to draw a tab — before trusting it. The second guard is what holds against a teardown path that never
 routes through the first.
+
+### 100. The git panel's tabs are `Changes | Commit`; the graph pushes selections down by typed call and the panel signals closes back up by event
+
+What: phase 3 of the Solution-band work (spec `docs/plans/2026-08-26-solution-band-ai-dialogs-design.md` §5, plan
+`docs/plans/2026-08-30-git-panel-commit-tab.md`). The git panel's tab bar is now exactly **Changes | Commit**. The
+History tab is deleted outright, and the git graph's inline right-hand commit-details sidebar is deleted with it.
+Selecting a commit in the graph opens a closable **Commit** tab carrying the full commit message, a
+`short hash · author · date` row, whole-commit +/− totals and a changed-files tree; double-clicking a file there opens
+that file's diff **for that commit** in the centre pane (`CommitView::open_file_diff`, reused verbatim — its doc comment
+already named the graph's changed-files list as its caller). A multi-row graph selection renders a bare "N commits
+selected" and loads nothing. The sidebar's building blocks — the changed-files tree, the commit-message split, the
+markdown style, the client-side +/− fold — were **relocated, not rebuilt**, into `crates/git_ui/src/git_panel/commit_tab.rs`.
+
+Why the sidebar had to go: phase 2b (#96, #97) moved the git graph into the Solution band's *compact utility half*. The
+sidebar's `min_w(px(300.))` was the only min-width in the whole view, and deleting it is what reclaims the horizontal
+width the band actually needed. Note that this is horizontal, not vertical: the spec described a bottom strip, but the
+sidebar was a right-hand column (the bottom strip was the message region *inside* it).
+
+**Why the two directions of communication differ — the dependency edge decides it.** `git_graph` depends on `git_ui`
+and never the reverse (`crates/git_graph/Cargo.toml` has `git_ui.workspace = true`; `crates/git_ui/Cargo.toml` has no
+`git_graph` entry). Down is therefore the only direction the shared code could move, and the two halves of the
+conversation are asymmetric by necessity:
+
+- **graph → panel is a direct typed call.** The graph may name `git_ui` types and already looks the panel up
+  (`workspace.panel::<GitPanel>(cx)` off its `WeakEntity<Workspace>`), so it simply calls
+  `GitPanel::show_commit_selection` / `close_commit_tab`. No string-named-action IoC trick, no new provider registry —
+  neither is needed here and both are harder to test. The call is made through **`cx.defer_in`**, and that is not
+  decoration: `GitGraph::select_entry` is reachable from `invalidate_state` and from the deserialize path, where a
+  synchronous `workspace.update` is a double-lease panic.
+- **panel → graph is a GPUI event.** `git_ui` may not name `git_graph` at all, so `GitPanel` extends its existing
+  `pub enum Event` with `CommitTabClosed(Vec<Oid>)` and `GitGraph` subscribes. The subscription is installed in
+  `GitGraph::new`, not once at panel construction, because `GitGraphPanel` re-creates its inner `Entity<GitGraph>` on
+  every repository switch. **The payload is load-bearing:** the event reaches *every* `GitGraph` in the window, so a
+  graph clears its selection only when the closing tab's shas equal its own `selected_commit_shas()`. That also subsumes
+  the feedback-loop guard — with the synthetic local-changes row selected the graph's shas are `[]` while the event
+  carries a real commit, so the mismatch already stops the bounce.
+
+**`CommitSelectionSource` exists because a background re-anchor is not a gesture.** The graph re-anchors its selection
+by sha after every refetch, and refetches are triggered by repository events nobody asked for — a `git fetch` landing in
+a terminal, a branch checked out elsewhere. Those re-anchors reach `show_commit_selection` through the *same call* a
+click does, so before the split a fetch would swap the panel body out from under a user who had gone back to Changes to
+stage files and type a commit message. `UserGesture` re-activates the Commit tab (which is also what makes "select a
+commit, switch to Changes, click that row again" work); `Background` refreshes an already-open tab in place, never
+touches `active_tab`, and does nothing at all when the tab is closed. The only `Background` callers are the two
+re-anchors in `on_repository_event` and the deserialize path's `select_commit_by_sha`. A re-anchor that *fails* — the
+sha is gone after a `git commit --amend` — closes the tab instead, and only while it describes exactly that one sha.
+
+**What was dropped, and where it still lives.** Ref chips and the "In N branches" line are gone from the commit-details
+surface, along with `CommitBranches` / `format_branches_containing`; both remain in the full `CommitView`
+(`commit_view/refs_bar.rs`, `commit_view/contains_panel.rs`), one click away — the same place the full sha already
+lives. From the sidebar's context menu, Copy SHA and Copy Web URL survive on the graph's row menu and selection-copy of
+the message survives as `ctrl-c` → `markdown::Copy`, but **"Copy Author Email" has no equivalent anywhere and "Copy
+Message" degrades to "Copy Subject"**. Accepted deliberately: a message-block context menu on the Commit tab is new
+scope beyond spec §5. Per-file +/− counts stay out of scope for the reason #55 already recorded — `CommitFile` carries
+no numstat. The identity line also stopped being markdown: it is plain `Label`s now, so it is no longer selectable text
+and `markdown::Copy` no longer reaches it; the email and time-of-day moved into the row's tooltip.
+
+**The palette guard, and the class of hole a guard on the panel cannot close.** Narrowing `dispatch_context` makes the
+Commit tab inert to the *keymap*, but the panel's `.on_action` registrations stay live, so palette-dispatching
+`git::ToggleStaged` / `git::RestoreFile` / `menu::Confirm` would still act on the hidden Changes selection. The fix is
+applied **at registration, not per handler**: one `let shows_changes_list = self.active_tab == GitPanelTab::Changes;`
+and two `.when(shows_changes_list, …)` blocks cover 20 actions across 13 handlers (staging, restore, gitignore,
+expand/collapse, all eight selection movers, `open_diff`, `open_accordion_diff`, `jump_to_source`). Unregistering rather
+than guarding is safe only because nothing between the panel element and the window root handles any of them — the
+other `git::ToggleStaged` / `RestoreFile` handlers live on `editor` and `project_panel` elements, which are not
+ancestors. Repository-wide actions (`stage_all`, `commit`, `amend`, `stash_*`) are deliberately **not** guarded: they
+target the repository, not the invisible selection.
+
+**The trap: a guard that lives on the panel's own registrations is bypassed by any cross-crate reader of the panel's
+selection.** `git::FileHistory` is registered by `git_graph` on the **Workspace** element and resolves its target
+through `GitPanel::selected_file_history_target`, so it sailed straight past the guard — and a conditional registration
+would additionally have leaked whether a hidden file was selected. It is fixed on the *panel* side, by
+`selected_file_history_target` returning `None` off the Changes tab. `git_panel::FocusChanges` is the same class from
+the other end: a direct call, so it now switches to Changes before focusing rather than moving a selection nobody can
+see. The one deliberate exception is `GitPanel::select_entry_by_path`, which `project_diff` calls on every
+`EditorEvent::SelectionsChanged { local: true }`: it stays unguarded because it is a *sync*, not a command — it changes
+no repository state, opens nothing, and guarding it would only make the Changes list stale the moment the Commit tab
+closes. It says so in a comment, so the next reader does not file it as the same bug twice.
+
+**The vertical budget is solved by flex, not by arithmetic — and that is a GPUI constraint, not a preference.** At the
+shipped dock height the tab body is ~282px. Pinning the message block at its 200px cap (`flex_shrink_0`) plus a
+three-line identity row left 19px for a 28px header and **zero** for the tree. The obvious fix — read the available
+height and take a fraction of it — is not available: that height is only knowable during layout, where a `cx.notify()`
+is *discarded* (`Window::invalidate_view` returns false while `draw_phase != None`) and a re-derive-and-notify loop
+spins. So the layout states three floors and lets flex do the arithmetic: the message block drops `flex_shrink_0` and
+gains `min_h(COMMIT_MESSAGE_MIN_HEIGHT)`, the tree swaps `min_h_0()` for `min_h(COMMIT_FILE_TREE_MIN_HEIGHT)`, and the
+tree's explicit floor freezes it during the shrink pass so the message gives back exactly the shortfall (measured at
+1080: message 200 → 157, identity 63 → 25, tree 0 → 72; a one-line commit instead leaves the message at its 44px
+content height and the tree *grows* to 185 — the cap is not a floor). **An explicit `min_h` is load-bearing:** a flex
+item's automatic minimum size is its content, so without one neither child can shrink at all and the overflow returns.
+
+How to apply:
+
+- **When two crates in a dependency chain must talk both ways, do not reach for an IoC registry by reflex.** Call
+  downward directly and event upward. Reserve the string-named-action / provider-registry tricks for the cases where
+  the *downward* direction is the one that is blocked.
+- **A typed call from inside one view's `update` into another view must be deferred** (`cx.defer_in`) whenever the
+  calling method is reachable from an invalidation or deserialize path. Compiles clean, panics at runtime, and a
+  `VisualTestContext`-shaped unit test will not catch it.
+- **An event that fans out to N subscribers needs a payload identifying who it was about.** "Clear yourself" is only
+  correct when there is exactly one of you.
+- **Split a push API by *source* the moment a background refresh and a user gesture share it.** The symptom is always
+  the same: the UI moves under a user who did not touch it.
+- **Ephemeral by design.** The Commit tab is never persisted and never restored; the panel keeps booting on Changes.
+  The graph's own `selected_sha` *is* persisted and could re-drive it later if the maintainer asks, which is why no
+  `SerializedGitPanel` migration was worth writing.
+- The Commit tab lives as an `impl GitPanel` block in a sibling module (`commit_tab.rs` beside `changes_list.rs`), not
+  as its own `Entity` — the grain the Changes tab already set. It hangs off `GitPanel` as one `Option<CommitTabState>`,
+  so `Some` *is* the tab's presence in the tab bar and "open" cannot drift from "has something to show".
+- The row renderers take their host behaviour as `Rc<dyn Fn>` closures (`ChangedFileRowHandlers`). **Those may only be
+  installed into event callbacks**: the erasure means a `GitPanel` double-lease is not a compile error, and unlike the
+  graph the Commit tab renders under a live `Context<GitPanel>` lease. Build the bundle from `cx.weak_entity()` at the
+  top of `render`, never inside a nested `update`, and never invoke one during layout/prepaint/paint.
+- **An always-active tab needs an affordance of its own.** With the Commit tab closed the lone "Changes" tab painted as
+  a bare centred label above the toolbar and read as a section header, because `render_tab_bar` styled only the
+  *inactive* branch. The active tab now carries a 2px `border_focused` underline — the same idiom as the solution
+  band's project tabs (`crates/solutions_ui/src/project_tab.rs`).
 
 ## Where specs and plans live
 
