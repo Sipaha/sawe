@@ -139,20 +139,34 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
     from `commit_tab::commit_remote(&selection.repository, cx)`, not
     `GitPanel::git_remote` — so **Task 5's `git_remote` grep is unchanged: it
     still has no caller outside History.**
-53. **Indent, as shipped.** `COMMIT_TREE_INDENT = 18.0 + TREE_INDENT` (34px)
-    and **no container inset**: `ButtonLike`'s own 4px horizontal padding is the
-    directory header's indent, which lands the file rows at 38px — the same
-    left edge as the Changes tab's depth-1 rows *and* as the graph sidebar's
-    file rows. The graph's `.ml_neg_1()` is deliberately not carried over. The
-    **Density caveat (Task 2 review):** `ButtonLike`'s 4px is
+53. **Indent — CORRECTED by live measurement (Task 6 defect round).** The
+    original claim ("`COMMIT_TREE_INDENT = 18.0 + TREE_INDENT` (34px) lands the
+    file rows at 38px — the same left edge as the Changes tab's rows") held only
+    for the **padding box**, and that is not the edge the eye tracks. Measured
+    on a running headless editor, first painted pixel from the panel's left:
+    Changes file row **+45**, Commit file row **+39** — six pixels apart.
+    The padding boxes really do both land at 43 (Changes:
+    `1px row border + content_row_padding(0) 22 + 14px chevron slot + 6px gap`;
+    Commit: `34 + ButtonLike's 4px`), but a Changes row *spends* its chevron
+    slot and gap before painting anything, while a Commit row paints its status
+    glyph straight at its own padding edge.
+    `COMMIT_TREE_INDENT` is therefore now derived from the Changes tab's own
+    constants — `1.0 + ROW_LEFT_PADDING + SECTION_CONTENT_INDENT + 14.0 + 6.0
+    - 4.0` = **39px** — which measures at **+44** against the Changes row's
+    **+45**. The residual pixel is the checkbox's 2px inset inside its 20px
+    wrapper versus the status glyph's 1px inset, i.e. two different leading
+    elements, not a layout error; chasing it would take a magic constant.
+    `content_row_padding(0)` and not `(1)` because `tree_view` ships `false`
+    (`assets/settings/default.json`), so every Changes file row is at depth 0.
+    The **Density caveat (Task 2 review)** still stands: `ButtonLike`'s 4px is
     `DynamicSpacing::Base04`, whose tuple is `(2, 4, 6)`
     (`crates/ui/src/styles/spacing.rs`) — 4px only at `UiDensity::Default`, and it
-    is `rems()`, so it scales with `ui_font_size`. `COMMIT_TREE_INDENT` and the
-    Changes tab's `content_row_padding` are absolute px, so the two trees align
-    exactly on stock settings and drift a couple of pixels otherwise. The
-    headers then sit 2px inside the Changes tab's 6px section headers; closing
-    that last 2px would mean either editing the shared `render_changed_directory_row`
-    (which would move the graph's still-live sidebar too) or a magic negative
+    is `rems()`, so it scales with `ui_font_size`, while `COMMIT_TREE_INDENT`
+    and `content_row_padding` are absolute px. The two trees align on stock
+    settings and drift a couple of pixels otherwise.
+    Directory headers are **not** aligned and deliberately so: measured
+    Commit header **+7**, Changes section header **+11**. Closing that would
+    mean editing the shared `render_changed_directory_row` or a magic negative
     margin, and the file rows are the edge the eye tracks.
 
 ### Corrections established by the Task 3 review fixes (authoritative)
@@ -276,6 +290,44 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
     workspace level). It hides the changes list while `active_tab` stays
     `Changes`, so the 20 guarded actions stay registered with nothing on screen —
     and expanded + Commit tab rendered no tab bar, no ✕ and no commit editor.
+
+### Corrections established by the Task 6 live-verification defect round
+
+68. **The Commit tab's vertical budget is solved by flex, not by arithmetic.**
+    A live headless editor at the shipped dock height gave the tab body 282px;
+    the message block was pinned at `COMMIT_MESSAGE_MAX_HEIGHT` (200px,
+    `flex_shrink_0`) and the identity row wrapped to 63px, which left 19px for
+    a 28px "N Changed Files" header and **zero** for the tree. The fix is not a
+    computed fraction of the available height — that height is only knowable
+    during layout, where a `cx.notify()` is discarded and a re-derive-and-notify
+    spins (global constraints). Instead the message block drops `flex_shrink_0`
+    and gains `min_h(COMMIT_MESSAGE_MIN_HEIGHT)`, and the tree swaps
+    `min_h_0()` for `min_h(COMMIT_FILE_TREE_MIN_HEIGHT)`. Flex then does the
+    arithmetic: the tree's explicit floor freezes it at 72px during the shrink
+    pass, so the message gives back exactly the shortfall. Measured at 1080:
+    message 200 → 157, identity 63 → 25, header 28, tree 0 → 72. A commit with
+    a one-line subject instead leaves the message at its 44px content height
+    and the tree *grows* to 185 — the cap is not a floor.
+    **An explicit `min_h` is load-bearing, not decoration:** a flex item's
+    automatic minimum size is its content, so without it neither child can
+    shrink at all and the old overflow returns.
+69. **The identity row is `short hash · author · date` (spec §5), not prose.**
+    It was `<sha> <author> <email> on <date> at <time>` rendered as one
+    markdown run, which wrapped to three lines at a dock's width — two thirds
+    of defect 68's overflow. It is now plain `Label`s in one row where only the
+    author may shrink (`min_w_0` + `truncate()`); the email and the time of day
+    moved into the row's tooltip. `commit_identity_source` and its markdown
+    escaping (`escape_markdown_inline`) went with it — the line no longer
+    parses markdown, so nothing needs escaping. Cost: the identity line is no
+    longer selectable text and `markdown::Copy` no longer reaches it; the
+    tooltip carries the full string instead.
+70. **An always-active tab needs an affordance of its own.** `render_tab_bar`
+    styled only the *inactive* branch, so with the Commit tab closed the lone
+    "Changes" tab painted as a bare centred label above the View Diff / Stage
+    All toolbar and read as a section header. The active tab now carries a 2px
+    `border_focused` underline — the same idiom as the solution band's project
+    tabs (`crates/solutions_ui/src/project_tab.rs`), which is the fork's
+    existing answer to this exact question.
 
 ---
 
