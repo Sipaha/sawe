@@ -5319,10 +5319,21 @@ impl GitPanel {
                 .flex_1()
                 .justify_center()
                 .hover(|s| s.bg(cx.theme().colors().element_hover))
-                .border_b_1()
+                // The active tab carries an accent underline of its own rather
+                // than relying on the inactive tab's chrome for contrast. With
+                // the Commit tab closed there is no inactive tab to contrast
+                // against, and a bare centred label sitting above the panel's
+                // toolbar reads as a section header, not as a selected tab.
+                // Same idiom as the solution band's project tabs
+                // (`solutions_ui/src/project_tab.rs`).
+                .border_b_2()
+                .border_color(if active {
+                    cx.theme().colors().border_focused
+                } else {
+                    cx.theme().colors().border.opacity(0.6)
+                })
                 .when(!active, |s| {
                     s.bg(cx.theme().colors().editor_background.opacity(0.6))
-                        .border_color(cx.theme().colors().border.opacity(0.6))
                 })
                 .child(Label::new(label.clone()).when(!active, |this| this.color(Color::Muted)))
                 .when(show_changes && self.changes_count > 0, |this| {
