@@ -2,16 +2,15 @@
 //! the commit-message split, the markdown identity line and the client-side
 //! +/− totals.
 //!
-//! These were written for the git graph's inline detail sidebar and lived in
-//! `git_graph.rs`; they are relocated here verbatim so the git panel's Commit
-//! tab can host the same surface. `git_graph` depends on `git_ui` and never
-//! the reverse, so down is the only direction they could move.
+//! These were written for the git graph's inline detail sidebar, which the
+//! Commit tab replaced; they moved down here from `git_graph.rs` because
+//! `git_graph` depends on `git_ui` and never the reverse, so down was the only
+//! direction they could go.
 //!
 //! The row renderers are the one thing that could not come across unchanged:
-//! they were typed against `Context<GitGraph>` and are now hosted by two
-//! unrelated views, so their host behaviour arrives as
-//! [`ChangedFileRowHandlers`] — plain `&mut App` closures the host builds from
-//! its own weak handle. Nothing about what they paint changed.
+//! they were typed against `Context<GitGraph>` and take their host behaviour
+//! as [`ChangedFileRowHandlers`] instead — plain `&mut App` closures the host
+//! builds from its own weak handle.
 
 use super::*;
 
@@ -26,14 +25,14 @@ use time::{UtcOffset, format_description::BorrowedFormatItem};
 
 /// Left step of a Commit tab file row, measured from its directory header.
 ///
-/// The git graph's sidebar steps its file rows in by
+/// The graph sidebar this tab replaced stepped its file rows in by
 /// `18px + ProjectPanelSettings::indent_size` (38px at the shipped default).
 /// `git_ui` cannot read that setting — `project_panel` depends on `git_ui`, so
 /// the reverse is a dependency cycle — so the panel's own `TREE_INDENT` stands
 /// in for the project panel's step. The leading 18px is the directory header's
 /// chevron (14px) plus its gap (4px), which a file row has no equivalent of;
 /// dropping it and using a bare `TREE_INDENT` would be a 22px regression
-/// against the tree that ships today.
+/// against the tree that shipped before.
 const COMMIT_TREE_INDENT: f32 = 18.0 + TREE_INDENT;
 
 /// Cap on the Commit tab's message block. Without it a long commit message
@@ -196,7 +195,7 @@ impl ChangedFileEntry {
     }
 }
 
-/// One row of the sidebar's changed-files tree. IDEA renders the commit's
+/// One row of the Commit tab's changed-files tree. IDEA renders the commit's
 /// files grouped under their directory rather than as a flat list of
 /// `name  dir/path` pairs; a directory chain with a single child is compacted
 /// into one header (`docs/plans/completed`) instead of nesting a row per path
@@ -307,7 +306,7 @@ pub fn render_changed_directory_row(
 
 /// Split a raw commit message into its subject (first line) and body. The
 /// blank line git puts between them is dropped, as is trailing whitespace —
-/// otherwise the sidebar renders a run of empty lines under short messages.
+/// otherwise the tab renders a run of empty lines under short messages.
 pub fn split_commit_message(message: &str) -> (SharedString, SharedString) {
     let mut lines = message.lines();
     let subject = lines.next().unwrap_or_default().trim_end().to_string();
@@ -323,7 +322,7 @@ pub fn split_commit_message(message: &str) -> (SharedString, SharedString) {
 /// Escape the CommonMark inline markers that could turn an author name into
 /// formatting. Only the markers that can *start* an inline construct are
 /// escaped — over-escaping would show up verbatim in the text the user copies
-/// out of the sidebar, since `markdown::Copy` copies from the source.
+/// out of the tab, since `markdown::Copy` copies from the source.
 fn escape_markdown_inline(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
@@ -367,8 +366,8 @@ pub fn commit_identity_source(
 }
 
 /// `on <date> at <time>` reads better with the two halves separated, so the
-/// detail sidebar spells the time out instead of reusing the log column's
-/// compact `[day] [month] [year] [hour]:[minute]`.
+/// Commit tab spells the time out instead of reusing the log column's compact
+/// `[day] [month] [year] [hour]:[minute]`.
 fn detail_timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
     static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
     FORMAT.get_or_init(|| {
@@ -389,8 +388,8 @@ fn format_detail_timestamp(timestamp: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Style for the selectable single-line text fields of the commit-details
-/// sidebar, matching what the equivalent [`Label`] rendered before.
+/// Style for the selectable single-line text fields of the Commit tab,
+/// matching what the equivalent [`Label`] rendered before.
 pub fn detail_text_style(
     text_size: TextSize,
     color: Color,
@@ -818,6 +817,29 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::Changes, window, cx);
     }
 
+    /// The sha the Commit tab's *loaded* details were fetched for, as opposed
+    /// to the one [`Self::commit_tab_shas`] says it is describing. The git
+    /// graph's tests assert the two agree across a log refetch: when the
+    /// header and the file list drifted apart, clicking a file asked
+    /// `CommitView` for a path the displayed commit never touched, which
+    /// silently opened an empty tab.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_tab_loaded_details_sha(&self) -> Option<SharedString> {
+        match &self.commit_tab.as_ref()?.details {
+            LoadState::Loaded(details) => Some(details.sha.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the Commit tab's changed-files load finished. False while it is
+    /// loading, when it failed, and when the tab is closed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_tab_diff_is_loaded(&self) -> bool {
+        self.commit_tab
+            .as_ref()
+            .is_some_and(|state| matches!(state.diff, LoadState::Loaded(_)))
+    }
+
     /// The sha whose details the Commit tab is showing, if it is showing a
     /// single commit rather than a multi-row selection summary.
     fn commit_tab_sha(&self) -> Option<Oid> {
@@ -1110,11 +1132,11 @@ impl GitPanel {
     /// The tree carries no left inset of its own: `ButtonLike`'s own 4px
     /// horizontal padding is the directory header's indent, which puts the file
     /// rows at `4 + COMMIT_TREE_INDENT` = 38px — the same left edge as the
-    /// Changes tab's depth-1 file rows and as the graph sidebar's file rows.
-    /// The headers themselves then sit 2px inside the Changes tab's 6px section
-    /// headers; closing that last 2px would mean either changing the shared row
-    /// renderer (which would move the graph's sidebar too) or a magic negative
-    /// margin, and the file rows are the edge the eye actually tracks.
+    /// Changes tab's depth-1 file rows, and as the graph sidebar's file rows
+    /// sat at before it was deleted. The headers themselves then sit 2px inside
+    /// the Changes tab's 6px section headers; closing that last 2px would mean
+    /// either changing the shared row renderer or a magic negative margin, and
+    /// the file rows are the edge the eye actually tracks.
     fn render_commit_file_tree(
         &self,
         state: &CommitTabState,
