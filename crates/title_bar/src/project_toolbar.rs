@@ -4,7 +4,10 @@ use gpui::{
 };
 use project::Project;
 use solutions_ui::project_tab_strip::ProjectTabStrip;
-use ui::{ContextMenu, IconPosition, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
+use ui::{
+    ContextMenu, Divider, DividerColor, IconPosition, PopoverMenu, PopoverMenuHandle, Tooltip,
+    prelude::*,
+};
 use workspace::{MultiWorkspace, Workspace, dock::PanelButtons};
 
 /// Sawe fork: a full-width toolbar row mounted by `Workspace` directly
@@ -372,12 +375,11 @@ impl Render for ProjectToolbar {
             .border_t_1()
             .border_b_1()
             .border_color(border_color)
+            // `pl_2` (8px) puts the first dock toggle at the same inset as the
+            // project panel's own header buttons directly below it. (It used to
+            // be followed by a 32px spacer that pushed the first project tab
+            // past the 40px vertical dock strip; that strip is gone.)
             .pl_2()
-            // Inset so the first project tab lines up with the left edge of
-            // the project panel below it (the activity strip + panel border).
-            // `pl_2` (8px) + 32px = 40px from the body's left, matching where
-            // the project tree content begins.
-            .child(div().w(px(32.)))
             .child(
                 h_flex().gap_1().children(
                     self.dock_buttons
@@ -385,6 +387,16 @@ impl Render for ProjectToolbar {
                         .cloned()
                         .map(IntoElement::into_any_element),
                 ),
+            )
+            // The one separator between the dock toggles and the project tabs;
+            // `PanelButtons` deliberately draws none of its own so the three
+            // per-dock groups read as a single group here.
+            .child(
+                div()
+                    .px_1p5()
+                    .h_full()
+                    .py_1()
+                    .child(Divider::vertical().color(DividerColor::Border)),
             )
             .when_some(project_tab_strip, |this, strip| this.child(strip))
             .child(div().flex_1())

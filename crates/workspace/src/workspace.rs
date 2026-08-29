@@ -50,7 +50,7 @@ use client::{
     proto::{self, ErrorCode, PanelId, PeerId},
 };
 use collections::{HashMap, HashSet, TypeIdHashMap, hash_map};
-use dock::{Dock, DockPosition, PanelButtons, PanelHandle, RESIZE_HANDLE_SIZE};
+use dock::{Dock, DockPosition, PanelHandle, RESIZE_HANDLE_SIZE};
 use fs::Fs;
 use futures::{
     Future, FutureExt, StreamExt,
@@ -172,27 +172,20 @@ use crate::{
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 
-/// Fixed width of the vertical dock toggle strips that flank the workspace
-/// (`render_left_dock_strip` / `render_right_dock_strip`). The strips sit
-/// outside the docks but inside `self.bounds`, so the horizontal dock-resize
-/// math must subtract this to keep the resize handle under the cursor.
-pub(crate) const DOCK_STRIP_WIDTH: Pixels = px(40.);
-
 /// New size for a dock while its resize handle is dragged to `pointer`
 /// (a window-relative position), given the workspace content `bounds`.
 ///
-/// The left/right docks are inset from `bounds` by [`DOCK_STRIP_WIDTH`]
-/// (the fixed toggle strips flank them), so that width is subtracted to keep
-/// the handle exactly under the cursor. The bottom dock has no strip below it,
-/// so its height is measured straight from `bounds.bottom()`.
+/// Every dock is flush with its edge of `bounds` — nothing is interposed
+/// between a dock and the window edge — so each size is measured straight
+/// from the corresponding edge and the handle stays exactly under the cursor.
 pub(crate) fn dock_resize_target_size(
     position: DockPosition,
     bounds: Bounds<Pixels>,
     pointer: Point<Pixels>,
 ) -> Pixels {
     match position {
-        DockPosition::Left => pointer.x - bounds.left() - DOCK_STRIP_WIDTH,
-        DockPosition::Right => bounds.right() - pointer.x - DOCK_STRIP_WIDTH,
+        DockPosition::Left => pointer.x - bounds.left(),
+        DockPosition::Right => bounds.right() - pointer.x,
         DockPosition::Bottom => bounds.bottom() - pointer.y,
     }
 }
@@ -1442,9 +1435,6 @@ pub struct Workspace {
     left_dock: Entity<Dock>,
     bottom_dock: Entity<Dock>,
     right_dock: Entity<Dock>,
-    left_dock_strip: Entity<PanelButtons>,
-    right_dock_strip: Entity<PanelButtons>,
-    bottom_dock_strip: Entity<PanelButtons>,
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
@@ -1859,12 +1849,6 @@ impl Workspace {
         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
-        // IDEA-style edge strips: vertical PanelButtons living on the workspace
-        // sides (rendered in `Workspace::render`) instead of as small icons in
-        // the status bar.
-        let left_dock_strip = cx.new(|cx| PanelButtons::new_vertical(left_dock.clone(), cx));
-        let bottom_dock_strip = cx.new(|cx| PanelButtons::new_vertical(bottom_dock.clone(), cx));
-        let right_dock_strip = cx.new(|cx| PanelButtons::new_vertical(right_dock.clone(), cx));
         let multi_workspace = window
             .root::<MultiWorkspace>()
             .flatten()
@@ -1961,9 +1945,6 @@ impl Workspace {
             left_dock,
             bottom_dock,
             right_dock,
-            left_dock_strip,
-            right_dock_strip,
-            bottom_dock_strip,
             _panels_task: None,
             project: project.clone(),
             follower_states: Default::default(),
@@ -8329,42 +8310,6 @@ impl Workspace {
             )
     }
 
-    /// Vertical IDEA-style strip pinned to the left edge of the workspace.
-    /// Hosts left-dock toggles at the top and bottom-dock toggles at the
-    /// bottom, separated by a flex spacer so they stick to opposite ends.
-    fn render_left_dock_strip(&self, cx: &mut App) -> Div {
-        let colors = cx.theme().colors();
-        v_flex()
-            .flex_none()
-            .w(DOCK_STRIP_WIDTH)
-            .h_full()
-            .px_1()
-            .py_2()
-            .gap_2()
-            .border_r_1()
-            .border_color(colors.border)
-            .bg(colors.status_bar_background)
-            .child(self.left_dock_strip.clone())
-            .child(div().flex_1())
-            .child(self.bottom_dock_strip.clone())
-    }
-
-    /// Vertical strip pinned to the right edge — hosts right-dock toggles.
-    fn render_right_dock_strip(&self, cx: &mut App) -> Div {
-        let colors = cx.theme().colors();
-        v_flex()
-            .flex_none()
-            .w(DOCK_STRIP_WIDTH)
-            .h_full()
-            .px_1()
-            .py_2()
-            .gap_2()
-            .border_l_1()
-            .border_color(colors.border)
-            .bg(colors.status_bar_background)
-            .child(self.right_dock_strip.clone())
-    }
-
     fn render_dock(
         &self,
         position: DockPosition,
@@ -9201,7 +9146,6 @@ impl Render for Workspace {
                                     .w_full()
                                     .overflow_hidden()
                                     .debug_selector(|| "dock-row".into())
-                                    .child(self.render_left_dock_strip(cx))
                                     .children(self.render_dock(
                                         DockPosition::Left,
                                         &self.left_dock,
@@ -9244,7 +9188,6 @@ impl Render for Workspace {
                                         window,
                                         cx,
                                     ))
-                                    .child(self.render_right_dock_strip(cx))
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
                                 let zoomed_view = view.upgrade()?;
@@ -11558,7 +11501,6 @@ mod tests {
                 "an unset kind still reads None even once other kinds are populated"
             );
         });
-
     }
 
     /// The "unavailable" flag the band's placeholder is gated on (phase 2b
@@ -11627,23 +11569,20 @@ mod tests {
             size: size(px(1000.), px(800.)),
         };
 
-        // For each dock the resize handle must land exactly under the cursor
-        // (the bug was a `DOCK_STRIP_WIDTH` gap between edge and cursor). The
-        // dock occupies the span from its inner edge to the strip-inset outer
-        // edge; the handle is at `outer_edge -/+ size`.
+        // For each dock the resize handle must land exactly under the cursor.
+        // Every dock is flush with its edge of `bounds` (the vertical toggle
+        // strips that used to inset the left/right docks by `DOCK_STRIP_WIDTH`
+        // are gone), so the handle is at `edge -/+ size` with no extra term —
+        // an inset left over from the strips would show up here as a gap.
         let left_pointer = point(px(300.), px(400.));
         let left_size = dock_resize_target_size(DockPosition::Left, bounds, left_pointer);
-        assert_eq!(bounds.left() + DOCK_STRIP_WIDTH + left_size, left_pointer.x);
+        assert_eq!(bounds.left() + left_size, left_pointer.x);
 
         let right_pointer = point(px(700.), px(400.));
         let right_size = dock_resize_target_size(DockPosition::Right, bounds, right_pointer);
-        assert_eq!(
-            bounds.right() - DOCK_STRIP_WIDTH - right_size,
-            right_pointer.x
-        );
+        assert_eq!(bounds.right() - right_size, right_pointer.x);
 
-        // The bottom dock has no strip beneath it, so its handle is measured
-        // straight from `bounds.bottom()`.
+        // The bottom dock is measured straight from `bounds.bottom()`.
         let bottom_pointer = point(px(400.), px(600.));
         let bottom_size = dock_resize_target_size(DockPosition::Bottom, bounds, bottom_pointer);
         assert_eq!(bounds.bottom() - bottom_size, bottom_pointer.y);

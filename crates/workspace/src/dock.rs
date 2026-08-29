@@ -17,10 +17,7 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
 use std::sync::Arc;
 use std::time::Duration;
-use ui::{
-    ContextMenu, CountBadge, Divider, DividerColor, IconButton, Tooltip, prelude::*,
-    right_click_menu,
-};
+use ui::{ContextMenu, CountBadge, IconButton, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
@@ -360,9 +357,11 @@ struct PanelEntry {
     _subscriptions: [Subscription; 3],
 }
 
+/// The toggle buttons for one dock's panels. Sawe renders three of these
+/// (one per dock) at the leading edge of the project toolbar; see
+/// `title_bar::ProjectToolbar`.
 pub struct PanelButtons {
     dock: Entity<Dock>,
-    vertical: bool,
     _settings_subscription: Subscription,
 }
 
@@ -1238,20 +1237,6 @@ impl PanelButtons {
         let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         Self {
             dock,
-            vertical: false,
-            _settings_subscription: settings_subscription,
-        }
-    }
-
-    /// Vertical layout used by the IDEA-style edge strips on the workspace.
-    /// Buttons render top-to-bottom with larger icons; no horizontal dividers
-    /// or right-side reversal.
-    pub fn new_vertical(dock: Entity<Dock>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&dock, |_, _, cx| cx.notify()).detach();
-        let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
-        Self {
-            dock,
-            vertical: true,
             _settings_subscription: settings_subscription,
         }
     }
@@ -1263,27 +1248,15 @@ impl Render for PanelButtons {
         let active_index = dock.active_panel_index;
         let is_open = dock.is_open;
         let dock_position = dock.position;
-        let vertical = self.vertical;
 
-        let (menu_anchor, menu_attach) = if vertical {
-            match dock.position {
-                // Right-strip menus pop out to the left of the button.
-                DockPosition::Right => (Anchor::TopRight, Anchor::TopLeft),
-                // Left-strip and bottom-on-left-strip menus pop out to the right.
-                DockPosition::Left | DockPosition::Bottom => (Anchor::TopLeft, Anchor::TopRight),
-            }
-        } else {
-            match dock.position {
-                DockPosition::Left => (Anchor::BottomLeft, Anchor::TopLeft),
-                DockPosition::Bottom | DockPosition::Right => {
-                    (Anchor::BottomRight, Anchor::TopRight)
-                }
-            }
-        };
+        // These buttons live in the project toolbar near the top of the
+        // window, so a menu drops *below* its button: the menu's top-left
+        // corner attaches to the button's bottom-left corner.
+        let (menu_anchor, menu_attach) = (Anchor::TopLeft, Anchor::BottomLeft);
 
         let dock_entity = self.dock.clone();
         let workspace = dock.workspace.clone();
-        let mut buttons: Vec<_> = dock
+        let buttons: Vec<_> = dock
             .panel_entries
             .iter()
             .enumerate()
@@ -1415,13 +1388,8 @@ impl Render for PanelButtons {
                         .trigger(move |is_active, _window, _cx| {
                             // Include active state in element ID to invalidate the cached
                             // tooltip when panel state changes (e.g., via keyboard shortcut)
-                            let icon_size = if vertical {
-                                IconSize::Custom(rems_from_px(24.))
-                            } else {
-                                IconSize::Small
-                            };
                             let button = IconButton::new((name, is_active_button as u64), icon)
-                                .icon_size(icon_size)
+                                .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
                                 .on_click({
                                     let action = action.boxed_clone();
@@ -1448,29 +1416,12 @@ impl Render for PanelButtons {
             })
             .collect();
 
-        if !vertical && dock_position == DockPosition::Right {
-            buttons.reverse();
-        }
-
-        let has_buttons = !buttons.is_empty();
-
-        if vertical {
-            return v_flex().gap_2().children(buttons).into_any_element();
-        }
-
-        h_flex()
-            .gap_1()
-            .when(
-                has_buttons
-                    && (dock.position == DockPosition::Bottom
-                        || dock.position == DockPosition::Right),
-                |this| this.child(Divider::vertical().color(DividerColor::Border)),
-            )
-            .children(buttons)
-            .when(has_buttons && dock.position == DockPosition::Left, |this| {
-                this.child(Divider::vertical().color(DividerColor::Border))
-            })
-            .into_any_element()
+        // No per-dock dividers or right-dock reversal: both existed to separate
+        // dock buttons from the other items of the status bar they used to sit
+        // in, and to mirror the right dock's buttons against the window's right
+        // edge. All three docks' buttons now sit together at the leading edge of
+        // the project toolbar, where the caller draws the one separator.
+        h_flex().gap_1().children(buttons).into_any_element()
     }
 }
 
