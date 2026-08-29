@@ -706,6 +706,11 @@
       "cmd-shift-s": "workspace::SaveAs",
       "cmd-shift-n": "workspace::NewWindow",
       "ctrl-`": "console_panel::ToggleFocus",
+      // Does not fire while any editor — including the dialog's own compose
+      // box — is focused (the broad `"Editor"` context keeps `ctrl-shift-a`
+      // bound to `editor::SelectToBeginningOfLine` there); click out of the
+      // editor first. Accepted per the phase-2b task-8 ruling.
+      "ctrl-shift-a": "console_panel::ToggleDialog",
       "cmd-1": ["workspace::ActivatePane", 0],
       "cmd-2": ["workspace::ActivatePane", 1],
       "cmd-3": ["workspace::ActivatePane", 2],

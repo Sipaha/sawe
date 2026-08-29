@@ -356,6 +356,16 @@ pub struct SolutionAgentStore {
     /// reaching into each other. Mirrored into `solution_band_state` rows so
     /// the band reopens the way the user left it.
     band_state: HashMap<SolutionId, BandState>,
+    /// The most recent non-`None` `active_dialog_session` per solution,
+    /// updated every time `set_active_dialog_session` is called with
+    /// `Some(..)`. NOT persisted — deliberately in-memory only (phase 2b
+    /// task 8 ruling: a second persisted column duplicating most of what
+    /// `active_dialog_session` already restores across a restart wasn't
+    /// worth the extra migration). Exists solely so `ctrl-shift-a`
+    /// (`toggle_dialog_session`) has something to re-open on when the band
+    /// is collapsed: `active_dialog_session` itself is `None` in that state
+    /// and remembers nothing about what was showing before the collapse.
+    last_dialog_session: HashMap<SolutionId, SolutionSessionId>,
     /// In-flight debounced `solution_band_state` writes, keyed by solution so
     /// a newer drag position replaces (and thereby cancels) the pending write
     /// for the same band. `on_drag_move` fires continuously for the whole
@@ -802,6 +812,7 @@ impl SolutionAgentStore {
             backoff_timers: HashMap::new(),
             raw_transcript_history: HashMap::new(),
             band_state: HashMap::new(),
+            last_dialog_session: HashMap::new(),
             band_state_writes: HashMap::new(),
             band_state_touched: HashMap::new(),
             band_states_hydrated: false,
@@ -1477,6 +1488,9 @@ impl SolutionAgentStore {
             .entry(solution_id)
             .or_default()
             .active_dialog_session = session_id;
+        if let Some(session_id) = session_id {
+            self.last_dialog_session.insert(solution_id, session_id);
+        }
         if !self.band_states_hydrated {
             self.band_state_touched
                 .entry(solution_id)
@@ -1486,6 +1500,52 @@ impl SolutionAgentStore {
         self.persist_band_state_now(solution_id, cx);
         cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged { solution_id });
         cx.notify();
+    }
+
+    /// `ctrl-shift-a` (`console_panel::ToggleDialog`) logic: if a session is
+    /// currently showing, collapse the band (`None`). Otherwise reopen on
+    /// `last_dialog_session` — the last session shown this run — falling
+    /// back to the first session in `tab_order` (`first_tab_order_session`)
+    /// when nothing is remembered (e.g. right after a restart), and doing
+    /// nothing at all when the solution has no sessions eligible to be the
+    /// active dialog. See `last_dialog_session`'s field doc for why the
+    /// reopen target is in-memory rather than persisted.
+    pub fn toggle_dialog_session(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
+        if self.active_dialog_session(solution_id).is_some() {
+            self.set_active_dialog_session(solution_id, None, cx);
+            return;
+        }
+        let reopen_target = self
+            .last_dialog_session
+            .get(&solution_id)
+            .copied()
+            .or_else(|| self.first_tab_order_session(solution_id, cx));
+        if let Some(session_id) = reopen_target {
+            self.set_active_dialog_session(solution_id, Some(session_id), cx);
+        }
+    }
+
+    /// The session with the lowest `tab_order` among `solution_id`'s
+    /// sessions eligible to be the active dialog (`can_be_active_dialog`),
+    /// i.e. the leftmost tab in `session_tab_strip`. Mirrors
+    /// `SessionTabStrip::candidates_for`'s filter + sort, minus the
+    /// rendering-only fields that helper also collects — kept as a
+    /// selection-only free query here rather than sharing `TabCandidate`
+    /// (private to `session_tab_strip`, and pulling a full tab-strip type
+    /// into the store for one field would invert the dependency this
+    /// module doc already explains `session_tab_strip` exists to avoid).
+    fn first_tab_order_session(&self, solution_id: SolutionId, cx: &App) -> Option<SolutionSessionId> {
+        self.sessions_for(&solution_id)
+            .iter()
+            .filter_map(|session| {
+                let session = session.read(cx);
+                if !session.can_be_active_dialog() {
+                    return None;
+                }
+                session.tab_order.map(|order| (order, session.id))
+            })
+            .min_by_key(|(order, _)| *order)
+            .map(|(_, id)| id)
     }
 
     /// Show or hide the band's utility (terminal) section for `solution_id`.

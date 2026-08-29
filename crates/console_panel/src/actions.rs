@@ -11,6 +11,26 @@ gpui::actions!(
         NewTerminal,
         /// Creates a new AI-chat session and shows it in the Solution band.
         NewChat,
+        /// Toggles the Solution band's dialog half (`ctrl-shift-a`).
+        /// Collapses it if a session is currently showing
+        /// (`SolutionAgentStore::set_active_dialog_session(solution_id, None,
+        /// …)`); if collapsed, reopens on
+        /// `SolutionAgentStore::last_dialog_session` (the last session shown
+        /// this run), falling back to the first session in `tab_order`, and
+        /// doing nothing if the solution has no sessions at all. See
+        /// `SolutionAgentStore::toggle_dialog_session` for the full
+        /// precedence and `handle_toggle_dialog` for the handler.
+        ///
+        /// Bound only in the `"Workspace"` keymap context, deliberately NOT
+        /// overriding the more specific `"Terminal"` context (`ctrl-shift-a`
+        /// already means `editor::SelectAll` there) or, on macOS, the broad
+        /// `"Editor"` context (`ctrl-shift-a` already means
+        /// `editor::SelectToBeginningOfLine` there). Consequence: on macOS
+        /// this hotkey does not fire while any editor — including the
+        /// dialog's own compose box — has focus; the user must click out of
+        /// it first. Accepted per the phase-2b task-8 ruling rather than
+        /// breaking `SelectToBeginningOfLine` for every macOS editor.
+        ToggleDialog,
     ]
 );
 

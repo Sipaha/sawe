@@ -6449,3 +6449,215 @@ async fn active_dialog_session_cleared_by_purge_session_hard(cx: &mut TestAppCon
         });
     });
 }
+
+/// Shared setup for the `toggle_dialog_session` tests below: a solution with
+/// a registered mock agent, ready to `create_session` against. Returns the
+/// tempdir too (same contract as `setup_solution_and_project`) — callers
+/// must hold it in scope (`_tmp`) for the test body's lifetime, since
+/// `create_solution` writes into it.
+async fn setup_toggle_dialog_fixture(
+    cx: &mut TestAppContext,
+) -> (
+    SolutionId,
+    tempfile::TempDir,
+    SharedString,
+    gpui::Entity<project::Project>,
+) {
+    let (solution_id, tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::new(connect_count.clone())),
+            );
+        });
+    });
+    (solution_id, tmp, agent_id, project)
+}
+
+/// `console_panel::ToggleDialog`'s (`ctrl-shift-a`) simplest branch: a
+/// session is showing, so toggling collapses the band.
+#[gpui::test]
+async fn toggle_dialog_session_collapses_when_showing(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, agent_id, project) = setup_toggle_dialog_fixture(cx).await;
+
+    let session_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, Some(session_id), cx)
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.toggle_dialog_session(solution_id, cx));
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                None,
+                "toggling while a session is showing collapses the band"
+            );
+        });
+    });
+}
+
+/// Collapsed band, with a remembered `last_dialog_session`: toggling must
+/// reopen on that session, NOT on the first session in `tab_order` — the two
+/// differ here on purpose (`session_a` is tab_order 0, `session_b` is the
+/// one last shown) so a wrong precedence (falling straight to the tab_order
+/// fallback) is caught.
+#[gpui::test]
+async fn toggle_dialog_session_reopens_last_remembered_when_collapsed(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, agent_id, project) = setup_toggle_dialog_fixture(cx).await;
+
+    let session_a = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session a");
+    let session_b = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session b");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, Some(session_b), cx)
+        });
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, None, cx)
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.toggle_dialog_session(solution_id, cx));
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                Some(session_b),
+                "reopens on the last-remembered session"
+            );
+            assert_ne!(
+                store.active_dialog_session(solution_id),
+                Some(session_a),
+                "must not fall through to the tab_order fallback when something is remembered"
+            );
+        });
+    });
+}
+
+/// Collapsed band, nothing remembered (e.g. right after a restart, before
+/// any dialog was shown this run), but the solution has open tabs: toggling
+/// must fall back to the first session in `tab_order`.
+#[gpui::test]
+async fn toggle_dialog_session_falls_back_to_first_tab_order_when_nothing_remembered(
+    cx: &mut TestAppContext,
+) {
+    let (solution_id, _tmp, agent_id, project) = setup_toggle_dialog_fixture(cx).await;
+
+    let session_a = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session a");
+    let _session_b = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session b");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                None,
+                "sanity: nothing showing yet"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.toggle_dialog_session(solution_id, cx));
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                Some(session_a),
+                "falls back to the first session in tab_order (creation order here)"
+            );
+        });
+    });
+}
+
+/// Collapsed band, no sessions at all in the solution: toggling must be a
+/// pure no-op (no panic, selection stays `None`).
+#[gpui::test]
+async fn toggle_dialog_session_is_noop_with_no_sessions(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, _agent_id, _project) = setup_toggle_dialog_fixture(cx).await;
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.toggle_dialog_session(solution_id, cx));
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                None,
+                "no sessions to reopen on: toggling does nothing"
+            );
+        });
+    });
+}

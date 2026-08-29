@@ -657,6 +657,9 @@
       "shift-new": "workspace::NewWindow",
       "ctrl-shift-n": "file_finder::Toggle",
       "ctrl-`": "console_panel::ToggleFocus",
+      // Does not fire while the terminal is focused (`"Terminal"` context
+      // keeps `ctrl-shift-a` bound to `editor::SelectAll` there).
+      "ctrl-shift-a": "console_panel::ToggleDialog",
       "f10": ["app_menu::OpenApplicationMenu", "Zed"],
       "alt-1": ["workspace::ActivatePane", 0],
       "alt-2": ["workspace::ActivatePane", 1],

@@ -23,7 +23,7 @@ use solution_agent::solution_band::SolutionBand;
 use solution_agent::store::SolutionAgentStore;
 use workspace::{UtilityKind, Workspace};
 
-pub use actions::{NewChat, NewTerminal, ShowSession, ToggleFocus};
+pub use actions::{NewChat, NewTerminal, ShowSession, ToggleDialog, ToggleFocus};
 pub use panel::{ConsolePanel, ConsoleTab, console_panel_for_workspace};
 pub use terminal_provider::TerminalProvider;
 
@@ -43,6 +43,7 @@ pub fn init(cx: &mut gpui::App) {
         workspace.register_action(handle_new_chat);
         workspace.register_action(handle_toggle_focus);
         workspace.register_action(handle_show_session);
+        workspace.register_action(handle_toggle_dialog);
         workspace.register_action(ConsolePanel::handle_new_terminal);
     })
     .detach();
@@ -178,5 +179,27 @@ fn handle_show_session(
     }
     SolutionAgentStore::global(cx).update(cx, |store, cx| {
         store.set_active_dialog_session(solution_id, Some(session_id), cx);
+    });
+}
+
+/// `ToggleDialog` (`ctrl-shift-a`) handler. Resolves the workspace's active
+/// solution straight off `workspace` (same double-lease-avoidance reasoning
+/// as `handle_new_chat` — this runs inside `workspace.register_action`, so
+/// re-acquiring the `Workspace` entity through a weak handle would panic)
+/// and delegates the actual collapse/reopen decision to
+/// `SolutionAgentStore::toggle_dialog_session`, which owns the precedence
+/// (`last_dialog_session` → first `tab_order` session → no-op). A no-op
+/// when the workspace has no active solution.
+fn handle_toggle_dialog(
+    workspace: &mut Workspace,
+    _: &ToggleDialog,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(solution_id) = panel::active_solution_id_for_workspace(workspace, cx) else {
+        return;
+    };
+    SolutionAgentStore::global(cx).update(cx, |store, cx| {
+        store.toggle_dialog_session(solution_id, cx);
     });
 }
