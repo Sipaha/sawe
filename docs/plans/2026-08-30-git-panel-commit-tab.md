@@ -80,6 +80,25 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
 38. Graph geometry in a compact band: columns are fractions `0.74 / 0.13 / 0.13` (`git_graph.rs:2202-2219`) with **no horizontal scroll and no table min-width**; the graph overlay reserves at least `LEFT_PADDING(8) + LANE_WIDTH(16) * MIN_GRAPH_LANES(4) = 72px` of the Description column because the floor beats the 0.4 cap (`canvas_geometry.rs:60-84`). The sidebar's `min_w(px(300.))` is the only min-width in the view and it is what goes away. Retuning the fractions is **out of scope** for this plan; so is `log_toolbar.rs`.
 39. There are **no `GitGraphPanel` tests at all**; the band-slot tests use a `BandProbe` stub (`crates/workspace/src/workspace.rs:11447-11540`). All `git_ui` and `git_graph` tests are inline `#[cfg(test)] mod tests` — there is no `crates/git_ui/tests/` directory.
 
+### Corrections established while executing Task 1 (authoritative; supersede facts 11 and 34 where they differ)
+
+40. **`commit_identity_source` does not stand alone.** It depends on three private helpers fact 11 omitted — `escape_markdown_inline`, `format_detail_timestamp`, `detail_timestamp_format`. All three are used only by that chain and moved with it (private in `commit_tab.rs`). Verified byte-identical by the task review.
+41. **`git_ui` cannot read `ProjectPanelSettings`** — `crates/project_panel/Cargo.toml:26` has `git_ui.workspace = true`, so the reverse dependency is a cycle. `ChangedFileEntry::render` therefore takes `indent: Pixels` as a parameter; `git_graph` computes the byte-identical `px(18.0 + ProjectPanelSettings::get_global(cx).indent_size)` at the top of the same `uniform_list` render closure. The hoist out of the per-row loop is **not** observable (same `cx`, same paint, nothing takes `&mut App` in between) — confirmed by review.
+42. **The row renderers are hosted through a closure bundle, not generics:**
+    ```rust
+    pub struct ChangedFileRowHandlers {
+        pub select_file: Rc<dyn Fn(&RepoPath, &mut Window, &mut App)>,
+        pub deploy_file_context_menu: Rc<dyn Fn(&RepoPath, Point<Pixels>, &mut Window, &mut App)>,
+        pub toggle_directory: Rc<dyn Fn(&SharedString, &mut Window, &mut App)>,
+    }
+    ```
+    Each closure captures the host's `WeakEntity` and ends in `.ok()` — which is not new, it moved verbatim from the graph's own closures. No reference cycle; the `Rc`s drop with the frame.
+43. **`commit_tab.rs` opens with `use super::*`** (the `changes_list.rs:28` precedent), which inherits `git_panel.rs:29`'s `use git::status::{DiffStat, StageStatus}`. So inside that module **bare `DiffStat` already resolves to the DATA type**. The +/− component must be written `ui::DiffStat::new(...)`, fully qualified, exactly as `git_panel.rs:4710` does.
+44. **`ChangedFileEntry::render`'s `commit_sha` must be the FULL sha**, not `short_sha()` — it forwards straight to `CommitView::open_file_diff`. The graph passes `full_sha` (`git_graph.rs:3394`, `:3567`). A short sha compiles fine and opens an empty or wrong centre-pane tab.
+45. **Indent numbers, measured.** The graph's commit file row is `px(18.0 + indent_size)` = **38px** at the shipped default (`assets/settings/default.json:793`, `indent_size: 20`). The Changes tab's rows use `content_row_padding(depth)` = `px(ROW_LEFT_PADDING(6) + SECTION_CONTENT_INDENT(16) + depth * TREE_INDENT(16))` (`changes_list.rs:46`, constants `git_panel.rs:352-362`) = 22px at depth 0, 38px at depth 1. A bare `px(TREE_INDENT)` would be **16px — a 22px regression** against what ships today. Also note `render_changed_directory_row` gives its directory header **no** left padding at all (`commit_tab.rs:241`, plus the list's `.ml_neg_1()`), while a Changes-tab section header sits at 6px, so no file-row constant alone aligns the two trees.
+46. **The `Rc<dyn Fn>` bundle erases the host entity, so a `GitPanel` double-lease is not a compile error.** In the graph this never bites because the tree is not rendered from inside the host's own `update`; the Commit tab **is** rendered under a live `Context<GitPanel>` lease. **Binding rule:** these closures may only be installed into event callbacks. Never invoke one during `request_layout` / `prepaint` / `paint`, and build the bundle from `cx.weak_entity()` at the top of render, never inside a nested `update`. A wrongly-shaped unit test drawing through `VisualTestContext` will not catch this; the editor panics the first time a user opens the tab.
+47. **Deleting the sidebar in Task 4 removes the only `ProjectPanelSettings::get_global` caller in `git_graph`** (`git_graph.rs:3590`), so that import goes with it.
+
 ---
 
 ## Rulings made up front (binding; a reviewer judges against these)
@@ -141,12 +160,12 @@ pub struct ChangedFileRow  { /* preserve */ }
 pub fn build_changed_file_rows(/* preserve */) -> Vec<ChangedFileRow>;
 ```
 
-- [ ] Create `crates/git_ui/src/git_panel/commit_tab.rs` and declare it from `git_panel.rs` beside `changes_list.rs`. Move `split_commit_message`, `commit_identity_source`, `compute_diff_stats`, `detail_text_style`, `ChangedFileEntry`, `ChangedFileRow`, `build_changed_file_rows` and `render_changed_directory_row` from `git_graph.rs` (fact 11), keeping signatures and bodies intact wherever the borrow types allow.
-- [ ] `ChangedFileEntry::render` and `render_changed_directory_row` are typed against `Context<GitGraph>` today. Make them generic over the hosting view (`cx: &mut Context<V>` plus explicit callbacks) or take plain `&mut App` + closures — whichever keeps the graph's call sites compiling **unchanged in behaviour**. Do not change what they paint.
-- [ ] `git_graph.rs` re-imports them from `git_ui::git_panel::commit_tab::*` and deletes its local copies. The sidebar must look and behave **identically** after this task.
-- [ ] Move the four tests too: `test_split_commit_message`, `test_commit_identity_source`, `test_build_changed_file_rows_groups_by_directory`, plus helpers `changed_file_entry` / `describe_changed_file_row` (fact 11). They now live in `commit_tab.rs`'s test module.
-- [ ] Watch the `DiffStat` name collision (fact 34): in the new module spell the component `ui::DiffStat` and the data type `git::status::DiffStat`, always qualified.
-- [ ] Gate: `set -o pipefail; cargo check -p git_ui -p git_graph --all-targets`; `cargo test -p git_ui -p git_graph`.
+- [x] Create `crates/git_ui/src/git_panel/commit_tab.rs` and declare it from `git_panel.rs` beside `changes_list.rs`. Move `split_commit_message`, `commit_identity_source`, `compute_diff_stats`, `detail_text_style`, `ChangedFileEntry`, `ChangedFileRow`, `build_changed_file_rows` and `render_changed_directory_row` from `git_graph.rs` (fact 11), keeping signatures and bodies intact wherever the borrow types allow.
+- [x] `ChangedFileEntry::render` and `render_changed_directory_row` are typed against `Context<GitGraph>` today. Make them generic over the hosting view (`cx: &mut Context<V>` plus explicit callbacks) or take plain `&mut App` + closures — whichever keeps the graph's call sites compiling **unchanged in behaviour**. Do not change what they paint.
+- [x] `git_graph.rs` re-imports them from `git_ui::git_panel::commit_tab::*` and deletes its local copies. The sidebar must look and behave **identically** after this task.
+- [x] Move the three tests too: `test_split_commit_message`, `test_commit_identity_source`, `test_build_changed_file_rows_groups_by_directory`, plus helpers `changed_file_entry` / `describe_changed_file_row` (fact 11). They now live in `commit_tab.rs`'s test module.
+- [x] Watch the `DiffStat` name collision (fact 34): in the new module spell the component `ui::DiffStat` and the data type `git::status::DiffStat`, always qualified.
+- [x] Gate: `set -o pipefail; cargo check -p git_ui -p git_graph --all-targets`; `cargo test -p git_ui -p git_graph`.
 
 ### Task 2: Add the Commit tab, opened programmatically
 
@@ -180,6 +199,7 @@ pub enum Event { Focus, CommitTabClosed }   // extends git_panel.rs:417-420
 - [ ] `close_commit_tab` clears the state, returns `active_tab` to `Changes`, and **emits `Event::CommitTabClosed`**.
 - [ ] `render_tab_bar` (`:5284-5350`) renders the Commit tab **only while it is open**, with a hand-built ✕ (fact 20) whose click calls `close_commit_tab`. Changes keeps its `changes_count` badge; Commit passes `show_changes = false`.
 - [ ] Commit tab body, in spec §5's order: the full message (subject + body, Markdown-rendered via the relocated `detail_text_style`), a `short hash · author · date` row (`CommitAvatar`, `short_sha()`, `time_format`), a header carrying the file count and `ui::DiffStat::new(id, added, removed)` from `compute_diff_stats`, then the changed-files tree. Single click selects a file; **double click** calls `CommitView::open_file_diff(sha, repo, workspace, path, window, cx)` (fact 30). Multi-sha selection renders only a centred "N commits selected" label.
+- [ ] Indent: introduce a documented `COMMIT_TREE_INDENT` in `commit_tab.rs` valued `18.0 + TREE_INDENT` (34px) rather than a bare `TREE_INDENT`, per fact 45 — 16px would be a visible regression once Task 4 deletes the sidebar. Decide the directory-header padding question explicitly and say what you chose.
 - [ ] Explicit loading and error states — a commit whose diff fails to load must say so, not render an empty file list.
 - [ ] Add `git_panel::ActivateCommitTab` beside `ActivateChangesTab` (`:120-123`), with a handler that is a **no-op when the tab is not open**, and register it at `:6577-6578`.
 - [ ] Preserve `SHOW_PRE_COMMIT_SECTION`'s `false` gate verbatim while restructuring the `match self.active_tab` arms (fact 35).
@@ -246,4 +266,5 @@ impl GitGraph {
 - [ ] Full gates: `cargo test -p git_ui -p git_graph -p zed -p workspace`; `cargo fmt --all --check`; `./script/clippy -p git_ui -p git_graph` with the honest reading from fact 36 — zero findings naming code this plan wrote or moved.
 - [ ] `FORK.md`: a numbered decision entry for phase 3 (what moved, why the graph→panel/panel→graph split, what was dropped and where it still lives), touched-files rows for `crates/git_ui/src/git_panel/commit_tab.rs` and any first-time-modified upstream file, and an amendment to #55 noting that its three-trees extraction trigger has now fired and is deferred.
 - [ ] `docs/INDEX.md`: mark this plan complete in the plans table with its commit chain.
+- [ ] Narrow `ChangedFileEntry`'s field visibility (`commit_tab.rs:42-47`) to what the final consumers actually read — only `repo_path` is read cross-module today (`git_graph.rs:3609`); the other three are `pub` for no reader.
 - [ ] Tick every checkbox in this document and record the deferred items: the `affected_files`/commit-tree extraction (FORK.md #55), the two defects in fact 37, and the graph's column fractions in a compact band (fact 38).
