@@ -193,6 +193,41 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
 
 ---
 
+### Corrections established while executing Task 4
+
+57. **Fact 12 is WRONG about `get_remote`.** It claimed `deploy_commit_context_menu`
+    also used it. It did not: `get_remote`'s only two callers were both inside the
+    deleted sidebar (`deploy_commit_detail_context_menu`'s permalink and the
+    sidebar avatar), so it was deleted with them, along with the `GitRemote` /
+    `BuildCommitPermalinkParams` / `ParsedGitRemote` imports it pulled in. The
+    review confirmed `deploy_commit_context_menu` and
+    `deploy_multi_commit_context_menu` are **byte-identical** across the commit
+    and resolve their provider inline (`default_remote_url` →
+    `GitHostingProviderRegistry::default_global` → `parse_git_remote_url`), so no
+    permalink entry broke. `git_ui`'s `commit_tab::commit_remote` is the live
+    implementation (fact 52).
+58. **Fact 10 misses `changed_file_row_handlers`** — added by Task 1, its only
+    caller was `render_commit_detail_panel`, so it died with the sidebar.
+59. **`render_chip`'s `truncate` parameter now has one caller that always passes
+    `true`.** The `false` caller was the sidebar's `flex_wrap()` ref-chip row. The
+    parameter was left in place (no drive-by refactors) but its doc comment still
+    explains the flag through a wrapping-row scenario that no longer exists in
+    the file — Task 6 fixes the comment.
+60. **`select_entry` lost an incidental early return.** The old body bailed on an
+    unresolvable repository *before* `cx.emit(ItemEvent::Edit); cx.notify();`; the
+    rewrite bails only on `target_sha.is_none()`, so that case now emits and
+    notifies where it previously did neither. Judged a latent-bug fix — the
+    selection genuinely did change and should re-serialize — but it is untested
+    and was not in the commit message.
+61. **Deliberately accepted losses from the sidebar's context menu.** It offered
+    Copy SHA / Copy Message / Copy Author Email / Copy Web URL / `markdown::Copy`.
+    Copy SHA and Copy Web URL survive in the graph's row menu; message
+    selection-copy survives as `ctrl-c` → `markdown::Copy` in the Commit tab.
+    **"Copy Author Email" has no equivalent anywhere and "Copy Message" degrades
+    to "Copy Subject"** — accepted, because a message-block context menu on the
+    Commit tab is new scope beyond spec §5. Recorded in the deferred backlog, not
+    a Task 6 decision round.
+
 ---
 
 ## Rulings made up front (binding; a reviewer judges against these)
@@ -329,13 +364,13 @@ impl GitGraph {
 
 **Interfaces produced:** none — this is a deletion.
 
-- [ ] Delete the state, types, constants and methods enumerated in facts 8, 9 and 10, and the `render` block at `:4686-4698` including its drag listeners.
-- [ ] Delete the two async loads inside `select_entry` (`:2986-3067`) and the cleanup lines in `clear_selection` / `select_entry`. **Keep** everything in fact 12 — `get_remote`, `render_chip`, `is_head_ref`, every `fetch_commit_data` call, and `CommitView::open` behind `open_commit_view`.
-- [ ] Delete `CommitBranches` / `MAX_LISTED_BRANCHES` / `format_branches_containing` / `BRANCHES_CONTAINING_DEBOUNCE` and the test `test_format_branches_containing` (`:8479`) — the "In N branches" line is dropped per the rulings.
-- [ ] Sweep the imports that fact 13 lists as newly unused. Let `cargo check` name them rather than guessing; **do not** blanket-`#[allow(unused_imports)]`.
-- [ ] Delete `test_detail_split_state_is_sized_in_pixels` (`:8310`) and `test_commit_detail_text_entities_are_cached_per_commit` (`:8361`). **Rewrite** `test_commit_details_survive_external_commit` (`:8210`) against the Commit tab — its invariant (a commit's details stay paired with its sha across a refetch) has moved, not disappeared. Keep every selection test (fact: `:8555`, `:8616`, `:8634`, `:8661`, `:8710`, `:8736`, `:8765`).
-- [ ] Leave the two pre-existing defects in fact 37 alone; they are recorded in this plan and go to the backlog.
-- [ ] Gate: `set -o pipefail; cargo check -p git_ui -p git_graph --all-targets`; `cargo test -p git_graph`.
+- [x] Delete the state, types, constants and methods enumerated in facts 8, 9 and 10, and the `render` block at `:4686-4698` including its drag listeners.
+- [x] Delete the two async loads inside `select_entry` (`:2986-3067`) and the cleanup lines in `clear_selection` / `select_entry`. **Keep** everything in fact 12 — `get_remote`, `render_chip`, `is_head_ref`, every `fetch_commit_data` call, and `CommitView::open` behind `open_commit_view`.
+- [x] Delete `CommitBranches` / `MAX_LISTED_BRANCHES` / `format_branches_containing` / `BRANCHES_CONTAINING_DEBOUNCE` and the test `test_format_branches_containing` (`:8479`) — the "In N branches" line is dropped per the rulings.
+- [x] Sweep the imports that fact 13 lists as newly unused. Let `cargo check` name them rather than guessing; **do not** blanket-`#[allow(unused_imports)]`.
+- [x] Delete `test_detail_split_state_is_sized_in_pixels` (`:8310`) and `test_commit_detail_text_entities_are_cached_per_commit` (`:8361`). **Rewrite** `test_commit_details_survive_external_commit` (`:8210`) against the Commit tab — its invariant (a commit's details stay paired with its sha across a refetch) has moved, not disappeared. Keep every selection test (fact: `:8555`, `:8616`, `:8634`, `:8661`, `:8710`, `:8736`, `:8765`).
+- [x] Leave the two pre-existing defects in fact 37 alone; they are recorded in this plan and go to the backlog.
+- [x] Gate: `set -o pipefail; cargo check -p git_ui -p git_graph --all-targets`; `cargo test -p git_graph`.
 
 ### Task 5: Delete the History tab
 
@@ -361,5 +396,6 @@ impl GitGraph {
 - [ ] Full gates: `cargo test -p git_ui -p git_graph -p zed -p workspace`; `cargo fmt --all --check`; `./script/clippy -p git_ui -p git_graph` with the honest reading from fact 36 — zero findings naming code this plan wrote or moved.
 - [ ] `FORK.md`: a numbered decision entry for phase 3 (what moved, why the graph→panel/panel→graph split, what was dropped and where it still lives), touched-files rows for `crates/git_ui/src/git_panel/commit_tab.rs` and any first-time-modified upstream file, and an amendment to #55 noting that its three-trees extraction trigger has now fired and is deferred.
 - [ ] `docs/INDEX.md`: mark this plan complete in the plans table with its commit chain.
-- [ ] Narrow `ChangedFileEntry`'s field visibility (`commit_tab.rs:42-47`) to what the final consumers actually read — only `repo_path` is read cross-module today (`git_graph.rs:3609`); the other three are `pub` for no reader.
+- [ ] **Visibility sweep — bigger than originally scoped.** Task 1 made `commit_tab` a `pub mod` with ~10 `pub` items (`ChangedFileRowHandlers`, `ChangedFileEntry` + `from_commit_file`/`render`, `ChangedFileRow`, `build_changed_file_rows`, `render_changed_directory_row`, `split_commit_message`, `commit_identity_source`, `detail_text_style`, `compute_diff_stats`) *solely* so `git_graph` could import them. After Task 4 nothing outside `crates/git_ui/src/git_panel/` names `commit_tab::` at all — and `pub` inside a `pub mod` raises no `dead_code` warning, so this will never surface on its own. Take it back to `mod commit_tab` plus a `pub` → `pub(super)`/private pass; `git_panel.rs`'s `pub use commit_tab::{CommitSelection, CommitSelectionSource};` is the only export any other crate still needs. Include `ChangedFileEntry`'s three reader-less `pub` fields and `GitGraph::selected_commit_shas`.
+- [ ] Fix `render_chip`'s doc comment, which still explains its `truncate` flag through the wrapping ref-chip row that died with the sidebar (fact 59).
 - [ ] Tick every checkbox in this document and record the deferred items: the `affected_files`/commit-tree extraction (FORK.md #55), the two defects in fact 37, and the graph's column fractions in a compact band (fact 38).
