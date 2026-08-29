@@ -101,6 +101,48 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
 
 ---
 
+### Corrections established while executing Task 2 (authoritative)
+
+48. **The Commit tab is one field, not a spray of them.** `CommitSelection`,
+    `CommitTabState`, `LoadState` and the render live in `commit_tab.rs`;
+    `git_panel.rs` holds `commit_tab: Option<CommitTabState>` and re-exports
+    `pub use commit_tab::CommitSelection;`, so the path the Task-2 interface
+    block names (`git_ui::git_panel::CommitSelection`) resolves. `Some` *is*
+    the tab's presence in the tab bar — `commit_tab_is_open()` is `is_some()`,
+    so "open" and "has something to show" cannot drift apart.
+49. **Neither `show_commit_selection` nor `close_commit_tab` touches focus.**
+    Task 3 pushes from the graph mid-click / mid-arrow-key, and focusing the
+    panel there would kill the graph's own keyboard navigation. Only the
+    user-driven routes (the tab-bar row, `git_panel::ActivateCommitTab`) go
+    through `set_active_tab`, which does focus. If Task 3 wants the panel
+    focused on a graph selection it has to ask for that explicitly.
+50. **`set_active_tab` refuses `GitPanelTab::Commit` while the tab is closed**,
+    and that guard is load-bearing for the ✕: the close button is nested inside
+    the tab row's own `on_click`, so the row's `set_active_tab(Commit)` fires
+    too — and no-ops, because `close_commit_tab` already took the state. No
+    `stop_propagation` dance was needed.
+51. **`close_commit_tab` emits `Event::CommitTabClosed` only when a tab was
+    actually open** (early return on `take().is_none()`). A redundant close is
+    already silent, so Task 3's feedback-loop guard has one less case.
+52. **The loads go through `selection.repository`** (`Repository::show` /
+    `Repository::load_commit_diff`), *not* `GitPanel::load_commit_details`,
+    which resolves against `active_repository` and would contradict the "the
+    push carries the repository" ruling. The avatar's provider likewise comes
+    from `commit_tab::commit_remote(&selection.repository, cx)`, not
+    `GitPanel::git_remote` — so **Task 5's `git_remote` grep is unchanged: it
+    still has no caller outside History.**
+53. **Indent, as shipped.** `COMMIT_TREE_INDENT = 18.0 + TREE_INDENT` (34px)
+    and **no container inset**: `ButtonLike`'s own 4px horizontal padding is the
+    directory header's indent, which lands the file rows at 38px — the same
+    left edge as the Changes tab's depth-1 rows *and* as the graph sidebar's
+    file rows. The graph's `.ml_neg_1()` is deliberately not carried over. The
+    headers then sit 2px inside the Changes tab's 6px section headers; closing
+    that last 2px would mean either editing the shared `render_changed_directory_row`
+    (which would move the graph's still-live sidebar too) or a magic negative
+    margin, and the file rows are the edge the eye tracks.
+
+---
+
 ## Rulings made up front (binding; a reviewer judges against these)
 
 - **Graph → panel is a direct typed call; panel → graph is a GPUI event.** The graph already looks the panel up (fact 2) and may name `git_ui` types; `git_ui` may not name `git_graph` types (fact 1). So `GitGraph` calls `GitPanel::show_commit_selection(...)` / `close_commit_tab(...)`, and `GitPanel` extends its existing `pub enum Event` with `CommitTabClosed`, which `GitGraph` subscribes to in `GitGraph::new` (re-installed automatically because `GitGraphPanel` rebuilds the graph on repo switch, fact 4). *Rules out:* the string-named-action IoC trick and any new registry — neither is needed here, and both are harder to test. *Cost if wrong:* the graph gains a compile-time reference to the panel's API, which it already has.
@@ -194,17 +236,17 @@ impl GitPanel {
 pub enum Event { Focus, CommitTabClosed }   // extends git_panel.rs:417-420
 ```
 
-- [ ] Add the `Commit` variant plus the Commit tab's state (selection, loaded `CommitDetails`, loaded `CommitDiff` + its computed totals, the file tree's `collapsed_dirs` / scroll handle / selected file, and the load tasks). Reuse the existing `_repo_subscriptions` field (fact 26) rather than adding another.
-- [ ] `show_commit_selection` stores the selection, activates the tab, and — for a single sha — kicks off `load_commit_details` (fact 28) and `repository.load_commit_diff` (fact 29). **Guard both against stale responses by comparing the sha on completion**, exactly as `git_graph.rs:3011-3016` does. For a multi-sha selection it loads nothing.
-- [ ] `close_commit_tab` clears the state, returns `active_tab` to `Changes`, and **emits `Event::CommitTabClosed`**.
-- [ ] `render_tab_bar` (`:5284-5350`) renders the Commit tab **only while it is open**, with a hand-built ✕ (fact 20) whose click calls `close_commit_tab`. Changes keeps its `changes_count` badge; Commit passes `show_changes = false`.
-- [ ] Commit tab body, in spec §5's order: the full message (subject + body, Markdown-rendered via the relocated `detail_text_style`), a `short hash · author · date` row (`CommitAvatar`, `short_sha()`, `time_format`), a header carrying the file count and `ui::DiffStat::new(id, added, removed)` from `compute_diff_stats`, then the changed-files tree. Single click selects a file; **double click** calls `CommitView::open_file_diff(sha, repo, workspace, path, window, cx)` (fact 30). Multi-sha selection renders only a centred "N commits selected" label.
-- [ ] Indent: introduce a documented `COMMIT_TREE_INDENT` in `commit_tab.rs` valued `18.0 + TREE_INDENT` (34px) rather than a bare `TREE_INDENT`, per fact 45 — 16px would be a visible regression once Task 4 deletes the sidebar. Decide the directory-header padding question explicitly and say what you chose.
-- [ ] Explicit loading and error states — a commit whose diff fails to load must say so, not render an empty file list.
-- [ ] Add `git_panel::ActivateCommitTab` beside `ActivateChangesTab` (`:120-123`), with a handler that is a **no-op when the tab is not open**, and register it at `:6577-6578`.
-- [ ] Preserve `SHOW_PRE_COMMIT_SECTION`'s `false` gate verbatim while restructuring the `match self.active_tab` arms (fact 35).
-- [ ] Tests: `show_commit_selection` with one sha activates the Commit tab and `commit_tab_is_open()`; with three shas renders the count summary; `close_commit_tab` returns to Changes, emits `CommitTabClosed`, and leaves `commit_tab_is_open()` false; `ActivateCommitTab` while closed does nothing.
-- [ ] Gate: `set -o pipefail; cargo check -p git_ui --all-targets`; `cargo test -p git_ui`.
+- [x] Add the `Commit` variant plus the Commit tab's state (selection, loaded `CommitDetails`, loaded `CommitDiff` + its computed totals, the file tree's `collapsed_dirs` / scroll handle / selected file, and the load tasks). Reuse the existing `_repo_subscriptions` field (fact 26) rather than adding another.
+- [x] `show_commit_selection` stores the selection, activates the tab, and — for a single sha — kicks off `load_commit_details` (fact 28) and `repository.load_commit_diff` (fact 29). **Guard both against stale responses by comparing the sha on completion**, exactly as `git_graph.rs:3011-3016` does. For a multi-sha selection it loads nothing.
+- [x] `close_commit_tab` clears the state, returns `active_tab` to `Changes`, and **emits `Event::CommitTabClosed`**.
+- [x] `render_tab_bar` (`:5284-5350`) renders the Commit tab **only while it is open**, with a hand-built ✕ (fact 20) whose click calls `close_commit_tab`. Changes keeps its `changes_count` badge; Commit passes `show_changes = false`.
+- [x] Commit tab body, in spec §5's order: the full message (subject + body, Markdown-rendered via the relocated `detail_text_style`), a `short hash · author · date` row (`CommitAvatar`, `short_sha()`, `time_format`), a header carrying the file count and `ui::DiffStat::new(id, added, removed)` from `compute_diff_stats`, then the changed-files tree. Single click selects a file; **double click** calls `CommitView::open_file_diff(sha, repo, workspace, path, window, cx)` (fact 30). Multi-sha selection renders only a centred "N commits selected" label.
+- [x] Indent: introduce a documented `COMMIT_TREE_INDENT` in `commit_tab.rs` valued `18.0 + TREE_INDENT` (34px) rather than a bare `TREE_INDENT`, per fact 45 — 16px would be a visible regression once Task 4 deletes the sidebar. Decide the directory-header padding question explicitly and say what you chose.
+- [x] Explicit loading and error states — a commit whose diff fails to load must say so, not render an empty file list.
+- [x] Add `git_panel::ActivateCommitTab` beside `ActivateChangesTab` (`:120-123`), with a handler that is a **no-op when the tab is not open**, and register it at `:6577-6578`.
+- [x] Preserve `SHOW_PRE_COMMIT_SECTION`'s `false` gate verbatim while restructuring the `match self.active_tab` arms (fact 35).
+- [x] Tests: `show_commit_selection` with one sha activates the Commit tab and `commit_tab_is_open()`; with three shas renders the count summary; `close_commit_tab` returns to Changes, emits `CommitTabClosed`, and leaves `commit_tab_is_open()` false; `ActivateCommitTab` while closed does nothing.
+- [x] Gate: `set -o pipefail; cargo check -p git_ui --all-targets`; `cargo test -p git_ui`.
 
 ### Task 3: Wire the graph's selection to the panel, both ways
 

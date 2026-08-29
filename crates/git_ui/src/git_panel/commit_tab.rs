@@ -15,14 +15,31 @@
 
 use super::*;
 
-use git::repository::{CommitDiff, CommitFile};
+use git::repository::{CommitDetails, CommitDiff, CommitFile};
 use git::status::{StatusCode, TrackedStatus};
-use gpui::{AnyElement, StyleRefinement, TextStyleRefinement, UnderlineStyle};
+use gpui::{AnyElement, ClipboardItem, StyleRefinement, TextStyleRefinement, UnderlineStyle};
 use language::line_diff;
-use markdown::MarkdownStyle;
+use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use std::rc::Rc;
 use std::sync::OnceLock;
 use time::{UtcOffset, format_description::BorrowedFormatItem};
+
+/// Left step of a Commit tab file row, measured from its directory header.
+///
+/// The git graph's sidebar steps its file rows in by
+/// `18px + ProjectPanelSettings::indent_size` (38px at the shipped default).
+/// `git_ui` cannot read that setting — `project_panel` depends on `git_ui`, so
+/// the reverse is a dependency cycle — so the panel's own `TREE_INDENT` stands
+/// in for the project panel's step. The leading 18px is the directory header's
+/// chevron (14px) plus its gap (4px), which a file row has no equivalent of;
+/// dropping it and using a bare `TREE_INDENT` would be a 22px regression
+/// against the tree that ships today.
+const COMMIT_TREE_INDENT: f32 = 18.0 + TREE_INDENT;
+
+/// Cap on the Commit tab's message block. Without it a long commit message
+/// pushes the changed-files tree out of a dock-width panel entirely; the block
+/// scrolls past this height and a short message still takes only what it needs.
+const COMMIT_MESSAGE_MAX_HEIGHT: f32 = 200.0;
 
 /// What a changed-files row does when the user acts on it. The tree is hosted
 /// by two views that share no type, so each host supplies its own behaviour as
@@ -428,6 +445,640 @@ pub fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
                 )
             })
     })
+}
+
+/// A git-graph selection handed to the git panel's Commit tab.
+///
+/// The selection carries its own repository rather than letting the panel
+/// resolve `active_repository`: the panel follows the Solution's active member
+/// and the two can disagree transiently, and a Commit tab describing a
+/// different repository than the graph row the user clicked is exactly the bug
+/// this avoids.
+#[derive(Clone)]
+pub struct CommitSelection {
+    pub repository: Entity<Repository>,
+    /// Non-empty. A single sha renders the commit's details; more than one
+    /// renders a bare "N commits selected" summary.
+    pub shas: Vec<Oid>,
+}
+
+/// Where one of the Commit tab's two background loads has got to.
+///
+/// `Failed` exists so that a diff which errored is not indistinguishable from
+/// a commit that genuinely touched no files; `Idle` is a multi-commit
+/// selection, which loads nothing at all.
+pub(super) enum LoadState<T> {
+    Idle,
+    Loading,
+    Loaded(T),
+    Failed(SharedString),
+}
+
+pub(super) struct LoadedCommitDiff {
+    diff: CommitDiff,
+    lines_added: usize,
+    lines_removed: usize,
+}
+
+/// Selectable text of the commit message. `ui::Label` has no selection
+/// support, so the subject / body / identity line are `MarkdownElement`s. The
+/// entities are built once when the details load rather than per frame: a
+/// `Markdown` owns the user's in-progress selection, and rebuilding it every
+/// frame would wipe a selection mid-drag.
+struct CommitDetailText {
+    subject: Entity<Markdown>,
+    /// Everything after the subject line, verbatim. Parsed as plain text (only
+    /// bare URLs become links) so that the `#`, `*` and backticks commit
+    /// messages are full of are not swallowed as markdown syntax.
+    body: Entity<Markdown>,
+    /// `<short-sha> <author> <email> on <date> at <time>` — see
+    /// [`commit_identity_source`].
+    identity: Entity<Markdown>,
+}
+
+/// Everything the Commit tab shows.
+///
+/// It hangs off [`GitPanel`] as an `Option` because the tab exists only while
+/// something is in it: `Some` is exactly what puts the tab in the tab bar, so
+/// "is the tab open" and "is there anything to show" cannot drift apart the
+/// way a parallel `bool` would let them.
+pub(super) struct CommitTabState {
+    pub(super) selection: CommitSelection,
+    pub(super) details: LoadState<CommitDetails>,
+    pub(super) diff: LoadState<LoadedCommitDiff>,
+    text: Option<CommitDetailText>,
+    collapsed_dirs: HashSet<SharedString>,
+    scroll_handle: UniformListScrollHandle,
+    selected_file: Option<RepoPath>,
+    _details_task: Option<Task<()>>,
+    _diff_task: Option<Task<()>>,
+}
+
+impl CommitTabState {
+    fn new(selection: CommitSelection) -> Self {
+        Self {
+            selection,
+            details: LoadState::Idle,
+            diff: LoadState::Idle,
+            text: None,
+            collapsed_dirs: HashSet::default(),
+            scroll_handle: UniformListScrollHandle::new(),
+            selected_file: None,
+            _details_task: None,
+            _diff_task: None,
+        }
+    }
+}
+
+/// The hosting provider of the repository the Commit tab is showing — used for
+/// the author avatar. Deliberately not [`GitPanel::git_remote`], which resolves
+/// against `active_repository`; see [`CommitSelection`].
+fn commit_remote(repository: &Entity<Repository>, cx: &mut App) -> Option<GitRemote> {
+    let remote_url = repository.read(cx).default_remote_url()?;
+    let provider_registry = GitHostingProviderRegistry::default_global(cx);
+    let (provider, parsed) = parse_git_remote_url(provider_registry, &remote_url)?;
+    Some(GitRemote {
+        host: provider,
+        owner: parsed.owner.into(),
+        repo: parsed.repo.into(),
+    })
+}
+
+impl GitPanel {
+    /// Whether the Commit tab is present in the tab bar.
+    pub fn commit_tab_is_open(&self) -> bool {
+        self.commit_tab.is_some()
+    }
+
+    /// Show a git-graph selection in the Commit tab, opening the tab if it is
+    /// closed. One sha renders that commit's details; more render a bare count.
+    ///
+    /// Activating the tab here deliberately does **not** move focus: the caller
+    /// is the graph, mid-click or mid-arrow-key, and pulling focus into the
+    /// panel would break the graph's own keyboard navigation. The user-driven
+    /// routes into the tab (its tab-bar row, `git_panel::ActivateCommitTab`) go
+    /// through `set_active_tab`, which does focus.
+    pub fn show_commit_selection(
+        &mut self,
+        selection: CommitSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&sha) = selection.shas.first() else {
+            // An empty selection is a deselection. Callers are expected to say
+            // that with `close_commit_tab`, but a tab left describing nothing
+            // is worse than closing one they meant to keep.
+            self.close_commit_tab(window, cx);
+            return;
+        };
+
+        let already_showing = self.commit_tab.as_ref().is_some_and(|state| {
+            state.selection.repository.entity_id() == selection.repository.entity_id()
+                && state.selection.shas == selection.shas
+        });
+        if already_showing {
+            // Re-selecting the same row must not restart the loads or throw
+            // away the tree's scroll position and collapsed directories.
+            self.active_tab = GitPanelTab::Commit;
+            cx.notify();
+            return;
+        }
+
+        let repository = selection.repository.clone();
+        let is_single_commit = selection.shas.len() == 1;
+        let mut state = CommitTabState::new(selection);
+
+        if is_single_commit {
+            state.details = LoadState::Loading;
+            state.diff = LoadState::Loading;
+
+            let details = repository.update(cx, |repository, _| repository.show(sha.to_string()));
+            state._details_task = Some(cx.spawn(async move |this, cx| {
+                let loaded = details.await;
+                this.update(cx, |this, cx| {
+                    // Drop a load that resolved after the selection moved on,
+                    // rather than pairing it with whatever is shown now.
+                    if this.commit_tab_sha() != Some(sha) {
+                        return;
+                    }
+                    let loaded = match loaded {
+                        Ok(Ok(details)) => {
+                            let (subject, body) = split_commit_message(&details.message);
+                            let identity = commit_identity_source(
+                                &details.short_sha(),
+                                &details.author_name,
+                                &details.author_email,
+                                Some(details.commit_timestamp),
+                            );
+                            let text = CommitDetailText {
+                                subject: cx.new(|cx| Markdown::new_text(subject, cx)),
+                                body: cx.new(|cx| Markdown::new_text(body, cx)),
+                                identity: cx.new(|cx| Markdown::new(identity, None, None, cx)),
+                            };
+                            Ok((details, text))
+                        }
+                        Ok(Err(error)) => Err(SharedString::from(format!(
+                            "Couldn't load commit {}: {error:#}",
+                            sha.display_short()
+                        ))),
+                        Err(_) => Err(SharedString::from(format!(
+                            "Loading commit {} was cancelled.",
+                            sha.display_short()
+                        ))),
+                    };
+                    if let Some(state) = this.commit_tab.as_mut() {
+                        match loaded {
+                            Ok((details, text)) => {
+                                state.text = Some(text);
+                                state.details = LoadState::Loaded(details);
+                            }
+                            Err(message) => state.details = LoadState::Failed(message),
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }));
+
+            let diff = repository.update(cx, |repository, _| {
+                repository.load_commit_diff(sha.to_string())
+            });
+            state._diff_task = Some(cx.spawn(async move |this, cx| {
+                let loaded = diff.await;
+                this.update(cx, |this, cx| {
+                    if this.commit_tab_sha() != Some(sha) {
+                        return;
+                    }
+                    let loaded = match loaded {
+                        Ok(Ok(diff)) => {
+                            let (lines_added, lines_removed) = compute_diff_stats(&diff);
+                            LoadState::Loaded(LoadedCommitDiff {
+                                diff,
+                                lines_added,
+                                lines_removed,
+                            })
+                        }
+                        Ok(Err(error)) => LoadState::Failed(SharedString::from(format!(
+                            "Couldn't load the changes of commit {}: {error:#}",
+                            sha.display_short()
+                        ))),
+                        Err(_) => LoadState::Failed(SharedString::from(format!(
+                            "Loading the changes of commit {} was cancelled.",
+                            sha.display_short()
+                        ))),
+                    };
+                    if let Some(state) = this.commit_tab.as_mut() {
+                        state.diff = loaded;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+
+        self.commit_tab = Some(state);
+        self.active_tab = GitPanelTab::Commit;
+        cx.notify();
+    }
+
+    /// Close the Commit tab and drop everything it was showing, emitting
+    /// [`Event::CommitTabClosed`] so the git graph can clear the row selection
+    /// that opened it.
+    ///
+    /// Focus is left alone on the way out for the same reason
+    /// [`Self::show_commit_selection`] does not take it: the close can arrive
+    /// from the graph.
+    pub fn close_commit_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.commit_tab.take().is_none() {
+            return;
+        }
+        // Only the Commit tab itself is yanked back to Changes; a user parked
+        // on another tab keeps the tab they chose.
+        if self.active_tab == GitPanelTab::Commit {
+            self.active_tab = GitPanelTab::Changes;
+        }
+        cx.emit(Event::CommitTabClosed);
+        cx.notify();
+    }
+
+    /// The sha whose details the Commit tab is showing, if it is showing a
+    /// single commit rather than a multi-row selection summary.
+    fn commit_tab_sha(&self) -> Option<Oid> {
+        match self.commit_tab.as_ref()?.selection.shas.as_slice() {
+            [sha] => Some(*sha),
+            _ => None,
+        }
+    }
+
+    pub(super) fn activate_commit_tab(
+        &mut self,
+        _: &ActivateCommitTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.commit_tab_is_open() {
+            return;
+        }
+        self.set_active_tab(GitPanelTab::Commit, window, cx);
+    }
+
+    fn toggle_commit_directory(&mut self, key: &SharedString, cx: &mut Context<Self>) {
+        let Some(state) = self.commit_tab.as_mut() else {
+            return;
+        };
+        if !state.collapsed_dirs.remove(key) {
+            state.collapsed_dirs.insert(key.clone());
+        }
+        cx.notify();
+    }
+
+    fn deploy_commit_file_context_menu(
+        &mut self,
+        path: RepoPath,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.as_unix_str().to_string();
+        let focus_handle = self.focus_handle.clone();
+        let context_menu = ContextMenu::build(window, cx, move |context_menu, _window, _cx| {
+            context_menu
+                .context(focus_handle)
+                .entry("Copy Path", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                })
+        });
+        self.set_context_menu(context_menu, position, window, cx);
+    }
+
+    /// How the Commit tab's file rows reach back into the panel.
+    ///
+    /// This bundle erases the host entity behind `Rc<dyn Fn(…, &mut App)>`, so
+    /// invoking one of these closures while the panel is already leased is a
+    /// runtime double-lease panic that the compiler cannot see and a
+    /// `VisualTestContext` draw will not reproduce. `GitPanel::render` holds
+    /// such a lease for its whole duration — unlike the git graph, which
+    /// renders the same tree outside its own update — so the bundle must be
+    /// built here from `cx.weak_entity()` and its closures may only ever be
+    /// installed into event callbacks, never called during layout or paint.
+    fn commit_file_row_handlers(&self, cx: &Context<Self>) -> ChangedFileRowHandlers {
+        let panel = cx.weak_entity();
+        ChangedFileRowHandlers {
+            select_file: Rc::new({
+                let panel = panel.clone();
+                move |repo_path, _window, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            if let Some(state) = panel.commit_tab.as_mut() {
+                                state.selected_file = Some(repo_path.clone());
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                }
+            }),
+            deploy_file_context_menu: Rc::new({
+                let panel = panel.clone();
+                move |repo_path, position, window, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.deploy_commit_file_context_menu(
+                                repo_path.clone(),
+                                position,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
+            }),
+            toggle_directory: Rc::new(move |key, _window, cx| {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.toggle_commit_directory(key, cx);
+                    })
+                    .ok();
+            }),
+        }
+    }
+
+    /// The Commit tab body, in spec §5's order: the commit message, the
+    /// `<short sha> <author> <email> on <date>` identity line, then the
+    /// changed-files tree under a header carrying the file count and the
+    /// commit's +/− totals.
+    pub(super) fn render_commit_tab(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(state) = self.commit_tab.as_ref() else {
+            return Empty.into_any_element();
+        };
+
+        let selected_commits = state.selection.shas.len();
+        if selected_commits > 1 {
+            return v_flex()
+                .flex_1()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new(format!("{selected_commits} commits selected")).color(Color::Muted),
+                )
+                .into_any_element();
+        }
+
+        let Some(&sha) = state.selection.shas.first() else {
+            return Empty.into_any_element();
+        };
+        // The FULL sha, never `display_short()`: it is forwarded verbatim to
+        // `CommitView::open_file_diff`, which opens an empty tab for a short one.
+        let full_sha: SharedString = sha.to_string().into();
+
+        let mut body = v_flex().flex_1().size_full().min_h_0().overflow_hidden();
+
+        body = match (&state.details, &state.text) {
+            (LoadState::Loaded(details), Some(text)) => {
+                // The message matches the log rows beside it —
+                // `TextSize::Default`. The identity line stays small: it is
+                // metadata about the commit, not the commit.
+                let subject_style = detail_text_style(
+                    TextSize::Default,
+                    Color::Default,
+                    Some(gpui::FontWeight::SEMIBOLD),
+                    window,
+                    cx,
+                );
+                let body_style =
+                    detail_text_style(TextSize::Default, Color::Default, None, window, cx);
+                let identity_style =
+                    detail_text_style(TextSize::Small, Color::Muted, None, window, cx);
+                let has_body = !text.body.read(cx).source().is_empty();
+
+                let author_email =
+                    (!details.author_email.is_empty()).then(|| details.author_email.clone());
+                let remote = commit_remote(&state.selection.repository, cx);
+                let avatar = CommitAvatar::new(&full_sha, author_email, remote.as_ref())
+                    .size(px(16.))
+                    .render(window, cx);
+
+                body.child(
+                    div()
+                        .id("commit-tab-message")
+                        .flex_shrink_0()
+                        .max_h(px(COMMIT_MESSAGE_MAX_HEIGHT))
+                        .overflow_y_scroll()
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .px_2()
+                                .py_1p5()
+                                .gap_1p5()
+                                .child(div().min_w_0().child(MarkdownElement::new(
+                                    text.subject.clone(),
+                                    subject_style,
+                                )))
+                                .children(has_body.then(|| {
+                                    div()
+                                        .min_w_0()
+                                        .child(MarkdownElement::new(text.body.clone(), body_style))
+                                })),
+                        ),
+                )
+                // `flex_1` on the text, not just `min_w_0`: in a row flex a
+                // child's width comes from its own content and `min_w_0` lets
+                // it shrink to nothing, so a narrow dock could hand the
+                // markdown a one-character width and wrap the identity line
+                // vertically.
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .w_full()
+                        .px_2()
+                        .pb_1p5()
+                        .gap_1p5()
+                        .items_start()
+                        .child(div().flex_shrink_0().pt_0p5().child(avatar))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(MarkdownElement::new(text.identity.clone(), identity_style)),
+                        ),
+                )
+            }
+            (LoadState::Failed(error), _) => body.child(
+                div().px_2().py_1p5().child(
+                    Label::new(error.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                ),
+            ),
+            _ => body.child(
+                div().px_2().py_1p5().child(
+                    Label::new("Loading commit…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            ),
+        };
+
+        let border = cx.theme().colors().border;
+        body = match &state.diff {
+            LoadState::Loaded(loaded) => {
+                let file_count = loaded.diff.files.len();
+                body.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .justify_between()
+                        .border_t_1()
+                        .border_color(border)
+                        .child(
+                            Label::new(format!(
+                                "{file_count} Changed {}",
+                                if file_count == 1 { "File" } else { "Files" }
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        // `ui::DiffStat`, fully qualified: `use super::*`
+                        // brings `git::status::DiffStat`, the data type, into
+                        // scope under the same bare name.
+                        .child(ui::DiffStat::new(
+                            "commit-tab-diff-stat",
+                            loaded.lines_added,
+                            loaded.lines_removed,
+                        )),
+                )
+                .child(self.render_commit_file_tree(state, loaded, full_sha, window, cx))
+            }
+            LoadState::Failed(error) => body.child(
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1p5()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        Label::new(error.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Error),
+                    ),
+            ),
+            LoadState::Loading => body.child(
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1p5()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        Label::new("Loading changed files…")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            ),
+            LoadState::Idle => body,
+        };
+
+        body.into_any_element()
+    }
+
+    /// The commit's changed files, grouped by directory.
+    ///
+    /// The tree carries no left inset of its own: `ButtonLike`'s own 4px
+    /// horizontal padding is the directory header's indent, which puts the file
+    /// rows at `4 + COMMIT_TREE_INDENT` = 38px — the same left edge as the
+    /// Changes tab's depth-1 file rows and as the graph sidebar's file rows.
+    /// The headers themselves then sit 2px inside the Changes tab's 6px section
+    /// headers; closing that last 2px would mean either changing the shared row
+    /// renderer (which would move the graph's sidebar too) or a magic negative
+    /// margin, and the file rows are the edge the eye actually tracks.
+    fn render_commit_file_tree(
+        &self,
+        state: &CommitTabState,
+        loaded: &LoadedCommitDiff,
+        commit_sha: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entries: Vec<ChangedFileEntry> = loaded
+            .diff
+            .files
+            .iter()
+            .map(ChangedFileEntry::from_commit_file)
+            .collect();
+        let repo_label: SharedString = state
+            .selection
+            .repository
+            .read(cx)
+            .work_directory_abs_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Repository".to_string())
+            .into();
+        let rows: Rc<Vec<ChangedFileRow>> = Rc::new(build_changed_file_rows(
+            &entries,
+            &repo_label,
+            &state.collapsed_dirs,
+        ));
+        let row_count = rows.len();
+        let repository = state.selection.repository.downgrade();
+        let workspace = self.workspace.clone();
+        let selected_file = state.selected_file.clone();
+        let scroll_handle = state.scroll_handle.clone();
+        let handlers = self.commit_file_row_handlers(cx);
+
+        div()
+            .id("commit-tab-files")
+            .flex_1()
+            .min_h_0()
+            .child(
+                uniform_list(
+                    "commit-tab-files-list",
+                    row_count,
+                    move |range, _window, _cx| {
+                        range
+                            .filter_map(|ix| {
+                                let row = rows.get(ix)?;
+                                Some(match row {
+                                    ChangedFileRow::Directory {
+                                        key,
+                                        label,
+                                        file_count,
+                                        collapsed,
+                                    } => render_changed_directory_row(
+                                        ix,
+                                        key.clone(),
+                                        label.clone(),
+                                        *file_count,
+                                        *collapsed,
+                                        handlers.clone(),
+                                    ),
+                                    ChangedFileRow::File(entry) => entry.render(
+                                        ix,
+                                        px(COMMIT_TREE_INDENT),
+                                        commit_sha.clone(),
+                                        repository.clone(),
+                                        workspace.clone(),
+                                        handlers.clone(),
+                                        selected_file.as_ref() == Some(&entry.repo_path),
+                                    ),
+                                })
+                            })
+                            .collect()
+                    },
+                )
+                .size_full()
+                .track_scroll(&scroll_handle),
+            )
+            .vertical_scrollbar_for(&scroll_handle, window, cx)
+            .into_any_element()
+    }
 }
 
 #[cfg(test)]

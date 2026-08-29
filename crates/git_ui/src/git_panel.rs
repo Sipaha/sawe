@@ -85,6 +85,8 @@ use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFon
 mod changes_list;
 pub mod commit_tab;
 
+pub use commit_tab::CommitSelection;
+
 actions!(
     git_panel,
     [
@@ -122,6 +124,8 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Activates the Commit tab, when a commit is open in it.
+        ActivateCommitTab,
         /// Opens the selected file itself in an editor tab (IDEA's "Jump to
         /// Source"), as opposed to `menu::Confirm`, which opens its diff.
         JumpToSource,
@@ -418,6 +422,9 @@ pub fn register(workspace: &mut Workspace) {
 #[derive(Debug, Clone)]
 pub enum Event {
     Focus,
+    /// The Commit tab was closed. The git graph clears the row selection that
+    /// opened it when it sees this.
+    CommitTabClosed,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -432,6 +439,9 @@ struct SerializedGitPanel {
 enum GitPanelTab {
     Changes,
     History,
+    /// Only reachable while `GitPanel::commit_tab` is `Some` — the tab is not
+    /// in the tab bar otherwise.
+    Commit,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -840,6 +850,8 @@ pub struct GitPanel {
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
     active_tab: GitPanelTab,
+    /// `Some` exactly while the closable Commit tab is in the tab bar.
+    commit_tab: Option<commit_tab::CommitTabState>,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history_shas: Option<Vec<Oid>>,
     focused_history_entry: Option<usize>,
@@ -1071,6 +1083,7 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
+                commit_tab: None,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history_shas: None,
                 focused_history_entry: None,
@@ -5289,6 +5302,7 @@ impl GitPanel {
         let tab = |id: ElementId,
                    active: bool,
                    show_changes: bool,
+                   closable: bool,
                    label: SharedString,
                    set_active_tab: GitPanelTab,
                    tooltip_action: Box<dyn Action>| {
@@ -5316,6 +5330,19 @@ impl GitPanel {
                             .color(Color::Muted),
                     )
                 })
+                // The row's own `on_click` fires too, but `set_active_tab`
+                // refuses `Commit` once the tab is gone, so the two land on
+                // Changes either way and no propagation dance is needed.
+                .when(closable, |this| {
+                    this.child(
+                        IconButton::new("close-commit-tab", IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Close Commit Tab"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_commit_tab(window, cx);
+                            })),
+                    )
+                })
                 .tooltip(Tooltip::for_action_title_in(
                     format!("Toggle {} Tab", label),
                     tooltip_action.as_ref(),
@@ -5334,6 +5361,7 @@ impl GitPanel {
                 ElementId::Name("changes-tab".into()),
                 active_tab == GitPanelTab::Changes,
                 true,
+                false,
                 "Changes".into(),
                 GitPanelTab::Changes,
                 ActivateChangesTab.boxed_clone(),
@@ -5341,12 +5369,25 @@ impl GitPanel {
             .child(Divider::vertical().color(ui::DividerColor::BorderFaded))
             .child(tab(
                 ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
+                active_tab == GitPanelTab::History,
+                false,
                 false,
                 "History".into(),
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
             ))
+            .when(self.commit_tab_is_open(), |this| {
+                this.child(Divider::vertical().color(ui::DividerColor::BorderFaded))
+                    .child(tab(
+                        ElementId::Name("commit-tab".into()),
+                        active_tab == GitPanelTab::Commit,
+                        false,
+                        true,
+                        "Commit".into(),
+                        GitPanelTab::Commit,
+                        ActivateCommitTab.boxed_clone(),
+                    ))
+            })
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5436,6 +5477,12 @@ impl GitPanel {
     }
 
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
+        // The Commit tab has no tab-bar row while it is closed, so every
+        // user-facing route into it — the row itself, `ActivateCommitTab`, the
+        // `ctrl-2` keybinding — is a no-op rather than an empty tab.
+        if tab == GitPanelTab::Commit && !self.commit_tab_is_open() {
+            return;
+        }
         if self.active_tab == tab {
             return;
         }
@@ -5451,6 +5498,12 @@ impl GitPanel {
                 self.commit_history_shas.take();
                 self.focused_history_entry = None;
                 self._repo_subscriptions.clear();
+            }
+            // Only reached from a user gesture; `show_commit_selection`
+            // activates the tab without taking focus, because its caller is the
+            // git graph mid-interaction.
+            GitPanelTab::Commit => {
+                self.focus_handle.focus(window, cx);
             }
         }
         cx.notify();
@@ -6577,6 +6630,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::activate_commit_tab))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -6625,6 +6679,7 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::Commit => this.child(self.render_commit_tab(window, cx)),
                     })
                     .into_any_element(),
             )
@@ -9095,6 +9150,170 @@ mod tests {
     // a repo with no branch, so a flip to a detached-HEAD repo had nothing to
     // overwrite them with. The resolution is re-driven synchronously here, with
     // no executor turn in between, so only the invalidation can clear the rows.
+    async fn commit_tab_fixture(
+        cx: &mut TestAppContext,
+    ) -> (Entity<GitPanel>, Entity<Repository>, VisualTestContext) {
+        let NestedRepoSolution {
+            project,
+            member_root,
+            ..
+        } = setup_nested_repo_solution(cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        let repository = repo_with_work_directory(&project, &member_root, &mut cx);
+        (panel, repository, cx)
+    }
+
+    fn test_sha(hex: &str) -> Oid {
+        hex.parse().expect("valid abbreviated sha")
+    }
+
+    #[gpui::test]
+    async fn test_show_commit_selection_opens_the_commit_tab(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel.commit_tab_is_open(),
+                "the panel boots with no Commit tab"
+            );
+        });
+
+        let sha = test_sha("823a3f8a");
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec![sha],
+                },
+                window,
+                cx,
+            );
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.commit_tab_is_open());
+            assert_eq!(panel.active_tab, GitPanelTab::Commit);
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert_eq!(state.selection.shas, vec![sha]);
+            assert!(
+                matches!(state.details, commit_tab::LoadState::Loading),
+                "a single-commit selection starts both background loads"
+            );
+            assert!(matches!(state.diff, commit_tab::LoadState::Loading));
+        });
+    }
+
+    /// A multi-row graph selection shows a bare count and must not fire a
+    /// `show` / `load_commit_diff` pair for a commit it is not describing.
+    #[gpui::test]
+    async fn test_show_commit_selection_with_many_shas_loads_nothing(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let shas = vec![
+            test_sha("823a3f8a"),
+            test_sha("1a2b3c4d"),
+            test_sha("deadbeef"),
+        ];
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: shas.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.commit_tab_is_open());
+            assert_eq!(panel.active_tab, GitPanelTab::Commit);
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert_eq!(state.selection.shas, shas);
+            assert!(matches!(state.details, commit_tab::LoadState::Idle));
+            assert!(matches!(state.diff, commit_tab::LoadState::Idle));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_close_commit_tab_returns_to_changes_and_emits(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let closed = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let _subscription = cx.update(|_window, cx| {
+            cx.subscribe(&panel, {
+                let closed = closed.clone();
+                move |_, event: &Event, _| {
+                    if matches!(event, Event::CommitTabClosed) {
+                        closed.set(closed.get() + 1);
+                    }
+                }
+            })
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec![test_sha("823a3f8a")],
+                },
+                window,
+                cx,
+            );
+            panel.close_commit_tab(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.commit_tab_is_open());
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+        });
+        assert_eq!(
+            closed.get(),
+            1,
+            "closing the tab signals the graph exactly once"
+        );
+
+        // A second close has nothing to close and must stay silent, or the
+        // graph would see a phantom deselection.
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.close_commit_tab(window, cx);
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(closed.get(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_activate_commit_tab_is_a_no_op_while_closed(cx: &mut TestAppContext) {
+        let (panel, _repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.activate_commit_tab(&ActivateCommitTab, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.commit_tab_is_open());
+            assert_eq!(
+                panel.active_tab,
+                GitPanelTab::Changes,
+                "ctrl-2 with no commit open must not strand the panel on an empty tab"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_history_drops_previous_repository_commits(cx: &mut TestAppContext) {
         let NestedRepoSolution {
