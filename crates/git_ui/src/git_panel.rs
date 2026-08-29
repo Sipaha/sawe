@@ -83,6 +83,7 @@ use workspace::{
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
 mod changes_list;
+pub mod commit_tab;
 
 actions!(
     git_panel,

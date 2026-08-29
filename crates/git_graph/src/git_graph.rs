@@ -138,25 +138,26 @@ use editor::Editor;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
-    repository::{CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath},
-    status::{FileStatus, StatusCode, TrackedStatus},
+    repository::{CommitDiff, InitialGraphCommitData, LogOrder, LogSource, RepoPath},
 };
 use git_ui::{
     commit_context_menu::{MultiCommitContext, build_multi_commit_context_menu},
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
-    git_status_icon,
+    git_panel::commit_tab::{
+        ChangedFileEntry, ChangedFileRow, ChangedFileRowHandlers, build_changed_file_rows,
+        commit_identity_source, compute_diff_stats, detail_text_style,
+        render_changed_directory_row, split_commit_message,
+    },
 };
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
     DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Modifiers,
     MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
-    SharedString, StyleRefinement, Subscription, Task, TextStyleRefinement, UnderlineStyle,
-    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
-    px, uniform_list,
+    SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions,
+    anchored, deferred, point, prelude::*, px, uniform_list,
 };
-use language::line_diff;
-use markdown::{Markdown, MarkdownElement, MarkdownStyle};
+use markdown::{Markdown, MarkdownElement};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use project::{
     ProjectPath,
@@ -181,11 +182,10 @@ use std::{
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
-    ButtonLike, Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat,
-    HeaderResizeInfo, RedistributableColumnsState, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
-    prelude::*, render_redistributable_columns_resize_handles, render_table_header,
-    table_row::TableRow,
+    Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, HeaderResizeInfo,
+    RedistributableColumnsState, Table, TableInteractionState, TableRenderContext,
+    TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns, prelude::*,
+    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
 };
 use workspace::{
     Workspace,
@@ -213,277 +213,6 @@ fn is_hash_like(text: &str) -> bool {
 struct DraggedSplitHandle;
 
 struct DraggedDetailSplitHandle;
-
-#[derive(Clone)]
-struct ChangedFileEntry {
-    status: FileStatus,
-    file_name: SharedString,
-    dir_path: SharedString,
-    repo_path: RepoPath,
-}
-
-impl ChangedFileEntry {
-    fn from_commit_file(file: &CommitFile) -> Self {
-        let file_name: SharedString = file
-            .path
-            .file_name()
-            .map(|n| n.to_string())
-            .unwrap_or_default()
-            .into();
-        let dir_path: SharedString = file
-            .path
-            .parent()
-            .map(|p| p.as_unix_str().to_string())
-            .unwrap_or_default()
-            .into();
-
-        let status_code = match (&file.old_text, &file.new_text) {
-            (None, Some(_)) => StatusCode::Added,
-            (Some(_), None) => StatusCode::Deleted,
-            _ => StatusCode::Modified,
-        };
-
-        let status = FileStatus::Tracked(TrackedStatus {
-            index_status: status_code,
-            worktree_status: StatusCode::Unmodified,
-        });
-
-        Self {
-            status,
-            file_name,
-            dir_path,
-            repo_path: file.path.clone(),
-        }
-    }
-
-    fn open_file_diff(
-        &self,
-        commit_sha: &SharedString,
-        repository: &WeakEntity<Repository>,
-        workspace: &WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        CommitView::open_file_diff(
-            commit_sha.to_string(),
-            repository.clone(),
-            workspace.clone(),
-            self.repo_path.clone(),
-            window,
-            cx,
-        );
-    }
-
-    /// Full repo-relative path, used for tooltips and the copy-path menu.
-    fn display_path(&self) -> SharedString {
-        if self.dir_path.is_empty() {
-            self.file_name.clone()
-        } else {
-            format!("{}/{}", self.dir_path, self.file_name).into()
-        }
-    }
-
-    /// A file row of the changed-files tree. The directory is carried by the
-    /// header row above, so the row itself only shows the file name — the
-    /// panel is narrow and IDEA's tree does the same.
-    fn render(
-        &self,
-        ix: usize,
-        commit_sha: SharedString,
-        repository: WeakEntity<Repository>,
-        workspace: WeakEntity<Workspace>,
-        graph: WeakEntity<GitGraph>,
-        is_selected: bool,
-        cx: &App,
-    ) -> AnyElement {
-        let file_name = self.file_name.clone();
-        let full_path = self.display_path();
-
-        // One indent step in from the directory header, measured from the
-        // project panel's own setting so the two trees read the same. The
-        // constant is the header's leading chevron (14px) plus its gap (4px),
-        // which the file row has no equivalent of.
-        let indent = px(18.0 + ProjectPanelSettings::get_global(cx).indent_size);
-
-        let graph_for_click = graph.clone();
-
-        div()
-            .w_full()
-            .pl(indent)
-            .on_mouse_down(MouseButton::Right, {
-                let repo_path = self.repo_path.clone();
-                move |event: &MouseDownEvent, window, cx| {
-                    graph
-                        .update(cx, |graph, cx| {
-                            graph.deploy_changed_file_context_menu(
-                                repo_path.clone(),
-                                event.position,
-                                window,
-                                cx,
-                            );
-                        })
-                        .ok();
-                    cx.stop_propagation();
-                }
-            })
-            .child(
-                ButtonLike::new(("changed-file", ix))
-                    .toggle_state(is_selected)
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .w_full()
-                            .gap_1()
-                            .overflow_hidden()
-                            .child(git_status_icon(self.status))
-                            .child(Label::new(file_name).size(LabelSize::Small).truncate()),
-                    )
-                    .tooltip({
-                        let meta = full_path;
-                        move |_, cx| Tooltip::with_meta("Open Diff", None, meta.clone(), cx)
-                    })
-                    // Single click only selects; the diff opens on double
-                    // click, so walking the file list with the mouse does not
-                    // spray tabs across the pane.
-                    .on_click({
-                        let entry = self.clone();
-                        let graph = graph_for_click;
-                        move |event: &ClickEvent, window, cx| {
-                            let repo_path = entry.repo_path.clone();
-                            graph
-                                .update(cx, |graph, cx| {
-                                    graph.selected_changed_file = Some(repo_path);
-                                    cx.notify();
-                                })
-                                .ok();
-                            if event.click_count() >= 2 {
-                                entry.open_file_diff(
-                                    &commit_sha,
-                                    &repository,
-                                    &workspace,
-                                    window,
-                                    cx,
-                                );
-                            }
-                        }
-                    }),
-            )
-            .into_any_element()
-    }
-}
-
-/// One row of the sidebar's changed-files tree. IDEA renders the commit's
-/// files grouped under their directory rather than as a flat list of
-/// `name  dir/path` pairs; a directory chain with a single child is compacted
-/// into one header (`docs/plans/completed`) instead of nesting a row per path
-/// component.
-#[derive(Clone)]
-enum ChangedFileRow {
-    Directory {
-        /// Raw directory path — the key into `collapsed_changed_dirs`. Empty
-        /// for files sitting at the repository root.
-        key: SharedString,
-        /// What the row shows: the directory path, or the repository name for
-        /// the root group.
-        label: SharedString,
-        file_count: usize,
-        collapsed: bool,
-    },
-    File(ChangedFileEntry),
-}
-
-/// Flatten a commit's changed files into directory-grouped rows. Files under a
-/// collapsed directory are dropped, but its header keeps the full count so the
-/// user can see how much is hidden.
-fn build_changed_file_rows(
-    entries: &[ChangedFileEntry],
-    root_label: &SharedString,
-    collapsed: &HashSet<SharedString>,
-) -> Vec<ChangedFileRow> {
-    let mut by_directory: BTreeMap<SharedString, Vec<&ChangedFileEntry>> = BTreeMap::new();
-    for entry in entries {
-        by_directory
-            .entry(entry.dir_path.clone())
-            .or_default()
-            .push(entry);
-    }
-
-    let mut rows = Vec::new();
-    for (directory, mut files) in by_directory {
-        files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
-        let is_collapsed = collapsed.contains(&directory);
-        rows.push(ChangedFileRow::Directory {
-            key: directory.clone(),
-            label: if directory.is_empty() {
-                root_label.clone()
-            } else {
-                directory
-            },
-            file_count: files.len(),
-            collapsed: is_collapsed,
-        });
-        if !is_collapsed {
-            rows.extend(files.into_iter().cloned().map(ChangedFileRow::File));
-        }
-    }
-    rows
-}
-
-/// Header row of one directory group in the changed-files tree. Clicking it
-/// collapses / expands the group.
-fn render_changed_directory_row(
-    ix: usize,
-    key: SharedString,
-    label: SharedString,
-    file_count: usize,
-    collapsed: bool,
-    graph: WeakEntity<GitGraph>,
-) -> AnyElement {
-    let tooltip_label = label.clone();
-    ButtonLike::new(("changed-dir", ix))
-        .child(
-            h_flex()
-                .min_w_0()
-                .w_full()
-                .gap_1()
-                .overflow_hidden()
-                // A plain chevron rather than a `Disclosure`: that renders as
-                // an `IconButton`, and a nested button inside the row's own
-                // `ButtonLike` both muddies the click target and makes the row
-                // taller than a file row — `uniform_list` sizes every row from
-                // the first one, so the two must match exactly.
-                .child(
-                    Icon::new(if collapsed {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-                )
-                // Default (16px), matching the project panel's folder glyph and
-                // the 16px status glyph on the file rows below it.
-                .child(Icon::new(IconName::Folder).color(Color::Muted))
-                .child(Label::new(label).size(LabelSize::Small).truncate_start())
-                .child(
-                    Label::new(format!(
-                        "{file_count} {}",
-                        if file_count == 1 { "file" } else { "files" }
-                    ))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                ),
-        )
-        .tooltip(move |_, cx| Tooltip::simple(tooltip_label.clone(), cx))
-        .on_click(move |_, _, cx| {
-            graph
-                .update(cx, |graph, cx| {
-                    graph.toggle_changed_directory(&key, cx);
-                })
-                .ok();
-        })
-        .into_any_element()
-}
 
 /// Branches containing the selected commit, tagged with the sha they were
 /// resolved for. `branches` stays `None` until `git branch --contains`
@@ -522,67 +251,6 @@ fn format_branches_containing(branches: &[SharedString]) -> Option<String> {
     } else {
         Some(format!("{prefix}{listed} and {hidden} more"))
     }
-}
-
-/// Split a raw commit message into its subject (first line) and body. The
-/// blank line git puts between them is dropped, as is trailing whitespace —
-/// otherwise the sidebar renders a run of empty lines under short messages.
-fn split_commit_message(message: &str) -> (SharedString, SharedString) {
-    let mut lines = message.lines();
-    let subject = lines.next().unwrap_or_default().trim_end().to_string();
-    let body = lines
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim_matches(|c: char| c == '\n' || c == '\r')
-        .trim_end()
-        .to_string();
-    (subject.into(), body.into())
-}
-
-/// Escape the CommonMark inline markers that could turn an author name into
-/// formatting. Only the markers that can *start* an inline construct are
-/// escaped — over-escaping would show up verbatim in the text the user copies
-/// out of the sidebar, since `markdown::Copy` copies from the source.
-fn escape_markdown_inline(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for character in text.chars() {
-        if matches!(character, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
-}
-
-/// The markdown source of IDEA's identity line:
-/// `550e4c28 antivanov <anton.ivanov@citeck.ru> on 14 Aug 2026 at 06:24`.
-/// The email is a real `mailto:` link; the rest is plain text so the whole
-/// line stays selectable as one run.
-fn commit_identity_source(
-    short_sha: &str,
-    author_name: &str,
-    author_email: &str,
-    timestamp: Option<i64>,
-) -> SharedString {
-    let mut source = escape_markdown_inline(short_sha);
-    if !author_name.is_empty() {
-        source.push(' ');
-        source.push_str(&escape_markdown_inline(author_name));
-    }
-    if !author_email.is_empty() {
-        // The angle brackets are escaped and sit *outside* the link so the
-        // parser cannot read them as an HTML tag or a nested autolink.
-        source.push_str(&format!(
-            " \\<[{}](mailto:{})\\>",
-            escape_markdown_inline(author_email),
-            author_email
-        ));
-    }
-    if let Some(timestamp) = timestamp {
-        source.push_str(" on ");
-        source.push_str(&escape_markdown_inline(&format_detail_timestamp(timestamp)));
-    }
-    source.into()
 }
 
 /// The diff backing the commit-details sidebar, tagged with the commit it was
@@ -827,29 +495,6 @@ fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
         time::format_description::parse("[day] [month repr:short] [year] [hour]:[minute]")
             .unwrap_or_default()
     })
-}
-
-/// `on <date> at <time>` reads better with the two halves separated, so the
-/// detail sidebar spells the time out instead of reusing the log column's
-/// compact `[day] [month] [year] [hour]:[minute]`.
-fn detail_timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
-    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
-    FORMAT.get_or_init(|| {
-        time::format_description::parse("[day] [month repr:short] [year] at [hour]:[minute]")
-            .unwrap_or_default()
-    })
-}
-
-fn format_detail_timestamp(timestamp: i64) -> String {
-    let Ok(datetime) = OffsetDateTime::from_unix_timestamp(timestamp) else {
-        return "Unknown".to_string();
-    };
-
-    let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    datetime
-        .to_offset(local_offset)
-        .format(detail_timestamp_format())
-        .unwrap_or_default()
 }
 
 fn format_timestamp(timestamp: i64) -> String {
@@ -1520,64 +1165,6 @@ fn open_or_reuse_graph(
         graph
     });
     workspace.add_item_to_active_pane(Box::new(git_graph), None, true, window, cx);
-}
-
-/// Style for the selectable single-line text fields of the commit-details
-/// sidebar, matching what the equivalent [`Label`] rendered before.
-fn detail_text_style(
-    text_size: TextSize,
-    color: Color,
-    weight: Option<gpui::FontWeight>,
-    window: &Window,
-    cx: &App,
-) -> MarkdownStyle {
-    let refinement = TextStyleRefinement {
-        font_size: Some(text_size.rems(cx).into()),
-        color: Some(color.color(cx)),
-        font_weight: weight,
-        ..Default::default()
-    };
-    let mut base_text_style = window.text_style();
-    base_text_style.refine(&refinement);
-
-    let container_style = StyleRefinement::default();
-
-    MarkdownStyle {
-        base_text_style,
-        // `base_text_style` alone is NOT enough: markdown's text runs carry
-        // `HighlightStyle`, which has no font size, so the glyphs are laid out
-        // at whatever size the containing div inherits — the window's UI size.
-        // Setting the size on the container too is what actually shrinks the
-        // text, and is what `MarkdownStyle::with_preview_overrides` does.
-        container_style,
-        selection_background_color: cx.theme().colors().element_selection_background,
-        link: TextStyleRefinement {
-            color: Some(cx.theme().colors().link_text_hover),
-            underline: Some(UnderlineStyle {
-                thickness: px(1.),
-                color: Some(cx.theme().colors().link_text_hover),
-                wavy: false,
-            }),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
-fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
-    diff.files.iter().fold((0, 0), |(added, removed), file| {
-        let old_text = file.old_text.as_deref().unwrap_or("");
-        let new_text = file.new_text.as_deref().unwrap_or("");
-        let hunks = line_diff(old_text, new_text);
-        hunks
-            .iter()
-            .fold((added, removed), |(a, r), (old_range, new_range)| {
-                (
-                    a + (new_range.end - new_range.start) as usize,
-                    r + (old_range.end - old_range.start) as usize,
-                )
-            })
-    })
 }
 
 pub struct GitGraph {
@@ -3190,6 +2777,48 @@ impl GitGraph {
         }
     }
 
+    /// The detail sidebar's half of the changed-files tree: the rows live in
+    /// `git_ui` now, so they reach back into the graph through these closures
+    /// rather than naming [`GitGraph`].
+    fn changed_file_row_handlers(&self, cx: &Context<Self>) -> ChangedFileRowHandlers {
+        let graph = cx.weak_entity();
+        ChangedFileRowHandlers {
+            select_file: Rc::new({
+                let graph = graph.clone();
+                move |repo_path, _window, cx| {
+                    graph
+                        .update(cx, |graph, cx| {
+                            graph.selected_changed_file = Some(repo_path.clone());
+                            cx.notify();
+                        })
+                        .ok();
+                }
+            }),
+            deploy_file_context_menu: Rc::new({
+                let graph = graph.clone();
+                move |repo_path, position, window, cx| {
+                    graph
+                        .update(cx, |graph, cx| {
+                            graph.deploy_changed_file_context_menu(
+                                repo_path.clone(),
+                                position,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
+            }),
+            toggle_directory: Rc::new(move |key, _window, cx| {
+                graph
+                    .update(cx, |graph, cx| {
+                        graph.toggle_changed_directory(key, cx);
+                    })
+                    .ok();
+            }),
+        }
+    }
+
     fn toggle_changed_directory(&mut self, key: &SharedString, cx: &mut Context<Self>) {
         if !self.collapsed_changed_dirs.remove(key) {
             self.collapsed_changed_dirs.insert(key.clone());
@@ -3938,12 +3567,22 @@ impl GitGraph {
                                 let commit_sha = full_sha.clone();
                                 let repository = repository.downgrade();
                                 let workspace = self.workspace.clone();
-                                let graph = cx.weak_entity();
+                                let handlers = self.changed_file_row_handlers(cx);
                                 let selected_changed_file = self.selected_changed_file.clone();
                                 uniform_list(
                                     "changed-files-list",
                                     row_count,
                                     move |range, _window, cx| {
+                                        // One indent step in from the directory
+                                        // header, measured from the project
+                                        // panel's own setting so the two trees
+                                        // read the same. The constant is the
+                                        // header's leading chevron (14px) plus
+                                        // its gap (4px), which the file row has
+                                        // no equivalent of.
+                                        let indent =
+                                            px(18.0
+                                                + ProjectPanelSettings::get_global(cx).indent_size);
                                         range
                                             .map(|ix| match &rows[ix] {
                                                 ChangedFileRow::Directory {
@@ -3957,17 +3596,17 @@ impl GitGraph {
                                                     label.clone(),
                                                     *file_count,
                                                     *collapsed,
-                                                    graph.clone(),
+                                                    handlers.clone(),
                                                 ),
                                                 ChangedFileRow::File(entry) => entry.render(
                                                     ix,
+                                                    indent,
                                                     commit_sha.clone(),
                                                     repository.clone(),
                                                     workspace.clone(),
-                                                    graph.clone(),
+                                                    handlers.clone(),
                                                     selected_changed_file.as_ref()
                                                         == Some(&entry.repo_path),
-                                                    cx,
                                                 ),
                                             })
                                             .collect()
@@ -8424,58 +8063,6 @@ mod tests {
     }
 
     #[test]
-    fn test_split_commit_message() {
-        let (subject, body) = split_commit_message("Just a subject");
-        assert_eq!(subject, "Just a subject");
-        assert_eq!(body, "");
-
-        let (subject, body) =
-            split_commit_message("Subject line\n\nFirst paragraph.\n\nSecond paragraph.\n\n");
-        assert_eq!(subject, "Subject line");
-        assert_eq!(
-            body, "First paragraph.\n\nSecond paragraph.",
-            "the blank line git puts after the subject and the trailing newlines are dropped, \
-             but blank lines inside the body are kept"
-        );
-
-        let (subject, body) = split_commit_message("Subject\nBody starts immediately");
-        assert_eq!(subject, "Subject");
-        assert_eq!(body, "Body starts immediately");
-
-        let (subject, body) = split_commit_message("");
-        assert_eq!(subject, "");
-        assert_eq!(body, "");
-    }
-
-    /// The identity line is the one place the sidebar parses real markdown, so
-    /// the author name has to be escaped and the email has to come out as a
-    /// `mailto:` link with the angle brackets outside it.
-    #[test]
-    fn test_commit_identity_source() {
-        assert_eq!(
-            commit_identity_source("550e4c28", "antivanov", "anton@citeck.ru", None).as_ref(),
-            "550e4c28 antivanov \\<[anton@citeck.ru](mailto:anton@citeck.ru)\\>"
-        );
-
-        assert_eq!(
-            commit_identity_source("550e4c28", "a_b*c", "", None).as_ref(),
-            "550e4c28 a\\_b\\*c",
-            "markdown inline markers in an author name must not become formatting"
-        );
-
-        assert_eq!(
-            commit_identity_source("550e4c28", "", "", None).as_ref(),
-            "550e4c28"
-        );
-
-        let with_date = commit_identity_source("550e4c28", "Ada", "ada@example.com", Some(0));
-        assert!(
-            with_date.contains(" on "),
-            "a resolved timestamp gets an `on <date> at <time>` suffix: {with_date}"
-        );
-    }
-
-    #[test]
     fn test_format_branches_containing() {
         assert_eq!(format_branches_containing(&[]), None);
         assert_eq!(
@@ -8494,54 +8081,6 @@ mod tests {
             format_branches_containing(&many).as_deref(),
             Some("In 8 branches: b0, b1, b2, b3, b4 and 3 more"),
             "a commit on a busy branch must not spell out every branch name"
-        );
-    }
-
-    fn changed_file_entry(path: &str) -> ChangedFileEntry {
-        ChangedFileEntry::from_commit_file(&CommitFile {
-            path: RepoPath::new(path).expect("valid repo path"),
-            old_text: Some("old".to_string()),
-            new_text: Some("new".to_string()),
-            is_binary: false,
-        })
-    }
-
-    #[test]
-    fn test_build_changed_file_rows_groups_by_directory() {
-        let entries = vec![
-            changed_file_entry("docs/plans/b.md"),
-            changed_file_entry("README.md"),
-            changed_file_entry("docs/plans/a.md"),
-        ];
-        let root: SharedString = "my-repo".into();
-
-        let rows = build_changed_file_rows(&entries, &root, &HashSet::default());
-        let described: Vec<String> = rows.iter().map(describe_changed_file_row).collect();
-        assert_eq!(
-            described,
-            vec![
-                "dir[key=, label=my-repo, 1]".to_string(),
-                "file[README.md]".to_string(),
-                "dir[key=docs/plans, label=docs/plans, 2]".to_string(),
-                "file[a.md]".to_string(),
-                "file[b.md]".to_string(),
-            ],
-            "root-level files sit under a header named after the repository, \
-             and each directory group is sorted by file name"
-        );
-
-        let mut collapsed = HashSet::default();
-        collapsed.insert(SharedString::from("docs/plans"));
-        let rows = build_changed_file_rows(&entries, &root, &collapsed);
-        let described: Vec<String> = rows.iter().map(describe_changed_file_row).collect();
-        assert_eq!(
-            described,
-            vec![
-                "dir[key=, label=my-repo, 1]".to_string(),
-                "file[README.md]".to_string(),
-                "dir[key=docs/plans, label=docs/plans, 2]".to_string(),
-            ],
-            "a collapsed directory hides its files but keeps its count"
         );
     }
 
@@ -8831,17 +8370,5 @@ mod tests {
             assert_eq!(graph.selected_entry_idxs, rows([0]));
             assert_eq!(graph.selection_anchor_idx, None);
         });
-    }
-
-    fn describe_changed_file_row(row: &ChangedFileRow) -> String {
-        match row {
-            ChangedFileRow::Directory {
-                key,
-                label,
-                file_count,
-                ..
-            } => format!("dir[key={key}, label={label}, {file_count}]"),
-            ChangedFileRow::File(entry) => format!("file[{}]", entry.file_name),
-        }
     }
 }
