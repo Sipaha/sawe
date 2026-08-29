@@ -6144,6 +6144,15 @@ impl Render for GitPanel {
         let project = self.project.read(cx);
         let has_entries = !self.entries.is_empty();
         let has_write_access = self.has_write_access(cx);
+        // Every action below whose target is the Changes selection is only
+        // registered while that selection is on screen. `dispatch_context`
+        // withholds the `ChangesList` key context on the Commit tab, but the
+        // command palette dispatches by action name and never consults the
+        // keymap — without this it could stage, restore or diff a file the user
+        // cannot see. Nothing between this element and the window root handles
+        // these actions, so unregistering them makes them inert rather than
+        // handing them to somebody else.
+        let shows_changes_list = self.active_tab == GitPanelTab::Changes;
 
         #[cfg(feature = "call")]
         let has_co_authors = self
@@ -6167,38 +6176,42 @@ impl Render for GitPanel {
             .key_context(self.dispatch_context(window, cx))
             .track_focus(&self.focus_handle)
             .when(has_write_access && !project.is_read_only(cx), |this| {
-                this.on_action(cx.listener(Self::toggle_staged_for_selected))
-                    .on_action(cx.listener(Self::stage_range))
-                    .on_action(cx.listener(GitPanel::on_commit))
+                this.on_action(cx.listener(GitPanel::on_commit))
                     .on_action(cx.listener(GitPanel::on_amend))
                     .on_action(cx.listener(GitPanel::toggle_signoff_enabled))
                     .on_action(cx.listener(Self::stage_all))
                     .on_action(cx.listener(Self::unstage_all))
-                    .on_action(cx.listener(Self::stage_selected))
-                    .on_action(cx.listener(Self::unstage_selected))
                     .on_action(cx.listener(Self::restore_tracked_files))
-                    .on_action(cx.listener(Self::revert_selected))
-                    .on_action(cx.listener(Self::add_to_gitignore))
-                    .on_action(cx.listener(Self::add_to_git_info_exclude))
                     .on_action(cx.listener(Self::clean_all))
                     .on_action(cx.listener(Self::generate_commit_message_action))
                     .on_action(cx.listener(Self::stash_all))
                     .on_action(cx.listener(Self::stash_pop))
+                    .when(shows_changes_list, |this| {
+                        this.on_action(cx.listener(Self::toggle_staged_for_selected))
+                            .on_action(cx.listener(Self::stage_range))
+                            .on_action(cx.listener(Self::stage_selected))
+                            .on_action(cx.listener(Self::unstage_selected))
+                            .on_action(cx.listener(Self::revert_selected))
+                            .on_action(cx.listener(Self::add_to_gitignore))
+                            .on_action(cx.listener(Self::add_to_git_info_exclude))
+                    })
             })
-            .on_action(cx.listener(Self::collapse_selected_entry))
-            .on_action(cx.listener(Self::expand_selected_entry))
-            .on_action(cx.listener(Self::select_first))
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::select_previous))
-            .on_action(cx.listener(Self::select_last))
-            .on_action(cx.listener(Self::first_entry))
-            .on_action(cx.listener(Self::next_entry))
-            .on_action(cx.listener(Self::previous_entry))
-            .on_action(cx.listener(Self::last_entry))
+            .when(shows_changes_list, |this| {
+                this.on_action(cx.listener(Self::collapse_selected_entry))
+                    .on_action(cx.listener(Self::expand_selected_entry))
+                    .on_action(cx.listener(Self::select_first))
+                    .on_action(cx.listener(Self::select_next))
+                    .on_action(cx.listener(Self::select_previous))
+                    .on_action(cx.listener(Self::select_last))
+                    .on_action(cx.listener(Self::first_entry))
+                    .on_action(cx.listener(Self::next_entry))
+                    .on_action(cx.listener(Self::previous_entry))
+                    .on_action(cx.listener(Self::last_entry))
+                    .on_action(cx.listener(Self::open_diff))
+                    .on_action(cx.listener(Self::open_accordion_diff))
+                    .on_action(cx.listener(Self::jump_to_source))
+            })
             .on_action(cx.listener(Self::close_panel))
-            .on_action(cx.listener(Self::open_diff))
-            .on_action(cx.listener(Self::open_accordion_diff))
-            .on_action(cx.listener(Self::jump_to_source))
             .on_action(cx.listener(Self::focus_changes_list))
             .on_action(cx.listener(Self::focus_editor))
             .on_action(cx.listener(Self::expand_commit_editor))
@@ -9249,6 +9262,114 @@ mod tests {
                  changes list — `escape` returns focus to the editor"
             );
         });
+    }
+
+    /// `dispatch_context` only governs the *keymap*. The command palette
+    /// dispatches by action name straight into the focused panel, so narrowing
+    /// the key context left `git::ToggleStaged`, `git::RestoreFile` and
+    /// `menu::Confirm` palette-reachable while the Commit tab hid the selection
+    /// they act on — staging, restoring and diffing files with nothing on
+    /// screen to show for it. The panel must therefore stop *registering* them,
+    /// which is what `Window::available_actions` — the exact list the palette
+    /// builds itself from — is asserted against here.
+    #[gpui::test]
+    async fn test_the_commit_tab_hides_the_changes_selection_actions(cx: &mut TestAppContext) {
+        const SELECTION_SCOPED: &[&str] = &[
+            "git::ToggleStaged",
+            "git::StageRange",
+            "git::StageFile",
+            "git::UnstageFile",
+            "git::RestoreFile",
+            "git::AddToGitignore",
+            "git::AddToGitInfoExclude",
+            "git_panel::ExpandSelectedEntry",
+            "git_panel::CollapseSelectedEntry",
+            "git_panel::FirstEntry",
+            "git_panel::LastEntry",
+            "git_panel::NextEntry",
+            "git_panel::PreviousEntry",
+            "menu::SelectFirst",
+            "menu::SelectLast",
+            "menu::SelectNext",
+            "menu::SelectPrevious",
+            "menu::Confirm",
+            "menu::SecondaryConfirm",
+            "git_panel::JumpToSource",
+        ];
+
+        let NestedRepoSolution {
+            project,
+            member_root,
+            ..
+        } = setup_nested_repo_solution(cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        // The panel has to be a real dock panel: `available_actions` reads the
+        // *rendered* frame's dispatch tree, so an unrendered panel would report
+        // nothing and the test would pass without proving anything.
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = GitPanel::new(workspace, window, cx);
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+            panel
+        });
+        let repository = repo_with_work_directory(&project, &member_root, cx);
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.focus_handle.focus(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        let available = |cx: &mut VisualTestContext| -> Vec<String> {
+            cx.update(|window, cx| {
+                window
+                    .available_actions(cx)
+                    .iter()
+                    .map(|action| action.name().to_string())
+                    .collect()
+            })
+        };
+
+        let on_changes = available(cx);
+        for name in SELECTION_SCOPED {
+            assert!(
+                on_changes.iter().any(|available| available == name),
+                "precondition: `{name}` is palette-reachable on the Changes tab"
+            );
+        }
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+            panel.focus_handle.focus(window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        let on_commit = available(cx);
+        assert!(
+            on_commit
+                .iter()
+                .any(|available| available == "git_panel::ActivateChangesTab"),
+            "the panel is still in the dispatch tree — otherwise the assertions \
+             below would hold for the wrong reason"
+        );
+        for name in SELECTION_SCOPED {
+            assert!(
+                !on_commit.iter().any(|available| available == name),
+                "`{name}` acts on the hidden Changes selection and must not be \
+                 palette-reachable while the Commit tab is showing"
+            );
+        }
     }
 
     /// A commit belongs to the repository it was read from, so a repository
