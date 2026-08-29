@@ -101,18 +101,34 @@ To disable this behavior use:
   "line_indicator_format": "long"
 
   // Individual status bar icons can be hidden:
-  // "project_panel": {"button": false },
-  // "outline_panel": {"button": false },
-  // "collaboration_panel": {"button": false },
-  // "git_panel": {"button": false },
-
-  // "agent": {"button": false },
-  // "debugger": {"button": false },  // inert in Sawe: the debugger lives in
-                                      // the Solution band, not a dock strip
   // "diagnostics": {"button": false },
   // "search": {"button": false },
 }
 ```
+
+The three buttons at the far left of the status bar select what the Solution
+band's utility section shows — Terminal, Git Graph or Debug — and hide the
+section when you click the one already selected. They have no `button`
+setting: they are the only affordance that reaches the git graph, so hiding
+them would strand a whole content behind nothing.
+
+The project-zone panel toggles are **not** status bar icons in Sawe. They
+live in the project toolbar, the row directly under the solution tabs, and
+their `button` settings still control them from there:
+
+```json [settings]
+{
+  // "project_panel": { "button": false },
+  // "outline_panel": { "button": false },
+  // "git_panel": { "button": false },
+}
+```
+
+`"agent"`, `"collaboration_panel"` and `"debugger"` also accept a `button`
+setting, but all three are inert here: the upstream agent panel and the
+collab panel are not mounted in this fork, and the debugger is an occupant
+of the Solution band's utility section rather than a dock panel, so it has
+no toggle button to hide.
 
 ### Titlebar
 

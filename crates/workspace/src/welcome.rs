@@ -3,8 +3,8 @@
 //! Welcome is a top-level window in its own right (root view =
 //! `WelcomeWindow`), NOT a workspace tab. The previous design embedded
 //! a `WelcomePage` Item inside a regular `Workspace`, which forced a
-//! pile of conditional gates (hide dock strips, hide status bar, hide
-//! project panel, close all docks, …) to keep the launcher chrome-
+//! pile of conditional gates (hide the panel toggles, hide status bar,
+//! hide project panel, close all docks, …) to keep the launcher chrome-
 //! free. Now the launcher window doesn't share any structure with a
 //! Solution workspace, so chrome can't accidentally bleed in.
 //!

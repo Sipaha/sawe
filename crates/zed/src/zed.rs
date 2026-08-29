@@ -510,7 +510,10 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                     // surface is `solution_agent`, not upstream's agent panel).
                     // Re-adding it on every active-workspace switch was a
                     // leftover that reintroduced the stray ZedAssistant
-                    // (sparkle) toggle button in the left dock strip. The
+                    // (sparkle) toggle button among the dock panel toggles —
+                    // which since phase 2b task 7 live in the project
+                    // toolbar (`title_bar::project_toolbar`), the vertical
+                    // dock strips having been deleted in task 8. The
                     // guarded source-init above is inert while the panel is
                     // unmounted and stays only so re-enabling is a one-line
                     // change (restore the `ensure_agent_panel_for_workspace`
