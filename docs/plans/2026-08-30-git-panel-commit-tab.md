@@ -116,11 +116,19 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
     user-driven routes (the tab-bar row, `git_panel::ActivateCommitTab`) go
     through `set_active_tab`, which does focus. If Task 3 wants the panel
     focused on a graph selection it has to ask for that explicitly.
-50. **`set_active_tab` refuses `GitPanelTab::Commit` while the tab is closed**,
-    and that guard is load-bearing for the ✕: the close button is nested inside
-    the tab row's own `on_click`, so the row's `set_active_tab(Commit)` fires
-    too — and no-ops, because `close_commit_tab` already took the state. No
-    `stop_propagation` dance was needed.
+50. **CORRECTED by the Task 2 review — the ✕ does NOT let the row's click
+    through.** `ButtonLike`'s click wrapper calls `cx.stop_propagation()` before
+    the handler (`crates/ui/src/components/button/button_like.rs:767-773`), and
+    GPUI bubbles listeners with `for … in mouse_listeners.iter_mut().rev() { … if
+    !cx.propagate_event { break } }` (`crates/gpui/src/window.rs:4669-4677`) while
+    `Interactivity::paint` registers the parent's listeners *before* the child's
+    (`crates/gpui/src/elements/div.rs:2236` vs `:2262`) — so the nested ✕ runs
+    first and the tab row's `on_click` never runs at all. A `stop_propagation`
+    dance IS in play; it is just `ButtonLike`'s, not ours. `set_active_tab`'s
+    refusal of `GitPanelTab::Commit` while the tab is closed is therefore
+    belt-and-braces, not the mechanism. **Do not build on the original claim** —
+    replacing the ✕ with an element that does not stop propagation would strand
+    the panel on an empty tab.
 51. **`close_commit_tab` emits `Event::CommitTabClosed` only when a tab was
     actually open** (early return on `take().is_none()`). A redundant close is
     already silent, so Task 3's feedback-loop guard has one less case.
@@ -136,6 +144,12 @@ Two read-only agents mapped the panel and the graph. Everything below is cited; 
     directory header's indent, which lands the file rows at 38px — the same
     left edge as the Changes tab's depth-1 rows *and* as the graph sidebar's
     file rows. The graph's `.ml_neg_1()` is deliberately not carried over. The
+    **Density caveat (Task 2 review):** `ButtonLike`'s 4px is
+    `DynamicSpacing::Base04`, whose tuple is `(2, 4, 6)`
+    (`crates/ui/src/styles/spacing.rs`) — 4px only at `UiDensity::Default`, and it
+    is `rems()`, so it scales with `ui_font_size`. `COMMIT_TREE_INDENT` and the
+    Changes tab's `content_row_padding` are absolute px, so the two trees align
+    exactly on stock settings and drift a couple of pixels otherwise. The
     headers then sit 2px inside the Changes tab's 6px section headers; closing
     that last 2px would mean either editing the shared `render_changed_directory_row`
     (which would move the graph's still-live sidebar too) or a magic negative
