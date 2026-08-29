@@ -1510,19 +1510,50 @@ impl SolutionAgentStore {
     /// nothing at all when the solution has no sessions eligible to be the
     /// active dialog. See `last_dialog_session`'s field doc for why the
     /// reopen target is in-memory rather than persisted.
+    ///
+    /// The remembered id is validated (`session_can_be_active_dialog`)
+    /// before use, NOT trusted blindly. `clear_active_dialog_for_session`
+    /// scrubs `last_dialog_session` on the two teardown paths it knows
+    /// about (`close_session`, `purge_session_hard`), but this hotkey must
+    /// not depend on having enumerated every path that can make a session
+    /// disappear or stop qualifying (`cold_close_solution` deliberately
+    /// does NOT clear it, for instance — see that function's doc). A stale
+    /// id here silently falls through to the `tab_order` fallback instead
+    /// of reopening on — or worse, persisting — a dead session (review
+    /// fix-round 1, Critical).
     pub fn toggle_dialog_session(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
         if self.active_dialog_session(solution_id).is_some() {
             self.set_active_dialog_session(solution_id, None, cx);
             return;
         }
-        let reopen_target = self
+        let remembered = self
             .last_dialog_session
             .get(&solution_id)
             .copied()
-            .or_else(|| self.first_tab_order_session(solution_id, cx));
+            .filter(|id| self.session_can_be_active_dialog(solution_id, *id, cx));
+        let reopen_target = remembered.or_else(|| self.first_tab_order_session(solution_id, cx));
         if let Some(session_id) = reopen_target {
             self.set_active_dialog_session(solution_id, Some(session_id), cx);
         }
+    }
+
+    /// Whether `id` is a session of `solution_id` currently eligible to be
+    /// the Solution band's active dialog — the same
+    /// `can_be_active_dialog` predicate `session_tab_strip::candidates_for`
+    /// filters tabs on, scoped to the given solution the same way
+    /// `sessions_for` scopes it there. `false` for an id that doesn't
+    /// resolve to a live session at all (closed/purged), not just for one
+    /// that resolves but is ineligible.
+    fn session_can_be_active_dialog(
+        &self,
+        solution_id: SolutionId,
+        id: SolutionSessionId,
+        cx: &App,
+    ) -> bool {
+        self.session(id).is_some_and(|session| {
+            let session = session.read(cx);
+            session.solution_id == solution_id && session.can_be_active_dialog()
+        })
     }
 
     /// The session with the lowest `tab_order` among `solution_id`'s
@@ -1678,12 +1709,18 @@ impl SolutionAgentStore {
     }
 
     /// Drop a solution's in-memory band geometry (and any pending write for
-    /// it). The matching row is deleted by `delete_by_solution` on the same
-    /// `purge_solution_fully` path — see the call site there.
+    /// it), plus its `ctrl-shift-a` reopen memory. The matching row is
+    /// deleted by `delete_by_solution` on the same `purge_solution_fully`
+    /// path — see the call site there. `last_dialog_session` lives outside
+    /// `band_state` (it survives a collapse, which `band_state`'s own
+    /// `active_dialog_session` field does not), so a purged solution would
+    /// otherwise leak one bounded entry here forever (review fix-round 1,
+    /// Minor).
     pub(crate) fn forget_band_state(&mut self, solution_id: SolutionId) {
         self.band_state.remove(&solution_id);
         self.band_state_writes.remove(&solution_id);
         self.band_state_touched.remove(&solution_id);
+        self.last_dialog_session.remove(&solution_id);
     }
 
     fn persist_band_state_now(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
@@ -1752,7 +1789,22 @@ impl SolutionAgentStore {
     /// `set_active_dialog_session` put it there — which set that solution's
     /// `active_dialog_session` mask bit. So the clear is always inside a flush
     /// the mask has already scheduled, and marking it again would be a no-op.
+    ///
+    /// Also scrubs `last_dialog_session` of any entry pointing at `id`,
+    /// unconditionally — NOT gated on `affected` being non-empty. The two
+    /// maps diverge exactly when a band was already collapsed before `id`
+    /// went away: `active_dialog_session` reads `None` by then (so `id`
+    /// wouldn't show up in `affected`), but `last_dialog_session` still
+    /// remembers `id` from before the collapse, and without this scrub
+    /// `ctrl-shift-a` would reopen on a dead id (review fix-round 1,
+    /// Critical). `toggle_dialog_session` independently re-validates
+    /// whatever it reads from `last_dialog_session` before using it, so
+    /// this scrub is defense-in-depth, not the only thing standing between
+    /// the hotkey and a dangling id — but it is what keeps the map itself
+    /// honest for anything else that might read it later.
     fn clear_active_dialog_for_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        self.last_dialog_session.retain(|_, remembered| *remembered != id);
+
         let affected: Vec<SolutionId> = self
             .band_state
             .iter()

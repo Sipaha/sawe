@@ -6661,3 +6661,120 @@ async fn toggle_dialog_session_is_noop_with_no_sessions(cx: &mut TestAppContext)
         });
     });
 }
+
+/// Fix-round 1, Critical: `last_dialog_session` must not go stale when its
+/// remembered session is closed. `S` becomes the active dialog
+/// (`last_dialog_session[X] = S`); closing `S` clears `active_dialog_session`
+/// (`clear_active_dialog_for_session`) but, before the fix, left
+/// `last_dialog_session[X] = S` dangling — so the next `ctrl-shift-a` would
+/// reopen on the dead id: rendering nothing (the id no longer resolves to a
+/// session) and persisting a dangling `active_dialog_session` into the DB.
+/// This pins BOTH halves of the fix: `clear_active_dialog_for_session`
+/// scrubbing the map on close, AND `toggle_dialog_session` independently
+/// validating whatever it reads from the map before trusting it (defends
+/// against any OTHER path that removes a session without going through
+/// `clear_active_dialog_for_session`).
+#[gpui::test]
+async fn toggle_dialog_session_does_not_reopen_a_closed_remembered_session(
+    cx: &mut TestAppContext,
+) {
+    let (solution_id, _tmp, agent_id, project) = setup_toggle_dialog_fixture(cx).await;
+
+    // `session_a` (tab_order 0) is the only OTHER open tab and must be what
+    // the hotkey falls through to; `session_s` (tab_order 1) is the one
+    // remembered, then closed.
+    let session_a = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session a");
+    let session_s = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session s");
+
+    // Wire up real persistence so the "no dangling id reaches the persisted
+    // row" half of the assertion is checking the actual DB, not just
+    // in-memory state.
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // `session_s` becomes the active dialog, and therefore
+    // `last_dialog_session`.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, Some(session_s), cx)
+        });
+    });
+
+    // Close `session_s`. `active_dialog_session` correctly collapses to
+    // `None`; before the fix `last_dialog_session` kept pointing at the
+    // now-closed session.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store
+            .update(cx, |store, cx| store.close_session(session_s, cx))
+            .expect("close_session");
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                None,
+                "sanity: closing the active dialog's session collapses the band"
+            );
+        });
+    });
+
+    // The hotkey: must open a LIVE session (`session_a`, the only tab left),
+    // never the dead `session_s`.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.toggle_dialog_session(solution_id, cx));
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                Some(session_a),
+                "must fall through to a live tab_order session, not the dead remembered one"
+            );
+        });
+    });
+
+    // Read the persisted row straight from the DB (not through the store),
+    // so a bug that corrupted only the persisted row -- not the in-memory
+    // state -- would still be caught.
+    let persisted = db.load_band_states().await.expect("load_band_states");
+    let (_, band_state) = persisted
+        .into_iter()
+        .find(|(id, _)| *id == solution_id)
+        .expect("band row for solution");
+    assert_eq!(
+        band_state.active_dialog_session,
+        Some(session_a),
+        "persisted row must reflect the live session, never the dangling session_s"
+    );
+}
