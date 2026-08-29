@@ -35,10 +35,24 @@ use time::{UtcOffset, format_description::BorrowedFormatItem};
 /// against the tree that shipped before.
 const COMMIT_TREE_INDENT: f32 = 18.0 + TREE_INDENT;
 
-/// Cap on the Commit tab's message block. Without it a long commit message
-/// pushes the changed-files tree out of a dock-width panel entirely; the block
-/// scrolls past this height and a short message still takes only what it needs.
+/// Cap on the Commit tab's message block *when there is room for it*.
+///
+/// The block is not pinned at this height: it is a flex child with
+/// [`COMMIT_MESSAGE_MIN_HEIGHT`] as its floor, so on a dock-height panel it
+/// gives its space back to the changed-files tree instead of pushing the tree
+/// off the bottom. It scrolls internally, so shrinking it costs only scrolling.
 const COMMIT_MESSAGE_MAX_HEIGHT: f32 = 200.0;
+
+/// Floor of the Commit tab's message block: enough for the first line of the
+/// subject plus the block's own vertical padding, so that however short the
+/// panel gets the user can still see *which* commit the tab is describing.
+const COMMIT_MESSAGE_MIN_HEIGHT: f32 = 44.0;
+
+/// Floor of the changed-files tree. The tree is the tab's payload, so it gets
+/// a guaranteed share rather than absorbing every shortfall as the `flex_1`
+/// child: without this the message block and the identity row together left it
+/// zero pixels on a git panel at its shipped dock height.
+const COMMIT_FILE_TREE_MIN_HEIGHT: f32 = 72.0;
 
 /// What a changed-files row does when the user acts on it. The tree is hosted
 /// by two views that share no type, so each host supplies its own behaviour as
@@ -319,54 +333,75 @@ pub fn split_commit_message(message: &str) -> (SharedString, SharedString) {
     (subject.into(), body.into())
 }
 
-/// Escape the CommonMark inline markers that could turn an author name into
-/// formatting. Only the markers that can *start* an inline construct are
-/// escaped — over-escaping would show up verbatim in the text the user copies
-/// out of the tab, since `markdown::Copy` copies from the source.
-fn escape_markdown_inline(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for character in text.chars() {
-        if matches!(character, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
+/// Spec §5's `short hash · author · date`, pre-split so that a panel too
+/// narrow for the whole line truncates the author rather than dropping the
+/// date off the end.
+///
+/// The sidebar this tab replaced rendered
+/// `<sha> <author> <email> on <date> at <time>` as one markdown run. At a
+/// dock's width that wraps to three lines, and those lines came straight out
+/// of the changed-files tree's vertical budget — measured at 63px against a
+/// 282px tab body. The email and the time of day therefore live in
+/// [`CommitIdentity::tooltip`] instead of on the line.
+struct CommitIdentity {
+    short_sha: SharedString,
+    author: Option<SharedString>,
+    date: Option<SharedString>,
+    /// The full identity, including everything the line itself drops.
+    tooltip: SharedString,
 }
 
-/// The markdown source of IDEA's identity line:
-/// `550e4c28 antivanov <anton.ivanov@citeck.ru> on 14 Aug 2026 at 06:24`.
-/// The email is a real `mailto:` link; the rest is plain text so the whole
-/// line stays selectable as one run.
-pub fn commit_identity_source(
+fn commit_identity(
     short_sha: &str,
     author_name: &str,
     author_email: &str,
     timestamp: Option<i64>,
-) -> SharedString {
-    let mut source = escape_markdown_inline(short_sha);
+) -> CommitIdentity {
+    let mut tooltip = short_sha.to_string();
     if !author_name.is_empty() {
-        source.push(' ');
-        source.push_str(&escape_markdown_inline(author_name));
+        tooltip.push_str(" · ");
+        tooltip.push_str(author_name);
     }
     if !author_email.is_empty() {
-        // The angle brackets are escaped and sit *outside* the link so the
-        // parser cannot read them as an HTML tag or a nested autolink.
-        source.push_str(&format!(
-            " \\<[{}](mailto:{})\\>",
-            escape_markdown_inline(author_email),
-            author_email
-        ));
+        tooltip.push_str(if author_name.is_empty() { " · " } else { " " });
+        tooltip.push('<');
+        tooltip.push_str(author_email);
+        tooltip.push('>');
     }
     if let Some(timestamp) = timestamp {
-        source.push_str(" on ");
-        source.push_str(&escape_markdown_inline(&format_detail_timestamp(timestamp)));
+        tooltip.push_str(" · ");
+        tooltip.push_str(&format_detail_timestamp(timestamp));
     }
-    source.into()
+
+    CommitIdentity {
+        short_sha: short_sha.to_string().into(),
+        author: (!author_name.is_empty()).then(|| author_name.to_string().into()),
+        date: timestamp.map(|timestamp| format_identity_date(timestamp).into()),
+        tooltip: tooltip.into(),
+    }
+}
+
+/// The line's three pieces share one style; a helper keeps them provably
+/// identical rather than repeating the builder chain three times.
+fn identity_label(text: SharedString) -> Label {
+    Label::new(text).size(LabelSize::Small).color(Color::Muted)
+}
+
+fn identity_separator() -> Label {
+    identity_label("·".into())
+}
+
+/// The line's date carries no time of day: it is the half of the timestamp a
+/// user scanning a commit list is actually reading, and the panel is narrow.
+fn identity_date_format() -> &'static [BorrowedFormatItem<'static>] {
+    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
+    FORMAT.get_or_init(|| {
+        time::format_description::parse("[day] [month repr:short] [year]").unwrap_or_default()
+    })
 }
 
 /// `on <date> at <time>` reads better with the two halves separated, so the
-/// Commit tab spells the time out instead of reusing the log column's compact
+/// tooltip spells the time out instead of reusing the log column's compact
 /// `[day] [month] [year] [hour]:[minute]`.
 fn detail_timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
     static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
@@ -376,7 +411,7 @@ fn detail_timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
     })
 }
 
-fn format_detail_timestamp(timestamp: i64) -> String {
+fn format_with(timestamp: i64, format: &[BorrowedFormatItem<'static>]) -> String {
     let Ok(datetime) = OffsetDateTime::from_unix_timestamp(timestamp) else {
         return "Unknown".to_string();
     };
@@ -384,8 +419,16 @@ fn format_detail_timestamp(timestamp: i64) -> String {
     let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     datetime
         .to_offset(local_offset)
-        .format(detail_timestamp_format())
+        .format(format)
         .unwrap_or_default()
+}
+
+fn format_identity_date(timestamp: i64) -> String {
+    format_with(timestamp, identity_date_format())
+}
+
+fn format_detail_timestamp(timestamp: i64) -> String {
+    format_with(timestamp, detail_timestamp_format())
 }
 
 /// Style for the selectable single-line text fields of the Commit tab,
@@ -511,9 +554,8 @@ struct CommitDetailText {
     /// bare URLs become links) so that the `#`, `*` and backticks commit
     /// messages are full of are not swallowed as markdown syntax.
     body: Entity<Markdown>,
-    /// `<short-sha> <author> <email> on <date> at <time>` — see
-    /// [`commit_identity_source`].
-    identity: Entity<Markdown>,
+    /// `<short sha> · <author> · <date>` — see [`commit_identity`].
+    identity: CommitIdentity,
 }
 
 /// Everything the Commit tab shows.
@@ -693,16 +735,15 @@ impl GitPanel {
                 let loaded = match loaded {
                     Ok(Ok(details)) => {
                         let (subject, body) = split_commit_message(&details.message);
-                        let identity = commit_identity_source(
-                            &details.short_sha(),
-                            &details.author_name,
-                            &details.author_email,
-                            Some(details.commit_timestamp),
-                        );
                         let text = CommitDetailText {
                             subject: cx.new(|cx| Markdown::new_text(subject, cx)),
                             body: cx.new(|cx| Markdown::new_text(body, cx)),
-                            identity: cx.new(|cx| Markdown::new(identity, None, None, cx)),
+                            identity: commit_identity(
+                                &details.short_sha(),
+                                &details.author_name,
+                                &details.author_email,
+                                Some(details.commit_timestamp),
+                            ),
                         };
                         Ok((details, text))
                     }
@@ -997,8 +1038,6 @@ impl GitPanel {
                 );
                 let body_style =
                     detail_text_style(TextSize::Default, Color::Default, None, window, cx);
-                let identity_style =
-                    detail_text_style(TextSize::Small, Color::Muted, None, window, cx);
                 let has_body = !text.body.read(cx).source().is_empty();
 
                 let author_email =
@@ -1009,9 +1048,16 @@ impl GitPanel {
                     .render(window, cx);
 
                 body.child(
+                    // Shrinkable between its floor and its cap rather than
+                    // pinned at the cap: on a dock-height panel the tab body
+                    // has ~282px to spend, and a fixed 200px message left the
+                    // changed-files tree nothing. Flex does the arithmetic, so
+                    // nothing here has to read the available height — which it
+                    // could only do from layout, where a `cx.notify()` would be
+                    // discarded and a re-derive-and-notify would spin.
                     div()
                         .id("commit-tab-message")
-                        .flex_shrink_0()
+                        .min_h(px(COMMIT_MESSAGE_MIN_HEIGHT))
                         .max_h(px(COMMIT_MESSAGE_MAX_HEIGHT))
                         .overflow_y_scroll()
                         .child(
@@ -1031,26 +1077,38 @@ impl GitPanel {
                                 })),
                         ),
                 )
-                // `flex_1` on the text, not just `min_w_0`: in a row flex a
-                // child's width comes from its own content and `min_w_0` lets
-                // it shrink to nothing, so a narrow dock could hand the
-                // markdown a one-character width and wrap the identity line
-                // vertically.
+                // One line, always: only the author is allowed to shrink, and
+                // it truncates rather than wrapping. A wrapped identity row is
+                // vertical budget taken from the changed-files tree below it.
                 .child(
                     h_flex()
+                        .id("commit-tab-identity")
                         .flex_shrink_0()
                         .w_full()
                         .px_2()
                         .pb_1p5()
-                        .gap_1p5()
-                        .items_start()
-                        .child(div().flex_shrink_0().pt_0p5().child(avatar))
-                        .child(
-                            div()
-                                .flex_1()
+                        .gap_1()
+                        .items_center()
+                        .child(div().flex_shrink_0().child(avatar))
+                        .child(identity_label(text.identity.short_sha.clone()))
+                        .children(text.identity.author.clone().map(|author| {
+                            h_flex()
                                 .min_w_0()
-                                .child(MarkdownElement::new(text.identity.clone(), identity_style)),
-                        ),
+                                .gap_1()
+                                .child(identity_separator())
+                                .child(identity_label(author).truncate())
+                        }))
+                        .children(text.identity.date.clone().map(|date| {
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .child(identity_separator())
+                                .child(identity_label(date))
+                        }))
+                        .tooltip({
+                            let identity = text.identity.tooltip.clone();
+                            move |_, cx| Tooltip::simple(identity.clone(), cx)
+                        }),
                 )
             }
             (LoadState::Failed(error), _) => body.child(
@@ -1182,7 +1240,10 @@ impl GitPanel {
         div()
             .id("commit-tab-files")
             .flex_1()
-            .min_h_0()
+            // An explicit floor, not `min_h_0()`: as the only `flex_1` child of
+            // the tab body the tree would otherwise absorb the whole shortfall
+            // on a short panel and render zero rows.
+            .min_h(px(COMMIT_FILE_TREE_MIN_HEIGHT))
             .child(
                 uniform_list(
                     "commit-tab-files-list",
@@ -1255,31 +1316,42 @@ mod tests {
         assert_eq!(body, "");
     }
 
-    /// The identity line is the one place the detail surface parses real
-    /// markdown, so the author name has to be escaped and the email has to
-    /// come out as a `mailto:` link with the angle brackets outside it.
+    /// Spec §5's line is `short hash · author · date`; the email and the time
+    /// of day are the tooltip's job, because on the line they wrapped the row
+    /// to three lines in a dock-width panel.
     #[test]
-    fn test_commit_identity_source() {
+    fn test_commit_identity() {
+        let identity = commit_identity("550e4c28", "antivanov", "anton@citeck.ru", None);
+        assert_eq!(identity.short_sha.as_ref(), "550e4c28");
+        assert_eq!(identity.author.as_deref(), Some("antivanov"));
+        assert_eq!(identity.date, None);
         assert_eq!(
-            commit_identity_source("550e4c28", "antivanov", "anton@citeck.ru", None).as_ref(),
-            "550e4c28 antivanov \\<[anton@citeck.ru](mailto:anton@citeck.ru)\\>"
+            identity.tooltip.as_ref(),
+            "550e4c28 · antivanov <anton@citeck.ru>",
+            "the email the line drops has to survive in the tooltip"
         );
 
+        let anonymous = commit_identity("550e4c28", "", "", None);
+        assert_eq!(anonymous.author, None);
+        assert_eq!(anonymous.tooltip.as_ref(), "550e4c28");
+
+        let email_only = commit_identity("550e4c28", "", "ada@example.com", None);
         assert_eq!(
-            commit_identity_source("550e4c28", "a_b*c", "", None).as_ref(),
-            "550e4c28 a\\_b\\*c",
-            "markdown inline markers in an author name must not become formatting"
+            email_only.tooltip.as_ref(),
+            "550e4c28 · <ada@example.com>",
+            "with no author name the email takes the separator the name would have used"
         );
 
-        assert_eq!(
-            commit_identity_source("550e4c28", "", "", None).as_ref(),
-            "550e4c28"
-        );
-
-        let with_date = commit_identity_source("550e4c28", "Ada", "ada@example.com", Some(0));
+        let dated = commit_identity("550e4c28", "Ada", "ada@example.com", Some(0));
+        let date = dated.date.expect("a resolved timestamp yields a date");
         assert!(
-            with_date.contains(" on "),
-            "a resolved timestamp gets an `on <date> at <time>` suffix: {with_date}"
+            !date.contains(':'),
+            "the line's date carries no time of day: {date}"
+        );
+        assert!(
+            dated.tooltip.contains(" at "),
+            "the tooltip keeps the time of day: {}",
+            dated.tooltip
         );
     }
 
