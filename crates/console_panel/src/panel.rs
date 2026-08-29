@@ -555,6 +555,14 @@ impl Focusable for ConsolePanel {
 
 impl Render for ConsolePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Focus that stopped on the panel's own handle is a mis-aimed focus:
+        // the handle belongs to a container with no key handling, so the
+        // keystroke after `ctrl-\`` used to go nowhere. Hand it down to the
+        // terminal the strip is showing.
+        if self.focus_handle.is_focused(window) {
+            self.focus_active_terminal(window, cx);
+        }
+
         // Keep the per-member active-tab memory current from this safe
         // (un-leased) context: record which tab is active for the member we
         // are about to render, so `on_active_member_changed` can stash it
@@ -1391,6 +1399,48 @@ impl ConsolePanel {
             .into_any_element()
     }
 
+    /// Hand focus that landed on the panel itself to the terminal the strip
+    /// is actually showing, so `ctrl-\`` (and every other caller that focuses
+    /// this panel: the task / `runInTerminal` reveal paths, a click on the
+    /// tab strip) leaves the caret where the user can type.
+    ///
+    /// Driven from `render` rather than from a `cx.on_focus` subscription —
+    /// the shape `DebugPanel` uses — because `ConsolePanel::new` is handed
+    /// only a `Context` (every construction site builds it inside `cx.new`,
+    /// including one in another crate's tests) and `cx.on_focus` needs a
+    /// `Window`. Installing the subscription from the first render is one
+    /// frame too late for the case that matters: `ctrl-\`` on a hidden
+    /// section shows the panel and focuses it in the same effect cycle, so
+    /// the subscription's deferred activation misses that frame's focus
+    /// event and focus stays stranded. Redirecting during render also lands
+    /// in the frame being built, so the terminal's own focus-in listener
+    /// runs at the end of *this* draw instead of waiting for another one.
+    ///
+    /// This must stay a redirect rather than the shorter-looking fix of
+    /// returning the terminal's handle from [`Focusable::focus_handle`]: the
+    /// band's `toggle_utility_focus` tri-state asks
+    /// `focus_handle.contains_focused`, which is only true of an ANCESTOR of
+    /// the focused handle — handing out the terminal's own handle would make
+    /// the "visible but unfocused" and "visible and focused" legs
+    /// indistinguishable.
+    ///
+    /// The index has to come from `effective_active_index`, the same
+    /// scope-filtered choice `render_active_tab` paints: `active_index` alone
+    /// can point at a tab belonging to another member, whose view is not in
+    /// the frame at all, and focusing a handle outside the rendered dispatch
+    /// tree strands focus (`Workspace`'s focus-lost listener then yanks it to
+    /// the centre pane).
+    fn focus_active_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scope_flags = self.tab_scope_flags(cx);
+        let Some(index) = effective_active_index(&scope_flags, self.active_index) else {
+            return;
+        };
+        let Some(ConsoleTab::Terminal { view, .. }) = self.tabs.get(index) else {
+            return;
+        };
+        view.focus_handle(cx).focus(window, cx);
+    }
+
     fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         // Per-member active-tab memory is recorded in `render` / handled in
         // `on_active_member_changed`, both of which read the workspace from a
@@ -1995,6 +2045,79 @@ mod tests {
             "a revealed task terminal must actually be the thing on screen"
         );
         assert!(band.read_with(cx, |band, cx| band.utility_visible(cx)));
+    }
+
+    /// `ctrl-\`` has to leave the caret in the terminal, not on the panel's
+    /// own handle — which is a container with no key handling, so every
+    /// keystroke after the hotkey went nowhere until the user clicked into
+    /// the terminal.
+    ///
+    /// The last assertion is the one that speaks about keystrokes rather than
+    /// about focus bookkeeping: `Window::available_actions` is computed from
+    /// the dispatch path of the focused node in the RENDERED frame, so a
+    /// terminal action showing up there means a key event dispatched now
+    /// would traverse the terminal's element. With focus resting on the
+    /// panel root (the bug) that path stops above the terminal and no
+    /// terminal action is reachable.
+    #[gpui::test]
+    async fn toggle_focus_lands_in_the_active_terminal(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, _solution_id) = bootstrap_band_and_panel(cx, true).await;
+        let band = band_of(&window_handle, cx);
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let terminal = panel
+            .read_with(cx, |panel, cx| panel.active_terminal_view(cx))
+            .expect("the panel has one terminal tab");
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                assert!(
+                    terminal.focus_handle(cx).is_focused(window),
+                    "ctrl-` must focus the terminal itself, not the panel around it"
+                );
+                assert!(
+                    panel.focus_handle(cx).contains_focused(window, cx),
+                    "and the panel must still count as focused, or the band's \
+                     tri-state loses its 'visible and focused' leg"
+                );
+                let terminal_action_reachable = window
+                    .available_actions(cx)
+                    .iter()
+                    .any(|action| action.name().starts_with("terminal"));
+                assert!(
+                    terminal_action_reachable,
+                    "a keystroke dispatched now must travel through the \
+                     terminal's element"
+                );
+            })
+            .unwrap();
+
+        // Tri-state, third leg: the section is visible AND focused, so the
+        // next ctrl-` hides it. That decision reads `contains_focused` on the
+        // panel's handle, which the redirect above has to keep true.
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "a second ctrl-` on the focused terminal still hides the section"
+        );
     }
 
     /// Switching the band's utility content away from the occupant that holds
