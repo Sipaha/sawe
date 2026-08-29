@@ -80,7 +80,7 @@ use workspace::{
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
 mod changes_list;
-pub mod commit_tab;
+mod commit_tab;
 
 pub use commit_tab::{CommitSelection, CommitSelectionSource};
 
@@ -1091,6 +1091,19 @@ impl GitPanel {
         self.entries_indices.get(path).copied()
     }
 
+    /// Move the Changes list's selection onto `path`, expanding whatever
+    /// section or tree directories were hiding it.
+    ///
+    /// Deliberately **not** guarded on `active_tab == GitPanelTab::Changes`,
+    /// unlike the 20 selection-scoped actions the panel unregisters off the
+    /// Changes tab. The caller is `project_diff`, which syncs on every
+    /// `EditorEvent::SelectionsChanged { local: true }` so that the list is
+    /// already pointing at the right row whenever the user comes back to it.
+    /// From the Commit tab that work happens against an unrendered list: it
+    /// changes no repository state, opens nothing, leaks nothing, and the
+    /// expanded sections it leaves behind are what the user would have seen
+    /// had they been on Changes all along. Guarding it would instead mean the
+    /// Changes list is stale the moment the Commit tab is closed.
     pub fn select_entry_by_path(
         &mut self,
         path: ProjectPath,

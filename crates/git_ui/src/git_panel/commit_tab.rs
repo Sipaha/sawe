@@ -1,6 +1,6 @@
 //! The building blocks of a *commit's* detail surface: the changed-files tree,
-//! the commit-message split, the markdown identity line and the client-side
-//! +/− totals.
+//! the commit-message split, the `short hash · author · date` identity line
+//! and the client-side +/− totals.
 //!
 //! These were written for the git graph's inline detail sidebar, which the
 //! Commit tab replaced; they moved down here from `git_graph.rs` because
@@ -60,30 +60,33 @@ const COMMIT_MESSAGE_MIN_HEIGHT: f32 = 44.0;
 /// zero pixels on a git panel at its shipped dock height.
 const COMMIT_FILE_TREE_MIN_HEIGHT: f32 = 72.0;
 
-/// What a changed-files row does when the user acts on it. The tree is hosted
-/// by two views that share no type, so each host supplies its own behaviour as
-/// `&mut App` closures built from its own weak handle rather than the rows
-/// naming a concrete view.
+/// What a changed-files row does when the user acts on it, supplied by the
+/// host as `&mut App` closures built from its own weak handle rather than the
+/// rows naming a concrete view. The indirection dates from the tree having two
+/// hosts that shared no type; the git graph's sidebar is gone and the Commit
+/// tab is the only host left, but erasing the host is also what keeps these
+/// closures safe to install into event callbacks under the panel's own lease
+/// — see [`GitPanel::commit_file_row_handlers`].
 #[derive(Clone)]
-pub struct ChangedFileRowHandlers {
+struct ChangedFileRowHandlers {
     /// Left click on a file row — marks it as the tree's selected file.
-    pub select_file: Rc<dyn Fn(&RepoPath, &mut Window, &mut App)>,
+    select_file: Rc<dyn Fn(&RepoPath, &mut Window, &mut App)>,
     /// Right click on a file row, at the click position.
-    pub deploy_file_context_menu: Rc<dyn Fn(&RepoPath, Point<Pixels>, &mut Window, &mut App)>,
+    deploy_file_context_menu: Rc<dyn Fn(&RepoPath, Point<Pixels>, &mut Window, &mut App)>,
     /// Click on a directory header row — collapses or expands the group.
-    pub toggle_directory: Rc<dyn Fn(&SharedString, &mut Window, &mut App)>,
+    toggle_directory: Rc<dyn Fn(&SharedString, &mut Window, &mut App)>,
 }
 
 #[derive(Clone)]
-pub struct ChangedFileEntry {
-    pub status: FileStatus,
-    pub file_name: SharedString,
-    pub dir_path: SharedString,
-    pub repo_path: RepoPath,
+struct ChangedFileEntry {
+    status: FileStatus,
+    file_name: SharedString,
+    dir_path: SharedString,
+    repo_path: RepoPath,
 }
 
 impl ChangedFileEntry {
-    pub fn from_commit_file(file: &CommitFile) -> Self {
+    fn from_commit_file(file: &CommitFile) -> Self {
         let file_name: SharedString = file
             .path
             .file_name()
@@ -147,10 +150,10 @@ impl ChangedFileEntry {
     /// header row above, so the row itself only shows the file name — the
     /// panel is narrow and IDEA's tree does the same.
     /// `indent` is the row's left padding: one step in from the directory
-    /// header. It is passed in rather than read here because it comes from
-    /// `ProjectPanelSettings`, and `project_panel` depends on `git_ui` — the
-    /// host reads the setting and hands the result down.
-    pub fn render(
+    /// header. It stays a parameter rather than reading [`COMMIT_TREE_INDENT`]
+    /// directly so the row renderer keeps no opinion about the tree it is laid
+    /// out in.
+    fn render(
         &self,
         ix: usize,
         indent: Pixels,
@@ -221,7 +224,7 @@ impl ChangedFileEntry {
 /// into one header (`docs/plans/completed`) instead of nesting a row per path
 /// component.
 #[derive(Clone)]
-pub enum ChangedFileRow {
+enum ChangedFileRow {
     Directory {
         /// Raw directory path — the key into `collapsed_changed_dirs`. Empty
         /// for files sitting at the repository root.
@@ -238,7 +241,7 @@ pub enum ChangedFileRow {
 /// Flatten a commit's changed files into directory-grouped rows. Files under a
 /// collapsed directory are dropped, but its header keeps the full count so the
 /// user can see how much is hidden.
-pub fn build_changed_file_rows(
+fn build_changed_file_rows(
     entries: &[ChangedFileEntry],
     root_label: &SharedString,
     collapsed: &HashSet<SharedString>,
@@ -274,7 +277,7 @@ pub fn build_changed_file_rows(
 
 /// Header row of one directory group in the changed-files tree. Clicking it
 /// collapses / expands the group.
-pub fn render_changed_directory_row(
+fn render_changed_directory_row(
     ix: usize,
     key: SharedString,
     label: SharedString,
@@ -327,7 +330,7 @@ pub fn render_changed_directory_row(
 /// Split a raw commit message into its subject (first line) and body. The
 /// blank line git puts between them is dropped, as is trailing whitespace —
 /// otherwise the tab renders a run of empty lines under short messages.
-pub fn split_commit_message(message: &str) -> (SharedString, SharedString) {
+fn split_commit_message(message: &str) -> (SharedString, SharedString) {
     let mut lines = message.lines();
     let subject = lines.next().unwrap_or_default().trim_end().to_string();
     let body = lines
@@ -439,7 +442,7 @@ fn format_detail_timestamp(timestamp: i64) -> String {
 
 /// Style for the selectable single-line text fields of the Commit tab,
 /// matching what the equivalent [`Label`] rendered before.
-pub fn detail_text_style(
+fn detail_text_style(
     text_size: TextSize,
     color: Color,
     weight: Option<gpui::FontWeight>,
@@ -479,7 +482,7 @@ pub fn detail_text_style(
     }
 }
 
-pub fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
+fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
     diff.files.iter().fold((0, 0), |(added, removed), file| {
         let old_text = file.old_text.as_deref().unwrap_or("");
         let new_text = file.new_text.as_deref().unwrap_or("");
@@ -1201,13 +1204,13 @@ impl GitPanel {
     /// The commit's changed files, grouped by directory.
     ///
     /// The tree carries no left inset of its own: `ButtonLike`'s own 4px
-    /// horizontal padding is the directory header's indent, which puts the file
-    /// rows at `4 + COMMIT_TREE_INDENT` = 38px — the same left edge as the
-    /// Changes tab's depth-1 file rows, and as the graph sidebar's file rows
-    /// sat at before it was deleted. The headers themselves then sit 2px inside
-    /// the Changes tab's 6px section headers; closing that last 2px would mean
-    /// either changing the shared row renderer or a magic negative margin, and
-    /// the file rows are the edge the eye actually tracks.
+    /// horizontal padding is the directory header's indent, and the file rows
+    /// step in by [`COMMIT_TREE_INDENT`] on top of it so that their painted
+    /// content edge lands on the Changes tab's — see that constant for the
+    /// measurement. The directory headers are deliberately *not* aligned with
+    /// the Changes tab's section headers (measured 4px apart): closing that
+    /// would mean either changing the shared row renderer or a magic negative
+    /// margin, and the file rows are the edge the eye actually tracks.
     fn render_commit_file_tree(
         &self,
         state: &CommitTabState,

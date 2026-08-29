@@ -1183,7 +1183,7 @@ impl GitGraph {
     /// than being reported as one. An empty result therefore means "nothing
     /// commit-shaped is selected", which is what the git panel's Commit tab
     /// treats as a deselection.
-    pub fn selected_commit_shas(&self) -> Vec<Oid> {
+    fn selected_commit_shas(&self) -> Vec<Oid> {
         let mut view_idxs: Vec<usize> = self.selected_entry_idxs.iter().copied().collect();
         view_idxs.sort_unstable();
         view_idxs
@@ -2023,11 +2023,14 @@ impl GitGraph {
             .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
     }
 
-    /// `truncate` belongs to the caller, not the chip: in the graph's
-    /// Description column a long ref must shrink so the subject stays visible,
-    /// but `Chip::truncate` sets `min_w_0`, and in a wrapping row that lets
-    /// every chip collapse to a bare ellipsis instead of wrapping to the next
-    /// line, which is why the flag is the caller's to set.
+    /// `truncate` belongs to the caller, not the chip. Today the graph's
+    /// Description column is the only caller and it always passes `true`,
+    /// because a long ref there must shrink so the commit subject stays
+    /// visible. The flag survives because `Chip::truncate` sets `min_w_0`,
+    /// which is wrong in any row that wraps: every chip would collapse to a
+    /// bare ellipsis rather than wrap to the next line. The `false` caller was
+    /// the commit-detail sidebar's wrapping ref-chip row, deleted when the
+    /// Commit tab replaced it.
     fn render_chip(
         &self,
         name: &SharedString,
