@@ -1078,6 +1078,12 @@
     },
   },
   {
+    "context": "GitPanel && CommitTab",
+    "bindings": {
+      "escape": "git_panel::ToggleFocus",
+    },
+  },
+  {
     "context": "GitPanel && ChangesList && !GitBranchSelector",
     "use_key_equivalents": true,
     "bindings": {

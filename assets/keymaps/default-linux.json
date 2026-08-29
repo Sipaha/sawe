@@ -1021,6 +1021,12 @@
     },
   },
   {
+    "context": "GitPanel && CommitTab",
+    "bindings": {
+      "escape": "git_panel::ToggleFocus",
+    },
+  },
+  {
     "context": "GitPanel && ChangesList && !GitBranchSelector",
     "bindings": {
       "left": "git_panel::CollapseSelectedEntry",

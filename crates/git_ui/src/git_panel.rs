@@ -1232,9 +1232,14 @@ impl GitPanel {
 
         if self.commit_editor.read(cx).is_focused(window) {
             dispatch_context.add("CommitEditor");
-        } else if self.active_tab != GitPanelTab::Commit
+        } else if self.active_tab == GitPanelTab::Commit
             && self.focus_handle.contains_focused(window, cx)
         {
+            // Withholding `ChangesList` below also withholds the bindings that
+            // are not about the changes list at all — `escape` returns focus to
+            // the editor. `CommitTab` is where those live for this tab.
+            dispatch_context.add("CommitTab");
+        } else if self.focus_handle.contains_focused(window, cx) {
             // The Commit tab renders no changes list and has no keyboard
             // navigation of its own, yet `set_active_tab` focuses the panel. The
             // `ChangesList` bindings would then act on the hidden Changes
@@ -9528,13 +9533,19 @@ mod tests {
             "GitPanel && ChangesList && !GitBranchSelector",
         )
         .expect("the shipped keymap's predicate parses");
+        let commit_tab_bindings = gpui::KeyBindingContextPredicate::parse("GitPanel && CommitTab")
+            .expect("the shipped keymap's predicate parses");
 
         cx.update_window_entity(&panel, |panel, window, cx| {
             panel.focus_handle.focus(window, cx);
             let context = panel.dispatch_context(window, cx);
             assert!(
-                changes_list_bindings.eval(&[context]),
+                changes_list_bindings.eval(&[context.clone()]),
                 "precondition: the Changes tab does bind the changes list keymap"
+            );
+            assert!(
+                !commit_tab_bindings.eval(&[context]),
+                "precondition: the Changes tab does not carry the Commit tab context"
             );
         });
 
@@ -9553,8 +9564,13 @@ mod tests {
             assert!(!context.contains("ChangesList"));
             assert!(!context.contains("menu"));
             assert!(
-                !changes_list_bindings.eval(&[context]),
+                !changes_list_bindings.eval(&[context.clone()]),
                 "no changes-list binding may resolve while the Commit tab is showing"
+            );
+            assert!(
+                commit_tab_bindings.eval(&[context]),
+                "the Commit tab still needs the bindings that are not about the \
+                 changes list — `escape` returns focus to the editor"
             );
         });
     }
