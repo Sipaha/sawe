@@ -285,7 +285,13 @@ pub struct SolutionAgentStore {
     /// append's upsert can land before an earlier link's stale
     /// `delete_entries_from` runs, silently deleting the just-written row —
     /// phase-6b keystone bug). Stored as `Task<()>` so it stays alive across
-    /// links; removed on `purge_session_hard`.
+    /// links.
+    ///
+    /// Because each link moves the PREVIOUS link into its own future, dropping
+    /// a session's entry cancels the ENTIRE chain, not just its last hop. So
+    /// teardown must state what it wants: soft closes hand the chain off with
+    /// `.detach()`, hard purges drop it. See `ChainDisposition` in
+    /// `store/teardown.rs`.
     entries_persist_chain: HashMap<SolutionSessionId, Task<()>>,
     /// When the stuck-turn watchdog last auto-reconnected each session, as
     /// epoch-millis. A fresh `claude --resume` must re-ingest the whole

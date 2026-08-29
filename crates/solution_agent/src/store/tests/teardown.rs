@@ -511,27 +511,23 @@ async fn cold_close_solution_keeps_sessions_restorable(cx: &mut gpui::TestAppCon
 /// `cold_close_solution` must not rewrite a cold-hydrated session's persisted
 /// entry rows.
 ///
-/// NOTE ON WHAT THIS DOES AND DOES NOT PROVE. This assertion currently holds
-/// for two independent reasons, and it cannot tell them apart:
+/// WHAT THIS PROVES, AND SINCE WHEN. The assertion used to hold for two
+/// independent reasons and could not tell them apart:
 ///
 ///   1. the liveness gate in `cold_close_solution` skips `persist_all_rows` for
 ///      a session with no `acp_thread`, and
-///   2. `persist_all_rows`'s work is parked in an `entries_persist_chain` task
-///      that `evict_session_runtime_maps` drops later in the same synchronous
-///      block, so the flush never reaches disk for ANY session, live or cold.
+///   2. `persist_all_rows`'s work was parked in an `entries_persist_chain` task
+///      that `evict_session_runtime_maps` dropped later in the same synchronous
+///      block, so the flush reached disk for NO session, live or cold.
 ///
-/// (2) was verified by probe: a LIVE session with three rows on disk and an
-/// empty Main stream also comes through this call with three rows, though an
-/// executed flush would have truncated it to zero via
-/// `delete_entries_from(main_len)`. So removing the gate today does not make
-/// this test fail — it is pinning the invariant, not the mechanism.
-///
-/// It earns its place anyway: the day someone repairs (2), this is what fails
-/// if they repair it without keeping (1), and the failure mode they would
-/// otherwise ship is "closing a Solution window truncates the transcript of
-/// every chat the editor had merely restored from disk" — on legacy pre-6b
-/// layouts, where teammate-tagged rows demux out of Main so `entries.len() >
-/// main_len`. Do not delete this because it looks tautological.
+/// (2) is gone: the cold close now evicts with `ChainDisposition::Drain`, so a
+/// LIVE session's flush does run (see
+/// `close_session_flushes_the_persist_chain_to_disk`). Only (1) stands between
+/// this transcript and a rewrite, which is exactly what the test now pins: drop
+/// the gate and it fails, because the failure mode is live — "closing a
+/// Solution window truncates the transcript of every chat the editor had merely
+/// restored from disk", on legacy pre-6b layouts where teammate-tagged rows
+/// demux out of Main so `entries.len() > main_len`.
 #[gpui::test]
 async fn cold_close_solution_does_not_rewrite_cold_session_rows(cx: &mut gpui::TestAppContext) {
     let (store, seeded_id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
@@ -589,6 +585,257 @@ async fn cold_close_solution_does_not_rewrite_cold_session_rows(cx: &mut gpui::T
         2,
         "cold close must not flush a session that was never resumed — \
          persist_all_rows' delete_entries_from(main_len) would truncate it"
+    );
+}
+
+/// The soft close must FLUSH the session's queued entry-row writes, not cancel
+/// them. `close_session` issues `persist_all_rows` and then tears down; the
+/// teardown evicts `entries_persist_chain`, and because every chain link moves
+/// the previous one into its own future, dropping that map entry used to cancel
+/// the whole chain — so closing a chat tab silently discarded the transcript
+/// tail. Permanently: `persist_all_rows` advances `persisted_main_seq` before
+/// spawning, so no later persist re-picks those rows.
+///
+/// Three stale rows on disk, a two-entry Main stream in memory: an executed
+/// flush rewrites idx 0..1 and `delete_entries_from(2)` trims idx 2. A cancelled
+/// one leaves all three stale rows.
+#[gpui::test]
+async fn close_session_flushes_persist_chain_to_disk(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    for idx in 0..3 {
+        db.upsert_entry(id, idx, 0, 1_700_000_000_000 + idx, None, b"stale".to_vec())
+            .await
+            .expect("seed stale row");
+    }
+
+    let message = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = vec![message(1, "alpha"), message(2, "bravo")];
+            s.rebuild_streams();
+            cx.notify();
+        });
+        // Two links deep, both issued before the executor is pumped: the second
+        // link owns the first, so the whole chain has to survive the teardown.
+        store.persist_main_stream(id, cx);
+        store.close_session(id, cx).expect("close_session");
+        assert!(
+            !store.entries_persist_chain.contains_key(&id),
+            "the chain must leave the map synchronously — a deferred eviction \
+             would drop the chain a close→reopen had already re-keyed"
+        );
+    });
+    cx.run_until_parked();
+
+    let rows = db.load_entries(id).await.expect("load rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "the flush must reach disk: idx 0..1 rewritten and the stale idx 2 \
+         trimmed by delete_entries_from(main_len)"
+    );
+    let texts: Vec<String> = rows
+        .iter()
+        .map(
+            |row| match crate::session_entry::kind_from_payload(&row.payload).expect("decode") {
+                SessionEntryKind::UserMessage { content_md, .. } => content_md,
+                other => panic!("unexpected persisted kind: {other:?}"),
+            },
+        )
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["alpha".to_string(), "bravo".to_string()],
+        "the persisted rows must carry the in-memory Main stream, not the stale payloads"
+    );
+}
+
+/// The `close_session` twin of `cold_close_solution_does_not_rewrite_cold_session_rows`:
+/// closing a tab the editor merely RESTORED from disk must write nothing.
+///
+/// Now that the soft close actually drains its chain, an ungated
+/// `persist_all_rows` here would be a full rewrite of a transcript the user
+/// never touched — and on a legacy pre-6b layout (teammate-tagged rows
+/// interleaved into the flat index space, so `entries.len() > main_len`) the
+/// rewrite's `delete_entries_from(main_len)` deletes the teammate rows. A cold
+/// session cannot have changed since hydration, so the correct write count is
+/// zero.
+#[gpui::test]
+async fn close_session_does_not_rewrite_a_cold_legacy_session(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+
+    let (store, seeded_id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (db, sol) = store.update(cx, |store, cx| {
+        (
+            store.persistence().expect("persistence"),
+            store
+                .session(seeded_id)
+                .expect("session")
+                .read(cx)
+                .solution_id,
+        )
+    });
+
+    let asst = |n: u64, subagent: Option<&str>, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: subagent.map(SharedString::from),
+        kind: SessionEntryKind::AssistantMessage {
+            chunks: vec![AssistantChunk::Message(text.into())],
+        },
+    };
+    let user = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+    // LEGACY layout: Main "alpha"@0, teammate "noise"@1, Main "bravo"@2 — the
+    // flat mirror is one row longer than the Main stream it demuxes to.
+    let legacy = [
+        asst(1, None, "alpha"),
+        asst(2, Some("T1"), "noise"),
+        user(3, "bravo"),
+    ];
+
+    let cold_id = SolutionSessionId::new();
+    store.update(cx, |store, cx| {
+        insert_cold_session(
+            cold_id,
+            sol,
+            SharedString::from("claude-acp"),
+            None,
+            None,
+            store,
+            cx,
+        );
+    });
+    for (idx, entry) in legacy.iter().enumerate() {
+        db.upsert_entry(
+            cold_id,
+            idx as i64,
+            entry.mod_seq as i64,
+            entry.created_ms,
+            entry.subagent_id.as_ref().map(|s| s.to_string()),
+            entry.to_payload(),
+        )
+        .await
+        .expect("seed legacy row");
+    }
+    store.update(cx, |store, cx| {
+        let session = store.session(cold_id).expect("cold session");
+        session.update(cx, |s, cx| {
+            s.entries = legacy.to_vec();
+            s.hydrate_streams_main_only();
+            cx.notify();
+        });
+        assert_eq!(
+            session.read(cx).streams[&crate::stream::StreamId::Main]
+                .entries
+                .len(),
+            2,
+            "precondition: Main is shorter than the flat mirror, so a flush would truncate"
+        );
+    });
+
+    store.update(cx, |store, cx| {
+        store.close_session(cold_id, cx).expect("close_session")
+    });
+    cx.run_until_parked();
+
+    let rows = db.load_entries(cold_id).await.expect("load after close");
+    assert_eq!(
+        rows.len(),
+        3,
+        "closing a never-resumed tab must not flush — persist_all_rows' \
+         delete_entries_from(main_len) would drop the teammate row"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.subagent_id.as_deref() == Some("T1")),
+        "the legacy teammate-tagged row must survive untouched"
+    );
+}
+
+/// The anti-resurrection guard for the hard purge. `purge_session_hard` evicts
+/// the runtime maps BEFORE it issues `db.purge_session`, and the two are
+/// unordered background work over the same connection. If the purge handed the
+/// persist chain off (`Drain`) instead of dropping it, a queued link could run
+/// after the cascade DELETE and re-insert entry rows for a session that no
+/// longer has a `solution_sessions` row — orphans no UI enumerates and no GC
+/// reaps, forever. Hence `ChainDisposition::Abandon` on this path.
+///
+/// SCOPE, MEASURED. The guard is exact only for a chain that is ONE link deep,
+/// which is what this test pins. Dropping the map entry does not cancel a
+/// deeper chain promptly: every link is already queued on the executor when it
+/// is spawned, and only the OUTERMOST link's handle lives in the map — the
+/// inner handles live inside their successor's future and are not dropped until
+/// that successor's runnable is run. So the innermost links keep running while
+/// the cancellation walks inward one runnable at a time. Measured on this
+/// fixture: a 2-link chain leaves 1 orphan row after the purge, an 8-link chain
+/// leaves 5. That leak predates the disposition split and is not introduced by
+/// it (it is the same `.remove()` drop as before); closing it needs the purge
+/// DELETE sequenced after the abandoned writes, which is a change to the purge
+/// ordering rather than to the disposition.
+#[gpui::test]
+async fn purge_session_hard_abandons_in_flight_persist_chain(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    let message = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = (1..=8).map(|n| message(n, "row")).collect();
+            s.rebuild_streams();
+            cx.notify();
+        });
+        // Issued before the executor is pumped, so the flush is genuinely
+        // in flight when the purge tears the session down.
+        store.persist_all_rows(id, cx);
+        store.purge_session_hard(id, None, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        db.load_entries(id).await.expect("load").is_empty(),
+        "a hard purge must abandon its queued entry-row writes — a surviving \
+         link re-inserts rows for a session that no longer exists"
     );
 }
 
