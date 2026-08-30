@@ -1652,6 +1652,43 @@ How to apply:
   tail afterwards; closing that needs hydration ordered behind the chain, which `hydrate_all_for_solution` cannot do
   while it is `&self` and the chain's completion signal is an `AtomicBool` rather than a cloneable handle.
 
+### 102. The visual dump's rows are contributed by the crates that own them, not synthesized by `solutions`
+
+What: `solutions::mcp::visual_structure` (which backs `workspace.dump_visual_structure` /
+`windows.dump_visual_structure`) now emits a `ProjectToolbar` row and a `SolutionBand` row, spliced into the workspace
+column in painted order. Neither node is built there. `StructureSlot::{ProjectToolbar, SolutionBand}` plus
+`register_structure_provider(cx, slot, provider)` is a pull-based global registry; `title_bar::init` and
+`solution_agent::init` each register a closure that downcasts the relevant `Workspace` `AnyView` slot
+(`project_toolbar_item` / `solution_band_item`) back to its concrete type and calls a `structure_node` method living
+next to that type's `render`. `VisualNode` gained an `attributes: BTreeMap<String, serde_json::Value>` bag (omitted
+when empty, so pre-existing nodes serialize unchanged) for facts that do not fit `kind` / `label` / `visible` /
+`focused` — band height, effective height, divider ratio.
+
+Why not build the nodes in `solutions`. It cannot: `solution_agent` depends on `solutions` (so the edge cannot run back),
+`title_bar` reaches `solutions_ui` / `git_ui` / `run_config_ui`, and both rows reach `Workspace` only as an `AnyView`.
+Inverting the direction — the owner registers into the dump — is the only arrangement in which the node builder can see
+the state its own `render` sees. The alternative that was actually tried in this file's history and abandoned is worse:
+`build_title_bar_node` and `build_status_bar_node` both used to hand-synthesize children from whatever state
+`solutions` could reach, both drifted out of sync with what was painted, and both were stripped back to bare presence
+nodes with a comment saying a wrong child is worse than no child. The registry is how a row gets real children without
+re-acquiring that failure mode.
+
+How to apply. Adding a row to the dump = add a `StructureSlot` variant, splice it at the right index in
+`build_workspace_node` (child order is the window's vertical order and agents read it that way), and register a
+provider from the owning crate's `init`. Build the node's `visible` flags from the *same helper* `render` gates the
+child on rather than a re-derivation — `ProjectToolbar::{repository_selector_state, branch_summary, unpushed_commits}`
+were extracted out of the three `render_*` methods for exactly this, so the probe and the paint cannot disagree. Where
+the content is a type-erased slot the owning crate also cannot see into (the band's utility occupant, the run-config
+strip), say so in the payload with `occupant_introspectable: false` instead of guessing; the band's utility node
+additionally separates `visible` (what is painted) from `requested_visible` (the persisted `utility_visible` toggle the
+status-bar buttons and `ctrl-`` flip) and reports `occupant: registered | hidden | pending | unavailable`, mirroring
+`SolutionBand::render`'s own four-way `match` — collapsing those two booleans into one would make a still-loading
+occupant indistinguishable from a failed one, which is the same distinction decision #95 exists to preserve.
+
+Providers run under the dump's live `&Workspace` borrow, so each `structure_node` takes that reference as a parameter
+instead of upgrading its own weak handle — the same double-lease discipline `ProjectToolbar::new` and
+`SolutionBand::{set_utility_visible, activate_utility_kind}` already follow.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.
