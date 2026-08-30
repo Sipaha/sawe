@@ -3634,6 +3634,23 @@ async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppCon
         sc.max_tokens, None,
         "the context window is live-thread-only and must not be guessed"
     );
+    // The CURSOR pair, pinned as literals rather than only cross-compared with
+    // the delta RPC: these are the two values the wire contract is built on and
+    // that `build_cold_session` / `entries_from_rows` own outright. The fixture
+    // writes no `epoch` row (so the rows branch serves the persisted 0, with no
+    // `bump_epoch` — that is the legacy-blob branch's job) and mod_seqs 1/2/3
+    // (so the Main stream's watermark is 3). A hydration-side change to either
+    // policy would silently force every cached mobile cursor for every closed
+    // session through a spurious `reset`, or silently break live-to-cold cursor
+    // continuity, and a self-consistency check could not see either.
+    assert_eq!(
+        sc.epoch, 0,
+        "a row-native cold session serves the persisted epoch verbatim"
+    );
+    assert_eq!(
+        sc.current_seq, 3,
+        "the Main stream's watermark is the max persisted mod_seq"
+    );
     let tool_call = sc.entries[2]
         .tool_call
         .as_ref()
@@ -3724,6 +3741,15 @@ async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::Test
         .await
         .expect("get_session_changes must succeed for a closed session still in the database")
         .structured_content;
+    // Literal pins on the cursor pair, for the reason spelled out in
+    // `get_session_closed_row_native_returns_session`: cross-comparing `full`
+    // against `caught_up` only proves the two RPCs agree with each other, which
+    // they would keep doing while both drifted.
+    assert_eq!(full.epoch, 0, "row-native cold session serves epoch 0");
+    assert_eq!(
+        full.current_seq, 3,
+        "watermark is the max persisted mod_seq"
+    );
     assert!(
         !caught_up.reset,
         "the cursor get_session just issued must not be rejected as a stale epoch"
@@ -3782,6 +3808,35 @@ async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::Test
         "the queue section is present and empty, not omitted"
     );
 
+    // PARTIAL delta, from a cursor strictly inside the transcript. This is what
+    // pins the persisted `mod_seq` numbering itself: a `since_seq` of 2 may
+    // return the third row and nothing else. A renumbering in
+    // `entries_from_rows` would leave the `since_seq = 0` count above at 3 and
+    // the caught-up poll self-consistent, and only show up here.
+    let partial = GetSessionChangesTool
+        .run(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 2,
+                known_epoch: full.epoch,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("cold delta from mid-transcript")
+        .structured_content;
+    assert_eq!(
+        partial.changed_entries.len(),
+        1,
+        "only the mod_seq-3 row is past a since_seq of 2"
+    );
+    assert_eq!(
+        partial.changed_entries[0].index, 2,
+        "and it is the third entry of the stream"
+    );
+
     // A stale epoch still resets, from the cold path as from the live one.
     let stale = GetSessionChangesTool
         .run(
@@ -3828,5 +3883,149 @@ async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::Test
         msg.contains("session_not_found")
             && msg.contains("neither open nor archived in the database"),
         "the error must distinguish 'not open' from 'not in the db'; got {msg:?}"
+    );
+}
+
+/// The rows-absent (legacy blob) branch of `build_cold_session`, on the wire.
+/// Every other cold-path test seeds entry rows, so the `migrating` branch — the
+/// one that decodes the pre-Phase-4 `acp_thread_blob` and BUMPS the epoch —
+/// reaches the wire nowhere else.
+///
+/// The bump is hydration's migration policy, not something the read path
+/// invents: `hydrate_all_for_solution` does the same `bump_epoch()` for the
+/// same rows-empty case, then persists rows + the bumped epoch, so a desktop
+/// restore and this cold read advertise the SAME epoch. What is pinned here is
+/// the resulting client-visible value (`0 → 1`), because it is not the epoch
+/// the session advertised back when the blob was written, and a change to the
+/// policy on either side must be visible rather than silently re-resetting
+/// every cached cursor.
+#[gpui::test]
+async fn get_session_legacy_blob_closed_session_serves_bumped_epoch(cx: &mut gpui::TestAppContext) {
+    let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let executor = cx.executor();
+    let db = std::sync::Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = chrono::Utc::now();
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new(format!("acp-{}", session_id.as_str())),
+        title: SharedString::from("legacy blob session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    })
+    .await
+    .expect("save metadata");
+
+    // A pre-Phase-4 blob and NO entry rows — the un-migrated shape.
+    let blob = serde_json::to_vec(&crate::store::PersistedSession {
+        title: "legacy blob session".into(),
+        entry_summaries: vec!["first legacy line".into(), "second legacy line".into()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    db.save_blob(session_id, blob).await.expect("save blob");
+
+    let sc = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                include_full_content: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session must serve a legacy blob-only closed session")
+        .structured_content;
+
+    assert_eq!(sc.title, "legacy blob session");
+    // ONE stream entry, not two: the legacy branch turns every blob line into an
+    // Assistant entry, and adjacent assistant messages coalesce into a single
+    // stream entry (`push_coalesced`) whose `mod_seq` is raised to the merged
+    // maximum. That is the same collapse the desktop shows for a migrated
+    // transcript, so pin it rather than working around it.
+    assert_eq!(sc.total_count, 1, "adjacent legacy lines coalesce into one");
+    assert!(
+        sc.entries[0]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("first legacy line")),
+        "legacy blob content must round-trip; got {:?}",
+        sc.entries[0].markdown
+    );
+    assert_eq!(
+        sc.epoch, 1,
+        "the rows-absent branch bumps the persisted epoch (0) exactly once"
+    );
+    assert_eq!(
+        sc.current_seq, 2,
+        "`rebuild_entries` numbers a migrated transcript's mod_seq from 1"
+    );
+
+    // The delta RPC must agree with the full load on the bumped epoch, or a
+    // client seeded by that full load resets on its very first poll.
+    let delta = GetSessionChangesTool
+        .run(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: sc.current_seq,
+                known_epoch: sc.epoch,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("cold delta for a legacy blob session")
+        .structured_content;
+    assert!(
+        !delta.reset,
+        "the epoch the full load issued must not be rejected by the delta poll"
+    );
+    assert_eq!(delta.epoch, 1);
+    assert_eq!(delta.current_seq, 2);
+    assert!(delta.changed_entries.is_empty());
+
+    // Reading it must not migrate it: the cold path is a pure read, so the rows
+    // stay absent and a repeat call serves the same bumped epoch rather than
+    // bumping again.
+    let rows = db.load_entries(session_id).await.expect("load entries");
+    assert!(
+        rows.is_empty(),
+        "a read must not perform the blob-to-rows migration"
+    );
+    let again = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("second cold read")
+        .structured_content;
+    assert_eq!(
+        again.epoch, 1,
+        "the bump is derived from the persisted epoch each time, never compounded"
     );
 }
