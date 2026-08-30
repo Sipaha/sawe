@@ -957,7 +957,16 @@ fn rebuild_streams_shell_streams_survive_an_entries_driven_rebuild() {
 // ---------------------------------------------------------------------------
 // Measurement harness (task-rebuild-streams). `#[ignore]`d: it is a timing
 // probe, not an assertion. Run with
-// `cargo test -p solution_agent --release -- --ignored --nocapture bench_rebuild`.
+//
+//   cargo test -p solution_agent --lib \
+//     --config 'profile.dev.package.solution_agent.opt-level=3' \
+//     bench_rebuild -- --ignored --nocapture
+//
+// The `--config` override raises ONLY this crate (`serde_json`, where a large
+// share of the copied bytes live, is already at opt-level 3 in
+// `[profile.dev.package]`). Do NOT reach for `--release` here: it rebuilds the
+// whole dependency tree into the shared `target/`, which this repo's build
+// conventions rule out for agent-driven checks.
 // ---------------------------------------------------------------------------
 
 /// Build a synthetic transcript whose *shape* matches the maintainer's largest
@@ -1062,7 +1071,7 @@ pub(crate) fn synthetic_transcript(entry_count: usize, images: usize) -> Vec<Arc
         entries.push(Arc::new(SessionEntry {
             created_ms: 1_700_000_000_000 + i as i64,
             mod_seq: i as u64 + 1,
-            // ~4% of entries carry a teammate tag, in a handful of runs.
+            // ~1.4% of entries carry a teammate tag (1/10 x 1/7), over 5 runs.
             subagent_id: if bucket == 9 && i % 7 == 0 {
                 Some(SharedString::from(format!("toolu_team{}", i % 5)))
             } else {
@@ -1299,13 +1308,48 @@ fn assert_mirror_matches_reference(session: &SolutionSession, seed: u64, step: &
     }
 }
 
+/// How many coalesce merges the mirror performed: for each stream, the number
+/// of flat entries ROUTED to it minus the number of entries it ended up with.
+/// Computed from the flat transcript, independently of `push_coalesced`, so a
+/// merge that stops happening shows up here as a zero rather than as silence.
+#[cfg(test)]
+fn merges_performed(session: &SolutionSession) -> usize {
+    use crate::stream::StreamId;
+    let mut routed: HashMap<StreamId, usize> = HashMap::new();
+    for entry in &session.entries {
+        let id = match &entry.subagent_id {
+            None => StreamId::Main,
+            Some(toolu) => StreamId::Teammate(toolu.clone()),
+        };
+        *routed.entry(id).or_default() += 1;
+    }
+    session
+        .streams
+        .iter()
+        .map(|(id, stream)| {
+            routed
+                .get(id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(stream.entries.len())
+        })
+        .sum()
+}
+
 #[test]
 fn shared_mirror_demuxes_identically_to_an_owned_reference() {
     // Property: over randomised transcripts — coalescing assistant runs,
     // teammate-tagged entries, and repeated in-place updates — the shared
     // mirror is byte-identical to the owned reference demux, the flat entries
     // are never written through the sharing, and a rebuild is idempotent.
-    let mut checked_a_merge = false;
+    // Anti-vacuity: `push_coalesced`'s merge is the ONLY write into the mirror
+    // and the entire reason `Arc::make_mut` is there, so the property test is
+    // worthless if the generator drifts into never producing an adjacent
+    // same-stream assistant pair. Count the merges that actually happen — a
+    // "some stream is shorter than the flat list" proxy is satisfied by a bare
+    // teammate split and would stay green through exactly that drift.
+    let mut merges_seen = 0usize;
+    let mut seeds_with_a_merge = 0usize;
     let mut checked_a_teammate = false;
     for seed in 1..=200u64 {
         let mut rng = Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -1319,17 +1363,37 @@ fn shared_mirror_demuxes_identically_to_an_owned_reference() {
 
         session.rebuild_streams();
         assert_mirror_matches_reference(&session, seed, "initial");
-        checked_a_merge |= session
-            .streams
-            .values()
-            .any(|s| s.entries.len() < flat_before.len() && !s.entries.is_empty());
+        let merges_here = merges_performed(&session);
+        merges_seen += merges_here;
+        seeds_with_a_merge += usize::from(merges_here > 0);
         checked_a_teammate |= session.streams.len() > 1;
+        // The flat transcript is the source of truth and a rebuild must never
+        // write through the sharing into it. Compared BY VALUE, and here in
+        // particular: this is the point at which the first merge has just run.
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .map(|e| (**e).clone())
+                .collect::<Vec<_>>(),
+            flat_before,
+            "seed {seed}: the first rebuild wrote through into the flat transcript"
+        );
 
         // Idempotence: rebuilding without touching `entries` must be a no-op.
         // Pre-`Arc::make_mut`, a merge wrote into the shared original, so a
         // second rebuild re-appended the same chunks.
         session.rebuild_streams();
         assert_mirror_matches_reference(&session, seed, "second rebuild");
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .map(|e| (**e).clone())
+                .collect::<Vec<_>>(),
+            flat_before,
+            "seed {seed}: the second rebuild wrote through into the flat transcript"
+        );
 
         // In-place updates — the `EntryUpdated` shape — replacing an entry and
         // advancing its `mod_seq`, exactly as the store's arm does.
@@ -1341,23 +1405,29 @@ fn shared_mirror_demuxes_identically_to_an_owned_reference() {
             let index = rng.below(session.entries.len());
             next_seq += 1;
             session.entries[index] = random_entry(&mut rng, next_seq);
+            // Snapshot AFTER the edit and BEFORE the rebuild, so the comparison
+            // below is about what the rebuild did, not about what the edit did.
+            let flat_expected: Vec<SessionEntry> =
+                session.entries.iter().map(|e| (**e).clone()).collect();
             session.rebuild_streams();
             assert_mirror_matches_reference(&session, seed, &format!("update {update}"));
+            merges_seen += merges_performed(&session);
+            assert_eq!(
+                session
+                    .entries
+                    .iter()
+                    .map(|e| (**e).clone())
+                    .collect::<Vec<_>>(),
+                flat_expected,
+                "seed {seed} / update {update}: the rebuild wrote through into the flat transcript"
+            );
         }
-
-        // The flat transcript is the source of truth and must never be mutated
-        // by the mirror it feeds. Compare against a snapshot taken before any
-        // rebuild, restricted to the prefix the updates above left untouched.
-        let flat_after: Vec<SessionEntry> = session.entries.iter().map(|e| (**e).clone()).collect();
-        assert_eq!(
-            flat_after.len(),
-            flat_before.len(),
-            "seed {seed}: rebuild changed the flat entry count"
-        );
     }
     assert!(
-        checked_a_merge,
-        "the generator never produced a coalescing run — the property test would be vacuous"
+        seeds_with_a_merge >= 40 && merges_seen >= 100,
+        "the generator produced only {merges_seen} coalesce merges over {seeds_with_a_merge} of \
+         200 seeds — `push_coalesced`'s merge, the mirror's only write, is barely exercised and \
+         the property test is close to vacuous"
     );
     assert!(
         checked_a_teammate,

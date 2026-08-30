@@ -93,28 +93,38 @@ impl Stream {
     /// and a tool call (or any non-message entry) between two messages sits
     /// between them and so is a natural boundary.
     pub fn push_coalesced(&mut self, entry: Arc<SessionEntry>) {
-        let mergeable = matches!(entry.kind, SessionEntryKind::AssistantMessage { .. })
-            && self
-                .entries
-                .last()
-                .is_some_and(|last| matches!(last.kind, SessionEntryKind::AssistantMessage { .. }));
-        if !mergeable {
+        if !self.merge_into_tail(&entry) {
             self.entries.push(entry);
-            return;
         }
-        let (SessionEntryKind::AssistantMessage { chunks: incoming }, Some(last)) =
-            (&entry.kind, self.entries.last_mut())
-        else {
-            unreachable!("guarded by `mergeable` above");
+    }
+
+    /// Merge `entry` into this stream's tail when both are `AssistantMessage`,
+    /// returning whether it happened. Every rejection is a `false` — never a
+    /// panic and never a silent swallow — so the only thing a future drift
+    /// between these checks can cost is a coalesce, and the caller still pushes
+    /// the entry.
+    fn merge_into_tail(&mut self, entry: &SessionEntry) -> bool {
+        let SessionEntryKind::AssistantMessage { chunks: incoming } = &entry.kind else {
+            return false;
         };
+        let Some(tail) = self.entries.last_mut() else {
+            return false;
+        };
+        // Decided on the SHARED tail, before any fork: `Arc::make_mut` below
+        // deep-copies whenever `session.entries` still holds the entry, and
+        // forking for a push that then turns out not to merge is exactly the
+        // copy this mirror exists to avoid.
+        if !matches!(tail.kind, SessionEntryKind::AssistantMessage { .. }) {
+            return false;
+        }
         // `make_mut` is what keeps the *session's* copy of the first fragment
         // pristine: the merge below rewrites the group head, so the mirror must
         // fork it away from the shared original. It deep-copies at most once per
         // group per rebuild — the fork leaves the mirror holding the sole
         // reference, so the 2nd..kth fragment of the same run merge in place.
-        let last = Arc::make_mut(last);
-        let SessionEntryKind::AssistantMessage { chunks } = &mut last.kind else {
-            unreachable!("guarded by `mergeable` above");
+        let tail = Arc::make_mut(tail);
+        let SessionEntryKind::AssistantMessage { chunks } = &mut tail.kind else {
+            return false;
         };
         chunks.extend(incoming.iter().cloned());
         // The coalesced entry's `mod_seq` is the phase-4 wire delta key. A
@@ -123,7 +133,8 @@ impl Stream {
         // update (decision #5 — otherwise a coalesced-message update is
         // silently missed). The forked head is the mirror's own, so bumping its
         // mod_seq is local to the stream mirror.
-        last.mod_seq = last.mod_seq.max(entry.mod_seq);
+        tail.mod_seq = tail.mod_seq.max(entry.mod_seq);
+        true
     }
 }
 
