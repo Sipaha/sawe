@@ -417,6 +417,11 @@ impl ProjectToolbar {
             })
             .collect();
 
+        // `render` builds the strip through `ensure_project_tab_strip`, so a
+        // toolbar that has never painted reports `visible: false` here even
+        // though the next frame will show the strip. A live window always has
+        // painted before an agent can dump it; a test that constructs the
+        // toolbar without drawing it has to build the strip itself.
         children.push(
             VisualNode::new("ProjectTabStrip").with_visible(self.project_tab_strip.is_some()),
         );
@@ -681,6 +686,8 @@ mod tests {
         let (project, _) = setup_solution_member("toolbar-structure", nested_repo_tree(), cx).await;
 
         let (toolbar, workspace, cx) = toolbar_in_window(&project, cx);
+        // Stands in for the first paint: the fixture never draws the toolbar,
+        // and `render` is what builds the tab strip on a live window.
         toolbar.update(cx, |toolbar, cx| {
             toolbar
                 .ensure_project_tab_strip(cx)
