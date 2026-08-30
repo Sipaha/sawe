@@ -1930,6 +1930,16 @@ async fn entries_removed_restamps_survivor_on_coalesce_split(cx: &mut TestAppCon
             "survivor re-stamped so the delta re-delivers the shrunk entry (seq {} !> {cursor_before})",
             main.seq,
         );
+        // The re-stamp is MIRROR-LOCAL. `streams[Main]` shares its entries with
+        // the flat ingest mirror behind an `Arc`, so a write-through is now the
+        // easy mistake to make here — and a mutation confirmed that nothing else
+        // in the suite notices one. The flat entry keeps the first-fragment
+        // `mod_seq` it was stamped with; only the coalesced Main entry moves.
+        assert_eq!(
+            s.entries.iter().map(|e| e.mod_seq).collect::<Vec<_>>(),
+            vec![1, 7],
+            "the flat transcript must keep its own mod_seq stamps"
+        );
     });
 }
 
