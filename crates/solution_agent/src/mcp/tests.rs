@@ -5778,13 +5778,21 @@ async fn get_session_entry_agrees_with_get_session_across_teammate_tagged_entrie
 #[gpui::test]
 async fn get_session_entry_image_indices_agree_with_get_session(cx: &mut gpui::TestAppContext) {
     let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    // Shape chosen so the flat prefix and the Main prefix of the SAME length
+    // hold different numbers of images: the teammate's two images sit BEFORE
+    // Main's first entry, and Main's first entry is itself a coalesced pair. A
+    // mutant that keeps the stream walk but replays the cursor over the flat
+    // mirror survives any shape where those two prefixes happen to tie — the
+    // first draft of this test was exactly that shape and let the mutant live.
     set_transcript(
         session_id,
         cx,
         vec![
-            parity_user(1, "here is a screenshot", 1),
-            tagged(parity_user(2, "teammate attachments", 2), "toolu_img_1"),
-            parity_assistant(3, "and back to you: `Image`"),
+            tagged(parity_user(1, "teammate attachments", 2), "toolu_img_1"),
+            parity_assistant(2, "fragment a"),
+            parity_assistant(3, "fragment b"),
+            parity_user(4, "here is a screenshot", 1),
+            parity_assistant(5, "and back to you: `Image`"),
         ],
     );
 
@@ -5794,9 +5802,32 @@ async fn get_session_entry_image_indices_agree_with_get_session(cx: &mut gpui::T
     };
     assert_entry_parity(cx, session_id, Some(teammate.clone())).await;
 
-    // Main's assistant bubble sits after exactly ONE Main image, so its link is
-    // `spk-image://1`. Over the flat mirror the two teammate images would have
-    // pushed the cursor to 3.
+    // Main is [coalesced a+b, user(1 image), assistant], so the assistant's
+    // link is numbered from exactly ONE Main image: `spk-image://1`. The flat
+    // prefix of the same length holds the teammate's two images and one
+    // assistant fragment, and would have numbered it `spk-image://2`.
+    let main_2 = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 2,
+                stream_id: None,
+                include_images: true,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_entry Main 2")
+        .structured_content
+        .entry;
+    let md = main_2.markdown.expect("single-entry always has markdown");
+    assert!(
+        md.contains("spk-image://1"),
+        "the assistant image link is numbered in Main's image space; got {md:?}"
+    );
+
+    // Same axis on the entry that OWNS the image: Main's screenshot is Main's
+    // image 0, even though two teammate images precede it in the flat mirror.
     let main_1 = GetSessionEntryTool
         .run(
             GetSessionEntryParams {
@@ -5811,10 +5842,15 @@ async fn get_session_entry_image_indices_agree_with_get_session(cx: &mut gpui::T
         .expect("get_session_entry Main 1")
         .structured_content
         .entry;
-    let md = main_1.markdown.expect("single-entry always has markdown");
-    assert!(
-        md.contains("spk-image://1"),
-        "the assistant image link is numbered in Main's image space; got {md:?}"
+    assert_eq!(
+        main_1
+            .images
+            .expect("include_images was set")
+            .iter()
+            .map(|img| img.index)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "Main's own first image is Main image 0"
     );
 
     // The teammate stream numbers its own images from 0, on both RPCs.
