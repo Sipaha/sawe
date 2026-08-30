@@ -99,7 +99,18 @@ A read-only recon pass answered the question that had blocked this item for two 
     stale rows and still trims the tail afterwards; only the torn middle is gone. Original entry:
     **Batched `upsert_entries` — the one follow-up that pays for itself twice.** `persist_all_rows` awaits one background round trip *per row* (`db/entries.rs:19-50`: every op is its own `executor.spawn` + connection lock). A single batched write under one lock would shrink the close→reopen torn-read window of fact 22 by ~200x AND narrow fact 21's cancellation walk to a single runnable, without a schema change or a migration. Queued deliberately, not attempted here — it changes the write path this plan's tests pin.
 
-24. **App quit loses everything in flight with no flush attempt at all.** There is no `on_app_quit` hook in `solution_agent`; the store global drops with the process. This is a *separate, larger* bug than the one this plan fixes — adding a quit-time drain is new scope (and the chain runs on the **foreground** executor, so a detached link needs the app to keep pumping, which quit does not). Recorded as a new pool item.
+24. ✅ **DONE** (`solution_agent: Drain the entry-persist chain when the app quits`) — FORK.md decision 103. The
+    premise that made this look unclosable was right about GPUI and wrong about the chain. GPUI's quit contract, read out
+    of `App::shutdown` + `LocalExecutor::block_with_timeout` + `PlatformScheduler::block`: quit observers run
+    synchronously, then the main thread BLOCKS on their futures for `SHUTDOWN_TIMEOUT` (200ms) with the **foreground
+    session marked blocked**, so no foreground runnable progresses for the whole quit window (`TestScheduler::step`
+    excludes blocked sessions by the same rule) while background runnables keep running. So a quit-time drain is
+    impossible for foreground work — but the chain never needed to be foreground. It captures no entity (fact 4) and its
+    ordering comes from `prev.await`, not executor FIFO, so the links moved to `cx.background_spawn` and a new
+    `flush_persist_chains_on_quit` observer awaits every unfinished chain. It takes the whole map, which is
+    disposition-correct for free because `Abandon` removes a purged session's chain before the purge's DELETE. It drains
+    only — it never re-derives a flush, so fact 15's gate is not undone. Original entry:
+    **App quit loses everything in flight with no flush attempt at all.** There is no `on_app_quit` hook in `solution_agent`; the store global drops with the process. This is a *separate, larger* bug than the one this plan fixes — adding a quit-time drain is new scope (and the chain runs on the **foreground** executor, so a detached link needs the app to keep pumping, which quit does not). Recorded as a new pool item.
 
 25. **`solution_agent`'s database runs on sqlite's defaults — rollback journal, `synchronous=FULL`.** It opens with a bare
     `Connection::open_file` under its own `Arc<Mutex<Connection>>` (`db.rs::open` → `open_connection`, which issues DDL

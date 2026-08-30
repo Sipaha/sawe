@@ -1601,8 +1601,9 @@ neither touch a dropped entity nor read stale in-memory state.
 (`Release`) as its last act, with no `.await` after it; `retire_finished_persist_chains` `retain`s on the paired
 `Acquire` load. Removing a chain that has already run can neither cancel work nor reorder anything, so it is the one
 removal that is unconditionally safe. The safety argument rests on the map always holding the **outermost** link:
-`finished == true` there implies every predecessor completed. The read is synchronous on the foreground executor — the
-same thread the chain runs on — so no store code can observe `true` while the future still has work to do.
+`finished == true` there implies every predecessor completed. The chain runs on a background thread (decision 103), so
+the guarantee is carried by the `Release`/`Acquire` pairing rather than by same-thread reads: seeing `true` means seeing
+every write the chain made, and seeing a stale `false` only postpones reclaiming a spent key.
 
 **`close_session` needed `cold_close_solution`'s `is_live` gate in the same change, because the two bugs point in
 opposite directions.** Bug 1 is loss of writes that should happen; bug 2 is execution of a rewrite that should not.
@@ -1727,3 +1728,55 @@ Don't add:
 - Per-crate module layout / data flow / type catalogs — those go stale fast and the agent can read the code. Rules are "traps to avoid", not "maps to follow".
 - Long-term TODOs — use issues for those.
 - Status updates — the git log is canonical.
+
+### 103. The entry-persist chain runs on the BACKGROUND executor so that app quit can drain it
+
+What: `persist_all_rows` / `persist_main_stream` spawn their chain links with `cx.background_spawn` rather than
+`cx.spawn`, and `SolutionAgentStore` registers an `on_app_quit` observer
+(`flush_persist_chains_on_quit`) that takes the whole `entries_persist_chain` map and awaits every link that has not
+finished. Before this there was no quit hook in the crate at all: the store global died with the process and every
+queued entry-row write was cancelled — silently, and permanently, because the persist helpers advance
+`persisted_main_seq` synchronously before they spawn and every persist filters `mod_seq > watermark`, so no later
+persist re-picks those rows. Quitting the editor mid-turn truncated the tail of the conversation.
+
+**GPUI's quit contract, which is what forces the design.** `App::shutdown` invokes each quit observer synchronously
+(entities and globals still alive, windows not yet cleared), collects the futures they return, clears the windows,
+`flush_effects`, sets `quitting = true` — and then BLOCKS the main thread on those futures for at most
+`gpui::SHUTDOWN_TIMEOUT` (200ms) before the process exits. The block goes through
+`LocalExecutor::block_with_timeout`, which passes the FOREGROUND session id to the scheduler, so for the whole quit
+window that session counts as blocked and **no foreground runnable makes any progress**: in production
+`LinuxDispatcher::dispatch_on_main_thread` only enqueues onto a channel the parked main thread has stopped draining,
+and `TestScheduler::step` models the identical rule by excluding runnables whose session is in `blocked_sessions`.
+Background runnables keep running on their own threads throughout. So a quit-time drain is possible *only* for work that
+is not on the foreground executor; awaiting a foreground `Task` from a quit observer parks until the timeout, logs
+`timed out waiting on app_will_quit`, and loses the write anyway.
+
+**Why moving the chain is legitimate rather than a workaround.** A chain link never needed the main thread. It captures
+no entity — rows, length, epoch and change_seq are snapshotted synchronously before the spawn and `db` is an
+`Arc<SolutionAgentDb>` whose every operation is itself a background task — and its ordering comes from `prev.await`,
+not from executor FIFO (that is the whole point of the chain; see decision 101). `Task<T>` is `Send` when `T` is, so a
+link can own its predecessor across threads. The one property that changes is that `PersistChain::finished` is now read
+from a different thread than the one that sets it, which the existing `Release`/`Acquire` pairing already covers.
+
+**Why the quit hook may take the entire map.** Disposition is already resolved by the time it runs:
+`ChainDisposition::Abandon` REMOVES a purged session's chain before the purge issues its cascade DELETE, so nothing left
+under a key can resurrect rows for a deleted session. Emptying the map cannot cancel anything either — the tasks are
+moved into the returned future, which owns them until they finish.
+
+**What it deliberately does not do.** It drains; it does not re-derive a fresh flush from the live sessions. The chain
+is already the complete record of what is unwritten (there is no persist debounce — every ingest event issues a
+persist), so re-deriving would buy nothing and would rewrite sessions the user never resumed, which is exactly what
+`close_session`'s liveness gate exists to prevent.
+
+How to apply:
+
+- **Establish the quit contract from the code before designing anything that has to survive quit.** "Register an
+  `on_app_quit` and await your work" is only half true: the answer depends entirely on which executor the work is on,
+  and the two existing in-tree examples disagree — `session::app_will_quit` awaits a `background_spawn` (sound), while
+  `MultiWorkspace::app_will_quit` awaits foreground `cx.spawn` tasks (it can only ever burn the 200ms timeout).
+- **Foreground is not the default for durability work.** If a future captures no entity and its ordering is explicit,
+  put it on the background executor; that is the difference between surviving a quit and not.
+- **A `TestAppContext` test can prove this**, because `TestScheduler` models the blocked-session rule. Issue the chain,
+  do NOT `run_until_parked`, call `cx.quit()`, then read the rows with `load_entries_blocking`. Pin the tick budget with
+  `cx.executor().set_block_on_ticks(usize::MAX..=usize::MAX)` first — a timed block otherwise draws a random budget from
+  `1..=1000` ticks and the drain is randomly cut short.
