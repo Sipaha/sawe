@@ -436,8 +436,15 @@ impl Copilot {
         &mut self,
         _cx: &mut Context<Self>,
     ) -> impl Future<Output = ()> + use<> {
+        // `LanguageServer::shutdown` must be called here rather than inside the
+        // returned future: it is what hands back the future that actually drives
+        // the shutdown request/exit notification. Wrapping the call in an async
+        // block instead makes the block's *output* the shutdown future, which is
+        // then dropped undriven — and because the call has already taken
+        // `io_tasks`, the server's own `Drop` shutdown returns `None` too, so the
+        // server ends up killed by pipe closure with no LSP handshake at all.
         let shutdown = match mem::replace(&mut self.server, CopilotServer::Disabled) {
-            CopilotServer::Running(server) => Some(Box::pin(async move { server.lsp.shutdown() })),
+            CopilotServer::Running(server) => server.lsp.shutdown(),
             _ => None,
         };
 
@@ -1483,6 +1490,36 @@ mod tests {
         paths::PathStyle,
         rel_path::{RelPath, rel_path},
     };
+
+    /// `LanguageServer::shutdown` returns `Option<impl Future>`; the request is
+    /// only sent when that inner future is driven. Awaiting a wrapper whose
+    /// output *is* the option leaves the exchange undriven while still consuming
+    /// `io_tasks`, so the server dies by pipe closure instead. Assert on the
+    /// server actually receiving `shutdown`, not on the future resolving.
+    #[gpui::test]
+    async fn test_shutdown_language_server_drives_the_lsp_shutdown_request(
+        cx: &mut TestAppContext,
+    ) {
+        let (copilot, fake_server) = Copilot::fake(cx);
+
+        let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        fake_server.set_request_handler::<lsp::request::Shutdown, _, _>({
+            let shutdown_requested = shutdown_requested.clone();
+            move |_, _| {
+                shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                async move { Ok(()) }
+            }
+        });
+
+        let shutdown = copilot.update(cx, |copilot, cx| copilot.shutdown_language_server(cx));
+        cx.executor().spawn(shutdown).detach();
+        cx.run_until_parked();
+
+        assert!(
+            shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
+            "copilot quit without sending the LSP shutdown request"
+        );
+    }
 
     #[gpui::test]
     async fn test_copilot_does_not_start_when_ai_disabled(cx: &mut TestAppContext) {
