@@ -24,7 +24,7 @@ whole-commit +/− totals and a changed-files tree; double-clicking a file opens
 that file's diff **for that commit** in the centre pane; a multi-row selection
 renders "N commits selected".
 
-**Three backlog items also cleared:**
+**Six backlog items also cleared:**
 
 - **`ctrl-\`` now leaves the caret in the band's active terminal.** It used to
   focus the `ConsolePanel`'s root handle, so typing after the hotkey went
@@ -34,6 +34,23 @@ renders "N commits selected".
   silent, permanent data loss on every tab and window close.
 - **An entry-row flush is now one batched write.** 200 rows went from 407
   executor turns to 7, and from 38 observable partial row sets to zero.
+- **The git graph has a keybinding again.** `ctrl-alt-\`` → `git_graph::ToggleFocus`,
+  driving the band's three-leg tri-state. Its dock toggle died with its `Panel`
+  impl in phase 2b, leaving the unhideable status-bar button as the only path.
+  Fixing it exposed a second bug: `GitGraphPanel::focus_handle` returned the
+  *inner graph's* handle and the panel's own handle was never `track_focus`'d,
+  so the tri-state could never reach its hide leg — and `set_active_repo`
+  ejected focus to the centre pane on every member switch. 44 lines of keymap
+  entries naming actions that exist nowhere went with it.
+- **With vim on, typing into the git graph's search box drove the commit
+  list.** `vim.json` binds bare `j` / `k` / `shift-g` / `g g` under
+  `"GitGraph && !GitGraphSearchBar"` with no `vim_mode` gate, and **nothing
+  emitted `GitGraphSearchBar`** — so `shift-g` jumped the list to the oldest
+  commit instead of typing a `G`. The negated clause was a missing emission,
+  not a dead leftover.
+- **The Solution band and the project-toolbar row are now first-class nodes in
+  the MCP visual dump.** Every band check this session had to go through
+  screenshots because the structured dump did not mention them.
 
 Everything is on `origin/main`. Working tree clean.
 
@@ -137,13 +154,20 @@ deleted), `8093f946e0` (History deleted), `44312c93d8` (palette guard),
 (FORK.md #101 + follow-ups), `06028b311e` + `b43d1cbd3a` (batching),
 `4373927a9c` + `2a2738234f` (its review follow-ups).
 
+**Graph keybinding** — `114e2b3e79` `18eaec348f` `a90ade3341` `5ac3b50703`
+`63c3182eba`, plus `3aed2b44d6` + `7a78c52751` (the vim search-box fix and
+FORK.md #30's addendum).
+
+**Band nodes in the visual dump** — `fde3747183` `ff8f3c639a` `78f2b3d136`
+`71c219fe53` (FORK.md #102), then `9ce7855b6c` `4eb90999f9` `4e1e6c3152`
+`f2accdbedb` (its review follow-ups, including the `run-mcp --runtime-dir`
+fix below).
+
 ---
 
 ## Open pool, in priority order
 
-1. **Backlog, none urgent.** The git graph has no keybinding at all (its dock
-   toggle died with its `Panel` impl in phase 2b; the unhideable status-bar
-   button is its only path). `DebuggerSettings.dock` / `.button` are inert with
+1. **Backlog, none urgent.** `DebuggerSettings.dock` / `.button` are inert with
    their UI controls removed but the fields kept. `running.rs::handle_run_in_terminal`
    is a second, independent embedded-terminal mechanism inside the debug
    session's own sub-pane — if the band shows Terminal when an adapter fires
@@ -153,8 +177,6 @@ deleted), `8093f946e0` (History deleted), `44312c93d8` (palette guard),
    `last_dialog_session` id that fails validation lingers until the next real
    selection. `solution_agent.get_session` returns `session_not_found` after a
    window close until `list_sessions` re-hydrates.
-   `solutions::mcp::visual_structure` emits no node for the band or the
-   project-toolbar row.
 2. **Deferred from the two plans**, with the reasoning already written down so
    nobody re-derives it — see each plan's deferred list:
    - FORK.md #55's three-changed-files-trees extraction trigger has now fired.
@@ -202,6 +224,16 @@ deliberately gated on liveness with cold orphans logged instead.
 - **Re-issuing `solutions.open` between headless probes resets focus.** Two
   agents chasing focus bugs read that as a failure of their own fix. Do the
   whole sequence in one connection.
+- **`script/run-mcp --runtime-dir` did not isolate anything, and was actively
+  dangerous — now fixed.** It set only `XDG_*`, which nothing in this fork's
+  path chain reads (`paths::base_dir()` is `home_dir()/.spk/<channel>` and
+  `home_dir()` honours only `SAWE_HOME`). Worse, that branch *skipped* the
+  `export SAWE_HOME="$HOME"` its sibling does, so the script waited on a socket
+  the editor never bound **while the editor it launched contended the
+  maintainer's real lock**. Two agents collided on that lock this session. It
+  now exports `SAWE_HOME` properly; `--skip-onboarding` was inert twice over
+  (wrong DB path, and the branch it targeted no longer exists — Welcome is this
+  fork's launcher for every cold launch) and now exits 2 with an explanation.
 - A screenshot still renders the retained scene and does not run a draw.
 
 ---
