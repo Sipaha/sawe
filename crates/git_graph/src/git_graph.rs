@@ -7515,8 +7515,14 @@ mod tests {
                 .any(|context| context.contains("GitGraph")),
             "precondition: focusing the graph enters the GitGraph context"
         );
+        // `depth_of`, not `eval`: `eval` passes the full stack to both sides of
+        // an `And`, so `Identifier("GitGraph")` is only ever tested against the
+        // deepest context — the focused editor's. That makes `!eval` true even
+        // when the binding is live, which is exactly the bug this test guards.
+        // The real keymap resolves through `depth_of` (`keymap.rs`), which
+        // scans every prefix of the stack.
         assert!(
-            commit_list_bindings.eval(&graph_stack),
+            commit_list_bindings.depth_of(&graph_stack).is_some(),
             "precondition: `j` still navigates the commit list when the graph holds focus"
         );
 
@@ -7535,7 +7541,7 @@ mod tests {
             "the focused search input must emit GitGraphSearchBar, got {search_stack:?}"
         );
         assert!(
-            !commit_list_bindings.eval(&search_stack),
+            commit_list_bindings.depth_of(&search_stack).is_none(),
             "no commit-list binding may resolve while the search input holds focus"
         );
     }
