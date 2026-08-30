@@ -3939,10 +3939,11 @@ impl workspace::SerializableItem for GitGraph {
             .to_string_lossy()
             .to_string();
 
-        let selected_sha = self
-            .selected_entry_idx
-            .and_then(|idx| self.graph_data.commits.get(idx))
-            .map(|commit| commit.data.sha.to_string());
+        // `selected_entry_idx` is view-space: when the synthetic
+        // local-changes row occupies view 0 every commit sits one row below
+        // its index in `graph_data.commits`, and that row is not a commit at
+        // all. `selected_commit_sha` is the conversion.
+        let selected_sha = self.selected_commit_sha().map(|sha| sha.to_string());
 
         let search_query = self.search_state.editor.read(cx).text(cx);
         let search_query = if search_query.is_empty() {
@@ -8138,5 +8139,167 @@ mod tests {
             assert_eq!(graph.selected_entry_idxs, rows([0]));
             assert_eq!(graph.selection_anchor_idx, None);
         });
+    }
+
+    /// `serialize` persists the selection as a sha, and the selection index is
+    /// view-space: with the synthetic local-changes row at view 0 every commit
+    /// sits one row below its index in `graph_data.commits`. Reading the
+    /// commit list with the raw view index therefore persisted the
+    /// *neighbouring* commit — and turned a selection of the synthetic row,
+    /// which is not a commit at all, into a selection of the newest one.
+    #[gpui::test]
+    async fn test_serialize_persists_the_selected_sha_past_the_local_changes_row(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: oid(1),
+                parents: smallvec![oid(2)],
+                ref_names: vec!["HEAD".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid(2),
+                parents: smallvec![oid(3)],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: oid(3),
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" },
+            }),
+        )
+        .await;
+        fs.set_graph_commits(Path::new("/project/.git"), commits.clone());
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        multi_workspace.update(cx, |multi, cx| multi.set_random_database_id(cx));
+        let workspace_id = workspace.read_with(&*cx, |workspace, _| {
+            workspace
+                .database_id()
+                .expect("the test workspace was just given a database id")
+        });
+
+        // `git_graphs.workspace_id` is a foreign key into `workspaces`, and
+        // the id a test workspace invents has no row behind it.
+        let db = cx.read(|cx| persistence::GitGraphsDb::global(cx));
+        let raw_workspace_id = i64::from(workspace_id);
+        db.write(move |connection| -> anyhow::Result<()> {
+            connection.exec(&format!(
+                "INSERT INTO workspaces(workspace_id) VALUES ({raw_workspace_id})"
+            ))?()?;
+            Ok(())
+        })
+        .await
+        .expect("seeding the workspace row should succeed");
+
+        let repo_path = RepoPath::new(&"src/main.rs").expect("valid repo path");
+        let workspace_weak = workspace.downgrade();
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::for_file_history(
+                repository.read(cx).id,
+                repo_path,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        draw_graph(&git_graph, cx);
+
+        git_graph.update(cx, |graph, cx| {
+            assert_eq!(
+                graph.graph_data.commits.len(),
+                commits.len(),
+                "the file-history graph should have loaded the fake repository's commits"
+            );
+            graph.set_with_local_changes(true, cx);
+            assert!(graph.has_local_changes_row());
+        });
+
+        // View row 1 is the newest commit; view row 0 is the synthetic
+        // local-changes row.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.select_entry(
+                1,
+                ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let item_id = workspace::ItemId::from(4242_u64);
+        let persist = |cx: &mut gpui::VisualTestContext| {
+            let save = workspace.update_in(cx, |workspace, window, cx| {
+                git_graph.update(cx, |graph, cx| {
+                    <GitGraph as workspace::SerializableItem>::serialize(
+                        graph, workspace, item_id, false, window, cx,
+                    )
+                })
+            });
+            save.expect("serialize should produce a save task")
+        };
+
+        persist(cx).await.expect("save should succeed");
+        let persisted_sha = db
+            .get_git_graph(item_id, workspace_id)
+            .expect("reading the persisted row should succeed")
+            .expect("serialize should have written a row")
+            .4;
+        assert_eq!(
+            persisted_sha.as_deref(),
+            Some(commits[0].sha.to_string().as_str()),
+            "the selected commit's own sha should be persisted, not its neighbour's"
+        );
+
+        // The synthetic row has no commit data, so selecting it persists no
+        // selection at all rather than the commit that shares its view index.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.select_entry(
+                0,
+                ScrollStrategy::Nearest,
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        persist(cx).await.expect("save should succeed");
+        let persisted_sha = db
+            .get_git_graph(item_id, workspace_id)
+            .expect("reading the persisted row should succeed")
+            .expect("serialize should have written a row")
+            .4;
+        assert_eq!(
+            persisted_sha, None,
+            "the synthetic local-changes row is not a commit and must not be persisted as one"
+        );
     }
 }
