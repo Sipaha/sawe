@@ -1582,8 +1582,9 @@ nothing ordering it against the first**, so the close flush's trailing `delete_e
 the new chain's tail upsert and delete the user's new message — the phase-6b bug reintroduced at the close/reopen seam.
 Close a tab, reopen it, type one message, and that message was absent from disk and gone at the next cold load. Measured
 A/B on one fixture: a 3-entry transcript closed, reopened and appended to yields **4 rows on the parent commit and 3 on
-`76be3e00fa`**; at 200 entries, 201 vs 200. The window is wide because `persist_all_rows` awaits one background round
-trip *per row*. The fix (`f851e02f97`) is retention: `Drain` removes nothing, so the reopen's first persist finds the
+`76be3e00fa`**; at 200 entries, 201 vs 200. The window was wide because `persist_all_rows` awaited one background round
+trip *per row* — it is a single batched write now (last bullet below), which narrows the window without touching the
+ordering argument. The fix (`f851e02f97`) is retention: `Drain` removes nothing, so the reopen's first persist finds the
 flush already under the key and takes it as its `prev` for free, and the deferred-eviction race never arises because
 nothing is deferred. This is viable only because a chain link **captures no entity** — rows, length, epoch and
 change_seq are snapshotted synchronously before the spawn and `db` is an `Arc` — so a link that outlives its session can
@@ -1625,6 +1626,19 @@ How to apply:
   only removal it authorizes is a no-op one.
 - If a persist path advances a watermark before it spawns, treat the spawned work as **unrecoverable if dropped**. Look
   for the watermark before assuming a retry will cover a cancelled write.
+- **A DB helper awaited in a loop is a torn read waiting to happen.** A flush goes out as one
+  `SolutionAgentDb::upsert_entries_and_trim` — every row *plus* the trailing trim past `main_len`, under a single
+  connection acquisition and savepoint — rather than N `upsert_entry` awaits followed by a separate
+  `delete_entries_from`. Each of those awaits was an `executor.spawn` that released the connection, and every reader
+  takes that same lock, so a concurrent `load_entries` could observe any prefix of the flush; cold load derives
+  `persisted_main_seq` from the short read and the session's next persist trims the rest away permanently. Measured
+  before/after on the same fixture: a 200-row flush cost **407 executor turns and exposed 38 distinct partial row sets**,
+  now **7 turns and two states** — the same 7 a 4-row flush costs. The trim rides inside the same write on purpose: the
+  gap between the last upsert and a separate trim holds fresh rows *with a stale tail behind them*, which is precisely
+  the "flat mirror longer than Main" shape cold load reads as a legacy layout. **This narrows the close→reopen window,
+  it does not close it** — a reopen ordered entirely before the flush still hydrates the stale rows and still trims the
+  tail afterwards; closing that needs hydration ordered behind the chain, which `hydrate_all_for_solution` cannot do
+  while it is `&self` and the chain's completion signal is an `AtomicBool` rather than a cloneable handle.
 
 ## Where specs and plans live
 

@@ -1939,27 +1939,34 @@ async fn a_flush_costs_the_same_executor_turns_at_any_size(cx: &mut gpui::TestAp
 
 /// The same shrink stated as the property it buys, and the direct answer to the
 /// plan's fact 22: a reader that samples the table between every executor turn
-/// of a close flush must never catch it half-written.
+/// of a close flush must never catch it half-applied.
 ///
 /// This is fact 22's reproduction with its timing made exhaustive rather than
-/// lucky. Three stale rows on disk, forty entries in memory; the close drains
-/// its chain, and the table is read on the test's own thread after every single
-/// turn the executor takes. Under the per-row writer those samples counted
-/// 3, 4, 5 … 40, and a reopen landing on any of them hydrated a short transcript
-/// whose next persist trimmed the rest away for good. Now every reader takes the
-/// one lock the whole flush holds, so only two row sets exist to be seen.
+/// lucky. Forty stale rows on disk, an eight-entry transcript in memory — the
+/// SHRINKING direction, deliberately, because it is the one in which the flush's
+/// trailing trim is observable: an intermediate state where the first eight rows
+/// are fresh and thirty-two stale ones still trail them is exactly the "flat
+/// mirror longer than Main" shape cold load reads as a legacy layout. The table
+/// is read on the test's own thread after every single turn the executor takes,
+/// and each sample is reduced to `(row count, how many rows are still stale)`.
+///
+/// Under the per-row writer those samples walked `(40, 40)`, `(40, 39)` … down
+/// to `(40, 32)` before the trim dropped them to `(8, 0)`; batching the rows but
+/// awaiting the trim separately still parks on `(40, 32)`. Now the whole flush
+/// is one acquisition of the one lock every reader takes, so only its two
+/// endpoints exist to be seen.
 ///
 /// What this does NOT claim: the window is closed. A reopen whose `load_entries`
 /// is ordered entirely BEFORE the flush still hydrates the pre-flush rows and
-/// still trims the tail afterwards. What batching removes is the torn middle —
-/// the reader now sees a consistent snapshot either way, and the interval in
-/// which it can see the stale one shrank from N round trips to one.
+/// still trims the rest afterwards. What batching removes is the torn middle —
+/// the reader now sees a self-consistent snapshot either way, and the interval
+/// in which it can see the stale one shrank from N round trips to one.
 #[gpui::test]
 async fn a_reader_never_observes_a_half_written_close_flush(cx: &mut gpui::TestAppContext) {
     use crate::session_entry::{SessionEntry, SessionEntryKind};
 
-    const STALE_ROWS: i64 = 3;
-    const ENTRIES: u64 = 40;
+    const STALE_ROWS: i64 = 40;
+    const ENTRIES: u64 = 8;
 
     let (id, _thread, _tmp) = create_session_with_thread(cx).await;
     let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
@@ -1995,7 +2002,9 @@ async fn a_reader_never_observes_a_half_written_close_flush(cx: &mut gpui::TestA
 
     let mut observed = std::collections::BTreeSet::new();
     loop {
-        observed.insert(db.load_entries_blocking(id).expect("sample").len());
+        let rows = db.load_entries_blocking(id).expect("sample");
+        let stale = rows.iter().filter(|row| row.payload == b"stale").count();
+        observed.insert((rows.len(), stale));
         if !cx.executor().tick() {
             break;
         }
@@ -2003,9 +2012,13 @@ async fn a_reader_never_observes_a_half_written_close_flush(cx: &mut gpui::TestA
 
     assert_eq!(
         observed.into_iter().collect::<Vec<_>>(),
-        vec![STALE_ROWS as usize, ENTRIES as usize],
+        vec![
+            (ENTRIES as usize, 0),
+            (STALE_ROWS as usize, STALE_ROWS as usize)
+        ],
         "a reader sampling between every executor turn must only ever see the \
-         row set from before the flush or the one after it — a count in between \
-         is a torn read, and cold load turns it into a permanent truncation"
+         row set from before the flush or the one after it — anything in \
+         between is a torn read, and cold load turns it into a permanent \
+         truncation"
     );
 }
