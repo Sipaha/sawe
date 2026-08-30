@@ -3421,20 +3421,25 @@ async fn create_session_in_a_member_less_solution_clears_the_member_guard(
     );
 }
 
-/// `get_session` must serve a session that is no longer in `store.sessions`
-/// but whose metadata + entry rows are still in the DB — the state the store
-/// is left in after a window close (`cold_close_solution` evicts the entities
-/// and leaves the rows) or a closed tab. Before the fix the tool resolved
-/// only through the in-memory map and returned `session_not_found` until
-/// something else (`list_sessions`) happened to re-hydrate the store.
-///
-/// Same fixture shape as `read_session_history_closed_row_native_returns_entries`,
-/// whose archive path this mirrors.
-#[gpui::test]
-async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppContext) {
+/// Seed a session that exists ONLY in the database: a metadata row plus three
+/// entry rows (user, assistant, and a tool call stranded mid-confirmation),
+/// with nothing in `store.sessions`. This is the state a window close leaves
+/// behind — `cold_close_solution` evicts the entities and keeps every row — and
+/// the fixture both cold-path tests below share so they cannot drift on what
+/// "closed but present" means. Returns the seeded ids and the tempdir the
+/// caller must hold for the test's lifetime.
+async fn seed_closed_db_only_session(
+    cx: &mut gpui::TestAppContext,
+) -> (
+    solutions::SolutionId,
+    crate::model::SolutionSessionId,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    tempfile::TempDir,
+) {
     use crate::session_entry::{SessionEntry, SessionEntryKind};
 
-    let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let (solution_id, tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
     let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
     let executor = cx.executor();
@@ -3508,6 +3513,40 @@ async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppCon
     )
     .await
     .expect("upsert assistant entry");
+    // A tool call persisted while it was still awaiting the user's
+    // confirmation. Its authorization options live only on the live
+    // `AcpThread` (`live_auth_options_for_session`), never on the row, so the
+    // cold path must serve an EMPTY options list rather than inventing one.
+    // `entries_from_rows` also terminalises the stranded status on the way in
+    // (`normalize_stranded_tool_status`), which is asserted below so a change
+    // to either behaviour surfaces here.
+    let tool_call_entry = SessionEntry {
+        created_ms: 1_700_000_000_002,
+        mod_seq: 3,
+        subagent_id: None,
+        kind: SessionEntryKind::ToolCall {
+            id: "tc_closed_1".into(),
+            label_md: "Run tests".into(),
+            kind: acp::ToolKind::Execute,
+            status: crate::session_entry::ToolStatus::WaitingForConfirmation,
+            content_md: vec!["```\nok\n```".into()],
+            raw_input: None,
+            raw_output: None,
+            tool_name: Some("bash".into()),
+            locations: Vec::new(),
+            status_started_at: None,
+        },
+    };
+    db.upsert_entry(
+        session_id,
+        2,
+        tool_call_entry.mod_seq as i64,
+        tool_call_entry.created_ms,
+        None,
+        tool_call_entry.to_payload(),
+    )
+    .await
+    .expect("upsert tool call entry");
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -3516,6 +3555,23 @@ async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppCon
             "session must not be in memory for this test"
         );
     });
+
+    (solution_id, session_id, created, last_activity, tmp)
+}
+
+/// `get_session` must serve a session that is no longer in `store.sessions`
+/// but whose metadata + entry rows are still in the DB — the state the store
+/// is left in after a window close (`cold_close_solution` evicts the entities
+/// and leaves the rows) or a closed tab. Before the fix the tool resolved
+/// only through the in-memory map and returned `session_not_found` until
+/// something else (`list_sessions`) happened to re-hydrate the store.
+///
+/// Same fixture shape as `read_session_history_closed_row_native_returns_entries`,
+/// whose archive path this mirrors.
+#[gpui::test]
+async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppContext) {
+    let (solution_id, session_id, created, last_activity, _tmp) =
+        seed_closed_db_only_session(cx).await;
 
     let result = GetSessionTool
         .run(
@@ -3539,10 +3595,10 @@ async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppCon
     assert_eq!(sc.total_tokens, Some(4321));
     assert_eq!(sc.cwd.as_deref(), Some("/tmp/closed-session-cwd"));
     assert_eq!(
-        sc.total_count, 2,
-        "both persisted rows must ride the transcript"
+        sc.total_count, 3,
+        "every persisted row must ride the transcript"
     );
-    assert_eq!(sc.entries.len(), 2);
+    assert_eq!(sc.entries.len(), 3);
     assert!(
         sc.entries[0]
             .markdown
@@ -3559,13 +3615,39 @@ async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppCon
         "assistant entry must round-trip; got {:?}",
         sc.entries[1].markdown
     );
-    // A cold row has no live thread, so the live-only fields are served
-    // empty rather than wrong.
-    assert!(sc.pending_bundles.is_empty());
+    // A cold row has no live thread, so every live-only field is served
+    // empty/None rather than wrong. These are the fields a later refactor
+    // could most plausibly start serving a WRONG value for (persisting
+    // `state` and restoring it verbatim, say), so each is pinned.
+    assert!(sc.pending_bundles.is_empty(), "no live queue to report");
     assert_eq!(
         sc.streams.len(),
         1,
         "a cold session collapses to the Main stream only"
+    );
+    assert!(
+        matches!(sc.state, SessionStateDto::Idle),
+        "a session with no subprocess is Idle, never a restored Running; got {:?}",
+        sc.state
+    );
+    assert_eq!(
+        sc.max_tokens, None,
+        "the context window is live-thread-only and must not be guessed"
+    );
+    let tool_call = sc.entries[2]
+        .tool_call
+        .as_ref()
+        .expect("the third entry is the tool call");
+    assert_eq!(tool_call.tool_call_id, "tc_closed_1");
+    assert!(
+        tool_call.options.is_empty(),
+        "authorization options are a live-only side channel; got {:?}",
+        tool_call.options
+    );
+    assert!(
+        matches!(tool_call.status, ToolCallStatusDto::Canceled),
+        "a stranded in-flight tool call is terminalised on the way out of the db; got {:?}",
+        tool_call.status
     );
 
     // The session is served WITHOUT being hydrated back into the store —
@@ -3585,6 +3667,157 @@ async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppCon
             GetSessionParams {
                 session_id: unknown.to_string(),
                 ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("an unknown session id must still fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("session_not_found")
+            && msg.contains("neither open nor archived in the database"),
+        "the error must distinguish 'not open' from 'not in the db'; got {msg:?}"
+    );
+}
+
+/// The cold `get_session` path handed a client an `(epoch, current_seq)`
+/// cursor; `get_session_changes` must honour that cursor for the SAME closed
+/// session instead of hard-erroring over a transcript the client has already
+/// rendered. Fix round 1, Important 1: serving `get_session` from the DB
+/// without serving this one created that asymmetry — before it, both calls
+/// failed together.
+///
+/// Also pins that the cold delta is a REAL delta, not a caught-up stub: a poll
+/// from `since_seq = 0` returns the persisted entries, while a poll from the
+/// watermark returns none.
+#[gpui::test]
+async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::TestAppContext) {
+    let (_solution_id, session_id, _created, _last_activity, _tmp) =
+        seed_closed_db_only_session(cx).await;
+
+    // The cursor a client would have been seeded with by the cold full load.
+    let full = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("cold get_session")
+        .structured_content;
+
+    // Caught up: polling from the cursor `get_session` issued returns no
+    // entries, no reset, and the same epoch — the client stays converged.
+    let caught_up = GetSessionChangesTool
+        .run(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: full.current_seq,
+                known_epoch: full.epoch,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_changes must succeed for a closed session still in the database")
+        .structured_content;
+    assert!(
+        !caught_up.reset,
+        "the cursor get_session just issued must not be rejected as a stale epoch"
+    );
+    assert_eq!(caught_up.epoch, full.epoch);
+    assert_eq!(caught_up.current_seq, full.current_seq);
+    assert_eq!(caught_up.total_count, full.total_count);
+    assert!(
+        caught_up.changed_entries.is_empty(),
+        "nothing changed since the full load; got {} entries",
+        caught_up.changed_entries.len()
+    );
+
+    // Behind: a client polling from 0 gets the genuine persisted entries, not
+    // an empty "always caught up" stub.
+    let behind = GetSessionChangesTool
+        .run(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 0,
+                known_epoch: full.epoch,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("cold delta from 0")
+        .structured_content;
+    assert!(!behind.reset);
+    assert_eq!(
+        behind.changed_entries.len(),
+        3,
+        "every persisted row is behind a since_seq of 0"
+    );
+    assert_eq!(behind.current_seq, full.current_seq);
+    assert!(
+        behind.changed_entries[0]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("hello from closed session")),
+        "the delta must carry real content; got {:?}",
+        behind.changed_entries[0].markdown
+    );
+    // Live-only sections degrade the same way the full load's do.
+    assert!(
+        matches!(behind.state, Some(SessionStateDto::Idle)),
+        "a session with no subprocess is Idle; got {:?}",
+        behind.state
+    );
+    assert!(
+        behind
+            .pending_bundles
+            .as_ref()
+            .is_some_and(|bundles| bundles.is_empty()),
+        "the queue section is present and empty, not omitted"
+    );
+
+    // A stale epoch still resets, from the cold path as from the live one.
+    let stale = GetSessionChangesTool
+        .run(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 0,
+                known_epoch: full.epoch + 1,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("cold delta with a stale epoch")
+        .structured_content;
+    assert!(stale.reset, "an epoch mismatch must still ask for a reload");
+
+    // Serving the delta must not resurrect the session in memory.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(
+            store.read(cx).session(session_id).is_none(),
+            "the delta fallback must stay a pure read"
+        );
+    });
+
+    // Neither in memory nor in the database: still an error, still saying which.
+    let unknown = crate::model::SolutionSessionId::new();
+    let err = GetSessionChangesTool
+        .run(
+            GetSessionChangesParams {
+                session_id: unknown.to_string(),
+                since_seq: 0,
+                known_epoch: 0,
+                stream_id: None,
+                include_images: false,
             },
             &mut cx.to_async(),
         )

@@ -3,7 +3,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;
-use gpui::{App, AsyncApp};
+use gpui::{App, AsyncApp, Entity};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -706,6 +706,26 @@ async fn get_session_from_db(
     input: &GetSessionParams,
     cx: &mut AsyncApp,
 ) -> Result<GetSessionResult> {
+    let session = load_cold_session(session_id, cx).await?;
+    Ok(cx.update(|cx| build_get_session_result(session.read(cx), input, cx)))
+}
+
+/// Reconstruct the persisted session `session_id` as a DETACHED cold entity —
+/// built by the same `build_cold_session` the desktop restore uses, but never
+/// registered in the store, so the caller reads what it needs and drops it.
+/// Shared by the `get_session` and `get_session_changes` DB fallbacks: the two
+/// must agree on whether a closed session exists and on the `(epoch,
+/// current_seq)` cursor they hand out, which they only do by construction if
+/// they load it the same way.
+///
+/// Errors distinguish "not open, and there is no database at all" from "not
+/// open and not in the database" — the same two cases `read_session_history`
+/// separates, since a client that gets `session_not_found` needs to know
+/// whether retrying after a hydration could help.
+async fn load_cold_session(
+    session_id: SolutionSessionId,
+    cx: &mut AsyncApp,
+) -> Result<Entity<crate::model::SolutionSession>> {
     let db = cx
         .update(|cx| {
             let store = SolutionAgentStore::global(cx);
@@ -739,7 +759,7 @@ async fn get_session_from_db(
             meta.tab_order,
             cx,
         );
-        build_get_session_result(session.read(cx), input, cx)
+        session
     }))
 }
 
@@ -885,189 +905,25 @@ impl McpServerTool for GetSessionChangesTool {
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
 
-        let result = cx.update(|cx| -> Result<GetSessionChangesResult> {
+        // 1. In-memory path — live or cold-restored, the freshest source.
+        let in_memory = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
-            let entity = store
-                .read_with(cx, |store, _| store.session(session_id))
-                .with_context(|| format!("session_not_found: {}", session_id))?;
-            let session = entity.read(cx);
-
-            let epoch = session.epoch;
-
-            // Select the stream this delta belongs to (decision #7: descriptors
-            // for ALL streams, entries for the SELECTED one). `None` ⇒ Main. A
-            // stream the client asked for that has since closed / never existed
-            // yields an empty delta — the `streams` descriptor list below reveals
-            // what streams actually exist so the client can re-select.
-            //
-            // 6d-B: a `Shell(...)` stream_id is honoured — shells now ride the
-            // wire (v4), so `selected_stream_id` below round-trips whatever the
-            // client selected.
-            let selected = input
-                .stream_id
-                .as_ref()
-                .map(StreamIdDto::to_model)
-                .unwrap_or(crate::stream::StreamId::Main);
-            let selected_stream_id = StreamIdDto::from_model(&selected);
-            let selected_stream = session.streams.get(&selected);
-
-            // Epoch mismatch: the client's cache is against a rotated/reset
-            // transcript. Return a `reset` with the entry sections empty/absent;
-            // the client ignores them and full-reloads. The `streams` descriptor
-            // list is still populated (always-present, decision #7). `current_seq`
-            // is the selected stream's watermark for schema completeness.
-            let stream_seq = selected_stream.map_or(0, |s| s.seq);
-            if input.known_epoch != epoch {
-                let total_count = selected_stream.map_or(0, |s| s.entries.len());
-                return Ok(GetSessionChangesResult {
-                    epoch,
-                    current_seq: stream_seq,
-                    reset: true,
-                    total_count,
-                    changed_entries: Vec::new(),
-                    has_more: false,
-                    removed_indices: Vec::new(),
-                    state: None,
-                    pending_bundles: None,
-                    streams: build_streams_vec(session),
-                    selected_stream_id,
-                });
-            }
-
-            let live_auth_options = live_auth_options_for_session(session, cx);
-
-            // Walk the SELECTED stream's entries oldest-first with ONE
-            // `image_cursor`, advancing it over EVERY entry — including unchanged
-            // ones — exactly as `get_session` does for the same stream. This
-            // keeps the per-stream `EntryImage.index` / `spk-image://N` indices
-            // identical to what `get_session` returns for the same `stream_id`,
-            // so a delta-applied transcript renders byte-for-byte like a full
-            // load. `index` is STREAM-LOCAL (the enumerate position within the
-            // selected stream), matching `get_session`.
-            //
-            // Delta key is `entry.mod_seq` (per-entry), which the stream mirror
-            // keeps coalesce-aware (`push_coalesced` raises the merged entry's
-            // mod_seq to the incoming max — decision #5), so a coalesce-merge
-            // update is NOT missed even though the coalesced entry's own first-
-            // fragment mod_seq is otherwise frozen.
-            let stream_entries: &[crate::session_entry::SessionEntry] =
-                selected_stream.map_or(&[][..], |s| s.entries.as_slice());
-            let mut image_cursor = 0usize;
-            // Collect each changed entry WITH its `mod_seq` so the page can be
-            // taken in `mod_seq` order (the cursor axis), independent of index
-            // order — an old entry re-edited has a high `mod_seq` but a low
-            // index. The image index baked into each `EntrySummary` is computed
-            // during this index-order walk, so reordering the Vec afterwards is
-            // safe.
-            let mut changed: Vec<(u64, EntrySummary)> = Vec::new();
-            let total_count = stream_entries.len();
-            for (index, entry) in stream_entries.iter().enumerate() {
-                if entry.mod_seq > input.since_seq {
-                    let summary = summarize_entry(
-                        entry,
-                        index,
-                        true,
-                        input.include_images,
-                        &mut image_cursor,
-                        &live_auth_options,
-                    );
-                    changed.push((entry.mod_seq, summary));
-                } else {
-                    // Skipped (unchanged): still advance the cursor so later
-                    // changed entries get per-stream image indices identical to
-                    // get_session's. `summarize_entry` itself advances the
-                    // cursor; the skip branch must mirror that.
-                    image_cursor += count_images_in_entry(&entry.kind);
-                }
-            }
-
-            // Paginate by `mod_seq` (ascending) so a client that fell far behind
-            // catches up in bounded pages instead of one unbounded "big bang"
-            // response. The cursor advances only to the last entry of the page;
-            // `has_more` tells the client to keep polling from there. Sections
-            // stay gated on the request's `since_seq` (eligible from page 1) and
-            // are idempotent full-replacements, so re-sending them across a
-            // multi-page catch-up is harmless.
-            changed.sort_by_key(|(seq, _)| *seq);
-            let has_more = changed.len() > CHANGED_ENTRIES_PAGE;
-            let (changed_entries, page_current_seq): (Vec<EntrySummary>, u64) = if has_more {
-                let page_last_seq = changed[CHANGED_ENTRIES_PAGE - 1].0;
-                let entries = changed
-                    .into_iter()
-                    .take(CHANGED_ENTRIES_PAGE)
-                    .map(|(_, e)| e)
-                    .collect();
-                (entries, page_last_seq)
-            } else {
-                // Caught up entry-wise: hand out the SELECTED STREAM's `seq`
-                // (its max entry mod_seq, 0 for an empty/missing stream) so the
-                // client's PER-STREAM cursor tracks that stream and a re-poll
-                // from here returns nothing. NOT `session.change_seq` — that is a
-                // session-global clock and would over-advance a lagging stream's
-                // cursor past its own unseen entries.
-                let entries = changed.into_iter().map(|(_, e)| e).collect();
-                (entries, stream_seq)
-            };
-
-            // Wall-clock anchors for the state DTO — same scheme as
-            // `session_summary` (monotonic Instant rebased onto unix-millis).
-            let instant_to_ms = |started_at: std::time::Instant| -> i64 {
-                let wall = chrono::Utc::now()
-                    - chrono::Duration::from_std(started_at.elapsed()).unwrap_or_default();
-                wall.timestamp_millis()
-            };
-            let running_started_at_ms = match &session.state {
-                crate::model::SessionState::Running { started_at, .. } => {
-                    instant_to_ms(*started_at)
-                }
-                _ => 0,
-            };
-            let stopping_started_at_ms = match &session.state {
-                crate::model::SessionState::Stopping { started_at } => instant_to_ms(*started_at),
-                _ => 0,
-            };
-
-            // Always send the three small sections (state scalar, queue,
-            // subagent strip) regardless of `since_seq`. They are bounded and
-            // cheap, and the old `watermark > since_seq` gate created an
-            // UNRECOVERABLE staleness hole: once a client's cursor advanced past
-            // a section watermark, the delta path could never resend that
-            // section. Two ways that happened in the wild:
-            //   * cache-restore on session open synthesises a placeholder state
-            //     (`Idle`) and seats the cursor at `cached.lastSeq`, already far
-            //     above a long-Running session's old `state_seq` → the next
-            //     delta omitted `state` → the phone froze at "Idle" while the
-            //     desktop ran for an hour;
-            //   * a section mutation that forgot to bump its watermark (e.g. the
-            //     `→Idle` subagent-strip GC) → the cleared strip never reached
-            //     the phone, stranding a finished subagent tab.
-            // Sending them every poll makes each delta a full re-establishment
-            // of the small mutable state — unconditional convergence, immune to
-            // a placeholder cursor or a missed bump. `applySessionDelta` already
-            // treats a present section as an authoritative replacement (an empty
-            // Vec means "now empty"). The watermarks still drive the cheap
-            // `agent_session_dirty` poke; they just no longer gate delivery.
-            let state = Some(SessionStateDto::from_state(
-                &session.state,
-                running_started_at_ms,
-                stopping_started_at_ms,
-            ));
-            let pending_bundles = Some(build_pending_bundle_summaries(session, cx));
-
-            Ok(GetSessionChangesResult {
-                epoch,
-                current_seq: page_current_seq,
-                reset: false,
-                total_count,
-                changed_entries,
-                has_more,
-                removed_indices: Vec::new(),
-                state,
-                pending_bundles,
-                streams: build_streams_vec(session),
-                selected_stream_id,
-            })
-        })?;
+            let entity = store.read_with(cx, |store, _| store.session(session_id))?;
+            Some(build_get_session_changes_result(
+                entity.read(cx),
+                &input,
+                cx,
+            ))
+        });
+        let result = match in_memory {
+            Some(result) => result,
+            // 2. Cold path: not in memory, but still on disk. Must stay in
+            //    lock-step with `get_session`'s own fallback — a client that
+            //    was served a cold full load then polls this RPC with the
+            //    cursor it was handed, and a hard error there would strand a
+            //    transcript the client has already rendered.
+            None => get_session_changes_from_db(session_id, &input, cx).await?,
+        };
 
         let text = format!(
             "{} changed entr{} (epoch {}, seq {})",
@@ -1085,6 +941,211 @@ impl McpServerTool for GetSessionChangesTool {
             structured_content: result,
         })
     }
+}
+
+/// Compute one delta poll's payload for `session`. Split out of the tool body
+/// so the in-memory path and the cold DB fallback below produce the same shape
+/// from the same code — in particular the same `(epoch, current_seq)` cursor
+/// arithmetic, which is what lets a client seeded by a cold `get_session` keep
+/// polling without a spurious `reset`.
+fn build_get_session_changes_result(
+    session: &crate::model::SolutionSession,
+    input: &GetSessionChangesParams,
+    cx: &App,
+) -> GetSessionChangesResult {
+    let epoch = session.epoch;
+
+    // Select the stream this delta belongs to (decision #7: descriptors
+    // for ALL streams, entries for the SELECTED one). `None` ⇒ Main. A
+    // stream the client asked for that has since closed / never existed
+    // yields an empty delta — the `streams` descriptor list below reveals
+    // what streams actually exist so the client can re-select.
+    //
+    // 6d-B: a `Shell(...)` stream_id is honoured — shells now ride the
+    // wire (v4), so `selected_stream_id` below round-trips whatever the
+    // client selected.
+    let selected = input
+        .stream_id
+        .as_ref()
+        .map(StreamIdDto::to_model)
+        .unwrap_or(crate::stream::StreamId::Main);
+    let selected_stream_id = StreamIdDto::from_model(&selected);
+    let selected_stream = session.streams.get(&selected);
+
+    // Epoch mismatch: the client's cache is against a rotated/reset
+    // transcript. Return a `reset` with the entry sections empty/absent;
+    // the client ignores them and full-reloads. The `streams` descriptor
+    // list is still populated (always-present, decision #7). `current_seq`
+    // is the selected stream's watermark for schema completeness.
+    let stream_seq = selected_stream.map_or(0, |s| s.seq);
+    if input.known_epoch != epoch {
+        let total_count = selected_stream.map_or(0, |s| s.entries.len());
+        return GetSessionChangesResult {
+            epoch,
+            current_seq: stream_seq,
+            reset: true,
+            total_count,
+            changed_entries: Vec::new(),
+            has_more: false,
+            removed_indices: Vec::new(),
+            state: None,
+            pending_bundles: None,
+            streams: build_streams_vec(session),
+            selected_stream_id,
+        };
+    }
+
+    let live_auth_options = live_auth_options_for_session(session, cx);
+
+    // Walk the SELECTED stream's entries oldest-first with ONE
+    // `image_cursor`, advancing it over EVERY entry — including unchanged
+    // ones — exactly as `get_session` does for the same stream. This
+    // keeps the per-stream `EntryImage.index` / `spk-image://N` indices
+    // identical to what `get_session` returns for the same `stream_id`,
+    // so a delta-applied transcript renders byte-for-byte like a full
+    // load. `index` is STREAM-LOCAL (the enumerate position within the
+    // selected stream), matching `get_session`.
+    //
+    // Delta key is `entry.mod_seq` (per-entry), which the stream mirror
+    // keeps coalesce-aware (`push_coalesced` raises the merged entry's
+    // mod_seq to the incoming max — decision #5), so a coalesce-merge
+    // update is NOT missed even though the coalesced entry's own first-
+    // fragment mod_seq is otherwise frozen.
+    let stream_entries: &[crate::session_entry::SessionEntry] =
+        selected_stream.map_or(&[][..], |s| s.entries.as_slice());
+    let mut image_cursor = 0usize;
+    // Collect each changed entry WITH its `mod_seq` so the page can be
+    // taken in `mod_seq` order (the cursor axis), independent of index
+    // order — an old entry re-edited has a high `mod_seq` but a low
+    // index. The image index baked into each `EntrySummary` is computed
+    // during this index-order walk, so reordering the Vec afterwards is
+    // safe.
+    let mut changed: Vec<(u64, EntrySummary)> = Vec::new();
+    let total_count = stream_entries.len();
+    for (index, entry) in stream_entries.iter().enumerate() {
+        if entry.mod_seq > input.since_seq {
+            let summary = summarize_entry(
+                entry,
+                index,
+                true,
+                input.include_images,
+                &mut image_cursor,
+                &live_auth_options,
+            );
+            changed.push((entry.mod_seq, summary));
+        } else {
+            // Skipped (unchanged): still advance the cursor so later
+            // changed entries get per-stream image indices identical to
+            // get_session's. `summarize_entry` itself advances the
+            // cursor; the skip branch must mirror that.
+            image_cursor += count_images_in_entry(&entry.kind);
+        }
+    }
+
+    // Paginate by `mod_seq` (ascending) so a client that fell far behind
+    // catches up in bounded pages instead of one unbounded "big bang"
+    // response. The cursor advances only to the last entry of the page;
+    // `has_more` tells the client to keep polling from there. Sections
+    // stay gated on the request's `since_seq` (eligible from page 1) and
+    // are idempotent full-replacements, so re-sending them across a
+    // multi-page catch-up is harmless.
+    changed.sort_by_key(|(seq, _)| *seq);
+    let has_more = changed.len() > CHANGED_ENTRIES_PAGE;
+    let (changed_entries, page_current_seq): (Vec<EntrySummary>, u64) = if has_more {
+        let page_last_seq = changed[CHANGED_ENTRIES_PAGE - 1].0;
+        let entries = changed
+            .into_iter()
+            .take(CHANGED_ENTRIES_PAGE)
+            .map(|(_, e)| e)
+            .collect();
+        (entries, page_last_seq)
+    } else {
+        // Caught up entry-wise: hand out the SELECTED STREAM's `seq`
+        // (its max entry mod_seq, 0 for an empty/missing stream) so the
+        // client's PER-STREAM cursor tracks that stream and a re-poll
+        // from here returns nothing. NOT `session.change_seq` — that is a
+        // session-global clock and would over-advance a lagging stream's
+        // cursor past its own unseen entries.
+        let entries = changed.into_iter().map(|(_, e)| e).collect();
+        (entries, stream_seq)
+    };
+
+    // Wall-clock anchors for the state DTO — same scheme as
+    // `session_summary` (monotonic Instant rebased onto unix-millis).
+    let instant_to_ms = |started_at: std::time::Instant| -> i64 {
+        let wall = chrono::Utc::now()
+            - chrono::Duration::from_std(started_at.elapsed()).unwrap_or_default();
+        wall.timestamp_millis()
+    };
+    let running_started_at_ms = match &session.state {
+        crate::model::SessionState::Running { started_at, .. } => instant_to_ms(*started_at),
+        _ => 0,
+    };
+    let stopping_started_at_ms = match &session.state {
+        crate::model::SessionState::Stopping { started_at } => instant_to_ms(*started_at),
+        _ => 0,
+    };
+
+    // Always send the three small sections (state scalar, queue,
+    // subagent strip) regardless of `since_seq`. They are bounded and
+    // cheap, and the old `watermark > since_seq` gate created an
+    // UNRECOVERABLE staleness hole: once a client's cursor advanced past
+    // a section watermark, the delta path could never resend that
+    // section. Two ways that happened in the wild:
+    //   * cache-restore on session open synthesises a placeholder state
+    //     (`Idle`) and seats the cursor at `cached.lastSeq`, already far
+    //     above a long-Running session's old `state_seq` → the next
+    //     delta omitted `state` → the phone froze at "Idle" while the
+    //     desktop ran for an hour;
+    //   * a section mutation that forgot to bump its watermark (e.g. the
+    //     `→Idle` subagent-strip GC) → the cleared strip never reached
+    //     the phone, stranding a finished subagent tab.
+    // Sending them every poll makes each delta a full re-establishment
+    // of the small mutable state — unconditional convergence, immune to
+    // a placeholder cursor or a missed bump. `applySessionDelta` already
+    // treats a present section as an authoritative replacement (an empty
+    // Vec means "now empty"). The watermarks still drive the cheap
+    // `agent_session_dirty` poke; they just no longer gate delivery.
+    let state = Some(SessionStateDto::from_state(
+        &session.state,
+        running_started_at_ms,
+        stopping_started_at_ms,
+    ));
+    let pending_bundles = Some(build_pending_bundle_summaries(session, cx));
+
+    GetSessionChangesResult {
+        epoch,
+        current_seq: page_current_seq,
+        reset: false,
+        total_count,
+        changed_entries,
+        has_more,
+        removed_indices: Vec::new(),
+        state,
+        pending_bundles,
+        streams: build_streams_vec(session),
+        selected_stream_id,
+    }
+}
+
+/// `get_session_changes` for a session that is not in memory but is still in
+/// the database — the mirror of [`get_session_from_db`], and deliberately not
+/// a cheaper "always caught up, no changes" stub: the cold entity is rebuilt
+/// from the persisted rows, so a `since_seq` below the transcript's watermark
+/// yields the genuine missing entries (a client that opened a closed session
+/// from a cache older than the last turn still converges), and a client already
+/// at the watermark naturally gets an empty, caught-up delta.
+///
+/// The one thing this cannot do is notice that the session was reopened and has
+/// grown since the poll started — the rows are re-read on every call, so the
+/// next poll sees the growth; nothing is cached across calls.
+async fn get_session_changes_from_db(
+    session_id: SolutionSessionId,
+    input: &GetSessionChangesParams,
+    cx: &mut AsyncApp,
+) -> Result<GetSessionChangesResult> {
+    let session = load_cold_session(session_id, cx).await?;
+    Ok(cx.update(|cx| build_get_session_changes_result(session.read(cx), input, cx)))
 }
 
 /// Fetch the full content of a single session entry by index. Designed
