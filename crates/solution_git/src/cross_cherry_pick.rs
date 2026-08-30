@@ -1254,7 +1254,7 @@ pub mod mcp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solutions::{CatalogId, SolutionId, SolutionMember};
+    use solutions::{SolutionId, SolutionMember};
     use std::path::Path;
     use std::process::Command;
 

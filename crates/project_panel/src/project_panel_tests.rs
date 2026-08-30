@@ -9821,27 +9821,6 @@ fn init_test_with_editor(cx: &mut TestAppContext) {
     });
 }
 
-fn init_test_with_git_ui(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        let app_state = AppState::test(cx);
-        theme_settings::init(theme::LoadThemes::JustBase, cx);
-        editor::init(cx);
-        git_ui::init(cx);
-        crate::init(cx);
-        workspace::init(app_state, cx);
-
-        cx.update_global::<SettingsStore, _>(|store, cx| {
-            store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
-                settings.project.worktree.file_scan_exclusions = Some(Vec::new())
-            });
-        });
-    });
-}
-
 fn set_auto_open_settings(
     cx: &mut TestAppContext,
     auto_open_settings: ProjectPanelAutoOpenSettings,

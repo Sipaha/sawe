@@ -3035,49 +3035,6 @@ impl GitPanel {
         }
     }
 
-    fn build_commit_message_prompt(
-        prompt: &str,
-        user_agents_md: Option<&str>,
-        rules_content: Option<&str>,
-        instructions: Option<&str>,
-        subject: &str,
-        diff_text: &str,
-    ) -> String {
-        let user_agents_md_section = match user_agents_md {
-            Some(user_agents_md) => format!(
-                "\n\nThe user has provided the following rules that you should follow when writing the commit message. Project-specific rules may override these instructions when they conflict:\n\
-                <rules>\n{user_agents_md}\n</rules>\n"
-            ),
-            None => String::new(),
-        };
-
-        let rules_section = match rules_content {
-            Some(rules) => format!(
-                "\n\nThe user has provided the following rules specific to this project that you should follow when writing the commit message:\n\
-                <project_rules>\n{rules}\n</project_rules>\n"
-            ),
-            None => String::new(),
-        };
-
-        let instructions_section = match instructions {
-            Some(instructions) if !instructions.trim().is_empty() => format!(
-                "\n\nThe user has provided the following instructions for writing commit messages that you should follow:\n\
-                <commit_message_instructions>\n{instructions}\n</commit_message_instructions>\n"
-            ),
-            _ => String::new(),
-        };
-
-        let subject_section = if subject.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\nHere is the user's subject line:\n{subject}")
-        };
-
-        format!(
-            "{prompt}{user_agents_md_section}{rules_section}{instructions_section}{subject_section}\nHere are the changes in this commit:\n{diff_text}"
-        )
-    }
-
     /// Generates a commit message via the fork's `solution_agent` ephemeral
     /// pool (subscription-auth `claude` subprocess), NOT upstream's
     /// `LanguageModelRegistry` (which would require a configured BYOK
@@ -8119,44 +8076,6 @@ mod tests {
             [...skipped 2 hunks...]
         "};
         assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_commit_message_prompt_includes_user_agents_md_before_project_rules() {
-        let prompt = GitPanel::build_commit_message_prompt(
-            "Write a commit message.",
-            Some("Use terse commit messages."),
-            Some("Use the git_ui prefix."),
-            Some("Follow the configured commit message format."),
-            "Update generated message",
-            "diff --git a/file b/file",
-        );
-
-        assert!(prompt.contains("Use terse commit messages."));
-        assert!(prompt.contains("Use the git_ui prefix."));
-        assert!(prompt.contains("Follow the configured commit message format."));
-        assert!(prompt.contains("Update generated message"));
-        assert!(prompt.contains("diff --git a/file b/file"));
-
-        let user_agents_md_index = prompt.find("<rules>").unwrap();
-        let project_rules_index = prompt.find("<project_rules>").unwrap();
-        let instructions_index = prompt.find("<commit_message_instructions>").unwrap();
-        assert!(user_agents_md_index < project_rules_index);
-        assert!(project_rules_index < instructions_index);
-    }
-
-    #[test]
-    fn test_commit_message_prompt_omits_blank_instructions() {
-        let prompt = GitPanel::build_commit_message_prompt(
-            "Write a commit message.",
-            None,
-            None,
-            Some("   \n  "),
-            "",
-            "diff --git a/file b/file",
-        );
-
-        assert!(!prompt.contains("<commit_message_instructions>"));
     }
 
     #[gpui::test]
