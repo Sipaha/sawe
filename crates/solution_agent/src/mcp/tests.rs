@@ -2677,6 +2677,12 @@ async fn read_session_history_distinguishes_a_wiped_session_from_a_legacy_one(
         "legacy blob content must round-trip; got {:?}",
         sc.entries[0]
     );
+    assert_eq!(
+        sc.title, "legacy session",
+        "even on the blob branch the title must come from the metadata row: the \
+         blob is rewritten only when a turn ends, while `rename_session` writes \
+         the row alone, so the blob's copy ('blob title' here) is the stale one"
+    );
 
     // (3) ROW-NATIVE: entry rows present. Serves them, and takes its title from
     // the METADATA row. The old shape decoded the blob for that title and

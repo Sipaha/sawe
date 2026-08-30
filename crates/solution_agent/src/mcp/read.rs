@@ -1663,7 +1663,14 @@ impl McpServerTool for ReadSessionHistoryTool {
             structured_content: ReadSessionHistoryResult {
                 session_id: session_id.to_string(),
                 source: "archived".to_string(),
-                title: snapshot.title,
+                // The metadata column, like the other two archive branches, not
+                // `snapshot.title`. The blob is written once per turn and never
+                // rewritten by a rename — `rename_session` updates the session
+                // row alone — so for a renamed legacy session the blob's copy is
+                // whatever the title was when the last turn ended, and every
+                // other reconstruction path (`build_cold_session`, `resume_session`,
+                // the row-native branches above) already takes the row's.
+                title: head.meta.title.to_string(),
                 total_entries: total,
                 returned_entries: returned,
                 entries: slice,
