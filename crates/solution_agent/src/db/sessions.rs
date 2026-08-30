@@ -47,6 +47,25 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Everything the MCP cold-read path needs about a closed session EXCEPT
+    /// its transcript, in ONE acquisition of the shared connection mutex.
+    ///
+    /// It replaces a `load_metadata` + `load_epoch` + `load_change_seq`
+    /// sequence that took the mutex three times for three reads of the SAME
+    /// `solution_sessions` row, and it adds the two entry-table aggregates the
+    /// cold cache validates against. Both aggregates are answered from
+    /// `idx_session_entry_modseq (session_id, mod_seq)` without touching a
+    /// single `payload` blob, which is the entire point: the cheap head can be
+    /// re-read on every poll to decide whether the expensive transcript read
+    /// may be skipped.
+    pub fn load_cold_head(&self, id: SolutionSessionId) -> Task<Result<Option<ColdSessionHead>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            select_cold_head_by_id(&connection, id)
+        })
+    }
+
     pub fn save_blob(&self, id: SolutionSessionId, blob: Vec<u8>) -> Task<Result<()>> {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
@@ -611,12 +630,15 @@ type MetadataRow = (
     (Option<String>, Option<String>, Option<String>, Option<i64>),
 );
 
-const METADATA_COLUMNS: &str = indoc! {"
-    SELECT id, solution_id, agent_id, acp_session_id, title,
-           created_at, last_activity_at, preview, total_tokens,
-           context_count, cwd, parent_session_id,
-           desired_model, desired_effort, cached_models, tab_order
-    FROM solution_sessions
+/// The `solution_sessions` columns [`metadata_from_row`] decodes, in
+/// [`MetadataRow`] order. Kept as a bare select-list (rather than a whole
+/// `SELECT … FROM …`) so `select_cold_head_by_id` can append its own columns
+/// after it without re-listing these sixteen.
+const METADATA_SELECT_LIST: &str = indoc! {"
+    id, solution_id, agent_id, acp_session_id, title,
+    created_at, last_activity_at, preview, total_tokens,
+    context_count, cwd, parent_session_id,
+    desired_model, desired_effort, cached_models, tab_order
 "};
 
 fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
@@ -686,13 +708,39 @@ pub(crate) fn select_metadata_for_solution(
     solution_id: SolutionId,
 ) -> Result<Vec<SolutionSessionMetadata>> {
     let mut select = connection.select_bound::<i64, MetadataRow>(&format!(
-        "{METADATA_COLUMNS}WHERE solution_id = ? ORDER BY last_activity_at DESC"
+        "SELECT {METADATA_SELECT_LIST} FROM solution_sessions \
+         WHERE solution_id = ? ORDER BY last_activity_at DESC"
     ))?;
     select(solution_id.0)?
         .into_iter()
         .map(metadata_from_row)
         .collect()
 }
+
+/// One `solution_sessions` row plus the two `solution_session_entries`
+/// aggregates that fingerprint its transcript, as read by
+/// [`SolutionAgentDb::load_cold_head`].
+///
+/// `(entry_count, max_entry_mod_seq)` is what the MCP cold cache keys on: entry
+/// `mod_seq`s are handed out by `SolutionSession::bump_change_seq`, which is
+/// strictly monotonic per session, so an append raises both, a re-edit raises
+/// the max, and the trim that ends every flush lowers the count. A payload
+/// rewrite that moved neither would have to re-persist an entry under a
+/// `mod_seq` it already had, which no persist path can produce.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColdSessionHead {
+    pub meta: SolutionSessionMetadata,
+    /// `solution_sessions.epoch`; 0 when the column was never written.
+    pub epoch: i64,
+    /// `solution_sessions.change_seq`; `None` for a legacy row that predates
+    /// the column (the cold build then re-derives the anchor from the rows).
+    pub change_seq: Option<i64>,
+    pub entry_count: i64,
+    /// `MAX(mod_seq)` over the session's entry rows, 0 when it has none.
+    pub max_entry_mod_seq: i64,
+}
+
+type ColdHeadRow = (MetadataRow, (Option<i64>, Option<i64>, i64, i64));
 
 /// The single-session counterpart of [`select_metadata_for_solution`], for
 /// callers that hold a session id but not the solution it belongs to (the
@@ -702,11 +750,46 @@ pub(crate) fn select_metadata_by_id(
     connection: &Connection,
     id: SolutionSessionId,
 ) -> Result<Option<SolutionSessionMetadata>> {
-    let mut select = connection
-        .select_bound::<String, MetadataRow>(&format!("{METADATA_COLUMNS}WHERE id = ? LIMIT 1"))?;
+    let mut select = connection.select_bound::<String, MetadataRow>(&format!(
+        "SELECT {METADATA_SELECT_LIST} FROM solution_sessions WHERE id = ? LIMIT 1"
+    ))?;
     select(id.to_string())?
         .into_iter()
         .next()
         .map(metadata_from_row)
         .transpose()
+}
+
+/// See [`SolutionAgentDb::load_cold_head`]. Deliberately a query of its own
+/// rather than two more columns on `METADATA_SELECT_LIST`: the shared list also
+/// serves `select_metadata_for_solution`, which lists every session in a
+/// solution on the hydration path, and hanging two correlated aggregate
+/// subqueries off that listing would pay for the cold path's fingerprint on a
+/// call that has no use for it.
+pub(crate) fn select_cold_head_by_id(
+    connection: &Connection,
+    id: SolutionSessionId,
+) -> Result<Option<ColdSessionHead>> {
+    let mut select = connection.select_bound::<String, ColdHeadRow>(&format!(
+        "SELECT {METADATA_SELECT_LIST},
+                epoch,
+                change_seq,
+                (SELECT COUNT(*) FROM solution_session_entries e
+                  WHERE e.session_id = solution_sessions.id),
+                (SELECT COALESCE(MAX(e.mod_seq), 0) FROM solution_session_entries e
+                  WHERE e.session_id = solution_sessions.id)
+         FROM solution_sessions WHERE id = ? LIMIT 1"
+    ))?;
+    let Some((metadata_row, (epoch, change_seq, entry_count, max_entry_mod_seq))) =
+        select(id.to_string())?.into_iter().next()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ColdSessionHead {
+        meta: metadata_from_row(metadata_row)?,
+        epoch: epoch.unwrap_or(0),
+        change_seq,
+        entry_count,
+        max_entry_mod_seq,
+    }))
 }

@@ -46,6 +46,15 @@ pub struct BackgroundShellRow {
 pub struct SolutionAgentDb {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
+    /// How many times [`Self::load_entries`] has read a session's transcript.
+    ///
+    /// The MCP cold-read path's whole claim is "a paging burst costs ONE
+    /// transcript read", and the only way to assert that is to count the reads.
+    /// Per-instance rather than a process-wide static so tests running in
+    /// parallel cannot see each other's reads, and `cfg`-gated so a release
+    /// build carries neither the field nor the increment.
+    #[cfg(any(test, feature = "test-support"))]
+    entry_load_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct GlobalSolutionAgentDb(Shared<Task<Result<Arc<SolutionAgentDb>, Arc<anyhow::Error>>>>);
@@ -381,7 +390,17 @@ impl SolutionAgentDb {
         Ok(Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
+            #[cfg(any(test, feature = "test-support"))]
+            entry_load_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Reads of a session transcript served by [`Self::load_entries`] since
+    /// this handle was opened. See the field's own note for why it exists.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn entry_load_count(&self) -> usize {
+        self.entry_load_count
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Hard-delete every persisted trace of a session across all six tables
@@ -707,6 +726,8 @@ mod band;
 mod entries;
 mod sessions;
 mod supervisor;
+
+pub use sessions::ColdSessionHead;
 
 #[cfg(test)]
 mod tests;

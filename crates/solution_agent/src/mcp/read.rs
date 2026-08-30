@@ -7,6 +7,7 @@ use gpui::{App, AsyncApp, Entity};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::mcp::cold_cache::ColdSessionCache;
 use crate::model::SolutionSessionId;
 use crate::store::{PersistedSession, SolutionAgentStore};
 use solutions::SolutionId;
@@ -736,9 +737,29 @@ async fn load_cold_session(
                 "session_not_found: {session_id} is not open and no session database is attached"
             )
         })?;
-    let meta = db.load_metadata(session_id).await?.ok_or_else(|| {
-        anyhow!("session_not_found: {session_id} is neither open nor archived in the database")
-    })?;
+    // ONE round trip for the metadata row, the `(epoch, change_seq)` cursor pair
+    // that used to cost a `load_epoch` + `load_change_seq` read of the very same
+    // row, and the entry-table fingerprint the cache validates against. Nothing
+    // here touches a `payload` blob.
+    let Some(head) = db.load_cold_head(session_id).await? else {
+        // The row is gone (hard purge). Release any copy we still hold — the id
+        // has just stopped being servable, and this is the one place that
+        // learns it. Serving it was already impossible: the check below is
+        // gated on a head that no longer exists.
+        cx.update(|cx| ColdSessionCache::forget(cx, session_id));
+        return Err(anyhow!(
+            "session_not_found: {session_id} is neither open nor archived in the database"
+        ));
+    };
+    // A client catching up pages in `ceil(behind / CHANGED_ENTRIES_PAGE)`
+    // back-to-back polls, each of which lands here. Reusing the reconstruction
+    // makes the whole burst cost one transcript read instead of one per page;
+    // `take_valid` serves it only if `head` still equals the one it was built
+    // from, so the reuse cannot outlive the state it describes. See
+    // `mcp::cold_cache`.
+    if let Some(session) = cx.update(|cx| ColdSessionCache::take_valid(cx, session_id, &head)) {
+        return Ok(session);
+    }
     let rows = db.load_entries(session_id).await?;
     // The legacy blob is only consulted when the session has no entry rows —
     // same precedence as hydration and `read_session_history`.
@@ -747,20 +768,22 @@ async fn load_cold_session(
     } else {
         None
     };
-    let epoch = db.load_epoch(session_id).await?.unwrap_or(0);
-    let change_seq = db.load_change_seq(session_id).await?.map(|seq| seq as u64);
-    Ok(cx.update(|cx| {
+    let change_seq = head.change_seq.map(|seq| seq as u64);
+    let session = cx.update(|cx| {
         let (session, _migrating) = crate::store::build_cold_session(
-            &meta,
+            &head.meta,
             (!rows.is_empty()).then_some(rows),
             blob,
-            epoch,
+            head.epoch,
             change_seq,
-            meta.tab_order,
+            head.meta.tab_order,
             cx,
         );
         session
-    }))
+    });
+    let entry_count = cx.update(|cx| session.read(cx).entries.len());
+    cx.update(|cx| ColdSessionCache::store(cx, session_id, head, session.clone(), entry_count));
+    Ok(session)
 }
 
 // =====================================================================
@@ -1215,47 +1238,31 @@ impl McpServerTool for GetSessionEntryTool {
         let want_index = input.index;
         let include_images = input.include_images;
 
-        let result = cx.update(|cx| -> Result<GetSessionEntryResult> {
+        // 1. In-memory path — live or cold-restored, the freshest source.
+        let in_memory = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
-            let entity = store
-                .read_with(cx, |store, _| store.session(session_id))
-                .with_context(|| format!("session_not_found: {}", session_id))?;
-            let session = entity.read(cx);
-            // Phase 4 Task 5a: read the single entry from the unified
-            // `session.entries` (works for cold/resumed row-native
-            // sessions too — the old live-thread-only path errored
-            // `session_has_no_thread` for any sleeping session).
-            let entries = &session.entries;
-            let len = entries.len();
-            anyhow::ensure!(
-                want_index < len,
-                "entry_index_out_of_range: {} (session has {} entries)",
+            let entity = store.read_with(cx, |store, _| store.session(session_id))?;
+            Some(build_get_session_entry_result(
+                entity.read(cx),
                 want_index,
-                len
-            );
-            // Replay the image cursor up to `want_index` so the
-            // returned `EntryImage.index` matches what
-            // `get_session{ include_images: true }` would have
-            // assigned to the same image — keeps cross-references
-            // (markdown `spk-image://N` links etc.) consistent.
-            let mut image_cursor = 0usize;
-            for entry in entries.iter().take(want_index) {
-                image_cursor += count_images_in_entry(&entry.kind);
-            }
-            let entry = entries
-                .get(want_index)
-                .ok_or_else(|| anyhow!("entry vanished mid-read"))?;
-            let live_auth_options = live_auth_options_for_session(session, cx);
-            let summary = summarize_entry(
-                entry,
-                want_index,
-                true,
                 include_images,
-                &mut image_cursor,
-                &live_auth_options,
-            );
-            Ok(GetSessionEntryResult { entry: summary })
-        })?;
+                cx,
+            ))
+        });
+        let result = match in_memory {
+            Some(result) => result?,
+            // 2. Cold path, through the SAME `load_cold_session` the other two
+            //    read RPCs use. Once `get_session` could serve a closed
+            //    session, a client could have a closed transcript on screen —
+            //    and tapping one of its bubbles hit a `session_not_found` for a
+            //    session the very same client had just been served.
+            None => {
+                let session = load_cold_session(session_id, cx).await?;
+                cx.update(|cx| {
+                    build_get_session_entry_result(session.read(cx), want_index, include_images, cx)
+                })?
+            }
+        };
 
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
@@ -1264,6 +1271,52 @@ impl McpServerTool for GetSessionEntryTool {
             structured_content: result,
         })
     }
+}
+
+/// Extract one entry's full summary from `session`. Split out of the tool body
+/// so the in-memory path and the cold DB fallback answer from the same code —
+/// in particular the same image-cursor replay, which is what keeps a
+/// `spk-image://N` reference in this entry pointing at the image
+/// `get_session` numbered N.
+fn build_get_session_entry_result(
+    session: &crate::model::SolutionSession,
+    want_index: usize,
+    include_images: bool,
+    cx: &App,
+) -> Result<GetSessionEntryResult> {
+    // Phase 4 Task 5a: read the single entry from the unified
+    // `session.entries` (works for cold/resumed row-native sessions too — the
+    // old live-thread-only path errored `session_has_no_thread` for any
+    // sleeping session).
+    let entries = &session.entries;
+    let len = entries.len();
+    anyhow::ensure!(
+        want_index < len,
+        "entry_index_out_of_range: {} (session has {} entries)",
+        want_index,
+        len
+    );
+    // Replay the image cursor up to `want_index` so the returned
+    // `EntryImage.index` matches what `get_session{ include_images: true }`
+    // would have assigned to the same image — keeps cross-references (markdown
+    // `spk-image://N` links etc.) consistent.
+    let mut image_cursor = 0usize;
+    for entry in entries.iter().take(want_index) {
+        image_cursor += count_images_in_entry(&entry.kind);
+    }
+    let entry = entries
+        .get(want_index)
+        .ok_or_else(|| anyhow!("entry vanished mid-read"))?;
+    let live_auth_options = live_auth_options_for_session(session, cx);
+    let summary = summarize_entry(
+        entry,
+        want_index,
+        true,
+        include_images,
+        &mut image_cursor,
+        &live_auth_options,
+    );
+    Ok(GetSessionEntryResult { entry: summary })
 }
 
 // =====================================================================

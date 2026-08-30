@@ -105,7 +105,11 @@ impl SolutionAgentDb {
 
     pub fn load_entries(&self, session_id: SolutionSessionId) -> Task<Result<Vec<EntryRow>>> {
         let connection = self.connection.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let entry_load_count = self.entry_load_count.clone();
         self.executor.spawn(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            entry_load_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let connection = connection.lock();
             select_entries_for_session(&connection, &session_id.to_string())
         })

@@ -4029,3 +4029,429 @@ async fn get_session_legacy_blob_closed_session_serves_bumped_epoch(cx: &mut gpu
         "the bump is derived from the persisted epoch each time, never compounded"
     );
 }
+
+/// Seed a closed session (metadata row + `count` entry rows, nothing in
+/// `store.sessions`) and hand back the DB handle, so a test can read the
+/// transcript-read counter off it. Entry `mod_seq`s run `1..=count`, matching
+/// what `bump_change_seq` would have allocated, so the delta cursor arithmetic
+/// in `get_session_changes` behaves exactly as it does in the wild.
+///
+/// Every row is a USER message on purpose: `Stream::push_coalesced` merges
+/// consecutive assistant messages, so a run of assistant rows would arrive as
+/// ONE stream entry and quietly collapse the multi-page burst these tests are
+/// built to produce.
+async fn seed_closed_session_with_entries(
+    cx: &mut gpui::TestAppContext,
+    count: usize,
+) -> (
+    crate::model::SolutionSessionId,
+    std::sync::Arc<crate::db::SolutionAgentDb>,
+    tempfile::TempDir,
+) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (solution_id, tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let executor = cx.executor();
+    let db = std::sync::Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = chrono::Utc::now();
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new(format!("acp-{}", session_id.as_str())),
+        title: SharedString::from("closed paging session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: Some(0),
+    })
+    .await
+    .expect("save metadata");
+
+    for idx in 0..count {
+        let entry = SessionEntry {
+            created_ms: 1_700_000_000_000 + idx as i64,
+            mod_seq: idx as u64 + 1,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: format!("line {idx}"),
+                chunks: vec![fake_user_text_chunk(&format!("line {idx}"))],
+            },
+        };
+        db.upsert_entry(
+            session_id,
+            idx as i64,
+            entry.mod_seq as i64,
+            entry.created_ms,
+            None,
+            entry.to_payload(),
+        )
+        .await
+        .expect("upsert entry");
+    }
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(
+            store.read(cx).session(session_id).is_none(),
+            "session must not be in memory for this test"
+        );
+    });
+
+    (session_id, db, tmp)
+}
+
+/// Drive `get_session_changes` from `since_seq` until it reports no more, the
+/// way a client catching up on a closed session does — `has_more` makes it
+/// re-poll immediately from the advanced cursor. Returns the number of polls
+/// and every entry index it was handed, in order.
+async fn drain_cold_delta(
+    cx: &mut gpui::TestAppContext,
+    session_id: crate::model::SolutionSessionId,
+    epoch: u64,
+) -> (usize, Vec<usize>) {
+    let mut since_seq = 0u64;
+    let mut polls = 0usize;
+    let mut seen = Vec::new();
+    loop {
+        let page = GetSessionChangesTool
+            .run(
+                GetSessionChangesParams {
+                    session_id: session_id.to_string(),
+                    since_seq,
+                    known_epoch: epoch,
+                    stream_id: None,
+                    include_images: false,
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("a closed session must keep serving deltas")
+            .structured_content;
+        polls += 1;
+        assert!(!page.reset, "the epoch is pinned, so no poll may reset");
+        seen.extend(page.changed_entries.iter().map(|entry| entry.index));
+        since_seq = page.current_seq;
+        if !page.has_more {
+            return (polls, seen);
+        }
+        assert!(polls < 100, "the burst must terminate");
+    }
+}
+
+/// THE regression this change exists for: a client that fell behind on a
+/// CLOSED session pages in `ceil(behind / CHANGED_ENTRIES_PAGE)` back-to-back
+/// polls (`has_more` drives an immediate re-poll), and every one of those polls
+/// used to re-read and re-decode the ENTIRE transcript — 25 entries here, but
+/// 1,520 rows / 5.3 MB on the maintainer's largest real session, over the one
+/// shared sqlite connection that every live session's persist flush also
+/// queues behind.
+///
+/// The burst must now cost ONE transcript read. The count is observed on the DB
+/// handle itself (`entry_load_count`, `cfg`-gated to test builds) rather than
+/// inferred from timing, so the assertion fails loudly rather than flakily if
+/// the reuse stops happening.
+#[gpui::test]
+async fn cold_paging_burst_reads_the_transcript_once(cx: &mut gpui::TestAppContext) {
+    let entry_count = CHANGED_ENTRIES_PAGE * 2 + 5;
+    let (session_id, db, _tmp) = seed_closed_session_with_entries(cx, entry_count).await;
+
+    let (polls, seen) = drain_cold_delta(cx, session_id, 0).await;
+
+    assert_eq!(
+        polls, 3,
+        "{entry_count} entries at a page size of {CHANGED_ENTRIES_PAGE} must take three polls — \
+         without a multi-page burst this test proves nothing"
+    );
+    assert_eq!(
+        seen,
+        (0..entry_count).collect::<Vec<_>>(),
+        "the burst must still deliver every entry exactly once, in order"
+    );
+    assert_eq!(
+        db.entry_load_count(),
+        1,
+        "the whole burst must cost ONE transcript read, not one per page"
+    );
+
+    // The reuse must not have smuggled the session back into the store: the
+    // cold path stays a pure read, which is what lets it serve user-closed tabs
+    // that `list_sessions` would refuse.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(
+            store.read(cx).session(session_id).is_none(),
+            "a cached cold read must not resurrect the session in memory"
+        );
+    });
+}
+
+/// The reuse is gated on a freshly-read head, not on a timer: an entry appended
+/// under a cached copy moves `(entry_count, max_entry_mod_seq)`, so the next
+/// poll must rebuild and serve the new entry.
+///
+/// This is the test that a "cache that never invalidates" fails.
+#[gpui::test]
+async fn cold_cache_rebuilds_when_the_transcript_grows(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (session_id, db, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+
+    let first = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("closed session must be served")
+        .structured_content;
+    assert_eq!(first.total_count, 3);
+    assert_eq!(db.entry_load_count(), 1);
+
+    let appended = SessionEntry {
+        created_ms: 1_700_000_000_100,
+        mod_seq: 4,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: "appended after the cold read".into(),
+            chunks: vec![fake_user_text_chunk("appended after the cold read")],
+        },
+    };
+    db.upsert_entry(
+        session_id,
+        3,
+        appended.mod_seq as i64,
+        appended.created_ms,
+        None,
+        appended.to_payload(),
+    )
+    .await
+    .expect("append entry");
+
+    let second = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                include_full_content: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("closed session must be served")
+        .structured_content;
+    assert_eq!(
+        second.total_count, 4,
+        "a row appended under the cached copy must be visible on the next read"
+    );
+    assert!(
+        second.entries[3]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("appended after the cold read")),
+        "got {:?}",
+        second.entries[3].markdown
+    );
+    assert_eq!(
+        db.entry_load_count(),
+        2,
+        "the changed head must force a real re-read, not a second cache hit"
+    );
+}
+
+/// A hard-purged session must never be served out of the cache. The guarantee
+/// is structural rather than hook-based: every hit is gated on a
+/// `solution_sessions` row that `purge_session` deletes, so the head read
+/// returns `None`, the RPC errors, and the retained copy is dropped on the way
+/// out.
+#[gpui::test]
+async fn cold_cache_never_serves_a_purged_session(cx: &mut gpui::TestAppContext) {
+    let (session_id, db, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+
+    GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("closed session must be served");
+    cx.update(|cx| {
+        assert_eq!(
+            crate::mcp::cold_cache::ColdSessionCache::len_for_test(cx),
+            1,
+            "the read must have retained a copy, or this test proves nothing"
+        );
+    });
+
+    db.purge_session(session_id).await.expect("purge");
+
+    let err = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("a purged session must not be served from the cache");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("session_not_found")
+            && msg.contains("neither open nor archived in the database"),
+        "got {msg:?}"
+    );
+    cx.update(|cx| {
+        assert_eq!(
+            crate::mcp::cold_cache::ColdSessionCache::len_for_test(cx),
+            0,
+            "the purged copy must be released, not left to age out"
+        );
+    });
+}
+
+/// The TTL bounds RETENTION, not correctness — but it has to actually fire, or
+/// an idle editor holds a transcript forever. After the entry ages out the next
+/// read rebuilds from the database.
+#[gpui::test]
+async fn cold_cache_entry_expires_after_the_ttl(cx: &mut gpui::TestAppContext) {
+    let (session_id, db, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+
+    let read = async |cx: &mut gpui::TestAppContext| {
+        GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("closed session must be served");
+    };
+
+    read(cx).await;
+    read(cx).await;
+    assert_eq!(db.entry_load_count(), 1, "the second read must be a hit");
+
+    cx.update(crate::mcp::cold_cache::ColdSessionCache::expire_all_for_test);
+    read(cx).await;
+    assert_eq!(
+        db.entry_load_count(),
+        2,
+        "an aged-out entry must be rebuilt from the database"
+    );
+    cx.update(|cx| {
+        assert_eq!(
+            crate::mcp::cold_cache::ColdSessionCache::len_for_test(cx),
+            1,
+            "the rebuild re-populates a single entry, it does not accumulate"
+        );
+    });
+}
+
+/// `get_session_entry` was the last read RPC with no cold path: it resolved
+/// only through `store.session()` and 404'd for a closed session. Before
+/// `get_session` grew its DB fallback that was unreachable — a client could not
+/// have a closed transcript on screen — but once it could, tapping a bubble in
+/// one hit `session_not_found` for a session the same client had just been
+/// served. It now resolves through the SAME `load_cold_session` as the other
+/// two, so all three agree on whether a closed session exists.
+#[gpui::test]
+async fn get_session_entry_serves_a_closed_session(cx: &mut gpui::TestAppContext) {
+    let (session_id, _db, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+
+    let result = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 2,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_entry must serve a closed session still in the database")
+        .structured_content;
+    assert_eq!(result.entry.index, 2);
+    assert!(
+        result
+            .entry
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("line 2")),
+        "the single-entry call always populates markdown; got {:?}",
+        result.entry.markdown
+    );
+
+    // Out of range on a cold session is still an out-of-range error, not a
+    // not-found: the session exists, the index does not.
+    let err = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 99,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("an index past the transcript must fail");
+    assert!(
+        format!("{err:#}").contains("entry_index_out_of_range"),
+        "got {err:#}"
+    );
+
+    // An id in neither memory nor the database still fails, with the same
+    // wording the other two read RPCs use.
+    let unknown = crate::model::SolutionSessionId::new();
+    let err = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: unknown.to_string(),
+                index: 0,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("an unknown session id must still fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("session_not_found")
+            && msg.contains("neither open nor archived in the database"),
+        "got {msg:?}"
+    );
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(
+            store.read(cx).session(session_id).is_none(),
+            "the single-entry cold read must stay a pure read too"
+        );
+    });
+}

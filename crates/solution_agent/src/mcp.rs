@@ -8,6 +8,7 @@
 use gpui::App;
 
 mod authorization;
+mod cold_cache;
 mod context;
 mod dto;
 mod lifecycle;

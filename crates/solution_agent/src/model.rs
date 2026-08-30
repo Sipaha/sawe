@@ -1124,7 +1124,13 @@ impl EventEmitter<SolutionSessionEvent> for SolutionSession {}
 
 /// Lightweight metadata row used for navigator listing without hydrating
 /// the full conversation blob.
-#[derive(Clone, Debug)]
+///
+/// `PartialEq` is load-bearing for the MCP cold-read cache
+/// (`mcp::cold_cache`): a cached cold entity may only be reused when a freshly
+/// read metadata row compares equal to the one it was built from, so a new
+/// field here automatically joins the cache's staleness check instead of
+/// silently becoming a value the cache can serve stale.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SolutionSessionMetadata {
     pub id: SolutionSessionId,
     pub solution_id: SolutionId,
