@@ -2710,9 +2710,9 @@ async fn a_failed_row_read_on_reopen_does_not_delete_the_rows(cx: &mut TestAppCo
             mod_seq: (idx + 1) as u64,
             subagent_id: None,
             kind: crate::session_entry::SessionEntryKind::AssistantMessage {
-                chunks: vec![crate::session_entry::AssistantChunk::Message(
-                    format!("line {idx}").into(),
-                )],
+                chunks: vec![crate::session_entry::AssistantChunk::Message(format!(
+                    "line {idx}"
+                ))],
             },
         };
         db.upsert_entry(

@@ -267,9 +267,9 @@ pub(crate) async fn resume_a_row_native_session_through_a_failed_row_read(
             }
         } else {
             crate::session_entry::SessionEntryKind::AssistantMessage {
-                chunks: vec![crate::session_entry::AssistantChunk::Message(
-                    format!("assistant line {idx}").into(),
-                )],
+                chunks: vec![crate::session_entry::AssistantChunk::Message(format!(
+                    "assistant line {idx}"
+                ))],
             }
         };
         let entry = crate::session_entry::SessionEntry {
