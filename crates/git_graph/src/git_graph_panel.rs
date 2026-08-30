@@ -195,7 +195,9 @@ impl Render for GitGraphPanel {
 /// `debugger_ui::debugger_panel::debug_panel_for_workspace`, including taking
 /// `&Workspace` rather than the entity: callers already hold the workspace
 /// leased, and re-reading the entity there is GPUI's double-lease panic.
-pub fn git_graph_panel_for_workspace(workspace: &Workspace) -> Option<Entity<GitGraphPanel>> {
+pub(crate) fn git_graph_panel_for_workspace(
+    workspace: &Workspace,
+) -> Option<Entity<GitGraphPanel>> {
     workspace
         .solution_band_utility_item(UtilityKind::GitGraph)?
         .downcast::<GitGraphPanel>()
@@ -338,6 +340,58 @@ mod tests {
             .expect("window is open");
     }
 
+    /// `ctrl-alt-\`` has to leave focus in the GRAPH, not on the panel
+    /// container around it — the container handles no keys, so every
+    /// keystroke after the hotkey would go nowhere. The two tri-state tests
+    /// above cannot see this: they bootstrap without a repository, so
+    /// `self.graph` is `None`, `render`'s redirect early-returns, and their
+    /// `contains_focused` assertions are satisfied by
+    /// `DispatchTree::focus_contains`'s `parent == child` short-circuit
+    /// rather than by any panel→graph ancestry.
+    ///
+    /// The `is_action_available` assertion is the one that speaks about
+    /// keystrokes rather than focus bookkeeping: it walks only the dispatch
+    /// path to the focused node in the RENDERED frame, and
+    /// `git_graph::OpenCommitView` is registered on `GitGraph`'s own element
+    /// and nowhere else in this workspace, so its reachability means a key
+    /// event dispatched now really traverses the graph. With focus resting
+    /// on the panel root that path stops above the graph and the action is
+    /// unreachable.
+    #[gpui::test]
+    async fn toggle_focus_lands_in_the_graph(cx: &mut TestAppContext) {
+        let (window, panel, band) = bootstrap_with_repositories(cx, 1).await;
+        let graph = panel
+            .read_with(cx, |panel, _cx| panel.graph.clone())
+            .expect("a worktree with a .git resolves one repository");
+
+        toggle(&window, cx);
+
+        window
+            .update(cx, |_workspace, window, cx| {
+                assert!(
+                    graph.focus_handle(cx).is_focused(window),
+                    "ctrl-alt-` must focus the graph itself, not the panel around it"
+                );
+                assert!(
+                    panel.focus_handle(cx).contains_focused(window, cx),
+                    "and the panel must still count as focused, or the band's \
+                     tri-state loses its 'visible and focused' leg"
+                );
+                assert!(
+                    window.is_action_available(&crate::OpenCommitView, cx),
+                    "a keystroke dispatched now must travel through the graph's \
+                     element"
+                );
+            })
+            .expect("window is open");
+
+        toggle(&window, cx);
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "a second press on the focused graph still hides the section"
+        );
+    }
+
     fn toggle(window: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) {
         window
             .update(cx, |workspace, window, cx| {
@@ -354,6 +408,22 @@ mod tests {
         Entity<GitGraphPanel>,
         Entity<SolutionBand>,
     ) {
+        bootstrap_with_repositories(cx, 0).await
+    }
+
+    /// One worktree per requested repository, each carrying a `.git` so the
+    /// project resolves a `Repository` for it. `0` gives a single plain
+    /// worktree and hence no repository at all — the state in which
+    /// `GitGraphPanel::graph` stays `None` and `render`'s redirect has
+    /// nothing to hand focus to.
+    async fn bootstrap_with_repositories(
+        cx: &mut TestAppContext,
+        repository_count: usize,
+    ) -> (
+        gpui::WindowHandle<Workspace>,
+        Entity<GitGraphPanel>,
+        Entity<SolutionBand>,
+    ) {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
@@ -362,8 +432,27 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/root", serde_json::json!({})).await;
-        let project = Project::test(fs, [std::path::Path::new("/root")], cx).await;
+        let mut roots = Vec::new();
+        if repository_count == 0 {
+            fs.insert_tree("/root", serde_json::json!({})).await;
+            roots.push(std::path::PathBuf::from("/root"));
+        } else {
+            for index in 0..repository_count {
+                let root = std::path::PathBuf::from(format!("/repo-{index}"));
+                fs.insert_tree(
+                    &root,
+                    serde_json::json!({".git": {}, "file.txt": "content"}),
+                )
+                .await;
+                roots.push(root);
+            }
+        }
+        let root_paths = roots
+            .iter()
+            .map(|root| root.as_path())
+            .collect::<Vec<&std::path::Path>>();
+        let project = Project::test(fs, root_paths, cx).await;
+        cx.run_until_parked();
 
         let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
         let (panel, band) = window
