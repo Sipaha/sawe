@@ -10,7 +10,7 @@ phases, which are all still finished and untouched.
 one 19× performance win, all found by pulling on threads that pool named in one
 line each.
 
-Everything below is on `origin/main`, HEAD `750149c196`. Working tree clean.
+Everything below is on `origin/main`, HEAD `f84b1ea605`. Working tree clean.
 
 ---
 
@@ -233,14 +233,19 @@ review.
    `status_row` renders `is_cold` ("Sleeping") ahead of `Errored`, so naively reusing
    `Errored` would be invisible on exactly the tab that needs it most. A product decision,
    with the backend already in place.
-4. **The previous small-deferred list is empty** — `shutdown_server`'s vestigial
+4. **`read_session_history`'s "third decoder" is not one — do not re-open it.** Asked twice,
+   answered in FORK.md #105: every decision in its archive ladder is already shared, and
+   what is local is a flat slice where `build_cold_session` coalesces. A two-line legacy
+   blob is `total_count: 1` to `get_session` and `total_entries: 2` there, pinned on both
+   sides.
+5. **The previous small-deferred list is empty** — `shutdown_server`'s vestigial
    `Result`, the archived title, the undecodable-blob divergence, the mock's
    swappable adjacent gates and the four workspace warnings all shipped, and
    `read_session_history` now carries the same `session_unreadable` code as the
    other two. `cargo check --workspace --all-targets` is at **zero** warnings;
    keep it there. What is left in that class: `read_session_history` still has
    an ad-hoc rows→blob decoder, a third of the same on-disk state.
-5. **The debugger's still-pending-startup server is never shut down at quit.**
+6. **The debugger's still-pending-startup server is never shut down at quit.**
    Unfixable without publishing the starting server's `Arc` into a shared slot,
    which two reviewers agreed to defer *harder*: it would let the quit hook's
    `shutdown()` run against a server the startup task still owns and is
@@ -276,7 +281,7 @@ deliberately gated on liveness with cold orphans logged instead.
 ## Resume recipe
 
 Read this file, then `docs/INDEX.md`, then `git log --oneline -30` to confirm
-the chain ends at `750149c196`. Pick from the pool above per
+the chain ends at `f84b1ea605`. Pick from the pool above per
 `docs/workflow/supervisor-mode.md` § 7. **Nothing is in flight and the pool is
 genuinely thin** — every item this session identified has shipped, and what is
 left is small cleanups plus one deliberately-deferred design call. If that pool
