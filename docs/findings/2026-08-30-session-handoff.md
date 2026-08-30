@@ -24,7 +24,7 @@ whole-commit +/− totals and a changed-files tree; double-clicking a file opens
 that file's diff **for that commit** in the centre pane; a multi-row selection
 renders "N commits selected".
 
-**Nine backlog items also cleared:**
+**Twelve backlog items also cleared:**
 
 - **`ctrl-\`` now leaves the caret in the band's active terminal.** It used to
   focus the `ConsolePanel`'s root handle, so typing after the hotkey went
@@ -61,6 +61,24 @@ renders "N commits selected".
   toggle on — but sticky, because that toggle is itself persisted. **The old
   round-trip test agreed with the bug**: it never called `serialize`, it
   hand-rolled the same buggy expression on both the write and the assert.
+- **The git log's Date column truncated on every row.** Columns were fixed
+  fractions `0.74 / 0.13 / 0.13`, and no single fraction works: the date needs
+  0.069 of a 1920px window but 0.21 of a 640px band half. Date and Author are
+  now sized to their measured content with Description absorbing the rest —
+  which also hands Description ~231px back at full width. The follow-up matters
+  as much as the fix: the derivation cached on **table width alone**, so a UI
+  font-size change silently re-truncated it until any 1px resize; the cache is
+  now keyed on the derivation's own arguments, which cannot go stale by
+  construction.
+- **Two latent bugs found while auditing quit hooks.** `RunningState::activate_item`
+  indexed a *filtered* `SubView` sequence into the pane's *unfiltered* item list
+  (silently selecting the wrong tab — `Pane::activate_item` is bounds-guarded, so
+  it never panicked) and ended in a bare `.unwrap()`; it is now unified with
+  `reveal_debug_terminal` behind one focus-parameterised helper. And
+  `Copilot::shutdown_language_server` awaited an async block whose output *was*
+  the `Option<impl Future>` from `LanguageServer::shutdown` and **discarded it**
+  — so copilot's server was never asked to shut down at all, dying by pipe
+  closure instead.
 - **A DAP `runInTerminal` terminal could land invisibly.** It is the *default*
   launch path for the JS and Python adapters, and the adapter blocks on our
   reply with no timeout. The always-present half of the bug was not the band but
