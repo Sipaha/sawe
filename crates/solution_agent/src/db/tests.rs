@@ -810,8 +810,8 @@ async fn entry_upsert_same_idx_updates_in_place(cx: &mut gpui::TestAppContext) {
     assert_eq!(rows[0].payload, b"updated".to_vec());
 }
 
-/// The batched writer must be equivalent to "upsert each row, then
-/// `delete_entries_from(trim)`" — same rows in, same stale tail out — because it
+/// The batched writer must be equivalent to "upsert each row, then delete every
+/// row at or past `trim`" — same rows in, same stale tail out — because it
 /// replaced exactly that sequence at both persist sites.
 #[gpui::test]
 async fn upsert_entries_and_trim_writes_every_row_and_drops_the_stale_tail(
@@ -881,23 +881,48 @@ async fn upsert_entries_and_trim_with_no_rows_still_trims(cx: &mut gpui::TestApp
     assert!(db.load_entries(session_id).await.unwrap().is_empty());
 }
 
+/// The batched writer binds one prepared statement over and over, so a `None`
+/// `subagent_id` following a `Some` must clear the binding rather than inherit
+/// it (and vice versa). Today no production flush can expose that: both persist
+/// sites write the Main stream, and `stream::demux` guarantees every Main entry
+/// carries `subagent_id == None`. Pinned at the DB layer so the writer stays
+/// correct independently of that guarantee.
 #[gpui::test]
-async fn delete_entries_from_leaves_earlier_rows(cx: &mut gpui::TestAppContext) {
+async fn upsert_entries_and_trim_binds_each_rows_own_subagent_id(cx: &mut gpui::TestAppContext) {
     let executor = cx.executor();
     let db = SolutionAgentDb::open(executor).unwrap();
 
     let session_id = SolutionSessionId::new();
-    for i in 0i64..3 {
-        db.upsert_entry(session_id, i, i, i * 100, None, vec![i as u8])
-            .await
-            .unwrap();
-    }
+    let tags = [
+        Some("T1".to_string()),
+        None,
+        Some("T2".to_string()),
+        None,
+        Some("T2".to_string()),
+    ];
+    let rows: Vec<crate::db::EntryRow> = tags
+        .iter()
+        .enumerate()
+        .map(|(idx, subagent_id)| crate::db::EntryRow {
+            idx: idx as i64,
+            mod_seq: idx as i64,
+            created_ms: idx as i64 * 10,
+            subagent_id: subagent_id.clone(),
+            payload: vec![idx as u8],
+        })
+        .collect();
+    db.upsert_entries_and_trim(session_id, rows, tags.len() as i64)
+        .await
+        .unwrap();
 
-    db.delete_entries_from(session_id, 1).await.unwrap();
-
-    let rows = db.load_entries(session_id).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].idx, 0);
+    let written: Vec<Option<String>> = db
+        .load_entries(session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.subagent_id)
+        .collect();
+    assert_eq!(written, tags.to_vec());
 }
 
 #[gpui::test]

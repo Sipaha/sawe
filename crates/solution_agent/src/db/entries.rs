@@ -57,12 +57,24 @@ impl SolutionAgentDb {
     /// only two states to see: the row set from before it, or the one after.
     ///
     /// `trim_from_idx` rides along for exactly that reason rather than staying a
-    /// separately-awaited [`Self::delete_entries_from`]. Between the last upsert
-    /// and the trim the table holds the new rows AND the stale tail beyond them
-    /// — which is precisely the "flat mirror longer than Main" shape cold load
-    /// reads as a legacy row layout (`model::hydrate_streams_main_only`). The
-    /// order within the closure is the order the callers issued it in: upserts
-    /// first, trim last.
+    /// separately-awaited trim. Between the last upsert and the trim the table
+    /// holds the new rows AND the stale tail beyond them — a fresh head followed
+    /// by a stale tail, which cold load accepts as authoritative under EITHER
+    /// branch of `model::hydrate_streams_main_only`'s `entries.len() == main_len`
+    /// check, so neither branch rescues the reader:
+    ///
+    /// - the stale tail is normally untagged too (the write that left it was
+    ///   itself a Main-local flush), so `stream::demux` routes every row into
+    ///   Main and the counts MATCH — the layout is not read as legacy at all,
+    ///   the watermark is seeded from the spliced transcript, no realign is
+    ///   armed, and the splice is authoritative from then on;
+    /// - if `Stream::push_coalesced` does merge across the head/tail seam the
+    ///   counts differ and legacy IS detected — which only means
+    ///   `persisted_main_seq` is seeded to 0, so the full rewrite that arms
+    ///   writes the spliced transcript back permanently.
+    ///
+    /// The order within the closure is the order the callers issued it in:
+    /// upserts first, trim last.
     pub fn upsert_entries_and_trim(
         &self,
         session_id: SolutionSessionId,
@@ -96,18 +108,6 @@ impl SolutionAgentDb {
         self.executor.spawn(async move {
             let connection = connection.lock();
             select_entries_for_session(&connection, &session_id.to_string())
-        })
-    }
-
-    pub fn delete_entries_from(
-        &self,
-        session_id: SolutionSessionId,
-        from_idx: i64,
-    ) -> Task<Result<()>> {
-        let connection = self.connection.clone();
-        self.executor.spawn(async move {
-            let connection = connection.lock();
-            delete_entries_from_idx(&connection, &session_id.to_string(), from_idx)
         })
     }
 
@@ -148,9 +148,22 @@ pub(crate) fn insert_or_update_entries_and_trim(
     rows: Vec<EntryRow>,
     trim_from_idx: i64,
 ) -> Result<()> {
+    // A row at or past the trim would be written and then deleted again by the
+    // closure below. Both persist sites derive `idx` from an `enumerate()` over
+    // the very slice whose length they pass as `trim_from_idx`, so this holds by
+    // construction — and it is the sole reason upsert-before-trim is the safe
+    // order. Reversed, such a row would SURVIVE the trim as an unreachable stale
+    // tail instead of being swallowed.
+    debug_assert!(
+        rows.iter().all(|row| row.idx < trim_from_idx),
+        "upsert_entries_and_trim would swallow its own row: max idx {:?} >= trim {trim_from_idx}",
+        rows.iter().map(|row| row.idx).max(),
+    );
     // One savepoint so a failure part-way through cannot leave the session with
-    // some of the flush applied — a half-applied flush is indistinguishable on
-    // the next cold load from a genuinely shorter transcript.
+    // some of the flush applied. Growing, that would merely look like a shorter
+    // transcript on the next cold load. Shrinking, it is the fresh-head-over-
+    // stale-tail splice the folded trim exists to prevent — so the upserts and
+    // the trim have to stand or fall together.
     let tx = connection.with_savepoint("upsert_entries_and_trim", || {
         {
             let mut upsert = connection
@@ -197,6 +210,11 @@ pub(crate) fn select_entries_for_session(
         .collect())
 }
 
+/// The trim half of a flush. Reachable only from
+/// [`SolutionAgentDb::upsert_entries_and_trim`]: a standalone `delete_entries_from`
+/// task existed until the trim was folded into the batched write, and it is not
+/// coming back — a trim awaited separately from the upserts that shrink the row
+/// set is exactly the torn write that batching removed.
 pub(crate) fn delete_entries_from_idx(
     connection: &Connection,
     session_id: &str,
