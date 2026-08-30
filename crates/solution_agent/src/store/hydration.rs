@@ -303,10 +303,14 @@ pub(crate) fn unique_session_title(
 ///   construction", which is what it used to say and is false.)
 /// * Every path that could set `epoch > 0` therefore either wrote rows (so we
 ///   are not in this branch) or deliberately deleted them.
-/// * And a write that FAILED cannot leave the watermark claiming otherwise: the
-///   optimistic `persisted_main_seq` advance is rolled back on failure (see
-///   `SolutionAgentStore::persist_all_rows_inner`), so a later flush cannot
-///   succeed with a delta that silently omits rows which never landed.
+/// * And a write that FAILED cannot leave the watermark claiming otherwise. Two
+///   halves, because the rollback alone is not enough: the optimistic
+///   `persisted_main_seq` advance is rolled back on failure, and — since that
+///   rollback is consumed on the FOREGROUND — a flush already captured when the
+///   failure lands would still carry a delta computed against the stale
+///   watermark, so both persist tasks additionally decline to save the epoch
+///   when `entry_write_failed` is set, which chain ordering guarantees they
+///   observe. See `SolutionAgentStore::persist_all_rows_inner` for both.
 ///
 /// Consequence worth stating plainly: for a session matching this predicate the
 /// blob is treated as unreadable. `persist_context_wipe` clears it at the source

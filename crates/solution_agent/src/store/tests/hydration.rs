@@ -2494,3 +2494,159 @@ async fn mock_agent_server_composes_a_prompt_gate_with_resume_support(cx: &mut T
     .await
     .expect("a prompt gate must not disable resume support");
 }
+
+/// The watermark rollback closes the failure window only for flushes captured
+/// AFTER the failure is visible. The flag is set on the background and consumed
+/// on the foreground, so a flush captured in between inherits the lie:
+///
+///   1. `persist_main_stream` P1 advances the watermark and spawns T1;
+///   2. still in the same foreground burst, P2 captures its plan — the flag is
+///      clear, so it gets no rollback — and spawns T2 chained behind T1;
+///   3. T1 fails and sets the flag; T2 then succeeds with its pre-captured
+///      delta and, unguarded, saved the epoch.
+///
+/// If P2's delta is empty — reachable through the `EntriesRemoved` rewind, or a
+/// delta whose only row `drop_empty_payload_rows` discards — and the table was
+/// empty because T1 was the legacy→rows migration flush, the disk lands on zero
+/// rows + `epoch > 0` + a retained blob: the state `is_wiped_row_native` treats
+/// as authoritative, now load-bearing for four reconstruction paths. So both
+/// tasks also decline the epoch when the flag is set, which chain ordering
+/// (`prev.await`) guarantees they observe.
+///
+/// The predecessor's failure is injected directly rather than through
+/// `break_entry_writes_for_test`: the window needs T1 to FAIL while T2 SUCCEEDS
+/// against the same table, and there is no deterministic point between two
+/// chained background tasks at which a test could repair it. Setting the flag
+/// after the plan capture reproduces the only state the gate can observe, and
+/// with the same happens-before edge — the flag is written before the task runs.
+#[gpui::test]
+async fn a_flush_captured_before_a_predecessor_failed_does_not_advance_the_epoch(
+    cx: &mut TestAppContext,
+) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("alpha".to_string()),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    let epoch_before = db
+        .load_epoch(session_id)
+        .await
+        .expect("load epoch before")
+        .unwrap_or(0);
+    assert_eq!(epoch_before, 0, "a never-wiped session sits at epoch 0");
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("session")
+                .update(cx, |s, _| s.bump_epoch());
+            // Captures its plan against a CLEAR flag: the watermark is already at
+            // the tail, so this flush's delta is empty and its write will succeed
+            // no matter what a predecessor did to the table.
+            store.persist_main_stream(session_id, cx);
+            // Only now does the chained predecessor fail.
+            store
+                .entry_write_failed
+                .get(&session_id)
+                .expect("a persist creates the flag")
+                .store(true, std::sync::atomic::Ordering::Release);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_epoch(session_id)
+            .await
+            .expect("load epoch after")
+            .unwrap_or(0),
+        epoch_before,
+        "a flush whose own write succeeded must still decline to advance the \
+         epoch over a table a chained predecessor left short"
+    );
+
+    // The task must READ the flag, never consume it. Consuming it would satisfy
+    // every epoch assertion here and still disable the repair: the foreground is
+    // the only place that rolls the watermark back, so a task that swallowed the
+    // flag would leave the short rows un-re-covered forever.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            assert!(
+                store
+                    .entry_write_failed
+                    .get(&session_id)
+                    .expect("flag still tracked")
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "the declining task must leave the flag set for the foreground to \
+                 consume — clearing it here skips the watermark rollback"
+            );
+        });
+    });
+
+    // The same gate on the full-flush sibling, which has its own copy of it.
+    // Re-arm the predecessor failure against a plan captured while it was clear.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .entry_write_failed
+                .get(&session_id)
+                .expect("flag exists")
+                .store(false, std::sync::atomic::Ordering::Release);
+            store.persist_all_rows(session_id, cx);
+            store
+                .entry_write_failed
+                .get(&session_id)
+                .expect("flag exists")
+                .store(true, std::sync::atomic::Ordering::Release);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_epoch(session_id)
+            .await
+            .expect("load epoch after full flush")
+            .unwrap_or(0),
+        epoch_before,
+        "persist_all_rows carries the same gate as persist_main_stream — a full \
+         flush must decline the epoch too when a predecessor left the table short"
+    );
+
+    // …and the decline is a one-flush lag, not a permanent stall: the next
+    // foreground persist consumes the flag, re-covers every row, and saves the
+    // epoch it withheld.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.persist_main_stream(session_id, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_epoch(session_id)
+            .await
+            .expect("load epoch after recovery")
+            .unwrap_or(0),
+        1,
+        "the withheld epoch must land on the next persist, once the flag has \
+         been consumed and the rows re-covered"
+    );
+}

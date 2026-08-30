@@ -4168,7 +4168,20 @@ impl SolutionAgentStore {
                 // never happened, and the blob would be suppressed on the
                 // strength of it. Leaving the epoch behind instead just means
                 // the next successful flush re-writes both, in order.
-                if rows_written {
+                //
+                // `write_failed` as well as `rows_written`, because OUR write
+                // succeeding does not mean the table is whole. The rollback is
+                // consumed on the FOREGROUND; a flush captured in the window
+                // between a predecessor's spawn and its failure saw a clear flag,
+                // got no rollback, and carries a delta computed against a
+                // watermark that predecessor has since invalidated. Chain
+                // ordering is what makes this readable: we `prev.await`ed that
+                // predecessor, so its `store(true)` happens-before this load.
+                // Declining here costs one lagging epoch, repaired by the next
+                // foreground persist (which does see the flag and re-covers
+                // everything); advancing would claim a generation over a table
+                // we already know may be short.
+                if rows_written && !write_failed.load(std::sync::atomic::Ordering::Acquire) {
                     db.save_epoch(session_id, epoch).await.log_err();
                     db.save_change_seq(session_id, change_seq).await.log_err();
                 }
@@ -4271,7 +4284,10 @@ impl SolutionAgentStore {
                 if !rows_written {
                     write_failed.store(true, std::sync::atomic::Ordering::Release);
                 }
-                if rows_written {
+                // Both conditions, for the reasons spelled out at the same gate
+                // in `persist_all_rows_inner`: our own write landing, and no
+                // chained predecessor having failed after our plan was captured.
+                if rows_written && !write_failed.load(std::sync::atomic::Ordering::Acquire) {
                     db.save_epoch(session_id, epoch).await.log_err();
                     db.save_change_seq(session_id, change_seq).await.log_err();
                 }

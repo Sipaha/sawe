@@ -1566,8 +1566,10 @@ impl McpServerTool for ReadSessionHistoryTool {
             // closed without ever sending — no rows, no blob, `epoch == 0`. The
             // second was the last case where these two tools still disagreed. The
             // conflation is gone for free now that `load_cold_head` establishes
-            // existence first, so `session_not_found` is raised in exactly one
-            // place: the head that is not there.
+            // existence first: the only "this session does not exist" answers
+            // left are the two that genuinely mean it — no head for this id, and
+            // no session database attached at all — and neither is reached by
+            // asking about a transcript.
             return Ok(ToolResponse {
                 content: vec![ToolResponseContent::Text {
                     text: "0/0 entries (archived)".to_string(),

@@ -123,7 +123,7 @@ impl SolutionAgentDb {
         })
     }
 
-    /// Drop `solution_session_entries` so every subsequent entry write FAILS.
+    /// Rename `solution_session_entries` away so every subsequent entry write FAILS.
     ///
     /// Test-only, and the only way to observe the "an epoch must never outrun
     /// the row write it describes" contract in `persist_all_rows_inner` /
