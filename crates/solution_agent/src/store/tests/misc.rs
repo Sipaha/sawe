@@ -6780,7 +6780,7 @@ async fn toggle_dialog_session_does_not_reopen_a_closed_remembered_session(
 }
 
 /// A remembered id that stops qualifying must be DROPPED from
-/// `last_dialog_session`, not merely skipped. `persist_tab_order` is the
+/// `last_dialog_session` — and ONLY that solution's entry. `persist_tab_order` is the
 /// live path that produces this state: it NULLs `tab_order` on every session
 /// of the solution absent from the new order (what the close-tab affordance
 /// and the `workspace.close_session` RPC go through), which leaves the
@@ -6790,9 +6790,38 @@ async fn toggle_dialog_session_does_not_reopen_a_closed_remembered_session(
 /// finds nothing and `set_active_dialog_session` does not run: with the entry
 /// left in place the map keeps pointing at a session the hotkey can never
 /// reopen, and every later press re-does the same failed validation.
+///
+/// A second solution's remembered entry is seeded and asserted intact, because
+/// `last_dialog_session` is one map shared by every solution: a drop written as
+/// `clear()` (or a `retain` on the wrong key) would pass every other assertion
+/// here while silently forgetting every OTHER solution's reopen target.
 #[gpui::test]
 async fn toggle_dialog_session_drops_a_stale_remembered_id(cx: &mut TestAppContext) {
     let (solution_id, _tmp, agent_id, project) = setup_toggle_dialog_fixture(cx).await;
+
+    // A second, independent solution whose band remembers its own session.
+    // Nothing this test does to `solution_id` may touch it.
+    let (other_solution, other_session) = cx.update(|cx| {
+        let solution_store = solutions::SolutionStore::global(cx);
+        let root = solution_store
+            .read(cx)
+            .find_solution(solution_id)
+            .expect("solution")
+            .root
+            .clone();
+        let other_solution = solution_store
+            .update(cx, |store, cx| {
+                store.create_solution("Other", root.join("other"), cx)
+            })
+            .expect("create second solution");
+        let other_session = crate::model::SolutionSessionId::new();
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(other_solution, Some(other_session), cx);
+            store.set_active_dialog_session(other_solution, None, cx);
+        });
+        (other_solution, other_session)
+    });
 
     let session_id = cx
         .update(|cx| {
@@ -6852,6 +6881,11 @@ async fn toggle_dialog_session_drops_a_stale_remembered_id(cx: &mut TestAppConte
                 store.active_dialog_session(solution_id),
                 None,
                 "with no eligible session the hotkey stays a no-op"
+            );
+            assert_eq!(
+                store.last_dialog_session.get(&other_solution),
+                Some(&other_session),
+                "the drop is per-solution: another band's reopen target survives"
             );
         });
     });

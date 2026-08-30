@@ -1670,6 +1670,17 @@ impl SolutionAgentStore {
     /// close-tab path), which leaves the session in `self.sessions` but
     /// makes `can_be_active_dialog` false — the map would otherwise hold that
     /// id until the next `set_active_dialog_session` happened to overwrite it.
+    ///
+    /// The drop is lossy, in exactly one case. When the fallback below DOES
+    /// find a session, its `set_active_dialog_session` re-inserts an entry, so
+    /// the map is replaced rather than emptied and the drop changes nothing.
+    /// Only when nothing is eligible (every tab of the solution closed) does the
+    /// solution end up with no memory at all — and if the user then re-pins the
+    /// forgotten session BEHIND some other tab, the next `ctrl-shift-a` opens
+    /// the leftmost tab instead of the session that was last shown. That is the
+    /// accepted price of not leaving an id in the map that the band can never
+    /// open; keeping it would make every other reader of the map re-derive
+    /// whether it is still true.
     pub fn toggle_dialog_session(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
         if self.active_dialog_session(solution_id).is_some() {
             self.set_active_dialog_session(solution_id, None, cx);
