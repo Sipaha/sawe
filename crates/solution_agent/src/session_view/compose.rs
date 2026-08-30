@@ -214,8 +214,21 @@ impl SolutionSessionView {
         self.dispatch_send(blocks, target, window, cx);
     }
 
-    /// Send `blocks` and, if the send comes back `Err`, put the user's draft
-    /// BACK in the compose box and raise a toast.
+    /// Send `blocks`; on failure raise a toast, and — only when the failure
+    /// consumed nothing — put the user's draft BACK in the compose box.
+    ///
+    /// The two halves are deliberately scoped differently. **The toast is
+    /// broad**: every send failure surfaces, which is what makes a refusal
+    /// visible on a cold tab at all (`status_row` renders `is_cold` /
+    /// "Sleeping" ahead of `SessionState::Errored`, so that tab has no
+    /// state-derived surface). **The restore is narrow**, keyed on
+    /// [`crate::store::SendFailure::consumed`] rather than on "was this a
+    /// refusal" — the framing matters, so the next failure mode added to the
+    /// funnel lands on the right side by default. `AcpThread::send_inner`
+    /// pushes the `UserMessage` entry before `connection.prompt`, so an
+    /// ordinary turn failure (usage wall, agent crash, dropped connection)
+    /// already has the message in the transcript as a bubble; restoring it
+    /// would put the same text in two places and make Enter a duplicate send.
     ///
     /// Every compose send used to be `.detach_and_log_err(cx)`, which meant the
     /// error reached the log and nobody else — while `submit_compose_now` had
@@ -243,19 +256,28 @@ impl SolutionSessionView {
     ) {
         let session_id = self.session_id;
         let send = SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.send_message_blocks_targeted(session_id, blocks.clone(), target, true, cx)
+            store.send_message_blocks_targeted_inner(session_id, blocks.clone(), target, true, cx)
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Err(err) = send.await else {
+            let Err(failure) = send.await else {
                 return;
             };
+            let err = failure.source;
             this.update_in(cx, |this, window, cx| {
                 log::warn!(
                     target: "solution_agent::queue",
-                    "session={session_id} send failed; restoring the draft into compose \
-                     (err={err:#}) — content: {}",
+                    "session={session_id} send failed (consumed={}) — content: {}; err={err:#}",
+                    failure.consumed,
                     crate::store::summarize_blocks_for_log(&blocks),
                 );
+                if failure.consumed {
+                    // The message is already a bubble in the transcript, with the
+                    // failure rendered under it. Putting it back in the compose
+                    // box too would show it in two places and make Enter re-send
+                    // it. Toast only.
+                    this.show_toast(SharedString::from(format!("{err:#}")), cx);
+                    return;
+                }
                 let (failed_text, failed_images) = super::recall::unpack_recalled_bundle(blocks);
                 // MERGE rather than "restore only if the box is still empty":
                 // this mirrors the cold-send resume-failure restore in

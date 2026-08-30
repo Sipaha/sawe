@@ -204,6 +204,47 @@ pub(crate) fn save_inbox_image(
 /// `MAX_PREVIEW`; images / resources collapse to a typed marker. Kept
 /// in this file (vs `conversation_render`) because the queue codepath
 /// is the only consumer.
+/// Why a send failed, and — the part the compose row needs — whether the user's
+/// message was already CONSUMED before it did.
+///
+/// The boundary is structural rather than a judgement call, and it is worth
+/// stating as "consumed or not" rather than "was it a refusal", so that the next
+/// failure mode added to this funnel lands on the right side by default:
+/// `AcpThread::send_inner` pushes the `UserMessage` entry onto the thread BEFORE
+/// it calls `connection.prompt`, so every error that comes out of
+/// `send_task.await` has already put the message in the transcript — as a
+/// bubble, with `SessionState::Errored` set and an error entry rendered under
+/// it. Every error returned BEFORE that point consumed nothing at all: empty
+/// blocks, an unknown session, the unreadable-transcript refusal, a cold wake
+/// that could not resume.
+///
+/// `SolutionSessionView::dispatch_send` restores the user's draft into the
+/// compose box only when `consumed` is false. Restoring it for a consumed
+/// failure — an ordinary usage wall, an agent crash, a dropped connection —
+/// would put the same text in two places at once and make Enter a duplicate
+/// send. The toast is deliberately NOT narrowed the same way: it is the only
+/// surface a cold tab has.
+pub(crate) struct SendFailure {
+    pub consumed: bool,
+    pub source: anyhow::Error,
+}
+
+impl SendFailure {
+    fn not_consumed(source: anyhow::Error) -> Self {
+        Self {
+            consumed: false,
+            source,
+        }
+    }
+
+    fn consumed(source: anyhow::Error) -> Self {
+        Self {
+            consumed: true,
+            source,
+        }
+    }
+}
+
 pub(crate) fn summarize_blocks_for_log(
     blocks: &[agent_client_protocol::schema::ContentBlock],
 ) -> String {
@@ -495,14 +536,33 @@ impl SolutionAgentStore {
         from_user: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        let task =
+            self.send_message_blocks_targeted_inner(session_id, blocks, target, from_user, cx);
+        cx.spawn(async move |_, _| task.await.map_err(|failure| failure.source))
+    }
+
+    /// [`Self::send_message_blocks_targeted`], but reporting whether a failure
+    /// CONSUMED the user's message. See [`SendFailure`]; only the compose row
+    /// needs the distinction, and it needs it to decide whether restoring the
+    /// draft would duplicate a message that is already in the transcript.
+    pub(crate) fn send_message_blocks_targeted_inner(
+        &mut self,
+        session_id: SolutionSessionId,
+        blocks: Vec<agent_client_protocol::schema::ContentBlock>,
+        target: QueueTarget,
+        from_user: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<std::result::Result<(), SendFailure>> {
         let Some(session_entity) = self.session(session_id) else {
-            return Task::ready(Err(anyhow!("unknown session {session_id}")));
+            return Task::ready(Err(SendFailure::not_consumed(anyhow!(
+                "unknown session {session_id}"
+            ))));
         };
 
         if blocks.is_empty() {
-            return Task::ready(Err(anyhow!(
+            return Task::ready(Err(SendFailure::not_consumed(anyhow!(
                 "send_message_blocks: at least one ContentBlock required"
-            )));
+            ))));
         }
 
         // This copy of the session was restored WITHOUT its transcript (a read
@@ -726,6 +786,11 @@ impl SolutionAgentStore {
         // resolved.
         let expected_acp_session_id = session_entity.read(cx).acp_session_id.clone();
 
+        // EVERYTHING past this point is CONSUMED. `AcpThread::send_inner` pushes
+        // the `UserMessage` entry onto the thread BEFORE it calls
+        // `connection.prompt`, so by the time `send_task` can resolve `Err` the
+        // message is already a bubble in the transcript (with `Errored` on the
+        // session and an error entry under it). See `SendFailure`.
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = send_task.await;
             match &result {
@@ -752,7 +817,8 @@ impl SolutionAgentStore {
                             store.mark_state_changed(session_id, cx);
                             cx.notify();
                         }
-                    })?;
+                    })
+                    .map_err(SendFailure::consumed)?;
                 }
                 Ok(_) => {
                     // Stopped event already transitioned state to Idle
@@ -820,10 +886,13 @@ impl SolutionAgentStore {
                                     .detach();
                             }
                         }
-                    })?;
+                    })
+                    .map_err(SendFailure::consumed)?;
                 }
             }
-            result.map(|_| ()).map_err(|err| anyhow!(err))
+            result
+                .map(|_| ())
+                .map_err(|err| SendFailure::consumed(anyhow!(err)))
         })
     }
 
@@ -847,7 +916,7 @@ impl SolutionAgentStore {
         target: QueueTarget,
         from_user: bool,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
+    ) -> Task<std::result::Result<(), SendFailure>> {
         log::warn!(
             target: "solution_agent::queue",
             "session={session_id} send into a session that was restored WITHOUT its \
@@ -905,8 +974,12 @@ impl SolutionAgentStore {
                         cx,
                     );
                     cx.notify();
-                })?;
-                return Err(anyhow!("{message}"));
+                })
+                .map_err(SendFailure::not_consumed)?;
+                // NOT consumed: the refusal happens before `acp_thread.send`, so
+                // nothing was appended to the transcript and the user's draft is
+                // theirs to get back.
+                return Err(SendFailure::not_consumed(anyhow!("{message}")));
             }
             this.update(cx, |store, cx| {
                 // `retry_transcript_load` clears the flag on every `Ok` path, so
@@ -916,13 +989,16 @@ impl SolutionAgentStore {
                     .session(session_id)
                     .is_some_and(|s| s.read(cx).transcript_unavailable)
                 {
-                    return Task::ready(Err(anyhow!(
+                    return Task::ready(Err(SendFailure::not_consumed(anyhow!(
                         "session {session_id}: the transcript retry reported success but \
                          the session is still flagged unreadable; refusing the send"
-                    )));
+                    ))));
                 }
-                store.send_message_blocks_targeted(session_id, blocks, target, from_user, cx)
-            })?
+                // `_inner`, so the re-entered send's own consumed/not-consumed
+                // verdict reaches the caller instead of being flattened here.
+                store.send_message_blocks_targeted_inner(session_id, blocks, target, from_user, cx)
+            })
+            .map_err(SendFailure::not_consumed)?
             .await
         })
     }
@@ -952,9 +1028,11 @@ impl SolutionAgentStore {
         session_id: SolutionSessionId,
         blocks: Vec<agent_client_protocol::schema::ContentBlock>,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
+    ) -> Task<std::result::Result<(), SendFailure>> {
         let Some(session_entity) = self.session(session_id) else {
-            return Task::ready(Err(anyhow!("unknown session {session_id}")));
+            return Task::ready(Err(SendFailure::not_consumed(anyhow!(
+                "unknown session {session_id}"
+            ))));
         };
         let (meta, cached_project) = session_entity.read_with(cx, |s, _| {
             let meta = SolutionSessionMetadata {
@@ -988,10 +1066,10 @@ impl SolutionAgentStore {
                 .cloned()
         });
         let Some(solution) = solution else {
-            return Task::ready(Err(anyhow!(
+            return Task::ready(Err(SendFailure::not_consumed(anyhow!(
                 "unknown_solution: cannot wake session {session_id} — solution {solution_id:?} \
                  not found in SolutionStore"
-            )));
+            ))));
         };
 
         let project = match cached_project {
@@ -999,10 +1077,10 @@ impl SolutionAgentStore {
             None => match SolutionAgentStore::make_headless_project_for_solution(&solution, cx) {
                 Ok(project) => project,
                 Err(err) => {
-                    return Task::ready(Err(anyhow!(
+                    return Task::ready(Err(SendFailure::not_consumed(anyhow!(
                         "wake_for_send: headless project construction failed for {session_id}: \
                          {err:#}"
-                    )));
+                    ))));
                 }
             },
         };
@@ -1016,15 +1094,26 @@ impl SolutionAgentStore {
 
         let resume_task = self.resume_session(meta, project, cx);
         cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let _resumed_id = resume_task.await?;
+            // A wake that never resumed consumed nothing — the thread was never
+            // attached, so `AcpThread::send` was never reached.
+            let _resumed_id = resume_task.await.map_err(SendFailure::not_consumed)?;
             // The thread is now attached on the same session entity;
             // re-enter the send path so the hot branch fires. If a
             // racing path attached the thread first, this still
             // resolves correctly — `send_message_blocks` always
             // re-reads `acp_thread()` after the cold check.
-            let task = this.update(cx, |store, cx| {
-                store.send_message_blocks(session_id, blocks, cx)
-            })?;
+            let task = this
+                .update(cx, |store, cx| {
+                    // `_inner`, so the re-entered send's own verdict survives.
+                    store.send_message_blocks_targeted_inner(
+                        session_id,
+                        blocks,
+                        QueueTarget::Main,
+                        true,
+                        cx,
+                    )
+                })
+                .map_err(SendFailure::not_consumed)?;
             task.await
         })
     }

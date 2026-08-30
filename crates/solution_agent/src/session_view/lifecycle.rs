@@ -28,9 +28,18 @@ impl SolutionSessionView {
     ) -> Self {
         // `observe_in`, not `observe`: `flush_pending_send_if_ready` below has to
         // be able to put a REFUSED send's draft back into the compose editor, and
-        // `Editor::set_text` needs a `Window`. The view only ever exists inside a
-        // window, so the extra "skip if the window is gone" condition
-        // `observe_in` carries costs nothing here.
+        // `Editor::set_text` needs a `Window`. It is also strictly better here —
+        // it drops the subscription when the observed entity goes away, not only
+        // when this view does.
+        //
+        // The delta to be aware of is NOT "the callback is dropped once the
+        // window is gone". It is that the body runs inside `App::with_window`,
+        // which returns `None` and SILENTLY SKIPS `on_notify` — while the
+        // subscription stays registered — in three cases: the observer has no
+        // window mapping, its window is closed, or that window is already on the
+        // update stack. Only the third is dangerous, and it is unreachable here:
+        // `flush_effects` runs only at the outermost `App::update`, and the trail
+        // restores the window before that boundary.
         cx.observe_in(&session, window, |this, _, window, cx| {
             // The underlying `acp_thread` field can swap out from under us
             // (rotate_context for compact, reset_context for /clear). The

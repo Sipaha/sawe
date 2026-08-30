@@ -538,3 +538,113 @@ async fn a_refused_send_restores_the_draft_into_the_compose_box(cx: &mut gpui::T
         })
         .unwrap();
 }
+
+/// The restore must be NARROW: an ordinary turn failure must NOT put the draft
+/// back, because the message is already in the transcript.
+///
+/// `AcpThread::send_inner` pushes the `UserMessage` entry BEFORE
+/// `connection.prompt`, and `send_message_blocks_targeted` propagates the
+/// prompt's `Err`. So on a usage wall, an agent crash or a dropped connection
+/// the message is already a bubble with `Errored` set and an error entry under
+/// it — restoring it into the compose box as well would show the same text in
+/// two places and make Enter a duplicate send. The boundary is
+/// `SendFailure::consumed`, not "was this a refusal": stated that way, the next
+/// failure mode added to the funnel lands on the right side by default.
+///
+/// The toast is deliberately NOT narrowed with it, so a cold-tab refusal — which
+/// has no state-derived surface at all — is still visible.
+#[gpui::test]
+async fn a_consumed_turn_failure_does_not_restore_the_draft(cx: &mut gpui::TestAppContext) {
+    use crate::store::SolutionAgentStore;
+    use gpui::VisualTestContext;
+
+    let (_db, meta, project, prompt_tx, _tmp) =
+        crate::store::tests::resume_a_row_native_session_through_a_failed_row_read(cx, 3).await;
+    let session_id = meta.id;
+    cx.update(|cx| theme_settings::init(theme::LoadThemes::JustBase, cx));
+
+    let workspace_window =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| {
+        workspace_window
+            .root(cx)
+            .expect("workspace window alive")
+            .downgrade()
+    });
+    let session = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .expect("the fixture's flagged session")
+    });
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(session_id, session.clone(), workspace_weak, window, cx)
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.run_until_parked();
+
+    // Bring the session back to health through the REAL path rather than by
+    // clearing the flag by hand: this first send's retry succeeds (the injector
+    // is one-shot and the fixture spent it), so the flag clears, the transcript
+    // is repopulated, and the turn runs to completion.
+    prompt_tx.send(()).await.expect("release the first turn");
+    view_window
+        .update(vcx, |view, window, cx| {
+            view.compose_editor_for_test().update(cx, |editor, cx| {
+                editor.set_text("first message", window, cx)
+            });
+            view.submit_compose_now(window, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    let entries_before = cx.update(|cx| {
+        session.read_with(cx, |s, _| {
+            assert!(
+                !s.transcript_unavailable,
+                "precondition: the session must be healthy before the ordinary failure, \
+                 or this test would be measuring the refusal path again"
+            );
+            s.entries.len()
+        })
+    });
+
+    // Now an ORDINARY turn failure: the prompt gate is closed, so
+    // `MockConnection::prompt` resolves `Err` — but only AFTER `send_inner` has
+    // already pushed the user message onto the thread.
+    prompt_tx.close();
+    let draft = "an ordinary message whose turn fails";
+    view_window
+        .update(vcx, |view, window, cx| {
+            view.compose_editor_for_test()
+                .update(cx, |editor, cx| editor.set_text(draft, window, cx));
+            view.submit_compose_now(window, cx);
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    cx.update(|cx| {
+        session.read_with(cx, |s, _| {
+            assert_eq!(
+                s.entries.len(),
+                entries_before + 1,
+                "the failing turn must have CONSUMED the message — if it did not, this \
+                 test is not exercising the consumed branch at all"
+            );
+            assert!(
+                matches!(s.state, crate::model::SessionState::Errored(_)),
+                "and the failure must have surfaced on the session; got {:?}",
+                s.state
+            );
+        });
+    });
+    view_window
+        .update(vcx, |view, _window, cx| {
+            assert_eq!(
+                view.compose_editor_for_test().read(cx).text(cx),
+                "",
+                "a CONSUMED failure must not restore the draft: the message is already \
+                 a bubble in the transcript, so putting it back would duplicate it"
+            );
+        })
+        .unwrap();
+}

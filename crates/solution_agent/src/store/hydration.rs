@@ -333,12 +333,11 @@ pub(crate) fn is_wiped_row_native(rows_empty: bool, epoch: i64) -> bool {
 /// and `retry_transcript_load`.
 ///
 /// `transcript_known_bad` is "we already know this session's transcript is not
-/// readable" — a read that errored, or a blob that would not decode. It is
-/// separate from the epoch term because it is discovered at different times per
-/// caller: `build_cold_session` only learns it BY decoding (so it passes `false`
-/// and folds the decode result into `migrating` afterwards), while the two paths
-/// that perform their own reads know it up front and use it to skip the blob read
-/// outright.
+/// readable" — a read that errored, or a blob that would not decode. All three
+/// callers pass a real value for it. The two that perform their own reads know it
+/// before they get here and use the answer to SKIP the blob read outright;
+/// `build_cold_session` arrives with the blob already in hand and learns it by
+/// decoding, so for it the call is purely the `migrating` question.
 pub(crate) fn legacy_blob_is_the_transcript(
     rows_empty: bool,
     epoch: i64,
@@ -437,11 +436,7 @@ pub(crate) fn build_cold_session(
         let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
         crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, 0, cx)
     };
-    // `transcript_known_bad: false` — this function learns it only BY decoding,
-    // which has already happened above, so the decode result is ANDed in here
-    // rather than passed down.
-    let migrating =
-        legacy_blob_is_the_transcript(rows_absent, epoch, false) && undecodable_blob.is_none();
+    let migrating = legacy_blob_is_the_transcript(rows_absent, epoch, undecodable_blob.is_some());
     let transcript_missing = undecodable_blob.is_some();
     let entity = cx.new(|_| {
         let mut s = SolutionSession::new_idle(

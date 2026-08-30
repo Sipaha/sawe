@@ -4335,6 +4335,40 @@ impl SolutionAgentStore {
                 s.solution_id,
             )
         });
+        // TRIPWIRE, not a guard. On a correct build this is unreachable: every
+        // producer that can append to a flagged session is stopped upstream — a
+        // send retries-then-refuses in `send_message_blocks_targeted`, and
+        // `push_system_note` drops the note. So a line here is by construction a
+        // bug report, and `debug_assert!` turns it into a test failure.
+        //
+        // It exists because this class has now shipped TWICE (the close flush,
+        // then the system note), its failure mode is silent and irreversible row
+        // deletion, and its only user-visible tell is "my tab came back empty".
+        // The complete question is not "what reaches `AcpThread::push_entry`" —
+        // that framing is what missed the system-note door — but "what reaches
+        // `persist_main_stream`", and that set also includes the `EntriesRemoved`
+        // and `EntryUpdated` arms of `store::acp_event`. A third door announces
+        // itself here instead of deleting rows quietly.
+        //
+        // Deliberately NOT a suppression: declining the write here would swallow
+        // a real send too, which is the option FORK.md #110 rules out.
+        if session.read(cx).transcript_unavailable {
+            log::error!(
+                target: "solution_agent::persist",
+                "session={session_id} BUG: persist_main_stream reached for a session \
+                 restored without its transcript — writing {} row(s) with \
+                 main_len={main_len}, which deletes every row at idx >= {main_len}, \
+                 rows this copy never read. Some producer appended to a flagged \
+                 session without going through the send funnel or `push_system_note`.",
+                rows.len(),
+            );
+            debug_assert!(
+                false,
+                "persist_main_stream reached for session {session_id} with \
+                 transcript_unavailable set (main_len={main_len}, rows={})",
+                rows.len(),
+            );
+        }
         let rows = Self::drop_empty_payload_rows(session_id, rows);
         // SERIALIZE behind this session's prior persist link: the plan above is
         // captured in event order, but the trim carries a point-in-time length — if a later append's upsert lands before an
