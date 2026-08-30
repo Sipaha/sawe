@@ -10,7 +10,7 @@ phases, which are all still finished and untouched.
 one 19× performance win, all found by pulling on threads that pool named in one
 line each.
 
-Everything below is on `origin/main`, HEAD `b08eb5e8b5`. Working tree clean.
+Everything below is on `origin/main`, HEAD `0ff21ebd59`. Working tree clean.
 
 ---
 
@@ -72,8 +72,28 @@ lib test target. The flag came from three upstream Zed commits that moved tests
 to `tests/integration/`; the trade was sound and the invariant decayed silently
 when ten `src/` files regrew test modules. 327 → 376 tests.
 
-**Docs.** FORK.md #105, #107, #108 are new; #55's extraction trigger is
-withdrawn permanently; #97 gained a permanent ruling; #103 records its fix;
+**49 unit tests were compiled, green, and never run — and nothing stopped that recurring.**
+`[lib] test = false` in `project`, `worktree` and `fs` kept `cargo test -p <crate>` from
+building the lib test target. The flag came from three upstream Zed commits that moved tests
+to `tests/integration/`; the trade was sound and the invariant decayed silently when ten
+`src/` files regrew test modules. 327 → 376 tests. `tooling/test_target_guard` now fails the
+build on that combination, from a **build script** — because in this fork CI is doubly
+disabled and `cargo test --workspace` is run approximately never, while
+`cargo check --workspace --all-targets` runs continuously under flycheck. FORK.md **#109**.
+
+**`script/check-licenses` had never passed.** Ten fork-local crates — including
+`solution_agent` and `console_panel` — declare `license = "GPL-3.0-or-later"` and carried no
+`LICENSE-GPL` symlink. Added; the script exits 0 for the first time.
+
+**`rebuild_streams`'s decoration got a property test.** The existing 200-seed property pinned
+`demux` ≡ an independent reference but left every decoration input empty, so closed-stream
+removal, hydration-orphan suppression, both `Utc::now()`-derived folds, the never-clobber rule
+and label enrichment were covered only by single-shape tests. Three of those behaviours had
+**zero** coverage anywhere in the repo — proven by applying each mutation and watching this
+one test be the sole failure.
+
+**Docs.** FORK.md #105, #107, #108 and #109 are new; #55's extraction trigger
+is withdrawn permanently; #97 gained a permanent ruling; #103 records its fix;
 the MCP-sockets entry was renumbered 106 because it duplicated 17.
 
 ---
@@ -170,23 +190,10 @@ review.
 
 ## Outstanding pool, in priority order
 
-1. **`rebuild_streams`'s decoration is under-tested.** The 200-seed property
-   test's `build_session()` leaves `closed_streams`, `hydration_orphan_streams`,
-   `background_shells` and `background_agents` empty, so it pins `demux` ≡
-   reference and nothing else; closed/orphan removal, both `Utc::now()`-derived
-   folds and label enrichment are covered only by four single-shape tests. Both
-   the implementer and the reviewer named this as the best next investment in
-   that area, and it is the gap any future incremental-demux attempt would have
-   to close first.
-2. **The dead-test invariant is unguarded.** Nothing flags a crate with both
-   `[lib] test = false` and `#[cfg(test)]` in `src/`, and the failure is
-   completely silent — it already decayed once over three upstream commits.
-   `collab`, `opencode` and `vercel` still set the flag and are correct only
-   because they have no in-`src` tests today.
-3. **A `.rules` line for `Arc::get_mut`** on `SolutionSession::entries` /
+1. **A `.rules` line for `Arc::get_mut`** on `SolutionSession::entries` /
    `Stream::entries` (see #4 above). Drafted in the rebuild-streams report;
    `.rules` additions go through the suggestion path, not an inline edit.
-4. **Small deferred items, each already reasoned out:** `shutdown_server`
+2. **Small deferred items, each already reasoned out:** `shutdown_server`
    returns an `anyhow::Result<()>` neither arm can produce while `join_all`
    drops the results unexamined; `read_session_history` keeps an ad-hoc
    rows→blob→title decoder that is a third decoder of the same on-disk state,
@@ -200,7 +207,7 @@ review.
    `Option<Receiver<()>>` parameters that can be swapped silently at a call
    site; four pre-existing unused-import / dead-code warnings in `git_ui`,
    `solutions` and `project_panel`.
-5. **The debugger's still-pending-startup server is never shut down at quit.**
+3. **The debugger's still-pending-startup server is never shut down at quit.**
    Unfixable without publishing the starting server's `Arc` into a shared slot,
    which two reviewers agreed to defer *harder*: it would let the quit hook's
    `shutdown()` run against a server the startup task still owns and is
@@ -235,7 +242,11 @@ deliberately gated on liveness with cold orphans logged instead.
 
 ## Resume recipe
 
-Read this file, then `docs/INDEX.md`, then `git log --oneline -20` to confirm
-the chain ends at `b08eb5e8b5`. Pick from the pool above per
-`docs/workflow/supervisor-mode.md` § 7. Nothing is in flight and nothing is
-urgent; item 1 is the highest-value and item 2 is the cheapest.
+Read this file, then `docs/INDEX.md`, then `git log --oneline -30` to confirm
+the chain ends at `0ff21ebd59`. Pick from the pool above per
+`docs/workflow/supervisor-mode.md` § 7. **Nothing is in flight and the pool is
+genuinely thin** — every item this session identified has shipped, and what is
+left is small cleanups plus one deliberately-deferred design call. If that pool
+looks too thin to be true, note that it looked that way at the start of this
+session too, and pulling on its one-line entries produced four real defects and
+a 19× performance win.
