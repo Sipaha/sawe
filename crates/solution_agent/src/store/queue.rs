@@ -857,23 +857,54 @@ impl SolutionAgentStore {
         let retry = self.retry_transcript_load(session_id, cx);
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             if let Err(err) = retry.await {
+                // The advice has to match the failure, or it sends the user round
+                // a loop that cannot succeed: an undecodable blob fails
+                // identically on every reopen, so "close and reopen" would be a
+                // second lie on top of the one this whole change removes.
+                let advice = if err.permanent {
+                    "Its saved bytes are damaged and will not decode, so reopening the \
+                     tab cannot recover it — copy anything you still need out of this \
+                     tab and start a new session."
+                } else {
+                    "The read failed but the data is intact; close and reopen the tab \
+                     to try again."
+                };
                 let message = SharedString::from(format!(
                     "This session's saved conversation could not be read, so your message \
                      was NOT sent — sending it would have overwritten the conversation on \
-                     disk. Close and reopen the tab to try again. ({err:#})"
+                     disk. {advice} ({err})"
                 ));
                 log::error!(
                     target: "solution_agent::queue",
                     "session={session_id} refusing the send: {message}",
                 );
                 this.update(cx, |store, cx| {
-                    if let Some(session) = store.session(session_id) {
-                        session.update(cx, |s, _| {
-                            s.state = SessionState::Errored(message.clone());
-                        });
-                        store.mark_state_changed(session_id, cx);
-                        cx.notify();
-                    }
+                    // Through `mutate_state`, NOT a direct assignment. The direct
+                    // assignment in `send_message_blocks_targeted`'s own `Err` arm
+                    // works only because of a precondition this path lacks, stated
+                    // in that arm's own comment: `run_turn` already emitted
+                    // `AcpThreadEvent::Error`, so the transition — and with it the
+                    // tray notification, which `notifier::decide_notification`
+                    // only ever sees from inside `mutate_state`, its single
+                    // production caller — had ALREADY happened, and the assignment
+                    // merely overwrites the message text. Here no turn ran, so a
+                    // direct assignment would set a state nobody was notified of.
+                    store.mutate_state(
+                        session_id,
+                        |state| {
+                            // A refused send on a RUNNING session must not clobber
+                            // `Running`: the in-flight turn still owns the state
+                            // and its own `Stopped` handler will move it. The
+                            // refusal is still surfaced — the compose row raises a
+                            // toast, which is not state-derived. Only an
+                            // idle/errored/cold tab takes the badge.
+                            if !matches!(state, SessionState::Running { .. }) {
+                                *state = SessionState::Errored(message.clone());
+                            }
+                        },
+                        cx,
+                    );
+                    cx.notify();
                 })?;
                 return Err(anyhow!("{message}"));
             }

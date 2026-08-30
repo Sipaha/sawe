@@ -3,7 +3,7 @@
 use crate::adapter::AdapterRegistry;
 use crate::model::SessionState;
 use crate::store::*;
-use crate::test_support::{MockAgentServer, MockConnection};
+use crate::test_support::{MockAgentServer, MockConnection, PromptGate};
 use chrono::Utc;
 use gpui::{Entity, SharedString, TestAppContext};
 use std::path::PathBuf;
@@ -176,4 +176,171 @@ pub(crate) fn make_task_tool_call(
         call = call.raw_input(serde_json::Value::Object(raw_input));
     }
     call
+}
+
+/// Fixture shared by the retry-then-refuse tests (`store::tests::hydration`) and
+/// the compose-restore view test (`session_view::tests`).
+///
+/// Builds a session BORN row-native (three entry rows, no legacy blob, `epoch`
+/// NULL — the combination that made a failed row read destructive, since
+/// `is_wiped_row_native` cannot fire on it), then resumes it through an injected
+/// `load_entries` failure. What comes back is the state this whole feature is
+/// about: a LIVE tab (`acp_thread` attached) whose `entries` are empty and whose
+/// `transcript_unavailable` is set, with all three rows still on disk.
+///
+/// Returns the db handle, the metadata (for a second resume), the project, and
+/// the prompt-gate sender + tempdir, which must be kept alive for the duration
+/// of the test.
+pub(crate) async fn resume_a_row_native_session_through_a_failed_row_read(
+    cx: &mut TestAppContext,
+    rows: usize,
+) -> (
+    Arc<crate::db::SolutionAgentDb>,
+    crate::model::SolutionSessionMetadata,
+    Entity<project::Project>,
+    async_channel::Sender<()>,
+    tempfile::TempDir,
+) {
+    let (solution_id, tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    let (prompt_tx, prompt_rx) = async_channel::unbounded::<()>();
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                // Resume support AND a prompt gate: the resume has to attach a
+                // live thread (otherwise the send takes the cold-wake path and
+                // this proves nothing), and the send that follows has to be able
+                // to complete rather than dying inside the mock.
+                Rc::new(MockAgentServer::configured(
+                    Arc::new(AtomicUsize::new(0)),
+                    None,
+                    Some(PromptGate(prompt_rx)),
+                    None,
+                    true,
+                )),
+            );
+        });
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-retry"),
+        title: SharedString::from("row-native session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    db.save_metadata(meta.clone()).await.expect("save metadata");
+    for idx in 0..rows as i64 {
+        // Roles ALTERNATE. Consecutive assistant messages coalesce into a single
+        // Main-stream bubble (`rebuild_streams`), so a uniform fixture would come
+        // back as one entry and the row counts below would be measuring the
+        // coalescer rather than the transcript.
+        let kind = if idx % 2 == 0 {
+            crate::session_entry::SessionEntryKind::UserMessage {
+                id: None,
+                content_md: format!("user line {idx}"),
+                chunks: vec![],
+            }
+        } else {
+            crate::session_entry::SessionEntryKind::AssistantMessage {
+                chunks: vec![crate::session_entry::AssistantChunk::Message(
+                    format!("assistant line {idx}").into(),
+                )],
+            }
+        };
+        let entry = crate::session_entry::SessionEntry {
+            created_ms: 1_700_000_000_000 + idx,
+            mod_seq: (idx + 1) as u64,
+            subagent_id: None,
+            kind,
+        };
+        db.upsert_entry(
+            session_id,
+            idx,
+            entry.mod_seq as i64,
+            entry.created_ms,
+            None,
+            entry.to_payload(),
+        )
+        .await
+        .expect("upsert entry");
+    }
+    assert_eq!(
+        db.load_entries(session_id).await.expect("load rows").len(),
+        rows,
+        "fixture must have rows to lose"
+    );
+    assert!(
+        db.load_blob(session_id).await.expect("load blob").is_none(),
+        "fixture must have no blob: the blob path is a different arm"
+    );
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch"),
+        None,
+        "fixture's epoch must be NULL, or `is_wiped_row_native` short-circuits \
+         the branch under test"
+    );
+
+    db.fail_next_entry_load();
+    let resumed = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.resume_session(meta.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("a failed row read must not fail the reopen");
+    assert_eq!(resumed, session_id);
+    cx.run_until_parked();
+
+    // NON-VACUITY: everything below is about a session that failed to read its
+    // transcript. A reopen that read the rows would show them here and would
+    // satisfy the rest without ever entering the branch under test.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("resumed session");
+            session.read_with(cx, |s, _| {
+                assert!(
+                    s.entries.is_empty(),
+                    "the reopen must have hit the injected read failure; got {} entries",
+                    s.entries.len()
+                );
+                assert!(
+                    s.transcript_unavailable,
+                    "the reopen must have flagged the session unreadable"
+                );
+                assert!(
+                    s.acp_thread().is_some(),
+                    "the reopened session must be LIVE, or the send below takes the \
+                     cold-wake path instead of the one under test"
+                );
+            });
+        });
+    });
+
+    (db, meta, project, prompt_tx, tmp)
 }

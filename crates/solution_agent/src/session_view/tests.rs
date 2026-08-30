@@ -417,3 +417,124 @@ async fn render_sizes_list_state_to_selected_stream_not_flat_entries(
         })
         .unwrap();
 }
+
+/// A REFUSED send must put the user's draft back in the compose box.
+///
+/// Every compose send used to be `.detach_and_log_err(cx)`, and
+/// `submit_compose_now` clears the editor BEFORE dispatching — so a send the
+/// store refuses ate what the user typed and left only a log line. That is
+/// tolerable only while every refusal is transient. It is not: a session whose
+/// legacy blob will not decode refuses PERMANENTLY (the bytes read fine and are
+/// corrupt), so such a tab would swallow every message typed into it forever —
+/// the same lie the transcript guard removed from the disk, relocated to the
+/// compose box.
+///
+/// Driven through the real `submit_compose_now` against a real store refusal on
+/// a session restored through an injected row-read failure — not by calling
+/// `dispatch_send` by hand.
+#[gpui::test]
+async fn a_refused_send_restores_the_draft_into_the_compose_box(cx: &mut gpui::TestAppContext) {
+    use crate::store::SolutionAgentStore;
+    use gpui::VisualTestContext;
+
+    let (db, meta, project, prompt_tx, _tmp) =
+        crate::store::tests::resume_a_row_native_session_through_a_failed_row_read(cx, 3).await;
+    let session_id = meta.id;
+    // A refused send must never reach the agent, so close the mock's prompt gate:
+    // if the refusal ever stops firing, `MockConnection::prompt` resolves `Err`
+    // immediately instead of parking forever, and this test FAILS rather than
+    // hanging.
+    prompt_tx.close();
+    cx.update(|cx| theme_settings::init(theme::LoadThemes::JustBase, cx));
+
+    let workspace_window =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| {
+        workspace_window
+            .root(cx)
+            .expect("workspace window alive")
+            .downgrade()
+    });
+    let session = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .expect("the fixture's flagged session")
+    });
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(session_id, session, workspace_weak, window, cx)
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.run_until_parked();
+
+    let draft = "the message the user typed and must not lose";
+    view_window
+        .update(vcx, |view, window, cx| {
+            view.compose_editor_for_test()
+                .update(cx, |editor, cx| editor.set_text(draft, window, cx));
+        })
+        .unwrap();
+
+    // The retry re-reads all three inputs; fail the row read again so it refuses.
+    db.fail_next_entry_load();
+    view_window
+        .update(vcx, |view, window, cx| {
+            view.submit_compose_now(window, cx);
+            // A precondition, not a side assertion: the submit path clears the
+            // editor BEFORE dispatching, which is precisely why a refused send
+            // used to destroy the draft. If that ever stops being true, the
+            // restore assertion below would pass for the wrong reason.
+            assert_eq!(
+                view.compose_editor_for_test().read(cx).text(cx),
+                "",
+                "submit must clear the compose box before dispatching"
+            );
+        })
+        .unwrap();
+    vcx.run_until_parked();
+
+    view_window
+        .update(vcx, |view, _window, cx| {
+            assert_eq!(
+                view.compose_editor_for_test().read(cx).text(cx),
+                draft,
+                "a refused send must put the user's draft back in the compose box"
+            );
+        })
+        .unwrap();
+    assert_eq!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after the refused send")
+            .len(),
+        3,
+        "and the rows it refused over must still be on disk"
+    );
+
+    // The restore MERGES rather than clobbering. A user who starts typing again
+    // while the retry is in flight must keep what they typed, with the failed
+    // draft FIRST — restored images' `[image #N]` placeholders are positional
+    // against `pending_images`, so the failed text has to lead.
+    db.fail_next_entry_load();
+    view_window
+        .update(vcx, |view, window, cx| {
+            view.compose_editor_for_test()
+                .update(cx, |editor, cx| editor.set_text(draft, window, cx));
+            view.submit_compose_now(window, cx);
+            view.compose_editor_for_test().update(cx, |editor, cx| {
+                editor.set_text("typed while waiting", window, cx)
+            });
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    view_window
+        .update(vcx, |view, _window, cx| {
+            assert_eq!(
+                view.compose_editor_for_test().read(cx).text(cx),
+                format!("{draft}\ntyped while waiting"),
+                "the failed draft must be merged in ahead of the new text, neither \
+                 dropped nor clobbering it"
+            );
+        })
+        .unwrap();
+}

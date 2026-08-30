@@ -75,7 +75,7 @@ impl SolutionSessionView {
         true
     }
 
-    fn submit_compose_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn submit_compose_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compose_disabled(cx) {
             // Shell view: a read-only background-shell transcript, not a live
             // agent — there is nothing to send to. Silently drop — the UI also
@@ -190,18 +190,13 @@ impl SolutionSessionView {
         // the bottom even if the user had scrolled up to read older context.
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.list_state.scroll_to_end();
-        let session_id = self.session_id;
         // Route the follow-up: every tab routes to Main — teammate/shell tabs
         // are view-only since the per-source-streams fold.
         let target = crate::model::QueueTarget::Main;
 
         if self.pending_images.is_empty() {
             let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(content))];
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store
-                    .send_message_blocks_targeted(session_id, blocks, target, true, cx)
-                    .detach_and_log_err(cx);
-            });
+            self.dispatch_send(blocks, target, window, cx);
             return;
         }
 
@@ -216,11 +211,84 @@ impl SolutionSessionView {
                 image.mime_type,
             )));
         }
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store
-                .send_message_blocks_targeted(session_id, blocks, target, true, cx)
-                .detach_and_log_err(cx);
+        self.dispatch_send(blocks, target, window, cx);
+    }
+
+    /// Send `blocks` and, if the send comes back `Err`, put the user's draft
+    /// BACK in the compose box and raise a toast.
+    ///
+    /// Every compose send used to be `.detach_and_log_err(cx)`, which meant the
+    /// error reached the log and nobody else — while `submit_compose_now` had
+    /// already cleared the editor, so a refused send silently ate what the user
+    /// typed. That was tolerable only while every refusal was transient. It is
+    /// not: `retry_transcript_load` refuses PERMANENTLY when a session's legacy
+    /// blob will not decode (the bytes are read fine and are corrupt, so every
+    /// retry fails identically), and such a tab would otherwise swallow every
+    /// message typed into it for the rest of its life with a red tab dot as the
+    /// only tell — the same lie this work removed from the disk, relocated to the
+    /// compose box.
+    ///
+    /// A toast rather than a state-derived badge, deliberately: `status_row`
+    /// renders `is_cold` ("Sleeping") AHEAD of `SessionState::Errored`, so a
+    /// refusal on a session that never went live has no state-derived surface at
+    /// all. A toast has no such precedence problem and needs no new UI
+    /// vocabulary — `show_toast` is what the slash-command rejection and the
+    /// resume failure already use.
+    fn dispatch_send(
+        &mut self,
+        blocks: Vec<acp::ContentBlock>,
+        target: crate::model::QueueTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = self.session_id;
+        let send = SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.send_message_blocks_targeted(session_id, blocks.clone(), target, true, cx)
         });
+        cx.spawn_in(window, async move |this, cx| {
+            let Err(err) = send.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                log::warn!(
+                    target: "solution_agent::queue",
+                    "session={session_id} send failed; restoring the draft into compose \
+                     (err={err:#}) — content: {}",
+                    crate::store::summarize_blocks_for_log(&blocks),
+                );
+                let (failed_text, failed_images) = super::recall::unpack_recalled_bundle(blocks);
+                // MERGE rather than "restore only if the box is still empty":
+                // this mirrors the cold-send resume-failure restore in
+                // `session_view.rs`, whose comment states the rule the crate
+                // already settled on — "a failed send must never destroy whatever
+                // they typed while waiting". Skipping the restore when the user
+                // has started typing again would do exactly that. The failed text
+                // goes FIRST because the restored images' `[image #N]`
+                // placeholders sit inside it and `pending_images` is positional.
+                let current_text = this.compose_editor.read(cx).text(cx);
+                let merged_text = if current_text.is_empty() {
+                    failed_text
+                } else if failed_text.is_empty() {
+                    current_text
+                } else {
+                    format!("{failed_text}\n{current_text}")
+                };
+                if !merged_text.is_empty() {
+                    this.compose_editor.update(cx, |editor, cx| {
+                        editor.set_text(merged_text, window, cx);
+                    });
+                }
+                if !failed_images.is_empty() {
+                    let mut merged = failed_images;
+                    merged.extend(std::mem::take(&mut this.pending_images));
+                    this.pending_images = merged;
+                }
+                this.show_toast(SharedString::from(format!("{err:#}")), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Drop a single text block into `pending_send` and start the
@@ -259,7 +327,11 @@ impl SolutionSessionView {
     /// Drain `pending_send` once the session has gone live (acp_thread
     /// attached). Called from the session-observe callback so the
     /// dispatch happens on the same tick the resume completes.
-    pub(crate) fn flush_pending_send_if_ready(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn flush_pending_send_if_ready(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(blocks) = self.pending_send.take() else {
             return;
         };
@@ -269,12 +341,7 @@ impl SolutionSessionView {
             return;
         }
         self.resuming = false;
-        let session_id = self.session_id;
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store
-                .send_message_blocks(session_id, blocks, cx)
-                .detach_and_log_err(cx);
-        });
+        self.dispatch_send(blocks, crate::model::QueueTarget::Main, window, cx);
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.list_state.scroll_to_end();
         cx.notify();

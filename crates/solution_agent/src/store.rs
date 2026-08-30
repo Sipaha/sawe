@@ -3133,9 +3133,42 @@ impl SolutionAgentStore {
         text: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.sessions.get(&session_id).cloned()
-            && let Some(thread) = session.read(cx).acp_thread().cloned()
-        {
+        let Some(session) = self.sessions.get(&session_id).cloned() else {
+            return;
+        };
+        // THE SECOND DOOR onto FORK.md #110's residual, and the one reached
+        // without the user typing anything. A note is a full transcript APPEND —
+        // `AcpThread::push_system_note` -> `push_entry` -> `NewEntry` ->
+        // `store::acp_event`'s `persist_main_stream` — which writes the Main
+        // stream from index 0 and trims. On a session restored WITHOUT its
+        // transcript that is `upsert_entries_and_trim(id, [row 0], 1)`: measured
+        // 3 rows -> 1, with `save_epoch` rewinding a real wipe marker 5 -> 0 in
+        // the same flush. `respawn_agent` fires a recovered-note unconditionally
+        // after every successful respawn (tab-strip "Restart agent", the stuck-
+        // session watchdog, the `restart_agent`/`reconnect_agent` MCP tools), so
+        // the user story is just: a tab comes back empty after a transient
+        // sqlite error, and the user clicks Restart agent. Its sibling
+        // `persist_all_rows` at the top of `respawn_agent` is already declined by
+        // the flush guard — and then the breadcrumb wrote anyway.
+        //
+        // Dropping it is NOT the "suppress the write silently" option that
+        // FORK.md #110 rejects for a SEND. That option is rejected because it
+        // loses the USER'S TURN with no signal; a system note is editor-generated
+        // breadcrumb text about the editor's own recovery, so there is nothing of
+        // the user's to lose and a log line is the proportionate signal. The send
+        // path retries-then-refuses precisely because a user turn IS worth
+        // refusing over. Guarding `persist_main_stream` itself would be the
+        // rejected option: it would also swallow a real send.
+        if session.read(cx).transcript_unavailable {
+            log::warn!(
+                target: "solution_agent::store",
+                "session={session_id} dropping a system note: this copy was restored \
+                 without its transcript, and appending would rewrite the Main stream \
+                 from index 0 over the rows it could not read"
+            );
+            return;
+        }
+        if let Some(thread) = session.read(cx).acp_thread().cloned() {
             thread.update(cx, |t, cx| t.push_system_note(level, text, cx));
         }
     }

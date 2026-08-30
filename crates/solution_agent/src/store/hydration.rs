@@ -320,6 +320,33 @@ pub(crate) fn is_wiped_row_native(rows_empty: bool, epoch: i64) -> bool {
     rows_empty && epoch > 0
 }
 
+/// The single predicate behind BOTH "may this path consult the legacy blob?" and
+/// "is reading it a legacy->rows migration?" — they are one question, and the one
+/// place they were asked separately is where the guard went missing.
+///
+/// `resume_session` open-codes its own rows-empty->blob fallback because it builds
+/// its own entity, and its copy shipped WITHOUT the `is_wiped_row_native` term
+/// that `build_cold_session` already had: reopening a `/clear`ed tab from History
+/// repainted the erased conversation and rewound the epoch N -> 1. The guard had
+/// to be re-added by hand (see the block comment at that call site). Three call
+/// sites now derive it from here instead: `build_cold_session`, `resume_session`
+/// and `retry_transcript_load`.
+///
+/// `transcript_known_bad` is "we already know this session's transcript is not
+/// readable" — a read that errored, or a blob that would not decode. It is
+/// separate from the epoch term because it is discovered at different times per
+/// caller: `build_cold_session` only learns it BY decoding (so it passes `false`
+/// and folds the decode result into `migrating` afterwards), while the two paths
+/// that perform their own reads know it up front and use it to skip the blob read
+/// outright.
+pub(crate) fn legacy_blob_is_the_transcript(
+    rows_empty: bool,
+    epoch: i64,
+    transcript_known_bad: bool,
+) -> bool {
+    rows_empty && !is_wiped_row_native(rows_empty, epoch) && !transcript_known_bad
+}
+
 /// What [`build_cold_session`] reconstructed, beyond the entity itself.
 pub(crate) struct ColdSessionBuild {
     pub session: Entity<SolutionSession>,
@@ -410,7 +437,11 @@ pub(crate) fn build_cold_session(
         let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
         crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, 0, cx)
     };
-    let migrating = rows_absent && !wiped_row_native && undecodable_blob.is_none();
+    // `transcript_known_bad: false` — this function learns it only BY decoding,
+    // which has already happened above, so the decode result is ANDed in here
+    // rather than passed down.
+    let migrating =
+        legacy_blob_is_the_transcript(rows_absent, epoch, false) && undecodable_blob.is_none();
     let transcript_missing = undecodable_blob.is_some();
     let entity = cx.new(|_| {
         let mut s = SolutionSession::new_idle(
@@ -835,24 +866,26 @@ impl SolutionAgentStore {
             // The rows-empty->blob fallback here is `build_cold_session`'s, open-
             // coded: `resume_session` builds its own entity (the fresh-entity
             // branch below), so the guard in that function does not cover this
-            // path. It needs the same one, and this is the more user-visible of
-            // the two — reopening a `/clear`ed tab from History lands here, not
-            // in `hydrate_all_for_solution`. Gating the LOAD rather than the use
+            // path. It needs the same one — which is why both now ask
+            // `legacy_blob_is_the_transcript` rather than each spelling the
+            // condition out — and this is the more user-visible of the two:
+            // reopening a `/clear`ed tab from History lands here, not in
+            // `hydrate_all_for_solution`. Gating the LOAD rather than the use
             // also saves the read outright.
-            let wiped_row_native =
-                is_wiped_row_native(preloaded_rows.is_empty(), preloaded_epoch);
-            // `|| transcript_unavailable` is what stops the epoch failure above
-            // from REPAINTING as well as from persisting: with the epoch lost to
-            // `0`, `wiped_row_native` is false, so without this the retained blob
-            // of a wiped session would be decoded and shown — the erased
-            // conversation back on screen even though nothing is written. The
-            // in-memory epoch does go 5 → 0 in that case, which costs the client
-            // one reset; the DB keeps 5 (the persist guard declines), so the next
-            // successful reopen restores it.
-            let preloaded_persisted: Option<PersistedSession> = if !preloaded_rows.is_empty()
-                || wiped_row_native
-                || transcript_unavailable
-            {
+            //
+            // The `transcript_known_bad` argument is what stops the epoch failure
+            // above from REPAINTING as well as from persisting: with the epoch
+            // lost to `0` the wiped-row-native term is false, so without it the
+            // retained blob of a wiped session would be decoded and shown — the
+            // erased conversation back on screen even though nothing is written.
+            // The in-memory epoch does go 5 → 0 in that case, which costs the
+            // client one reset; the DB keeps 5 (the persist guard declines), so
+            // the next successful reopen restores it.
+            let preloaded_persisted: Option<PersistedSession> = if !legacy_blob_is_the_transcript(
+                preloaded_rows.is_empty(),
+                preloaded_epoch,
+                transcript_unavailable,
+            ) {
                 None
             } else {
                 let load_task = this.update(cx, |store, _| {
@@ -993,9 +1026,11 @@ impl SolutionAgentStore {
                     // user's own intent — and for a row-native session the trim
                     // deletes the rows outright. NEVER derive this flag from
                     // "rows absent" alone.
-                    let migrating = preloaded_rows.is_empty()
-                        && !wiped_row_native
-                        && !transcript_unavailable;
+                    let migrating = legacy_blob_is_the_transcript(
+                        preloaded_rows.is_empty(),
+                        preloaded_epoch,
+                        transcript_unavailable,
+                    );
                     let entries = if !preloaded_rows.is_empty() {
                         entries_from_rows(preloaded_rows)
                     } else {
@@ -1117,6 +1152,43 @@ impl SolutionAgentStore {
     }
 }
 
+/// Why [`SolutionAgentStore::retry_transcript_load`] refused.
+///
+/// The distinction is not cosmetic: it decides what the user is told to DO. A
+/// transient failure is a read that errored — sqlite may well be fine on the next
+/// attempt, so closing and reopening the tab is a real recovery. A permanent one
+/// is a blob whose bytes are on disk and will not decode; that fails identically
+/// forever, so telling the user to reopen the tab sends them round a loop that
+/// can never succeed while the tab silently eats every message they type into it.
+pub(crate) struct TranscriptRetryError {
+    /// `true` when re-reading cannot help: the bytes were read fine and are
+    /// corrupt. Only the blob decode sets this.
+    pub permanent: bool,
+    pub source: anyhow::Error,
+}
+
+impl TranscriptRetryError {
+    fn transient(source: anyhow::Error) -> Self {
+        Self {
+            permanent: false,
+            source,
+        }
+    }
+
+    fn permanent(source: anyhow::Error) -> Self {
+        Self {
+            permanent: true,
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for TranscriptRetryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.source)
+    }
+}
+
 impl SolutionAgentStore {
     /// Re-read the transcript of a session whose restore could not read one
     /// (`SolutionSession::transcript_unavailable`) and repopulate the entity
@@ -1143,9 +1215,11 @@ impl SolutionAgentStore {
         &mut self,
         session_id: SolutionSessionId,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
+    ) -> Task<std::result::Result<(), TranscriptRetryError>> {
         let Some(session) = self.sessions.get(&session_id).cloned() else {
-            return Task::ready(Err(anyhow!("unknown session {session_id}")));
+            return Task::ready(Err(TranscriptRetryError::transient(anyhow!(
+                "unknown session {session_id}"
+            ))));
         };
         if !session.read(cx).transcript_unavailable {
             return Task::ready(Ok(()));
@@ -1160,54 +1234,70 @@ impl SolutionAgentStore {
         // only way to append to a flagged session is a send, and a send is what
         // this function gates.
         if !session.read(cx).entries.is_empty() {
-            return Task::ready(Err(anyhow!(
+            return Task::ready(Err(TranscriptRetryError::permanent(anyhow!(
                 "session {session_id} was restored without its transcript but has since \
                  accumulated {} live entr(ies); re-reading it now would overwrite them",
                 session.read(cx).entries.len()
-            )));
+            ))));
         }
         // Unreachable: `persistence` is only ever assigned `Some`, and every
         // writer of `transcript_unavailable` runs with a `db` in hand. Kept as a
         // refusal rather than an "allow the send" shortcut so that a future
         // change which does clear it cannot silently re-open the write.
         let Some(db) = self.persistence.clone() else {
-            return Task::ready(Err(anyhow!(
+            return Task::ready(Err(TranscriptRetryError::permanent(anyhow!(
                 "session {session_id}: no persistence configured, so its transcript \
                  cannot be re-read"
-            )));
+            ))));
         };
         let rows_task = db.load_entries(session_id);
         let epoch_task = db.load_epoch(session_id);
         let change_seq_task = db.load_change_seq(session_id);
         cx.spawn(async move |this, cx| {
             let rows = rows_task.await.map_err(|err| {
-                anyhow!("re-reading session {session_id}'s entry rows failed: {err:#}")
+                TranscriptRetryError::transient(anyhow!(
+                    "re-reading session {session_id}'s entry rows failed: {err:#}"
+                ))
             })?;
             let epoch = epoch_task
                 .await
-                .map_err(|err| anyhow!("re-reading session {session_id}'s epoch failed: {err:#}"))?
+                .map_err(|err| {
+                    TranscriptRetryError::transient(anyhow!(
+                        "re-reading session {session_id}'s epoch failed: {err:#}"
+                    ))
+                })?
                 .unwrap_or(0);
             let change_seq = change_seq_task.await.ok().flatten().map(|v| v as u64);
-            let wiped_row_native = is_wiped_row_native(rows.is_empty(), epoch);
-            // Same precedence as `resume_session`: the blob is consulted only
-            // when there are no rows AND the session is not a deliberately
-            // wiped row-native one, whose retained blob is the pre-wipe
-            // transcript and must never be repainted (#105).
-            let persisted = if rows.is_empty() && !wiped_row_native {
-                let blob_task = this.update(cx, |store, _| {
-                    store.persistence().map(|db| db.load_blob(session_id))
-                })?;
+            // Same precedence as `resume_session` and `build_cold_session`, and
+            // through the same predicate so it cannot drift from them: the blob is
+            // consulted only when there are no rows AND the session is not a
+            // deliberately wiped row-native one, whose retained blob is the
+            // pre-wipe transcript and must never be repainted (#105). The reads
+            // above all succeeded, so `transcript_known_bad` is `false` here.
+            let migrating = legacy_blob_is_the_transcript(rows.is_empty(), epoch, false);
+            let persisted = if migrating {
+                let blob_task = this
+                    .update(cx, |store, _| {
+                        store.persistence().map(|db| db.load_blob(session_id))
+                    })
+                    .map_err(TranscriptRetryError::transient)?;
                 match blob_task {
                     Some(task) => match task.await.map_err(|err| {
-                        anyhow!("re-reading session {session_id}'s legacy blob failed: {err:#}")
+                        TranscriptRetryError::transient(anyhow!(
+                            "re-reading session {session_id}'s legacy blob failed: {err:#}"
+                        ))
                     })? {
+                        // A decode failure is PERMANENT: the bytes were read
+                        // fine and are corrupt, so every future retry fails
+                        // identically. The refusal must say so, or the user is
+                        // told to close and reopen a tab that can never recover.
                         Some(bytes) => Some(
                             serde_json::from_slice::<PersistedSession>(&bytes).map_err(|err| {
-                                anyhow!(
+                                TranscriptRetryError::permanent(anyhow!(
                                     "decoding session {session_id}'s legacy blob \
                                      ({} bytes) failed: {err:#}",
                                     bytes.len()
-                                )
+                                ))
                             })?,
                         ),
                         // No blob at all is a fact, not a failure.
@@ -1220,7 +1310,9 @@ impl SolutionAgentStore {
             };
             this.update(cx, |store, cx| {
                 let Some(session) = store.sessions.get(&session_id).cloned() else {
-                    anyhow::bail!("session {session_id} went away during the transcript retry");
+                    return Err(TranscriptRetryError::transient(anyhow!(
+                        "session {session_id} went away during the transcript retry"
+                    )));
                 };
                 // Re-checked after the await: another path may have repopulated
                 // or appended to this session while the reads were in flight.
@@ -1228,15 +1320,11 @@ impl SolutionAgentStore {
                     return Ok(());
                 }
                 if !session.read(cx).entries.is_empty() {
-                    anyhow::bail!(
+                    return Err(TranscriptRetryError::permanent(anyhow!(
                         "session {session_id} accumulated live entries while its transcript \
                          was being re-read; refusing to overwrite them"
-                    );
+                    )));
                 }
-                // Identical derivation to `resume_session`'s fresh-entity
-                // branch, minus the `transcript_unavailable` term: the reads
-                // above all succeeded, so an empty row set here is a fact.
-                let migrating = rows.is_empty() && !wiped_row_native;
                 let entries = if !rows.is_empty() {
                     entries_from_rows(rows)
                 } else {
@@ -1281,7 +1369,8 @@ impl SolutionAgentStore {
                     store.persist_all_rows(session_id, cx);
                 }
                 Ok(())
-            })?
+            })
+            .map_err(TranscriptRetryError::transient)?
         })
     }
 }

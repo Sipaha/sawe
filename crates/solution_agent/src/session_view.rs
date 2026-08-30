@@ -1015,6 +1015,10 @@ impl SolutionSessionView {
         Self::new(session_id, session, workspace, window, cx)
     }
 
+    pub(crate) fn compose_editor_for_test(&self) -> &Entity<editor::Editor> {
+        &self.compose_editor
+    }
+
     pub(crate) fn pending_send_for_test(&self) -> Option<&Vec<acp::ContentBlock>> {
         self.pending_send.as_ref()
     }

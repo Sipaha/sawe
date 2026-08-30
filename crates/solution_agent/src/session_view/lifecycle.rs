@@ -26,7 +26,12 @@ impl SolutionSessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(&session, |this, _, cx| {
+        // `observe_in`, not `observe`: `flush_pending_send_if_ready` below has to
+        // be able to put a REFUSED send's draft back into the compose editor, and
+        // `Editor::set_text` needs a `Window`. The view only ever exists inside a
+        // window, so the extra "skip if the window is gone" condition
+        // `observe_in` carries costs nothing here.
+        cx.observe_in(&session, window, |this, _, window, cx| {
             // The underlying `acp_thread` field can swap out from under us
             // (rotate_context for compact, reset_context for /clear). The
             // thread subscription set up in `new` is bound to the
@@ -40,7 +45,7 @@ impl SolutionSessionView {
             // while the session was cold and the resume task has now
             // attached an `AcpThread`, dispatch the captured message
             // and clear the resuming indicator.
-            this.flush_pending_send_if_ready(cx);
+            this.flush_pending_send_if_ready(window, cx);
             // Thread mutated (new chunk streamed in, tool call appended, etc.).
             // Match indices stored in `find` reference (entry_idx, span_idx,
             // byte range) so a streaming append before/inside an existing
