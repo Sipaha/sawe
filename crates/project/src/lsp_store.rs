@@ -1371,7 +1371,11 @@ impl LocalLspStore {
         }
     }
 
-    async fn shutdown_server(server_state: LanguageServerState) -> anyhow::Result<()> {
+    // Infallible on purpose: the caller `join_all`s these and has nowhere to report a
+    // failure to (the app is already quitting), so a `Result` here would only be dropped
+    // unexamined. If an arm ever needs to fail, handle it inside rather than widening the
+    // return type back out.
+    async fn shutdown_server(server_state: LanguageServerState) {
         match server_state {
             LanguageServerState::Running { server, .. } => {
                 if let Some(shutdown) = server.shutdown() {
@@ -1404,7 +1408,6 @@ impl LocalLspStore {
             // would have left, only without spending the budget to get there.
             LanguageServerState::Starting { .. } => {}
         }
-        Ok(())
     }
 
     #[cfg(any(test, feature = "test-support"))]
