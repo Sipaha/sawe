@@ -1378,15 +1378,24 @@ impl LocalLspStore {
                     shutdown.await;
                 }
             }
-            LanguageServerState::Starting { startup, .. } => {
-                if let Some(server) = startup.await
-                    && let Some(shutdown) = server.shutdown()
-                {
-                    shutdown.await;
-                }
-            }
+            // A still-starting server is dropped, not awaited. `startup` is a foreground
+            // `cx.spawn`, and `App::shutdown` blocks the main thread's session on these
+            // futures for the whole `gpui::SHUTDOWN_TIMEOUT` — no foreground runnable makes
+            // any progress for that window (FORK.md #103). So awaiting it can only park
+            // until the timeout expires and then be dropped anyway, never reaching a
+            // `shutdown` request, while `join_all` keeps the entire quit hook pending
+            // behind it. Dropping the task leaves exactly the orphaned child the timeout
+            // would have left, only without spending the budget to get there.
+            LanguageServerState::Starting { .. } => {}
         }
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shutdown_language_servers_on_quit_for_test(
+        &mut self,
+    ) -> impl Future<Output = ()> + use<> {
+        self.shutdown_language_servers_on_quit()
     }
 
     fn language_servers_for_worktree(

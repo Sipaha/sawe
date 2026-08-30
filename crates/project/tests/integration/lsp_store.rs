@@ -158,3 +158,69 @@ fn test_trailing_newline_in_completion_documentation() {
         CompletionDocumentation::SingleLine(s) if s == "some value"
     ));
 }
+
+/// A language server that is still starting when the user quits must not be
+/// awaited by the quit hook.
+///
+/// The test is only meaningful because `TestScheduler` models GPUI's real quit
+/// contract: `App::shutdown` blocks the main thread on the collected quit
+/// futures through the FOREGROUND executor's session, and `TestScheduler::block`
+/// excludes runnables whose session is blocked — exactly as the production main
+/// thread stops draining its dispatch channel. `LanguageServerState::Starting`
+/// carries a `cx.spawn`ed `startup` task, i.e. foreground work, so awaiting it
+/// from that hook can only burn `gpui::SHUTDOWN_TIMEOUT` and still never send a
+/// shutdown request (FORK.md #103).
+///
+/// `set_block_on_ticks` pins the tick budget the scheduler draws for a timed
+/// block; the default `0..=1000` has a floor of zero, which would let the block
+/// return without polling the quit future even once and pass vacuously.
+#[gpui::test]
+async fn test_quit_does_not_await_a_starting_language_server(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/the-root"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    let project = Project::test(fs, [path!("/the-root").as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+
+    lsp_store.update(cx, |lsp_store, cx| {
+        // Stands in for a server whose `startup` has not resolved yet. The real one is
+        // spawned the same way — on the foreground executor — so it is just as
+        // unresolvable once `shutdown` has blocked that session.
+        let startup = cx.spawn(async move |_, _| {
+            futures::future::pending::<()>().await;
+            None
+        });
+        lsp_store
+            .as_local_mut()
+            .expect("Project::test builds a local lsp store")
+            .language_servers
+            .insert(
+                lsp::LanguageServerId(0),
+                LanguageServerState::Starting {
+                    startup,
+                    pending_workspace_folders: Default::default(),
+                },
+            );
+    });
+
+    let quit_future = lsp_store.update(cx, |lsp_store, _| {
+        lsp_store
+            .as_local_mut()
+            .expect("Project::test builds a local lsp store")
+            .shutdown_language_servers_on_quit_for_test()
+    });
+
+    cx.executor().set_block_on_ticks(64..=64);
+    let completed = cx
+        .foreground_executor()
+        .block_with_timeout(gpui::SHUTDOWN_TIMEOUT, quit_future)
+        .is_ok();
+
+    assert!(
+        completed,
+        "the quit hook parked on a still-starting language server, \
+         which burns the whole shutdown budget and shuts nothing down"
+    );
+}
