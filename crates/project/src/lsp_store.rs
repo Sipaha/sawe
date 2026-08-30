@@ -1378,6 +1378,22 @@ impl LocalLspStore {
                     shutdown.await;
                 }
             }
+            // An already-finished startup resolves on the first poll with the stored
+            // output and no scheduler involvement (`async_task::poll_task`), so this arm
+            // cannot park, and `server.shutdown()` is background-driven — this is the one
+            // case where the quit hook can still really stop a `Starting` server, and the
+            // unconditional `startup.await` below used to cover it. Caveat inherited
+            // verbatim from that await: `is_ready()` is `CLOSED | COMPLETED`, so it is
+            // also true for a task whose future panicked or whose runnable was dropped,
+            // and awaiting one of those panics with "Task polled after completion".
+            // Reaching it needs the main thread to have already panicked.
+            LanguageServerState::Starting { startup, .. } if startup.is_ready() => {
+                if let Some(server) = startup.await
+                    && let Some(shutdown) = server.shutdown()
+                {
+                    shutdown.await;
+                }
+            }
             // A still-starting server is dropped, not awaited. `startup` is a foreground
             // `cx.spawn`, and `App::shutdown` blocks the main thread's session on these
             // futures for the whole `gpui::SHUTDOWN_TIMEOUT` — no foreground runnable makes
