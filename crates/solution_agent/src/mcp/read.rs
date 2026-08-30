@@ -1468,43 +1468,47 @@ impl McpServerTool for ReadSessionHistoryTool {
         }
 
         // 2. Archive path: session is not in the in-memory store.
-        //    Phase 4: prefer per-entry rows (the canonical source for
-        //    row-native sessions whose blob write path is dead).  Fall
-        //    back to the legacy blob only when rows are empty — that
-        //    covers un-migrated sessions written before Phase 4.
         //
-        //    Load rows and blob concurrently so the blob (needed for
-        //    the title in the row-native path if the DB has no separate
-        //    title API) is already in flight when we decide which branch
-        //    to take.
-        let load_tasks = cx.update(|cx| {
+        //    Driven off `load_cold_head`, the same cheap head the cold
+        //    `get_session` reads: it answers "does this session exist", "how
+        //    many entry rows does it have" and "what generation is it at" in ONE
+        //    round trip, from `solution_sessions` plus two index-only aggregates
+        //    over `solution_session_entries`, touching no `payload`. That is
+        //    what lets this path decide its branch BEFORE reading a transcript,
+        //    instead of the old shape, which loaded the rows and the blob
+        //    concurrently and threw one of them away every time.
+        //
+        //    Three outcomes, and the middle one is the fix:
+        //      * rows present            -> row-native, read them;
+        //      * no rows, `epoch > 0`    -> WIPED (`/clear`, `/compact`) — an
+        //                                   empty archive, never the blob;
+        //      * no rows, `epoch == 0`   -> genuinely un-migrated, read the blob.
+        //    `is_wiped_row_native` is the shared predicate; this used to be the
+        //    one reconstruction path with no guard at all, so a session cleared
+        //    by a build that still kept the blob served its erased transcript
+        //    here even after the desktop and `get_session` stopped doing so.
+        let head_task = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.read_with(cx, |store, _| {
                 store
                     .persistence()
-                    .map(|db| (db.load_entries(session_id), db.load_blob(session_id)))
+                    .map(|db| (db.clone(), db.load_cold_head(session_id)))
             })
         });
-        let (rows, blob_bytes) = match load_tasks {
-            Some((rows_task, blob_task)) => (rows_task.await?, blob_task.await?),
-            None => (Vec::new(), None),
+        let not_found = || {
+            anyhow!("session_not_found: {session_id} is neither open nor archived in the database")
         };
+        let Some((db, head_task)) = head_task else {
+            return Err(not_found());
+        };
+        let head = head_task.await?.ok_or_else(not_found)?;
 
-        if !rows.is_empty() {
+        if head.entry_count > 0 {
             // Row-native path: reconstruct markdown from the stored entries.
-            let entries_all = crate::store::entries_from_rows(rows)
+            let entries_all = crate::store::entries_from_rows(db.load_entries(session_id).await?)
                 .into_iter()
                 .map(|entry| session_entry_to_markdown(&entry.kind))
                 .collect::<Vec<_>>();
-            // The title lives in the session metadata row (the blob is not
-            // the source of truth for row-native sessions and may be
-            // absent).  Use the blob's title as a best-effort fallback
-            // when available; fall back to an empty string otherwise.
-            let title = blob_bytes
-                .as_deref()
-                .and_then(|b| serde_json::from_slice::<PersistedSession>(b).ok())
-                .map(|s| s.title)
-                .unwrap_or_default();
             let total = entries_all.len();
             let slice = entries_all
                 .into_iter()
@@ -1519,7 +1523,11 @@ impl McpServerTool for ReadSessionHistoryTool {
                 structured_content: ReadSessionHistoryResult {
                     session_id: session_id.to_string(),
                     source: "archived".to_string(),
-                    title,
+                    // The metadata column, not a best-effort decode of a blob
+                    // that a row-native session usually does not have (the old
+                    // shape silently served "" for every such session, and now
+                    // serves "" for none of them).
+                    title: head.meta.title.to_string(),
                     total_entries: total,
                     returned_entries: returned,
                     entries: slice,
@@ -1527,10 +1535,30 @@ impl McpServerTool for ReadSessionHistoryTool {
             });
         }
 
+        if crate::store::is_wiped_row_native(true, head.epoch) {
+            // A wiped session EXISTS — it has a metadata row, a title, a tab the
+            // user can still click. Answering `session_not_found` (which the old
+            // code did once the blob was NULLed) would tell a client the session
+            // was deleted, and would disagree with `get_session`, which serves
+            // this same state as an empty transcript. An empty archive is the
+            // honest answer: "this session is real and has nothing in it."
+            return Ok(ToolResponse {
+                content: vec![ToolResponseContent::Text {
+                    text: "0/0 entries (archived)".to_string(),
+                }],
+                structured_content: ReadSessionHistoryResult {
+                    session_id: session_id.to_string(),
+                    source: "archived".to_string(),
+                    title: head.meta.title.to_string(),
+                    total_entries: 0,
+                    returned_entries: 0,
+                    entries: Vec::new(),
+                },
+            });
+        }
+
         // Legacy blob fallback (un-migrated sessions written before Phase 4).
-        let blob_bytes = blob_bytes.ok_or_else(|| {
-            anyhow!("session_not_found: {session_id} is neither open nor archived in the database")
-        })?;
+        let blob_bytes = db.load_blob(session_id).await?.ok_or_else(not_found)?;
         let snapshot: PersistedSession = serde_json::from_slice(&blob_bytes)
             .with_context(|| format!("decoding archived session {session_id}"))?;
         let total = snapshot.entry_summaries.len();

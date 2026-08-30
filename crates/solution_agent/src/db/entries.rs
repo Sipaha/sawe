@@ -97,12 +97,13 @@ impl SolutionAgentDb {
     /// [`Self::upsert_entries_and_trim`] for a CONTEXT WIPE (`/clear`,
     /// `/compact`), which additionally drops the legacy `acp_thread_blob`.
     ///
-    /// Why it has to be the same savepoint: every read path
-    /// (`store::build_cold_session`, `read_session_history`) consults the blob
-    /// exactly when a session has no entry rows, so "rows deleted, blob kept" is
-    /// the one intermediate state that resurrects the transcript the user just
-    /// wiped. Rows-and-blob or neither; a failure part-way through must leave
-    /// the pre-wipe state intact rather than half of it.
+    /// Why it has to be the same savepoint: the store consults the blob exactly
+    /// when a session has no entry rows, so "rows deleted, blob kept" is the one
+    /// intermediate state that resurrects the transcript the user just wiped.
+    /// Rows-and-blob or neither; a failure part-way through must leave the
+    /// pre-wipe state intact rather than half of it. (Which readers do that is
+    /// the store's business and is not enumerated here — see
+    /// `store::hydration::is_wiped_row_native`.)
     pub fn upsert_entries_trim_and_clear_blob(
         &self,
         session_id: SolutionSessionId,
@@ -126,6 +127,22 @@ impl SolutionAgentDb {
     /// background executor. Test-only: a `load_entries` task needs an executor
     /// turn of its own, so it cannot sample the table *between* two turns —
     /// which is the whole measurement in the flush-atomicity tests.
+    /// Drop `solution_session_entries` so every subsequent entry write FAILS.
+    ///
+    /// Test-only, and the only way to observe the "an epoch must never outrun
+    /// the row write it describes" contract in `persist_all_rows_inner` /
+    /// `persist_main_stream`: on an in-memory sqlite there is otherwise no way
+    /// to make a write fail on demand, and the state a violation manufactures
+    /// (no rows + `epoch > 0`) is exactly what `is_wiped_row_native` reads as a
+    /// wipe — i.e. it would make a genuinely un-migrated blob unreadable.
+    /// `solution_sessions` is left intact so the epoch is still observable.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn break_entry_writes_for_test(&self) -> Result<()> {
+        let connection = self.connection.lock();
+        connection.exec("DROP TABLE solution_session_entries")?()?;
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn load_entries_blocking(&self, session_id: SolutionSessionId) -> Result<Vec<EntryRow>> {
         let connection = self.connection.lock();

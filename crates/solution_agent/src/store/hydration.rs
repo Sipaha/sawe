@@ -275,6 +275,40 @@ pub(crate) fn unique_session_title(
     SharedString::from(base.to_string())
 }
 
+/// Is this session one whose transcript was WIPED (`/clear`, `/compact`) rather
+/// than one that was never migrated off the pre-Phase-4 `acp_thread_blob`?
+///
+/// The two are indistinguishable by rows alone — both have none — which is the
+/// whole defect: with zero rows every reconstruction path falls back to the
+/// blob, so a wiped session used to serve back the conversation the user had
+/// just erased, at an epoch BELOW the persisted one (the legacy branch bumps a
+/// fresh entity 0→1 regardless of what the column holds, which a client cached
+/// at N reads as a reset).
+///
+/// `epoch > 0` is the discriminator. Being precise about it, because this
+/// predicate is the justification for suppressing on-disk data:
+///
+/// * The column is nullable with NO `DEFAULT` and `insert_or_update_metadata`
+///   never names it, so a session that has never been through a persist path
+///   reads back as `NULL` → `0`.
+/// * Three writers reach it, not two: `persist_all_rows`,
+///   `persist_context_wipe` and `persist_main_stream` (via `save_epoch`). If
+///   you add a fourth, it belongs in this list.
+/// * All three save the epoch strictly AFTER awaiting the row write, and only
+///   if that write succeeded, so `epoch > 0` implies a row write really ran.
+///   `persist_main_stream` additionally only runs on ingest, which has rows to
+///   write by construction.
+/// * Every path that could set `epoch > 0` therefore either wrote rows (so we
+///   are not in this branch) or deliberately deleted them.
+///
+/// Consequence worth stating plainly: for a session matching this predicate the
+/// blob is treated as unreadable. `persist_context_wipe` clears it at the source
+/// now, so for new wipes this is belt-and-braces — but it is the ONLY repair for
+/// sessions already wiped by a build that kept it.
+pub(crate) fn is_wiped_row_native(rows_empty: bool, epoch: i64) -> bool {
+    rows_empty && epoch > 0
+}
+
 /// Build the COLD (`acp_thread: None`) session entity described by `meta` and
 /// its persisted transcript — `rows` when the session is row-native, else the
 /// legacy `blob`. Returns the entity plus whether the legacy branch was taken
@@ -295,21 +329,7 @@ pub(crate) fn build_cold_session(
     tab_order: Option<i64>,
     cx: &mut App,
 ) -> (Entity<SolutionSession>, bool) {
-    // A persisted `epoch > 0` proves the session is ROW-NATIVE: the only writers
-    // of that column are `persist_all_rows` / `persist_context_wipe`, and a
-    // session reaches them only after hydration's legacy→rows migration has
-    // already bumped it past 0. So "no rows AND epoch > 0" is not an
-    // un-migrated session — it is a migrated one whose transcript was WIPED
-    // (`/clear`, `/compact`), and its retained `acp_thread_blob` describes the
-    // conversation the user just erased. Consulting it here would serve the
-    // pre-wipe transcript back on the next cold load and, because the legacy
-    // branch bumps a fresh entity's epoch to 1, would advertise an epoch BELOW
-    // the persisted one, which every cached client reads as a reset.
-    //
-    // `persist_context_wipe` now clears the blob at the source, so this is
-    // belt-and-braces for new wipes — but it is the only repair for sessions
-    // already wiped by a build that did not.
-    let wiped_row_native = rows.is_none() && epoch > 0;
+    let wiped_row_native = is_wiped_row_native(rows.is_none(), epoch);
     let blob = if wiped_row_native { None } else { blob };
     let migrating = rows.is_none() && !wiped_row_native;
     // Same precedence as `resume_session`: the metadata
@@ -705,7 +725,18 @@ impl SolutionAgentStore {
                     None => (Vec::new(), 0, None),
                 }
             };
-            let preloaded_persisted: Option<PersistedSession> = if !preloaded_rows.is_empty() {
+            // The rows-empty->blob fallback here is `build_cold_session`'s, open-
+            // coded: `resume_session` builds its own entity (the fresh-entity
+            // branch below), so the guard in that function does not cover this
+            // path. It needs the same one, and this is the more user-visible of
+            // the two — reopening a `/clear`ed tab from History lands here, not
+            // in `hydrate_all_for_solution`. Gating the LOAD rather than the use
+            // also saves the read outright.
+            let wiped_row_native =
+                is_wiped_row_native(preloaded_rows.is_empty(), preloaded_epoch);
+            let preloaded_persisted: Option<PersistedSession> = if !preloaded_rows.is_empty()
+                || wiped_row_native
+            {
                 None
             } else {
                 let load_task = this.update(cx, |store, _| {
@@ -822,8 +853,12 @@ impl SolutionAgentStore {
                     //
                     // Phase 4: prefer the per-entry rows (no epoch bump — read
                     // the persisted generation). Fall back to the legacy blob
-                    // only when there are no rows, then lazily migrate it.
-                    let migrating = preloaded_rows.is_empty();
+                    // only when there are no rows AND the session is not a wiped
+                    // row-native one (see `is_wiped_row_native`), then lazily
+                    // migrate it. Without that second condition, reopening a
+                    // `/clear`ed tab from History repaints the erased
+                    // conversation and drops the epoch from N to 1.
+                    let migrating = preloaded_rows.is_empty() && !wiped_row_native;
                     let entries = if !preloaded_rows.is_empty() {
                         entries_from_rows(preloaded_rows)
                     } else {

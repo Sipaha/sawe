@@ -2019,3 +2019,312 @@ async fn compact_wipes_the_legacy_blob_like_clear_does(cx: &mut TestAppContext) 
          the pre-rotation transcript it just archived"
     );
 }
+
+/// The FOURTH leak surface, and the most user-visible one:
+/// [`SolutionAgentStore::resume_session`] does NOT go through
+/// `build_cold_session` — its fresh-entity branch open-codes its own copy of
+/// the rows-empty→blob fallback. Guarding only `hydrate_all_for_solution` and
+/// the MCP cold read left this one open.
+///
+/// The path a user actually walks: a migrated session is `/clear`ed by a build
+/// that kept the blob, the tab is closed (so the session leaves
+/// `store.sessions`), and it is reopened from History. That reopen is a
+/// `resume_session`, which took the legacy branch, decoded the retained blob,
+/// repainted the erased conversation, and dropped the epoch from N to 1.
+#[gpui::test]
+async fn resume_of_a_wiped_session_does_not_repaint_the_blob(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            // Resume support is opt-in on the mock; the fresh-entity branch is
+            // only reachable after a successful ACP attach.
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::with_resume_support(Arc::new(
+                    AtomicUsize::new(0),
+                ))),
+            );
+        });
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-wiped"),
+        title: SharedString::from("cleared session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    // The metadata row must exist FIRST: `save_blob` / `save_epoch` are
+    // `UPDATE .. WHERE id = ?` and would silently no-op without it, which would
+    // make this test vacuous — it would pass on an unguarded build too.
+    db.save_metadata(meta.clone()).await.expect("save metadata");
+
+    let blob = serde_json::to_vec(&PersistedSession {
+        title: "cleared session".into(),
+        entry_summaries: vec!["the secret the user wants gone".to_string()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    db.save_blob(session_id, blob).await.expect("save blob");
+    db.save_epoch(session_id, 3).await.expect("save epoch");
+
+    // Non-vacuity: the fixture really is the broken shape — blob present, zero
+    // rows, epoch set — and the session really is absent from the store, so
+    // `resume_session` must take the fresh-entity branch.
+    assert!(
+        db.load_blob(session_id).await.expect("load blob").is_some(),
+        "fixture must actually have a blob on disk"
+    );
+    assert!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows")
+            .is_empty(),
+        "fixture must have zero entry rows"
+    );
+    cx.update(|cx| {
+        assert!(
+            SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(session_id)
+                .is_none(),
+            "the session must not be in memory, or resume takes the hot path"
+        );
+    });
+
+    let resumed = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.resume_session(meta, project, cx))
+        })
+        .await
+        .expect("resume_session");
+    assert_eq!(resumed, session_id);
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("resumed session");
+            session.read_with(cx, |s, _| {
+                assert!(
+                    s.entries.is_empty(),
+                    "reopening a /clear'ed tab from History must not repaint the \
+                     pre-clear blob; got {} entries",
+                    s.entries.len()
+                );
+                assert_eq!(
+                    s.epoch, 3,
+                    "the resume must serve the PERSISTED epoch — the legacy branch \
+                     bumps a fresh entity to 1, i.e. BACKWARDS from 3"
+                );
+            });
+        });
+    });
+}
+
+/// The other side of the same predicate on the resume path: a genuinely
+/// un-migrated blob-only session (`epoch` never written, so NULL → 0) must
+/// still have its transcript restored when the user reopens it from History.
+/// Without this, `resume_of_a_wiped_session_does_not_repaint_the_blob` would be
+/// satisfied by simply never reading the blob again.
+#[gpui::test]
+async fn resume_of_a_legacy_blob_session_still_restores_it(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::with_resume_support(Arc::new(
+                    AtomicUsize::new(0),
+                ))),
+            );
+        });
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-legacy"),
+        title: SharedString::from("legacy session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    db.save_metadata(meta.clone()).await.expect("save metadata");
+
+    let blob = serde_json::to_vec(&PersistedSession {
+        title: "legacy session".into(),
+        entry_summaries: vec!["a line the user still wants".to_string()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    db.save_blob(session_id, blob).await.expect("save blob");
+    // Deliberately NO `save_epoch`: an un-migrated row's `epoch` is NULL.
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch"),
+        None,
+        "an un-migrated session's epoch column must be NULL for this fixture"
+    );
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.resume_session(meta, project, cx))
+    })
+    .await
+    .expect("resume_session");
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("resumed session");
+            session.read_with(cx, |s, _| {
+                assert_eq!(
+                    s.entries.len(),
+                    1,
+                    "a never-migrated legacy transcript must still be restored on reopen"
+                );
+                assert_eq!(s.epoch, 1, "the legacy branch bumps 0 -> 1");
+            });
+        });
+    });
+}
+
+/// The epoch must never outrun the row write it describes.
+///
+/// Both persist paths used to `.log_err()` the entry write and then save the
+/// epoch unconditionally. That is benign on its own — a stale generation — but
+/// `is_wiped_row_native` makes it load-bearing: "no rows + `epoch > 0`" is
+/// precisely what that predicate reads as "wiped, do not consult the blob". A
+/// failed write (disk full, I/O) on hydration's legacy→rows migration would
+/// therefore persist `epoch = 1` for a session whose rows never landed, and the
+/// guard would then suppress its genuinely un-migrated blob FOREVER — turning a
+/// transient I/O error into permanent invisibility of a real transcript.
+#[gpui::test]
+async fn a_failed_row_write_must_not_advance_the_epoch(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    let epoch_before = db
+        .load_epoch(session_id)
+        .await
+        .expect("load epoch before")
+        .unwrap_or(0);
+    assert_eq!(
+        epoch_before, 0,
+        "a session that has never been wiped sits at epoch 0 — which is the \
+         value `is_wiped_row_native` depends on staying put"
+    );
+
+    db.break_entry_writes_for_test()
+        .expect("drop the entries table");
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("session")
+                .update(cx, |s, _| s.bump_epoch());
+            store.persist_all_rows(session_id, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_epoch(session_id)
+            .await
+            .expect("load epoch after")
+            .unwrap_or(0),
+        epoch_before,
+        "the epoch must not advance past a row write that failed — doing so \
+         manufactures the 'no rows + epoch > 0' shape that suppresses the blob"
+    );
+
+    // The incremental sibling carries the identical contract: it also writes the
+    // epoch after its `upsert_entries_and_trim`, and its trim runs even when the
+    // delta is empty, so a broken table fails it too.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("session")
+                .update(cx, |s, _| s.bump_epoch());
+            store.persist_main_stream(session_id, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_epoch(session_id)
+            .await
+            .expect("load epoch after incremental")
+            .unwrap_or(0),
+        epoch_before,
+        "persist_main_stream must apply the same rule as persist_all_rows"
+    );
+}

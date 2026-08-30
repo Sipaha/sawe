@@ -767,7 +767,7 @@ pub(crate) use queue::summarize_blocks_for_log;
 // consumers of `PersistedSession`/`entries_from_rows`, and the
 // `store/tests/{hydration,model_catalog}.rs` buckets.
 pub use hydration::PersistedSession;
-pub(crate) use hydration::{build_cold_session, entries_from_rows};
+pub(crate) use hydration::{build_cold_session, entries_from_rows, is_wiped_row_native};
 use hydration::{extract_preview, unique_session_title};
 // Every store.rs caller of `cold_entries_from_persisted` moved into `hydration`;
 // only the `store/tests/hydration.rs` bucket still reaches it via
@@ -4030,12 +4030,15 @@ impl SolutionAgentStore {
     /// savepoint as the row deletion.
     ///
     /// Rewriting the rows is not on its own enough to wipe a transcript. Every
-    /// read path — `build_cold_session` (desktop restore and the cold
-    /// `get_session` fallback) and `read_session_history` — falls back to the
-    /// blob precisely when a session has NO entry rows, which is the state a
-    /// wipe leaves behind. So for a session old enough to carry a blob, the
-    /// row-only truncation deleted the rows and then handed the pre-wipe
-    /// transcript straight back on the next cold load.
+    /// path that reconstructs a persisted session falls back to the blob
+    /// precisely when that session has NO entry rows — which is the state a wipe
+    /// leaves behind — so for a session old enough to carry a blob, the row-only
+    /// truncation deleted the rows and then handed the pre-wipe transcript
+    /// straight back on the next read. Deliberately NOT enumerating those paths
+    /// here: the list was wrong within a day of being written (it missed
+    /// `resume_session`, which open-codes its own copy of the fallback). Find
+    /// them by the guard they all have to apply,
+    /// `store::hydration::is_wiped_row_native`.
     ///
     /// Not folded into `persist_all_rows`: hydration's legacy→rows migration
     /// calls that one with a full row set derived FROM the blob and must keep
@@ -4099,17 +4102,27 @@ impl SolutionAgentStore {
                 if let Some(prev) = prev {
                     prev.await;
                 }
-                if clear_legacy_blob {
+                let rows_written = if clear_legacy_blob {
                     db.upsert_entries_trim_and_clear_blob(session_id, rows, len)
                         .await
-                        .log_err();
                 } else {
-                    db.upsert_entries_and_trim(session_id, rows, len)
-                        .await
-                        .log_err();
+                    db.upsert_entries_and_trim(session_id, rows, len).await
                 }
-                db.save_epoch(session_id, epoch).await.log_err();
-                db.save_change_seq(session_id, change_seq).await.log_err();
+                .log_err()
+                .is_some();
+                // Only advance the generation the row write DESCRIBES. If that
+                // write failed (disk full, I/O), saving the epoch anyway
+                // manufactures the exact state `is_wiped_row_native` reads as
+                // "wiped": no rows + `epoch > 0`. On the legacy->rows migration
+                // that would make a genuinely un-migrated transcript
+                // permanently invisible — the epoch would claim a row write that
+                // never happened, and the blob would be suppressed on the
+                // strength of it. Leaving the epoch behind instead just means
+                // the next successful flush re-writes both, in order.
+                if rows_written {
+                    db.save_epoch(session_id, epoch).await.log_err();
+                    db.save_change_seq(session_id, change_seq).await.log_err();
+                }
                 finished.store(true, std::sync::atomic::Ordering::Release);
             }
         });
@@ -4188,11 +4201,18 @@ impl SolutionAgentStore {
                 if let Some(prev) = prev {
                     prev.await;
                 }
-                db.upsert_entries_and_trim(session_id, rows, main_len)
+                // Same ordering contract as `persist_all_rows_inner`: the epoch
+                // must not outrun the row write it describes, because
+                // `is_wiped_row_native` reads "no rows + epoch > 0" as a wipe.
+                let rows_written = db
+                    .upsert_entries_and_trim(session_id, rows, main_len)
                     .await
-                    .log_err();
-                db.save_epoch(session_id, epoch).await.log_err();
-                db.save_change_seq(session_id, change_seq).await.log_err();
+                    .log_err()
+                    .is_some();
+                if rows_written {
+                    db.save_epoch(session_id, epoch).await.log_err();
+                    db.save_change_seq(session_id, change_seq).await.log_err();
+                }
                 finished.store(true, std::sync::atomic::Ordering::Release);
             }
         });

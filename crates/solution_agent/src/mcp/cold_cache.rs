@@ -43,6 +43,13 @@
 //!   discriminators, either of which invalidates. A legacy blob-only session
 //!   that instead gains rows moves `entry_count` off 0.
 //!
+//!   The epoch half of that survived `persist_all_rows_inner` making its
+//!   `save_epoch` conditional on the row write succeeding, and is in fact now
+//!   tighter: the blob clear rides in the SAME savepoint as that write, so a
+//!   cleared blob implies a committed write implies a saved epoch. The two can
+//!   no longer come apart in the direction that would matter here (blob gone,
+//!   head unmoved).
+//!
 //! If you add a SECOND blob writer, check it moves one of those; this is the
 //! one input whose safety rests on its writers rather than on a fingerprint.
 //!

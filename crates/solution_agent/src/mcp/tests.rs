@@ -2553,6 +2553,186 @@ async fn read_session_history_closed_row_native_returns_entries(cx: &mut gpui::T
     );
 }
 
+/// `read_session_history` was the FOURTH reconstruction path with a
+/// rows-empty→blob fallback, and the last one without a guard: after the
+/// desktop and `get_session` stopped serving a wiped session's retained blob,
+/// this tool still did.
+///
+/// All three branches of the rewritten archive path are pinned together,
+/// because the fix is the middle one and it is only meaningful if the other two
+/// still behave — a guard that suppressed everything, or that answered
+/// `session_not_found`, would satisfy the middle assertion on its own.
+#[gpui::test]
+async fn read_session_history_distinguishes_a_wiped_session_from_a_legacy_one(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let executor = cx.executor();
+    let db = std::sync::Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let now = chrono::Utc::now();
+    let seed = |title: &'static str| crate::model::SolutionSessionMetadata {
+        id: crate::model::SolutionSessionId::new(),
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new("acp-x"),
+        title: SharedString::from(title),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    let blob = |line: &str| {
+        serde_json::to_vec(&crate::store::PersistedSession {
+            title: "blob title".into(),
+            entry_summaries: vec![line.to_string()],
+            ..Default::default()
+        })
+        .expect("encode blob")
+    };
+    let read = |id: crate::model::SolutionSessionId, cx: &mut gpui::TestAppContext| {
+        let mut acx = cx.to_async();
+        async move {
+            ReadSessionHistoryTool
+                .run(
+                    ReadSessionHistoryParams {
+                        session_id: id.to_string(),
+                        ..Default::default()
+                    },
+                    &mut acx,
+                )
+                .await
+        }
+    };
+
+    // (1) WIPED: rows deleted, epoch bumped, blob retained by an older build.
+    let wiped = seed("cleared session");
+    let wiped_id = wiped.id;
+    db.save_metadata(wiped).await.expect("save wiped metadata");
+    db.save_blob(wiped_id, blob("the secret the user wants gone"))
+        .await
+        .expect("save blob");
+    db.save_epoch(wiped_id, 4).await.expect("save epoch");
+    assert!(
+        db.load_blob(wiped_id).await.expect("load blob").is_some(),
+        "fixture must actually have a blob on disk, or this test is vacuous"
+    );
+
+    let sc = read(wiped_id, cx)
+        .await
+        .expect("a wiped session EXISTS and must not error")
+        .structured_content;
+    assert_eq!(
+        sc.total_entries, 0,
+        "a wiped session must read as an EMPTY archive, not as its retained \
+         pre-clear blob; got {:?}",
+        sc.entries
+    );
+    assert!(sc.entries.is_empty());
+    assert_eq!(sc.source, "archived");
+    assert_eq!(
+        sc.title, "cleared session",
+        "the title must come from the metadata row (the blob's says 'blob title')"
+    );
+
+    // (2) GENUINELY LEGACY: no rows, blob present, epoch never written (NULL).
+    let legacy = seed("legacy session");
+    let legacy_id = legacy.id;
+    db.save_metadata(legacy)
+        .await
+        .expect("save legacy metadata");
+    db.save_blob(legacy_id, blob("a line the user still wants"))
+        .await
+        .expect("save blob");
+    assert_eq!(
+        db.load_epoch(legacy_id).await.expect("load epoch"),
+        None,
+        "an un-migrated session's epoch column must be NULL for this fixture"
+    );
+
+    let sc = read(legacy_id, cx)
+        .await
+        .expect("a legacy blob-only session must still be readable")
+        .structured_content;
+    assert_eq!(sc.total_entries, 1, "the legacy blob must still be served");
+    assert!(
+        sc.entries[0].contains("a line the user still wants"),
+        "legacy blob content must round-trip; got {:?}",
+        sc.entries[0]
+    );
+
+    // (3) ROW-NATIVE: entry rows present. Serves them, and takes its title from
+    // the METADATA row. The old shape decoded the blob for that title and
+    // silently served "" for every row-native session without one — this branch
+    // is why the archive read no longer loads a payload it then throws away.
+    let native = seed("row-native session");
+    let native_id = native.id;
+    db.save_metadata(native)
+        .await
+        .expect("save native metadata");
+    let native_entry = crate::session_entry::SessionEntry {
+        created_ms: 1_700_000_000_000,
+        mod_seq: 1,
+        subagent_id: None,
+        kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+            chunks: vec![crate::session_entry::AssistantChunk::Message(
+                "a row-native line".into(),
+            )],
+        },
+    };
+    db.upsert_entry(
+        native_id,
+        0,
+        native_entry.mod_seq as i64,
+        native_entry.created_ms,
+        None,
+        native_entry.to_payload(),
+    )
+    .await
+    .expect("upsert entry");
+
+    let sc = read(native_id, cx)
+        .await
+        .expect("a row-native archived session must be readable")
+        .structured_content;
+    assert_eq!(sc.total_entries, 1);
+    assert!(
+        sc.entries[0].contains("a row-native line"),
+        "row content must round-trip; got {:?}",
+        sc.entries[0]
+    );
+    assert_eq!(
+        sc.title, "row-native session",
+        "the row-native title must come from the metadata row, not from a blob \
+         decode that yields \"\" for the sessions that actually take this branch"
+    );
+
+    // (4) GENUINELY ABSENT: no metadata row at all. Still an error, and still
+    // the same error — "empty archive" must not swallow a bad id.
+    let err = read(crate::model::SolutionSessionId::new(), cx)
+        .await
+        .expect_err("an unknown session id must still fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("session_not_found") && msg.contains("neither open nor archived"),
+        "an absent session must still report session_not_found; got {msg:?}"
+    );
+}
+
 // -----------------------------------------------------------------
 // Task 5.2: get_session_changes (mobile delta).
 // -----------------------------------------------------------------
