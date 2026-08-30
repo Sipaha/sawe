@@ -255,6 +255,7 @@ async fn get_session_entry_happy_path_returns_full_markdown(cx: &mut gpui::TestA
             GetSessionEntryParams {
                 session_id: session_id.to_string(),
                 index: 0,
+                stream_id: None,
                 include_images: false,
             },
             &mut cx.to_async(),
@@ -281,6 +282,7 @@ async fn get_session_entry_out_of_range_errors(cx: &mut gpui::TestAppContext) {
             GetSessionEntryParams {
                 session_id: session_id.to_string(),
                 index: 9_999,
+                stream_id: None,
                 include_images: false,
             },
             &mut cx.to_async(),
@@ -1878,17 +1880,16 @@ async fn get_session_entry_carries_created_ms(cx: &mut gpui::TestAppContext) {
 
     // Directly stamp entry 0 with a real time; leave entry 1 at sentinel.
     let fake_ms: i64 = 1_700_000_000_000;
-    cx.update(|cx| {
-        let store = SolutionAgentStore::global(cx);
-        let session_entity = store.read(cx).session(session_id).expect("session exists");
-        session_entity.update(cx, |s, _| {
-            if let Some(e) = s.entries.get_mut(0) {
-                e.created_ms = fake_ms;
-            }
-            if let Some(e) = s.entries.get_mut(1) {
-                e.created_ms = NO_TIMESTAMP_MS;
-            }
-        });
+    // Through `mutate_session`, which refreshes the stream mirror the wire now
+    // reads: a bare `entries` poke would leave the mirror holding the
+    // pre-mutation clone and this test would assert against a stale copy.
+    mutate_session(session_id, cx, |s| {
+        if let Some(e) = s.entries.get_mut(0) {
+            e.created_ms = fake_ms;
+        }
+        if let Some(e) = s.entries.get_mut(1) {
+            e.created_ms = NO_TIMESTAMP_MS;
+        }
     });
 
     let result = GetSessionEntryTool
@@ -1896,6 +1897,7 @@ async fn get_session_entry_carries_created_ms(cx: &mut gpui::TestAppContext) {
             GetSessionEntryParams {
                 session_id: session_id.to_string(),
                 index: 0,
+                stream_id: None,
                 include_images: false,
             },
             &mut cx.to_async(),
@@ -1918,6 +1920,7 @@ async fn get_session_entry_carries_created_ms(cx: &mut gpui::TestAppContext) {
             GetSessionEntryParams {
                 session_id: session_id.to_string(),
                 index: 1,
+                stream_id: None,
                 include_images: false,
             },
             &mut cx.to_async(),
@@ -5235,6 +5238,7 @@ async fn get_session_entry_serves_a_closed_session(cx: &mut gpui::TestAppContext
             GetSessionEntryParams {
                 session_id: session_id.to_string(),
                 index: 2,
+                stream_id: None,
                 include_images: false,
             },
             &mut cx.to_async(),
@@ -5260,6 +5264,7 @@ async fn get_session_entry_serves_a_closed_session(cx: &mut gpui::TestAppContext
             GetSessionEntryParams {
                 session_id: session_id.to_string(),
                 index: 99,
+                stream_id: None,
                 include_images: false,
             },
             &mut cx.to_async(),
@@ -5279,6 +5284,7 @@ async fn get_session_entry_serves_a_closed_session(cx: &mut gpui::TestAppContext
             GetSessionEntryParams {
                 session_id: unknown.to_string(),
                 index: 0,
+                stream_id: None,
                 include_images: false,
             },
             &mut cx.to_async(),
@@ -5483,4 +5489,404 @@ async fn cold_cache_rebuilds_when_an_entry_is_edited_in_place(cx: &mut gpui::Tes
         second.current_seq, 4,
         "and the watermark must follow the edit"
     );
+}
+
+// =================================================================
+// `get_session_entry` must index the SAME space `get_session` labels
+// its entries with (stream-local + coalesced), not the flat mirror.
+// =================================================================
+
+/// Pin an exact transcript shape on a live session. Goes through
+/// `mutate_session` (which refreshes the stream mirror), because the shapes
+/// under test here — a run of consecutive assistant messages that
+/// `push_coalesced` merges, and teammate-tagged entries that `demux` routes out
+/// of Main — cannot be produced deterministically through the mock agent.
+fn set_transcript(
+    session_id: SolutionSessionId,
+    cx: &mut gpui::TestAppContext,
+    entries: Vec<crate::session_entry::SessionEntry>,
+) {
+    mutate_session(session_id, cx, |s| {
+        s.entries = entries;
+    });
+}
+
+fn parity_assistant(mod_seq: u64, text: &str) -> crate::session_entry::SessionEntry {
+    crate::session_entry::SessionEntry {
+        created_ms: 1_700_000_000_000 + mod_seq as i64,
+        mod_seq,
+        subagent_id: None,
+        kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+            chunks: vec![crate::session_entry::AssistantChunk::Message(
+                text.to_string(),
+            )],
+        },
+    }
+}
+
+/// A user message carrying `images` inline PNG chunks after its text — the only
+/// entry shape `count_images_in_entry` counts, so it is what moves the image
+/// cursor the `spk-image://N` links are numbered from.
+fn parity_user(mod_seq: u64, text: &str, images: usize) -> crate::session_entry::SessionEntry {
+    let tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAen5lOEAAAAASUVORK5CYII=";
+    let mut chunks = vec![fake_user_text_chunk(text)];
+    for _ in 0..images {
+        chunks.push(fake_image_chunk("image/png", tiny_png));
+    }
+    crate::session_entry::SessionEntry {
+        created_ms: 1_700_000_000_000 + mod_seq as i64,
+        mod_seq,
+        subagent_id: None,
+        kind: crate::session_entry::SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.to_string(),
+            chunks,
+        },
+    }
+}
+
+fn tagged(
+    mut entry: crate::session_entry::SessionEntry,
+    toolu: &str,
+) -> crate::session_entry::SessionEntry {
+    entry.subagent_id = Some(SharedString::from(toolu.to_string()));
+    entry
+}
+
+/// The assertion that matters: for EVERY index `get_session` hands out for a
+/// stream, `get_session_entry` with that same index (and stream) must return
+/// byte-for-byte the same `EntrySummary` — index, markdown (including the
+/// `spk-image://N` links baked in from the image cursor) and `images` payloads
+/// alike. Returns the stream's `total_count`.
+async fn assert_entry_parity(
+    cx: &mut gpui::TestAppContext,
+    session_id: SolutionSessionId,
+    stream_id: Option<StreamIdDto>,
+) -> usize {
+    let full = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                include_full_content: true,
+                include_images: true,
+                stream_id: stream_id.clone(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session")
+        .structured_content;
+    assert_eq!(
+        full.entries.len(),
+        full.total_count,
+        "unpaginated get_session must serve the whole stream"
+    );
+    for (n, served) in full.entries.iter().enumerate() {
+        let one = GetSessionEntryTool
+            .run(
+                GetSessionEntryParams {
+                    session_id: session_id.to_string(),
+                    index: n,
+                    stream_id: stream_id.clone(),
+                    include_images: true,
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("get_session_entry index {n}: {err:#}"))
+            .structured_content
+            .entry;
+        assert_eq!(
+            serde_json::to_value(&one).expect("serialize single-entry result"),
+            serde_json::to_value(served).expect("serialize get_session entry"),
+            "get_session_entry {{ index: {n}, stream_id: {stream_id:?} }} must return the \
+             entry get_session labelled index {n}"
+        );
+    }
+    let err = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: full.total_count,
+                stream_id: stream_id.clone(),
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("one past the stream's end must be out of range");
+    assert!(
+        format!("{err:#}").contains("entry_index_out_of_range"),
+        "got {err:#}"
+    );
+    full.total_count
+}
+
+/// `[assistant "a", assistant "b", user "q"]`: `push_coalesced` merges the two
+/// assistant messages, so the wire stream is 2 entries while the flat mirror is
+/// 3. Indexing the flat mirror made `get_session_entry { index: 1 }` — the user
+/// bubble as far as the client is concerned — serve assistant "b".
+#[gpui::test]
+async fn get_session_entry_agrees_with_get_session_across_a_coalescing_transcript(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    set_transcript(
+        session_id,
+        cx,
+        vec![
+            parity_assistant(1, "fragment a"),
+            parity_assistant(2, "fragment b"),
+            parity_user(3, "a question", 0),
+        ],
+    );
+
+    let total = assert_entry_parity(cx, session_id, None).await;
+    assert_eq!(
+        total, 2,
+        "the two assistant fragments coalesce into one entry"
+    );
+
+    let one = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 1,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_entry")
+        .structured_content
+        .entry;
+    assert_eq!(
+        one.role,
+        EntryRoleDto::User,
+        "index 1 is the user bubble in the coalesced space the client was served"
+    );
+    assert!(
+        one.markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("a question")),
+        "got {:?}",
+        one.markdown
+    );
+}
+
+/// Teammate-tagged entries route out of Main entirely, so a Main index and a
+/// flat index disagree even with no coalescing at all — and the teammate
+/// stream's own indices start over at 0.
+#[gpui::test]
+async fn get_session_entry_agrees_with_get_session_across_teammate_tagged_entries(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    set_transcript(
+        session_id,
+        cx,
+        vec![
+            parity_user(1, "main question", 0),
+            tagged(parity_assistant(2, "teammate work"), "toolu_parity_1"),
+            parity_user(3, "main follow-up", 0),
+        ],
+    );
+
+    let main_total = assert_entry_parity(cx, session_id, None).await;
+    assert_eq!(main_total, 2, "the tagged entry is not part of Main");
+    let teammate = StreamIdDto::Teammate {
+        toolu: "toolu_parity_1".to_string(),
+    };
+    let teammate_total = assert_entry_parity(cx, session_id, Some(teammate.clone())).await;
+    assert_eq!(teammate_total, 1);
+
+    let main_1 = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 1,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_entry Main 1")
+        .structured_content
+        .entry;
+    assert!(
+        main_1
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("main follow-up")),
+        "Main index 1 is the second Main entry, not the flat mirror's tagged one; got {:?}",
+        main_1.markdown
+    );
+
+    let teammate_0 = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 0,
+                stream_id: Some(teammate),
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_entry teammate 0")
+        .structured_content
+        .entry;
+    assert!(
+        teammate_0
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("teammate work")),
+        "the teammate stream indexes from 0; got {:?}",
+        teammate_0.markdown
+    );
+
+    // A stream that never existed is reported as a missing stream, not as an
+    // out-of-range index into an empty one.
+    let err = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 0,
+                stream_id: Some(StreamIdDto::Teammate {
+                    toolu: "toolu_never_existed".to_string(),
+                }),
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("an unknown stream must fail");
+    assert!(
+        format!("{err:#}").contains("stream_not_found"),
+        "got {err:#}"
+    );
+}
+
+/// The second axis: the image cursor. `get_session` replays it over the
+/// SELECTED stream, so the `spk-image://N` link baked into an assistant bubble
+/// is numbered in stream-local image order. Replaying it over the flat mirror
+/// instead numbered the same link from images that belong to OTHER streams —
+/// the cross-reference `get_session_entry`'s own doc comment promises.
+#[gpui::test]
+async fn get_session_entry_image_indices_agree_with_get_session(cx: &mut gpui::TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    set_transcript(
+        session_id,
+        cx,
+        vec![
+            parity_user(1, "here is a screenshot", 1),
+            tagged(parity_user(2, "teammate attachments", 2), "toolu_img_1"),
+            parity_assistant(3, "and back to you: `Image`"),
+        ],
+    );
+
+    assert_entry_parity(cx, session_id, None).await;
+    let teammate = StreamIdDto::Teammate {
+        toolu: "toolu_img_1".to_string(),
+    };
+    assert_entry_parity(cx, session_id, Some(teammate.clone())).await;
+
+    // Main's assistant bubble sits after exactly ONE Main image, so its link is
+    // `spk-image://1`. Over the flat mirror the two teammate images would have
+    // pushed the cursor to 3.
+    let main_1 = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 1,
+                stream_id: None,
+                include_images: true,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_entry Main 1")
+        .structured_content
+        .entry;
+    let md = main_1.markdown.expect("single-entry always has markdown");
+    assert!(
+        md.contains("spk-image://1"),
+        "the assistant image link is numbered in Main's image space; got {md:?}"
+    );
+
+    // The teammate stream numbers its own images from 0, on both RPCs.
+    let teammate_0 = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: session_id.to_string(),
+                index: 0,
+                stream_id: Some(teammate),
+                include_images: true,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session_entry teammate 0")
+        .structured_content
+        .entry;
+    let indices: Vec<usize> = teammate_0
+        .images
+        .expect("include_images was set")
+        .iter()
+        .map(|img| img.index)
+        .collect();
+    assert_eq!(
+        indices,
+        vec![0, 1],
+        "a stream's image cursor starts at 0 for that stream"
+    );
+}
+
+/// The cold path answers from the same stream space. Four consecutive assistant
+/// ROWS are one Main entry (`cold_cache_serves_a_coalescing_transcript_identically`
+/// pins the `get_session` half), so a closed session is exactly where an
+/// index-space mismatch is most visible: the flat mirror accepted 0..=3.
+#[gpui::test]
+async fn get_session_entry_agrees_with_get_session_on_a_closed_coalescing_session(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 0).await;
+    for idx in 0..4u64 {
+        let row = SessionEntry {
+            created_ms: 1_700_000_000_000 + idx as i64,
+            mod_seq: idx + 1,
+            subagent_id: None,
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![crate::session_entry::AssistantChunk::Message(format!(
+                    "fragment {idx}"
+                ))],
+            },
+        };
+        db.upsert_entry(
+            session_id,
+            idx as i64,
+            row.mod_seq as i64,
+            row.created_ms,
+            None,
+            row.to_payload(),
+        )
+        .await
+        .expect("upsert");
+    }
+
+    let total = assert_entry_parity(cx, session_id, None).await;
+    assert_eq!(total, 1, "four assistant rows are one coalesced Main entry");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(
+            store.read(cx).session(session_id).is_none(),
+            "the parity round-trip must stay a pure read"
+        );
+    });
 }

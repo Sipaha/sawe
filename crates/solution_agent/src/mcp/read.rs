@@ -1198,8 +1198,20 @@ async fn get_session_changes_from_db(
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct GetSessionEntryParams {
     pub session_id: String,
-    /// 0-based index into the session's entries, oldest-first.
+    /// 0-based index into the SELECTED stream's entries, oldest-first — the
+    /// SAME stream-local, coalesced space `get_session` /
+    /// `get_session_changes` stamp onto `EntrySummary.index` for the same
+    /// `stream_id`. NOT an index into the flat `session.entries` mirror: that
+    /// mirror is un-coalesced and carries every stream's entries, so a client
+    /// echoing back an index it was served would land on a different entry
+    /// (FORK.md #105 pins the stream-local space as the wire contract).
     pub index: usize,
+    /// The stream `index` addresses, identical semantics to
+    /// `GetSessionParams::stream_id` (`None` / absent ⇒ Main). A client that
+    /// tapped a bubble in a teammate tab passes that tab's id so the index it
+    /// echoes back is read in the space it was served in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<StreamIdDto>,
     /// Default false. When true, the returned `EntrySummary.images`
     /// carries inline base64 image payloads.
     #[serde(default)]
@@ -1215,12 +1227,15 @@ impl<'de> Deserialize<'de> for GetSessionEntryParams {
             #[serde(default)]
             index: usize,
             #[serde(default)]
+            stream_id: Option<StreamIdDto>,
+            #[serde(default)]
             include_images: bool,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             session_id: inner.session_id,
             index: inner.index,
+            stream_id: inner.stream_id,
             include_images: inner.include_images,
         })
     }
@@ -1251,18 +1266,12 @@ impl McpServerTool for GetSessionEntryTool {
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
         let want_index = input.index;
-        let include_images = input.include_images;
 
         // 1. In-memory path — live or cold-restored, the freshest source.
         let in_memory = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             let entity = store.read_with(cx, |store, _| store.session(session_id))?;
-            Some(build_get_session_entry_result(
-                entity.read(cx),
-                want_index,
-                include_images,
-                cx,
-            ))
+            Some(build_get_session_entry_result(entity.read(cx), &input, cx))
         });
         let result = match in_memory {
             Some(result) => result?,
@@ -1273,9 +1282,7 @@ impl McpServerTool for GetSessionEntryTool {
             //    session the very same client had just been served.
             None => {
                 let session = load_cold_session(session_id, cx).await?;
-                cx.update(|cx| {
-                    build_get_session_entry_result(session.read(cx), want_index, include_images, cx)
-                })?
+                cx.update(|cx| build_get_session_entry_result(session.read(cx), &input, cx))?
             }
         };
 
@@ -1293,28 +1300,55 @@ impl McpServerTool for GetSessionEntryTool {
 /// in particular the same image-cursor replay, which is what keeps a
 /// `spk-image://N` reference in this entry pointing at the image
 /// `get_session` numbered N.
+///
+/// Indexes the SELECTED stream (`input.stream_id`, default Main), NOT the flat
+/// `session.entries` mirror. The two spaces genuinely differ: `demux` routes
+/// teammate-tagged entries out of Main and `push_coalesced` merges consecutive
+/// assistant messages, so the flat mirror is both longer than Main and
+/// differently ordered. `get_session` / `get_session_changes` serve stream-local
+/// indices (FORK.md #105), and this RPC exists to re-fetch an entry a client was
+/// served by one of them — reading the flat mirror handed back a DIFFERENT entry
+/// for the same `index`, and replayed the image cursor over a different walk on
+/// top of that.
 fn build_get_session_entry_result(
     session: &crate::model::SolutionSession,
-    want_index: usize,
-    include_images: bool,
+    input: &GetSessionEntryParams,
     cx: &App,
 ) -> Result<GetSessionEntryResult> {
-    // Phase 4 Task 5a: read the single entry from the unified
-    // `session.entries` (works for cold/resumed row-native sessions too — the
-    // old live-thread-only path errored `session_has_no_thread` for any
-    // sleeping session).
-    let entries = &session.entries;
+    let want_index = input.index;
+    let selected = input
+        .stream_id
+        .as_ref()
+        .map(StreamIdDto::to_model)
+        .unwrap_or(crate::stream::StreamId::Main);
+    // A missing stream is reported as such rather than as an empty one: unlike
+    // `get_session`, which can honestly answer "that stream has no entries",
+    // the single-entry call has no valid answer either way, so it may as well
+    // say WHICH of the two things went wrong. Main is always present, so this
+    // only fires for a teammate/shell tab that closed under the client.
+    let stream = session.streams.get(&selected).ok_or_else(|| {
+        let available = session
+            .streams
+            .keys()
+            .map(|id| format!("{id:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow!("stream_not_found: {selected:?} (session has: {available})")
+    })?;
+    let entries = &stream.entries;
     let len = entries.len();
     anyhow::ensure!(
         want_index < len,
-        "entry_index_out_of_range: {} (session has {} entries)",
+        "entry_index_out_of_range: {} (stream {:?} has {} entries)",
         want_index,
+        selected,
         len
     );
-    // Replay the image cursor up to `want_index` so the returned
-    // `EntryImage.index` matches what `get_session{ include_images: true }`
-    // would have assigned to the same image — keeps cross-references (markdown
-    // `spk-image://N` links etc.) consistent.
+    // Replay the image cursor up to `want_index` over the SAME per-stream walk
+    // `get_session` / `get_session_changes` use, so the returned
+    // `EntryImage.index` — and the `spk-image://N` links the assistant-markdown
+    // rewrite bakes in from it — match what those RPCs assigned to the same
+    // image in the same stream.
     let mut image_cursor = 0usize;
     for entry in entries.iter().take(want_index) {
         image_cursor += count_images_in_entry(&entry.kind);
@@ -1327,7 +1361,7 @@ fn build_get_session_entry_result(
         entry,
         want_index,
         true,
-        include_images,
+        input.include_images,
         &mut image_cursor,
         &live_auth_options,
     );
