@@ -109,6 +109,7 @@ fn build_session() -> SolutionSession {
         hydration_orphan_streams: std::collections::HashSet::new(),
         hydration_watermark: 0,
         persisted_main_seq: 0,
+        transcript_unavailable: false,
         hydrating: false,
         last_turn_duration: None,
         cached_total_tokens: None,

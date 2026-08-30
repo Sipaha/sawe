@@ -411,6 +411,7 @@ pub(crate) fn build_cold_session(
         crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, 0, cx)
     };
     let migrating = rows_absent && !wiped_row_native && undecodable_blob.is_none();
+    let transcript_missing = undecodable_blob.is_some();
     let entity = cx.new(|_| {
         let mut s = SolutionSession::new_idle(
             meta.id,
@@ -424,6 +425,10 @@ pub(crate) fn build_cold_session(
         s.context_count = meta.context_count;
         s.cwd = meta.cwd.clone();
         s.entries = entries.into_iter().map(std::sync::Arc::new).collect();
+        // Same contract as `resume_session`'s copy: a cold session built without
+        // the transcript it should have had is not an empty session, and must not
+        // be flushed as one once `resume_session` promotes it to live.
+        s.transcript_unavailable = transcript_missing;
         // Rebuild the per-source `streams` mirror (phase 2c) —
         // the desktop render reads it, and this cold-load path
         // assigns `entries` directly. Without it a restored
@@ -993,6 +998,11 @@ impl SolutionAgentStore {
                         // view (an O(N) demux at load time); the live thread
                         // attached below reopens any still-live teammate.
                         s.hydrate_streams_main_only();
+                        // The empty transcript above is a failure, not a fact —
+                        // carry that onto the entity so a later flush (a close,
+                        // an eviction) declines rather than writing it over the
+                        // rows on disk. See `SolutionSession::transcript_unavailable`.
+                        s.transcript_unavailable = transcript_unavailable;
                         // Legacy/migrating rows have no persisted change_seq and no
                         // pre-restart delta client → fall back to max(mod_seq).
                         s.restore_change_seq(if migrating {

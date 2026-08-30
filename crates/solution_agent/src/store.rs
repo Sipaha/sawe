@@ -4105,6 +4105,27 @@ impl SolutionAgentStore {
         let Some(db) = self.persistence.clone() else {
             return;
         };
+        // This session was restored without its transcript (see
+        // `SolutionSession::transcript_unavailable`), so its empty `entries` is
+        // not a fact about the conversation and must not be written over the one
+        // on disk — this flush rewrites the whole Main stream and trims from its
+        // tail, which at length 0 deletes every row. Reached by the ordinary
+        // path, not a corner: a reopen after a transient read error leaves the
+        // tab live-and-empty, and `close_session` / `cold_close_solution` flush
+        // any session with a live thread.
+        //
+        // A WIPE is exempt on purpose. `/clear` is the user saying "this
+        // conversation is over" about the session in front of them; refusing it
+        // would leave rows the user asked to be rid of, and it clears the blob in
+        // the same savepoint, so it is destructive by intent rather than by
+        // accident.
+        if !clear_legacy_blob && session.read(cx).transcript_unavailable {
+            log::warn!(
+                target: "solution_agent::persist",
+                "session={session_id} declining a full flush: this copy was restored                  without its transcript, so writing it would delete the rows it                  could not read"
+            );
+            return;
+        }
         // Capture the full-flush plan + advance the watermark SYNCHRONOUSLY (in
         // event order), so a concurrent `persist_main_stream` doesn't re-upsert
         // the rows this flush covers, and so the plan can't drift before the

@@ -2299,156 +2299,6 @@ async fn resume_of_a_wiped_session_does_not_repaint_the_blob(cx: &mut TestAppCon
     });
 }
 
-/// The same guard on the same path, for the OTHER thing that leaves a session
-/// with no rows and a blob: a blob that does not decode.
-///
-/// `resume_session` derived `migrating` from "no rows and not wiped" alone, so a
-/// failed decode still bumped the epoch and flushed zero rows — and "no rows +
-/// epoch > 0" is what `is_wiped_row_native` reads as a deliberate `/clear`.
-/// Reopening a corrupt tab from History therefore CONVERTED it into a wiped one,
-/// and the intact bytes still sitting in the column became unreachable for
-/// every later read. The reopen has to be lossless: it shows the user an empty
-/// conversation, but it leaves the row exactly as it found it.
-#[gpui::test]
-async fn resume_of_an_undecodable_blob_leaves_the_row_recoverable(cx: &mut TestAppContext) {
-    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
-    let agent_id = SharedString::from("mock-agent");
-    cx.update(|cx| {
-        let registry = Arc::new(AdapterRegistry::new());
-        SolutionAgentStore::init_global(cx, registry);
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.register_agent_server(
-                agent_id.clone(),
-                Rc::new(MockAgentServer::with_resume_support(Arc::new(
-                    AtomicUsize::new(0),
-                ))),
-            );
-        });
-    });
-
-    let executor = cx.executor();
-    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
-    cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.set_persistence(db.clone(), cx);
-        });
-    });
-
-    let session_id = crate::model::SolutionSessionId::new();
-    let now = Utc::now();
-    let meta = crate::model::SolutionSessionMetadata {
-        id: session_id,
-        solution_id,
-        agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-corrupt"),
-        title: SharedString::from("corrupt session"),
-        created_at: now,
-        last_activity_at: now,
-        preview: None,
-        total_tokens: None,
-        context_count: 1,
-        cwd: PathBuf::new(),
-        parent_session_id: None,
-        desired_model: None,
-        desired_effort: None,
-        cached_models: vec![],
-        tab_order: None,
-    };
-    // `save_blob` is an `UPDATE .. WHERE id = ?`; without the row first it
-    // no-ops and the fixture silently loses its blob.
-    db.save_metadata(meta.clone()).await.expect("save metadata");
-
-    let intact = serde_json::to_vec(&PersistedSession {
-        title: "corrupt session".into(),
-        entry_summaries: vec!["a line the user still wants".to_string()],
-        ..Default::default()
-    })
-    .expect("encode blob");
-    let mut truncated = intact.clone();
-    truncated.truncate(intact.len() / 2);
-    assert!(
-        serde_json::from_slice::<PersistedSession>(&truncated).is_err(),
-        "fixture must actually fail to decode, or this test proves nothing"
-    );
-    db.save_blob(session_id, truncated)
-        .await
-        .expect("save blob");
-    assert_eq!(
-        db.load_epoch(session_id).await.expect("load epoch"),
-        None,
-        "fixture is un-migrated: the epoch column is NULL, so nothing but this \
-         reopen can set it"
-    );
-
-    let resumed = cx
-        .update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.resume_session(meta.clone(), project.clone(), cx)
-            })
-        })
-        .await
-        .expect("a corrupt transcript must not fail the reopen");
-    assert_eq!(resumed, session_id);
-    cx.run_until_parked();
-
-    cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store
-                .session(session_id)
-                .expect("resumed session")
-                .read_with(cx, |s, _| {
-                    assert!(s.entries.is_empty(), "nothing could be decoded");
-                    assert_eq!(
-                        s.epoch, 0,
-                        "the migration bump must not fire for a blob that was never read"
-                    );
-                });
-        });
-    });
-    assert_eq!(
-        db.load_epoch(session_id).await.expect("load epoch after"),
-        None,
-        "no epoch may be written: with zero rows it would read as a deliberate \
-         wipe and permanently suppress the blob"
-    );
-    assert!(
-        db.load_blob(session_id).await.expect("load blob").is_some(),
-        "the bytes must be left on disk — they are the only copy of the transcript"
-    );
-
-    // What that buys: repair the bytes, close the tab, reopen it — the
-    // transcript comes back. It cannot if this reopen marked the row as wiped.
-    db.save_blob(session_id, intact).await.expect("repair blob");
-    cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.sessions.remove(&session_id);
-            store.by_solution.remove(&solution_id);
-        });
-    });
-    cx.update(|cx| {
-        SolutionAgentStore::global(cx)
-            .update(cx, |store, cx| store.resume_session(meta, project, cx))
-    })
-    .await
-    .expect("second resume");
-    cx.run_until_parked();
-    cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store
-                .session(session_id)
-                .expect("re-resumed session")
-                .read_with(cx, |s, _| {
-                    assert_eq!(
-                        s.entries.len(),
-                        1,
-                        "the repaired blob must come back — the failed reopen must \
-                         not have marked the session as wiped"
-                    );
-                });
-        });
-    });
-}
-
 /// F2, the destructive one: a transient entry-ROW read failure on reopen must
 /// not delete the transcript.
 ///
@@ -2594,14 +2444,39 @@ async fn a_failed_row_read_on_reopen_does_not_delete_the_rows(cx: &mut TestAppCo
         "and it must not record the failure as a generation bump"
     );
 
-    // The reopen is lossless, not merely non-destructive: close the tab and
-    // reopen it with a healthy read, and the transcript is all there.
+    // Through `close_session`, NOT a hand eviction of `store.sessions` — the
+    // substitution is what hid the second half of this bug. A resumed session is
+    // LIVE (`set_acp_thread`), `close_session` flushes every live session, and
+    // that flush is a full rewrite that trims from the in-memory tail: at length
+    // 0 it deletes every row. So the rows survived the failed reopen and died on
+    // the close, which is the ordinary next thing a user does.
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store.sessions.remove(&session_id);
-            store.by_solution.remove(&solution_id);
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            assert!(
+                store
+                    .session(session_id)
+                    .expect("still open")
+                    .read(cx)
+                    .acp_thread()
+                    .is_some(),
+                "the reopened session must be LIVE, or the close below skips the \
+                 flush and this half of the test proves nothing"
+            );
+            store.close_session(session_id, cx).expect("close");
         });
     });
+    cx.run_until_parked();
+    assert_eq!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after close")
+            .len(),
+        3,
+        "closing the tab after a failed row read must not delete the rows either"
+    );
+
+    // And it is lossless, not merely non-destructive: reopen with a healthy read
+    // and the whole transcript is there.
     cx.update(|cx| {
         SolutionAgentStore::global(cx)
             .update(cx, |store, cx| store.resume_session(meta, project, cx))

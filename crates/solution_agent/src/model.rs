@@ -449,6 +449,24 @@ pub struct SolutionSession {
     /// loaded cold rows are not needlessly re-upserted on the first post-load
     /// persist.
     pub persisted_main_seq: u64,
+    /// This session was restored WITHOUT its persisted transcript, because a
+    /// read of one of its inputs failed (entry rows, `epoch`, or the legacy
+    /// blob) or the blob would not decode. `entries` is therefore empty and is
+    /// NOT this session's content.
+    ///
+    /// It exists because "empty" is otherwise indistinguishable from "the user
+    /// cleared it", and the difference decides whether a flush may overwrite the
+    /// rows on disk: `persist_all_rows` rewrites the whole Main stream and trims
+    /// everything past its tail, so flushing an empty in-memory transcript over
+    /// a three-row session DELETES it (`trim_from_idx = 0`). `close_session` and
+    /// `cold_close_solution` both flush any session with a live thread, and a
+    /// reopened tab has one — so without this flag the rows survived the failed
+    /// reopen and died when the user closed the tab.
+    ///
+    /// Ephemeral and never persisted: it describes this process's copy of the
+    /// session, and the next reopen either reads the transcript or sets it
+    /// again.
+    pub transcript_unavailable: bool,
     /// `true` while a restored tab's transcript is still being loaded on a
     /// background task: the session view renders a loading spinner (instead
     /// of "no messages yet") while this is `true` and there is no live
@@ -662,6 +680,7 @@ impl SolutionSession {
             hydration_orphan_streams: std::collections::HashSet::new(),
             hydration_watermark: 0,
             persisted_main_seq: 0,
+            transcript_unavailable: false,
             hydrating: false,
             last_turn_duration: None,
             cached_total_tokens: None,
