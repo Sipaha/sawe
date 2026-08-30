@@ -2847,6 +2847,478 @@ async fn a_failed_row_read_on_reopen_does_not_delete_the_rows(cx: &mut TestAppCo
     });
 }
 
+/// Fixture shared by the three retry-then-refuse tests below.
+///
+/// Builds a session BORN row-native (three entry rows, no legacy blob, `epoch`
+/// NULL — the combination that made a failed row read destructive, since
+/// `is_wiped_row_native` cannot fire on it), then resumes it through an injected
+/// `load_entries` failure. What comes back is the state this whole feature is
+/// about: a LIVE tab (`acp_thread` attached) whose `entries` are empty and whose
+/// `transcript_unavailable` is set, with all three rows still on disk.
+///
+/// Returns the db handle, the metadata (for a second resume), the project, and
+/// the prompt-gate sender + tempdir, which must be kept alive for the duration
+/// of the test.
+async fn resume_a_row_native_session_through_a_failed_row_read(
+    cx: &mut TestAppContext,
+    rows: usize,
+) -> (
+    Arc<crate::db::SolutionAgentDb>,
+    crate::model::SolutionSessionMetadata,
+    Entity<project::Project>,
+    async_channel::Sender<()>,
+    tempfile::TempDir,
+) {
+    let (solution_id, tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    let (prompt_tx, prompt_rx) = async_channel::unbounded::<()>();
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                // Resume support AND a prompt gate: the resume has to attach a
+                // live thread (otherwise the send takes the cold-wake path and
+                // this proves nothing), and the send that follows has to be able
+                // to complete rather than dying inside the mock.
+                Rc::new(MockAgentServer::configured(
+                    Arc::new(AtomicUsize::new(0)),
+                    None,
+                    Some(PromptGate(prompt_rx)),
+                    None,
+                    true,
+                )),
+            );
+        });
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-retry"),
+        title: SharedString::from("row-native session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    db.save_metadata(meta.clone()).await.expect("save metadata");
+    for idx in 0..rows as i64 {
+        // Roles ALTERNATE. Consecutive assistant messages coalesce into a single
+        // Main-stream bubble (`rebuild_streams`), so a uniform fixture would come
+        // back as one entry and the row counts below would be measuring the
+        // coalescer rather than the transcript.
+        let kind = if idx % 2 == 0 {
+            crate::session_entry::SessionEntryKind::UserMessage {
+                id: None,
+                content_md: format!("user line {idx}"),
+                chunks: vec![],
+            }
+        } else {
+            crate::session_entry::SessionEntryKind::AssistantMessage {
+                chunks: vec![crate::session_entry::AssistantChunk::Message(
+                    format!("assistant line {idx}").into(),
+                )],
+            }
+        };
+        let entry = crate::session_entry::SessionEntry {
+            created_ms: 1_700_000_000_000 + idx,
+            mod_seq: (idx + 1) as u64,
+            subagent_id: None,
+            kind,
+        };
+        db.upsert_entry(
+            session_id,
+            idx,
+            entry.mod_seq as i64,
+            entry.created_ms,
+            None,
+            entry.to_payload(),
+        )
+        .await
+        .expect("upsert entry");
+    }
+    assert_eq!(
+        db.load_entries(session_id).await.expect("load rows").len(),
+        rows,
+        "fixture must have rows to lose"
+    );
+    assert!(
+        db.load_blob(session_id).await.expect("load blob").is_none(),
+        "fixture must have no blob: the blob path is a different arm"
+    );
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch"),
+        None,
+        "fixture's epoch must be NULL, or `is_wiped_row_native` short-circuits \
+         the branch under test"
+    );
+
+    db.fail_next_entry_load();
+    let resumed = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.resume_session(meta.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("a failed row read must not fail the reopen");
+    assert_eq!(resumed, session_id);
+    cx.run_until_parked();
+
+    // NON-VACUITY: everything below is about a session that failed to read its
+    // transcript. A reopen that read the rows would show them here and would
+    // satisfy the rest without ever entering the branch under test.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("resumed session");
+            session.read_with(cx, |s, _| {
+                assert!(
+                    s.entries.is_empty(),
+                    "the reopen must have hit the injected read failure; got {} entries",
+                    s.entries.len()
+                );
+                assert!(
+                    s.transcript_unavailable,
+                    "the reopen must have flagged the session unreadable"
+                );
+                assert!(
+                    s.acp_thread().is_some(),
+                    "the reopened session must be LIVE, or the send below takes the \
+                     cold-wake path instead of the one under test"
+                );
+            });
+        });
+    });
+
+    (db, meta, project, prompt_tx, tmp)
+}
+
+/// F3, the door #110 left open: TYPING into a session whose transcript failed to
+/// load must not destroy the rows the close-flush guard preserves.
+///
+/// `persist_all_rows_inner` declines for a flagged session, but the INCREMENTAL
+/// `persist_main_stream` did not — and a send reaches it: `AcpThread::send`
+/// pushes the user-message entry, `NewEntry` lands in `store::acp_event`, and the
+/// flush that follows writes a one-row Main stream with
+/// `upsert_entries_and_trim(id, [row 0], 1)`, deleting every row past it. Three
+/// rows became one, permanently, from one transient sqlite error plus one
+/// keystroke.
+///
+/// Both `load_entries` failures are injected: the first makes the reopen flag the
+/// session, the second makes the retry fail too — so this test pins the REFUSAL
+/// arm. Its sibling below pins the success arm.
+#[gpui::test]
+async fn a_send_into_a_session_restored_without_its_transcript_keeps_the_rows(
+    cx: &mut TestAppContext,
+) {
+    let (db, meta, _project, prompt_tx, _tmp) =
+        resume_a_row_native_session_through_a_failed_row_read(cx, 3).await;
+    let session_id = meta.id;
+
+    // A refused send must never reach the agent, so close the mock's prompt gate:
+    // if the refusal ever stops firing, `MockConnection::prompt` resolves `Err`
+    // immediately instead of parking forever, and this test FAILS rather than
+    // hanging.
+    prompt_tx.close();
+
+    // The retry re-reads all three inputs; fail the row read again so it refuses.
+    db.fail_next_entry_load();
+    let send = cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.send_message(session_id, "a message the user just typed".into(), cx)
+        })
+    });
+    let send_result = send.await;
+    cx.run_until_parked();
+
+    // The headline claim FIRST, so a regression reports the data loss rather than
+    // an error-string mismatch on the way to it. The injector is ONE-SHOT, so this
+    // read doubles as proof that the retry happened at all: a send that never
+    // re-read the transcript leaves the injection armed and this very call
+    // inherits it.
+    let rows_after = db.load_entries(session_id).await.unwrap_or_else(|err| {
+        panic!(
+            "the send never re-read the transcript — the injected failure was still \
+             armed and this verification read consumed it instead ({err})"
+        )
+    });
+    assert_eq!(
+        rows_after.len(),
+        3,
+        "a send into a session whose transcript could not be read must leave every \
+         row on disk — `persist_main_stream` writes Main from index 0 and trims"
+    );
+
+    let err = format!(
+        "{:#}",
+        send_result.expect_err("the send must be refused, not silently swallowed")
+    );
+    assert!(
+        err.contains("could not be read"),
+        "the refusal must name the session as unreadable; got: {err}"
+    );
+    assert_eq!(
+        db.load_epoch(session_id)
+            .await
+            .expect("load epoch after the send"),
+        None,
+        "and it must not stamp a generation over a transcript it never read"
+    );
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session still open");
+            session.read_with(cx, |s, _| {
+                assert!(
+                    s.transcript_unavailable,
+                    "a failed retry must LEAVE the flag set, or the next send writes"
+                );
+                assert!(
+                    s.entries.is_empty(),
+                    "the refused message must not have been appended; got {} entries",
+                    s.entries.len()
+                );
+                match &s.state {
+                    SessionState::Errored(msg) => assert!(
+                        msg.contains("could not be read"),
+                        "the refusal must surface through the state every other send \
+                         failure uses; got: {msg}"
+                    ),
+                    other => panic!("expected Errored after a refused send, got {other:?}"),
+                }
+            });
+        });
+    });
+
+    // And it is still lossless: a healthy reopen brings the whole transcript back.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _cx| {
+            store.sessions.remove(&session_id);
+        });
+    });
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.resume_session(meta, _project, cx))
+    })
+    .await
+    .expect("second resume");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("re-resumed session")
+                .read_with(cx, |s, _| {
+                    assert_eq!(s.entries.len(), 3, "every entry must come back");
+                });
+        });
+    });
+}
+
+/// The success arm: a transient read error that has since cleared must cost the
+/// user nothing. The retry on the first send repopulates the session from disk,
+/// clears the flag, and the send goes through — and because the flag is gone, the
+/// close that follows flushes normally instead of declining forever.
+#[gpui::test]
+async fn a_send_retries_the_transcript_load_and_proceeds_when_it_succeeds(cx: &mut TestAppContext) {
+    let (db, meta, _project, prompt_tx, _tmp) =
+        resume_a_row_native_session_through_a_failed_row_read(cx, 3).await;
+    let session_id = meta.id;
+
+    // No second injection: the retry's reads succeed (the injector is one-shot).
+    let send = cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.send_message(session_id, "a message the user just typed".into(), cx)
+        })
+    });
+    prompt_tx.send(()).await.expect("release the prompt gate");
+    send.await
+        .expect("the send must proceed after a successful retry");
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after the send")
+            .len(),
+        4,
+        "the user's turn must be persisted ON TOP of the recovered transcript, not \
+         instead of it"
+    );
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session still open");
+            session.read_with(cx, |s, _| {
+                assert!(
+                    !s.transcript_unavailable,
+                    "a successful retry must clear the flag"
+                );
+                assert_eq!(
+                    s.entries.len(),
+                    4,
+                    "the retry must have restored the three rows, and the send must \
+                     have appended the user's message after them; got {} entries",
+                    s.entries.len()
+                );
+                assert_eq!(
+                    s.live_base, 3,
+                    "`live_base` must be re-anchored above the restored prefix, or the \
+                     first streamed entry overwrites a restored one"
+                );
+                assert!(
+                    !matches!(s.state, SessionState::Errored(_)),
+                    "a send that went through must not have been reported as refused"
+                );
+            });
+        });
+    });
+
+    // And the close now flushes instead of declining: with the flag cleared,
+    // `persist_all_rows_inner` runs its full rewrite, which is what trims any
+    // torn or teammate rows past the Main tail.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.close_session(session_id, cx).expect("close");
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after close")
+            .len(),
+        4,
+        "the close's full flush must write the recovered transcript back intact"
+    );
+}
+
+/// The retry re-reads ALL THREE inputs, because `transcript_unavailable` records
+/// only THAT the restore failed, never which of them failed. Here the rows read
+/// clean and the EPOCH read is what fails on the retry — if the retry only
+/// re-read the rows it would sail past this and clear the flag on a transcript it
+/// had only half-read.
+#[gpui::test]
+async fn the_retry_refuses_when_the_epoch_read_is_the_one_that_fails(cx: &mut TestAppContext) {
+    let (db, meta, _project, prompt_tx, _tmp) =
+        resume_a_row_native_session_through_a_failed_row_read(cx, 3).await;
+    let session_id = meta.id;
+
+    // See the sibling test: a closed gate turns "the refusal stopped firing" into
+    // a fast failure instead of a hang.
+    prompt_tx.close();
+
+    db.fail_next_epoch_load();
+    let send = cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.send_message(session_id, "another typed message".into(), cx)
+        })
+    });
+    let send_result = send.await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after")
+            .len(),
+        3,
+        "nothing on disk may change when the retry refuses"
+    );
+    let err = format!(
+        "{:#}",
+        send_result.expect_err("a failed epoch re-read must refuse the send")
+    );
+    assert!(
+        err.contains("could not be read"),
+        "the refusal must name the session as unreadable; got: {err}"
+    );
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch after"),
+        None,
+        "and no generation may be stamped"
+    );
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("session still open")
+                .read_with(cx, |s, _| {
+                    assert!(
+                        s.transcript_unavailable,
+                        "the flag must survive a retry that only half-read the transcript"
+                    );
+                    assert!(s.entries.is_empty(), "and nothing may be repopulated");
+                });
+        });
+    });
+}
+
+/// Rider: a successful `/clear` must CLEAR the flag, not merely be exempt from
+/// the flush guard it gates.
+///
+/// `persist_context_wipe` deletes every row and drops the blob in one savepoint,
+/// so after it the session's empty `entries` IS the persisted transcript. Leaving
+/// the flag set made a wiped-then-reused session unflushable-on-close for the rest
+/// of its life — and, once the send path started consulting the flag, sent every
+/// later message through a retry-then-refuse round trip over a disk state the
+/// editor had just written itself.
+#[gpui::test]
+async fn a_context_wipe_clears_the_transcript_unavailable_flag(cx: &mut TestAppContext) {
+    let (db, meta, _project, _prompt_tx, _tmp) =
+        resume_a_row_native_session_through_a_failed_row_read(cx, 3).await;
+    let session_id = meta.id;
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.persist_context_wipe(session_id, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("session still open")
+                .read_with(cx, |s, _| {
+                    assert!(
+                        !s.transcript_unavailable,
+                        "a wipe rewrites the whole transcript on purpose, so it must \
+                         also retire the flag that says we never read one"
+                    );
+                });
+        });
+    });
+    assert!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after the wipe")
+            .is_empty(),
+        "the wipe is exempt from the guard, so it must actually have deleted the rows"
+    );
+}
+
 /// F1: a transient BLOB read failure is the same defect as an undecodable blob,
 /// and was left unjoined to the flag that guards it.
 ///

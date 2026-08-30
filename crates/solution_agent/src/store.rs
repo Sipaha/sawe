@@ -4128,6 +4128,21 @@ impl SolutionAgentStore {
             );
             return;
         }
+        // A wipe CLEARS the flag as well as being exempt from it. After this
+        // write the persisted transcript is empty by the user's own instruction
+        // — rows trimmed from 0, blob dropped in the same savepoint — so the
+        // session's empty `entries` has stopped being "a transcript we failed to
+        // read" and become "the transcript". Leaving it set would make every
+        // later full flush of this session decline for the rest of its life (the
+        // torn/teammate-row trim never runs again), and would make the next send
+        // take the retry-then-refuse path in `send_message_blocks_targeted` for
+        // a session whose disk state we just wrote ourselves. Cleared here rather
+        // than in the DB task because the exemption is a statement about intent,
+        // not about the write landing: an eventual write failure sets
+        // `entry_write_failed`, whose rollback re-covers the whole stream.
+        if clear_legacy_blob {
+            session.update(cx, |s, _| s.transcript_unavailable = false);
+        }
         // Capture the full-flush plan + advance the watermark SYNCHRONOUSLY (in
         // event order), so a concurrent `persist_main_stream` doesn't re-upsert
         // the rows this flush covers, and so the plan can't drift before the

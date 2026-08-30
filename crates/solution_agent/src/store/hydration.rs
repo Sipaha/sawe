@@ -1118,6 +1118,175 @@ impl SolutionAgentStore {
 }
 
 impl SolutionAgentStore {
+    /// Re-read the transcript of a session whose restore could not read one
+    /// (`SolutionSession::transcript_unavailable`) and repopulate the entity
+    /// from what comes back. `Ok` means the session is now carrying its real
+    /// transcript and the flag is clear; `Err` means the read failed again and
+    /// NOTHING was touched — neither the entity nor the rows on disk.
+    ///
+    /// All three inputs are re-read (rows, `epoch`, and — when the rows come
+    /// back empty and the session is not a wiped row-native one — the legacy
+    /// blob), because the flag records only *that* the restore failed, never
+    /// which of them failed. Every one of them is `?`-ed rather than swallowed:
+    /// this IS the retry, so a second failure has to refuse, and swallowing it
+    /// here would rebuild the exact "a failed read is indistinguishable from an
+    /// empty transcript" defect the flag exists to stop (FORK.md #110).
+    /// `change_seq` stays best-effort for the same reason `resume_session`'s
+    /// copy does: it is a client cursor, not an input to `migrating`, and a lost
+    /// one costs one resync and cannot authorize a rewrite.
+    ///
+    /// The caller is `send_message_blocks_targeted`: a send into a flagged
+    /// session would otherwise reach `persist_main_stream`, which writes the
+    /// (empty + one new user message) Main stream from index 0 and trims —
+    /// deleting the very rows the close-flush guard preserves.
+    pub(crate) fn retry_transcript_load(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(session) = self.sessions.get(&session_id).cloned() else {
+            return Task::ready(Err(anyhow!("unknown session {session_id}")));
+        };
+        if !session.read(cx).transcript_unavailable {
+            return Task::ready(Ok(()));
+        }
+        // The retry REPLACES `entries`, so it may only run while there is
+        // nothing there to replace. Entries can only have arrived from the live
+        // thread, and those are not on disk — overwriting them with the restored
+        // prefix would lose them, and splicing them behind it would need every
+        // one of them re-stamped above the restored `mod_seq` watermark. Refuse
+        // instead; a close and reopen re-runs the whole restore. In practice
+        // unreachable: `claude --resume` does not re-emit a transcript, so the
+        // only way to append to a flagged session is a send, and a send is what
+        // this function gates.
+        if !session.read(cx).entries.is_empty() {
+            return Task::ready(Err(anyhow!(
+                "session {session_id} was restored without its transcript but has since \
+                 accumulated {} live entr(ies); re-reading it now would overwrite them",
+                session.read(cx).entries.len()
+            )));
+        }
+        // Unreachable: `persistence` is only ever assigned `Some`, and every
+        // writer of `transcript_unavailable` runs with a `db` in hand. Kept as a
+        // refusal rather than an "allow the send" shortcut so that a future
+        // change which does clear it cannot silently re-open the write.
+        let Some(db) = self.persistence.clone() else {
+            return Task::ready(Err(anyhow!(
+                "session {session_id}: no persistence configured, so its transcript \
+                 cannot be re-read"
+            )));
+        };
+        let rows_task = db.load_entries(session_id);
+        let epoch_task = db.load_epoch(session_id);
+        let change_seq_task = db.load_change_seq(session_id);
+        cx.spawn(async move |this, cx| {
+            let rows = rows_task.await.map_err(|err| {
+                anyhow!("re-reading session {session_id}'s entry rows failed: {err:#}")
+            })?;
+            let epoch = epoch_task
+                .await
+                .map_err(|err| anyhow!("re-reading session {session_id}'s epoch failed: {err:#}"))?
+                .unwrap_or(0);
+            let change_seq = change_seq_task.await.ok().flatten().map(|v| v as u64);
+            let wiped_row_native = is_wiped_row_native(rows.is_empty(), epoch);
+            // Same precedence as `resume_session`: the blob is consulted only
+            // when there are no rows AND the session is not a deliberately
+            // wiped row-native one, whose retained blob is the pre-wipe
+            // transcript and must never be repainted (#105).
+            let persisted = if rows.is_empty() && !wiped_row_native {
+                let blob_task = this.update(cx, |store, _| {
+                    store.persistence().map(|db| db.load_blob(session_id))
+                })?;
+                match blob_task {
+                    Some(task) => match task.await.map_err(|err| {
+                        anyhow!("re-reading session {session_id}'s legacy blob failed: {err:#}")
+                    })? {
+                        Some(bytes) => Some(
+                            serde_json::from_slice::<PersistedSession>(&bytes).map_err(|err| {
+                                anyhow!(
+                                    "decoding session {session_id}'s legacy blob \
+                                     ({} bytes) failed: {err:#}",
+                                    bytes.len()
+                                )
+                            })?,
+                        ),
+                        // No blob at all is a fact, not a failure.
+                        None => None,
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
+            this.update(cx, |store, cx| {
+                let Some(session) = store.sessions.get(&session_id).cloned() else {
+                    anyhow::bail!("session {session_id} went away during the transcript retry");
+                };
+                // Re-checked after the await: another path may have repopulated
+                // or appended to this session while the reads were in flight.
+                if !session.read(cx).transcript_unavailable {
+                    return Ok(());
+                }
+                if !session.read(cx).entries.is_empty() {
+                    anyhow::bail!(
+                        "session {session_id} accumulated live entries while its transcript \
+                         was being re-read; refusing to overwrite them"
+                    );
+                }
+                // Identical derivation to `resume_session`'s fresh-entity
+                // branch, minus the `transcript_unavailable` term: the reads
+                // above all succeeded, so an empty row set here is a fact.
+                let migrating = rows.is_empty() && !wiped_row_native;
+                let entries = if !rows.is_empty() {
+                    entries_from_rows(rows)
+                } else {
+                    let (cold_entries, restored_created_ms) =
+                        cold_entries_from_persisted(persisted, cx);
+                    crate::session_entry::rebuild_entries(
+                        &cold_entries,
+                        &[],
+                        &restored_created_ms,
+                        0,
+                        cx,
+                    )
+                };
+                session.update(cx, |s, cx| {
+                    s.entries = entries.into_iter().map(std::sync::Arc::new).collect();
+                    s.hydrate_streams_main_only();
+                    s.restore_change_seq(if migrating { None } else { change_seq });
+                    if migrating {
+                        s.bump_epoch();
+                    } else {
+                        s.epoch = epoch as u64;
+                    }
+                    // `set_acp_thread` anchored `live_base` at the length
+                    // `entries` had when the thread attached, which was 0
+                    // because the restore had nothing to put there. The live
+                    // thread's local index 0 now has to land AFTER the prefix we
+                    // just restored, or the first streamed entry overwrites a
+                    // restored one (`store::acp_event`'s `global_entry_index`).
+                    if s.acp_thread().is_some() {
+                        s.live_base = s.entries.len();
+                    }
+                    // Last, and only here: the session is now carrying the
+                    // transcript the restore could not read, so a flush of it is
+                    // no longer a flush of a failure.
+                    s.transcript_unavailable = false;
+                    cx.notify();
+                });
+                // Legacy blob -> rows migration, exactly as `resume_session`
+                // schedules it: the flush is now describing a transcript that
+                // was actually read.
+                if migrating {
+                    store.persist_all_rows(session_id, cx);
+                }
+                Ok(())
+            })?
+        })
+    }
+}
+
+impl SolutionAgentStore {
     /// Best-effort GC of on-disk per-session archive dirs
     /// (`<solution_root>/.agents/<sid>/` — compact handoff dumps + the
     /// mid-turn image inbox). Only kicks in once a solution has accumulated

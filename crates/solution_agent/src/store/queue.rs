@@ -505,6 +505,28 @@ impl SolutionAgentStore {
             )));
         }
 
+        // This copy of the session was restored WITHOUT its transcript (a read
+        // of the rows / `epoch` / blob failed, or the blob would not decode), so
+        // its empty `entries` is not a fact about the conversation. Letting the
+        // send through would append the user's message at Main index 0 and then
+        // `persist_main_stream` would write that one-row Main stream with a trim
+        // — `upsert_entries_and_trim(id, [row 0], 1)` DELETES every row past it,
+        // which is the whole transcript the close-flush guard was added to save.
+        // In the epoch arm it also writes `save_epoch`/`save_change_seq` from the
+        // collapsed in-memory values, rewinding a genuine `/clear`'s wipe marker.
+        //
+        // So: retry the load first, and refuse if it fails again (FORK.md #110).
+        // A transient sqlite error that has since cleared costs the user nothing
+        // — the retry repopulates the session and this same send is re-entered.
+        // Suppressing the write instead would lose the user's turn with no
+        // signal, and appending at a base offset cannot work: a new entry's
+        // `mod_seq` comes from a counter seeded off the EMPTY transcript, so the
+        // appended turn sorts at or below the preserved rows and is invisible to
+        // every client cursor.
+        if session_entity.read(cx).transcript_unavailable {
+            return self.send_after_transcript_retry(session_id, blocks, target, from_user, cx);
+        }
+
         // A genuine USER message into a supervised session both (a) resets the
         // continue-cap / audit-cadence counter and (b) RESUMES supervision when
         // it was paused in `WaitingUser` (the human answered the supervisor's
@@ -802,6 +824,75 @@ impl SolutionAgentStore {
                 }
             }
             result.map(|_| ()).map_err(|err| anyhow!(err))
+        })
+    }
+
+    /// The `transcript_unavailable` arm of [`Self::send_message_blocks_targeted`]:
+    /// re-read the session's transcript and then either re-enter the send (the
+    /// read succeeded — the original failure was transient and cost the user
+    /// nothing) or refuse it (the read failed again).
+    ///
+    /// The refusal reuses the failure surface every send already has —
+    /// `SessionState::Errored(msg)`, which `status_row` renders as
+    /// "Error: <msg>" with the full text in its tooltip and `notifier` turns
+    /// into the usual errored-session notification — rather than inventing a
+    /// banner or a read-only mode for this one case. Note that the *desktop
+    /// compose path* detaches the returned `Task` with `detach_and_log_err`,
+    /// so the returned `Err` itself only reaches the log; the session state is
+    /// what the user actually sees.
+    fn send_after_transcript_retry(
+        &mut self,
+        session_id: SolutionSessionId,
+        blocks: Vec<agent_client_protocol::schema::ContentBlock>,
+        target: QueueTarget,
+        from_user: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        log::warn!(
+            target: "solution_agent::queue",
+            "session={session_id} send into a session that was restored WITHOUT its \
+             transcript — re-reading it before deciding, because sending would rewrite \
+             the rows the restore could not read",
+        );
+        let retry = self.retry_transcript_load(session_id, cx);
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            if let Err(err) = retry.await {
+                let message = SharedString::from(format!(
+                    "This session's saved conversation could not be read, so your message \
+                     was NOT sent — sending it would have overwritten the conversation on \
+                     disk. Close and reopen the tab to try again. ({err:#})"
+                ));
+                log::error!(
+                    target: "solution_agent::queue",
+                    "session={session_id} refusing the send: {message}",
+                );
+                this.update(cx, |store, cx| {
+                    if let Some(session) = store.session(session_id) {
+                        session.update(cx, |s, _| {
+                            s.state = SessionState::Errored(message.clone());
+                        });
+                        store.mark_state_changed(session_id, cx);
+                        cx.notify();
+                    }
+                })?;
+                return Err(anyhow!("{message}"));
+            }
+            this.update(cx, |store, cx| {
+                // `retry_transcript_load` clears the flag on every `Ok` path, so
+                // the re-entry below cannot come back here. Bail rather than
+                // recurse forever if that ever stops being true.
+                if store
+                    .session(session_id)
+                    .is_some_and(|s| s.read(cx).transcript_unavailable)
+                {
+                    return Task::ready(Err(anyhow!(
+                        "session {session_id}: the transcript retry reported success but \
+                         the session is still flagged unreadable; refusing the send"
+                    )));
+                }
+                store.send_message_blocks_targeted(session_id, blocks, target, from_user, cx)
+            })?
+            .await
         })
     }
 
