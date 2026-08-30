@@ -475,6 +475,14 @@ async fn a_refused_send_restores_the_draft_into_the_compose_box(cx: &mut gpui::T
         })
         .unwrap();
 
+    // Non-vacuity for the toast assertion below: nothing has been raised yet.
+    assert!(
+        workspace_window
+            .read_with(vcx, |workspace, _| workspace.notification_ids().is_empty())
+            .unwrap(),
+        "precondition: no notification before the refused send"
+    );
+
     // The retry re-reads all three inputs; fail the row read again so it refuses.
     db.fail_next_entry_load();
     view_window
@@ -502,6 +510,13 @@ async fn a_refused_send_restores_the_draft_into_the_compose_box(cx: &mut gpui::T
             );
         })
         .unwrap();
+    assert!(
+        !workspace_window
+            .read_with(vcx, |workspace, _| workspace.notification_ids().is_empty())
+            .unwrap(),
+        "and it must raise a toast — on a cold tab that is the ONLY surface, since \
+         `status_row` renders `is_cold` (\"Sleeping\") ahead of `Errored`"
+    );
     assert_eq!(
         db.load_entries(session_id)
             .await
@@ -608,6 +623,14 @@ async fn a_consumed_turn_failure_does_not_restore_the_draft(cx: &mut gpui::TestA
         })
     });
 
+    assert!(
+        workspace_window
+            .read_with(vcx, |workspace, _| workspace.notification_ids().is_empty())
+            .unwrap(),
+        "precondition: the successful first turn must not have toasted, or the \
+         assertion after the failure below would be vacuous"
+    );
+
     // Now an ORDINARY turn failure: the prompt gate is closed, so
     // `MockConnection::prompt` resolves `Err` — but only AFTER `send_inner` has
     // already pushed the user message onto the thread.
@@ -647,4 +670,12 @@ async fn a_consumed_turn_failure_does_not_restore_the_draft(cx: &mut gpui::TestA
             );
         })
         .unwrap();
+    // The TOAST is deliberately NOT narrowed with the restore. Only the restore
+    // is; keeping the toast broad is what makes a cold-tab refusal visible.
+    assert!(
+        !workspace_window
+            .read_with(vcx, |workspace, _| workspace.notification_ids().is_empty())
+            .unwrap(),
+        "the toast must stay broad — every send failure surfaces, consumed or not"
+    );
 }
