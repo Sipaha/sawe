@@ -4545,9 +4545,11 @@ async fn cold_cache_serves_a_coalescing_transcript_identically(cx: &mut gpui::Te
         "including the merged chunk list"
     );
 
-    // A fifth fragment merges into the SAME entry, so `total_count` does not
-    // move — only `max_entry_mod_seq` does. If the head fingerprint were keyed
-    // on the count alone this would serve stale.
+    // A fifth fragment merges into the SAME stream entry, so the WIRE
+    // `total_count` does not move even though a row was added. (The head's own
+    // `entry_count` does move — rows are rows; it is
+    // `cold_cache_rebuilds_when_an_entry_is_edited_in_place` that pins the
+    // `max_entry_mod_seq` half of the fingerprint.)
     let row = assistant_row(4);
     db.upsert_entry(
         session_id,
@@ -4843,5 +4845,96 @@ async fn cold_cache_byte_cap_evicts_two_large_transcripts(cx: &mut gpui::TestApp
         db.entry_load_count(),
         3,
         "the evicted one must be rebuilt from the database"
+    );
+}
+
+/// The `max_entry_mod_seq` half of the head fingerprint, which no other test
+/// discriminates: an entry EDITED IN PLACE keeps its `idx`, so the row count
+/// does not move — only the `mod_seq` the edit bumps. That is not an exotic
+/// case, it is the ordinary one: `upsert_entry`'s `ON CONFLICT(session_id, idx)
+/// DO UPDATE` is how a tool call rewrites itself as it transitions, and
+/// `get_session_changes` filters on exactly that bumped `mod_seq`.
+///
+/// A fingerprint of `(entry_count)` alone serves the pre-edit transcript here
+/// forever (up to the TTL), which is the same class of bug as the
+/// `(session_id, change_seq)` key: an edit does not necessarily move the
+/// session's `change_seq` column either, since `update_change_seq` is a
+/// `max(...)` and only runs after the row write.
+#[gpui::test]
+async fn cold_cache_rebuilds_when_an_entry_is_edited_in_place(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+
+    let load = async |cx: &mut gpui::TestAppContext| {
+        GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    include_full_content: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("closed session must be served")
+            .structured_content
+    };
+
+    let first = load(cx).await;
+    assert_eq!(first.total_count, 3);
+    assert!(
+        first.entries[1]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("line 1")),
+        "got {:?}",
+        first.entries[1].markdown
+    );
+    assert_eq!(db.entry_load_count(), 1);
+
+    // Same `idx`, new payload, bumped `mod_seq` — the row count is unchanged.
+    let edited = SessionEntry {
+        created_ms: 1_700_000_000_001,
+        mod_seq: 4,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: "line 1 was edited".to_string(),
+            chunks: vec![fake_user_text_chunk("line 1 was edited")],
+        },
+    };
+    db.upsert_entry(
+        session_id,
+        1,
+        edited.mod_seq as i64,
+        edited.created_ms,
+        None,
+        edited.to_payload(),
+    )
+    .await
+    .expect("edit entry in place");
+
+    let second = load(cx).await;
+    assert_eq!(
+        second.total_count, 3,
+        "an in-place edit does not change the row count — that is the point"
+    );
+    assert_eq!(
+        db.entry_load_count(),
+        2,
+        "the bumped mod_seq must invalidate the copy even though the count held"
+    );
+    assert!(
+        second.entries[1]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("line 1 was edited")),
+        "the edit must be visible; got {:?}",
+        second.entries[1].markdown
+    );
+    assert_eq!(
+        second.current_seq, 4,
+        "and the watermark must follow the edit"
     );
 }
