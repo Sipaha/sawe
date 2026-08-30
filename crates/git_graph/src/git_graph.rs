@@ -2985,6 +2985,12 @@ impl GitGraph {
         let in_diffs_focus_handle = query_focus_handle.clone();
 
         h_flex()
+            // The whole search field sits inside the `GitGraph` key context,
+            // so vim's commit-list bindings (`j`/`k`/`shift-g`/`g g`, keyed on
+            // `GitGraph && !GitGraphSearchBar`) would otherwise swallow those
+            // characters instead of letting them reach the query editor. The
+            // negated clause needs this identifier to actually be emitted.
+            .key_context("GitGraphSearchBar")
             .h_7()
             .w_full()
             .min_w_0()
@@ -7462,6 +7468,76 @@ mod tests {
         git_panel.read_with(&*cx, |panel, _| {
             assert_eq!(panel.commit_tab_shas(), [oid(2)]);
         });
+    }
+
+    /// The shipped vim keymap binds bare `j` / `k` / `shift-g` / `g g` to
+    /// commit-list navigation under `GitGraph && !GitGraphSearchBar`, with no
+    /// `vim_mode` gate. The search input lives inside the `GitGraph` context,
+    /// so unless it emits `GitGraphSearchBar` those bindings win over plain
+    /// text input and typing `j` into the search box moves the selection —
+    /// `shift-g` even jumps the list to the oldest commit — instead of
+    /// filtering. `gpui::KeyBindingContextPredicate`'s `Not` scans the whole
+    /// stack, so emitting the identifier anywhere above the focused editor is
+    /// enough to withhold the block.
+    #[gpui::test]
+    async fn test_search_input_withholds_the_vim_commit_list_bindings(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let (_project, git_graph, _git_panel, mut cx) =
+            setup_graph_with_git_panel(&fs, three_commits(), cx).await;
+        let cx = &mut cx;
+
+        let commit_list_bindings =
+            gpui::KeyBindingContextPredicate::parse("GitGraph && !GitGraphSearchBar")
+                .expect("the shipped keymap's predicate parses");
+
+        // `VisualTestContext::draw` paints into `next_frame` and never swaps
+        // it in, so `Window::context_stack` would still describe the workspace.
+        // Put the graph in a pane and let the real draw build the tree.
+        let workspace = git_graph
+            .read_with(&*cx, |graph, _| graph.workspace.clone())
+            .upgrade()
+            .expect("the fixture's workspace outlives the graph");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.focus_handle.focus(window, cx);
+        });
+        cx.run_until_parked();
+        let graph_stack = cx.update(|window, _| window.context_stack());
+        assert!(
+            graph_stack
+                .iter()
+                .any(|context| context.contains("GitGraph")),
+            "precondition: focusing the graph enters the GitGraph context"
+        );
+        assert!(
+            commit_list_bindings.eval(&graph_stack),
+            "precondition: `j` still navigates the commit list when the graph holds focus"
+        );
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph
+                .search_state
+                .editor
+                .update(cx, |editor, cx| editor.focus_handle(cx).focus(window, cx));
+        });
+        cx.run_until_parked();
+        let search_stack = cx.update(|window, _| window.context_stack());
+        assert!(
+            search_stack
+                .iter()
+                .any(|context| context.contains("GitGraphSearchBar")),
+            "the focused search input must emit GitGraphSearchBar, got {search_stack:?}"
+        );
+        assert!(
+            !commit_list_bindings.eval(&search_stack),
+            "no commit-list binding may resolve while the search input holds focus"
+        );
     }
 
     /// Escape deselects in the graph, which has to close the tab the selection
