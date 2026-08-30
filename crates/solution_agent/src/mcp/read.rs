@@ -1646,8 +1646,20 @@ impl McpServerTool for ReadSessionHistoryTool {
         };
 
         // Legacy blob fallback (un-migrated sessions written before Phase 4).
-        let snapshot: PersistedSession = serde_json::from_slice(&blob_bytes)
-            .with_context(|| format!("decoding archived session {session_id}"))?;
+        //
+        // Same `session_unreadable:` code the cold `get_session` path raises for
+        // the identical condition. This tool has always propagated the decode
+        // error, but it carried no code, so a client bucketing by prefix filed the
+        // SAME corrupt session under two different classes depending on which RPC
+        // it happened to ask — and neither is `session_not_found`, which would
+        // claim the row is gone.
+        let snapshot: PersistedSession =
+            serde_json::from_slice(&blob_bytes).with_context(|| {
+                format!(
+                    "session_unreadable: {session_id} has an archived transcript \
+                     that cannot be decoded"
+                )
+            })?;
         let total = snapshot.entry_summaries.len();
         let slice = snapshot
             .entry_summaries
@@ -1664,12 +1676,14 @@ impl McpServerTool for ReadSessionHistoryTool {
                 session_id: session_id.to_string(),
                 source: "archived".to_string(),
                 // The metadata column, like the other two archive branches, not
-                // `snapshot.title`. The blob is written once per turn and never
-                // rewritten by a rename — `rename_session` updates the session
-                // row alone — so for a renamed legacy session the blob's copy is
-                // whatever the title was when the last turn ended, and every
-                // other reconstruction path (`build_cold_session`, `resume_session`,
-                // the row-native branches above) already takes the row's.
+                // `snapshot.title`. Nothing in this tree rewrites a blob at all —
+                // `save_blob` has no production caller; the only production writes
+                // to that column CLEAR it (`persist_context_wipe`) — so the blob's
+                // title is frozen at whenever the pre-Phase-4 build that wrote it
+                // last ran, while `rename_session` keeps updating the session row.
+                // Every other reconstruction path (`build_cold_session`,
+                // `resume_session`, the row-native branches above) already takes
+                // the row's.
                 title: head.meta.title.to_string(),
                 total_entries: total,
                 returned_entries: returned,

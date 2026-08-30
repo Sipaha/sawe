@@ -4376,9 +4376,33 @@ async fn get_session_refuses_to_serve_an_undecodable_blob_as_empty(cx: &mut gpui
         "get_session_changes must fail the same way; got {delta_err:#}"
     );
 
+    // `get_session_entry` is the third RPC through `load_cold_session`, so it
+    // inherits the refusal. FORK.md #105 requires any such tool to go through
+    // that one function; this is what makes "any" checkable rather than a
+    // convention.
+    let entry_err = GetSessionEntryTool
+        .run(
+            GetSessionEntryParams {
+                session_id: corrupt_id.to_string(),
+                index: 0,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("get_session_entry must not serve an entry out of a corrupt session");
+    assert!(
+        format!("{entry_err:#}").contains("session_unreadable"),
+        "got {entry_err:#}"
+    );
+
     // The tool that always propagated must still propagate — this is the half of
     // the disagreement that was already right, and the assertion above is only
-    // "they agree" if this one holds.
+    // "they agree" if this one holds. It must also carry the same CODE: it used
+    // to propagate a bare "decoding archived session <id>", so a client
+    // bucketing by prefix filed one condition under two classes depending on
+    // which RPC it asked.
     let history_err = ReadSessionHistoryTool
         .run(
             ReadSessionHistoryParams {
@@ -4389,9 +4413,14 @@ async fn get_session_refuses_to_serve_an_undecodable_blob_as_empty(cx: &mut gpui
         )
         .await
         .expect_err("read_session_history must keep propagating the decode error");
+    let history_msg = format!("{history_err:#}");
     assert!(
-        format!("{history_err:#}").contains("decoding archived session"),
-        "got {history_err:#}"
+        history_msg.contains("session_unreadable") && history_msg.contains("cannot be decoded"),
+        "all four read tools must tag this one condition the same way; got {history_msg:?}"
+    );
+    assert!(
+        !history_msg.contains("session_not_found"),
+        "and none of them may claim the row is gone; got {history_msg:?}"
     );
 
     // A read must not "repair" the row by overwriting it: the bytes stay on disk,
