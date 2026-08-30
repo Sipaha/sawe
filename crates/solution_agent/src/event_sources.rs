@@ -690,12 +690,17 @@ mod tests {
     #[gpui::test]
     async fn message_appended_payload_reports_the_coalesced_entry(cx: &mut TestAppContext) {
         let (session_id, _thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        // Distinct stamps: `push_coalesced` keeps the FIRST fragment's
+        // `created_ms` on the merged entry, so the payload must report that one
+        // for BOTH fragments' appends — the same value `get_session` serves.
+        let mut fragment_b = assistant_entry("fragment b", None);
+        fragment_b.created_ms = 1_700_000_009_000;
         set_transcript(
             session_id,
             cx,
             vec![
                 assistant_entry("fragment a", None),
-                assistant_entry("fragment b", None),
+                fragment_b,
                 user_entry("a question"),
             ],
         );
@@ -724,11 +729,56 @@ mod tests {
             Some(1),
             "the user message is index 1 of Main, not 2"
         );
+        for flat in [0usize, 1] {
+            assert_eq!(
+                payloads[flat]["created_ms"].as_i64(),
+                Some(1_700_000_000_000),
+                "the merged entry keeps the FIRST fragment's stamp; flat {flat} got {:?}",
+                payloads[flat]["created_ms"]
+            );
+        }
 
         let payload = payloads[1].clone();
         let (index, markdown) = chase_notification(cx, session_id, &payload).await;
         assert_eq!(index, 0);
         assert!(markdown.contains("fragment a") && markdown.contains("fragment b"));
+    }
+
+    /// `client_send_id(s)` used to be read off the live `AcpThread`'s
+    /// `UserMessage`; they now come from the stored entry's retained
+    /// `acp::ContentBlock`s through the same `csids_from_blocks` every other
+    /// surface uses. The client pops its optimistic bubbles off these, so
+    /// losing them in the rewrite would have been silent.
+    #[gpui::test]
+    async fn message_appended_payload_carries_client_send_ids(cx: &mut TestAppContext) {
+        let (session_id, _thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        let mut stamped = user_entry("from the phone");
+        if let crate::session_entry::SessionEntryKind::UserMessage { chunks, .. } =
+            &mut stamped.kind
+        {
+            *chunks = vec![
+                stamped_text("from the phone", 42),
+                stamped_text("and again", 43),
+            ];
+        }
+        set_transcript(
+            session_id,
+            cx,
+            vec![stamped, user_entry("from the desktop")],
+        );
+
+        let stamped_payload = cx.update(|cx| build_message_appended_payload(session_id, 0, cx));
+        assert_eq!(stamped_payload["client_send_id"].as_i64(), Some(42));
+        assert_eq!(
+            stamped_payload["client_send_ids"],
+            serde_json::json!([42, 43])
+        );
+
+        let plain = cx.update(|cx| build_message_appended_payload(session_id, 1, cx));
+        assert!(
+            plain["client_send_id"].is_null() && plain["client_send_ids"].is_null(),
+            "an unstamped message carries neither key; got {plain:?}"
+        );
     }
 
     /// A resumed session offsets the live thread's local indices by
