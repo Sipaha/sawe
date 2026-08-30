@@ -10,7 +10,7 @@ phases, which are all still finished and untouched.
 one 19× performance win, all found by pulling on threads that pool named in one
 line each.
 
-Everything below is on `origin/main`, HEAD `64ed93cb19`. Working tree clean.
+Everything below is on `origin/main`, HEAD `750149c196`. Working tree clean.
 
 ---
 
@@ -105,6 +105,13 @@ fork-local crates declared GPL and carried no `LICENSE-GPL` symlink.
 **Docs.** FORK.md #105, #107, #108, #109 and #110 are new; #55's extraction trigger
 is withdrawn permanently; #97 gained a permanent ruling; #103 records its fix;
 the MCP-sockets entry was renumbered 106 because it duplicated 17.
+
+**Two lessons about how to mutation-test, both learned the expensive way.** An implementer
+mutation-tested with a *single-test filter* and then reasoned about repo-wide coverage from
+it, concluding that pruning two assertions would silently reopen a hole; running the whole
+suite showed fifteen other tests catch it. And twice an assertion added moments earlier
+masked the isolation of the one being tested — **if you add an assertion and then
+mutation-test a different one, prune the new one first.**
 
 **Twelve vacuous or missing assertions were caught this session, all one shape** — the test
 looked like it covered the case and did not. Twice the vacuous test was one written to *fix*
@@ -218,11 +225,14 @@ review.
    transcript failed to load destroyed the rows with no send anywhere (measured 3 → 1, and
    a wipe marker rewound 5 → 0). `persist_main_stream` now carries a tripwire rather than a
    guard. What is left in that area is one *known* limit, not a defect.
-3. **Making a corrupt session read as corrupt on an open Solution.** The known limit
-   above. Every read RPC prefers the in-memory store, so once hydrated the session reads as
-   an empty transcript with no error — non-destructive now, but not honest. The live session
-   already carries the flag and both regimes converge on one `build_get_session_result` call
-   site, so this is a condition on an existing seam plus a UI decision, not a new mechanism.
+3. **A passive desktop indicator for an unreadable session.** The wire is now honest in
+   both regimes, but `transcript_unavailable` still has no reader in `session_view`, so such
+   a tab renders as an ordinary empty conversation and the only signal is on *send*. The
+   divergence this created points the wrong way: the phone user, who can do nothing about
+   it, gets the error; the desktop user, who is the only one who can act, gets nothing. Note
+   `status_row` renders `is_cold` ("Sleeping") ahead of `Errored`, so naively reusing
+   `Errored` would be invisible on exactly the tab that needs it most. A product decision,
+   with the backend already in place.
 4. **The previous small-deferred list is empty** — `shutdown_server`'s vestigial
    `Result`, the archived title, the undecodable-blob divergence, the mock's
    swappable adjacent gates and the four workspace warnings all shipped, and
@@ -266,7 +276,7 @@ deliberately gated on liveness with cold orphans logged instead.
 ## Resume recipe
 
 Read this file, then `docs/INDEX.md`, then `git log --oneline -30` to confirm
-the chain ends at `64ed93cb19`. Pick from the pool above per
+the chain ends at `750149c196`. Pick from the pool above per
 `docs/workflow/supervisor-mode.md` § 7. **Nothing is in flight and the pool is
 genuinely thin** — every item this session identified has shipped, and what is
 left is small cleanups plus one deliberately-deferred design call. If that pool
