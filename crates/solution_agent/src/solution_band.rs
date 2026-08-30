@@ -65,10 +65,11 @@ use std::collections::HashMap;
 
 use gpui::{
     AnyView, App, AppContext as _, ClickEvent, Context, DefiniteLength, DragMoveEvent, Entity,
-    FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
+    FocusHandle, Focusable as _, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, deferred, div, px,
 };
 use project::Project;
+use solutions::mcp::{StructureSlot, VisualNode, register_structure_provider};
 use solutions::{SolutionId, SolutionStore};
 use ui::prelude::*;
 use ui::{Color, Label, LabelSize, h_flex, v_flex};
@@ -509,6 +510,123 @@ impl SolutionBand {
                 }))
                 .on_drag(DraggedBandEdge, |_, _, _, cx| cx.new(|_| gpui::Empty)),
         )
+    }
+}
+
+/// Teach `workspace.dump_visual_structure` about the band. Called from
+/// `solution_agent::init`. The band reaches the dump this way rather than
+/// the dump reaching the band directly: `solutions` owns the dump and
+/// cannot depend on this crate (the edge runs the other way), and
+/// `Workspace::solution_band_item` is an `AnyView`, so only this crate can
+/// turn it back into something describable.
+pub fn register_band_structure_provider(cx: &mut App) {
+    register_structure_provider(cx, StructureSlot::SolutionBand, |workspace, window, cx| {
+        let band = workspace
+            .solution_band_item()?
+            .downcast::<SolutionBand>()
+            .ok()?;
+        Some(band.read(cx).structure_node(workspace, window, cx))
+    });
+}
+
+/// How the currently-selected utility content resolved this frame. Mirrors
+/// the `match` at the top of [`SolutionBand::render`] exactly — the two must
+/// agree or the dump describes a band the user is not looking at.
+fn utility_occupant_state(workspace: &Workspace, kind: UtilityKind, visible: bool) -> &'static str {
+    if !visible {
+        "hidden"
+    } else if workspace.solution_band_utility_item(kind).is_some() {
+        "registered"
+    } else if workspace.solution_band_utility_unavailable(kind) {
+        "unavailable"
+    } else {
+        "pending"
+    }
+}
+
+impl SolutionBand {
+    /// The band's node for `workspace.dump_visual_structure`, so an agent can
+    /// answer "is the band there, how tall, which half shows what" without a
+    /// screenshot.
+    ///
+    /// `workspace` is the caller's already-borrowed `&Workspace` rather than
+    /// `self.workspace.upgrade()`: the dump holds that borrow across this
+    /// call, and re-reading the same entity here would be one more place to
+    /// get the lease rules wrong for no gain.
+    ///
+    /// Deliberately reports no focus and no contents for the utility half.
+    /// The occupant is an `AnyView` (`Workspace::solution_band_utility_item`),
+    /// so this crate has neither its `FocusHandle` nor its element tree —
+    /// `occupant_introspectable: false` says that in the payload instead of
+    /// guessing.
+    pub fn structure_node(&self, workspace: &Workspace, window: &Window, cx: &App) -> VisualNode {
+        let solution_id = self.solution_id(cx);
+        let state = self.band_state(cx);
+        let store = SolutionAgentStore::global(cx);
+
+        // Mirrors `render`: an `active_dialog_session` naming a session that
+        // is already gone paints no half, so it must not read as one here.
+        let dialog_session = state.active_dialog_session.filter(|session_id| {
+            self.views.contains_key(session_id) || store.read(cx).session(*session_id).is_some()
+        });
+        let dialog_node = {
+            let mut node = VisualNode::new("BandDialog").with_visible(dialog_session.is_some());
+            if let Some(session_id) = dialog_session {
+                node = node.with_attribute("session_id", session_id.as_str());
+                if let Some(session) = store.read(cx).session(session_id) {
+                    node = node.with_label(session.read(cx).title.to_string());
+                }
+                // Only a session whose view has actually been built can be
+                // asked about focus; an un-rendered band has no view yet and
+                // therefore holds no focus either, which `false` states
+                // correctly.
+                if let Some(view) = self.views.get(&session_id) {
+                    node = node
+                        .with_focused(view.read(cx).focus_handle(cx).contains_focused(window, cx));
+                }
+            }
+            node
+        };
+
+        let occupant = utility_occupant_state(workspace, state.utility_kind, state.utility_visible);
+        let utility_painted = matches!(occupant, "registered" | "unavailable");
+        let utility_node = VisualNode::new(format!("BandUtility({})", state.utility_kind.as_str()))
+            .with_label(state.utility_kind.label())
+            .with_visible(utility_painted)
+            .with_attribute("utility_kind", state.utility_kind.as_str())
+            // The persisted toggle, which is what the status-bar buttons and
+            // `ctrl-`` flip. It can be `true` while `visible` is `false`: the
+            // occupant for this kind may still be loading, or have failed.
+            .with_attribute("requested_visible", state.utility_visible)
+            .with_attribute("occupant", occupant)
+            .with_attribute("occupant_introspectable", false);
+
+        let split = dialog_session.is_some() && utility_painted;
+
+        let mut node = VisualNode::new("SolutionBand")
+            .with_visible(dialog_session.is_some() || utility_painted)
+            .with_attribute("height", state.height)
+            .with_attribute(
+                "effective_height",
+                effective_band_height(state.height, f32::from(window.viewport_size().height)),
+            )
+            .with_attribute("divider_ratio", state.divider_ratio)
+            .with_attribute("split", split)
+            .with_attribute(
+                "state_source",
+                match solution_id {
+                    Some(_) => "solution",
+                    None => "window_local",
+                },
+            );
+        if let Some(solution_id) = solution_id {
+            node = node.with_attribute("solution_id", solution_id.0);
+        }
+        node.with_children(vec![
+            dialog_node,
+            VisualNode::new("BandDivider").with_visible(split),
+            utility_node,
+        ])
     }
 }
 
@@ -1337,6 +1455,273 @@ mod tests {
         store.read_with(cx, |store, _| {
             assert_eq!(store.band_state(SolutionId(3)), BandState::default());
         });
+    }
+
+    /// Locate a child of the band node by kind prefix — `BandUtility(...)`
+    /// carries the live kind in its own `kind` string, so an exact match
+    /// would have to be re-spelled per assertion.
+    fn child_starting_with<'a>(node: &'a VisualNode, prefix: &str) -> &'a VisualNode {
+        node.children
+            .iter()
+            .find(|child| child.kind.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} child in {:?}", node.children))
+    }
+
+    fn attribute(node: &VisualNode, key: &str) -> serde_json::Value {
+        node.attributes
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {key:?} attribute on {:?}", node.kind))
+    }
+
+    /// The dump's answers to "is the band there, how tall, where is the
+    /// divider, which half shows what" for a Solution window with a
+    /// registered utility occupant.
+    #[gpui::test]
+    async fn the_band_structure_node_reports_geometry_and_the_utility_half(
+        cx: &mut TestAppContext,
+    ) {
+        let (solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let occupant = cx.new(|_| gpui::Empty);
+            workspace.set_solution_band_utility_item(
+                UtilityKind::GitGraph,
+                occupant.into(),
+                window,
+                cx,
+            );
+        });
+        cx.update(|_window, cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_band_height(solution_id, 412.0, cx);
+                store.set_band_divider_ratio(solution_id, 0.25, cx);
+                store.set_band_utility_kind(solution_id, UtilityKind::GitGraph, cx);
+                store.set_band_utility_visible(solution_id, true, cx);
+            });
+        });
+
+        let node = workspace.update_in(cx, |workspace, window, cx| {
+            band.read(cx).structure_node(workspace, window, cx)
+        });
+
+        assert_eq!(node.kind, "SolutionBand");
+        assert!(
+            node.visible,
+            "a shown utility half makes the band non-empty"
+        );
+        assert_eq!(attribute(&node, "height"), serde_json::json!(412.0));
+        assert_eq!(attribute(&node, "divider_ratio"), serde_json::json!(0.25));
+        assert_eq!(
+            attribute(&node, "state_source"),
+            serde_json::json!("solution")
+        );
+        assert_eq!(
+            attribute(&node, "solution_id"),
+            serde_json::json!(solution_id.0)
+        );
+        assert_eq!(
+            attribute(&node, "split"),
+            serde_json::json!(false),
+            "no dialog session is active, so the utility half is alone in the band"
+        );
+
+        let dialog = child_starting_with(&node, "BandDialog");
+        assert!(!dialog.visible);
+        assert!(dialog.label.is_none());
+
+        let utility = child_starting_with(&node, "BandUtility");
+        assert_eq!(utility.kind, "BandUtility(git_graph)");
+        assert_eq!(utility.label.as_deref(), Some("Git Graph"));
+        assert!(utility.visible);
+        assert_eq!(
+            attribute(&utility, "occupant"),
+            serde_json::json!("registered")
+        );
+        assert_eq!(
+            attribute(&utility, "requested_visible"),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            attribute(&utility, "occupant_introspectable"),
+            serde_json::json!(false),
+            "the occupant is an AnyView; the dump must say it cannot see inside \
+             rather than imply it looked"
+        );
+
+        assert!(!child_starting_with(&node, "BandDivider").visible);
+    }
+
+    /// Hiding the utility half must not erase the remembered kind (spec §3),
+    /// and the dump has to keep the two apart: `visible` is what is painted,
+    /// `requested_visible` is the persisted toggle the buttons flip.
+    #[gpui::test]
+    async fn a_hidden_utility_half_still_reports_its_remembered_kind(cx: &mut TestAppContext) {
+        let (solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let occupant = cx.new(|_| gpui::Empty);
+            workspace.set_solution_band_utility_item(
+                UtilityKind::Debug,
+                occupant.into(),
+                window,
+                cx,
+            );
+        });
+        cx.update(|_window, cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_band_utility_kind(solution_id, UtilityKind::Debug, cx);
+                store.set_band_utility_visible(solution_id, false, cx);
+            });
+        });
+
+        let node = workspace.update_in(cx, |workspace, window, cx| {
+            band.read(cx).structure_node(workspace, window, cx)
+        });
+
+        assert!(
+            !node.visible,
+            "neither half has anything to paint, so the band collapses"
+        );
+        let utility = child_starting_with(&node, "BandUtility");
+        assert_eq!(utility.kind, "BandUtility(debug)");
+        assert!(!utility.visible);
+        assert_eq!(
+            attribute(&utility, "requested_visible"),
+            serde_json::json!(false)
+        );
+        assert_eq!(attribute(&utility, "occupant"), serde_json::json!("hidden"));
+    }
+
+    /// A kind whose occupant has not landed yet reads as `pending`, not as
+    /// a painted half — the same distinction `render` draws before it decides
+    /// whether to paint the "is unavailable" placeholder.
+    #[gpui::test]
+    async fn a_pending_occupant_is_not_reported_as_a_painted_half(cx: &mut TestAppContext) {
+        let (solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+
+        cx.update(|_window, cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_band_utility_visible(solution_id, true, cx);
+            });
+        });
+
+        let pending = workspace.update_in(cx, |workspace, window, cx| {
+            band.read(cx).structure_node(workspace, window, cx)
+        });
+        let utility = child_starting_with(&pending, "BandUtility");
+        assert_eq!(
+            attribute(&utility, "occupant"),
+            serde_json::json!("pending")
+        );
+        assert!(!utility.visible);
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.mark_solution_band_utility_unavailable(UtilityKind::Terminal, cx);
+        });
+
+        let failed = workspace.update_in(cx, |workspace, window, cx| {
+            band.read(cx).structure_node(workspace, window, cx)
+        });
+        let utility = child_starting_with(&failed, "BandUtility");
+        assert_eq!(
+            attribute(&utility, "occupant"),
+            serde_json::json!("unavailable")
+        );
+        assert!(
+            utility.visible,
+            "the failure placeholder is a painted half, so the band is not empty"
+        );
+    }
+
+    /// A plain-folder window has no persisted row, and the dump must say so
+    /// rather than attributing the geometry to a Solution.
+    #[gpui::test]
+    async fn a_window_with_no_solution_reports_window_local_geometry(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let plain_dir = tempfile::tempdir().expect("plain-folder tempdir");
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(plain_dir.path(), serde_json::json!({ ".keep": "" }))
+            .await;
+        let project = project::Project::test(fs, [plain_dir.path()], cx).await;
+
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let band = workspace.update_in(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            cx.new(|cx| SolutionBand::new(workspace.weak_handle(), project, cx))
+        });
+        band.update(cx, |band, cx| band.set_band_height(None, 500.0, cx));
+
+        let node = workspace.update_in(cx, |workspace, window, cx| {
+            band.read(cx).structure_node(workspace, window, cx)
+        });
+
+        assert_eq!(
+            attribute(&node, "state_source"),
+            serde_json::json!("window_local")
+        );
+        assert!(
+            !node.attributes.contains_key("solution_id"),
+            "there is no Solution to name"
+        );
+        assert_eq!(attribute(&node, "height"), serde_json::json!(500.0));
     }
 
     /// The band's own view of its height, for a Solution window, comes from

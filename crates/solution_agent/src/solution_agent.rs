@@ -115,6 +115,7 @@ pub fn init(cx: &mut App) {
     .detach();
 
     mcp::register(cx);
+    solution_band::register_band_structure_provider(cx);
     event_sources::install(cx);
 
     // Chunked-upload manager: shared between the listener (pure tokio
