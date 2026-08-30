@@ -33,9 +33,9 @@ impl SolutionAgentDb {
     }
 
     /// Load one session's metadata row by id, without knowing its solution.
-    /// `None` when the row is gone (hard-purged / never existed). Used by
-    /// `solution_agent.get_session`'s DB fallback to serve a session that is
-    /// no longer in memory.
+    /// `None` when the row is gone (hard-purged / never existed). Reached from
+    /// `hydrate_all_for_solution`; the three MCP read RPCs' shared cold path
+    /// uses the wider [`Self::load_cold_head`] instead.
     pub fn load_metadata(
         &self,
         id: SolutionSessionId,
@@ -743,9 +743,8 @@ pub struct ColdSessionHead {
 type ColdHeadRow = (MetadataRow, (Option<i64>, Option<i64>, i64, i64));
 
 /// The single-session counterpart of [`select_metadata_for_solution`], for
-/// callers that hold a session id but not the solution it belongs to (the
-/// `solution_agent.get_session` DB fallback). `None` when no row exists —
-/// including for a session that was hard-purged.
+/// callers that hold a session id but not the solution it belongs to. `None`
+/// when no row exists — including for a session that was hard-purged.
 pub(crate) fn select_metadata_by_id(
     connection: &Connection,
     id: SolutionSessionId,

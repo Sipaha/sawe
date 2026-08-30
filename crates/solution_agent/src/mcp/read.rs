@@ -720,9 +720,11 @@ async fn get_session_from_db(
 /// they load it the same way.
 ///
 /// Errors distinguish "not open, and there is no database at all" from "not
-/// open and not in the database" — the same two cases `read_session_history`
-/// separates, since a client that gets `session_not_found` needs to know
-/// whether retrying after a hydration could help.
+/// open and not in the database", since a client that gets `session_not_found`
+/// needs to know whether retrying after a hydration could help.
+/// `read_session_history` does NOT make that distinction — with no database
+/// attached it falls through to the same "neither open nor archived" text — so
+/// this is a divergence from it, not a mirror of it.
 async fn load_cold_session(
     session_id: SolutionSessionId,
     cx: &mut AsyncApp,
@@ -769,6 +771,15 @@ async fn load_cold_session(
         None
     };
     let change_seq = head.change_seq.map(|seq| seq as u64);
+    // What the retained copy is bounded by: the on-disk bytes it is decoded
+    // from. Free here — the rows are in hand and only their lengths are summed
+    // — and unlike an entry COUNT it stays honest for a transcript of a few
+    // enormous tool outputs. See `cold_cache::MAX_CACHED_BYTES`.
+    let payload_bytes = rows
+        .iter()
+        .map(|row| row.payload.len())
+        .sum::<usize>()
+        .saturating_add(blob.as_ref().map_or(0, |blob| blob.len()));
     Ok(cx.update(|cx| {
         let (session, _migrating) = crate::store::build_cold_session(
             &head.meta,
@@ -779,8 +790,7 @@ async fn load_cold_session(
             head.meta.tab_order,
             cx,
         );
-        let entry_count = session.read(cx).entries.len();
-        ColdSessionCache::store(cx, session_id, head, session.clone(), entry_count);
+        ColdSessionCache::store(cx, session_id, head, session.clone(), payload_bytes);
         session
     }))
 }
@@ -1159,8 +1169,10 @@ fn build_get_session_changes_result(
 /// at the watermark naturally gets an empty, caught-up delta.
 ///
 /// The one thing this cannot do is notice that the session was reopened and has
-/// grown since the poll started — the rows are re-read on every call, so the
-/// next poll sees the growth; nothing is cached across calls.
+/// grown since the poll STARTED. `load_cold_session` may serve a reconstruction
+/// it already holds, but only after re-reading the session's head and finding it
+/// unchanged, so growth between two polls is always picked up by the later one —
+/// see `mcp::cold_cache` for what "unchanged" is checked against.
 async fn get_session_changes_from_db(
     session_id: SolutionSessionId,
     input: &GetSessionChangesParams,

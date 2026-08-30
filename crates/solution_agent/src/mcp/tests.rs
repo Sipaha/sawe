@@ -4046,6 +4046,7 @@ async fn seed_closed_session_with_entries(
 ) -> (
     crate::model::SolutionSessionId,
     std::sync::Arc<crate::db::SolutionAgentDb>,
+    solutions::SolutionId,
     tempfile::TempDir,
 ) {
     use crate::session_entry::{SessionEntry, SessionEntryKind};
@@ -4115,7 +4116,82 @@ async fn seed_closed_session_with_entries(
         );
     });
 
-    (session_id, db, tmp)
+    (session_id, db, solution_id, tmp)
+}
+
+/// Add ONE more closed session to an already-seeded solution, with `count` user
+/// rows of `payload_bytes_each` filler apiece. Lighter than
+/// `seed_closed_session_with_entries` (no second project setup) so a test can
+/// afford the several sessions the cache's eviction caps need.
+async fn add_closed_session(
+    db: &std::sync::Arc<crate::db::SolutionAgentDb>,
+    solution_id: solutions::SolutionId,
+    count: usize,
+    payload_bytes_each: usize,
+) -> crate::model::SolutionSessionId {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = chrono::Utc::now();
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new(format!("acp-{}", session_id.as_str())),
+        title: SharedString::from("extra closed session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: Some(0),
+    })
+    .await
+    .expect("save metadata");
+
+    for idx in 0..count {
+        let text = "x".repeat(payload_bytes_each);
+        let entry = SessionEntry {
+            created_ms: 1_700_000_000_000 + idx as i64,
+            mod_seq: idx as u64 + 1,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.clone(),
+                chunks: vec![fake_user_text_chunk(&text)],
+            },
+        };
+        db.upsert_entry(
+            session_id,
+            idx as i64,
+            entry.mod_seq as i64,
+            entry.created_ms,
+            None,
+            entry.to_payload(),
+        )
+        .await
+        .expect("upsert entry");
+    }
+    session_id
+}
+
+/// Cold-read `session_id` through `get_session`, discarding the result.
+async fn cold_load(cx: &mut gpui::TestAppContext, session_id: crate::model::SolutionSessionId) {
+    GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("closed session must be served");
 }
 
 /// Drive `get_session_changes` from `since_seq` until it reports no more, the
@@ -4171,7 +4247,8 @@ async fn drain_cold_delta(
 #[gpui::test]
 async fn cold_paging_burst_reads_the_transcript_once(cx: &mut gpui::TestAppContext) {
     let entry_count = CHANGED_ENTRIES_PAGE * 2 + 5;
-    let (session_id, db, _tmp) = seed_closed_session_with_entries(cx, entry_count).await;
+    let (session_id, db, _solution_id, _tmp) =
+        seed_closed_session_with_entries(cx, entry_count).await;
 
     let (polls, seen) = drain_cold_delta(cx, session_id, 0).await;
 
@@ -4212,7 +4289,7 @@ async fn cold_paging_burst_reads_the_transcript_once(cx: &mut gpui::TestAppConte
 async fn cold_cache_rebuilds_when_the_transcript_grows(cx: &mut gpui::TestAppContext) {
     use crate::session_entry::{SessionEntry, SessionEntryKind};
 
-    let (session_id, db, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+    let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 3).await;
 
     let first = GetSessionTool
         .run(
@@ -4287,7 +4364,7 @@ async fn cold_cache_rebuilds_when_the_transcript_grows(cx: &mut gpui::TestAppCon
 /// out.
 #[gpui::test]
 async fn cold_cache_never_serves_a_purged_session(cx: &mut gpui::TestAppContext) {
-    let (session_id, db, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+    let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 3).await;
 
     GetSessionTool
         .run(
@@ -4334,12 +4411,15 @@ async fn cold_cache_never_serves_a_purged_session(cx: &mut gpui::TestAppContext)
     });
 }
 
-/// The TTL bounds RETENTION, not correctness — but it has to actually fire, or
-/// an idle editor holds a transcript forever. After the entry ages out the next
-/// read rebuilds from the database.
+/// The TTL bounds RETENTION, not correctness — and it has to fire ON ITS OWN.
+/// Applying it only on the next cold read is the same as never applying it on
+/// an editor that has stopped making them: up to `MAX_CACHED_SESSIONS`
+/// transcripts would sit in the global for the rest of the process. So this
+/// asserts the SWEEP, by advancing the executor clock (which is also the clock
+/// the cache stamps entries with) rather than sleeping five real seconds.
 #[gpui::test]
-async fn cold_cache_entry_expires_after_the_ttl(cx: &mut gpui::TestAppContext) {
-    let (session_id, db, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+async fn cold_cache_sweep_reclaims_an_idle_entry(cx: &mut gpui::TestAppContext) {
+    let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 3).await;
 
     let read = async |cx: &mut gpui::TestAppContext| {
         GetSessionTool
@@ -4357,13 +4437,31 @@ async fn cold_cache_entry_expires_after_the_ttl(cx: &mut gpui::TestAppContext) {
     read(cx).await;
     read(cx).await;
     assert_eq!(db.entry_load_count(), 1, "the second read must be a hit");
+    cx.update(|cx| {
+        assert_eq!(
+            crate::mcp::cold_cache::ColdSessionCache::len_for_test(cx),
+            1,
+            "a copy must be retained, or this test proves nothing"
+        );
+    });
 
-    cx.update(crate::mcp::cold_cache::ColdSessionCache::expire_all_for_test);
+    // Nobody reads anything; the sweep alone must give the memory back.
+    cx.executor()
+        .advance_clock(crate::mcp::cold_cache::COLD_CACHE_TTL * 2);
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            crate::mcp::cold_cache::ColdSessionCache::len_for_test(cx),
+            0,
+            "the sweep must drop an idle entry with no further cold read"
+        );
+    });
+
     read(cx).await;
     assert_eq!(
         db.entry_load_count(),
         2,
-        "an aged-out entry must be rebuilt from the database"
+        "a swept entry must be rebuilt from the database"
     );
     cx.update(|cx| {
         assert_eq!(
@@ -4372,6 +4470,206 @@ async fn cold_cache_entry_expires_after_the_ttl(cx: &mut gpui::TestAppContext) {
             "the rebuild re-populates a single entry, it does not accumulate"
         );
     });
+}
+
+/// Every other cache test runs on an all-`UserMessage` transcript, where the
+/// flat row list and the Main stream are the same length. That is deliberate
+/// (it is what makes the paging burst multi-page) but it means none of them
+/// exercise `Stream::push_coalesced`, which merges consecutive assistant
+/// messages so N rows become ONE stream entry. Since a hit skips
+/// `entries_from_rows` AND `hydrate_streams_main_only`, the coalesced shape is
+/// something a broken cache could serve differently on the second call.
+#[gpui::test]
+async fn cold_cache_serves_a_coalescing_transcript_identically(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 0).await;
+    let assistant_row = |idx: usize| SessionEntry {
+        created_ms: 1_700_000_000_000 + idx as i64,
+        mod_seq: idx as u64 + 1,
+        subagent_id: None,
+        kind: SessionEntryKind::AssistantMessage {
+            chunks: vec![crate::session_entry::AssistantChunk::Message(format!(
+                "fragment {idx}"
+            ))],
+        },
+    };
+    for idx in 0..4 {
+        let row = assistant_row(idx);
+        db.upsert_entry(
+            session_id,
+            idx as i64,
+            row.mod_seq as i64,
+            row.created_ms,
+            None,
+            row.to_payload(),
+        )
+        .await
+        .expect("upsert");
+    }
+
+    let load = async |cx: &mut gpui::TestAppContext| {
+        GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    include_full_content: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("closed session must be served")
+            .structured_content
+    };
+
+    let first = load(cx).await;
+    assert_eq!(
+        first.total_count, 1,
+        "four consecutive assistant rows coalesce into one Main entry"
+    );
+    assert_eq!(
+        first.current_seq, 4,
+        "the merged entry carries the MAX fragment mod_seq, not the first"
+    );
+
+    let second = load(cx).await;
+    assert_eq!(db.entry_load_count(), 1, "the second load must be a hit");
+    assert_eq!(
+        (second.total_count, second.current_seq, second.epoch),
+        (first.total_count, first.current_seq, first.epoch),
+        "a hit must serve the same coalesced shape the miss built"
+    );
+    assert_eq!(
+        second.entries[0].markdown, first.entries[0].markdown,
+        "including the merged chunk list"
+    );
+
+    // A fifth fragment merges into the SAME entry, so `total_count` does not
+    // move — only `max_entry_mod_seq` does. If the head fingerprint were keyed
+    // on the count alone this would serve stale.
+    let row = assistant_row(4);
+    db.upsert_entry(
+        session_id,
+        4,
+        row.mod_seq as i64,
+        row.created_ms,
+        None,
+        row.to_payload(),
+    )
+    .await
+    .expect("upsert");
+
+    let third = load(cx).await;
+    assert_eq!(
+        db.entry_load_count(),
+        2,
+        "the changed head must force a re-read"
+    );
+    assert_eq!(third.total_count, 1, "still one coalesced entry");
+    assert_eq!(third.current_seq, 5, "but the watermark moved");
+    assert!(
+        third.entries[0]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("fragment 4")),
+        "the new fragment must be in the merged entry; got {:?}",
+        third.entries[0].markdown
+    );
+}
+
+/// The legacy blob-only branch — `entry_count == 0` on the head — is where the
+/// previous implementer warned a `(session_id, change_seq)` key degenerates:
+/// such a row usually has no `change_seq` at all, so the key never moves. It is
+/// safe here only because the blob has no production writer, and because the
+/// one transition that CAN happen — the row migration gives the session entry
+/// rows — moves `entry_count` off 0. Both halves are pinned.
+#[gpui::test]
+async fn cold_cache_on_a_legacy_blob_session(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 0).await;
+    let blob = serde_json::to_vec(&crate::store::PersistedSession {
+        title: "closed paging session".into(),
+        entry_summaries: vec!["legacy one".into(), "legacy two".into()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    db.save_blob(session_id, blob).await.expect("save blob");
+
+    let load = async |cx: &mut gpui::TestAppContext| {
+        GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    include_full_content: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("a legacy blob-only closed session must be served")
+            .structured_content
+    };
+
+    let first = load(cx).await;
+    assert_eq!(
+        first.epoch, 1,
+        "the legacy branch bumps the persisted epoch 0 -> 1"
+    );
+    let second = load(cx).await;
+    assert_eq!(
+        db.entry_load_count(),
+        1,
+        "the zero-row head is cacheable too: the second load must be a hit"
+    );
+    assert_eq!(
+        second.epoch, first.epoch,
+        "the bump must not compound across a hit any more than across a rebuild"
+    );
+    assert_eq!(second.total_count, first.total_count);
+
+    // The migration this branch exists to be migrated OUT of: rows appear, and
+    // `entry_count` moves off 0 even though `change_seq` is still NULL.
+    let migrated = SessionEntry {
+        created_ms: 1_700_000_000_500,
+        mod_seq: 1,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: "migrated row".to_string(),
+            chunks: vec![fake_user_text_chunk("migrated row")],
+        },
+    };
+    db.upsert_entry(
+        session_id,
+        0,
+        migrated.mod_seq as i64,
+        migrated.created_ms,
+        None,
+        migrated.to_payload(),
+    )
+    .await
+    .expect("upsert migrated row");
+
+    let third = load(cx).await;
+    assert_eq!(
+        db.entry_load_count(),
+        2,
+        "gaining rows must invalidate the blob-built copy"
+    );
+    assert_eq!(
+        third.epoch, 0,
+        "the rows branch serves the persisted epoch verbatim — no migration bump"
+    );
+    assert!(
+        third.entries[0]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("migrated row")),
+        "got {:?}",
+        third.entries[0].markdown
+    );
 }
 
 /// `get_session_entry` was the last read RPC with no cold path: it resolved
@@ -4383,7 +4681,7 @@ async fn cold_cache_entry_expires_after_the_ttl(cx: &mut gpui::TestAppContext) {
 /// two, so all three agree on whether a closed session exists.
 #[gpui::test]
 async fn get_session_entry_serves_a_closed_session(cx: &mut gpui::TestAppContext) {
-    let (session_id, _db, _tmp) = seed_closed_session_with_entries(cx, 3).await;
+    let (session_id, _db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 3).await;
 
     let result = GetSessionEntryTool
         .run(
@@ -4454,4 +4752,96 @@ async fn get_session_entry_serves_a_closed_session(cx: &mut gpui::TestAppContext
             "the single-entry cold read must stay a pure read too"
         );
     });
+}
+
+/// The session cap, and the LRU order it evicts in. Five closed sessions read
+/// in turn must leave exactly `MAX_CACHED_SESSIONS` retained, and the one
+/// evicted must be the least recently used — checked behaviourally (its next
+/// read costs a fresh transcript read) rather than by peeking at the map.
+#[gpui::test]
+async fn cold_cache_evicts_the_least_recently_used_session(cx: &mut gpui::TestAppContext) {
+    use crate::mcp::cold_cache::{ColdSessionCache, MAX_CACHED_SESSIONS};
+
+    let (first_id, db, solution_id, _tmp) = seed_closed_session_with_entries(cx, 2).await;
+    let mut ids = vec![first_id];
+    for _ in 0..MAX_CACHED_SESSIONS {
+        ids.push(add_closed_session(&db, solution_id, 2, 16).await);
+    }
+    assert_eq!(ids.len(), MAX_CACHED_SESSIONS + 1);
+
+    // Advance between loads: `touched_at` is the executor clock, which in a test
+    // only moves when told to, so without this all five entries tie and "least
+    // recently used" is whatever order the map happens to iterate in.
+    for id in &ids {
+        cold_load(cx, *id).await;
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        db.entry_load_count(),
+        ids.len(),
+        "each first read is a miss"
+    );
+    cx.update(|cx| {
+        assert_eq!(
+            ColdSessionCache::len_for_test(cx),
+            MAX_CACHED_SESSIONS,
+            "the map must be capped at MAX_CACHED_SESSIONS"
+        );
+    });
+
+    // The most recent one is still retained...
+    cold_load(cx, *ids.last().expect("non-empty")).await;
+    assert_eq!(
+        db.entry_load_count(),
+        ids.len(),
+        "the most recently used session must still be a hit"
+    );
+    // ...and the first, least-recently-used one is the one that went.
+    cold_load(cx, first_id).await;
+    assert_eq!(
+        db.entry_load_count(),
+        ids.len() + 1,
+        "the least recently used session must have been evicted"
+    );
+}
+
+/// The byte cap, and with it the `payload_bytes` accounting that makes it mean
+/// anything. Two sessions whose transcripts each exceed half of
+/// `MAX_CACHED_BYTES` cannot both be retained — which is exactly the case the
+/// old entry-COUNT cap got wrong (a handful of enormous tool outputs is a
+/// trivial entry count and hundreds of megabytes resident).
+///
+/// If `store` were handed a constant 0 for `payload_bytes`, both would stay and
+/// this fails.
+#[gpui::test]
+async fn cold_cache_byte_cap_evicts_two_large_transcripts(cx: &mut gpui::TestAppContext) {
+    use crate::mcp::cold_cache::{ColdSessionCache, MAX_CACHED_BYTES};
+
+    let (_seed_id, db, solution_id, _tmp) = seed_closed_session_with_entries(cx, 0).await;
+    let big = MAX_CACHED_BYTES / 2 + 1024 * 1024;
+    let heavy_a = add_closed_session(&db, solution_id, 1, big).await;
+    let heavy_b = add_closed_session(&db, solution_id, 1, big).await;
+
+    cold_load(cx, heavy_a).await;
+    cold_load(cx, heavy_b).await;
+    assert_eq!(db.entry_load_count(), 2, "both first reads are misses");
+    cx.update(|cx| {
+        assert_eq!(
+            ColdSessionCache::len_for_test(cx),
+            1,
+            "two over-half-cap transcripts must not both be retained — the byte \
+             cap, and the payload accounting behind it, is what decides this"
+        );
+    });
+
+    // The survivor is the one just inserted; the other must re-read.
+    cold_load(cx, heavy_b).await;
+    assert_eq!(db.entry_load_count(), 2, "the newest is still a hit");
+    cold_load(cx, heavy_a).await;
+    assert_eq!(
+        db.entry_load_count(),
+        3,
+        "the evicted one must be rebuilt from the database"
+    );
 }

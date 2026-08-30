@@ -20,17 +20,23 @@
 //! reused only if that head compares **equal** to the one it was built from.
 //! That is a total check rather than a heuristic, because
 //! `store::build_cold_session` is a pure function of exactly
-//! `(meta, rows, blob, epoch, change_seq, tab_order)`:
+//! `(meta, rows, blob, epoch, change_seq, tab_order)`. Four of those six are
+//! compared verbatim; the other two are argued:
 //!
-//! - `meta`, `epoch`, `change_seq` and `tab_order` are compared verbatim (hence
-//!   the `PartialEq` on `SolutionSessionMetadata`, whose doc comment points
-//!   back here so a newly added field joins the check automatically);
-//! - `rows` are fingerprinted by `(entry_count, max_entry_mod_seq)` — see
-//!   [`ColdSessionHead`] for why no persist path can change a payload without
-//!   moving one of those two;
-//! - `blob` is immutable for an existing row: `update_blob` has no production
-//!   caller, and `insert_or_update_metadata` never names `acp_thread_blob`. A
-//!   legacy blob-only session that later gains rows moves `entry_count` off 0.
+//! - `meta`, `tab_order`, `epoch` and `change_seq` — compared field by field
+//!   (hence the `PartialEq` on `SolutionSessionMetadata`, whose doc comment
+//!   points back here so a newly added field joins the check automatically);
+//! - `rows` are NOT compared, they are **fingerprinted** by
+//!   `(entry_count, max_entry_mod_seq)`. A row's `idx`, `created_ms`,
+//!   `subagent_id` and `payload` ride on the argument in [`ColdSessionHead`]'s
+//!   doc: `mod_seq` is allocated by `SolutionSession::bump_change_seq`, which is
+//!   strictly monotonic per session, so no persist path can change a row
+//!   without moving the count or the max. If you add a writer that can, this is
+//!   the door it comes through;
+//! - `blob` is likewise not compared: it is immutable for an existing row, since
+//!   `update_blob` has no production caller and `insert_or_update_metadata`
+//!   never names `acp_thread_blob`. A legacy blob-only session that later gains
+//!   rows moves `entry_count` off 0.
 //!
 //! The head is read BEFORE the transcript, which is what makes a torn read
 //! safe: if a writer lands between the two, the entity is built from rows that
@@ -48,20 +54,22 @@
 //! evicted again anything it changed has moved the head.
 //!
 //! The TTL is therefore **not** a correctness device — it exists so an idle
-//! editor gives the memory back instead of holding a transcript until the next
-//! cold read happens to evict it.
+//! editor gives the memory back, and it is enforced by a real sweep task (see
+//! [`ColdSessionCache::arm_sweep`]) rather than only by the next cold read
+//! happening to evict something.
 //!
 //! [`CHANGED_ENTRIES_PAGE`]: super::read::CHANGED_ENTRIES_PAGE
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use gpui::{App, Entity, Global};
+use gpui::{App, Entity, Global, Task};
 
 use crate::db::ColdSessionHead;
 use crate::model::{SolutionSession, SolutionSessionId};
 
-/// How long a reconstructed cold session may sit unused before it is dropped.
+/// How long a reconstructed cold session may sit unused before the sweep drops
+/// it.
 ///
 /// Sized to cover one catch-up burst, not to bound staleness (the head check
 /// above does that). A client `B` entries behind issues `ceil(B/10)`
@@ -73,35 +81,50 @@ pub(crate) const COLD_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Hard cap on how many closed sessions are retained at once.
 ///
-/// One entry serves a whole burst *and* both read RPCs for the same session, so
-/// the realistic demand is one entry per client currently paging a closed
-/// session. Four covers several such clients without turning the cache into a
-/// second copy of the transcript table.
+/// One entry serves a whole burst *and* all three read RPCs for the same
+/// session, so the realistic demand is one entry per client currently paging a
+/// closed session. Four covers several such clients without turning the cache
+/// into a second copy of the transcript table.
 pub(crate) const MAX_CACHED_SESSIONS: usize = 4;
 
-/// Hard cap on total retained `SessionEntry` count across all cached sessions.
+/// Hard cap on total retained transcript size, measured as the summed on-disk
+/// `payload` bytes the copies were built from (the legacy branch uses the blob's
+/// length).
 ///
-/// The session cap alone bounds the map but not the bytes — sessions have no
-/// size limit. Entries are the only unit available without walking every
-/// payload: on the maintainer's corpus (29,103 rows / 49 MB) they average
-/// ~1.7 KB, and the largest single session ~3.6 KB, so 4,000 entries is
-/// ~7–14 MB retained. That admits the corpus's worst-case session (1,520 rows)
-/// alongside two more of the same size, which is what a concurrent burst needs.
+/// The session cap alone bounds the map but NOT the bytes — sessions have no
+/// size limit, and four sessions of ten 10 MB tool outputs is 40 entries under
+/// any plausible entry-count cap and ~400 MB resident. Bytes are the only
+/// honest unit, and they are free to obtain: `EntryRow` already carries
+/// `payload.len()` at the point the cold path builds the entity, so summing it
+/// costs one pass over lengths and no extra I/O.
 ///
-/// A session LARGER than this cap is still cached: the freshly built entity is
+/// 16 MiB, because the largest transcript on the maintainer's real 206 MB
+/// corpus is 5.47 MB of payload — so the cap admits that worst case plus two
+/// more of the same size, which is what a concurrent burst needs, while staying
+/// a small fraction of an editor's footprint.
+///
+/// This measures the SOURCE bytes, not the decoded heap. The decoded
+/// `SessionEntry`s are proportional to it (their markdown and raw
+/// input/output strings are the bulk of both), not equal to it — this is a
+/// size-proportional bound, which is what the previous entry-count cap was not.
+///
+/// A session larger than the cap is still cached: the freshly built entity is
 /// always inserted and older entries are evicted to make room. Refusing it
 /// would deny the benefit to precisely the transcript whose re-read hurts most,
 /// and the peak is unchanged either way — that transcript is fully decoded in
 /// memory for the duration of the call regardless of whether it is kept.
-pub(crate) const MAX_CACHED_ENTRIES: usize = 4_000;
+pub(crate) const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
 
 struct CachedCold {
     /// The head this entity was built from. A hit requires equality with a
     /// freshly read one; see the module note.
     head: ColdSessionHead,
     session: Entity<SolutionSession>,
-    entry_count: usize,
-    /// When the entry was inserted or last served, for both TTL and LRU.
+    /// On-disk payload bytes this copy was built from — see [`MAX_CACHED_BYTES`].
+    payload_bytes: usize,
+    /// When the entry was inserted or last served, for both TTL and LRU. Taken
+    /// from the executor's clock rather than `Instant::now()` so the sweep is
+    /// testable without a wall-clock sleep.
     touched_at: Instant,
 }
 
@@ -111,6 +134,14 @@ struct CachedCold {
 #[derive(Default)]
 pub(crate) struct ColdSessionCache {
     entries: HashMap<SolutionSessionId, CachedCold>,
+    /// Whether a sweep task is currently running. Kept separately from `sweep`
+    /// because the task clears this flag from inside itself and must not drop
+    /// its own handle to do so.
+    sweep_armed: bool,
+    /// Handle for the sweep, held so the sweep dies with the `App` rather than
+    /// outliving it and panicking on a released context. A finished handle is
+    /// inert and is simply overwritten the next time a sweep is armed.
+    sweep: Option<Task<()>>,
 }
 
 impl Global for ColdSessionCache {}
@@ -123,7 +154,7 @@ impl ColdSessionCache {
         id: SolutionSessionId,
         head: &ColdSessionHead,
     ) -> Option<Entity<SolutionSession>> {
-        let now = Instant::now();
+        let now = cx.background_executor().now();
         let cache = cx.default_global::<Self>();
         cache.drop_expired(now);
         let cached = cache.entries.get_mut(&id)?;
@@ -137,15 +168,16 @@ impl ColdSessionCache {
         Some(cached.session.clone())
     }
 
-    /// Retain `session` as the cold reconstruction of `head`.
+    /// Retain `session` as the cold reconstruction of `head`. `payload_bytes` is
+    /// the on-disk size it was decoded from — see [`MAX_CACHED_BYTES`].
     pub(crate) fn store(
         cx: &mut App,
         id: SolutionSessionId,
         head: ColdSessionHead,
         session: Entity<SolutionSession>,
-        entry_count: usize,
+        payload_bytes: usize,
     ) {
-        let now = Instant::now();
+        let now = cx.background_executor().now();
         let cache = cx.default_global::<Self>();
         cache.drop_expired(now);
         cache.entries.insert(
@@ -153,17 +185,60 @@ impl ColdSessionCache {
             CachedCold {
                 head,
                 session,
-                entry_count,
+                payload_bytes,
                 touched_at: now,
             },
         );
         cache.evict_until_within_bounds(id);
+        Self::arm_sweep(cx);
     }
 
     /// Drop any copy of `id`. Called when the session's row is gone, so the
     /// memory is released at the same moment the id stops being servable.
     pub(crate) fn forget(cx: &mut App, id: SolutionSessionId) {
-        cx.default_global::<Self>().entries.remove(&id);
+        let now = cx.background_executor().now();
+        let cache = cx.default_global::<Self>();
+        cache.entries.remove(&id);
+        cache.drop_expired(now);
+    }
+
+    /// Start the reclamation sweep if one is not already running.
+    ///
+    /// Without this the TTL would only ever be applied by the NEXT cold read,
+    /// i.e. never on an editor that has stopped making them — the map would sit
+    /// at up to [`MAX_CACHED_SESSIONS`] transcripts for the rest of the process.
+    /// The task re-arms itself while anything is left and returns once the map
+    /// is empty, so an idle editor holds neither the memory nor a live timer.
+    ///
+    /// Its handle lives in the global, so the `App` dropping cancels it before
+    /// it can touch a released context. It clears `sweep_armed` from inside
+    /// itself but never touches `sweep` — dropping a task's own handle from
+    /// within its future is not something to rely on.
+    fn arm_sweep(cx: &mut App) {
+        if cx.default_global::<Self>().sweep_armed {
+            return;
+        }
+        cx.default_global::<Self>().sweep_armed = true;
+        let sweep = cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(COLD_CACHE_TTL).await;
+                let drained = cx.update(|cx| {
+                    let now = cx.background_executor().now();
+                    let cache = cx.default_global::<Self>();
+                    cache.drop_expired(now);
+                    if cache.entries.is_empty() {
+                        cache.sweep_armed = false;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if drained {
+                    return;
+                }
+            }
+        });
+        cx.default_global::<Self>().sweep = Some(sweep);
     }
 
     fn drop_expired(&mut self, now: Instant) {
@@ -176,8 +251,12 @@ impl ColdSessionCache {
     /// benefits from the burst it is in the middle of.
     fn evict_until_within_bounds(&mut self, keep: SolutionSessionId) {
         loop {
-            let entries: usize = self.entries.values().map(|cached| cached.entry_count).sum();
-            if self.entries.len() <= MAX_CACHED_SESSIONS && entries <= MAX_CACHED_ENTRIES {
+            let bytes: usize = self
+                .entries
+                .values()
+                .map(|cached| cached.payload_bytes)
+                .sum();
+            if self.entries.len() <= MAX_CACHED_SESSIONS && bytes <= MAX_CACHED_BYTES {
                 return;
             }
             let Some(victim) = self
@@ -190,17 +269,6 @@ impl ColdSessionCache {
                 return;
             };
             self.entries.remove(&victim);
-        }
-    }
-
-    /// Backdate every entry past [`COLD_CACHE_TTL`] so the next access expires
-    /// it. Tests cannot advance a real `Instant`, and sleeping five seconds in
-    /// a unit test to observe an expiry is not a trade worth making.
-    #[cfg(test)]
-    pub(crate) fn expire_all_for_test(cx: &mut App) {
-        let backdated = Instant::now() - COLD_CACHE_TTL - Duration::from_millis(1);
-        for cached in cx.default_global::<Self>().entries.values_mut() {
-            cached.touched_at = backdated;
         }
     }
 
