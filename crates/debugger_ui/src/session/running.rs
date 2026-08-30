@@ -1469,23 +1469,7 @@ impl RunningState {
             })
             .log_err();
 
-        self.ensure_pane_item(DebuggerPaneItem::Terminal, window, cx);
-
-        let terminal_tab = self.panes.panes().into_iter().find_map(|pane| {
-            pane.read(cx)
-                .items()
-                .position(|item| {
-                    item.act_as::<SubView>(cx)
-                        .is_some_and(|view| view.read(cx).kind == DebuggerPaneItem::Terminal)
-                })
-                .map(|index| (pane.clone(), index))
-        });
-        let Some((pane, index)) = terminal_tab else {
-            return;
-        };
-        pane.update(cx, |pane, cx| {
-            pane.activate_item(index, false, false, window, cx);
-        });
+        self.activate_pane_item(DebuggerPaneItem::Terminal, false, false, window, cx);
     }
 
     pub(crate) fn add_pane_item(
@@ -1670,22 +1654,47 @@ impl RunningState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.ensure_pane_item(item, window, cx);
+        self.activate_pane_item(item, true, true, window, cx);
+    }
 
-        let (variable_list_position, pane) = self
-            .panes
-            .panes()
-            .into_iter()
-            .find_map(|pane| {
-                pane.read(cx)
-                    .items_of_type::<SubView>()
-                    .position(|view| view.read(cx).view_kind() == item)
-                    .map(|view| (view, pane))
-            })
-            .unwrap();
+    /// Select the tab hosting `item_kind` in whichever debug pane holds it,
+    /// adding it first if no pane does.
+    ///
+    /// `activate_pane` and `focus_item` are handed straight to
+    /// [`Pane::activate_item`] and are what separates the two callers:
+    /// user-driven tab switches want both, while revealing a terminal the
+    /// adapter asked for must not pull focus away from a typing user.
+    ///
+    /// The position must be searched over `items()` rather than
+    /// `items_of_type::<SubView>()`, because `Pane::activate_item` indexes the
+    /// pane's full item list; an index into the filtered `SubView`
+    /// subsequence only coincides with it while debug panes happen to hold
+    /// nothing else, and silently selects the wrong tab once they don't.
+    fn activate_pane_item(
+        &mut self,
+        item_kind: DebuggerPaneItem,
+        activate_pane: bool,
+        focus_item: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_pane_item(item_kind, window, cx);
 
-        pane.update(cx, |this, cx| {
-            this.activate_item(variable_list_position, true, true, window, cx);
+        let hosting_tab = self.panes.panes().into_iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .position(|item| {
+                    item.act_as::<SubView>(cx)
+                        .is_some_and(|view| view.read(cx).view_kind() == item_kind)
+                })
+                .map(|index| (pane.clone(), index))
+        });
+        let Some((pane, index)) = hosting_tab else {
+            return;
+        };
+
+        pane.update(cx, |pane, cx| {
+            pane.activate_item(index, activate_pane, focus_item, window, cx);
         });
     }
 
@@ -2049,6 +2058,7 @@ mod tests {
         debugger_panel::debug_panel_for_workspace,
         tests::{init_test, init_test_workspace, start_debug_session},
     };
+    use editor::Editor;
     use gpui::{BackgroundExecutor, TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
     use serde_json::json;
@@ -2134,5 +2144,95 @@ mod tests {
                 cx,
             );
         });
+    }
+
+    /// `Pane::activate_item` indexes the pane's whole item list, so locating a
+    /// tab within the `SubView`-only subsequence picks the wrong tab as soon as
+    /// a debug pane holds anything else. Prepending one foreign item is the
+    /// smallest way to make the two index spaces disagree; without it the
+    /// filtered and unfiltered indices coincide and the confusion is invisible.
+    #[gpui::test]
+    async fn activate_item_selects_the_tab_when_its_pane_holds_a_foreign_item(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(executor);
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "main.rs": "fn main() {}",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let workspace = init_test_workspace(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+
+        start_debug_session(&workspace, cx, |_| {}).expect("debug session starts");
+        cx.run_until_parked();
+
+        let running_state = workspace
+            .update(cx, |multi_workspace, _window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let debug_panel = debug_panel_for_workspace(workspace).expect("debug panel");
+                    let active_session = debug_panel
+                        .read(cx)
+                        .active_session()
+                        .expect("active debug session");
+                    active_session.read(cx).running_state().clone()
+                })
+            })
+            .expect("workspace update succeeds");
+
+        let target_kind = DebuggerPaneItem::Console;
+        let host_pane = running_state.read_with(cx, |running_state, cx| {
+            running_state
+                .panes
+                .panes()
+                .into_iter()
+                .find(|pane| {
+                    pane.read(cx).items().any(|item| {
+                        item.act_as::<SubView>(cx)
+                            .is_some_and(|view| view.read(cx).view_kind() == target_kind)
+                    })
+                })
+                .cloned()
+                .expect("a debug pane hosts the console")
+        });
+
+        host_pane.update_in(cx, |host_pane, window, cx| {
+            let foreign_item = cx.new(|cx| Editor::single_line(window, cx));
+            host_pane.add_item(Box::new(foreign_item), false, false, Some(0), window, cx);
+        });
+        cx.run_until_parked();
+
+        let console_index = host_pane.read_with(cx, |host_pane, cx| {
+            host_pane
+                .items()
+                .position(|item| {
+                    item.act_as::<SubView>(cx)
+                        .is_some_and(|view| view.read(cx).view_kind() == target_kind)
+                })
+                .expect("the console tab survives the insertion")
+        });
+        assert_ne!(
+            console_index, 0,
+            "precondition: the foreign item has to shift the console off the index              it occupies in the SubView-only subsequence"
+        );
+
+        running_state.update_in(cx, |running_state, window, cx| {
+            running_state.activate_item(target_kind, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            running_state
+                .read_with(cx, |running_state, cx| running_state.active_pane_items(cx))
+                .contains(&target_kind),
+            "activating the console must select the console tab, not whichever tab              sits at its position among the pane's sub-views"
+        );
     }
 }
