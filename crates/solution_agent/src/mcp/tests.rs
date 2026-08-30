@@ -4283,6 +4283,29 @@ async fn add_closed_session(
     session_id
 }
 
+/// Assert the cache still holds `expected` entries.
+///
+/// Every hit assertion below is `entry_load_count() == N`, which fails
+/// identically whether the cache MISSED (the bug the test is hunting) or the
+/// entry was swept out from under it (a harness artefact). The two want
+/// different reactions, so pin the precondition separately: gpui's
+/// `TestScheduler::block` jumps the clock to the next timer when the runnable
+/// queue is empty and the polled future is pending, and every cold read arms a
+/// `COLD_CACHE_TTL` timer. No `await` in today's cold path has an empty queue
+/// behind it, so this cannot fire yet — but a future test that awaits with one
+/// would otherwise see a "must be a hit" failure and go looking for a cache bug
+/// that is not there.
+fn assert_cached(cx: &mut gpui::TestAppContext, expected: usize, context: &str) {
+    cx.update(|cx| {
+        assert_eq!(
+            crate::mcp::cold_cache::ColdSessionCache::len_for_test(cx),
+            expected,
+            "cache retention precondition failed ({context}) — if this fires, the \
+             assertion after it is about the harness, not about a cache miss"
+        );
+    });
+}
+
 /// Cold-read `session_id` through `get_session`, discarding the result.
 async fn cold_load(cx: &mut gpui::TestAppContext, session_id: crate::model::SolutionSessionId) {
     GetSessionTool
@@ -4354,6 +4377,7 @@ async fn cold_paging_burst_reads_the_transcript_once(cx: &mut gpui::TestAppConte
         seed_closed_session_with_entries(cx, entry_count).await;
 
     let (polls, seen) = drain_cold_delta(cx, session_id, 0).await;
+    assert_cached(cx, 1, "the burst retained exactly one reconstruction");
 
     assert_eq!(
         polls, 3,
@@ -4538,6 +4562,7 @@ async fn cold_cache_sweep_reclaims_an_idle_entry(cx: &mut gpui::TestAppContext) 
     };
 
     read(cx).await;
+    assert_cached(cx, 1, "after the first cold read");
     read(cx).await;
     assert_eq!(db.entry_load_count(), 1, "the second read must be a hit");
     cx.update(|cx| {
@@ -4636,6 +4661,7 @@ async fn cold_cache_serves_a_coalescing_transcript_identically(cx: &mut gpui::Te
         "the merged entry carries the MAX fragment mod_seq, not the first"
     );
 
+    assert_cached(cx, 1, "after the first cold load");
     let second = load(cx).await;
     assert_eq!(db.entry_load_count(), 1, "the second load must be a hit");
     assert_eq!(
@@ -4722,6 +4748,7 @@ async fn cold_cache_on_a_legacy_blob_session(cx: &mut gpui::TestAppContext) {
         first.epoch, 1,
         "the legacy branch bumps the persisted epoch 0 -> 1"
     );
+    assert_cached(cx, 1, "after the first legacy-blob load");
     let second = load(cx).await;
     assert_eq!(
         db.entry_load_count(),
@@ -4941,6 +4968,7 @@ async fn cold_cache_byte_cap_evicts_two_large_transcripts(cx: &mut gpui::TestApp
     });
 
     // The survivor is the one just inserted; the other must re-read.
+    assert_cached(cx, 1, "the byte cap left exactly the newest transcript");
     cold_load(cx, heavy_b).await;
     assert_eq!(db.entry_load_count(), 2, "the newest is still a hit");
     cold_load(cx, heavy_a).await;

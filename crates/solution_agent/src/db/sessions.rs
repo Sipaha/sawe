@@ -32,28 +32,14 @@ impl SolutionAgentDb {
         })
     }
 
-    /// Load one session's metadata row by id, without knowing its solution.
-    /// `None` when the row is gone (hard-purged / never existed). Reached from
-    /// `hydrate_all_for_solution`; the three MCP read RPCs' shared cold path
-    /// uses the wider [`Self::load_cold_head`] instead.
-    pub fn load_metadata(
-        &self,
-        id: SolutionSessionId,
-    ) -> Task<Result<Option<SolutionSessionMetadata>>> {
-        let connection = self.connection.clone();
-        self.executor.spawn(async move {
-            let connection = connection.lock();
-            select_metadata_by_id(&connection, id)
-        })
-    }
-
     /// Everything the MCP cold-read path needs about a closed session EXCEPT
     /// its transcript, in ONE acquisition of the shared connection mutex.
     ///
-    /// It replaces a `load_metadata` + `load_epoch` + `load_change_seq`
+    /// It subsumed a `load_metadata` + `load_epoch` + `load_change_seq`
     /// sequence that took the mutex three times for three reads of the SAME
-    /// `solution_sessions` row, and it adds the two entry-table aggregates the
-    /// cold cache validates against. Both aggregates are answered from
+    /// `solution_sessions` row — those three are gone; this is now the only
+    /// single-session metadata reader — and it adds the two entry-table
+    /// aggregates the cold cache validates against. Both aggregates are answered from
     /// `idx_session_entry_modseq (session_id, mod_seq)` without touching a
     /// single `payload` blob, which is the entire point: the cheap head can be
     /// re-read on every poll to decide whether the expensive transcript read
@@ -756,23 +742,6 @@ pub struct ColdSessionHead {
 }
 
 type ColdHeadRow = (MetadataRow, (Option<i64>, Option<i64>, i64, i64));
-
-/// The single-session counterpart of [`select_metadata_for_solution`], for
-/// callers that hold a session id but not the solution it belongs to. `None`
-/// when no row exists — including for a session that was hard-purged.
-pub(crate) fn select_metadata_by_id(
-    connection: &Connection,
-    id: SolutionSessionId,
-) -> Result<Option<SolutionSessionMetadata>> {
-    let mut select = connection.select_bound::<String, MetadataRow>(&format!(
-        "SELECT {METADATA_SELECT_LIST} FROM solution_sessions WHERE id = ? LIMIT 1"
-    ))?;
-    select(id.to_string())?
-        .into_iter()
-        .next()
-        .map(metadata_from_row)
-        .transpose()
-}
 
 /// See [`SolutionAgentDb::load_cold_head`]. Deliberately a query of its own
 /// rather than two more columns on `METADATA_SELECT_LIST`: the shared list also

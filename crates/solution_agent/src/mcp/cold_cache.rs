@@ -33,10 +33,18 @@
 //!   strictly monotonic per session, so no persist path can change a row
 //!   without moving the count or the max. If you add a writer that can, this is
 //!   the door it comes through;
-//! - `blob` is likewise not compared: it is immutable for an existing row, since
-//!   `update_blob` has no production caller and `insert_or_update_metadata`
-//!   never names `acp_thread_blob`. A legacy blob-only session that later gains
-//!   rows moves `entry_count` off 0.
+//! - `blob` is likewise not compared. It has exactly one writer —
+//!   `persist_context_wipe` -> `upsert_entries_trim_and_clear_blob`, which drops
+//!   it as part of a `/clear` or `/compact` wipe (`update_blob` still has no
+//!   production caller, and `insert_or_update_metadata` never names
+//!   `acp_thread_blob`). That writer cannot slip past the head: both call sites
+//!   `bump_epoch()` first and the wipe persists it via `save_epoch`, AND they
+//!   `clear_total_tokens`, which moves a `meta` field — two independent
+//!   discriminators, either of which invalidates. A legacy blob-only session
+//!   that instead gains rows moves `entry_count` off 0.
+//!
+//! If you add a SECOND blob writer, check it moves one of those; this is the
+//! one input whose safety rests on its writers rather than on a fingerprint.
 //!
 //! The head is read BEFORE the transcript, which is what makes a torn read
 //! safe: if a writer lands between the two, the entity is built from rows that
@@ -77,6 +85,14 @@ use crate::model::{SolutionSession, SolutionSessionId};
 /// entries behind, ~50 polls — completes in well under a second, so five
 /// seconds is a comfortable multiple while still returning the memory promptly
 /// once the burst ends.
+///
+/// **This is the idle threshold, not the retention bound.** One sweep task
+/// serves the whole map (see [`ColdSessionCache::arm_sweep`]), so an entry
+/// stored just after a tick survives that tick and is dropped by the next one:
+/// worst-case retention is `2 × COLD_CACHE_TTL − ε`, i.e. just under ten
+/// seconds. Deliberate — a per-entry timer for a four-slot map would cost more
+/// than the memory it reclaims sooner — but do not quote "5 s" as the figure a
+/// transcript can be held for.
 pub(crate) const COLD_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Hard cap on how many closed sessions are retained at once.
