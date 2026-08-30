@@ -6428,12 +6428,9 @@ mod tests {
             graph.selected_entry_idx = Some(5);
         });
 
-        let selected_sha = git_graph.read_with(&*cx, |graph, _| {
-            graph
-                .selected_entry_idx
-                .and_then(|idx| graph.graph_data.commits.get(idx))
-                .map(|c| c.data.sha.to_string())
-        });
+        let selected_sha = git_graph
+            .read_with(&*cx, |graph, _| graph.selected_commit_sha())
+            .map(|sha| sha.to_string());
         assert_eq!(selected_sha, Some(target_sha.to_string()));
 
         let item_id = workspace::ItemId::from(999_u64);
@@ -6509,10 +6506,7 @@ mod tests {
                 "log_source should be restored"
             );
 
-            let restored_selected_sha = graph
-                .selected_entry_idx
-                .and_then(|idx| graph.graph_data.commits.get(idx))
-                .map(|c| c.data.sha.to_string());
+            let restored_selected_sha = graph.selected_commit_sha().map(|sha| sha.to_string());
             assert_eq!(
                 restored_selected_sha, selected_sha,
                 "selected commit should be restored via pending_select_sha"
