@@ -11891,8 +11891,15 @@ impl LspStore {
         let Some(local) = self.as_local_mut() else {
             return;
         };
-        // If the language server for this key doesn't match the server id, don't store the
-        // server. Which will cause it to be dropped, killing the process
+        // The key has been re-pointed at a different server while this one was starting, so
+        // don't store it. Note that returning here does NOT stop that server: it drops only
+        // the caller's `server.clone()`, while the startup task goes on to return
+        // `Some(server)` and its `language_servers` entry stays `Starting` around a live,
+        // fully initialized server (the task only yields `Some` once `initialize` and
+        // `didChangeConfiguration` have both succeeded). That is the state
+        // `shutdown_server`'s `startup.is_ready()` arm exists to shut down at quit. The
+        // process outlives this return until the last `Arc` drops, and even then
+        // `Drop for LanguageServer` only hands the kill to a detached background task.
         if local
             .language_server_ids
             .get(&key)
