@@ -146,9 +146,9 @@ use git_ui::{
 };
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClickEvent, DefiniteLength, DismissEvent, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, Modifiers, MouseButton, MouseDownEvent, PathBuilder,
-    Pixels, Point, ScrollStrategy, SharedString, Subscription, Task, WeakEntity, Window, actions,
-    anchored, deferred, point, prelude::*, px,
+    EventEmitter, FocusHandle, Focusable, Hsla, Modifiers, MouseButton, MouseDownEvent,
+    PathBuilder, Pixels, Point, Rems, ScrollStrategy, SharedString, Subscription, Task, TextRun,
+    WeakEntity, Window, actions, anchored, deferred, point, prelude::*, px,
 };
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use project::{
@@ -162,6 +162,7 @@ use project_panel::ProjectPanel;
 use search::{
     SearchOption, SearchOptions, SearchSource, ToggleCaseSensitive, ToggleRegex, buffer_search,
 };
+use settings::Settings as _;
 use smallvec::{SmallVec, smallvec};
 use std::{
     ops::Range,
@@ -170,6 +171,7 @@ use std::{
     time::Duration,
 };
 use theme::AccentColors;
+use theme_settings::ThemeSettings;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, HeaderResizeInfo,
@@ -184,9 +186,84 @@ use workspace::{
 
 /// Index of the Description column, which the commit graph is drawn over.
 const DESCRIPTION_COLUMN_IDX: usize = 0;
+
+/// Column shares used before the table has been measured — the very first
+/// frame, where `cached_container_width` is still zero. Every later frame
+/// re-derives them from the content (see [`default_column_fractions`]).
+const UNMEASURED_COLUMN_FRACTIONS: [f32; 3] = [0.74, 0.13, 0.13];
+
+/// Smallest share of the log table the Description column keeps. Below this the
+/// Date and Author content widths are scaled back together: on a container too
+/// narrow for all three, squeezing the two short columns is better than
+/// starving the one that is actually being read.
+const MIN_DESCRIPTION_FRACTION: f32 = 0.4;
+
+/// The Date column's content is fixed-width: [`format_timestamp`] renders
+/// `[day] [month repr:short] [year] [hour]:[minute]`, which is always a
+/// two-digit day, a three-letter month, a four-digit year and `HH:MM`. So any
+/// instance of that shape measures the column exactly, and `May` is picked for
+/// the month because `M` is the widest glyph in the set of twelve.
+/// `test_date_column_sample_matches_the_formatter` fails if the format changes
+/// out from under this.
+const DATE_COLUMN_SAMPLE: &str = "30 May 2026 12:04";
+
+/// Author names have no fixed width, so unlike the Date sample this is a
+/// *default* rather than a measurement: room for a full "Firstname Lastname"
+/// and no more, with the divider left draggable for the repository where every
+/// author is `dependabot[bot]`. It is measured in the UI font rather than
+/// hard-coded in pixels so it tracks `ui_font_size` the way the row height does.
+const AUTHOR_COLUMN_SAMPLE: &str = "Firstname Lastname";
+
+/// `ui::render_cell` wraps every cell in `px_1()` and gpui lays out with a
+/// border box, so a column sized to its text alone clips it by the padding.
+const COLUMN_CELL_PADDING: Rems = Rems(0.5);
 // Extra vertical breathing room added to the UI line height when computing
 // the git graph's row height, so commit dots and lines have space around them.
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
+
+/// Share of the log table each column takes by default, for a table
+/// `container` wide. `date` and `author` are the measured widths of the two
+/// columns' content.
+///
+/// A flat fraction cannot serve both widths this view is used at. The Date
+/// string is a constant ~130px, which is ~20% of the Solution band's compact
+/// half but only ~7% of a full-window pane: the previous flat 0.13 therefore
+/// truncated *every* row in the band while leaving ~140px of dead whitespace
+/// beside the same text at full width. Sizing Date and Author to their content
+/// and letting Description absorb the remainder is both correct at every width
+/// and what IDEA's log does.
+///
+/// Returns `[description, date, author]`, summing to 1.
+fn default_column_fractions(date: Pixels, author: Pixels, container: Pixels) -> [f32; 3] {
+    if container <= px(0.) {
+        return UNMEASURED_COLUMN_FRACTIONS;
+    }
+
+    let date = (date / container).max(0.0);
+    let author = (author / container).max(0.0);
+    let sides = date + author;
+    let sides_budget = 1.0 - MIN_DESCRIPTION_FRACTION;
+    let (date, author) = if sides > sides_budget {
+        let scale = sides_budget / sides;
+        (date * scale, author * scale)
+    } else {
+        (date, author)
+    };
+
+    [1.0 - date - author, date, author]
+}
+
+fn new_column_widths_state(fractions: [f32; 3]) -> RedistributableColumnsState {
+    RedistributableColumnsState::new(
+        3,
+        fractions.map(DefiniteLength::Fraction).to_vec(),
+        vec![
+            TableResizeBehavior::Resizable,
+            TableResizeBehavior::Resizable,
+            TableResizeBehavior::Resizable,
+        ],
+    )
+}
 
 /// Whether a search string should be treated as a commit-hash lookup rather
 /// than a message grep: all-hex and at least git's default short-hash length
@@ -994,6 +1071,12 @@ pub struct GitGraph {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     table_interaction_state: Entity<TableInteractionState>,
     column_widths: Entity<RedistributableColumnsState>,
+    /// Width the log table was last laid out at, from
+    /// [`GitGraph::observe_table_width`].
+    table_width: Pixels,
+    /// Table width the current `column_widths` defaults were derived for. See
+    /// [`GitGraph::sync_default_column_widths`].
+    auto_column_widths_for: Pixels,
     selected_entry_idx: Option<usize>,
     /// Every selected row, in view space. Multi-row selections only come from
     /// Ctrl/Shift clicks on commit rows; every other path into
@@ -1636,6 +1719,104 @@ impl GitGraph {
         (raw * scale).round() / scale
     }
 
+    /// Width of `text` as the table would paint it in a cell, plus the cell's
+    /// own padding.
+    fn measured_column_width(text: &str, window: &Window, cx: &App) -> Pixels {
+        let font_size = TextSize::default().rems(cx).to_pixels(window.rem_size());
+        let run = TextRun {
+            len: text.len(),
+            font: ThemeSettings::get_global(cx).ui_font.clone(),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .layout_line(text, font_size, &[run], None)
+            .width
+            + COLUMN_CELL_PADDING.to_pixels(window.rem_size())
+    }
+
+    /// Record the log table's laid-out width and ask for one more frame when it
+    /// has changed, so [`GitGraph::sync_default_column_widths`] can re-derive
+    /// the columns against it.
+    ///
+    /// The width is only knowable once the table has been laid out, i.e. during
+    /// the draw, and gpui discards invalidation raised inside a draw — so the
+    /// redraw has to be deferred out of it. Reading the width instead off
+    /// `RedistributableColumnsState::cached_container_width` (which the table
+    /// fills in at the same point) is not enough on its own: nothing notifies
+    /// when that value lands, so after a window or band resize the table kept
+    /// the previous width's column shares until some unrelated event happened
+    /// to redraw it.
+    ///
+    /// The equality guard is load-bearing. An unconditional deferred notify
+    /// would re-arm itself on every frame and spin the view forever.
+    fn observe_table_width(&mut self, bounds: &[Bounds<Pixels>], cx: &mut Context<Self>) {
+        let Some(width) = bounds.first().map(|bounds| bounds.size.width) else {
+            return;
+        };
+        if self.table_width == width {
+            return;
+        }
+        self.table_width = width;
+
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+    }
+
+    /// Re-derive the default column widths whenever the table's own width
+    /// changes, so Date and Author stay sized to their content at both the
+    /// Solution band's compact width and a full-window pane item.
+    ///
+    /// This installs a *new* state entity rather than editing the existing one
+    /// because `RedistributableColumnsState` exposes no width mutator. Going
+    /// through the entity is not optional: the header, the rows, the resize
+    /// handles' positions and the drag arithmetic all read their widths from
+    /// it, so overriding only the rendered widths would paint the dividers
+    /// where the drag math does not believe they are, and the first grab would
+    /// jump the column sideways.
+    ///
+    /// A drag writes into the state, so "the state still holds exactly the
+    /// widths we installed" is what separates an untouched table from a tuned
+    /// one: while it differs, the user's widths stand and the derivation keeps
+    /// out of the way. Because that is re-checked rather than latched,
+    /// double-clicking the dividers back to their defaults (which are the
+    /// derived widths, not the unmeasured fallback) also hands the table back.
+    fn sync_default_column_widths(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let container = self.table_width;
+        if container <= px(0.) || container == self.auto_column_widths_for {
+            return;
+        }
+
+        let is_untouched = {
+            let state = self.column_widths.read(cx);
+            state.preview_widths().as_slice() == state.initial_widths().as_slice()
+        };
+        if !is_untouched {
+            return;
+        }
+
+        let fractions = default_column_fractions(
+            Self::measured_column_width(DATE_COLUMN_SAMPLE, window, cx),
+            Self::measured_column_width(AUTHOR_COLUMN_SAMPLE, window, cx),
+            container,
+        );
+        self.column_widths = cx.new(|_cx| {
+            let mut state = new_column_widths_state(fractions);
+            // Carried over so this frame's `graph_column_width` still sees a
+            // measured Description column; the fresh entity would otherwise
+            // report zero until its first prepaint and the graph would snap to
+            // its uncapped natural width for one frame on every resize.
+            state.set_cached_container_width(container);
+            state
+        });
+        self.auto_column_widths_for = container;
+    }
+
     /// Width of the commit-graph column: enough for the widest loaded row, so
     /// the DAG is never clipped, bounded by the share of the Description column
     /// the graph may take (see `graph_column_width_for`).
@@ -1715,21 +1896,11 @@ impl GitGraph {
         // git panel's Commit tab on click, and search-by-hash is server-side). The
         // commit-graph column is *not* a table column — it's rendered separately
         // at a fixed width to the left of the table (IDEA-style), no resize handle.
-        let column_widths = cx.new(|_cx| {
-            RedistributableColumnsState::new(
-                3,
-                vec![
-                    DefiniteLength::Fraction(0.74),
-                    DefiniteLength::Fraction(0.13),
-                    DefiniteLength::Fraction(0.13),
-                ],
-                vec![
-                    TableResizeBehavior::Resizable,
-                    TableResizeBehavior::Resizable,
-                    TableResizeBehavior::Resizable,
-                ],
-            )
-        });
+        //
+        // These fractions only survive the first frame: the table has not been
+        // measured yet, and `sync_default_column_widths` re-derives them from
+        // the columns' content as soon as it has a width to derive them for.
+        let column_widths = cx.new(|_cx| new_column_widths_state(UNMEASURED_COLUMN_FRACTIONS));
         let mut row_height = Self::row_height(window, cx);
 
         cx.observe_global_in::<settings::SettingsStore>(window, move |this, window, cx| {
@@ -1773,6 +1944,8 @@ impl GitGraph {
             context_menu: None,
             table_interaction_state,
             column_widths,
+            table_width: px(0.),
+            auto_column_widths_for: px(0.),
             selected_entry_idx: None,
             selected_entry_idxs: HashSet::default(),
             selection_anchor_idx: None,
@@ -3328,6 +3501,7 @@ impl GitGraph {
 
 impl Render for GitGraph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_default_column_widths(window, cx);
         let (mut commit_count, is_loading) = self.resolve_commit_count(cx);
 
         // S-FHT: when "With Local Changes" is enabled, prepend a synthetic
@@ -3570,21 +3744,43 @@ impl Render for GitGraph {
                             .flex_1()
                             .w_full()
                             .items_stretch()
-                            .child(bind_redistributable_columns(
+                            // A wrapper purely so the table's laid-out width can
+                            // be observed: `bind_redistributable_columns`
+                            // installs its own `on_children_prepainted` on the
+                            // div it is handed, and a div holds only one such
+                            // listener, so a second one has to sit outside it.
+                            // The wrapper's only child is the table, making the
+                            // reported bounds unambiguous.
+                            .child(
                                 div()
-                                    .relative()
                                     .flex_1()
                                     .min_w_0()
                                     .h_full()
-                                    .overflow_hidden()
-                                    .child(commits_table)
-                                    .child(render_redistributable_columns_resize_handles(
-                                        &self.column_widths,
-                                        window,
-                                        cx,
+                                    .on_children_prepainted({
+                                        let this = cx.weak_entity();
+                                        move |bounds, _window, cx| {
+                                            this.update(cx, |this, cx| {
+                                                this.observe_table_width(&bounds, cx);
+                                            })
+                                            .ok();
+                                        }
+                                    })
+                                    .child(bind_redistributable_columns(
+                                        div()
+                                            .relative()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .h_full()
+                                            .overflow_hidden()
+                                            .child(commits_table)
+                                            .child(render_redistributable_columns_resize_handles(
+                                                &self.column_widths,
+                                                window,
+                                                cx,
+                                            )),
+                                        self.column_widths.clone(),
                                     )),
-                                self.column_widths.clone(),
-                            ))
+                            )
                             // Last child, so the DAG paints on top of the
                             // table's row background instead of being
                             // covered by it on the hovered/selected row.
@@ -4717,6 +4913,75 @@ mod tests {
         assert!(!is_hash_like("fix bug")); // non-hex
         assert!(!is_hash_like("9509ee5z")); // trailing non-hex
     }
+
+    /// The Date column is sized by measuring [`DATE_COLUMN_SAMPLE`] instead of
+    /// the rows' own text, which is only sound while every date the formatter
+    /// produces has the sample's shape. Changing `timestamp_format` without
+    /// changing the sample must fail here rather than silently start truncating
+    /// again.
+    #[test]
+    fn test_date_column_sample_matches_the_formatter() {
+        let shape = |text: &str| {
+            text.chars()
+                .map(|c| {
+                    if c.is_ascii_digit() {
+                        'd'
+                    } else if c.is_ascii_alphabetic() {
+                        'a'
+                    } else {
+                        c
+                    }
+                })
+                .collect::<String>()
+        };
+
+        // A leap day, a single-digit day/hour/minute, and the epoch: every case
+        // where a non-padded field would shorten the string.
+        for timestamp in [0, 1_709_164_800, 1_800_000_000, 2_147_483_647] {
+            let formatted = format_timestamp(timestamp);
+            assert_eq!(
+                shape(&formatted),
+                shape(DATE_COLUMN_SAMPLE),
+                "{formatted:?} does not have the shape of DATE_COLUMN_SAMPLE {DATE_COLUMN_SAMPLE:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_column_fractions_size_date_and_author_to_their_content() {
+        let date = px(130.);
+        let author = px(140.);
+
+        // The Solution band's compact half of a 1920 window: the old flat 0.13
+        // gave Date 125px for 130px of text, so every row truncated.
+        let [description, date_fraction, author_fraction] =
+            default_column_fractions(date, author, px(960.));
+        assert!(px(960.) * date_fraction >= date);
+        assert!(px(960.) * author_fraction >= author);
+        assert!((description + date_fraction + author_fraction - 1.0).abs() < 0.001);
+
+        // A full-window pane item: the same two columns must not keep growing
+        // into whitespace, so Description takes everything they don't need.
+        let [wide_description, wide_date, wide_author] =
+            default_column_fractions(date, author, px(1920.));
+        assert!((px(1920.) * wide_date - date).abs() < px(1.));
+        assert!((px(1920.) * wide_author - author).abs() < px(1.));
+        assert!(wide_description > description);
+
+        // Too narrow for all three: Date and Author are scaled back together
+        // rather than starving the column being read.
+        let [narrow_description, narrow_date, narrow_author] =
+            default_column_fractions(date, author, px(300.));
+        assert!((narrow_description - MIN_DESCRIPTION_FRACTION).abs() < 0.001);
+        assert!(narrow_date > narrow_author * 0.9 && narrow_date < narrow_author);
+
+        // Unmeasured first frame.
+        assert_eq!(
+            default_column_fractions(date, author, px(0.)),
+            UNMEASURED_COLUMN_FRACTIONS
+        );
+    }
+
     use collections::{HashMap, HashSet};
     use fs::FakeFs;
     use git::Oid;
