@@ -4122,7 +4122,9 @@ impl SolutionAgentStore {
         if !clear_legacy_blob && session.read(cx).transcript_unavailable {
             log::warn!(
                 target: "solution_agent::persist",
-                "session={session_id} declining a full flush: this copy was restored                  without its transcript, so writing it would delete the rows it                  could not read"
+                "session={session_id} declining a full flush: this copy was \
+                 restored without its transcript, so writing it would delete the \
+                 rows it could not read"
             );
             return;
         }
