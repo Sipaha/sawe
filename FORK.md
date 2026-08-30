@@ -1547,6 +1547,85 @@ How to apply:
   *inactive* branch. The active tab now carries a 2px `border_focused` underline — the same idiom as the solution
   band's project tabs (`crates/solutions_ui/src/project_tab.rs`).
 
+### 101. Entry-persist-chain disposal is stated by each teardown caller, and a drained chain outlives its session under its own key
+
+What: every AI session has at most one `entries_persist_chain` entry (`crates/solution_agent/src/store.rs`), a
+`PersistChain` holding the **outermost** link of that session's serialized entry-row write chain. Each link moves the
+previous `Task` into its own future, so the map entry transitively owns the whole chain and dropping it cancels *all* of
+it, not just the last hop. The chain exists because GPUI detached tasks have no FIFO guarantee — that is the phase-6b
+keystone bug, two `upsert…` + `delete_entries_from(main_len)` pairs racing over the same rows. `evict_session_runtime_maps`
+(`store/teardown.rs`) used to drop that entry on **every** teardown, with a comment asserting the cancellation as a fact
+of teardown. It now takes an explicit `ChainDisposition::{Drain, Abandon}`: `close_session` and `cold_close_solution`
+drain, `purge_session_hard` and `purge_solution_fully` abandon (loudly — the old drop logged nothing at all). Plan:
+`docs/plans/2026-08-30-entries-persist-chain-teardown.md`.
+
+Why draining is not optional. Closing a chat tab or a Solution window discarded in-flight transcript writes
+**permanently and silently**: `persist_all_rows` / `persist_main_stream` advance `persisted_main_seq` synchronously
+*before* they spawn, and every persist filters `mod_seq > watermark`, so "a later persist catches up" is false — there is
+no later persist that re-picks those rows. There is also no persist debounce (`persist_main_stream` runs on every ingest
+event; the 500ms/2s `entry_update_throttles` govern only the MCP emit), so the loss is bounded only by how far the event
+stream had outrun sqlite.
+
+**Why the disposition is stated per caller and never inferred inside the evictor.** `purge_session_hard` evicts the
+runtime maps *before* it issues `db.purge_session`, and the two are unordered background work over the same connection.
+Drain a hard purge and a queued link runs after the cascade DELETE and re-inserts entry rows for a session that no longer
+has a `solution_sessions` row. Nothing enumerates entry rows without a session row, so those orphans are invisible to
+every UI — and `delete_by_solution` sweeps via `session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)`,
+so the solution-level purge cannot reach them either. There is no orphan reaper anywhere in the crate. The old
+unconditional drop is what had been preventing this, which is exactly why a generic "just detach it" fix ships the bug.
+
+**Why a drained chain stays under its KEY rather than being handed off with `.detach()` — the non-obvious part, and a
+Critical that shipped and was reverted.** The first cut (`76be3e00fa`) drained by detaching, reasoning that the key had
+to free synchronously because a *deferred* eviction would race a close→reopen that re-keyed the same
+`SolutionSessionId`. True, but one-directional: freeing the key lets the reopened session build a **second chain with
+nothing ordering it against the first**, so the close flush's trailing `delete_entries_from(old_main_len)` can land after
+the new chain's tail upsert and delete the user's new message — the phase-6b bug reintroduced at the close/reopen seam.
+Close a tab, reopen it, type one message, and that message was absent from disk and gone at the next cold load. Measured
+A/B on one fixture: a 3-entry transcript closed, reopened and appended to yields **4 rows on the parent commit and 3 on
+`76be3e00fa`**; at 200 entries, 201 vs 200. The window is wide because `persist_all_rows` awaits one background round
+trip *per row*. The fix (`f851e02f97`) is retention: `Drain` removes nothing, so the reopen's first persist finds the
+flush already under the key and takes it as its `prev` for free, and the deferred-eviction race never arises because
+nothing is deferred. This is viable only because a chain link **captures no entity** — rows, length, epoch and
+change_seq are snapshotted synchronously before the spawn and `db` is an `Arc` — so a link that outlives its session can
+neither touch a dropped entity nor read stale in-memory state.
+
+**The map is bounded by a spent-chain sweep, not a generation counter.** Each link flips an `Arc<AtomicBool>`
+(`Release`) as its last act, with no `.await` after it; `retire_finished_persist_chains` `retain`s on the paired
+`Acquire` load. Removing a chain that has already run can neither cancel work nor reorder anything, so it is the one
+removal that is unconditionally safe. The safety argument rests on the map always holding the **outermost** link:
+`finished == true` there implies every predecessor completed. The read is synchronous on the foreground executor — the
+same thread the chain runs on — so no store code can observe `true` while the future still has work to do.
+
+**`close_session` needed `cold_close_solution`'s `is_live` gate in the same change, because the two bugs point in
+opposite directions.** Bug 1 is loss of writes that should happen; bug 2 is execution of a rewrite that should not.
+`persist_all_rows` is a *full* Main rewrite whose `delete_entries_from(main_len)` deletes the teammate-tagged rows of a
+pre-2026-07-06 ("legacy") row layout. While the flush was being cancelled, `close_session` calling it unconditionally
+was unobservable; repairing the cancellation makes it live, so closing a restored, never-resumed tab would rewrite a
+session the user never touched. Gated on `acp_thread().is_some()`, mirroring `cold_close_solution`.
+
+**The legacy realign is intended, not something the gate avoids.** `hydrate_streams_main_only` deliberately arms the same
+`delete_entries_from(main_len)` at cold-load time, and `legacy_teammate_tagged_rows_realign_to_main_local_on_cold_load`
+(`store/tests/hydration.rs`) asserts the teammate rows *are* deleted. Repairing the flush extends an accepted truncation
+to sessions that were merely restored; the gate protects **untouched sessions**, not the row layout.
+
+How to apply:
+
+- **When one function is shared by a keep-the-rows caller and a delete-the-rows caller, make the difference a parameter,
+  not a heuristic.** "Is the session live" and friends are the wrong axis here — a soft-closed session is not live either,
+  and it must still drain.
+- **Cancelling a `Task` you hold is not the same as the work not happening.** Only the outermost link's handle is in the
+  map; the inner ones sit inside their successors' futures and are released only as those successors run, so an abandon
+  walks inward one runnable at a time and deeper chains keep writing (measured: 2 links leak 1 row, 8 leak 5). If a
+  cancellation must be *complete*, sequence the delete after it — do not pick a different disposition.
+- **A serialization chain keyed by an id is only serialized while the key survives.** Anything that frees the key while
+  work is queued under it — `.detach()`, a deferred evict, a "clean up on close" sweep — permits a second, unordered
+  chain the moment that id comes back. Reclaim such a key only when the work under it has provably finished.
+- **A completion flag on a chain is cheaper and stronger than a generation counter**, provided the map holds the
+  outermost link. Set it as the future's last act with no await after it, read it on the executor's own thread, and the
+  only removal it authorizes is a no-op one.
+- If a persist path advances a watermark before it spawns, treat the spawned work as **unrecoverable if dropped**. Look
+  for the watermark before assuming a retry will cover a cancelled write.
+
 ## Where specs and plans live
 
 `docs/superpowers/{specs,plans}/` is in `.gitignore` — these are personal working notes, not committed. Each major fork feature has a design spec + step-by-step implementation plan there. They're append-only history; the canonical state of the code lives in code + this file + `.rules`.
