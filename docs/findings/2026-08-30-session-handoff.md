@@ -24,7 +24,7 @@ whole-commit +/− totals and a changed-files tree; double-clicking a file opens
 that file's diff **for that commit** in the centre pane; a multi-row selection
 renders "N commits selected".
 
-**Six backlog items also cleared:**
+**Seven backlog items also cleared:**
 
 - **`ctrl-\`` now leaves the caret in the band's active terminal.** It used to
   focus the `ConsolePanel`'s root handle, so typing after the hotkey went
@@ -51,6 +51,8 @@ renders "N commits selected".
 - **The Solution band and the project-toolbar row are now first-class nodes in
   the MCP visual dump.** Every band check this session had to go through
   screenshots because the structured dump did not mention them.
+- **App quit now drains the entry-persist chain instead of cancelling it.**
+  Quitting mid-turn silently truncated the tail of the conversation.
 
 Everything is on `origin/main`. Working tree clean.
 
@@ -122,6 +124,37 @@ sweep `retain`s on it. Full write-up in FORK.md #101.
 point in opposite directions — one is loss of writes that should happen, the
 other is execution of a rewrite that should not.
 
+### 3b. GPUI's quit contract: only background work can finish
+
+`App::shutdown` invokes each quit observer synchronously (entities and globals
+alive, windows **not yet** cleared), collects their futures, clears windows,
+runs `flush_effects()`, then **blocks the main thread** on those futures for a
+200ms `SHUTDOWN_TIMEOUT`. The block passes the **foreground session id** down to
+the scheduler, so that session is blocked for the whole quit window. On Linux it
+is stronger still: the quit callback runs only after the event loop has already
+returned, so the main-thread channel is not merely un-drained — there is no loop
+left to drain it. **Awaiting a foreground `Task` from a quit observer can only
+burn the 200ms and lose the write.**
+
+That is why the persist chain moved from `cx.spawn` to `cx.background_spawn`.
+The chain never needed the foreground: a link captures no entity, ordering comes
+from `prev.await` rather than executor FIFO, and every `db.*` op was already a
+background task.
+
+The second half is subtler and cost an extra round: the quit hook must take the
+chain map **on the future's first poll**, not at observer registration time —
+otherwise the flush that `App::shutdown`'s own `windows.clear()` + `flush_effects()`
+triggers (window release → `SolutionStoreEvent::Closed` → `cold_close_solution`)
+lands in a map the hook already took. The trap in the obvious alternative:
+`shutdown(&mut self)` holds the `App` `RefCell` mutably borrowed while it blocks,
+so an `AsyncApp::update` inside the quit future panics. Full write-up in
+FORK.md #103.
+
+**Of 14 `on_app_quit` registrations in the tree, `MultiWorkspace` is the only
+unconditionally foreground-bound one** (defended on the main route by an explicit
+foreground pre-flush in `zed::quit`; the residual exposure is a platform-initiated
+quit). `LspStore::shutdown_server` is a conditional second.
+
 ### 4. The legacy row layout is intended behaviour, not a hazard to avoid
 
 This blocked the persist-chain item for two sessions on a false premise. There
@@ -190,9 +223,11 @@ fix below).
      FocusPreviousTabStop, ScrollDown, ScrollUp}`, actions that exist nowhere.
    - No test drives `select_entry` under a live `Context<Workspace>` lease, so
      the `cx.defer_in` is protected only by reasoning.
-   - **App quit loses every in-flight persist with no flush attempt at all** —
-     there is no `on_app_quit` hook in `solution_agent`. This is the largest
-     remaining hole in the same area the persist-chain work just closed.
+   - `Copilot::shutdown_language_server` awaits an async block whose output *is*
+     the `Option<impl Future>` from `LanguageServer::shutdown` and **discards
+     it**, so the LSP shutdown exchange is never driven — and `io_tasks.lock().take()`
+     runs eagerly, leaving the server to die by pipe closure. Found while
+     auditing quit hooks; real, unfixed.
    - Abandoning a chain cancels it only best-effort: cancellation walks inward
      one runnable at a time, so an 8-link chain leaks 5 orphan rows. Unreachable
      today (a purged session id is never re-hydrated) but real.
