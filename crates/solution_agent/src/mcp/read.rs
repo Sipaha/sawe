@@ -1589,10 +1589,11 @@ impl McpServerTool for ReadSessionHistoryTool {
         // truth). Reading `session.entries` makes the in-memory read the
         // single source for both states.
         //
-        //    This tool shares no seam at all with the other three — its archive
-        //    path below is its own, not `load_cold_session` — so
-        //    `readable_in_memory_session` is the ONLY thing that keeps its live
-        //    branch answering an unreadable transcript the way they do.
+        //    This tool does not share the other three's `load_cold_session`
+        //    entry point — its archive path below is its own, deliberately, for
+        //    the reasons recorded on that path — so `readable_in_memory_session`
+        //    is the ONLY thing that keeps its live branch answering an
+        //    unreadable transcript the way they do.
         let live = cx.update(|cx| {
             readable_in_memory_session(session_id, cx).map(|entity| {
                 entity.map(|entity| {
@@ -1632,6 +1633,30 @@ impl McpServerTool for ReadSessionHistoryTool {
         }
 
         // 2. Archive path: session is not in the in-memory store.
+        //
+        //    It deliberately does NOT route through `load_cold_session`, and
+        //    that is the answer to a question this file has now been asked
+        //    twice. There is no third decoder left here to fold away: all three
+        //    decisions the ladder below makes are already the shared ones —
+        //    `load_cold_head`, `is_wiped_row_native`, `entries_from_rows`. What
+        //    differs is the PRODUCT, not the decode. `load_cold_session` builds
+        //    a `SolutionSession`, whose legacy-blob branch prefers `entries_v2`
+        //    and then COALESCES adjacent assistant entries — `get_session`
+        //    serves a two-line legacy blob as `total_count: 1`, pinned by test —
+        //    whereas this tool pages FLAT over `entry_summaries`, which is the
+        //    only reason that field is still carried on `PersistedSession`. So
+        //    unifying would move `total_entries` and change the unit `limit` /
+        //    `offset` page over, and FORK.md #105 requires this flat space to
+        //    stay flat (it stamps no index and cross-references nothing).
+        //    Preserving the flat rendering instead would mean a mode parameter
+        //    on `load_cold_session` for exactly one caller — a function three
+        //    RPCs share precisely so they cannot disagree. It would also push an
+        //    archive sweep through the four-session / 16 MiB `ColdSessionCache`
+        //    that exists to make `get_session_changes`'s paging burst cost one
+        //    transcript read (#107), evicting the entries it is there to hold,
+        //    and would build and discard a full entity — streams, cursor,
+        //    model/effort restore — per call to render markdown. The sharing is
+        //    already at the right granularity; do not unify.
         //
         //    Driven off `load_cold_head`, the same cheap head the cold
         //    `get_session` reads: it answers "does this session exist", "how
