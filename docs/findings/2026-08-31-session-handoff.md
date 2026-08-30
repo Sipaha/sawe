@@ -10,7 +10,7 @@ phases, which are all still finished and untouched.
 one 19× performance win, all found by pulling on threads that pool named in one
 line each.
 
-Everything below is on `origin/main`, HEAD `0ff21ebd59`. Working tree clean.
+Everything below is on `origin/main`, HEAD `db39b67a47`. Working tree clean.
 
 ---
 
@@ -81,10 +81,6 @@ build on that combination, from a **build script** — because in this fork CI i
 disabled and `cargo test --workspace` is run approximately never, while
 `cargo check --workspace --all-targets` runs continuously under flycheck. FORK.md **#109**.
 
-**`script/check-licenses` had never passed.** Ten fork-local crates — including
-`solution_agent` and `console_panel` — declare `license = "GPL-3.0-or-later"` and carried no
-`LICENSE-GPL` symlink. Added; the script exits 0 for the first time.
-
 **`rebuild_streams`'s decoration got a property test.** The existing 200-seed property pinned
 `demux` ≡ an independent reference but left every decoration input empty, so closed-stream
 removal, hydration-orphan suppression, both `Utc::now()`-derived folds, the never-clobber rule
@@ -92,7 +88,21 @@ and label enrichment were covered only by single-shape tests. Three of those beh
 **zero** coverage anywhere in the repo — proven by applying each mutation and watching this
 one test be the sole failure.
 
-**Docs.** FORK.md #105, #107, #108 and #109 are new; #55's extraction trigger
+**A restore could rewrite a transcript it had never read — four ways.** `migrating`
+authorises a destructive rewrite (`persist_all_rows` flushes zero rows and bumps the epoch;
+for a row-native session `trim_from_idx = 0` deletes every row), and it was derived from
+"the entry set came back empty" — which is where every way of *failing* to read one lands.
+A failed blob decode, a failed blob load and a failed entry-row load all yield "no rows";
+the row one is unrecoverable, measured at **3 rows → 0 from one transient sqlite read
+error**. A failed *epoch* load is the mirror image: it collapses to `0`, which
+`is_wiped_row_native` reads as "legacy, consult the blob", so a genuinely `/clear`ed session
+gets its erased conversation repainted, written back as rows and its epoch rewound 5 → 1 —
+permanently. All four are closed behind one session-scoped flag. FORK.md **#110**.
+
+**`script/check-licenses` had never passed**, and four workspace warnings are gone: ten
+fork-local crates declared GPL and carried no `LICENSE-GPL` symlink.
+
+**Docs.** FORK.md #105, #107, #108, #109 and #110 are new; #55's extraction trigger
 is withdrawn permanently; #97 gained a permanent ruling; #103 records its fix;
 the MCP-sockets entry was renumbered 106 because it duplicated 17.
 
@@ -193,21 +203,28 @@ review.
 1. **A `.rules` line for `Arc::get_mut`** on `SolutionSession::entries` /
    `Stream::entries` (see #4 above). Drafted in the rebuild-streams report;
    `.rules` additions go through the suggestion path, not an inline edit.
-2. **Small deferred items, each already reasoned out:** `shutdown_server`
-   returns an `anyhow::Result<()>` neither arm can produce while `join_all`
-   drops the results unexamined; `read_session_history` keeps an ad-hoc
-   rows→blob→title decoder that is a third decoder of the same on-disk state,
-   and its archive-path `title` is `blob → unwrap_or_default()` — an empty
-   string for a row-native archived session, now a one-line fix with
-   `load_metadata` gone and `load_cold_head` in place; an **undecodable** blob
-   still makes `read_session_history` error while `build_cold_session` swallows
-   it with `.ok()` and serves an empty transcript (that is the questionable
-   side — silently serving "empty" for a corrupt transcript is how data loss
-   gets mistaken for a wipe); `MockAgentServer::configured` takes two adjacent
-   `Option<Receiver<()>>` parameters that can be swapped silently at a call
-   site; four pre-existing unused-import / dead-code warnings in `git_ui`,
-   `solutions` and `project_panel`.
-3. **The debugger's still-pending-startup server is never shut down at quit.**
+2. **The one product decision this session did not take.** `persist_main_stream` is
+   deliberately unguarded, so typing into a tab whose transcript failed to load writes from
+   Main index 0 and trims — and in the epoch arm also rewinds the persisted wipe marker. The
+   shape to build is **retry the load, then refuse**: re-run all three inputs on the first
+   send, clear the flag only after the retry actually populated the session, and refuse with
+   a visible error otherwise. Suppressing the write silently is the option to reject.
+   Appending with a base offset does *not* work — see #110. Two smaller riders: a successful
+   `/clear` never clears the flag either, and a declining close can leave torn/teammate rows
+   past the Main tail that the incremental path does not repair.
+3. **Making a corrupt session read as corrupt on an open Solution.** Today the refusal is
+   cold-path-only: every read RPC prefers the in-memory store, so once hydrated the session
+   reads as an empty transcript with no error. Non-destructive, not honest. The live session
+   already carries the flag and both regimes converge on one `build_get_session_result` call
+   site, so this is a condition on an existing seam plus a UI decision.
+4. **The previous small-deferred list is empty** — `shutdown_server`'s vestigial
+   `Result`, the archived title, the undecodable-blob divergence, the mock's
+   swappable adjacent gates and the four workspace warnings all shipped, and
+   `read_session_history` now carries the same `session_unreadable` code as the
+   other two. `cargo check --workspace --all-targets` is at **zero** warnings;
+   keep it there. What is left in that class: `read_session_history` still has
+   an ad-hoc rows→blob decoder, a third of the same on-disk state.
+5. **The debugger's still-pending-startup server is never shut down at quit.**
    Unfixable without publishing the starting server's `Arc` into a shared slot,
    which two reviewers agreed to defer *harder*: it would let the quit hook's
    `shutdown()` run against a server the startup task still owns and is
@@ -243,7 +260,7 @@ deliberately gated on liveness with cold orphans logged instead.
 ## Resume recipe
 
 Read this file, then `docs/INDEX.md`, then `git log --oneline -30` to confirm
-the chain ends at `0ff21ebd59`. Pick from the pool above per
+the chain ends at `db39b67a47`. Pick from the pool above per
 `docs/workflow/supervisor-mode.md` § 7. **Nothing is in flight and the pool is
 genuinely thin** — every item this session identified has shipped, and what is
 left is small cleanups plus one deliberately-deferred design call. If that pool
