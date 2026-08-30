@@ -659,7 +659,7 @@
       "ctrl-`": "console_panel::ToggleFocus",
       // The graph is the third occupant of the Solution band's utility
       // section, so it gets the same tri-state hotkey its two siblings have
-      // (`ctrl-\`` terminal, `ctrl-shift-d` / `cmd-shift-d` debugger).
+      // (`ctrl-\`` terminal, `ctrl-shift-d` debugger — `cmd`-prefixed on macOS).
       // Not a `g` mnemonic: `ctrl-shift-g` is `git_panel::ToggleFocus` right
       // below on all three platforms, and `ctrl-alt-g` / `ctrl-alt-shift-g`
       // are the `"Pane"` context's search-match bindings in
