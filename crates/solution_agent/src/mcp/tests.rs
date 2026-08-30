@@ -4639,6 +4639,25 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
         ]
     }
 
+    // The COLD regime is pinned as COLD, mirroring the hot regime's own
+    // assertion below. Without this the two halves are only nominally different:
+    // `ListSessionsTool` already calls `hydrate_all_for_solution` on entry so the
+    // phone can see closed sessions, so the moment ANY of these four gains the
+    // same hydrate-on-demand — the obvious next mobile request — both loops
+    // quietly become hot, every assertion still passes, and the one property
+    // this test exists to measure stops being measured.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let (corrupt, healthy) = store.read_with(cx, |store, _| {
+            (store.session(session_id), store.session(healthy_id))
+        });
+        assert!(
+            corrupt.is_none() && healthy.is_none(),
+            "neither session may be in memory yet, or the loops below are measuring \
+             the hot path twice"
+        );
+    });
+
     // COLD: all four refuse, all four with the same code. The sibling test above
     // pins this regime in detail; it is repeated here so the hot assertions can
     // be compared against it rather than against a remembered claim.
@@ -4647,6 +4666,14 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
         assert!(
             err.contains("session_unreadable"),
             "COLD {tool} must refuse with session_unreadable; got {err:?}"
+        );
+        // The regime-specific TEXT, not just the shared prefix. A cold read holds
+        // the decode error, so it may and must name the cause; if this sentence
+        // ever migrates to the hot message it is claiming a cause nobody
+        // established there.
+        assert!(
+            err.contains("has an archived transcript that cannot be decoded"),
+            "COLD {tool} must name the cause it actually established; got {err:?}"
         );
     }
     for (tool, outcome) in read_all_four(healthy_id, cx).await {
@@ -4700,6 +4727,19 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
         assert!(
             !err.contains("session_not_found"),
             "HOT {tool} must not claim the row is gone; got {err:?}"
+        );
+        // The regime-specific TEXT. The hot flag records only THAT a read failed
+        // — `resume_session` sets it from a row load, an epoch load, a blob load
+        // and a decode alike — so the hot message must describe the state it can
+        // observe and must NOT borrow the cold message's decode diagnosis.
+        assert!(
+            err.contains("is open, but its persisted transcript could not be read"),
+            "HOT {tool} must describe the state it can actually observe; got {err:?}"
+        );
+        assert!(
+            !err.contains("cannot be decoded"),
+            "HOT {tool} must not name a cause nobody established — the flag does \
+             not record which of the four reads failed; got {err:?}"
         );
     }
     // `get_session_entry` in particular must refuse for the RIGHT reason: the
