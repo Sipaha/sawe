@@ -7857,6 +7857,7 @@ dependencies = [
  "settings",
  "smallvec",
  "smol",
+ "solution_agent",
  "solutions",
  "theme",
  "theme_settings",

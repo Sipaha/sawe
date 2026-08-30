@@ -47,15 +47,16 @@ use crate::solution_band::{SolutionBand, utility_button_selected};
 
 /// The action whose keybinding each button advertises in its tooltip, looked
 /// up by name (`cx.build_action`) rather than imported — importing
-/// `console_panel::ToggleFocus` / `debug_panel::ToggleFocus` would be the
-/// crate cycle this module's doc explains. `None` for the git graph, whose
-/// own toggle action was deleted with its dock registration in phase 2b
-/// task 4 (nothing referenced it, and its handler could not compile without
-/// the `Panel` impl).
+/// `console_panel::ToggleFocus` / `git_graph::ToggleFocus` /
+/// `debug_panel::ToggleFocus` would be the crate cycle this module's doc
+/// explains. The return stays `Option` because a kind is allowed to have no
+/// hotkey: the git graph had none between phase 2b task 4, which deleted its
+/// dock-era toggle along with its `Panel` impl, and the `ctrl-alt-\`` binding
+/// that replaced it.
 pub fn toggle_action_name(kind: UtilityKind) -> Option<&'static str> {
     match kind {
         UtilityKind::Terminal => Some("console_panel::ToggleFocus"),
-        UtilityKind::GitGraph => None,
+        UtilityKind::GitGraph => Some("git_graph::ToggleFocus"),
         UtilityKind::Debug => Some("debug_panel::ToggleFocus"),
     }
 }
@@ -165,9 +166,10 @@ impl StatusItemView for UtilityButtons {
     }
 
     fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
-        // No user-facing hide setting: these three buttons are the only way
-        // to reach the git graph at all, so letting them be hidden would
-        // strand a whole content behind no affordance.
+        // No user-facing hide setting: these three buttons are the only
+        // *visible* affordance for the band's utility section — each
+        // occupant's hotkey aside, hiding them would leave a whole content
+        // area reachable only by a chord the user has to already know.
         None
     }
 }

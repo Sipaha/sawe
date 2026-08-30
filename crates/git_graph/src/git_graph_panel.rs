@@ -18,10 +18,11 @@ use gpui::{
     Render, Styled, Subscription, WeakEntity, Window, div,
 };
 use project::git_store::{GitStore, GitStoreEvent, RepositoryId};
+use solution_agent::solution_band::SolutionBand;
 use ui::prelude::*;
-use workspace::Workspace;
+use workspace::{UtilityKind, Workspace};
 
-use crate::GitGraph;
+use crate::{GitGraph, ToggleFocus};
 
 pub struct GitGraphPanel {
     workspace: WeakEntity<Workspace>,
@@ -135,25 +136,260 @@ impl GitGraphPanel {
 }
 
 impl Focusable for GitGraphPanel {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.graph
-            .as_ref()
-            .map(|graph| graph.focus_handle(cx))
-            .unwrap_or_else(|| self.focus_handle.clone())
+    /// The panel's own handle, never the inner graph's — even though the
+    /// graph is the only thing in here that handles keys. `Focusable` is what
+    /// `SolutionBand::toggle_utility_focus`'s tri-state asks
+    /// `contains_focused` on, and that predicate is only true of an ANCESTOR
+    /// of the focused handle: handing out the graph's handle would make the
+    /// "visible but unfocused" and "visible and focused" legs
+    /// indistinguishable, and would answer `false` outright whenever there is
+    /// no repository and hence no graph to hand out. `render` redirects focus
+    /// that stops here down into the graph instead — the same split
+    /// `ConsolePanel` uses, for the same reason.
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
 impl Render for GitGraphPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.graph {
-            Some(graph) => div().size_full().child(graph.clone()).into_any_element(),
-            None => div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(Label::new("No active repository").color(Color::Muted))
-                .into_any_element(),
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Focus that stopped on this container is a mis-aimed focus: the
+        // container carries no key context, so the keystroke after
+        // `ctrl-alt-\`` would go nowhere. Hand it down to the graph, which
+        // does. Done here rather than from a `cx.on_focus` subscription
+        // because `ctrl-alt-\`` on a hidden section shows the panel and
+        // focuses it within one effect cycle, so a subscription installed on
+        // the first render would miss exactly the frame that matters
+        // (`ConsolePanel::focus_active_terminal` records the full argument).
+        // With no repository there is nothing to redirect to and focus rests
+        // on the tracked container, which keeps `contains_focused` true so
+        // the tri-state can still hide the section.
+        if self.focus_handle.is_focused(window)
+            && let Some(graph) = self.graph.as_ref()
+        {
+            graph.focus_handle(cx).focus(window, cx);
         }
+
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .child(match &self.graph {
+                Some(graph) => graph.clone().into_any_element(),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Label::new("No active repository").color(Color::Muted))
+                    .into_any_element(),
+            })
+    }
+}
+
+/// Resolve the concrete `Entity<GitGraphPanel>` from the type-erased
+/// `Workspace::solution_band_utility_item` slot `zed.rs` installs at startup.
+/// `None` means either the panel-init task (`initialize_panels`) hasn't
+/// finished yet, or this workspace has no Solution band at all (headless /
+/// test workspaces that skip it). Mirrors
+/// `console_panel::console_panel_for_workspace` and
+/// `debugger_ui::debugger_panel::debug_panel_for_workspace`, including taking
+/// `&Workspace` rather than the entity: callers already hold the workspace
+/// leased, and re-reading the entity there is GPUI's double-lease panic.
+pub fn git_graph_panel_for_workspace(workspace: &Workspace) -> Option<Entity<GitGraphPanel>> {
+    workspace
+        .solution_band_utility_item(UtilityKind::GitGraph)?
+        .downcast::<GitGraphPanel>()
+        .ok()
+}
+
+fn solution_band(workspace: &Workspace) -> Option<Entity<SolutionBand>> {
+    workspace
+        .solution_band_item()
+        .and_then(|item| item.downcast::<SolutionBand>().ok())
+}
+
+/// `git_graph::ToggleFocus`'s (`ctrl-alt-\``) handler. The graph is not a
+/// dock panel (see the module doc), so this cannot go through
+/// `Workspace::toggle_panel_focus`; it drives the Solution band's utility
+/// section instead, exactly as `console_panel::handle_toggle_focus` and
+/// `debugger_ui::debugger_panel::handle_toggle_focus` do for their own
+/// occupants. A no-op if either the panel or the band hasn't been installed.
+///
+/// The "showing another kind" arm is not optional. `utility_kind` is
+/// persisted per Solution, so without selecting `GitGraph` here a user who
+/// last used the terminal would reopen the band **on the terminal** while
+/// focus went to an unrendered graph, leaving the graph unreachable by its
+/// own keybinding for the rest of that Solution's life.
+pub(crate) fn handle_toggle_focus(
+    workspace: &mut Workspace,
+    _: &ToggleFocus,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = git_graph_panel_for_workspace(workspace) else {
+        return;
+    };
+    let Some(band) = solution_band(workspace) else {
+        return;
+    };
+    let focus_handle = panel.focus_handle(cx);
+    band.update(cx, |band, cx| {
+        if band.utility_kind(cx) != UtilityKind::GitGraph {
+            band.set_utility_kind(UtilityKind::GitGraph, cx);
+            band.set_utility_visible(true, cx);
+            focus_handle.focus(window, cx);
+        } else {
+            band.toggle_utility_focus(&focus_handle, window, cx);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Action as _, TestAppContext};
+    use project::{FakeFs, Project};
+    use settings::SettingsStore;
+    use solution_agent::adapter::AdapterRegistry;
+    use solution_agent::store::SolutionAgentStore;
+
+    /// The status-bar button's tooltip looks its hotkey up by name
+    /// (`utility_buttons::toggle_action_name`), so a rename here silently
+    /// downgrades that tooltip to a keybinding-less one — the lookup logs and
+    /// falls back rather than failing. `console_panel` and `debugger_ui` pin
+    /// their own entry the same way.
+    #[test]
+    fn toggle_focus_action_matches_the_utility_button_tooltip_lookup() {
+        assert_eq!(
+            solution_agent::utility_buttons::toggle_action_name(UtilityKind::GitGraph),
+            Some(ToggleFocus.name())
+        );
+    }
+
+    /// The whole tri-state, on a workspace with **no** repository — the case
+    /// that used to be unreachable. The panel hands out a handle that only
+    /// `render`'s `track_focus` puts in the dispatch tree, so before that
+    /// existed the first press focused a handle no frame contained,
+    /// `Workspace`'s focus-lost listener yanked focus to the centre pane, and
+    /// `contains_focused` stayed false forever: every later press re-showed
+    /// the section instead of hiding it.
+    #[gpui::test]
+    async fn toggle_focus_shows_focuses_then_hides(cx: &mut TestAppContext) {
+        let (window, panel, band) = bootstrap(cx).await;
+
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "precondition: the utility section starts hidden"
+        );
+
+        toggle(&window, cx);
+        assert_eq!(
+            band.read_with(cx, |band, cx| band.utility_kind(cx)),
+            UtilityKind::GitGraph
+        );
+        assert!(band.read_with(cx, |band, cx| band.utility_visible(cx)));
+        window
+            .update(cx, |_workspace, window, cx| {
+                assert!(
+                    panel.focus_handle(cx).contains_focused(window, cx),
+                    "the first press must leave focus inside the graph panel, \
+                     or the tri-state loses its 'visible and focused' leg"
+                );
+            })
+            .expect("window is open");
+
+        toggle(&window, cx);
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "a second press on the focused graph hides the section"
+        );
+        assert_eq!(
+            band.read_with(cx, |band, cx| band.utility_kind(cx)),
+            UtilityKind::GitGraph,
+            "hiding must not rewrite the remembered kind"
+        );
+    }
+
+    /// The section already open on another occupant is not "visible" as far
+    /// as the graph is concerned: the press has to switch the kind, not fall
+    /// into the band's tri-state and hide the terminal.
+    #[gpui::test]
+    async fn toggle_focus_switches_from_another_kind(cx: &mut TestAppContext) {
+        let (window, panel, band) = bootstrap(cx).await;
+        band.update(cx, |band, cx| {
+            band.set_utility_kind(UtilityKind::Terminal, cx);
+            band.set_utility_visible(true, cx);
+        });
+
+        toggle(&window, cx);
+
+        assert_eq!(
+            band.read_with(cx, |band, cx| band.utility_kind(cx)),
+            UtilityKind::GitGraph
+        );
+        assert!(
+            band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "switching occupants must leave the section open, not toggle it shut"
+        );
+        window
+            .update(cx, |_workspace, window, cx| {
+                assert!(panel.focus_handle(cx).contains_focused(window, cx));
+            })
+            .expect("window is open");
+    }
+
+    fn toggle(window: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) {
+        window
+            .update(cx, |workspace, window, cx| {
+                handle_toggle_focus(workspace, &ToggleFocus, window, cx);
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+    }
+
+    async fn bootstrap(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<Workspace>,
+        Entity<GitGraphPanel>,
+        Entity<SolutionBand>,
+    ) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            SolutionAgentStore::init_global(cx, std::sync::Arc::new(AdapterRegistry::new()));
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = Project::test(fs, [std::path::Path::new("/root")], cx).await;
+
+        let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let (panel, band) = window
+            .update(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| {
+                    GitGraphPanel::new(
+                        workspace.weak_handle(),
+                        workspace.project().read(cx).git_store().clone(),
+                        window,
+                        cx,
+                    )
+                });
+                let band = cx.new(|cx| {
+                    SolutionBand::new(workspace.weak_handle(), workspace.project().clone(), cx)
+                });
+                workspace.set_solution_band_item(band.clone().into(), window, cx);
+                workspace.set_solution_band_utility_item(
+                    UtilityKind::GitGraph,
+                    panel.clone().into(),
+                    window,
+                    cx,
+                );
+                (panel, band)
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+        (window, panel, band)
     }
 }

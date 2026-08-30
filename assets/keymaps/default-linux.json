@@ -657,6 +657,16 @@
       "shift-new": "workspace::NewWindow",
       "ctrl-shift-n": "file_finder::Toggle",
       "ctrl-`": "console_panel::ToggleFocus",
+      // The graph is the third occupant of the Solution band's utility
+      // section, so it gets the same tri-state hotkey its two siblings have
+      // (`ctrl-\`` terminal, `ctrl-shift-d` / `cmd-shift-d` debugger).
+      // Not a `g` mnemonic: `ctrl-shift-g` is `git_panel::ToggleFocus` right
+      // below, and `ctrl-alt-g` / `ctrl-alt-shift-g` are the `"Pane"`
+      // context's search-match bindings, which would shadow this almost
+      // everywhere. `ctrl-alt-\`` is unbound in every keymap this repo
+      // ships, so unlike `ctrl-shift-a` it also fires from inside a terminal
+      // or an editor.
+      "ctrl-alt-`": "git_graph::ToggleFocus",
       // Does not fire while the terminal is focused (`"Terminal"` context
       // keeps `ctrl-shift-a` bound to `editor::SelectAll` there).
       "ctrl-shift-a": "console_panel::ToggleDialog",

@@ -222,6 +222,26 @@ actions!(
         /// Re-runs `git log` for the current filters, picking up commits that
         /// landed outside the editor.
         Refresh,
+        /// Shows, focuses or hides the commit graph in the Solution band's
+        /// utility section (`ctrl-alt-\``). Tri-state, the same one
+        /// `console_panel::ToggleFocus` and `debug_panel::ToggleFocus`
+        /// implement for the other two occupants of that section: hidden (or
+        /// showing another kind) → select the graph, show it and focus it;
+        /// shown but unfocused → focus it; shown and focused → hide the
+        /// section. See `git_graph_panel::handle_toggle_focus`.
+        ///
+        /// Bound in the `"Workspace"` context on all three platforms.
+        /// `ctrl-alt-\`` was picked because every mnemonic chord for "git"
+        /// is taken by something more useful in a context that would shadow
+        /// it: `ctrl-shift-g` is `git_panel::ToggleFocus` in the same
+        /// `"Workspace"` block, and `ctrl-alt-g` / `ctrl-alt-shift-g` are
+        /// `search::Select{Next,Previous}Match` in `"Pane"`, which is in the
+        /// focus path almost always. This chord is the terminal sibling's
+        /// (`ctrl-\``) neighbour on the same physical key, and it is unbound
+        /// in every keymap this repo ships, including the vim and
+        /// jetbrains/sublime/emacs alternatives — so it fires even from
+        /// inside the terminal or an editor, unlike `ctrl-shift-a`.
+        ToggleFocus,
     ]
 );
 
@@ -781,6 +801,7 @@ pub fn init(cx: &mut App) {
     mcp::register(cx);
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
+        workspace.register_action(git_graph_panel::handle_toggle_focus);
         workspace.register_action_renderer(|div, workspace, window, cx| {
             div.when_some(
                 resolve_file_history_target(workspace, window, cx),
