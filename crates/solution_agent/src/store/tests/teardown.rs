@@ -1668,7 +1668,11 @@ async fn close_then_reopen_orders_a_long_flush_before_the_new_message(
 /// whole process lifetime.
 ///
 /// Retiring only ever removes a SPENT chain, which is why it cannot reintroduce
-/// the close→reopen inversion: a link that has finished orders nothing.
+/// the close→reopen inversion: a link that has finished orders nothing. Both
+/// halves of that are asserted here, and the negative one is the load-bearing
+/// one: a sweep that reclaimed a chain still in flight would cancel the very
+/// close flush [`ChainDisposition::Drain`] exists to preserve, and would do it
+/// silently.
 #[gpui::test]
 async fn a_finished_persist_chain_is_retired_from_the_map(cx: &mut gpui::TestAppContext) {
     use crate::session_entry::{SessionEntry, SessionEntryKind};
@@ -1695,6 +1699,14 @@ async fn a_finished_persist_chain_is_retired_from_the_map(cx: &mut gpui::TestApp
             cx.notify();
         });
         store.close_session(id, cx).expect("close_session");
+        // Still inside the synchronous block, so the flush is queued and has
+        // not been polled: the sweep must leave it alone.
+        store.retire_finished_persist_chains();
+        assert!(
+            store.entries_persist_chain.contains_key(&id),
+            "a chain still in flight must survive the sweep — reclaiming it \
+             here would cancel the close flush instead of draining it"
+        );
     });
     cx.run_until_parked();
 
@@ -1723,6 +1735,15 @@ async fn a_finished_persist_chain_is_retired_from_the_map(cx: &mut gpui::TestApp
 /// explicit abandon in that branch the surviving link writes entry rows whose
 /// parent `solution_sessions` row the purge has just deleted: orphans no UI
 /// enumerates and no GC reaps.
+///
+/// What is pinned is that the purge REACHES the retained chain, and that is
+/// asserted directly — synchronously, off the map — so it holds at any chain
+/// depth. The `load_entries` check behind it is the stronger claim and is exact
+/// only for the ONE-link flush this fixture builds (8 entries, a single
+/// `persist_all_rows`): dropping a deeper chain cancels it from the outside in,
+/// so some rows still land. `purge_session_hard_abandons_in_flight_persist_chain`
+/// carries the measured numbers (2 links leak 1 row, 8 leak 5); it is a
+/// pre-existing purge-ordering gap, not something this branch can close.
 #[gpui::test]
 async fn purge_after_soft_close_abandons_the_drained_chain(cx: &mut gpui::TestAppContext) {
     use crate::session_entry::{SessionEntry, SessionEntryKind};
@@ -1754,6 +1775,14 @@ async fn purge_after_soft_close_abandons_the_drained_chain(cx: &mut gpui::TestAp
         // synchronous block, so the purge lands while the flush is queued.
         store.close_session(id, cx).expect("close_session");
         store.purge_session_hard(id, None, cx);
+        // Depth-independent evidence that the not-hydrated branch abandoned the
+        // chain at all: nothing else removes this key (the sweep only reclaims
+        // spent chains, and this one has not been polled yet).
+        assert!(
+            !store.entries_persist_chain.contains_key(&id),
+            "the purge must reach the retained chain of a session it can no \
+             longer tear down through `teardown_session_runtime`"
+        );
     });
     cx.run_until_parked();
 

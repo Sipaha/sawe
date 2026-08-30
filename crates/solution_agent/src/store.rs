@@ -3747,8 +3747,16 @@ impl SolutionAgentStore {
     /// It is what bounds the map. A drained chain deliberately outlives its
     /// session's teardown (a reopen must be able to chain behind it), so without
     /// this sweep every closed session would leave a key behind for the
-    /// process's lifetime. Called wherever the map is already being touched, so
-    /// the residue is at most the chains still in flight.
+    /// process's lifetime.
+    ///
+    /// It is called wherever the map is already being touched — both persist
+    /// sites and the `Drain` arm — and nowhere else, so a chain that goes spent
+    /// AFTER the last of those keeps its key until the next one. The residue at
+    /// an idle editor is therefore one entry per session closed since the last
+    /// persist anywhere in the process: a spent `Task`, an `Arc` and an id
+    /// apiece. No further sweep site was added for it, because the remaining
+    /// candidates are all unrelated to this map (`gc_orphan_members`) or take
+    /// `&self` and could not mutate it anyway (the hydration paths).
     fn retire_finished_persist_chains(&mut self) {
         self.entries_persist_chain
             .retain(|_, chain| !chain.is_finished());

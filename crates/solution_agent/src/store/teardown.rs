@@ -65,6 +65,13 @@ pub(crate) enum ChainDisposition {
     /// `purge_session_hard_abandons_in_flight_persist_chain` for the measured
     /// numbers. Fixing that means sequencing the DELETE after the abandoned
     /// writes, not choosing a different disposition here.
+    ///
+    /// The same partial cancellation also leaves those inner links ordered
+    /// against nothing, since the key is gone and a later chain under it would
+    /// not take them as its `prev`. That cannot bite today: an abandon only ever
+    /// follows a delete of the `solution_sessions` row, ids are never reused,
+    /// and hydration keys off that row — so a purged id is never re-hydrated and
+    /// no second chain can form under it.
     Abandon,
 }
 
