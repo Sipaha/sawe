@@ -226,9 +226,9 @@ const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 /// columns' content.
 ///
 /// A flat fraction cannot serve both widths this view is used at. The Date
-/// string is a constant ~130px, which is ~20% of the Solution band's compact
+/// string is a constant ~132px, which is ~20% of the Solution band's compact
 /// half but only ~7% of a full-window pane: the previous flat 0.13 therefore
-/// truncated *every* row in the band while leaving ~140px of dead whitespace
+/// truncated *every* row in the band while leaving ~118px of dead whitespace
 /// beside the same text at full width. Sizing Date and Author to their content
 /// and letting Description absorb the remainder is both correct at every width
 /// and what IDEA's log does.
@@ -251,6 +251,25 @@ fn default_column_fractions(date: Pixels, author: Pixels, container: Pixels) -> 
     };
 
     [1.0 - date - author, date, author]
+}
+
+/// Everything [`default_column_fractions`] derives from: the table's width and
+/// the two measured content widths.
+///
+/// The derived columns are cached against all three rather than against the
+/// table width alone, because the two measurements move with `rem_size` and the
+/// UI font while the table's width does not. A width-only key therefore stays
+/// satisfied across a font-size or theme change, and the columns keep the
+/// previous font's sizing -- which is the same truncation the derivation exists
+/// to remove, and is repaired by nothing short of a resize. Keying on the
+/// function's own arguments cannot go stale by construction; keying on whatever
+/// [`GitGraph::measured_column_width`] happens to read today would have to be
+/// revisited every time it reads something new.
+#[derive(Clone, Copy, PartialEq)]
+struct ColumnWidthInputs {
+    container: Pixels,
+    date: Pixels,
+    author: Pixels,
 }
 
 fn new_column_widths_state(fractions: [f32; 3]) -> RedistributableColumnsState {
@@ -1074,9 +1093,9 @@ pub struct GitGraph {
     /// Width the log table was last laid out at, from
     /// [`GitGraph::observe_table_width`].
     table_width: Pixels,
-    /// Table width the current `column_widths` defaults were derived for. See
-    /// [`GitGraph::sync_default_column_widths`].
-    auto_column_widths_for: Pixels,
+    /// Inputs the current `column_widths` defaults were derived from, or `None`
+    /// before the first derivation. See [`GitGraph::sync_default_column_widths`].
+    auto_column_widths_for: Option<ColumnWidthInputs>,
     selected_entry_idx: Option<usize>,
     /// Every selected row, in view space. Multi-row selections only come from
     /// Ctrl/Shift clicks on commit rows; every other path into
@@ -1768,9 +1787,10 @@ impl GitGraph {
         });
     }
 
-    /// Re-derive the default column widths whenever the table's own width
-    /// changes, so Date and Author stay sized to their content at both the
-    /// Solution band's compact width and a full-window pane item.
+    /// Re-derive the default column widths whenever anything they are derived
+    /// from changes, so Date and Author stay sized to their content at both the
+    /// Solution band's compact width and a full-window pane item, and across a
+    /// change of UI font (see [`ColumnWidthInputs`]).
     ///
     /// This installs a *new* state entity rather than editing the existing one
     /// because `RedistributableColumnsState` exposes no width mutator. Going
@@ -1784,11 +1804,30 @@ impl GitGraph {
     /// widths we installed" is what separates an untouched table from a tuned
     /// one: while it differs, the user's widths stand and the derivation keeps
     /// out of the way. Because that is re-checked rather than latched,
-    /// double-clicking the dividers back to their defaults (which are the
-    /// derived widths, not the unmeasured fallback) also hands the table back.
+    /// double-clicking a divider can also hand the table back -- but only when
+    /// that restores `preview_widths` to `initial_widths` exactly, which
+    /// `reset_column_to_initial_width` only does by redistributing the
+    /// difference onto the reset column's *neighbours*. Once several dividers
+    /// have been tuned, no sequence of double-clicks is guaranteed to get back.
+    ///
+    /// Swapping the entity is safe because nothing observes or subscribes to
+    /// `RedistributableColumnsState`, with one narrow exception: between a
+    /// divider's MouseDown and its first drag-move the preview still equals the
+    /// initial widths, so a swap in that window is not gated out, and the
+    /// in-flight `DraggedColumn`'s `state_id` then no longer matches the entity
+    /// `bind_redistributable_columns` guards on -- killing that drag until the
+    /// button is released and the divider re-grabbed.
     fn sync_default_column_widths(&mut self, window: &Window, cx: &mut Context<Self>) {
         let container = self.table_width;
-        if container <= px(0.) || container == self.auto_column_widths_for {
+        if container <= px(0.) {
+            return;
+        }
+        let inputs = ColumnWidthInputs {
+            container,
+            date: Self::measured_column_width(DATE_COLUMN_SAMPLE, window, cx),
+            author: Self::measured_column_width(AUTHOR_COLUMN_SAMPLE, window, cx),
+        };
+        if self.auto_column_widths_for == Some(inputs) {
             return;
         }
 
@@ -1800,11 +1839,7 @@ impl GitGraph {
             return;
         }
 
-        let fractions = default_column_fractions(
-            Self::measured_column_width(DATE_COLUMN_SAMPLE, window, cx),
-            Self::measured_column_width(AUTHOR_COLUMN_SAMPLE, window, cx),
-            container,
-        );
+        let fractions = default_column_fractions(inputs.date, inputs.author, inputs.container);
         self.column_widths = cx.new(|_cx| {
             let mut state = new_column_widths_state(fractions);
             // Carried over so this frame's `graph_column_width` still sees a
@@ -1814,7 +1849,7 @@ impl GitGraph {
             state.set_cached_container_width(container);
             state
         });
-        self.auto_column_widths_for = container;
+        self.auto_column_widths_for = Some(inputs);
     }
 
     /// Width of the commit-graph column: enough for the widest loaded row, so
@@ -1945,7 +1980,7 @@ impl GitGraph {
             table_interaction_state,
             column_widths,
             table_width: px(0.),
-            auto_column_widths_for: px(0.),
+            auto_column_widths_for: None,
             selected_entry_idx: None,
             selected_entry_idxs: HashSet::default(),
             selection_anchor_idx: None,
@@ -3610,7 +3645,15 @@ impl Render for GitGraph {
                                 ),
                                 header_context,
                                 Some(header_resize_info),
-                                Some(self.column_widths.entity_id()),
+                                // Only seeds the header cells' `ElementId`s, so
+                                // it wants the one entity that lives as long as
+                                // the view -- which is what `data_table`'s own
+                                // call site passes. `column_widths` is replaced
+                                // on every re-derivation, and keying off it
+                                // would throw away each cell's retained
+                                // interactivity state whenever the table is
+                                // resized.
+                                Some(self.table_interaction_state.entity_id()),
                                 cx,
                             ))),
                     )
@@ -4972,7 +5015,15 @@ mod tests {
         // rather than starving the column being read.
         let [narrow_description, narrow_date, narrow_author] =
             default_column_fractions(date, author, px(300.));
+        // Two assertions, because either alone is weak. The first pins the
+        // clamp to land *exactly* on the floor rather than merely near it, and
+        // so is what fails if the clamp is dropped. But it compares against the
+        // constant under test, so lowering that constant satisfies it just as
+        // happily -- hence the second, where the floor is spelled out as a
+        // literal on purpose. Both carry the same slack: the scale-back leaves
+        // the sum a few f32 ulps under an exact 0.4.
         assert!((narrow_description - MIN_DESCRIPTION_FRACTION).abs() < 0.001);
+        assert!(narrow_description >= 0.4 - 0.001);
         assert!(narrow_date > narrow_author * 0.9 && narrow_date < narrow_author);
 
         // Unmeasured first frame.
@@ -7034,6 +7085,120 @@ mod tests {
                 computed_row_height, measured_item_height,
             );
         });
+    }
+
+    /// The property the derived columns exist for is that Date is never
+    /// narrower than the date it holds. The two pure-function tests above only
+    /// check `default_column_fractions`' arithmetic; neither reaches either of
+    /// the inputs it is called with, so neither notices the columns being
+    /// derived against a stale table width or a stale font.
+    ///
+    /// So this one goes through a real window: the graph is a workspace pane
+    /// item and the width comes from `simulate_resize`, which is what makes the
+    /// deferred re-derivation in `observe_table_width` run at all. Driving
+    /// frames with `VisualTestContext::draw` instead would not do — it never
+    /// makes the views live window entities, so an invalidation that the app
+    /// drops mid-draw passes there (#62).
+    #[gpui::test]
+    async fn test_default_column_widths_follow_the_table_width_and_the_ui_font(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let mut rng = StdRng::seed_from_u64(7);
+        let commits = generate_random_commit_dag(&mut rng, 12, false);
+        let (_project, workspace, git_graph, cx) =
+            setup_graph_with_workspace(&fs, commits, cx).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        // The Date column as it was last laid out, beside the width its text
+        // actually needs. A derivation that has gone stale shows up as the
+        // former falling behind the latter.
+        let date_column = |cx: &mut gpui::VisualTestContext| {
+            git_graph.update_in(cx, |graph, window, cx| {
+                let table_width = graph.table_width;
+                assert!(
+                    table_width > px(0.),
+                    "the table was never laid out, so nothing below tests anything"
+                );
+                let DefiniteLength::Fraction(fraction) =
+                    graph.column_widths.read(cx).initial_widths()[1]
+                else {
+                    panic!("column widths are installed as fractions");
+                };
+                let needed = GitGraph::measured_column_width(DATE_COLUMN_SAMPLE, window, cx);
+                assert!(
+                    needed > COLUMN_CELL_PADDING.to_pixels(window.rem_size()),
+                    "the text system measured {DATE_COLUMN_SAMPLE:?} as empty, so a Date \
+                     column of any width would satisfy the assertions below"
+                );
+                (table_width * fraction, needed, table_width, fraction)
+            })
+        };
+
+        // Wide enough for both content columns outright: Date is sized to its
+        // text and nothing is clamped.
+        cx.simulate_resize(gpui::size(px(1600.), px(900.)));
+        cx.run_until_parked();
+        let (wide_date, wide_needed, wide_table, wide_fraction) = date_column(cx);
+        assert!(
+            wide_date >= wide_needed,
+            "Date was laid out {wide_date:?} wide for {wide_needed:?} of text \
+             in a {wide_table:?} table"
+        );
+
+        // The Solution band's case. Same text, much less room, so the same
+        // column has to claim a bigger share than it did above — and than the
+        // flat 0.13 that truncated it before this was derived at all.
+        cx.simulate_resize(gpui::size(px(700.), px(900.)));
+        cx.run_until_parked();
+        let (_, _, narrow_table, narrow_fraction) = date_column(cx);
+        assert!(
+            narrow_table < wide_table,
+            "the window resize never reached the table: still {narrow_table:?}"
+        );
+        assert!(
+            narrow_fraction > wide_fraction && narrow_fraction > UNMEASURED_COLUMN_FRACTIONS[1],
+            "Date kept {narrow_fraction} of a {narrow_table:?} table after holding \
+             {wide_fraction} of a {wide_table:?} one, so it was not re-derived"
+        );
+
+        // Now change the font without touching the window. The table's width is
+        // unchanged, so a derivation cached against the width alone stands pat
+        // and the columns keep the previous font's sizing — the truncation this
+        // whole derivation exists to remove, and one no resize provokes.
+        cx.simulate_resize(gpui::size(px(1600.), px(900.)));
+        cx.run_until_parked();
+        let (_, small_font_needed, _, _) = date_column(cx);
+
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    *settings.theme = ThemeSettingsContent {
+                        ui_font_size: Some(24.0.into()),
+                        ..Default::default()
+                    }
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        let (big_font_date, big_font_needed, big_font_table, _) = date_column(cx);
+        assert!(
+            big_font_needed > small_font_needed,
+            "the larger UI font did not widen the Date text ({small_font_needed:?} -> \
+             {big_font_needed:?}), so the assertion below proves nothing"
+        );
+        assert!(
+            big_font_date >= big_font_needed,
+            "after the UI font grew, Date was still laid out {big_font_date:?} wide for \
+             {big_font_needed:?} of text in a {big_font_table:?} table"
+        );
     }
 
     #[gpui::test]
