@@ -2559,6 +2559,26 @@ async fn a_failed_row_read_on_reopen_does_not_delete_the_rows(cx: &mut TestAppCo
     assert_eq!(resumed, session_id);
     cx.run_until_parked();
 
+    // NON-VACUITY: the injected failure must actually have been what this reopen
+    // saw. A reopen that read the rows successfully would show three entries
+    // here, and would then satisfy every assertion below without ever exercising
+    // the branch under test.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("resumed session")
+                .read_with(cx, |s, _| {
+                    assert!(
+                        s.entries.is_empty(),
+                        "the reopen must have hit the injected read failure; got {} \
+                         entries, which means it read the rows",
+                        s.entries.len()
+                    );
+                });
+        });
+    });
+
     assert_eq!(
         db.load_entries(session_id)
             .await
@@ -2688,6 +2708,25 @@ async fn a_failed_blob_read_on_reopen_does_not_wipe_the_session(cx: &mut TestApp
         .expect("a failed blob read must not fail the reopen");
     assert_eq!(resumed, session_id);
     cx.run_until_parked();
+
+    // NON-VACUITY: same as its sibling — a reopen that read the blob would show
+    // the transcript here, and would pass everything below without touching the
+    // branch under test.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("resumed session")
+                .read_with(cx, |s, _| {
+                    assert!(
+                        s.entries.is_empty(),
+                        "the reopen must have hit the injected read failure; got {} \
+                         entries, which means it read the blob",
+                        s.entries.len()
+                    );
+                });
+        });
+    });
 
     assert_eq!(
         db.load_epoch(session_id).await.expect("load epoch after"),
