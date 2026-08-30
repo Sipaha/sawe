@@ -722,16 +722,21 @@ pub(crate) fn select_metadata_for_solution(
         .collect()
 }
 
-/// One `solution_sessions` row plus the two `solution_session_entries`
-/// aggregates that fingerprint its transcript, as read by
-/// [`SolutionAgentDb::load_cold_head`].
+/// One `solution_sessions` row plus the aggregates that fingerprint its
+/// transcript, as read by [`SolutionAgentDb::load_cold_head`].
 ///
-/// `(entry_count, max_entry_mod_seq)` is what the MCP cold cache keys on: entry
-/// `mod_seq`s are handed out by `SolutionSession::bump_change_seq`, which is
-/// strictly monotonic per session, so an append raises both, a re-edit raises
-/// the max, and the trim that ends every flush lowers the count. A payload
-/// rewrite that moved neither would have to re-persist an entry under a
-/// `mod_seq` it already had, which no persist path can produce.
+/// `(entry_count, max_entry_mod_seq)` is what the MCP cold cache keys on for the
+/// ROW transcript: entry `mod_seq`s are handed out by
+/// `SolutionSession::bump_change_seq`, which is strictly monotonic per session,
+/// so an append raises both, a re-edit raises the max, and the trim that ends
+/// every flush lowers the count. A payload rewrite that moved neither would have
+/// to re-persist an entry under a `mod_seq` it already had, which no persist
+/// path can produce.
+///
+/// `blob_len` does the same job for the LEGACY transcript, and it is a
+/// fingerprint rather than an argument on purpose — see `mcp::cold_cache`, whose
+/// doc used to reason about the blob from its writers' incidental side effects
+/// instead.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColdSessionHead {
     pub meta: SolutionSessionMetadata,
@@ -743,9 +748,24 @@ pub struct ColdSessionHead {
     pub entry_count: i64,
     /// `MAX(mod_seq)` over the session's entry rows, 0 when it has none.
     pub max_entry_mod_seq: i64,
+    /// `LENGTH(acp_thread_blob)`; `None` when the column is NULL — which is both
+    /// "never had a legacy transcript" and "had one and a wipe dropped it".
+    ///
+    /// Length rather than `IS NOT NULL` because it is strictly cheaper AND
+    /// strictly more informative. SQLite answers `length()` on a blob column
+    /// from the record header, without materialising the payload; `IS NOT NULL`
+    /// does materialise it. Measured on 200 x 2 MB blobs (400 MB):
+    /// `sum(length(blob))` 0.00 s, `sum(blob IS NOT NULL)` 0.10 s,
+    /// `sum(length(hex(blob)))` (a real read, as control) 0.49 s. The extra
+    /// information is free: a rewrite that changes the size also moves this,
+    /// where a null-check would not.
+    pub blob_len: Option<i64>,
 }
 
-type ColdHeadRow = (MetadataRow, (Option<i64>, Option<i64>, i64, i64));
+type ColdHeadRow = (
+    MetadataRow,
+    (Option<i64>, Option<i64>, i64, i64, Option<i64>),
+);
 
 /// See [`SolutionAgentDb::load_cold_head`]. Deliberately a query of its own
 /// rather than two more columns on `METADATA_SELECT_LIST`: the shared list also
@@ -764,10 +784,11 @@ pub(crate) fn select_cold_head_by_id(
                 (SELECT COUNT(*) FROM solution_session_entries e
                   WHERE e.session_id = solution_sessions.id),
                 (SELECT COALESCE(MAX(e.mod_seq), 0) FROM solution_session_entries e
-                  WHERE e.session_id = solution_sessions.id)
+                  WHERE e.session_id = solution_sessions.id),
+                LENGTH(acp_thread_blob)
          FROM solution_sessions WHERE id = ? LIMIT 1"
     ))?;
-    let Some((metadata_row, (epoch, change_seq, entry_count, max_entry_mod_seq))) =
+    let Some((metadata_row, (epoch, change_seq, entry_count, max_entry_mod_seq, blob_len))) =
         select(id.to_string())?.into_iter().next()
     else {
         return Ok(None);
@@ -778,5 +799,6 @@ pub(crate) fn select_cold_head_by_id(
         change_seq,
         entry_count,
         max_entry_mod_seq,
+        blob_len,
     }))
 }

@@ -4177,6 +4177,16 @@ impl SolutionAgentStore {
                 // watermark that predecessor has since invalidated. Chain
                 // ordering is what makes this readable: we `prev.await`ed that
                 // predecessor, so its `store(true)` happens-before this load.
+                // It still holds when `prev` came back `None`, which it can —
+                // `retire_finished_persist_chains` runs on the foreground AFTER
+                // the plan capture and drops links that have already finished, so
+                // a predecessor that completed in that window leaves no link to
+                // await. The edge is then transitive rather than direct: T1
+                // `store(write_failed, Release)` -> T1 `store(finished, Release)`
+                // -> the foreground's `is_finished()` `load(Acquire)` that
+                // retired it -> the `background_spawn` of this task. Reordering
+                // `retire_finished_persist_chains()` relative to the capture
+                // would be reordering that chain.
                 // Declining here costs one lagging epoch, repaired by the next
                 // foreground persist (which does see the flag and re-covers
                 // everything); advancing would claim a generation over a table

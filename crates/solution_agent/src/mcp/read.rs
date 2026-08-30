@@ -1477,14 +1477,18 @@ impl McpServerTool for ReadSessionHistoryTool {
         //    `get_session` reads: it answers "does this session exist", "how
         //    many entry rows does it have" and "what generation is it at" in ONE
         //    round trip, from `solution_sessions` plus two index-only aggregates
-        //    over `solution_session_entries`, touching no `payload`. That is
+        //    over `solution_session_entries`, touching no `payload` (not even
+        //    the blob's — `LENGTH` on a blob column is answered from the record
+        //    header). That is
         //    what lets this path decide its branch BEFORE reading a transcript,
         //    instead of the old shape, which loaded the rows and the blob
         //    concurrently and threw one of them away every time.
         //
-        //    Outcomes, and the middle one is the fix:
-        //      * no head                 -> `session_not_found`, the ONLY site
-        //                                   that raises it;
+        //    Outcomes, and the middle one is the fix. `session_not_found` is
+        //    raised only by the two that genuinely mean it — no session database
+        //    attached at all, and no head for this id — never by a question
+        //    about a transcript:
+        //      * no database / no head   -> `session_not_found`;
         //      * rows present            -> row-native, read them;
         //      * no rows, `epoch > 0`    -> WIPED (`/clear`, `/compact`) — an
         //                                   empty archive, never the blob;

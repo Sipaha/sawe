@@ -4993,6 +4993,143 @@ async fn cold_cache_serves_a_coalescing_transcript_identically(cx: &mut gpui::Te
 /// safe here only because the blob has no production writer, and because the
 /// one transition that CAN happen — the row migration gives the session entry
 /// rows — moves `entry_count` off 0. Both halves are pinned.
+/// The cold cache must notice a blob that was DROPPED under it.
+///
+/// `blob` is the one `build_cold_session` input with no fingerprint on the head,
+/// and its safety used to be argued from its writers: the wipe was held to also
+/// move `epoch` (via `save_epoch`) and `total_tokens` (via `clear_total_tokens`),
+/// so the head could not miss it. That argument rested on two *incidental* side
+/// effects of an unrelated path staying incidental, and it stopped being true
+/// the moment `persist_all_rows_inner` learned to decline `save_epoch` while a
+/// chained predecessor's write had failed.
+///
+/// This fixture is the exact shape that then falls through every remaining
+/// discriminator: a blob-only session with NO entry rows (so `entry_count` and
+/// `max_entry_mod_seq` stay 0), `epoch` NULL (so a declined `save_epoch` moves
+/// nothing) and `total_tokens` NULL (so `clear_total_tokens` moves nothing). The
+/// wipe write itself still commits — rows deleted, blob cleared, one savepoint —
+/// so the transcript really is gone from disk while the cache still holds it.
+///
+/// Now pinned by `blob_len` on the head instead, which no writer can sidestep.
+#[gpui::test]
+async fn cold_cache_notices_a_wiped_blob_with_no_other_discriminator(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 0).await;
+    let blob = serde_json::to_vec(&crate::store::PersistedSession {
+        title: "closed paging session".into(),
+        entry_summaries: vec!["the secret the user wants gone".into()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    db.save_blob(session_id, blob).await.expect("save blob");
+
+    let load = async |cx: &mut gpui::TestAppContext| {
+        GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    include_full_content: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("a blob-only closed session must be served")
+            .structured_content
+    };
+
+    let first = load(cx).await;
+    assert_eq!(
+        first.total_count, 1,
+        "fixture must actually serve the blob first, or the test proves nothing"
+    );
+    assert_cached(cx, 1, "after the first blob-only load");
+
+    // A REWRITE, not just a drop. `blob_len` is a length rather than an
+    // `IS NOT NULL` because length is both cheaper and strictly more
+    // informative (see `ColdSessionHead::blob_len` for the measurement), and
+    // "more informative" is only true if something depends on it: a resized blob
+    // must invalidate too, and none of the other discriminators move for it
+    // either.
+    let rewritten = serde_json::to_vec(&crate::store::PersistedSession {
+        title: "closed paging session".into(),
+        entry_summaries: vec![
+            "a much longer replacement line".into(),
+            "and a second one".into(),
+        ],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    db.save_blob(session_id, rewritten)
+        .await
+        .expect("rewrite blob");
+
+    // Asserted on CONTENT, not on `total_count`: adjacent legacy lines coalesce
+    // into one stream entry (`push_coalesced`), so the count is 1 either way and
+    // would have made this assertion vacuous.
+    let rewritten_read = load(cx).await;
+    let rewritten_md = rewritten_read
+        .entries
+        .iter()
+        .filter_map(|e| e.markdown.clone())
+        .collect::<String>();
+    assert!(
+        rewritten_md.contains("a much longer replacement line"),
+        "a resized blob must invalidate the cached copy, not be served stale; \
+         got {rewritten_md:?}"
+    );
+    assert!(
+        !rewritten_md.contains("the secret the user wants gone"),
+        "and the pre-rewrite text must be gone; got {rewritten_md:?}"
+    );
+
+    // The wipe, exactly as `persist_context_wipe` issues it, and ONLY that: rows
+    // deleted (there are none) and the blob cleared, in one savepoint. No
+    // `save_epoch` — that is the write the `!write_failed` gate declines — and no
+    // `clear_total_tokens`, which would have had nothing to clear anyway.
+    db.upsert_entries_trim_and_clear_blob(session_id, Vec::new(), 0)
+        .await
+        .expect("wipe");
+    assert!(
+        db.load_blob(session_id).await.expect("load blob").is_none(),
+        "the wipe must really have dropped the blob"
+    );
+
+    // Non-vacuity: every OTHER discriminator on the head is unmoved, so a cache
+    // that did not fingerprint the blob would still hit.
+    let head = db
+        .load_cold_head(session_id)
+        .await
+        .expect("load head")
+        .expect("head exists");
+    assert_eq!(head.entry_count, 0, "no rows to move entry_count");
+    assert_eq!(
+        head.max_entry_mod_seq, 0,
+        "no rows to move max_entry_mod_seq"
+    );
+    assert_eq!(head.epoch, 0, "the declined save_epoch leaves this at 0");
+    assert_eq!(
+        head.meta.total_tokens, None,
+        "clear_total_tokens has nothing to move on a zero-token session"
+    );
+    assert_eq!(head.blob_len, None, "the one discriminator that DID move");
+
+    let second = load(cx).await;
+    assert_eq!(
+        second.total_count,
+        0,
+        "a wiped session must not be served its deleted transcript from cache; \
+         got {:?}",
+        second
+            .entries
+            .iter()
+            .map(|e| e.markdown.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(second.entries.is_empty());
+}
+
 #[gpui::test]
 async fn cold_cache_on_a_legacy_blob_session(cx: &mut gpui::TestAppContext) {
     use crate::session_entry::{SessionEntry, SessionEntryKind};

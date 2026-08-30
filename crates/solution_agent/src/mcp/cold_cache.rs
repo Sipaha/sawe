@@ -21,7 +21,7 @@
 //! That is a total check rather than a heuristic, because
 //! `store::build_cold_session` is a pure function of exactly
 //! `(meta, rows, blob, epoch, change_seq, tab_order)`. Four of those six are
-//! compared verbatim; the other two are argued:
+//! compared verbatim and the other two are fingerprinted:
 //!
 //! - `meta`, `tab_order`, `epoch` and `change_seq` — compared field by field
 //!   (hence the `PartialEq` on `SolutionSessionMetadata`, whose doc comment
@@ -33,25 +33,22 @@
 //!   strictly monotonic per session, so no persist path can change a row
 //!   without moving the count or the max. If you add a writer that can, this is
 //!   the door it comes through;
-//! - `blob` is likewise not compared. It has exactly one writer —
-//!   `persist_context_wipe` -> `upsert_entries_trim_and_clear_blob`, which drops
-//!   it as part of a `/clear` or `/compact` wipe (`update_blob` still has no
-//!   production caller, and `insert_or_update_metadata` never names
-//!   `acp_thread_blob`). That writer cannot slip past the head: both call sites
-//!   `bump_epoch()` first and the wipe persists it via `save_epoch`, AND they
-//!   `clear_total_tokens`, which moves a `meta` field — two independent
-//!   discriminators, either of which invalidates. A legacy blob-only session
-//!   that instead gains rows moves `entry_count` off 0.
+//! - `blob` is likewise not compared, it is **fingerprinted** by `blob_len`
+//!   (`LENGTH(acp_thread_blob)`, `None` for NULL). Any writer that adds, drops
+//!   or resizes it moves the head, with no appeal to who the writers are.
 //!
-//!   The epoch half of that survived `persist_all_rows_inner` making its
-//!   `save_epoch` conditional on the row write succeeding, and is in fact now
-//!   tighter: the blob clear rides in the SAME savepoint as that write, so a
-//!   cleared blob implies a committed write implies a saved epoch. The two can
-//!   no longer come apart in the direction that would matter here (blob gone,
-//!   head unmoved).
-//!
-//! If you add a SECOND blob writer, check it moves one of those; this is the
-//! one input whose safety rests on its writers rather than on a fingerprint.
+//! `blob_len` used to be an argument instead — the blob had one writer
+//! (`persist_context_wipe`), and that writer was held to also move `epoch` and
+//! `total_tokens`, so the head could not miss it. That argument was FALSE, and
+//! it is worth saying how, because it is the shape to distrust rather than the
+//! specific hole: it rested on two *incidental* side effects of an unrelated
+//! code path staying incidental. When `persist_all_rows_inner` learned to
+//! decline `save_epoch` while a chained predecessor's write had failed, a wipe
+//! could commit (blob cleared, rows deleted) with the epoch unmoved; for a
+//! blob-only session with no rows and zero tokens, `entry_count`,
+//! `max_entry_mod_seq` and `total_tokens` do not move either, so the cache
+//! served the deleted transcript for the whole TTL. A fingerprint cannot rot
+//! that way, which is why this input is now one.
 //!
 //! The head is read BEFORE the transcript, which is what makes a torn read
 //! safe: if a writer lands between the two, the entity is built from rows that
