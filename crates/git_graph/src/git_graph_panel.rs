@@ -284,6 +284,44 @@ mod tests {
         );
     }
 
+    /// Nothing in-tree resolves the shipped keymaps against the registered
+    /// action set, which is how four dead `git_graph::*` bindings survived
+    /// until `18eaec348f` deleted them. This is deliberately not that
+    /// resolution test — it cannot see an unregistered action or a wrong
+    /// context — but it does pin the exact name all three platform keymaps
+    /// spell against the action's real one, so a rename cannot silently turn
+    /// `ctrl-alt-\`` into a binding that is dropped at load, and cannot be
+    /// applied to one keymap while the other two are forgotten. Matching a
+    /// whole line rather than a formatted substring keeps it robust to
+    /// re-indentation while still pinning chord and action *together*.
+    #[test]
+    fn every_platform_keymap_binds_the_chord_to_the_real_action_name() {
+        let action_name = ToggleFocus.name();
+        for (platform, keymap) in [
+            (
+                "linux",
+                include_str!("../../../assets/keymaps/default-linux.json"),
+            ),
+            (
+                "macos",
+                include_str!("../../../assets/keymaps/default-macos.json"),
+            ),
+            (
+                "windows",
+                include_str!("../../../assets/keymaps/default-windows.json"),
+            ),
+        ] {
+            assert!(
+                keymap
+                    .lines()
+                    .any(|line| { line.contains("\"ctrl-alt-`\"") && line.contains(action_name) }),
+                "default-{platform}.json must bind ctrl-alt-` to {action_name} \
+                 on one line; a rename that misses a keymap leaves a binding \
+                 that resolves to nothing"
+            );
+        }
+    }
+
     /// The whole tri-state, on a workspace with **no** repository — the case
     /// that used to be unreachable. The panel hands out a handle that only
     /// `render`'s `track_focus` puts in the dispatch tree, so before that

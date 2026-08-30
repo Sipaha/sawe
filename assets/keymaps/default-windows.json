@@ -630,9 +630,11 @@
       // section, so it gets the same tri-state hotkey its two siblings have
       // (`ctrl-\`` terminal, `ctrl-shift-d` / `cmd-shift-d` debugger).
       // Not a `g` mnemonic: `ctrl-shift-g` is `git_panel::ToggleFocus` right
-      // below, and `ctrl-alt-g` / `ctrl-alt-shift-g` are the `"Pane"`
-      // context's search-match bindings, which would shadow this almost
-      // everywhere. `ctrl-alt-\`` is unbound in every keymap this repo
+      // below on all three platforms, and `ctrl-alt-g` / `ctrl-alt-shift-g`
+      // are the `"Pane"` context's search-match bindings in
+      // `default-linux.json`, which would shadow this almost everywhere
+      // there — the chord is kept identical across platforms rather than
+      // split per keymap. `ctrl-alt-\`` is unbound in every keymap this repo
       // ships, so unlike `ctrl-shift-a` it also fires from inside a terminal
       // or an editor.
       "ctrl-alt-`": "git_graph::ToggleFocus",
