@@ -28,9 +28,7 @@ impl SolutionSessionView {
     ) -> Self {
         // `observe_in`, not `observe`: `flush_pending_send_if_ready` below has to
         // be able to put a REFUSED send's draft back into the compose editor, and
-        // `Editor::set_text` needs a `Window`. It is also strictly better here —
-        // it drops the subscription when the observed entity goes away, not only
-        // when this view does.
+        // `Editor::set_text` needs a `Window`.
         //
         // The delta to be aware of is NOT "the callback is dropped once the
         // window is gone". It is that the body runs inside `App::with_window`,
