@@ -4474,23 +4474,26 @@ async fn get_session_refuses_to_serve_an_undecodable_blob_as_empty(cx: &mut gpui
     );
 }
 
-/// The scope of the refusal above, pinned rather than assumed: it is the COLD
-/// path only.
+/// The SCOPE of the refusal above, which used to be the cold path only.
 ///
-/// Every read RPC prefers the in-memory store, and `hydrate_all_for_solution`
-/// registers a session whose blob would not decode as an ordinary empty one. So
-/// for as long as the Solution is OPEN, `get_session` serves that corrupt
-/// session as an empty transcript and does not error — the same "corruption
-/// reported as emptiness" the cold path now refuses.
+/// This test previously carried the name
+/// `an_open_solution_still_serves_a_corrupt_session_as_empty` and pinned the
+/// limit as tolerable: every read RPC prefers the in-memory store, and
+/// `hydrate_all_for_solution` registers a session whose blob would not decode as
+/// an ordinary EMPTY one, so for as long as the Solution was OPEN all four tools
+/// served corruption as emptiness with no error. Non-destructive, but not
+/// honest — a client could not tell a `/clear`ed conversation from one that
+/// could not be read. The limit is now closed (FORK.md #110), and this test
+/// records the closure rather than the limit: ONE corrupt session is driven
+/// through BOTH regimes and all four read tools must answer `session_unreadable`
+/// in each.
 ///
-/// Pinned as a KNOWN LIMIT, not as desired behaviour. Two things make it
-/// tolerable and both are asserted here: the tools do not contradict each other
-/// in either regime, and the destructive half (a corrupt session being migrated
-/// into a permanently wiped one) is fixed in both. Closing it properly means the
-/// live session carrying the failure, which is a bigger change than a read
-/// guard; if that lands, this test is what tells you the behaviour moved.
+/// The two properties that made the old limit tolerable are still asserted, so
+/// closing the honesty gap cannot have reopened the destructive one: the tools
+/// do not contradict each other in either regime, and the bytes plus the epoch
+/// are left untouched on disk.
 #[gpui::test]
-async fn an_open_solution_still_serves_a_corrupt_session_as_empty(cx: &mut gpui::TestAppContext) {
+async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestAppContext) {
     let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
     let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
@@ -4540,17 +4543,116 @@ async fn an_open_solution_still_serves_a_corrupt_session_as_empty(cx: &mut gpui:
         .await
         .expect("save blob");
 
-    // COLD: refused, as the sibling test pins in detail.
-    GetSessionTool
-        .run(
-            GetSessionParams {
-                session_id: session_id.to_string(),
-                ..Default::default()
-            },
-            &mut cx.to_async(),
-        )
+    // The ANTI-VACUITY control, seeded into the SAME Solution so it is restored
+    // by the same `hydrate_all_for_solution` call: an intact legacy blob. Every
+    // assertion below pairs "the corrupt one is refused" with "this one is
+    // served", so a guard that simply refused everything — or a fixture that was
+    // missing something every read needs — fails the test instead of passing it.
+    let healthy_id = crate::model::SolutionSessionId::new();
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id: healthy_id,
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new("acp-healthy-open"),
+        title: SharedString::from("healthy session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    })
+    .await
+    .expect("save healthy metadata");
+    db.save_blob(healthy_id, intact)
         .await
-        .expect_err("cold read refuses");
+        .expect("save healthy blob");
+
+    // Every read tool, on both sessions, in whichever regime the store is in.
+    // Returns `Ok(())` when the tool served the session and `Err(message)` when
+    // it refused, so one helper can express "all four refuse" and "all four
+    // serve" without four copies of each.
+    async fn read_all_four(
+        id: crate::model::SolutionSessionId,
+        cx: &mut gpui::TestAppContext,
+    ) -> Vec<(&'static str, Result<usize, String>)> {
+        let get_session = GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: id.to_string(),
+                    include_full_content: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .map(|r| r.structured_content.total_count)
+            .map_err(|err| format!("{err:#}"));
+        let changes = GetSessionChangesTool
+            .run(
+                GetSessionChangesParams {
+                    session_id: id.to_string(),
+                    since_seq: 0,
+                    known_epoch: 0,
+                    stream_id: None,
+                    include_images: false,
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .map(|r| r.structured_content.total_count)
+            .map_err(|err| format!("{err:#}"));
+        let entry = GetSessionEntryTool
+            .run(
+                GetSessionEntryParams {
+                    session_id: id.to_string(),
+                    index: 0,
+                    stream_id: None,
+                    include_images: false,
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .map(|_| 1usize)
+            .map_err(|err| format!("{err:#}"));
+        let history = ReadSessionHistoryTool
+            .run(
+                ReadSessionHistoryParams {
+                    session_id: id.to_string(),
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .map(|r| r.structured_content.total_entries)
+            .map_err(|err| format!("{err:#}"));
+        vec![
+            ("get_session", get_session),
+            ("get_session_changes", changes),
+            ("get_session_entry", entry),
+            ("read_session_history", history),
+        ]
+    }
+
+    // COLD: all four refuse, all four with the same code. The sibling test above
+    // pins this regime in detail; it is repeated here so the hot assertions can
+    // be compared against it rather than against a remembered claim.
+    for (tool, outcome) in read_all_four(session_id, cx).await {
+        let err = outcome.expect_err(tool);
+        assert!(
+            err.contains("session_unreadable"),
+            "COLD {tool} must refuse with session_unreadable; got {err:?}"
+        );
+    }
+    for (tool, outcome) in read_all_four(healthy_id, cx).await {
+        let served = outcome.unwrap_or_else(|err| panic!("COLD {tool} refused the control: {err}"));
+        assert_eq!(served, 1, "COLD {tool} must serve the control's one entry");
+    }
 
     // Open the Solution. This is the ordinary desktop restore.
     cx.update(|cx| {
@@ -4562,59 +4664,107 @@ async fn an_open_solution_still_serves_a_corrupt_session_as_empty(cx: &mut gpui:
     .expect("restore");
     cx.run_until_parked();
     cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let (session, healthy) = store.read_with(cx, |store, _| {
+            (store.session(session_id), store.session(healthy_id))
+        });
+        let session =
+            session.expect("the session must now be in memory, or this is still the cold path");
         assert!(
-            SolutionAgentStore::global(cx)
-                .read(cx)
-                .session(session_id)
-                .is_some(),
-            "the session must now be in memory, or this test is still measuring \
-             the cold path"
+            session.read(cx).transcript_unavailable,
+            "the restore must carry the failure onto the live entity — that flag is \
+             the only thing the hot guard has to go on"
+        );
+        assert!(
+            session.read(cx).entries.is_empty(),
+            "and the entity it registered really is the empty one, so 'refused' \
+             below cannot be coming from a transcript that happened to load"
+        );
+        let healthy = healthy.expect("the control must be hydrated by the same call");
+        assert!(
+            !healthy.read(cx).transcript_unavailable,
+            "…and the control must NOT be flagged, or the hot half of this test \
+             compares two refusals"
         );
     });
 
-    // HOT: served as empty, with no error. The known limit.
-    let sc = GetSessionTool
+    // HOT: the gap this test used to pin as a known limit. All four refuse with
+    // the same code the cold regime raised, so a client gets one answer for one
+    // condition no matter whether the Solution happens to be open.
+    for (tool, outcome) in read_all_four(session_id, cx).await {
+        let err = outcome.expect_err(tool);
+        assert!(
+            err.contains("session_unreadable"),
+            "HOT {tool} must refuse with session_unreadable; got {err:?}"
+        );
+        assert!(
+            !err.contains("session_not_found"),
+            "HOT {tool} must not claim the row is gone; got {err:?}"
+        );
+    }
+    // `get_session_entry` in particular must refuse for the RIGHT reason: the
+    // flagged session's Main stream is empty, so a guard placed after the bounds
+    // check would still error — with `entry_index_out_of_range`, i.e. "that entry
+    // does not exist", which is the same lie in a different sentence.
+    let entry_err = GetSessionEntryTool
         .run(
-            GetSessionParams {
+            GetSessionEntryParams {
                 session_id: session_id.to_string(),
-                include_full_content: true,
-                ..Default::default()
+                index: 0,
+                stream_id: None,
+                include_images: false,
             },
             &mut cx.to_async(),
         )
         .await
-        .expect(
-            "KNOWN LIMIT: while the Solution is open the live store answers, and it \
-             holds the empty session hydration built",
-        )
-        .structured_content;
-    assert_eq!(
-        sc.total_count, 0,
-        "and it answers 'empty', not the transcript"
+        .expect_err("hot get_session_entry refuses");
+    assert!(
+        !format!("{entry_err:#}").contains("entry_index_out_of_range"),
+        "the guard must run BEFORE the bounds check; got {entry_err:#}"
     );
+    for (tool, outcome) in read_all_four(healthy_id, cx).await {
+        let served = outcome.unwrap_or_else(|err| panic!("HOT {tool} refused the control: {err}"));
+        assert_eq!(served, 1, "HOT {tool} must serve the control's one entry");
+    }
 
-    // The two mitigations, both load-bearing for calling this tolerable.
-    let history = ReadSessionHistoryTool
-        .run(
-            ReadSessionHistoryParams {
-                session_id: session_id.to_string(),
-                ..Default::default()
-            },
-            &mut cx.to_async(),
-        )
-        .await
-        .expect("the live path answers here too")
-        .structured_content;
-    assert_eq!(
-        history.source, "live",
-        "the tools must agree by taking the SAME path — one refusing while the \
-         other serves empty is the disagreement this whole task removed"
-    );
-    assert_eq!(history.total_entries, 0);
+    // The guard is deliberately UNCONDITIONAL on the transcript being empty, not
+    // "flagged AND nothing there". Give the flagged session an entry it could
+    // serve and it must still refuse: a partial transcript served as a whole one
+    // is the same lie in a smaller size, and the cold path refuses whatever it
+    // managed to reconstruct too.
+    cx.update(|cx| {
+        use crate::session_entry::{SessionEntry, SessionEntryKind};
+        let store = SolutionAgentStore::global(cx);
+        let session = store
+            .read_with(cx, |store, _| store.session(session_id))
+            .expect("still in memory");
+        session.update(cx, |s, _| {
+            s.entries.push(std::sync::Arc::new(SessionEntry {
+                created_ms: 1_700_000_000_000,
+                mod_seq: 1,
+                subagent_id: None,
+                kind: SessionEntryKind::UserMessage {
+                    id: None,
+                    content_md: "a fragment that arrived after the failed read".into(),
+                    chunks: vec![fake_user_text_chunk("a fragment")],
+                },
+            }));
+            s.hydrate_streams_main_only();
+        });
+    });
+    for (tool, outcome) in read_all_four(session_id, cx).await {
+        let err = outcome.expect_err(tool);
+        assert!(
+            err.contains("session_unreadable"),
+            "a flagged session with a partial transcript must still be refused by \
+             {tool}; got {err:?}"
+        );
+    }
+
+    // The mitigations that made the old limit tolerable must survive the fix.
     assert!(
         db.load_blob(session_id).await.expect("load blob").is_some(),
-        "and the destructive half stays fixed in this regime: the restore left \
-         the bytes on disk"
+        "the destructive half stays fixed: the restore left the bytes on disk"
     );
     assert_eq!(
         db.load_epoch(session_id).await.expect("load epoch"),

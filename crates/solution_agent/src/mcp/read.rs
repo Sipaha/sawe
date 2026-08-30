@@ -537,10 +537,14 @@ impl McpServerTool for GetSessionTool {
         let in_memory = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             let entity = store.read_with(cx, |store, _| store.session(session_id))?;
-            Some(build_get_session_result(entity.read(cx), &input, cx))
+            let session = entity.read(cx);
+            Some(
+                ensure_transcript_readable(session, session_id)
+                    .map(|()| build_get_session_result(session, &input, cx)),
+            )
         });
         let result = match in_memory {
-            Some(result) => result,
+            Some(result) => result?,
             // 2. Cold path: not in memory, but its rows may still be on disk.
             None => get_session_from_db(session_id, &input, cx).await?,
         };
@@ -551,6 +555,47 @@ impl McpServerTool for GetSessionTool {
             structured_content: result,
         })
     }
+}
+
+/// The IN-MEMORY counterpart of `load_cold_session`'s `undecodable_blob`
+/// refusal, and the reason the two regimes now answer a corrupt session the
+/// same way.
+///
+/// A session whose transcript could not be read at restore time is registered
+/// in `store.sessions` with an EMPTY `entries` and
+/// `SolutionSession::transcript_unavailable` set (FORK.md #110 — the flag lives
+/// on the session precisely so every consumer can ask). Every read RPC prefers
+/// the in-memory store, so without this guard the whole refusal evaporated the
+/// moment the Solution was opened: the four tools served the same corrupt
+/// session as an empty transcript with no error, and a client could not tell
+/// "the user cleared this conversation" from "this conversation could not be
+/// read". Non-destructive, but not honest.
+///
+/// Deliberately UNCONDITIONAL on `entries` being empty. A flagged session with
+/// live entries is a partial transcript, and serving a partial transcript as a
+/// whole one is the same lie in a smaller size; the cold path refuses whatever
+/// it managed to reconstruct, so refusing here too is also what keeps the two
+/// regimes byte-identical. (It is unreachable anyway: a send is routed to
+/// `retry_transcript_load` and refused, and a system note is dropped, so
+/// nothing appends to a flagged session.)
+///
+/// The `session_unreadable:` code is the cold path's, so a client bucketing by
+/// prefix files one condition under one class in both regimes. The TEXT
+/// differs on purpose: the cold refusal knows the failure was a blob that would
+/// not decode, whereas the flag records only *that* a read failed — a row load,
+/// an epoch load or a decode — so claiming "cannot be decoded" here would name
+/// a cause nobody established.
+fn ensure_transcript_readable(
+    session: &crate::model::SolutionSession,
+    session_id: SolutionSessionId,
+) -> Result<()> {
+    anyhow::ensure!(
+        !session.transcript_unavailable,
+        "session_unreadable: {session_id} is open, but its persisted transcript could not be \
+         read when it was restored; the in-memory copy is empty and is NOT this session's \
+         content. The bytes are still on disk — reopening the Solution retries the read."
+    );
+    Ok(())
 }
 
 /// Assemble the `get_session` payload for one session. Split out of the tool
@@ -811,16 +856,11 @@ async fn load_cold_session(
     // Deliberately BEFORE the cache store: a failed build must not be handed to
     // the next poll as a valid reconstruction.
     //
-    // SCOPE, because it is narrower than it reads: this is the COLD path. Every
-    // read RPC prefers the in-memory store, and `hydrate_all_for_solution`
-    // registers a corrupt session as an ordinary empty one — so while its
-    // Solution is OPEN, all four tools serve the same corrupt session as an empty
-    // transcript with no error at all. They still agree with each other in both
-    // regimes, and the destructive half (a corrupt session being MIGRATED into a
-    // permanently-wiped one) is fixed regardless of which regime you are in. What
-    // is not yet fixed is corruption being reported as emptiness on an open
-    // Solution; closing that means the live store carrying the failure, which is
-    // a bigger change than a read guard.
+    // SCOPE: this is the COLD half. Every read RPC prefers the in-memory store,
+    // so the hot half is `ensure_transcript_readable`, which asks the restored
+    // entity's `transcript_unavailable` flag the same question and raises the
+    // same `session_unreadable:` code. Both halves are needed — this one alone
+    // evaporated as soon as the Solution was opened.
     if let Some(err) = build.undecodable_blob {
         return Err(err.context(format!(
             "session_unreadable: {session_id} has an archived transcript that cannot be decoded"
@@ -979,14 +1019,22 @@ impl McpServerTool for GetSessionChangesTool {
         let in_memory = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             let entity = store.read_with(cx, |store, _| store.session(session_id))?;
-            Some(build_get_session_changes_result(
-                entity.read(cx),
-                &input,
-                cx,
-            ))
+            let session = entity.read(cx);
+            // An unreadable transcript is an ERROR here, not an empty delta,
+            // even though a polling client will now see it on every poll. The
+            // cold path already errors for the same session (its
+            // `load_cold_session` refuses), so the alternatives were "hot and
+            // cold disagree" or "both quietly report data loss as being caught
+            // up" — and a client that is told it is caught up on an empty
+            // transcript stops asking and renders the loss as the truth. A
+            // repeated error at least keeps the session on screen as broken.
+            Some(
+                ensure_transcript_readable(session, session_id)
+                    .map(|()| build_get_session_changes_result(session, &input, cx)),
+            )
         });
         let result = match in_memory {
-            Some(result) => result,
+            Some(result) => result?,
             // 2. Cold path: not in memory, but still on disk. Must stay in
             //    lock-step with `get_session`'s own fallback — a client that
             //    was served a cold full load then polls this RPC with the
@@ -1305,7 +1353,11 @@ impl McpServerTool for GetSessionEntryTool {
         let in_memory = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             let entity = store.read_with(cx, |store, _| store.session(session_id))?;
-            Some(build_get_session_entry_result(entity.read(cx), &input, cx))
+            let session = entity.read(cx);
+            Some(
+                ensure_transcript_readable(session, session_id)
+                    .and_then(|()| build_get_session_entry_result(session, &input, cx)),
+            )
         });
         let result = match in_memory {
             Some(result) => result?,
@@ -1502,21 +1554,30 @@ impl McpServerTool for ReadSessionHistoryTool {
         // row-native sessions, the blob is no longer the source of
         // truth). Reading `session.entries` makes the in-memory read the
         // single source for both states.
+        //
+        //    This tool does NOT share `load_cold_session` with the other three
+        //    (its archive path below is its own), so the in-memory guard has to
+        //    be applied here by hand rather than inherited — the live branch is
+        //    the one route that skips every shared seam.
         let live = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.read_with(cx, |store, _| {
                 let session = store.session(session_id)?;
                 let s = session.read(cx);
+                if let Err(err) = ensure_transcript_readable(s, session_id) {
+                    return Some(Err(err));
+                }
                 let title = s.title.to_string();
                 let entries = s
                     .entries
                     .iter()
                     .map(|entry| session_entry_to_markdown(&entry.kind))
                     .collect::<Vec<String>>();
-                Some((title, entries))
+                Some(Ok((title, entries)))
             })
         });
-        if let Some((title, entries)) = live {
+        if let Some(live) = live {
+            let (title, entries) = live?;
             let total = entries.len();
             let slice = entries
                 .into_iter()
