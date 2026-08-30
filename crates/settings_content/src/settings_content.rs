@@ -561,7 +561,9 @@ pub struct DebuggerSettingsContent {
     ///
     /// Default: true
     pub save_breakpoints: Option<bool>,
-    /// Whether to show the debug button in the status bar.
+    /// INERT in this fork. It gated the debugger's dock-strip icon; the dock
+    /// strips are gone and the band's utility contents carry their own buttons.
+    /// Nothing reads this field. Kept so existing settings files stay valid.
     ///
     /// Default: true
     pub button: Option<bool>,
@@ -577,7 +579,9 @@ pub struct DebuggerSettingsContent {
     ///
     /// Default: true
     pub format_dap_log_messages: Option<bool>,
-    /// The dock position of the debug panel
+    /// INERT in this fork. The debugger is hosted in the Solution band's
+    /// utility section rather than a dock, so it has no dock position to set —
+    /// see FORK.md #97. Kept so existing settings files stay valid.
     ///
     /// Default: Bottom
     pub dock: Option<DockPosition>,

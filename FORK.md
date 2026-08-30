@@ -1391,6 +1391,19 @@ is deterministic *because* the impl went, not merely as a side effect. The setti
 `test_new_sessions_ignore_the_debugger_dock_setting`, and `settings_ui` no longer renders a control for it —
 a working-looking dropdown over an inert setting is the dead-control trap.
 
+**Ruling (2026-08-31): `debugger.dock` and `debugger.button` stay in the schema, inert, permanently — do not
+re-open this.** Two plans have now declined to remove them and a third session re-derived the question from
+scratch, so here is the settled reasoning. Both are genuinely dead: `dock` has exactly one reader,
+`dap::send_telemetry`, and telemetry is disabled fork-wide, so it steers nothing even there; `button` has no
+reader anywhere in the tree. Deleting them is a settings migration — a `migrator` entry plus a schema change
+plus removing the telemetry field — for zero user-visible benefit, because an accepted-and-ignored key behaves
+identically to an absent one. What was actually wrong was not their presence but that they **lied**: the JSON
+schema's hover text still described a status-bar button and a dock position, so the settings editor advertised
+working controls. `assets/settings/default.json` already annotated both as inert; the Rust doc comments on
+`DebuggerSettings` and `DebuggerSettingsContent` now do too, which is what the schema actually renders. The
+general form: **an inert setting is fine, a lying one is not** — when a fork disables the thing a setting
+steered, annotate the doc comment that feeds the schema, don't just annotate the defaults file.
+
 Two more consequences fall out of having no dock: panel-level zoom became an explicit swallow-the-action
 no-op (there is no dock to zoom, and the band owns its own geometry), and the panel's "Close Panel" button,
 which dispatched `workspace::ToggleBottomDock`, now hides the band's utility section instead. `RunningState`'s
