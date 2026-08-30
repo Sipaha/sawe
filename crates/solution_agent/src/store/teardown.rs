@@ -566,6 +566,11 @@ impl SolutionAgentStore {
         self.metrics_emitter.clear_session(&id);
         self.raw_transcript_history.remove(&id);
         self.last_auto_reconnect_ms.remove(&id);
+        // Dropped with the session for the same reason as the maps above: it is
+        // keyed by session id and nothing else prunes it. Safe to drop even with
+        // a chain still draining — the flag only ever schedules a re-flush, and a
+        // reopened session's first persist is a full `persist_all_rows` anyway.
+        self.entry_write_failed.remove(&id);
     }
 
     /// Tear down the IN-MEMORY runtime state shared by every per-session

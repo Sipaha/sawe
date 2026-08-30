@@ -2328,3 +2328,169 @@ async fn a_failed_row_write_must_not_advance_the_epoch(cx: &mut TestAppContext) 
         "persist_main_stream must apply the same rule as persist_all_rows"
     );
 }
+
+/// The other half of "a failed write must not lie about what landed": the
+/// WATERMARK.
+///
+/// Both persist paths advance `persisted_main_seq` synchronously, in event
+/// order, before the detached write runs — deliberately, since that is what
+/// stops a burst of ingest events each re-capturing rows an earlier link
+/// already owns. But the advance used to happen whether or not the write
+/// succeeded, so a failed flush left the watermark claiming rows that are not
+/// on disk, and the NEXT flush's `mod_seq > watermark` delta skipped them
+/// permanently.
+///
+/// That is ordinary data loss on its own. It matters more now: the surviving
+/// flush still saves its epoch, so for a legacy session mid-migration the disk
+/// ends up at zero rows + `epoch > 0` + a retained blob — exactly the shape
+/// `is_wiped_row_native` treats as authoritative, which would suppress a real
+/// transcript forever.
+#[gpui::test]
+async fn a_failed_row_write_makes_the_next_flush_re_cover_every_row(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    // Alternating roles so `Stream::push_coalesced` cannot merge them: three
+    // distinct Main entries, one per flush.
+    let push_assistant = |text: &'static str, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            acp_thread.update(cx, |t, cx| {
+                t.push_assistant_content_block(
+                    agent_client_protocol::schema::ContentBlock::Text(
+                        agent_client_protocol::schema::TextContent::new(text.to_string()),
+                    ),
+                    false,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+    };
+    let push_user = |text: &'static str, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            acp_thread.update(cx, |t, cx| {
+                t.push_user_content_block(
+                    Some(acp_thread::UserMessageId::new()),
+                    agent_client_protocol::schema::ContentBlock::Text(
+                        agent_client_protocol::schema::TextContent::new(text.to_string()),
+                    ),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+    };
+
+    push_assistant("alpha", cx);
+    assert_eq!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after alpha")
+            .len(),
+        1,
+        "the first flush must land before the failure is introduced"
+    );
+
+    // A transient I/O failure swallows the SECOND flush. The watermark still
+    // advances past it — that is the optimistic advance the rollback exists for.
+    db.break_entry_writes_for_test().expect("break writes");
+    push_user("bravo", cx);
+    db.restore_entry_writes_for_test().expect("restore writes");
+
+    // The next flush consumes the failure flag, resets the watermark, and
+    // therefore re-covers `bravo` instead of writing only `charlie` over a hole.
+    push_assistant("charlie", cx);
+
+    let rows = db
+        .load_entries(session_id)
+        .await
+        .expect("load rows after recovery");
+    let texts: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{:?}",
+                crate::session_entry::kind_from_payload(&row.payload).expect("decode payload")
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        3,
+        "the recovered flush must re-cover every Main row, not just its own \
+         delta over the hole the failed write left; got {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("bravo")),
+        "the entry whose write failed must be back on disk; got {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("alpha")) && texts.iter().any(|t| t.contains("charlie")),
+        "and the flushes either side of it must be intact; got {texts:?}"
+    );
+}
+
+/// `MockAgentServer`'s options are not mutually exclusive, and `connect` used to
+/// choose between them with a priority `match` that silently dropped the losers
+/// — a server built with a prompt gate AND resume support handed out a
+/// connection that refused to resume, with no error anywhere. Latent then (no
+/// caller combined them); pinned now, because the next caller to combine them
+/// would have debugged a resume failure that had nothing to do with resume.
+#[gpui::test]
+async fn mock_agent_server_composes_a_prompt_gate_with_resume_support(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    let (_prompt_tx, prompt_rx) = async_channel::unbounded::<()>();
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::configured(
+                    Arc::new(AtomicUsize::new(0)),
+                    None,
+                    Some(prompt_rx),
+                    None,
+                    true,
+                )),
+            );
+        });
+    });
+
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: crate::model::SolutionSessionId::new(),
+        solution_id,
+        agent_id,
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-combined"),
+        title: SharedString::from("combined options"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+
+    // Fails with "does not support loading or resuming sessions" if `connect`
+    // drops `supports_resume` because a prompt gate was also configured.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.resume_session(meta, project, cx))
+    })
+    .await
+    .expect("a prompt gate must not disable resume support");
+}

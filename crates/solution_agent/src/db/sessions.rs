@@ -62,7 +62,11 @@ impl SolutionAgentDb {
 
     pub fn load_blob(&self, id: SolutionSessionId) -> Task<Result<Option<Vec<u8>>>> {
         let connection = self.connection.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let blob_load_count = self.blob_load_count.clone();
         self.executor.spawn(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            blob_load_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let connection = connection.lock();
             select_blob(&connection, id)
         })

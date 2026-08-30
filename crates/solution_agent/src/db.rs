@@ -55,6 +55,14 @@ pub struct SolutionAgentDb {
     /// build carries neither the field nor the increment.
     #[cfg(any(test, feature = "test-support"))]
     entry_load_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many times [`Self::load_blob`] has read a session's legacy
+    /// transcript blob. Same rationale as `entry_load_count`, for the opposite
+    /// claim: every reconstruction path is supposed to consult the blob ONLY
+    /// when the session has no entry rows and is not a wiped row-native one, and
+    /// "we did not read it" is otherwise invisible — the wiped session's served
+    /// result is identical either way, since the blob would be discarded.
+    #[cfg(any(test, feature = "test-support"))]
+    blob_load_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct GlobalSolutionAgentDb(Shared<Task<Result<Arc<SolutionAgentDb>, Arc<anyhow::Error>>>>);
@@ -392,6 +400,8 @@ impl SolutionAgentDb {
             connection: Arc::new(Mutex::new(connection)),
             #[cfg(any(test, feature = "test-support"))]
             entry_load_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            blob_load_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -400,6 +410,14 @@ impl SolutionAgentDb {
     #[cfg(any(test, feature = "test-support"))]
     pub fn entry_load_count(&self) -> usize {
         self.entry_load_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Reads of a session's legacy blob served by [`Self::load_blob`] since this
+    /// handle was opened. See the field's own note for why it exists.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn blob_load_count(&self) -> usize {
+        self.blob_load_count
             .load(std::sync::atomic::Ordering::Acquire)
     }
 

@@ -295,11 +295,18 @@ pub(crate) fn unique_session_title(
 ///   `persist_context_wipe` and `persist_main_stream` (via `save_epoch`). If
 ///   you add a fourth, it belongs in this list.
 /// * All three save the epoch strictly AFTER awaiting the row write, and only
-///   if that write succeeded, so `epoch > 0` implies a row write really ran.
-///   `persist_main_stream` additionally only runs on ingest, which has rows to
-///   write by construction.
+///   if that write succeeded, so `epoch > 0` implies a row write really ran and
+///   committed. (Not "ran with rows to write": `persist_main_stream`'s
+///   `EntriesRemoved` rewind — `store::acp_event.rs`'s middle call site — can
+///   legitimately flush an empty delta at `main_len == 0`. That is a deliberate
+///   deletion, which the next bullet covers; do not upgrade this to "has rows by
+///   construction", which is what it used to say and is false.)
 /// * Every path that could set `epoch > 0` therefore either wrote rows (so we
 ///   are not in this branch) or deliberately deleted them.
+/// * And a write that FAILED cannot leave the watermark claiming otherwise: the
+///   optimistic `persisted_main_seq` advance is rolled back on failure (see
+///   `SolutionAgentStore::persist_all_rows_inner`), so a later flush cannot
+///   succeed with a delta that silently omits rows which never landed.
 ///
 /// Consequence worth stating plainly: for a session matching this predicate the
 /// blob is treated as unreadable. `persist_context_wipe` clears it at the source

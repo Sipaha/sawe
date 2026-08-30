@@ -2721,7 +2721,36 @@ async fn read_session_history_distinguishes_a_wiped_session_from_a_legacy_one(
          decode that yields \"\" for the sessions that actually take this branch"
     );
 
-    // (4) GENUINELY ABSENT: no metadata row at all. Still an error, and still
+    // (4) NEVER WROTE ANYTHING: metadata row, no rows, no blob, `epoch == 0` —
+    // an ordinary tab the user opened and closed without sending. This used to
+    // be `session_not_found`, because the old code reached for the blob as its
+    // existence check and so conflated "no blob" with "no session". It was the
+    // last case where these two tools still disagreed: `get_session` has always
+    // served it as an empty transcript. Existence is now decided by the head, so
+    // the conflation is gone.
+    let never_used = seed("never used");
+    let never_used_id = never_used.id;
+    db.save_metadata(never_used)
+        .await
+        .expect("save never-used metadata");
+    assert!(
+        db.load_blob(never_used_id)
+            .await
+            .expect("load blob")
+            .is_none(),
+        "fixture must have no blob"
+    );
+
+    let sc = read(never_used_id, cx)
+        .await
+        .expect("a session that exists but has no transcript must not read as missing")
+        .structured_content;
+    assert_eq!(sc.total_entries, 0);
+    assert!(sc.entries.is_empty());
+    assert_eq!(sc.source, "archived");
+    assert_eq!(sc.title, "never used");
+
+    // (5) GENUINELY ABSENT: no metadata row at all. Still an error, and still
     // the same error — "empty archive" must not swallow a bad id.
     let err = read(crate::model::SolutionSessionId::new(), cx)
         .await
@@ -4311,6 +4340,75 @@ async fn get_session_ignores_the_blob_of_a_wiped_row_native_session(cx: &mut gpu
              advertise 1 regardless, which every client cached above 1 reads as a reset"
         );
     }
+
+    // The cold read must not even LOAD a blob it is going to discard. Invisible
+    // in the served result (the entity drops it either way), but it costs a
+    // payload read per call and inflates the cold cache's `payload_bytes` with
+    // bytes the retained entity does not hold.
+    assert_eq!(
+        db.blob_load_count(),
+        0,
+        "load_cold_session must skip the blob read for a wiped row-native session"
+    );
+
+    // …and the counter is live, so that 0 means something. Same handle, a
+    // GENUINELY un-migrated session (`epoch` NULL): the cold read must consult
+    // its blob, and the count must move.
+    let legacy_id = crate::model::SolutionSessionId::new();
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id: legacy_id,
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new(format!("acp-{}", legacy_id.as_str())),
+        title: SharedString::from("legacy session"),
+        created_at: chrono::Utc::now(),
+        last_activity_at: chrono::Utc::now(),
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    })
+    .await
+    .expect("save legacy metadata");
+    db.save_blob(
+        legacy_id,
+        serde_json::to_vec(&crate::store::PersistedSession {
+            title: "legacy session".into(),
+            entry_summaries: vec!["a line the user still wants".into()],
+            ..Default::default()
+        })
+        .expect("encode blob"),
+    )
+    .await
+    .expect("save blob");
+
+    let legacy = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: legacy_id.to_string(),
+                include_full_content: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("legacy cold read")
+        .structured_content;
+    assert_eq!(
+        legacy.total_count, 1,
+        "an un-migrated session's blob must still be read"
+    );
+    assert_eq!(
+        db.blob_load_count(),
+        1,
+        "exactly one blob read, and it belongs to the legacy session — without \
+         this the 0 above would hold even if the counter were never incremented"
+    );
 }
 
 /// Seed a closed session (metadata row + `count` entry rows, nothing in

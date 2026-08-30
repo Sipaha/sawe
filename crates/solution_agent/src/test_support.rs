@@ -35,41 +35,41 @@ pub struct MockConnection {
 }
 
 impl MockConnection {
-    pub fn new() -> Self {
+    /// Every option at once. The named constructors below are sugar over this,
+    /// and `MockAgentServer::connect` builds through it directly — a
+    /// priority-ordered `match` over the options silently DROPPED whichever one
+    /// lost, which is how a server built with both a prompt gate and resume
+    /// support quietly produced a connection that could not resume.
+    pub fn configured(
+        prompt_gate: Option<async_channel::Receiver<()>>,
+        cancel_count: Option<Arc<AtomicUsize>>,
+        supports_resume: bool,
+    ) -> Self {
         Self {
             next_session: Cell::new(0),
-            prompt_gate: parking_lot::Mutex::new(None),
-            cancel_count: Arc::new(AtomicUsize::new(0)),
-            supports_resume: false,
+            prompt_gate: parking_lot::Mutex::new(prompt_gate),
+            cancel_count: cancel_count.unwrap_or_else(|| Arc::new(AtomicUsize::new(0))),
+            supports_resume,
         }
+    }
+
+    pub fn new() -> Self {
+        Self::configured(None, None, false)
     }
 
     /// A mock whose `resume_session` SUCCEEDS, re-attaching to the id it is
     /// handed. Needed to exercise `SolutionAgentStore::resume_session`'s
     /// fresh-entity branch, which is only reachable after a successful attach.
     pub fn with_resume_support() -> Self {
-        Self {
-            supports_resume: true,
-            ..Self::new()
-        }
+        Self::configured(None, None, true)
     }
 
     pub fn with_prompt_gate(gate: async_channel::Receiver<()>) -> Self {
-        Self {
-            next_session: Cell::new(0),
-            prompt_gate: parking_lot::Mutex::new(Some(gate)),
-            cancel_count: Arc::new(AtomicUsize::new(0)),
-            supports_resume: false,
-        }
+        Self::configured(Some(gate), None, false)
     }
 
     pub fn with_cancel_count(cancel_count: Arc<AtomicUsize>) -> Self {
-        Self {
-            next_session: Cell::new(0),
-            prompt_gate: parking_lot::Mutex::new(None),
-            cancel_count,
-            supports_resume: false,
-        }
+        Self::configured(None, Some(cancel_count), false)
     }
 }
 
@@ -217,59 +217,53 @@ pub struct MockAgentServer {
 unsafe impl Send for MockAgentServer {}
 
 impl MockAgentServer {
-    pub fn new(connect_count: Arc<AtomicUsize>) -> Self {
+    /// Every option at once; the named constructors below are sugar over this.
+    /// Same reason as [`MockConnection::configured`] — these options are not
+    /// mutually exclusive, and expressing them as separate constructors is what
+    /// made it possible to build a server that could not say "gate the prompt
+    /// AND allow resume".
+    pub fn configured(
+        connect_count: Arc<AtomicUsize>,
+        gate: Option<async_channel::Receiver<()>>,
+        prompt_gate: Option<async_channel::Receiver<()>>,
+        cancel_count: Option<Arc<AtomicUsize>>,
+        supports_resume: bool,
+    ) -> Self {
         Self {
             connect_count,
-            gate: parking_lot::Mutex::new(None),
-            prompt_gate: parking_lot::Mutex::new(None),
-            cancel_count: None,
-            supports_resume: false,
+            gate: parking_lot::Mutex::new(gate),
+            prompt_gate: parking_lot::Mutex::new(prompt_gate),
+            cancel_count,
+            supports_resume,
         }
     }
 
+    pub fn new(connect_count: Arc<AtomicUsize>) -> Self {
+        Self::configured(connect_count, None, None, None, false)
+    }
+
     pub fn with_gate(connect_count: Arc<AtomicUsize>, gate: async_channel::Receiver<()>) -> Self {
-        Self {
-            connect_count,
-            gate: parking_lot::Mutex::new(Some(gate)),
-            prompt_gate: parking_lot::Mutex::new(None),
-            cancel_count: None,
-            supports_resume: false,
-        }
+        Self::configured(connect_count, Some(gate), None, None, false)
     }
 
     pub fn with_prompt_gate(
         connect_count: Arc<AtomicUsize>,
         prompt_gate: async_channel::Receiver<()>,
     ) -> Self {
-        Self {
-            connect_count,
-            gate: parking_lot::Mutex::new(None),
-            prompt_gate: parking_lot::Mutex::new(Some(prompt_gate)),
-            cancel_count: None,
-            supports_resume: false,
-        }
+        Self::configured(connect_count, None, Some(prompt_gate), None, false)
     }
 
     pub fn with_cancel_count(
         connect_count: Arc<AtomicUsize>,
         cancel_count: Arc<AtomicUsize>,
     ) -> Self {
-        Self {
-            connect_count,
-            gate: parking_lot::Mutex::new(None),
-            prompt_gate: parking_lot::Mutex::new(None),
-            cancel_count: Some(cancel_count),
-            supports_resume: false,
-        }
+        Self::configured(connect_count, None, None, Some(cancel_count), false)
     }
 
     /// Hands out a `MockConnection::with_resume_support`, so
     /// `SolutionAgentStore::resume_session` can actually attach.
     pub fn with_resume_support(connect_count: Arc<AtomicUsize>) -> Self {
-        Self {
-            supports_resume: true,
-            ..Self::new(connect_count)
-        }
+        Self::configured(connect_count, None, None, None, true)
     }
 }
 
@@ -295,15 +289,13 @@ impl agent_servers::AgentServer for MockAgentServer {
             if let Some(gate) = gate {
                 gate.recv().await.log_err();
             }
-            let connection: Rc<dyn acp_thread::AgentConnection> = match (prompt_gate, cancel_count)
-            {
-                (Some(prompt_gate), _) => Rc::new(MockConnection::with_prompt_gate(prompt_gate)),
-                (None, Some(cancel_count)) => {
-                    Rc::new(MockConnection::with_cancel_count(cancel_count))
-                }
-                (None, None) if supports_resume => Rc::new(MockConnection::with_resume_support()),
-                (None, None) => Rc::new(MockConnection::new()),
-            };
+            // Every option forwarded, none of them mutually exclusive. This was
+            // a priority `match` and it silently dropped the losers — a server
+            // built `with_prompt_gate` AND resume support handed out a
+            // connection that refused to resume, with no error anywhere.
+            let connection: Rc<dyn acp_thread::AgentConnection> = Rc::new(
+                MockConnection::configured(prompt_gate, cancel_count, supports_resume),
+            );
             Ok(connection)
         })
     }

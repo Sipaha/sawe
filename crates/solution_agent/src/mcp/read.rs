@@ -763,9 +763,13 @@ async fn load_cold_session(
         return Ok(session);
     }
     let rows = db.load_entries(session_id).await?;
-    // The legacy blob is only consulted when the session has no entry rows —
-    // same precedence as hydration and `read_session_history`.
-    let blob = if rows.is_empty() {
+    // The legacy blob is only consulted when the session has no entry rows AND
+    // is not a WIPED row-native one — same precedence as hydration and
+    // `read_session_history`. Gating the load, not the use: `build_cold_session`
+    // would drop a wiped session's blob anyway, so reading it burnt a payload
+    // read for nothing and then inflated `payload_bytes`, skewing the cold
+    // cache's byte bound with bytes the retained entity does not hold.
+    let blob = if rows.is_empty() && !crate::store::is_wiped_row_native(true, head.epoch) {
         db.load_blob(session_id).await?
     } else {
         None
@@ -1478,11 +1482,14 @@ impl McpServerTool for ReadSessionHistoryTool {
         //    instead of the old shape, which loaded the rows and the blob
         //    concurrently and threw one of them away every time.
         //
-        //    Three outcomes, and the middle one is the fix:
+        //    Outcomes, and the middle one is the fix:
+        //      * no head                 -> `session_not_found`, the ONLY site
+        //                                   that raises it;
         //      * rows present            -> row-native, read them;
         //      * no rows, `epoch > 0`    -> WIPED (`/clear`, `/compact`) — an
         //                                   empty archive, never the blob;
-        //      * no rows, `epoch == 0`   -> genuinely un-migrated, read the blob.
+        //      * no rows, `epoch == 0`   -> genuinely un-migrated, read the blob
+        //                                   (an empty archive when there is none).
         //    `is_wiped_row_native` is the shared predicate; this used to be the
         //    one reconstruction path with no guard at all, so a session cleared
         //    by a build that still kept the blob served its erased transcript
@@ -1535,13 +1542,32 @@ impl McpServerTool for ReadSessionHistoryTool {
             });
         }
 
-        if crate::store::is_wiped_row_native(true, head.epoch) {
-            // A wiped session EXISTS — it has a metadata row, a title, a tab the
-            // user can still click. Answering `session_not_found` (which the old
-            // code did once the blob was NULLed) would tell a client the session
-            // was deleted, and would disagree with `get_session`, which serves
-            // this same state as an empty transcript. An empty archive is the
-            // honest answer: "this session is real and has nothing in it."
+        // No entry rows. Either the session is a WIPED row-native one — in which
+        // case its retained `acp_thread_blob` describes the conversation the user
+        // erased and must not be read — or it is genuinely un-migrated and the
+        // blob is its only transcript.
+        let blob_bytes = if crate::store::is_wiped_row_native(true, head.epoch) {
+            None
+        } else {
+            db.load_blob(session_id).await?
+        };
+
+        let Some(blob_bytes) = blob_bytes else {
+            // Nothing to serve, but the session EXISTS: it has a metadata row, a
+            // title, and a tab the user can still click. `session_not_found` means
+            // "this id is not a thing I know about" — answering it here would tell
+            // a client the session was deleted, and would contradict `get_session`,
+            // which serves this same state as an empty transcript.
+            //
+            // Two shapes land here and BOTH used to error, because the old code
+            // reached for the blob as its existence check and so conflated "no
+            // blob" with "no session": a wiped session (rows gone, blob dropped by
+            // `persist_context_wipe`), and an ordinary tab the user opened and
+            // closed without ever sending — no rows, no blob, `epoch == 0`. The
+            // second was the last case where these two tools still disagreed. The
+            // conflation is gone for free now that `load_cold_head` establishes
+            // existence first, so `session_not_found` is raised in exactly one
+            // place: the head that is not there.
             return Ok(ToolResponse {
                 content: vec![ToolResponseContent::Text {
                     text: "0/0 entries (archived)".to_string(),
@@ -1555,10 +1581,9 @@ impl McpServerTool for ReadSessionHistoryTool {
                     entries: Vec::new(),
                 },
             });
-        }
+        };
 
         // Legacy blob fallback (un-migrated sessions written before Phase 4).
-        let blob_bytes = db.load_blob(session_id).await?.ok_or_else(not_found)?;
         let snapshot: PersistedSession = serde_json::from_slice(&blob_bytes)
             .with_context(|| format!("decoding archived session {session_id}"))?;
         let total = snapshot.entry_summaries.len();

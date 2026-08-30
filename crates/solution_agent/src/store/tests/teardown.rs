@@ -72,6 +72,10 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
                 .teammate_watchers
                 .arm_shell_watcher(id, Task::ready(()));
             store.backoff_timers.insert(id, Task::ready(()));
+            store.entry_write_failed.insert(
+                id,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            );
             store.teammate_watchers.set_scan_offset(id, 0);
             store
                 .metrics_emitter
@@ -117,6 +121,10 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
             assert!(
                 !store.backoff_timers.contains_key(&id),
                 "backoff_timers leaked"
+            );
+            assert!(
+                !store.entry_write_failed.contains_key(&id),
+                "entry_write_failed leaked"
             );
             assert!(
                 !store.teammate_watchers.has_scan_offset(id),
@@ -1026,6 +1034,10 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
                 .teammate_watchers
                 .arm_shell_watcher(id, Task::ready(()));
             store.backoff_timers.insert(id, Task::ready(()));
+            store.entry_write_failed.insert(
+                id,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            );
             store.teammate_watchers.set_scan_offset(id, 0);
             store.judge_sessions.insert(
                 id,
@@ -1055,6 +1067,10 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
             assert!(
                 !store.backoff_timers.contains_key(&id),
                 "backoff_timers leaked"
+            );
+            assert!(
+                !store.entry_write_failed.contains_key(&id),
+                "entry_write_failed leaked"
             );
             assert!(
                 !store.judge_sessions.contains_key(&id),

@@ -123,10 +123,6 @@ impl SolutionAgentDb {
         })
     }
 
-    /// Read a session's rows on the CALLING thread instead of through the
-    /// background executor. Test-only: a `load_entries` task needs an executor
-    /// turn of its own, so it cannot sample the table *between* two turns —
-    /// which is the whole measurement in the flush-atomicity tests.
     /// Drop `solution_session_entries` so every subsequent entry write FAILS.
     ///
     /// Test-only, and the only way to observe the "an epoch must never outrun
@@ -136,13 +132,44 @@ impl SolutionAgentDb {
     /// (no rows + `epoch > 0`) is exactly what `is_wiped_row_native` reads as a
     /// wipe — i.e. it would make a genuinely un-migrated blob unreadable.
     /// `solution_sessions` is left intact so the epoch is still observable.
+    ///
+    /// Blast radius is per TEST THREAD, not per handle: under `test`/
+    /// `test-support`, `SolutionAgentDb::open` names its in-memory database
+    /// `SOLUTION_AGENT_TEST_<thread name>`, so every handle opened on the same
+    /// thread shares one database and sees the table go missing. A later `open`
+    /// on that thread would also re-create an EMPTY `solution_session_entries`
+    /// (`open_connection` issues `CREATE TABLE IF NOT EXISTS`), which both
+    /// un-breaks writes behind the test's back and makes
+    /// [`Self::restore_entry_writes_for_test`] fail. Call it once, after every
+    /// handle the test needs, and do not use it in a test that reopens.
+    ///
+    /// Renames rather than drops, so the failure is REVERSIBLE and the existing
+    /// rows survive it — a test can model a transient I/O error and then assert
+    /// what the recovered flush wrote, which is the only way to observe that a
+    /// failed write did not permanently truncate the transcript.
     #[cfg(any(test, feature = "test-support"))]
     pub fn break_entry_writes_for_test(&self) -> Result<()> {
         let connection = self.connection.lock();
-        connection.exec("DROP TABLE solution_session_entries")?()?;
+        connection.exec(
+            "ALTER TABLE solution_session_entries RENAME TO solution_session_entries_broken",
+        )?()?;
         Ok(())
     }
 
+    /// Undo [`Self::break_entry_writes_for_test`], rows and indexes intact.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn restore_entry_writes_for_test(&self) -> Result<()> {
+        let connection = self.connection.lock();
+        connection.exec(
+            "ALTER TABLE solution_session_entries_broken RENAME TO solution_session_entries",
+        )?()?;
+        Ok(())
+    }
+
+    /// Read a session's rows on the CALLING thread instead of through the
+    /// background executor. Test-only: a `load_entries` task needs an executor
+    /// turn of its own, so it cannot sample the table *between* two turns —
+    /// which is the whole measurement in the flush-atomicity tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn load_entries_blocking(&self, session_id: SolutionSessionId) -> Result<Vec<EntryRow>> {
         let connection = self.connection.lock();

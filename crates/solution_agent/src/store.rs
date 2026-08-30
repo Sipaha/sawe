@@ -420,6 +420,28 @@ pub struct SolutionAgentStore {
     /// why a drained chain stays under its key instead of being detached — see
     /// [`Self::retire_finished_persist_chains`] for how the key is reclaimed.
     entries_persist_chain: PersistChains,
+    /// Per-session "the last entry-row write FAILED" flag, set by the detached
+    /// persist task and consumed on the foreground by the next persist for that
+    /// session, which rolls `persisted_main_seq` back to 0 so the flush re-covers
+    /// every row.
+    ///
+    /// Why a flag and not simply "advance the watermark after the write": both
+    /// persist paths advance it SYNCHRONOUSLY, in event order, and that is
+    /// load-bearing — it is what stops a burst of ingest events each re-capturing
+    /// the rows an earlier link already owns. Deferring the advance into the task
+    /// would give that up, and the task cannot roll it back itself: the chain is
+    /// deliberately `background_spawn`ed (see `flush_persist_chains_on_quit` for
+    /// why it must be), so it captures no `AsyncApp` — `AsyncApp` holds an `Rc`
+    /// and is `!Send`. An `Arc<AtomicBool>` crosses that boundary; an entity
+    /// handle does not.
+    ///
+    /// What it prevents: a failed write leaves the disk short of rows while the
+    /// watermark claims they landed, so the NEXT flush succeeds with a delta that
+    /// omits them and saves its epoch. For a legacy session mid-migration that is
+    /// zero rows + `epoch > 0` + a retained blob — precisely the shape
+    /// `is_wiped_row_native` reads as authoritative, which would suppress a real
+    /// transcript forever.
+    entry_write_failed: HashMap<SolutionSessionId, Arc<std::sync::atomic::AtomicBool>>,
     /// When the stuck-turn watchdog last auto-reconnected each session, as
     /// epoch-millis. A fresh `claude --resume` must re-ingest the whole
     /// transcript before it emits anything, and on a large context that easily
@@ -941,6 +963,7 @@ impl SolutionAgentStore {
             focus_resolver: None,
             entry_update_throttles: HashMap::new(),
             entries_persist_chain: PersistChains::default(),
+            entry_write_failed: HashMap::new(),
             last_auto_reconnect_ms: HashMap::new(),
             teammate_watchers: TeammateWatchers::new(),
             metrics_emitter: MetricsEmitter::new(),
@@ -3913,6 +3936,19 @@ impl SolutionAgentStore {
         self.entries_persist_chain.retire_finished();
     }
 
+    /// The `entry_write_failed` flag for `session_id`, creating it if absent.
+    /// Cloned into the detached persist task (which sets it) and swapped to
+    /// `false` on the foreground by the next persist (which acts on it).
+    fn take_entry_write_failure_flag(
+        &mut self,
+        session_id: SolutionSessionId,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        self.entry_write_failed
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
+    }
+
     /// Await every retained entry-row write chain, so quitting the editor does
     /// not cancel the tail of a conversation. Registered with `on_app_quit`.
     ///
@@ -4071,7 +4107,16 @@ impl SolutionAgentStore {
         // event order), so a concurrent `persist_main_stream` doesn't re-upsert
         // the rows this flush covers, and so the plan can't drift before the
         // chained DB task runs.
+        let write_failed = self.take_entry_write_failure_flag(session_id);
         let (rows, len, epoch, change_seq, solution_id) = session.update(cx, |s, _| {
+            // A previous flush for this session failed AFTER optimistically
+            // advancing the watermark. Roll it back so this pass re-covers every
+            // row — for a full flush that is already true (it rewrites the whole
+            // Main stream), but consuming the flag here is what stops a later
+            // incremental flush from inheriting the lie. See `entry_write_failed`.
+            if write_failed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                s.persisted_main_seq = 0;
+            }
             let main = s.streams.get(&crate::stream::StreamId::Main);
             let main_entries = main.map(|stream| stream.entries.as_slice()).unwrap_or(&[]);
             let rows: Vec<_> = main_entries
@@ -4098,6 +4143,7 @@ impl SolutionAgentStore {
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = cx.background_spawn({
             let finished = finished.clone();
+            let write_failed = write_failed.clone();
             async move {
                 if let Some(prev) = prev {
                     prev.await;
@@ -4110,6 +4156,9 @@ impl SolutionAgentStore {
                 }
                 .log_err()
                 .is_some();
+                if !rows_written {
+                    write_failed.store(true, std::sync::atomic::Ordering::Release);
+                }
                 // Only advance the generation the row write DESCRIBES. If that
                 // write failed (disk full, I/O), saving the epoch anyway
                 // manufactures the exact state `is_wiped_row_native` reads as
@@ -4160,7 +4209,16 @@ impl SolutionAgentStore {
         // Capture the persist plan + advance the watermark synchronously, so
         // concurrent detached tasks can't each re-read the pre-advance value and
         // redundantly upsert the same rows.
+        let write_failed = self.take_entry_write_failure_flag(session_id);
         let (rows, main_len, epoch, change_seq, solution_id) = session.update(cx, |s, _| {
+            // The rollback that makes the optimistic advance above safe: a
+            // previous flush advanced the watermark and then FAILED, so its rows
+            // are not on disk and a `mod_seq > watermark` delta would skip them
+            // permanently. Re-cover the whole stream instead. See
+            // `entry_write_failed` for why the failing task cannot do this itself.
+            if write_failed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                s.persisted_main_seq = 0;
+            }
             let old_watermark = s.persisted_main_seq;
             let main = s.streams.get(&crate::stream::StreamId::Main);
             let main_entries = main.map(|stream| stream.entries.as_slice()).unwrap_or(&[]);
@@ -4197,6 +4255,7 @@ impl SolutionAgentStore {
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = cx.background_spawn({
             let finished = finished.clone();
+            let write_failed = write_failed.clone();
             async move {
                 if let Some(prev) = prev {
                     prev.await;
@@ -4209,6 +4268,9 @@ impl SolutionAgentStore {
                     .await
                     .log_err()
                     .is_some();
+                if !rows_written {
+                    write_failed.store(true, std::sync::atomic::Ordering::Release);
+                }
                 if rows_written {
                     db.save_epoch(session_id, epoch).await.log_err();
                     db.save_change_seq(session_id, change_seq).await.log_err();
