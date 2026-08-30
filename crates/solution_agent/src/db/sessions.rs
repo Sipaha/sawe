@@ -67,12 +67,14 @@ impl SolutionAgentDb {
         #[cfg(any(test, feature = "test-support"))]
         let fail_next = self.fail_next_blob_load.clone();
         self.executor.spawn(async move {
-            #[cfg(any(test, feature = "test-support"))]
-            blob_load_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            // Fail BEFORE counting: the counters answer "how many times did this
+            // path read the column", and an injected failure read nothing.
             #[cfg(any(test, feature = "test-support"))]
             if fail_next.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 anyhow::bail!("injected blob read failure for {id}");
             }
+            #[cfg(any(test, feature = "test-support"))]
+            blob_load_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let connection = connection.lock();
             select_blob(&connection, id)
         })
@@ -96,7 +98,13 @@ impl SolutionAgentDb {
 
     pub fn load_epoch(&self, session_id: SolutionSessionId) -> Task<Result<Option<i64>>> {
         let connection = self.connection.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let fail_next = self.fail_next_epoch_load.clone();
         self.executor.spawn(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            if fail_next.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                anyhow::bail!("injected epoch read failure for {session_id}");
+            }
             let connection = connection.lock();
             select_epoch(&connection, &session_id.to_string())
         })

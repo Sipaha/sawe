@@ -2299,6 +2299,353 @@ async fn resume_of_a_wiped_session_does_not_repaint_the_blob(cx: &mut TestAppCon
     });
 }
 
+/// M5: the `epoch` read is the THIRD input to `migrating`, and losing it breaks
+/// the guard in the opposite direction from losing the rows or the blob.
+///
+/// `epoch_task.await.ok().flatten().unwrap_or(0)` collapses a failed read onto
+/// `0` — the value that means "legacy, never migrated, read the blob". Run that
+/// against a WIPED row-native session that still carries its pre-wipe blob (the
+/// exact shape `is_wiped_row_native` exists to repair) and the wipe is UN-done:
+/// the erased transcript is repainted, `migrating` fires, the rows are written
+/// back, and the epoch rewinds N → 1. Rows then exist, so every later read takes
+/// the rows branch — the wipe is destroyed permanently and every client cursor
+/// moves backwards. FORK.md #105's failure mode, resurrected by a swallowed
+/// read.
+///
+/// Runs the PROBE and the CONTROL on two identical fixtures, because "the wipe
+/// survived" is also what a reopen that never reached the blob would report.
+#[gpui::test]
+async fn a_failed_epoch_read_on_reopen_does_not_un_wipe_the_session(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::with_resume_support(Arc::new(
+                    AtomicUsize::new(0),
+                ))),
+            );
+        });
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    // The shape `/clear` leaves on a session old enough to carry a blob, as
+    // written by a build that kept it: zero rows, `epoch` at what the wipe
+    // bumped it to, pre-wipe blob still in the column.
+    let seed = |acp: &'static str| crate::model::SolutionSessionMetadata {
+        id: crate::model::SolutionSessionId::new(),
+        solution_id,
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new(acp),
+        title: SharedString::from("cleared session"),
+        created_at: Utc::now(),
+        last_activity_at: Utc::now(),
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    let blob = serde_json::to_vec(&PersistedSession {
+        title: "cleared session".into(),
+        entry_summaries: vec!["the secret the user wants gone".to_string()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+
+    let probe = seed("acp-probe");
+    let probe_id = probe.id;
+    db.save_metadata(probe.clone()).await.expect("save probe");
+    db.save_blob(probe_id, blob.clone())
+        .await
+        .expect("save probe blob");
+    db.save_epoch(probe_id, 5).await.expect("save probe epoch");
+
+    db.fail_next_epoch_load();
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.resume_session(probe.clone(), project.clone(), cx)
+        })
+    })
+    .await
+    .expect("a failed epoch read must not fail the reopen");
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(probe_id)
+                .expect("resumed session")
+                .read_with(cx, |s, _| {
+                    assert!(
+                        s.entries.is_empty(),
+                        "the erased transcript must not be repainted: without the \
+                         epoch, `wiped_row_native` reads false and the retained \
+                         blob is decoded; got {} entries",
+                        s.entries.len()
+                    );
+                    // The documented cost of the failure, pinned so a change to it
+                    // is visible: in memory the epoch does fall back to 0, which
+                    // costs the client one reset. On DISK it is untouched, so the
+                    // next successful reopen restores it.
+                    assert_eq!(
+                        s.epoch, 0,
+                        "an unread epoch has no better in-memory value than 0"
+                    );
+                });
+        });
+    });
+    assert_eq!(
+        db.load_epoch(probe_id).await.expect("load probe epoch"),
+        Some(5),
+        "the persisted generation must NOT rewind: writing it back as 1 is what \
+         makes the un-wipe permanent"
+    );
+    assert!(
+        db.load_entries(probe_id)
+            .await
+            .expect("load probe rows")
+            .is_empty(),
+        "and the erased rows must not be written back — once rows exist, every \
+         read takes the rows branch and the wipe is gone for good"
+    );
+    assert!(
+        db.load_blob(probe_id)
+            .await
+            .expect("load probe blob")
+            .is_some(),
+        "the blob is left exactly as found (the wipe guard, not this reopen, is \
+         what keeps it unread)"
+    );
+
+    // Closing the tab must not write it back either — the same live-session
+    // flush that the row-read test covers.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.close_session(probe_id, cx).expect("close");
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        db.load_epoch(probe_id).await.expect("load probe epoch"),
+        Some(5),
+        "closing the tab must not rewind the generation either"
+    );
+    assert!(
+        db.load_entries(probe_id)
+            .await
+            .expect("load probe rows")
+            .is_empty(),
+        "…nor write the erased transcript back as rows"
+    );
+
+    // CONTROL: the identical fixture with the epoch readable. If this repainted
+    // too, the probe's assertions would be measuring the wipe guard rather than
+    // the epoch failure.
+    let control = seed("acp-control");
+    let control_id = control.id;
+    db.save_metadata(control.clone())
+        .await
+        .expect("save control");
+    db.save_blob(control_id, blob)
+        .await
+        .expect("save control blob");
+    db.save_epoch(control_id, 5)
+        .await
+        .expect("save control epoch");
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.resume_session(control, project, cx))
+    })
+    .await
+    .expect("control resume");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(control_id)
+                .expect("control session")
+                .read_with(cx, |s, _| {
+                    assert!(s.entries.is_empty(), "control is wiped too");
+                    assert_eq!(
+                        s.epoch, 5,
+                        "and with the epoch READABLE it is served as persisted — \
+                         which is what makes the probe's 0 attributable to the \
+                         injected failure"
+                    );
+                });
+        });
+    });
+    assert_eq!(
+        db.load_epoch(control_id).await.expect("load control epoch"),
+        Some(5)
+    );
+}
+
+/// The same guard on the same path, for the OTHER thing that leaves a session
+/// with no rows and a blob: a blob that does not decode.
+///
+/// `resume_session` derived `migrating` from "no rows and not wiped" alone, so a
+/// failed decode still bumped the epoch and flushed zero rows — and "no rows +
+/// epoch > 0" is what `is_wiped_row_native` reads as a deliberate `/clear`.
+/// Reopening a corrupt tab from History therefore CONVERTED it into a wiped one,
+/// and the intact bytes still sitting in the column became unreachable for
+/// every later read. The reopen has to be lossless: it shows the user an empty
+/// conversation, but it leaves the row exactly as it found it.
+#[gpui::test]
+async fn resume_of_an_undecodable_blob_leaves_the_row_recoverable(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::with_resume_support(Arc::new(
+                    AtomicUsize::new(0),
+                ))),
+            );
+        });
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-corrupt"),
+        title: SharedString::from("corrupt session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    // `save_blob` is an `UPDATE .. WHERE id = ?`; without the row first it
+    // no-ops and the fixture silently loses its blob.
+    db.save_metadata(meta.clone()).await.expect("save metadata");
+
+    let intact = serde_json::to_vec(&PersistedSession {
+        title: "corrupt session".into(),
+        entry_summaries: vec!["a line the user still wants".to_string()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    let mut truncated = intact.clone();
+    truncated.truncate(intact.len() / 2);
+    assert!(
+        serde_json::from_slice::<PersistedSession>(&truncated).is_err(),
+        "fixture must actually fail to decode, or this test proves nothing"
+    );
+    db.save_blob(session_id, truncated)
+        .await
+        .expect("save blob");
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch"),
+        None,
+        "fixture is un-migrated: the epoch column is NULL, so nothing but this \
+         reopen can set it"
+    );
+
+    let resumed = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.resume_session(meta.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("a corrupt transcript must not fail the reopen");
+    assert_eq!(resumed, session_id);
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("resumed session")
+                .read_with(cx, |s, _| {
+                    assert!(s.entries.is_empty(), "nothing could be decoded");
+                    assert_eq!(
+                        s.epoch, 0,
+                        "the migration bump must not fire for a blob that was never read"
+                    );
+                });
+        });
+    });
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch after"),
+        None,
+        "no epoch may be written: with zero rows it would read as a deliberate \
+         wipe and permanently suppress the blob"
+    );
+    assert!(
+        db.load_blob(session_id).await.expect("load blob").is_some(),
+        "the bytes must be left on disk — they are the only copy of the transcript"
+    );
+
+    // What that buys: repair the bytes, close the tab, reopen it — the
+    // transcript comes back. It cannot if this reopen marked the row as wiped.
+    db.save_blob(session_id, intact).await.expect("repair blob");
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.sessions.remove(&session_id);
+            store.by_solution.remove(&solution_id);
+        });
+    });
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.resume_session(meta, project, cx))
+    })
+    .await
+    .expect("second resume");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("re-resumed session")
+                .read_with(cx, |s, _| {
+                    assert_eq!(
+                        s.entries.len(),
+                        1,
+                        "the repaired blob must come back — the failed reopen must \
+                         not have marked the session as wiped"
+                    );
+                });
+        });
+    });
+}
+
 /// F2, the destructive one: a transient entry-ROW read failure on reopen must
 /// not delete the transcript.
 ///

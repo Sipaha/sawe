@@ -183,12 +183,13 @@ impl SolutionAgentDb {
         #[cfg(any(test, feature = "test-support"))]
         let fail_next = self.fail_next_entry_load.clone();
         self.executor.spawn(async move {
-            #[cfg(any(test, feature = "test-support"))]
-            entry_load_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            // Fail BEFORE counting: see `load_blob`.
             #[cfg(any(test, feature = "test-support"))]
             if fail_next.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 anyhow::bail!("injected entry-row read failure for {session_id}");
             }
+            #[cfg(any(test, feature = "test-support"))]
+            entry_load_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let connection = connection.lock();
             select_entries_for_session(&connection, &session_id.to_string())
         })

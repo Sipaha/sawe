@@ -792,7 +792,39 @@ impl SolutionAgentStore {
                             );
                             Vec::new()
                         });
-                        let epoch = epoch_task.await.ok().flatten().unwrap_or(0);
+                        // The epoch is the THIRD input to `migrating`, and losing
+                        // it manufactures the opposite error from losing the rows
+                        // or the blob: `unwrap_or(0)` collapses a failed read onto
+                        // the value that means "legacy, never migrated, read the
+                        // blob". For a WIPED row-native session (rows gone, epoch
+                        // N, blob retained by an older build) that un-wipes it —
+                        // the erased transcript is repainted from the blob,
+                        // `migrating` fires, the rows are written back, and the
+                        // epoch rewinds N → 1. Rows then exist, so every later read
+                        // takes the rows branch and the wipe is gone for good,
+                        // with every client cursor moved backwards. That is
+                        // FORK.md #105's failure mode, resurrected by a swallowed
+                        // read. `Ok(None)` — the column is NULL on a genuinely
+                        // un-migrated session — is a real value and still means 0.
+                        let epoch = match epoch_task.await {
+                            Ok(epoch) => epoch.unwrap_or(0),
+                            Err(err) => {
+                                transcript_unavailable = true;
+                                log::error!(
+                                    target: "solution_agent::resume",
+                                    "session={} epoch load failed on reopen; \
+                                     reopening it EMPTY rather than risking an \
+                                     un-wipe: {err}",
+                                    meta.id
+                                );
+                                0
+                            }
+                        };
+                        // Deliberately still swallowed: `change_seq` is a client
+                        // cursor, not an input to `migrating`. A lost one falls
+                        // back to `max(mod_seq)` in `restore_change_seq`, which is
+                        // the same anchor a pre-column session gets — it costs one
+                        // client resync, and it cannot authorize a rewrite.
                         let change_seq =
                             change_seq_task.await.ok().flatten().map(|v| v as u64);
                         (rows, epoch, change_seq)
@@ -809,8 +841,17 @@ impl SolutionAgentStore {
             // also saves the read outright.
             let wiped_row_native =
                 is_wiped_row_native(preloaded_rows.is_empty(), preloaded_epoch);
+            // `|| transcript_unavailable` is what stops the epoch failure above
+            // from REPAINTING as well as from persisting: with the epoch lost to
+            // `0`, `wiped_row_native` is false, so without this the retained blob
+            // of a wiped session would be decoded and shown — the erased
+            // conversation back on screen even though nothing is written. The
+            // in-memory epoch does go 5 → 0 in that case, which costs the client
+            // one reset; the DB keeps 5 (the persist guard declines), so the next
+            // successful reopen restores it.
             let preloaded_persisted: Option<PersistedSession> = if !preloaded_rows.is_empty()
                 || wiped_row_native
+                || transcript_unavailable
             {
                 None
             } else {

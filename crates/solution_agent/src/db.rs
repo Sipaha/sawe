@@ -76,6 +76,8 @@ pub struct SolutionAgentDb {
     fail_next_entry_load: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "test-support"))]
     fail_next_blob_load: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_next_epoch_load: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct GlobalSolutionAgentDb(Shared<Task<Result<Arc<SolutionAgentDb>, Arc<anyhow::Error>>>>);
@@ -419,6 +421,8 @@ impl SolutionAgentDb {
             fail_next_entry_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-support"))]
             fail_next_blob_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next_epoch_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -443,6 +447,15 @@ impl SolutionAgentDb {
     #[cfg(any(test, feature = "test-support"))]
     pub fn fail_next_blob_load(&self) {
         self.fail_next_blob_load
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// [`Self::fail_next_entry_load`] for the `epoch` column read. The third
+    /// input to `migrating`, and the one whose loss manufactures an UN-wipe
+    /// rather than a wipe.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_epoch_load(&self) {
+        self.fail_next_epoch_load
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
