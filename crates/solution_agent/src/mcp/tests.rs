@@ -4030,6 +4030,109 @@ async fn get_session_legacy_blob_closed_session_serves_bumped_epoch(cx: &mut gpu
     );
 }
 
+/// The same rows-absent branch, but for a session that is row-native and WIPED
+/// rather than un-migrated — the `/clear` half of the defect, on the cold read
+/// path, and the repair for sessions already broken by a build that kept the
+/// blob.
+///
+/// Persisted shape after `/clear` on a session old enough to carry a blob: zero
+/// entry rows, `epoch` at whatever the wipe bumped it to, and (before
+/// `persist_context_wipe` existed) the pre-clear `acp_thread_blob` still in the
+/// row. Rows-absent alone cannot tell that apart from an un-migrated session, so
+/// the cold read decoded the blob and handed the user back the conversation they
+/// had just erased.
+///
+/// `epoch > 0` is what distinguishes them: only `persist_all_rows` /
+/// `persist_context_wipe` write that column, and a session reaches either only
+/// after hydration's legacy→rows migration has already bumped it past 0. A
+/// genuinely un-migrated session's `epoch` is NULL — that case stays pinned by
+/// `get_session_legacy_blob_closed_session_serves_bumped_epoch` above.
+#[gpui::test]
+async fn get_session_ignores_the_blob_of_a_wiped_row_native_session(cx: &mut gpui::TestAppContext) {
+    let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let executor = cx.executor();
+    let db = std::sync::Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    // Both ends of the discriminator, because the boundary is the whole fix:
+    // `1` is the lowest a row-native session can persist (hydration's migration
+    // bump), so `> 0` and a hypothetical `>= 2` are only distinguishable there;
+    // `4` is an ordinary long-lived session, where the legacy branch's `epoch =
+    // 1` would additionally read as a BACKWARDS jump to any cached client.
+    for persisted_epoch in [1i64, 4] {
+        let session_id = crate::model::SolutionSessionId::new();
+        let now = chrono::Utc::now();
+        db.save_metadata(crate::model::SolutionSessionMetadata {
+            id: session_id,
+            solution_id,
+            agent_id: SharedString::from("mock-agent"),
+            acp_session_id: acp::SessionId::new(format!("acp-{}", session_id.as_str())),
+            title: SharedString::from("cleared session"),
+            created_at: now,
+            last_activity_at: now,
+            preview: None,
+            total_tokens: None,
+            context_count: 1,
+            cwd: std::path::PathBuf::new(),
+            parent_session_id: None,
+            desired_model: None,
+            desired_effort: None,
+            cached_models: vec![],
+            tab_order: None,
+        })
+        .await
+        .expect("save metadata");
+
+        let blob = serde_json::to_vec(&crate::store::PersistedSession {
+            title: "cleared session".into(),
+            entry_summaries: vec!["the secret the user wants gone".into()],
+            ..Default::default()
+        })
+        .expect("encode blob");
+        db.save_blob(session_id, blob).await.expect("save blob");
+        // No entry rows, and an epoch a wipe left behind.
+        db.save_epoch(session_id, persisted_epoch)
+            .await
+            .expect("save epoch");
+
+        let sc = GetSessionTool
+            .run(
+                GetSessionParams {
+                    session_id: session_id.to_string(),
+                    include_full_content: true,
+                    ..Default::default()
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("get_session must still serve a wiped session")
+            .structured_content;
+
+        assert_eq!(
+            sc.total_count,
+            0,
+            "a wiped row-native session (epoch {persisted_epoch}) must serve an \
+             EMPTY transcript, not its retained pre-clear blob; got {:?}",
+            sc.entries
+                .iter()
+                .map(|e| e.markdown.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(sc.entries.is_empty());
+        assert_eq!(
+            sc.epoch, persisted_epoch as u64,
+            "the persisted epoch must be served as-is — the legacy branch would \
+             advertise 1 regardless, which every client cached above 1 reads as a reset"
+        );
+    }
+}
+
 /// Seed a closed session (metadata row + `count` entry rows, nothing in
 /// `store.sessions`) and hand back the DB handle, so a test can read the
 /// transcript-read counter off it. Entry `mod_seq`s run `1..=count`, matching

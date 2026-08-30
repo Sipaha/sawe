@@ -1796,3 +1796,226 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
         });
     });
 }
+
+/// `/clear` has to wipe BOTH persisted representations of a transcript, or a
+/// wiped conversation comes back.
+///
+/// The population this covers is not the shrinking "never migrated" one — it is
+/// any session old enough to have been written by a pre-Phase-4 build, migrated
+/// to entry rows since, and then `/clear`ed:
+///
+/// 1. `reset_context` truncates the entry rows (`upsert_entries_and_trim(id, [],
+///    0)`) and bumps the epoch. Nothing used to clear `acp_thread_blob` —
+///    `save_blob` has no production caller at all, so the blob is retained for
+///    the life of the row.
+/// 2. `build_cold_session` consults the blob exactly when a session has NO entry
+///    rows, which is permanently the state a `/clear` leaves behind.
+/// 3. So the next desktop restore (and the cold `get_session` read, pinned
+///    separately in `mcp::tests`) decoded the retained blob and served the
+///    PRE-clear transcript.
+///
+/// Drives the real sequence end to end: rows + a legacy blob, `/clear`, evict
+/// the solution, restore it from disk.
+#[gpui::test]
+async fn clear_wipes_the_legacy_blob_so_a_restore_cannot_replay_it(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    let solution_id = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .expect("session exists")
+            .read(cx)
+            .solution_id
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "the secret the user wants gone".to_string(),
+                    ),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    // The shape a migrated pre-Phase-4 session really has on disk: entry rows
+    // AND the original blob, which `hydrate_all_for_solution` deliberately keeps
+    // as the model/effort fallback (pinned by
+    // `legacy_v1_entry_summaries_survive_cold_load`).
+    let legacy_blob = serde_json::to_vec(&PersistedSession {
+        title: "migrated session".into(),
+        entry_summaries: vec!["the secret the user wants gone".to_string()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    db.save_blob(session_id, legacy_blob)
+        .await
+        .expect("save blob");
+    assert!(
+        !db.load_entries(session_id)
+            .await
+            .expect("load rows before")
+            .is_empty(),
+        "fixture must be row-native before the clear"
+    );
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| store.reset_context(session_id, cx))
+    })
+    .await
+    .expect("reset_context");
+    cx.run_until_parked();
+
+    assert!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after")
+            .is_empty(),
+        "/clear must delete every entry row"
+    );
+    assert!(
+        db.load_blob(session_id)
+            .await
+            .expect("load blob after")
+            .is_none(),
+        "/clear must drop the legacy blob too — with zero rows it is what every \
+         read path falls back to, so keeping it hands the wiped transcript back"
+    );
+    let epoch_after_clear = db
+        .load_epoch(session_id)
+        .await
+        .expect("load epoch after")
+        .unwrap_or(0);
+    assert!(
+        epoch_after_clear > 0,
+        "/clear must persist the bumped epoch (got {epoch_after_clear})"
+    );
+
+    // Desktop restore path: drop the whole solution from memory, then hydrate it
+    // back off disk exactly as `SolutionStoreEvent::Opened` does.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.cold_close_solution(&solution_id, cx));
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            assert!(
+                store.session(session_id).is_none(),
+                "cold_close_solution must evict the session so the restore is a real cold load"
+            );
+        });
+    });
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.hydrate_all_for_solution(solution_id, cx)
+        })
+    })
+    .await
+    .expect("restore");
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let restored = store.session(session_id).expect("session restored");
+            restored.read_with(cx, |s, _| {
+                assert!(
+                    s.entries.is_empty(),
+                    "a restored /clear'ed session must be empty, not replaying the \
+                     pre-clear blob; got {:?}",
+                    s.entries.len()
+                );
+                assert_eq!(
+                    s.epoch, epoch_after_clear as u64,
+                    "the restore must serve the PERSISTED epoch — the legacy branch \
+                     advertises 1, which a client cached at a higher epoch reads as a reset"
+                );
+            });
+        });
+    });
+}
+
+/// `/compact` (`rotate_context`) is the same wipe as `/clear` for this purpose:
+/// it clears `entries`, bumps the epoch, and rewrites the rows wholesale, which
+/// on a session whose new thread has not produced its summary yet leaves ZERO
+/// rows — the state in which every read path falls back to `acp_thread_blob`.
+/// It carries the retained blob into that state for exactly the same reason, so
+/// it goes through the same `persist_context_wipe`.
+///
+/// Only the DB side is asserted here: the restore that would replay the blob is
+/// identical to the one pinned by
+/// `clear_wipes_the_legacy_blob_so_a_restore_cannot_replay_it`, since after
+/// either wipe the persisted shape is the same (no rows, bumped epoch).
+#[gpui::test]
+async fn compact_wipes_the_legacy_blob_like_clear_does(cx: &mut TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_assistant_content_block(
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(
+                        "the secret the user wants gone".to_string(),
+                    ),
+                ),
+                false,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    let legacy_blob = serde_json::to_vec(&PersistedSession {
+        title: "migrated session".into(),
+        entry_summaries: vec!["the secret the user wants gone".to_string()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    db.save_blob(session_id, legacy_blob)
+        .await
+        .expect("save blob");
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| store.rotate_context(session_id, cx))
+    })
+    .await
+    .expect("rotate_context");
+    cx.run_until_parked();
+
+    assert!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after")
+            .is_empty(),
+        "/compact must delete the pre-rotation entry rows"
+    );
+    assert!(
+        db.load_blob(session_id)
+            .await
+            .expect("load blob after")
+            .is_none(),
+        "/compact must drop the legacy blob too, or the next cold load replays \
+         the pre-rotation transcript it just archived"
+    );
+}

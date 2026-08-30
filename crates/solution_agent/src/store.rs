@@ -3255,7 +3255,11 @@ impl SolutionAgentStore {
                 // Rewrite the rows wholesale (deleting the now-stale pre-rotation
                 // idx>0 rows) so the next cold load doesn't see new idx 0 + stale
                 // idx 1..N. Targeted upserts alone would leak the old rows.
-                store.persist_all_rows(session_id, cx);
+                // `persist_context_wipe`, not `persist_all_rows`: for a session
+                // old enough to still carry an `acp_thread_blob`, the rewrite can
+                // leave zero rows, and the read paths fall back to the blob in
+                // exactly that case — so the rows have to go with the blob.
+                store.persist_context_wipe(session_id, cx);
                 store.mark_state_changed(session_id, cx);
                 // Compact reused the pooled connection for a FRESH ACP session
                 // but left the PRE-rotation session live in the connection's
@@ -3458,8 +3462,12 @@ impl SolutionAgentStore {
                 // the rows wholesale (here that deletes ALL rows + saves the
                 // bumped epoch) so the next cold load doesn't replay the stale
                 // pre-clear transcript. Targeted upserts can't delete; this must
-                // run on the empty-entries clear path.
-                store.persist_all_rows(session_id, cx);
+                // run on the empty-entries clear path. Deleting the rows is only
+                // half a wipe for a session old enough to carry a legacy
+                // `acp_thread_blob` — with zero rows every read path falls back
+                // to that blob — so this goes through `persist_context_wipe`,
+                // which drops the blob in the same savepoint.
+                store.persist_context_wipe(session_id, cx);
                 // Reap the pre-clear ACP session's subprocess + balance the pool
                 // refcount that `get_or_spawn_connection` re-incremented above
                 // (same leak/double-count as `rotate_context`).
@@ -4014,6 +4022,39 @@ impl SolutionAgentStore {
     /// it also resets `persisted_main_seq` to the Main stream's current `seq`
     /// (the incremental `persist_main_stream` then skips these rows next time).
     pub fn persist_all_rows(&mut self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
+        self.persist_all_rows_inner(session_id, false, cx);
+    }
+
+    /// [`Self::persist_all_rows`] for a CONTEXT WIPE (`/clear`, `/compact`),
+    /// which additionally drops the legacy `acp_thread_blob` in the same
+    /// savepoint as the row deletion.
+    ///
+    /// Rewriting the rows is not on its own enough to wipe a transcript. Every
+    /// read path — `build_cold_session` (desktop restore and the cold
+    /// `get_session` fallback) and `read_session_history` — falls back to the
+    /// blob precisely when a session has NO entry rows, which is the state a
+    /// wipe leaves behind. So for a session old enough to carry a blob, the
+    /// row-only truncation deleted the rows and then handed the pre-wipe
+    /// transcript straight back on the next cold load.
+    ///
+    /// Not folded into `persist_all_rows`: hydration's legacy→rows migration
+    /// calls that one with a full row set derived FROM the blob and must keep
+    /// the blob (model/effort fallback), so "full flush" and "wipe" have to stay
+    /// distinguishable at the call site.
+    pub(crate) fn persist_context_wipe(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.persist_all_rows_inner(session_id, true, cx);
+    }
+
+    fn persist_all_rows_inner(
+        &mut self,
+        session_id: SolutionSessionId,
+        clear_legacy_blob: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_ephemeral_session(session_id, cx) {
             return;
         }
@@ -4058,9 +4099,15 @@ impl SolutionAgentStore {
                 if let Some(prev) = prev {
                     prev.await;
                 }
-                db.upsert_entries_and_trim(session_id, rows, len)
-                    .await
-                    .log_err();
+                if clear_legacy_blob {
+                    db.upsert_entries_trim_and_clear_blob(session_id, rows, len)
+                        .await
+                        .log_err();
+                } else {
+                    db.upsert_entries_and_trim(session_id, rows, len)
+                        .await
+                        .log_err();
+                }
                 db.save_epoch(session_id, epoch).await.log_err();
                 db.save_change_seq(session_id, change_seq).await.log_err();
                 finished.store(true, std::sync::atomic::Ordering::Release);

@@ -391,6 +391,21 @@ pub(crate) fn update_blob(
     Ok(())
 }
 
+/// Drop the legacy pre-Phase-4 transcript blob, leaving the column NULL rather
+/// than an empty BLOB — every reader tests `load_blob(..).is_some()` and would
+/// take the legacy branch on a zero-length blob only to fail decoding it.
+///
+/// Takes the id pre-stringified so `entries::insert_or_update_entries_and_trim`
+/// can run it inside the savepoint that deletes the entry rows: a context wipe
+/// has to drop both representations of the transcript or neither.
+pub(crate) fn clear_blob_by_id(connection: &Connection, id: &str) -> Result<()> {
+    let mut update = connection.exec_bound::<String>(indoc! {"
+        UPDATE solution_sessions SET acp_thread_blob = NULL WHERE id = ?
+    "})?;
+    update(id.to_string())?;
+    Ok(())
+}
+
 pub(crate) fn select_blob(
     connection: &Connection,
     id: SolutionSessionId,

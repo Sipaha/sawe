@@ -89,6 +89,35 @@ impl SolutionAgentDb {
                 &session_id.to_string(),
                 rows,
                 trim_from_idx,
+                false,
+            )
+        })
+    }
+
+    /// [`Self::upsert_entries_and_trim`] for a CONTEXT WIPE (`/clear`,
+    /// `/compact`), which additionally drops the legacy `acp_thread_blob`.
+    ///
+    /// Why it has to be the same savepoint: every read path
+    /// (`store::build_cold_session`, `read_session_history`) consults the blob
+    /// exactly when a session has no entry rows, so "rows deleted, blob kept" is
+    /// the one intermediate state that resurrects the transcript the user just
+    /// wiped. Rows-and-blob or neither; a failure part-way through must leave
+    /// the pre-wipe state intact rather than half of it.
+    pub fn upsert_entries_trim_and_clear_blob(
+        &self,
+        session_id: SolutionSessionId,
+        rows: Vec<EntryRow>,
+        trim_from_idx: i64,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            insert_or_update_entries_and_trim(
+                &connection,
+                &session_id.to_string(),
+                rows,
+                trim_from_idx,
+                true,
             )
         })
     }
@@ -151,6 +180,7 @@ pub(crate) fn insert_or_update_entries_and_trim(
     session_id: &str,
     rows: Vec<EntryRow>,
     trim_from_idx: i64,
+    clear_legacy_blob: bool,
 ) -> Result<()> {
     // A row at or past the trim would be written and then deleted again by the
     // closure below. Both persist sites derive `idx` from an `enumerate()` over
@@ -183,7 +213,11 @@ pub(crate) fn insert_or_update_entries_and_trim(
                 ))?;
             }
         }
-        delete_entries_from_idx(connection, session_id, trim_from_idx)
+        delete_entries_from_idx(connection, session_id, trim_from_idx)?;
+        if clear_legacy_blob {
+            super::sessions::clear_blob_by_id(connection, session_id)?;
+        }
+        Ok(())
     });
     tx.map_err(|e| anyhow!("upsert_entries_and_trim failed: {e}"))
 }

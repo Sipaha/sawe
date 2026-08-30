@@ -295,7 +295,23 @@ pub(crate) fn build_cold_session(
     tab_order: Option<i64>,
     cx: &mut App,
 ) -> (Entity<SolutionSession>, bool) {
-    let migrating = rows.is_none();
+    // A persisted `epoch > 0` proves the session is ROW-NATIVE: the only writers
+    // of that column are `persist_all_rows` / `persist_context_wipe`, and a
+    // session reaches them only after hydration's legacy→rows migration has
+    // already bumped it past 0. So "no rows AND epoch > 0" is not an
+    // un-migrated session — it is a migrated one whose transcript was WIPED
+    // (`/clear`, `/compact`), and its retained `acp_thread_blob` describes the
+    // conversation the user just erased. Consulting it here would serve the
+    // pre-wipe transcript back on the next cold load and, because the legacy
+    // branch bumps a fresh entity's epoch to 1, would advertise an epoch BELOW
+    // the persisted one, which every cached client reads as a reset.
+    //
+    // `persist_context_wipe` now clears the blob at the source, so this is
+    // belt-and-braces for new wipes — but it is the only repair for sessions
+    // already wiped by a build that did not.
+    let wiped_row_native = rows.is_none() && epoch > 0;
+    let blob = if wiped_row_native { None } else { blob };
+    let migrating = rows.is_none() && !wiped_row_native;
     // Same precedence as `resume_session`: the metadata
     // columns first, the legacy blob only as a fallback for
     // rows written before those columns existed. Without this
