@@ -206,7 +206,9 @@ fn classify_done_reasoning(reasoning: &str) -> (bool, &str) {
 /// (tail is an assistant/tool entry), which the generic continuation handles.
 /// An observer nudge tail is excluded: it's the supervisor's own voice, not the
 /// human's, and the generic "carry on" is right for it.
-fn tail_is_unanswered_user_message(entries: &[crate::session_entry::SessionEntry]) -> bool {
+fn tail_is_unanswered_user_message(
+    entries: &[std::sync::Arc<crate::session_entry::SessionEntry>],
+) -> bool {
     use crate::session_entry::SessionEntryKind;
     entries
         .iter()
@@ -4581,13 +4583,23 @@ impl SolutionAgentStore {
                 let mut entries = std::mem::take(&mut s.entries);
                 let mut changed = false;
                 for entry in entries.iter_mut() {
-                    if let crate::session_entry::SessionEntryKind::ToolCall { id, .. } = &entry.kind
-                        && async_parents.contains(id.as_str())
-                    {
+                    // Decide on the SHARED copy first: only an entry that really
+                    // needs terminalising is forked away from the `streams`
+                    // mirror, since an unconditional `Arc::make_mut` would
+                    // deep-copy the whole transcript on a path that usually
+                    // changes nothing.
+                    let stranded = match &entry.kind {
+                        crate::session_entry::SessionEntryKind::ToolCall { id, status, .. } => {
+                            !status.is_terminal() && !async_parents.contains(id.as_str())
+                        }
+                        _ => false,
+                    };
+                    if !stranded {
                         continue;
                     }
-                    changed |=
-                        crate::store::hydration::normalize_stranded_tool_status(&mut entry.kind);
+                    changed |= crate::store::hydration::normalize_stranded_tool_status(
+                        &mut std::sync::Arc::make_mut(entry).kind,
+                    );
                 }
                 s.entries = entries;
                 if changed {

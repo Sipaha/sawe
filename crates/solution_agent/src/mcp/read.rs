@@ -609,7 +609,7 @@ fn build_get_session_result(
         // stream's served markdown.
         let after = input.after_index;
         let before = input.before_index;
-        let stream_entries: &[crate::session_entry::SessionEntry] =
+        let stream_entries: &[std::sync::Arc<crate::session_entry::SessionEntry>] =
             selected_stream.map_or(&[][..], |s| s.entries.as_slice());
         let mut image_cursor = 0usize;
         let mut kept: Vec<EntrySummary> = Vec::new();
@@ -1052,7 +1052,7 @@ fn build_get_session_changes_result(
     // mod_seq to the incoming max — decision #5), so a coalesce-merge
     // update is NOT missed even though the coalesced entry's own first-
     // fragment mod_seq is otherwise frozen.
-    let stream_entries: &[crate::session_entry::SessionEntry] =
+    let stream_entries: &[std::sync::Arc<crate::session_entry::SessionEntry>] =
         selected_stream.map_or(&[][..], |s| s.entries.as_slice());
     let mut image_cursor = 0usize;
     // Collect each changed entry WITH its `mod_seq` so the page can be

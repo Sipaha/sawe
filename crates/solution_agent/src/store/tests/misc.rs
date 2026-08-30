@@ -1867,13 +1867,15 @@ async fn entries_removed_restamps_survivor_on_coalesce_split(cx: &mut TestAppCon
     use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
-    let asst = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::AssistantMessage {
-            chunks: vec![AssistantChunk::Message(text.into())],
-        },
+    let asst = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.into())],
+            },
+        })
     };
     let cursor_before = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -1882,7 +1884,7 @@ async fn entries_removed_restamps_survivor_on_coalesce_split(cx: &mut TestAppCon
             session.update(cx, |s, _| {
                 s.live_base = 0;
                 s.entries = vec![
-                    SessionEntry {
+                    std::sync::Arc::new(SessionEntry {
                         created_ms: 1,
                         mod_seq: 1,
                         subagent_id: None,
@@ -1891,7 +1893,7 @@ async fn entries_removed_restamps_survivor_on_coalesce_split(cx: &mut TestAppCon
                             content_md: "u".into(),
                             chunks: vec![],
                         },
-                    },
+                    }),
                     asst(7, "a1 "),
                     asst(8, "a2"),
                 ];
@@ -1952,13 +1954,15 @@ async fn interleaved_flat_entries_persist_as_coalesced_main_rows(cx: &mut TestAp
         });
     });
 
-    let asst = |n: u64, subagent: Option<&str>, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: subagent.map(SharedString::from),
-        kind: SessionEntryKind::AssistantMessage {
-            chunks: vec![AssistantChunk::Message(text.into())],
-        },
+    let asst = |n: u64, subagent: Option<&str>, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: subagent.map(SharedString::from),
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.into())],
+            },
+        })
     };
 
     // Torn interleave: parent "Three ", teammate "noise", parent "scouts". In the
@@ -2906,7 +2910,7 @@ async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut Test
         let session = store.read(cx).session(session_id).expect("session exists");
         session.update(cx, |s, _| {
             for e in s.entries.iter_mut() {
-                e.created_ms = NO_TIMESTAMP_MS;
+                std::sync::Arc::make_mut(e).created_ms = NO_TIMESTAMP_MS;
             }
         });
     });
@@ -4679,15 +4683,17 @@ async fn entry_updated_emits_the_global_entry_index(cx: &mut TestAppContext) {
         let session = store.read(cx).session(session_id).expect("session");
         session.update(cx, |s, cx| {
             s.entries = (0..2)
-                .map(|i| SessionEntry {
-                    created_ms: 1_700_000_000_000 + i,
-                    mod_seq: 0,
-                    subagent_id: None,
-                    kind: SessionEntryKind::UserMessage {
-                        id: None,
-                        content_md: format!("cold {i}"),
-                        chunks: vec![],
-                    },
+                .map(|i| {
+                    std::sync::Arc::new(SessionEntry {
+                        created_ms: 1_700_000_000_000 + i,
+                        mod_seq: 0,
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: format!("cold {i}"),
+                            chunks: vec![],
+                        },
+                    })
                 })
                 .collect();
             s.rebuild_streams();
@@ -4763,7 +4769,7 @@ async fn new_entry_after_cold_prefix_lands_at_live_base(cx: &mut TestAppContext)
             let session = store.session(session_id).expect("session exists");
             session.update(cx, |s, cx| {
                 s.entries = vec![
-                    SessionEntry {
+                    std::sync::Arc::new(SessionEntry {
                         created_ms: 1_700_000_000_000,
                         mod_seq: 0,
                         subagent_id: None,
@@ -4772,13 +4778,13 @@ async fn new_entry_after_cold_prefix_lands_at_live_base(cx: &mut TestAppContext)
                             content_md: "cold user".to_string(),
                             chunks: vec![],
                         },
-                    },
-                    SessionEntry {
+                    }),
+                    std::sync::Arc::new(SessionEntry {
                         created_ms: 1_700_000_001_000,
                         mod_seq: 0,
                         subagent_id: None,
                         kind: SessionEntryKind::AssistantMessage { chunks: vec![] },
-                    },
+                    }),
                 ];
                 // Re-attach the same thread so live_base = entries.len() = 2.
                 s.set_acp_thread(Some(acp_thread.clone()), cx);
@@ -4977,14 +4983,14 @@ async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
                 // Seed a teammate-tagged entry so the demux produces a live
                 // `Teammate` stream — since wire v5 the →Idle GC sources stranded
                 // ids from `streams`, so a pill with no stream is not "stranded".
-                s.entries = vec![SessionEntry {
+                s.entries = vec![std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_000,
                     mod_seq: 1,
                     subagent_id: Some(SharedString::from("toolu_gc_1")),
                     kind: SessionEntryKind::AssistantMessage {
                         chunks: vec![AssistantChunk::Message("sub work".into())],
                     },
-                }];
+                })];
                 s.rebuild_streams();
             });
             let seq = session.read(cx).subagents_seq;
@@ -5081,14 +5087,14 @@ async fn idle_transition_gc_closes_stranded_teammate_stream(cx: &mut TestAppCont
                 };
                 // Seed a teammate-tagged entry so the demux produces a live
                 // `Teammate` stream (the pill alone doesn't create one).
-                s.entries = vec![SessionEntry {
+                s.entries = vec![std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_000,
                     mod_seq: 1,
                     subagent_id: Some(SharedString::from("toolu_gc_2")),
                     kind: SessionEntryKind::AssistantMessage {
                         chunks: vec![AssistantChunk::Message("sub work".into())],
                     },
-                }];
+                })];
                 s.rebuild_streams();
             });
             let s = session.read(cx);
@@ -5175,14 +5181,14 @@ async fn idle_transition_gc_excludes_live_async_agent_teammate(cx: &mut TestAppC
                 // `background_agents` registration whose `parent_tool_use_id` is
                 // the teammate id — this is what marks it async-and-live for the
                 // →Idle exclusion set.
-                s.entries = vec![SessionEntry {
+                s.entries = vec![std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_000,
                     mod_seq: 1,
                     subagent_id: Some(SharedString::from("toolu_async_gc")),
                     kind: SessionEntryKind::AssistantMessage {
                         chunks: vec![AssistantChunk::Message("async work in flight".into())],
                     },
-                }];
+                })];
                 let bg_id = crate::background_agent::BackgroundAgentId::new("bg_async_gc");
                 s.background_agents.insert(
                     bg_id.clone(),
@@ -5286,14 +5292,14 @@ async fn idle_transition_gc_does_not_bump_last_activity_at(cx: &mut TestAppConte
                     started_at: std::time::Instant::now(),
                     notified: false,
                 };
-                s.entries = vec![SessionEntry {
+                s.entries = vec![std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_000,
                     mod_seq: 1,
                     subagent_id: Some(SharedString::from("toolu_gc_clock")),
                     kind: SessionEntryKind::AssistantMessage {
                         chunks: vec![AssistantChunk::Message("sub work".into())],
                     },
-                }];
+                })];
                 s.rebuild_streams();
                 s.last_activity_at = t0;
             });
@@ -6039,11 +6045,13 @@ fn classify_done_reasoning_park_vs_completion() {
 fn tail_unanswered_user_detection() {
     use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel};
     use agent_client_protocol::schema as acp;
-    let ent = |kind| SessionEntry {
-        created_ms: 0,
-        mod_seq: 0,
-        subagent_id: None,
-        kind,
+    let ent = |kind| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: None,
+            kind,
+        })
     };
     let user = |chunks: Vec<acp::ContentBlock>| SessionEntryKind::UserMessage {
         id: None,

@@ -636,7 +636,7 @@ async fn get_session_seeds_delta_cursor_epoch_and_seq(cx: &mut gpui::TestAppCont
         use crate::session_entry::{SessionEntry, SessionEntryKind};
         let next = s.change_seq + 1;
         s.change_seq = next;
-        s.entries.push(SessionEntry {
+        s.entries.push(std::sync::Arc::new(SessionEntry {
             created_ms: 1_700_000_000_100,
             mod_seq: next,
             subagent_id: None,
@@ -645,7 +645,7 @@ async fn get_session_seeds_delta_cursor_epoch_and_seq(cx: &mut gpui::TestAppCont
                 content_md: "more".into(),
                 chunks: vec![fake_user_text_chunk("more")],
             },
-        });
+        }));
     });
     let result = GetSessionTool
         .run(
@@ -694,7 +694,7 @@ async fn seed_cold_row_native_session(
             );
             session.title = SharedString::from("cold session");
             session.entries = vec![
-                SessionEntry {
+                std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_000,
                     mod_seq: 1,
                     subagent_id: None,
@@ -706,8 +706,8 @@ async fn seed_cold_row_native_session(
                             fake_image_chunk("image/png", &image_b64_clone),
                         ],
                     },
-                },
-                SessionEntry {
+                }),
+                std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_001,
                     mod_seq: 2,
                     subagent_id: None,
@@ -716,7 +716,7 @@ async fn seed_cold_row_native_session(
                             "world".into(),
                         )],
                     },
-                },
+                }),
             ];
             // Cold, row-native: NO live thread. The wire reads
             // `session.streams`; a direct `entries` assignment bypasses
@@ -1823,13 +1823,13 @@ async fn get_session_entries_carry_created_ms(cx: &mut gpui::TestAppContext) {
         let session_entity = store.read(cx).session(session_id).expect("session exists");
         session_entity.update(cx, |s, _| {
             if let Some(e) = s.entries.get_mut(0) {
-                e.created_ms = fake_ms;
+                std::sync::Arc::make_mut(e).created_ms = fake_ms;
             }
             if let Some(e) = s.entries.get_mut(1) {
-                e.created_ms = NO_TIMESTAMP_MS;
+                std::sync::Arc::make_mut(e).created_ms = NO_TIMESTAMP_MS;
             }
             if let Some(e) = s.entries.get_mut(2) {
-                e.created_ms = fake_ms + 1;
+                std::sync::Arc::make_mut(e).created_ms = fake_ms + 1;
             }
             // The wire reads `session.streams`; refresh the mirror so the
             // directly-stamped created_ms values propagate.
@@ -1885,10 +1885,10 @@ async fn get_session_entry_carries_created_ms(cx: &mut gpui::TestAppContext) {
     // pre-mutation clone and this test would assert against a stale copy.
     mutate_session(session_id, cx, |s| {
         if let Some(e) = s.entries.get_mut(0) {
-            e.created_ms = fake_ms;
+            std::sync::Arc::make_mut(e).created_ms = fake_ms;
         }
         if let Some(e) = s.entries.get_mut(1) {
-            e.created_ms = NO_TIMESTAMP_MS;
+            std::sync::Arc::make_mut(e).created_ms = NO_TIMESTAMP_MS;
         }
     });
 
@@ -2804,7 +2804,7 @@ async fn seed_delta_session(
             );
             session.title = SharedString::from("delta session");
             session.entries = vec![
-                SessionEntry {
+                std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_000,
                     mod_seq: 1,
                     subagent_id: None,
@@ -2816,15 +2816,15 @@ async fn seed_delta_session(
                             fake_image_chunk("image/png", TINY_PNG_B64),
                         ],
                     },
-                },
-                SessionEntry {
+                }),
+                std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_001,
                     mod_seq: 2,
                     subagent_id: None,
                     kind: SessionEntryKind::AssistantMessage {
                         chunks: vec![AssistantChunk::Message("a1-main".into())],
                     },
-                },
+                }),
                 // Phase 4b: seed_delta_session is a MAIN-ONLY transcript so
                 // stream-local Main indices equal the old absolute indices and
                 // the Main-stream delta tests keep their [0..3] expectations.
@@ -2832,7 +2832,7 @@ async fn seed_delta_session(
                 // assistant) so the Main stream's demux does NOT coalesce it
                 // into entry 1 — the four entries stay distinct on the wire.
                 // Teammate-stream selection is covered by dedicated tests.
-                SessionEntry {
+                std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_002,
                     mod_seq: 3,
                     subagent_id: None,
@@ -2841,8 +2841,8 @@ async fn seed_delta_session(
                         content_md: "u2".into(),
                         chunks: vec![fake_user_text_chunk("u2")],
                     },
-                },
-                SessionEntry {
+                }),
+                std::sync::Arc::new(SessionEntry {
                     created_ms: 1_700_000_000_003,
                     mod_seq: 4,
                     subagent_id: None,
@@ -2854,7 +2854,7 @@ async fn seed_delta_session(
                             fake_image_chunk("image/png", TINY_PNG_B64),
                         ],
                     },
-                },
+                }),
             ];
             session.change_seq = 4;
             // The wire reads `session.streams`; direct `entries` assignment
@@ -2956,13 +2956,15 @@ async fn get_session_changes_delivers_coalesce_merge_update(cx: &mut gpui::TestA
     let (session_id, _tmp) = seed_delta_session(cx).await;
     mutate_session(session_id, cx, |s| {
         use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
-        let asst = |n: u64, text: &str| SessionEntry {
-            created_ms: 1_700_000_000_000 + n as i64,
-            mod_seq: n,
-            subagent_id: None,
-            kind: SessionEntryKind::AssistantMessage {
-                chunks: vec![AssistantChunk::Message(text.into())],
-            },
+        let asst = |n: u64, text: &str| {
+            std::sync::Arc::new(SessionEntry {
+                created_ms: 1_700_000_000_000 + n as i64,
+                mod_seq: n,
+                subagent_id: None,
+                kind: SessionEntryKind::AssistantMessage {
+                    chunks: vec![AssistantChunk::Message(text.into())],
+                },
+            })
         };
         s.entries = vec![asst(1, "first "), asst(2, "second")];
         s.change_seq = 2;
@@ -3011,15 +3013,17 @@ async fn get_session_changes_paginates_changed_entries(cx: &mut gpui::TestAppCon
         // stream's demux keeps all 15 distinct — assistant messages would
         // coalesce into a single stream entry.
         s.entries = (1..=15u64)
-            .map(|n| SessionEntry {
-                created_ms: 1_700_000_000_000 + n as i64,
-                mod_seq: n,
-                subagent_id: None,
-                kind: SessionEntryKind::UserMessage {
-                    id: None,
-                    content_md: format!("u{n}"),
-                    chunks: vec![fake_user_text_chunk(&format!("u{n}"))],
-                },
+            .map(|n| {
+                std::sync::Arc::new(SessionEntry {
+                    created_ms: 1_700_000_000_000 + n as i64,
+                    mod_seq: n,
+                    subagent_id: None,
+                    kind: SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: format!("u{n}"),
+                        chunks: vec![fake_user_text_chunk(&format!("u{n}"))],
+                    },
+                })
             })
             .collect();
         s.change_seq = 15;
@@ -3190,15 +3194,17 @@ async fn get_session_changes_stream_selection_narrows_entries_and_total(
         use crate::session_entry::{SessionEntry, SessionEntryKind};
         // USER messages so the Main entries (m0/m1/m3) stay distinct — three
         // consecutive assistant messages would coalesce into one stream entry.
-        let mk = |n: u64, sub: Option<&str>, text: &str| SessionEntry {
-            created_ms: 1_700_000_000_000 + n as i64,
-            mod_seq: n,
-            subagent_id: sub.map(SharedString::from),
-            kind: SessionEntryKind::UserMessage {
-                id: None,
-                content_md: text.into(),
-                chunks: vec![fake_user_text_chunk(text)],
-            },
+        let mk = |n: u64, sub: Option<&str>, text: &str| {
+            std::sync::Arc::new(SessionEntry {
+                created_ms: 1_700_000_000_000 + n as i64,
+                mod_seq: n,
+                subagent_id: sub.map(SharedString::from),
+                kind: SessionEntryKind::UserMessage {
+                    id: None,
+                    content_md: text.into(),
+                    chunks: vec![fake_user_text_chunk(text)],
+                },
+            })
         };
         s.entries = vec![
             mk(1, None, "m0"),
@@ -3350,7 +3356,7 @@ async fn get_session_changes_tail_truncate_shrinks_total(cx: &mut gpui::TestAppC
         s.change_seq = 5;
         // Bump the surviving tail entry's mod_seq so it re-sends.
         if let Some(last) = s.entries.last_mut() {
-            last.mod_seq = 5;
+            std::sync::Arc::make_mut(last).mod_seq = 5;
         }
     });
 
@@ -4893,15 +4899,17 @@ async fn cold_cache_serves_a_coalescing_transcript_identically(cx: &mut gpui::Te
     use crate::session_entry::{SessionEntry, SessionEntryKind};
 
     let (session_id, db, _solution_id, _tmp) = seed_closed_session_with_entries(cx, 0).await;
-    let assistant_row = |idx: usize| SessionEntry {
-        created_ms: 1_700_000_000_000 + idx as i64,
-        mod_seq: idx as u64 + 1,
-        subagent_id: None,
-        kind: SessionEntryKind::AssistantMessage {
-            chunks: vec![crate::session_entry::AssistantChunk::Message(format!(
-                "fragment {idx}"
-            ))],
-        },
+    let assistant_row = |idx: usize| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + idx as i64,
+            mod_seq: idx as u64 + 1,
+            subagent_id: None,
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![crate::session_entry::AssistantChunk::Message(format!(
+                    "fragment {idx}"
+                ))],
+            },
+        })
     };
     for idx in 0..4 {
         let row = assistant_row(idx);
@@ -5507,7 +5515,7 @@ fn set_transcript(
     entries: Vec<crate::session_entry::SessionEntry>,
 ) {
     mutate_session(session_id, cx, |s| {
-        s.entries = entries;
+        s.entries = entries.into_iter().map(std::sync::Arc::new).collect();
     });
 }
 

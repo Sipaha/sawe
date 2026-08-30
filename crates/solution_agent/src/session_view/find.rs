@@ -153,7 +153,7 @@ impl SolutionSessionView {
         // render-frame field, so a `recompute_matches` fired from
         // `on_thread_event` reflects the just-mutated stream. Drill-in views
         // don't support find over the parent thread → no matches.
-        let stream_entries: &[crate::session_entry::SessionEntry] = session
+        let stream_entries: &[std::sync::Arc<crate::session_entry::SessionEntry>] = session
             .streams
             .get(&self.selected_stream)
             .map(|s| s.entries.as_slice())

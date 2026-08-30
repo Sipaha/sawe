@@ -10,7 +10,34 @@ use agent_client_protocol::schema as acp;
 use gpui::{App, SharedString};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+/// Test-only census of *deep* `SessionEntry` clones on the current thread.
+///
+/// The stream mirror shares its entries with `session.entries` behind `Arc`
+/// (see [`crate::stream::Stream::entries`]), so a `rebuild_streams` must copy
+/// only the head of each coalesced assistant run. This counter is what lets a
+/// test assert that — it is the difference between "the mirror is a view" and
+/// "the mirror is a second transcript", and nothing else observes it.
+#[cfg(test)]
+pub(crate) mod deep_clone_census {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn record() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Deep clones performed on this thread so far. Tests take a delta across
+    /// the call they are measuring rather than resetting, so a helper that
+    /// clones on the way in cannot silently zero another test's census.
+    pub(crate) fn taken() -> u64 {
+        COUNT.with(Cell::get)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionEntry {
     /// Unix-millis creation time. 0 = unknown (replayed gap / pre-feature).
     /// Stamped by the store, not the converter.
@@ -21,6 +48,22 @@ pub struct SessionEntry {
     /// None = main agent; Some = the sub-agent that produced this entry.
     pub subagent_id: Option<SharedString>,
     pub kind: SessionEntryKind,
+}
+
+/// Hand-written so `deep_clone_census` can see every deep copy. Exhaustive by
+/// construction: a new field on `SessionEntry` fails to compile here rather
+/// than being silently dropped from the clone.
+impl Clone for SessionEntry {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        crate::session_entry::deep_clone_census::record();
+        Self {
+            created_ms: self.created_ms,
+            mod_seq: self.mod_seq,
+            subagent_id: self.subagent_id.clone(),
+            kind: self.kind.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

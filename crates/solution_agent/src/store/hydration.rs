@@ -386,7 +386,7 @@ pub(crate) fn build_cold_session(
         s.last_activity_at = meta.last_activity_at;
         s.context_count = meta.context_count;
         s.cwd = meta.cwd.clone();
-        s.entries = entries;
+        s.entries = entries.into_iter().map(std::sync::Arc::new).collect();
         // Rebuild the per-source `streams` mirror (phase 2c) —
         // the desktop render reads it, and this cold-load path
         // assigns `entries` directly. Without it a restored
@@ -903,7 +903,8 @@ impl SolutionAgentStore {
                         s.desired_model = meta.desired_model.clone();
                         s.desired_effort = meta.desired_effort.clone();
                         s.cached_models = meta.cached_models.clone();
-                        s.entries = entries;
+                        s.entries =
+                            entries.into_iter().map(std::sync::Arc::new).collect();
                         // Rebuild the per-source `streams` mirror the desktop
                         // render reads from (phase 2c). Cold-load/hydration
                         // assigns `entries` directly, so without this the mirror

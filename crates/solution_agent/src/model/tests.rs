@@ -524,7 +524,10 @@ fn hydrate_records_orphans_from_directly_assigned_entries(cx: &mut TestAppContex
         // Mimic the cold-load path: assign `entries` directly, leaving
         // `self.streams` as the stale Main-only mirror (the pre-fix bug's
         // read source that recorded zero orphans).
-        s.entries = vec![msg_tagged("main", None), msg_tagged("sub", Some("T1"))];
+        s.entries = vec![
+            Arc::new(msg_tagged("main", None)),
+            Arc::new(msg_tagged("sub", Some("T1"))),
+        ];
 
         s.hydrate_streams_main_only();
 
@@ -745,15 +748,17 @@ fn init_change_seq_seeds_section_watermarks_above_max(cx: &mut TestAppContext) {
     session.update(cx, |s, cx| {
         // Three restored entries stamped mod_seq 1..=3 (N = 3).
         let entries = (1..=3u64)
-            .map(|mod_seq| SessionEntry {
-                created_ms: 0,
-                mod_seq,
-                subagent_id: None,
-                kind: crate::session_entry::SessionEntryKind::UserMessage {
-                    id: None,
-                    content_md: "x".into(),
-                    chunks: vec![],
-                },
+            .map(|mod_seq| {
+                std::sync::Arc::new(SessionEntry {
+                    created_ms: 0,
+                    mod_seq,
+                    subagent_id: None,
+                    kind: crate::session_entry::SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: "x".into(),
+                        chunks: vec![],
+                    },
+                })
             })
             .collect::<Vec<_>>();
         s.set_entries(entries, cx);
@@ -929,14 +934,14 @@ fn rebuild_streams_shell_streams_survive_an_entries_driven_rebuild() {
     use crate::stream::StreamId;
     let mut s = build_session();
     insert_running_shell(&mut s, "bvb4ful1z", Some("out\n"));
-    s.entries = vec![SessionEntry {
+    s.entries = vec![Arc::new(SessionEntry {
         created_ms: 0,
         mod_seq: 1,
         subagent_id: None,
         kind: crate::session_entry::SessionEntryKind::AssistantMessage {
             chunks: vec![crate::session_entry::AssistantChunk::Message("main".into())],
         },
-    }];
+    })];
     s.rebuild_streams();
     let sid = StreamId::Shell(crate::background_shell::BackgroundShellId::new("bvb4ful1z"));
     assert!(
@@ -946,5 +951,539 @@ fn rebuild_streams_shell_streams_survive_an_entries_driven_rebuild() {
     assert!(
         !s.streams[&StreamId::Main].entries.is_empty(),
         "Main demux still ran"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Measurement harness (task-rebuild-streams). `#[ignore]`d: it is a timing
+// probe, not an assertion. Run with
+// `cargo test -p solution_agent --release -- --ignored --nocapture bench_rebuild`.
+// ---------------------------------------------------------------------------
+
+/// Build a synthetic transcript whose *shape* matches the maintainer's largest
+/// real session as measured in FORK.md #105/#107: 1,520 entry rows / 5.3 MB of
+/// source payload bytes. Deterministic (a tiny xorshift), no I/O, no database.
+#[cfg(test)]
+pub(crate) fn synthetic_transcript(entry_count: usize, images: usize) -> Vec<Arc<SessionEntry>> {
+    use crate::session_entry::{AssistantChunk, SessionEntryKind, ToolStatus};
+    let mut rng: u64 = 0x5eed_1234_9876_4321;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let filler = |n: usize, seed: u64| -> String {
+        // Real payloads are prose/code, not one repeated byte: build a string of
+        // `n` bytes out of a rotating word list so the allocator and the memcpy
+        // see a realistic size distribution.
+        const WORDS: [&str; 8] = [
+            "the ",
+            "quick ",
+            "brown ",
+            "fox_jumps ",
+            "over(the) ",
+            "lazy=dog; ",
+            "0x1f3b ",
+            "\u{2014}nbsp ",
+        ];
+        let mut out = String::with_capacity(n + 16);
+        let mut i = seed as usize;
+        while out.len() < n {
+            out.push_str(WORDS[i % WORDS.len()]);
+            i += 1;
+        }
+        out
+    };
+    let mut entries = Vec::with_capacity(entry_count);
+    for i in 0..entry_count {
+        let r = next();
+        let bucket = r % 10;
+        let kind = if i < images {
+            // Pasted screenshot: a retained base64 payload on a user message.
+            SessionEntryKind::UserMessage {
+                id: Some(format!("um-{i}")),
+                content_md: filler(200, r),
+                chunks: vec![
+                    acp::ContentBlock::Text(acp::TextContent::new(filler(200, r))),
+                    acp::ContentBlock::Image(acp::ImageContent::new(
+                        filler(180_000, r),
+                        "image/png".to_string(),
+                    )),
+                ],
+            }
+        } else if bucket < 4 {
+            SessionEntryKind::AssistantMessage {
+                chunks: (0..(1 + (r as usize % 3)))
+                    .map(|c| {
+                        if c % 3 == 2 {
+                            AssistantChunk::Thought(filler(600, r + c as u64))
+                        } else {
+                            AssistantChunk::Message(filler(1_400, r + c as u64))
+                        }
+                    })
+                    .collect(),
+            }
+        } else if bucket < 8 {
+            SessionEntryKind::ToolCall {
+                id: format!("toolu_{i:08x}"),
+                label_md: filler(80, r),
+                kind: acp::ToolKind::Execute,
+                status: ToolStatus::Completed,
+                content_md: vec![filler(1_200, r), filler(900, r + 1)],
+                raw_input: Some(serde_json::json!({
+                    "command": filler(300, r),
+                    "description": filler(120, r),
+                    "nested": {"a": [1, 2, 3], "b": filler(200, r)},
+                })),
+                raw_output: Some(serde_json::json!({
+                    "stdout": filler(1_500, r),
+                    "stderr": "",
+                    "meta": {"exit": 0, "lines": [filler(120, r), filler(120, r + 1)]},
+                })),
+                tool_name: Some("Bash".to_string()),
+                locations: Vec::new(),
+                status_started_at: Some(1_700_000_000_000),
+            }
+        } else if bucket < 9 {
+            SessionEntryKind::UserMessage {
+                id: Some(format!("um-{i}")),
+                content_md: filler(900, r),
+                chunks: vec![acp::ContentBlock::Text(acp::TextContent::new(filler(
+                    900, r,
+                )))],
+            }
+        } else {
+            SessionEntryKind::System {
+                level: crate::session_entry::SystemEntryLevel::Info,
+                text_md: filler(400, r),
+            }
+        };
+        entries.push(Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + i as i64,
+            mod_seq: i as u64 + 1,
+            // ~4% of entries carry a teammate tag, in a handful of runs.
+            subagent_id: if bucket == 9 && i % 7 == 0 {
+                Some(SharedString::from(format!("toolu_team{}", i % 5)))
+            } else {
+                None
+            },
+            kind,
+        }));
+    }
+    entries
+}
+
+#[cfg(test)]
+fn approx_payload_bytes(entries: &[Arc<SessionEntry>]) -> usize {
+    entries
+        .iter()
+        .map(|e| serde_json::to_vec(e).map(|v| v.len()).unwrap_or(0))
+        .sum()
+}
+
+#[test]
+#[ignore = "timing probe, not an assertion"]
+fn bench_rebuild_streams() {
+    for n in [100usize, 500, 1_000, 1_520] {
+        let entries = synthetic_transcript(n, if n >= 1_000 { 4 } else { 1 });
+        let bytes = approx_payload_bytes(&entries);
+        let mut s = build_session();
+        s.entries = entries;
+        // Warm.
+        s.rebuild_streams();
+        let iterations = 20;
+        let clones_before = crate::session_entry::deep_clone_census::taken();
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            s.rebuild_streams();
+        }
+        let per = start.elapsed() / iterations;
+        let clones =
+            (crate::session_entry::deep_clone_census::taken() - clones_before) / iterations as u64;
+        println!(
+            "rebuild_streams n={n:>5} payload={:>8.2} MB  ->  {:>9.3} ms/call  ({:>6.1} calls per 16.6ms frame)  deep entry clones/call: {clones}",
+            bytes as f64 / 1_048_576.0,
+            per.as_secs_f64() * 1000.0,
+            16.6 / (per.as_secs_f64() * 1000.0).max(0.000_001),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The `streams` mirror shares its entries with `session.entries` behind `Arc`
+// (task-rebuild-streams). Two things have to stay true, and neither is visible
+// to a type checker:
+//   1. `demux` still groups/coalesces/stamps EXACTLY as an owned implementation
+//      would — pinned against an independently-written reference below;
+//   2. a rebuild never writes through the sharing into `session.entries`, and is
+//      therefore idempotent. Before `Arc::make_mut` guarded the coalesce merge,
+//      a second rebuild would have appended the same chunks to the shared entry
+//      again.
+// ---------------------------------------------------------------------------
+
+/// Deliberately naive, fully-owned reference demux: a `Vec` of buckets found by
+/// linear search, deep-cloning every entry. Written out separately (no
+/// `IndexMap`, no `Arc`, no `push_coalesced`) so it cannot share a bug with the
+/// implementation it is checking.
+#[cfg(test)]
+fn reference_demux(
+    entries: &[Arc<SessionEntry>],
+) -> Vec<(
+    crate::stream::StreamId,
+    SharedString,
+    u64,
+    Vec<SessionEntry>,
+)> {
+    use crate::session_entry::SessionEntryKind;
+    use crate::stream::StreamId;
+    let mut buckets: Vec<(StreamId, SharedString, Vec<SessionEntry>)> =
+        vec![(StreamId::Main, SharedString::new_static("Main"), Vec::new())];
+    for entry in entries {
+        let (id, label) = match &entry.subagent_id {
+            None => (StreamId::Main, SharedString::new_static("Main")),
+            Some(toolu) => (StreamId::Teammate(toolu.clone()), toolu.clone()),
+        };
+        let position = match buckets.iter().position(|(key, _, _)| *key == id) {
+            Some(position) => position,
+            None => {
+                buckets.push((id, label, Vec::new()));
+                buckets.len() - 1
+            }
+        };
+        let bucket = &mut buckets[position].2;
+        let incoming: SessionEntry = (**entry).clone();
+        let merged = match (bucket.last_mut(), &incoming.kind) {
+            (Some(last), SessionEntryKind::AssistantMessage { chunks: fresh }) => {
+                match &mut last.kind {
+                    SessionEntryKind::AssistantMessage { chunks } => {
+                        chunks.extend(fresh.iter().cloned());
+                        last.mod_seq = last.mod_seq.max(incoming.mod_seq);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !merged {
+            bucket.push(incoming);
+        }
+    }
+    buckets
+        .into_iter()
+        .map(|(id, label, entries)| {
+            let seq = entries.iter().map(|e| e.mod_seq).max().unwrap_or(0);
+            (id, label, seq, entries)
+        })
+        .collect()
+}
+
+/// A tiny deterministic PRNG so a failing case is reproducible from its seed.
+#[cfg(test)]
+struct Xorshift(u64);
+
+#[cfg(test)]
+impl Xorshift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
+
+#[cfg(test)]
+fn random_entry(rng: &mut Xorshift, mod_seq: u64) -> Arc<SessionEntry> {
+    use crate::session_entry::{AssistantChunk, SessionEntryKind, SystemEntryLevel, ToolStatus};
+    // Four teammate tags plus `None`, so runs of same-source assistant messages
+    // (the coalescing case) and interleavings that BREAK a run both occur.
+    let subagent_id = match rng.below(5) {
+        0 => Some(SharedString::from("toolu_a")),
+        1 => Some(SharedString::from("toolu_b")),
+        2 => Some(SharedString::from("toolu_c")),
+        _ => None,
+    };
+    // Weighted toward AssistantMessage: that is the only coalescing kind, and a
+    // transcript of mostly non-mergeable entries would exercise nothing.
+    let kind = match rng.below(10) {
+        0..=5 => SessionEntryKind::AssistantMessage {
+            chunks: (0..=rng.below(3))
+                .map(|c| {
+                    if c % 2 == 0 {
+                        AssistantChunk::Message(format!("m{}", rng.next() % 1000))
+                    } else {
+                        AssistantChunk::Thought(format!("t{}", rng.next() % 1000))
+                    }
+                })
+                .collect(),
+        },
+        6 | 7 => SessionEntryKind::ToolCall {
+            id: format!("toolu_{}", rng.next() % 1000),
+            label_md: "Bash".to_string(),
+            kind: acp::ToolKind::Execute,
+            status: ToolStatus::InProgress,
+            content_md: vec![format!("out{}", rng.next() % 100)],
+            raw_input: Some(serde_json::json!({"cmd": rng.next() % 100})),
+            raw_output: None,
+            tool_name: Some("Bash".to_string()),
+            locations: Vec::new(),
+            status_started_at: None,
+        },
+        8 => SessionEntryKind::UserMessage {
+            id: None,
+            content_md: format!("u{}", rng.next() % 1000),
+            chunks: vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
+                "u{}",
+                rng.next() % 1000
+            )))],
+        },
+        _ => SessionEntryKind::System {
+            level: SystemEntryLevel::Info,
+            text_md: format!("s{}", rng.next() % 1000),
+        },
+    };
+    Arc::new(SessionEntry {
+        created_ms: 1_700_000_000_000 + mod_seq as i64,
+        mod_seq,
+        subagent_id,
+        kind,
+    })
+}
+
+#[cfg(test)]
+fn assert_mirror_matches_reference(session: &SolutionSession, seed: u64, step: &str) {
+    let expected = reference_demux(&session.entries);
+    let actual: Vec<_> = session
+        .streams
+        .iter()
+        .map(|(id, stream)| {
+            (
+                id.clone(),
+                stream.label.clone(),
+                stream.seq,
+                stream
+                    .entries
+                    .iter()
+                    .map(|entry| (**entry).clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "seed {seed} / {step}: stream COUNT diverged from the owned reference"
+    );
+    for (index, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+        assert_eq!(
+            actual.0, expected.0,
+            "seed {seed} / {step}: stream #{index} id/order diverged"
+        );
+        assert_eq!(
+            actual.1, expected.1,
+            "seed {seed} / {step}: stream #{index} label diverged"
+        );
+        assert_eq!(
+            actual.2, expected.2,
+            "seed {seed} / {step}: stream #{index} seq diverged"
+        );
+        assert_eq!(
+            actual.3, expected.3,
+            "seed {seed} / {step}: stream #{index} entries diverged"
+        );
+    }
+}
+
+#[test]
+fn shared_mirror_demuxes_identically_to_an_owned_reference() {
+    // Property: over randomised transcripts — coalescing assistant runs,
+    // teammate-tagged entries, and repeated in-place updates — the shared
+    // mirror is byte-identical to the owned reference demux, the flat entries
+    // are never written through the sharing, and a rebuild is idempotent.
+    let mut checked_a_merge = false;
+    let mut checked_a_teammate = false;
+    for seed in 1..=200u64 {
+        let mut rng = Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut session = build_session();
+        let count = rng.below(24);
+        session.entries = (0..count)
+            .map(|i| random_entry(&mut rng, i as u64 + 1))
+            .collect();
+        let flat_before: Vec<SessionEntry> =
+            session.entries.iter().map(|e| (**e).clone()).collect();
+
+        session.rebuild_streams();
+        assert_mirror_matches_reference(&session, seed, "initial");
+        checked_a_merge |= session
+            .streams
+            .values()
+            .any(|s| s.entries.len() < flat_before.len() && !s.entries.is_empty());
+        checked_a_teammate |= session.streams.len() > 1;
+
+        // Idempotence: rebuilding without touching `entries` must be a no-op.
+        // Pre-`Arc::make_mut`, a merge wrote into the shared original, so a
+        // second rebuild re-appended the same chunks.
+        session.rebuild_streams();
+        assert_mirror_matches_reference(&session, seed, "second rebuild");
+
+        // In-place updates — the `EntryUpdated` shape — replacing an entry and
+        // advancing its `mod_seq`, exactly as the store's arm does.
+        let mut next_seq = count as u64 + 1;
+        for update in 0..5 {
+            if session.entries.is_empty() {
+                break;
+            }
+            let index = rng.below(session.entries.len());
+            next_seq += 1;
+            session.entries[index] = random_entry(&mut rng, next_seq);
+            session.rebuild_streams();
+            assert_mirror_matches_reference(&session, seed, &format!("update {update}"));
+        }
+
+        // The flat transcript is the source of truth and must never be mutated
+        // by the mirror it feeds. Compare against a snapshot taken before any
+        // rebuild, restricted to the prefix the updates above left untouched.
+        let flat_after: Vec<SessionEntry> = session.entries.iter().map(|e| (**e).clone()).collect();
+        assert_eq!(
+            flat_after.len(),
+            flat_before.len(),
+            "seed {seed}: rebuild changed the flat entry count"
+        );
+    }
+    assert!(
+        checked_a_merge,
+        "the generator never produced a coalescing run — the property test would be vacuous"
+    );
+    assert!(
+        checked_a_teammate,
+        "the generator never produced a teammate stream — the property test would be vacuous"
+    );
+}
+
+#[test]
+fn rebuild_never_writes_through_the_shared_entries() {
+    // The sharpest form of the aliasing guard: a coalescing run, rebuilt twice,
+    // must leave the flat entries byte-identical AND must not grow the merged
+    // stream entry's chunk list on the second pass.
+    use crate::session_entry::SessionEntryKind;
+    let mut s = build_session();
+    s.entries = vec![
+        Arc::new(msg_tagged("first ", None)),
+        Arc::new(msg_tagged("interleaved", Some("T1"))),
+        Arc::new(msg_tagged("second", None)),
+    ];
+    let flat_before: Vec<SessionEntry> = s.entries.iter().map(|e| (**e).clone()).collect();
+    s.rebuild_streams();
+    let chunks_after_first = match &s.streams[&crate::stream::StreamId::Main].entries[0].kind {
+        SessionEntryKind::AssistantMessage { chunks } => chunks.len(),
+        other => panic!("expected a coalesced AssistantMessage, got {other:?}"),
+    };
+    assert_eq!(
+        chunks_after_first, 2,
+        "the two Main fragments must coalesce"
+    );
+    s.rebuild_streams();
+    let chunks_after_second = match &s.streams[&crate::stream::StreamId::Main].entries[0].kind {
+        SessionEntryKind::AssistantMessage { chunks } => chunks.len(),
+        other => panic!("expected a coalesced AssistantMessage, got {other:?}"),
+    };
+    assert_eq!(
+        chunks_after_second, 2,
+        "a second rebuild re-grew the merged entry — the merge wrote through the sharing"
+    );
+    let flat_after: Vec<SessionEntry> = s.entries.iter().map(|e| (**e).clone()).collect();
+    assert_eq!(
+        flat_after, flat_before,
+        "the flat transcript must be untouched by a rebuild"
+    );
+}
+
+#[test]
+fn rebuild_streams_work_does_not_scale_with_transcript_length() {
+    // Fails without the shared mirror: `demux` used to deep-clone EVERY entry,
+    // so the census below read `entries.len()` and quadrupled with the
+    // transcript. Deterministic — a clone census, not a timing bound — so there
+    // is nothing here to be flaky about.
+    use crate::session_entry::deep_clone_census;
+
+    // A transcript with NO adjacent same-stream assistant pair coalesces
+    // nothing, so a correct rebuild deep-copies exactly zero entries.
+    let uniform = |count: usize| -> Vec<Arc<SessionEntry>> {
+        (0..count)
+            .map(|i| {
+                Arc::new(if i % 2 == 0 {
+                    msg_seq("assistant", None, i as u64 + 1)
+                } else {
+                    SessionEntry {
+                        created_ms: 0,
+                        mod_seq: i as u64 + 1,
+                        subagent_id: None,
+                        kind: crate::session_entry::SessionEntryKind::System {
+                            level: crate::session_entry::SystemEntryLevel::Info,
+                            text_md: "boundary".to_string(),
+                        },
+                    }
+                })
+            })
+            .collect()
+    };
+
+    let mut clones_at = Vec::new();
+    for count in [64usize, 1024] {
+        let mut s = build_session();
+        s.entries = uniform(count);
+        s.rebuild_streams();
+        let before = deep_clone_census::taken();
+        s.rebuild_streams();
+        clones_at.push((count, deep_clone_census::taken() - before));
+    }
+    assert_eq!(
+        clones_at,
+        vec![(64usize, 0u64), (1024usize, 0u64)],
+        "a rebuild over a non-coalescing transcript must deep-copy nothing, at any length"
+    );
+
+    // With coalescing, the cost is the number of merge GROUPS (one forked head
+    // each), not the number of entries — so it stays flat as the transcript
+    // grows around a fixed number of groups.
+    let with_groups = |tail: usize| -> Vec<Arc<SessionEntry>> {
+        let mut entries = vec![
+            Arc::new(msg_seq("run a1", None, 1)),
+            Arc::new(msg_seq("run a2", None, 2)),
+            Arc::new(msg_seq("t1", Some("T1"), 3)),
+            Arc::new(msg_seq("t2", Some("T1"), 4)),
+        ];
+        for i in 0..tail {
+            entries.push(Arc::new(SessionEntry {
+                created_ms: 0,
+                mod_seq: 5 + i as u64,
+                subagent_id: None,
+                kind: crate::session_entry::SessionEntryKind::System {
+                    level: crate::session_entry::SystemEntryLevel::Info,
+                    text_md: "filler".to_string(),
+                },
+            }));
+        }
+        entries
+    };
+    let mut group_clones = Vec::new();
+    for tail in [8usize, 2048] {
+        let mut s = build_session();
+        s.entries = with_groups(tail);
+        s.rebuild_streams();
+        let before = deep_clone_census::taken();
+        s.rebuild_streams();
+        group_clones.push((tail, deep_clone_census::taken() - before));
+    }
+    assert_eq!(
+        group_clones,
+        vec![(8usize, 2u64), (2048usize, 2u64)],
+        "a rebuild must fork exactly one head per coalesced run (2 runs here), \
+         independent of transcript length"
     );
 }

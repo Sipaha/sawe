@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use acp_thread::AcpThread;
@@ -398,7 +399,10 @@ pub struct SolutionSession {
     /// coalesced `streams`; only a few dev/notification readers still touch flat
     /// `entries` (see brief §D) and they stay 1:1-aligned with `AcpThread`.
     /// Mutated only through `set_entries` setter or the store's ingest arms.
-    pub entries: Vec<SessionEntry>,
+    /// Held behind `Arc` so `rebuild_streams`'s demux can share each entry with
+    /// the `streams` mirror instead of deep-copying the whole transcript on
+    /// every `EntryUpdated` (~60/s while text reveals).
+    pub entries: Vec<Arc<SessionEntry>>,
     /// Per-source stream mirror of `entries`, maintained by `rebuild_streams`
     /// after every `entries` mutation. Source of truth for per-stream rendering,
     /// the wire (phases 2c-5), AND persistence (`streams[Main]`, phase 6b).
@@ -788,8 +792,12 @@ impl SolutionSession {
 
     /// Store the given session entries and notify observers. Used by
     /// the store to maintain the mobile delta-sync payload (Phase 2+).
-    pub fn set_entries(&mut self, entries: Vec<SessionEntry>, cx: &mut Context<Self>) {
-        self.entries = entries;
+    pub fn set_entries(
+        &mut self,
+        entries: impl IntoIterator<Item = impl Into<Arc<SessionEntry>>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.entries = entries.into_iter().map(Into::into).collect();
         self.rebuild_streams();
         cx.notify();
     }
@@ -848,7 +856,7 @@ impl SolutionSession {
                 id: crate::stream::StreamId::Shell(id.clone()),
                 kind: crate::stream::StreamKind::Shell,
                 label: shell.stream_label(),
-                entries: vec![shell.stream_entry(shell_now)],
+                entries: vec![Arc::new(shell.stream_entry(shell_now))],
                 seq: 0,
                 state: crate::stream::StreamState::Live,
                 source: crate::stream::StreamSource::FileTail(shell.output_path.clone()),
@@ -904,7 +912,7 @@ impl SolutionSession {
                 // overwrites this with `teammate_labels[toolu]` (or the raw
                 // toolu when none was captured), the single label source.
                 label: parent_toolu,
-                entries: vec![agent.stream_entry(agent_now)],
+                entries: vec![Arc::new(agent.stream_entry(agent_now))],
                 seq: 0,
                 state: agent.stream_state(),
                 source: crate::stream::StreamSource::FileTail(agent.jsonl_path.clone()),

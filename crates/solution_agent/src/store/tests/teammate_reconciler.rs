@@ -2282,7 +2282,7 @@ async fn fold_does_not_resurrect_a_reaped_detached_agent_pill(cx: &mut TestAppCo
             };
             // NO tagged entries: the detached agent never interleaves, so its
             // stream can only come from the fold.
-            s.set_entries(vec![], cx);
+            s.set_entries(Vec::<crate::session_entry::SessionEntry>::new(), cx);
             let bg_id = crate::background_agent::BackgroundAgentId::new("bg_detached_stale");
             s.background_agents.insert(
                 bg_id.clone(),

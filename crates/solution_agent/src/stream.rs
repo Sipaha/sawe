@@ -11,6 +11,7 @@ use crate::session_entry::{SessionEntry, SessionEntryKind};
 use gpui::SharedString;
 use indexmap::IndexMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Which stream an entry belongs to. `Teammate` carries the parent `Agent`
 /// tool_use id (`toolu_…`) that all of that teammate's entries are tagged with.
@@ -48,7 +49,13 @@ pub struct Stream {
     pub id: StreamId,
     pub kind: StreamKind,
     pub label: SharedString,
-    pub entries: Vec<SessionEntry>,
+    /// Reference-counted so the mirror is a *view* of `session.entries`, not a
+    /// second copy of the transcript: `demux` runs on every `EntryUpdated`
+    /// (~60/s during a streaming reveal) and a deep clone per entry cost 2.7 ms
+    /// per rebuild on a 1,520-entry / 5.4 MB session — 16 % of a frame, thrown
+    /// away immediately. Only a coalesce-merge writes to an entry, and it goes
+    /// through `Arc::make_mut`, so the shared originals are never mutated.
+    pub entries: Vec<Arc<SessionEntry>>,
     /// Per-stream delta watermark (replaces the old global `mod_seq` churn).
     pub seq: u64,
     pub state: StreamState,
@@ -85,22 +92,38 @@ impl Stream {
     /// is correct: interleaving from *other* sources lives in *other* streams,
     /// and a tool call (or any non-message entry) between two messages sits
     /// between them and so is a natural boundary.
-    pub fn push_coalesced(&mut self, entry: SessionEntry) {
-        if let SessionEntryKind::AssistantMessage { chunks: incoming } = &entry.kind
-            && let Some(last) = self.entries.last_mut()
-            && let SessionEntryKind::AssistantMessage { chunks } = &mut last.kind
-        {
-            chunks.extend(incoming.iter().cloned());
-            // The coalesced entry's `mod_seq` is the phase-4 wire delta key. A
-            // merge keeps the FIRST fragment's chunks in place but MUST advance
-            // the key so a client polling `entry.mod_seq > since_seq` sees the
-            // update (decision #5 — otherwise a coalesced-message update is
-            // silently missed). Stream entries are clones, so bumping this copy's
-            // mod_seq is local to the stream mirror.
-            last.mod_seq = last.mod_seq.max(entry.mod_seq);
+    pub fn push_coalesced(&mut self, entry: Arc<SessionEntry>) {
+        let mergeable = matches!(entry.kind, SessionEntryKind::AssistantMessage { .. })
+            && self
+                .entries
+                .last()
+                .is_some_and(|last| matches!(last.kind, SessionEntryKind::AssistantMessage { .. }));
+        if !mergeable {
+            self.entries.push(entry);
             return;
         }
-        self.entries.push(entry);
+        let (SessionEntryKind::AssistantMessage { chunks: incoming }, Some(last)) =
+            (&entry.kind, self.entries.last_mut())
+        else {
+            unreachable!("guarded by `mergeable` above");
+        };
+        // `make_mut` is what keeps the *session's* copy of the first fragment
+        // pristine: the merge below rewrites the group head, so the mirror must
+        // fork it away from the shared original. It deep-copies at most once per
+        // group per rebuild — the fork leaves the mirror holding the sole
+        // reference, so the 2nd..kth fragment of the same run merge in place.
+        let last = Arc::make_mut(last);
+        let SessionEntryKind::AssistantMessage { chunks } = &mut last.kind else {
+            unreachable!("guarded by `mergeable` above");
+        };
+        chunks.extend(incoming.iter().cloned());
+        // The coalesced entry's `mod_seq` is the phase-4 wire delta key. A
+        // merge keeps the FIRST fragment's chunks in place but MUST advance
+        // the key so a client polling `entry.mod_seq > since_seq` sees the
+        // update (decision #5 — otherwise a coalesced-message update is
+        // silently missed). The forked head is the mirror's own, so bumping its
+        // mod_seq is local to the stream mirror.
+        last.mod_seq = last.mod_seq.max(entry.mod_seq);
     }
 }
 
@@ -109,7 +132,7 @@ impl Stream {
 /// (inserted first, possibly empty); teammate streams appear in first-seen
 /// order. Pure — a derived view over `session.entries`, not duplicated state.
 /// Shell streams are not produced here (their content lives outside `entries`).
-pub fn demux(entries: &[SessionEntry]) -> IndexMap<StreamId, Stream> {
+pub fn demux(entries: &[Arc<SessionEntry>]) -> IndexMap<StreamId, Stream> {
     let mut streams: IndexMap<StreamId, Stream> = IndexMap::new();
     streams.insert(StreamId::Main, Stream::main());
     for entry in entries {
@@ -121,7 +144,7 @@ pub fn demux(entries: &[SessionEntry]) -> IndexMap<StreamId, Stream> {
                 .entry(StreamId::Teammate(toolu.clone()))
                 .or_insert_with(|| Stream::teammate(toolu.clone())),
         };
-        stream.push_coalesced(entry.clone());
+        stream.push_coalesced(Arc::clone(entry));
     }
     streams
 }
@@ -131,19 +154,19 @@ mod tests {
     use super::*;
     use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
 
-    fn assistant(text: &str) -> SessionEntry {
-        SessionEntry {
+    fn assistant(text: &str) -> Arc<SessionEntry> {
+        Arc::new(SessionEntry {
             created_ms: 0,
             mod_seq: 0,
             subagent_id: None,
             kind: SessionEntryKind::AssistantMessage {
                 chunks: vec![AssistantChunk::Message(text.to_string())],
             },
-        }
+        })
     }
 
-    fn tool_call(id: &str) -> SessionEntry {
-        SessionEntry {
+    fn tool_call(id: &str) -> Arc<SessionEntry> {
+        Arc::new(SessionEntry {
             created_ms: 0,
             mod_seq: 0,
             subagent_id: None,
@@ -159,7 +182,7 @@ mod tests {
                 locations: Vec::new(),
                 status_started_at: None,
             },
-        }
+        })
     }
 
     #[test]
@@ -194,9 +217,9 @@ mod tests {
     fn coalesce_merge_raises_merged_entry_mod_seq() {
         let mut s = Stream::main();
         let mut first = assistant("Three ");
-        first.mod_seq = 1;
+        Arc::make_mut(&mut first).mod_seq = 1;
         let mut second = assistant("scouts");
-        second.mod_seq = 4;
+        Arc::make_mut(&mut second).mod_seq = 4;
         s.push_coalesced(first);
         s.push_coalesced(second);
         assert_eq!(
@@ -242,15 +265,15 @@ mod tests {
         assert_eq!(s.source, StreamSource::ParentThreadDemux);
     }
 
-    fn assistant_tagged(text: &str, sub: Option<&str>) -> SessionEntry {
-        SessionEntry {
+    fn assistant_tagged(text: &str, sub: Option<&str>) -> Arc<SessionEntry> {
+        Arc::new(SessionEntry {
             created_ms: 0,
             mod_seq: 0,
             subagent_id: sub.map(SharedString::from),
             kind: SessionEntryKind::AssistantMessage {
                 chunks: vec![AssistantChunk::Message(text.to_string())],
             },
-        }
+        })
     }
 
     #[test]

@@ -439,7 +439,11 @@ fn user_entry() -> SessionEntry {
 fn in_progress_tool_call_detected_from_session_entries() {
     // A `SessionEntryKind::ToolCall { status: InProgress }` anywhere in
     // the list flips the per-second elapsed-badge tick on.
-    let entries = vec![user_entry(), tool_entry(ToolStatus::InProgress)];
+    let entries: Vec<std::sync::Arc<SessionEntry>> =
+        vec![user_entry(), tool_entry(ToolStatus::InProgress)]
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
     assert!(entries_have_in_progress_tool_call(&entries));
 }
 
@@ -447,11 +451,14 @@ fn in_progress_tool_call_detected_from_session_entries() {
 fn no_in_progress_tool_call_when_all_terminal() {
     // Terminal / non-running statuses (and an empty list) do not.
     assert!(!entries_have_in_progress_tool_call(&[]));
-    let entries = vec![
+    let entries: Vec<std::sync::Arc<SessionEntry>> = vec![
         user_entry(),
         tool_entry(ToolStatus::Completed),
         tool_entry(ToolStatus::WaitingForConfirmation),
         tool_entry(ToolStatus::Failed),
-    ];
+    ]
+    .into_iter()
+    .map(std::sync::Arc::new)
+    .collect();
     assert!(!entries_have_in_progress_tool_call(&entries));
 }

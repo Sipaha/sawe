@@ -318,7 +318,10 @@ pub struct SolutionSessionView {
     /// `session.entries` + a `should_render_entry` filter. This is the phase-2c
     /// render flip: the selected stream is already demux'd + coalesced, so no
     /// per-entry Main/Task filtering happens at render.
-    main_stream_entries_for_render: Vec<crate::session_entry::SessionEntry>,
+    /// Reference-counted: this is refreshed from the selected stream at the top
+    /// of every `render`, and an owned copy meant a deep clone of the whole
+    /// visible transcript per frame.
+    main_stream_entries_for_render: Vec<std::sync::Arc<crate::session_entry::SessionEntry>>,
     /// The `StreamId` rendered on the previous frame, or `None` before the
     /// first paint. Tracked so ANY tab switch (Main↔Teammate↔Shell) can
     /// reset `list_state` to the newly-selected view's entry count + tail-anchor
@@ -1043,7 +1046,10 @@ impl SolutionSessionView {
     /// (its fenced-output entry). A selected teammate with no stream yet
     /// (finished / not-yet-seen) yields empty — rendered as
     /// "(no messages yet)", same as the old filter.
-    fn selected_parent_stream_entries(&self, cx: &App) -> Vec<crate::session_entry::SessionEntry> {
+    fn selected_parent_stream_entries(
+        &self,
+        cx: &App,
+    ) -> Vec<std::sync::Arc<crate::session_entry::SessionEntry>> {
         self.session
             .read(cx)
             .streams
@@ -1090,7 +1096,7 @@ impl SolutionSessionView {
         // index).
         self.main_stream_entries_for_render
             .iter()
-            .map(entry_text_spans)
+            .map(|entry| entry_text_spans(entry))
             .collect()
     }
 
@@ -1497,7 +1503,10 @@ impl Render for SolutionSessionView {
                                 ) = if let Some(thread_entity) = session.acp_thread() {
                                     let supports = thread_entity.read(cx).supports_truncate(cx);
                                     (
-                                        this.main_stream_entries_for_render.get(idx),
+                                        this
+                                            .main_stream_entries_for_render
+                                            .get(idx)
+                                            .map(|e| &**e),
                                         thread_entity.downgrade(),
                                         supports,
                                     )
@@ -1507,7 +1516,10 @@ impl Render for SolutionSessionView {
                                     // thread to rewind against, so the handle
                                     // is invalid and rewind is off.
                                     (
-                                        this.main_stream_entries_for_render.get(idx),
+                                        this
+                                            .main_stream_entries_for_render
+                                            .get(idx)
+                                            .map(|e| &**e),
                                         gpui::WeakEntity::<acp_thread::AcpThread>::new_invalid(),
                                         false,
                                     )

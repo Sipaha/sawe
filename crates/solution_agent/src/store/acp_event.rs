@@ -142,17 +142,19 @@ impl SolutionAgentStore {
                     }
                     additions
                 };
-                // Pre-extend length is the first index the newly-stamped entries
-                // begin at; captured before the closure so we can stamp exactly
-                // the appended entries' `mod_seq`.
-                let first_new = session_entity.read(cx).entries.len();
                 session_entity.update(cx, |s, cx| {
-                    s.entries.extend(new_entries);
-                    let new_count = s.entries.len() - first_new;
-                    let seqs: Vec<u64> = (0..new_count).map(|_| s.bump_change_seq()).collect();
-                    for (entry, seq) in s.entries[first_new..].iter_mut().zip(seqs) {
-                        entry.mod_seq = seq;
-                    }
+                    // Stamp `mod_seq` BEFORE sharing each entry into the mirror:
+                    // `session.entries` holds `Arc`s that `rebuild_streams` hands
+                    // to `streams`, so mutating one after the fact would need a
+                    // `make_mut` fork.
+                    let seqs: Vec<u64> = (0..new_entries.len())
+                        .map(|_| s.bump_change_seq())
+                        .collect();
+                    s.entries
+                        .extend(new_entries.into_iter().zip(seqs).map(|(mut entry, seq)| {
+                            entry.mod_seq = seq;
+                            std::sync::Arc::new(entry)
+                        }));
                     s.rebuild_streams();
                     cx.notify();
                 });
@@ -647,7 +649,11 @@ impl SolutionAgentStore {
                     if let Some(main) = s.streams.get_mut(&crate::stream::StreamId::Main)
                         && let Some(last) = main.entries.last_mut()
                     {
-                        last.mod_seq = seq;
+                        // Mirror-local bump: fork the shared entry so the flat
+                        // `session.entries` copy keeps the frozen first-fragment
+                        // `mod_seq` it had before (this re-stamp always was, and
+                        // must stay, local to `streams[Main]`).
+                        std::sync::Arc::make_mut(last).mod_seq = seq;
                         main.seq = seq;
                     }
                     cx.notify();
@@ -840,8 +846,13 @@ impl SolutionAgentStore {
                     session_entity.update(cx, |s, cx| {
                         let seq = s.bump_change_seq();
                         if let Some(slot) = s.entries.get_mut(global_idx) {
-                            *slot = entry;
-                            slot.mod_seq = seq;
+                            let mut entry = entry;
+                            entry.mod_seq = seq;
+                            // Replace the whole `Arc`, never `make_mut` it: the
+                            // old one is still shared with `streams` until the
+                            // rebuild below, and forking it would deep-copy the
+                            // entry for nothing.
+                            *slot = std::sync::Arc::new(entry);
                         }
                         s.rebuild_streams();
                         cx.notify();

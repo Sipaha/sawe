@@ -622,15 +622,17 @@ async fn close_session_flushes_persist_chain_to_disk(cx: &mut gpui::TestAppConte
             .expect("seed stale row");
     }
 
-    let message = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let message = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
 
     store.update(cx, |store, cx| {
@@ -702,23 +704,27 @@ async fn close_session_does_not_rewrite_a_cold_legacy_session(cx: &mut gpui::Tes
         )
     });
 
-    let asst = |n: u64, subagent: Option<&str>, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: subagent.map(SharedString::from),
-        kind: SessionEntryKind::AssistantMessage {
-            chunks: vec![AssistantChunk::Message(text.into())],
-        },
+    let asst = |n: u64, subagent: Option<&str>, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: subagent.map(SharedString::from),
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.into())],
+            },
+        })
     };
-    let user = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let user = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
     // LEGACY layout: Main "alpha"@0, teammate "noise"@1, Main "bravo"@2 — the
     // flat mirror is one row longer than the Main stream it demuxes to.
@@ -816,15 +822,17 @@ async fn purge_session_hard_abandons_in_flight_persist_chain(cx: &mut gpui::Test
     let store = cx.update(|cx| SolutionAgentStore::global(cx));
     store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
 
-    let message = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let message = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
 
     store.update(cx, |store, cx| {
@@ -1407,15 +1415,17 @@ async fn cold_close_solution_flushes_persist_chain_to_disk(cx: &mut gpui::TestAp
             .expect("seed stale row");
     }
 
-    let message = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let message = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
 
     store.update(cx, |store, cx| {
@@ -1484,15 +1494,17 @@ async fn close_then_reopen_orders_the_new_chain_behind_the_drained_flush(
     let store = cx.update(|cx| SolutionAgentStore::global(cx));
     store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
 
-    let message = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let message = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
 
     for idx in 0..3i64 {
@@ -1602,15 +1614,17 @@ async fn close_then_reopen_orders_a_long_flush_before_the_new_message(
     let store = cx.update(|cx| SolutionAgentStore::global(cx));
     store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
 
-    let message = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let message = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
 
     for idx in 0..ENTRIES as i64 {
@@ -1703,7 +1717,7 @@ async fn a_finished_persist_chain_is_retired_from_the_map(cx: &mut gpui::TestApp
     store.update(cx, |store, cx| {
         let session = store.session(id).expect("session");
         session.update(cx, |s, cx| {
-            s.entries = vec![SessionEntry {
+            s.entries = vec![std::sync::Arc::new(SessionEntry {
                 created_ms: 1_700_000_000_000,
                 mod_seq: 1,
                 subagent_id: None,
@@ -1712,7 +1726,7 @@ async fn a_finished_persist_chain_is_retired_from_the_map(cx: &mut gpui::TestApp
                     content_md: "alpha".into(),
                     chunks: vec![],
                 },
-            }];
+            })];
             s.rebuild_streams();
             cx.notify();
         });
@@ -1768,15 +1782,17 @@ async fn purge_after_soft_close_abandons_the_drained_chain(cx: &mut gpui::TestAp
     let store = cx.update(|cx| SolutionAgentStore::global(cx));
     store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
 
-    let message = |n: u64| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: "row".into(),
-            chunks: vec![],
-        },
+    let message = |n: u64| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: "row".into(),
+                chunks: vec![],
+            },
+        })
     };
 
     store.update(cx, |store, cx| {
@@ -1829,15 +1845,17 @@ async fn purge_solution_after_soft_close_abandons_the_drained_chain(cx: &mut gpu
         let solution_id = session.read(cx).solution_id;
         session.update(cx, |s, cx| {
             s.entries = (1..=8)
-                .map(|n| SessionEntry {
-                    created_ms: 1_700_000_000_000 + n,
-                    mod_seq: n as u64,
-                    subagent_id: None,
-                    kind: SessionEntryKind::UserMessage {
-                        id: None,
-                        content_md: "row".into(),
-                        chunks: vec![],
-                    },
+                .map(|n| {
+                    std::sync::Arc::new(SessionEntry {
+                        created_ms: 1_700_000_000_000 + n,
+                        mod_seq: n as u64,
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: "row".into(),
+                            chunks: vec![],
+                        },
+                    })
                 })
                 .collect();
             s.rebuild_streams();
@@ -1891,15 +1909,17 @@ async fn a_flush_costs_the_same_executor_turns_at_any_size(cx: &mut gpui::TestAp
         )
     });
 
-    let message = |n: u64| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: format!("m{n}"),
-            chunks: vec![],
-        },
+    let message = |n: u64| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: format!("m{n}"),
+                chunks: vec![],
+            },
+        })
     };
 
     let small = SolutionSessionId::new();
@@ -1996,15 +2016,17 @@ async fn a_reader_never_observes_a_half_written_close_flush(cx: &mut gpui::TestA
         let session = store.session(id).expect("session");
         session.update(cx, |s, cx| {
             s.entries = (1..=ENTRIES)
-                .map(|n| SessionEntry {
-                    created_ms: 1_700_000_000_000 + n as i64,
-                    mod_seq: n,
-                    subagent_id: None,
-                    kind: SessionEntryKind::UserMessage {
-                        id: None,
-                        content_md: format!("m{n}"),
-                        chunks: vec![],
-                    },
+                .map(|n| {
+                    std::sync::Arc::new(SessionEntry {
+                        created_ms: 1_700_000_000_000 + n as i64,
+                        mod_seq: n,
+                        subagent_id: None,
+                        kind: SessionEntryKind::UserMessage {
+                            id: None,
+                            content_md: format!("m{n}"),
+                            chunks: vec![],
+                        },
+                    })
                 })
                 .collect();
             s.rebuild_streams();
@@ -2073,15 +2095,17 @@ async fn app_quit_flushes_the_in_flight_entry_row_chain(cx: &mut gpui::TestAppCo
             .expect("seed stale row");
     }
 
-    let message = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let message = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
 
     store.update(cx, |store, cx| {
@@ -2154,15 +2178,17 @@ async fn app_quit_does_not_resurrect_an_abandoned_persist_chain(cx: &mut gpui::T
             .expect("seed stale row");
     }
 
-    let message = |n: u64| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: "resurrected".into(),
-            chunks: vec![],
-        },
+    let message = |n: u64| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: "resurrected".into(),
+                chunks: vec![],
+            },
+        })
     };
 
     store.update(cx, |store, cx| {
@@ -2221,15 +2247,17 @@ async fn app_quit_flushes_a_chain_issued_during_shutdown(cx: &mut gpui::TestAppC
             .expect("seed stale row");
     }
 
-    let message = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let message = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
 
     store.update(cx, |store, cx| {

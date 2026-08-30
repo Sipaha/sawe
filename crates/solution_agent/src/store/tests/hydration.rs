@@ -1454,23 +1454,27 @@ async fn legacy_teammate_tagged_rows_realign_to_main_local_on_cold_load(cx: &mut
         });
     });
 
-    let asst = |n: u64, subagent: Option<&str>, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: subagent.map(SharedString::from),
-        kind: SessionEntryKind::AssistantMessage {
-            chunks: vec![AssistantChunk::Message(text.into())],
-        },
+    let asst = |n: u64, subagent: Option<&str>, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: subagent.map(SharedString::from),
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.into())],
+            },
+        })
     };
-    let user = |n: u64, text: &str| SessionEntry {
-        created_ms: 1_700_000_000_000 + n as i64,
-        mod_seq: n,
-        subagent_id: None,
-        kind: SessionEntryKind::UserMessage {
-            id: None,
-            content_md: text.into(),
-            chunks: vec![],
-        },
+    let user = |n: u64, text: &str| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 1_700_000_000_000 + n as i64,
+            mod_seq: n,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
     };
 
     // LEGACY on-disk layout: Main "alpha"@0, teammate "noise"@1, Main user

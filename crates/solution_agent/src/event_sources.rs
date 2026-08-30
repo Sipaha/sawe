@@ -567,7 +567,7 @@ mod tests {
             let store = SolutionAgentStore::global(cx);
             let session = store.read(cx).session(session_id).expect("session");
             session.update(cx, |s, _| {
-                s.entries = entries;
+                s.entries = entries.into_iter().map(std::sync::Arc::new).collect();
                 s.rebuild_streams();
             });
         });
@@ -798,8 +798,8 @@ mod tests {
             let session = store.read(cx).session(session_id).expect("session");
             session.update(cx, |s, cx| {
                 s.entries = vec![
-                    user_entry("cold user"),
-                    assistant_entry("cold assistant", None),
+                    std::sync::Arc::new(user_entry("cold user")),
+                    std::sync::Arc::new(assistant_entry("cold assistant", None)),
                 ];
                 s.rebuild_streams();
                 s.set_acp_thread(Some(acp_thread.clone()), cx);
@@ -1121,7 +1121,7 @@ mod tests {
             let session = store.read(cx).session(session_id).expect("session");
             session.update(cx, |s, _| {
                 if let Some(e) = s.entries.get_mut(0) {
-                    e.created_ms = NO_TIMESTAMP_MS;
+                    std::sync::Arc::make_mut(e).created_ms = NO_TIMESTAMP_MS;
                 }
                 // The payload is built from the coalesced `streams` mirror now,
                 // so a direct `entries` poke has to refresh it — production

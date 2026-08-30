@@ -199,7 +199,7 @@ pub(crate) fn tool_status_text(status: &ToolStatus) -> &'static str {
 /// Pure predicate used by the view's per-second elapsed-badge tick: does
 /// any entry hold a tool call still `InProgress`? Reads owned
 /// [`SessionEntry`]s so it works on both cold and live transcripts.
-pub(crate) fn entries_have_in_progress_tool_call(entries: &[SessionEntry]) -> bool {
+pub(crate) fn entries_have_in_progress_tool_call(entries: &[std::sync::Arc<SessionEntry>]) -> bool {
     entries.iter().any(|entry| {
         matches!(
             &entry.kind,
