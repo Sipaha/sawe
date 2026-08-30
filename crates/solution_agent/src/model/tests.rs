@@ -1557,3 +1557,714 @@ fn rebuild_streams_work_does_not_scale_with_transcript_length() {
          independent of transcript length"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Property test #2 — `rebuild_streams`'s DECORATION, over randomised sessions.
+//
+// `shared_mirror_demuxes_identically_to_an_owned_reference` above pins
+// `demux` ≡ reference and NOTHING else: its `build_session()` leaves
+// `closed_streams`, `hydration_orphan_streams`, `background_shells` and
+// `background_agents` empty, so every step `rebuild_streams` runs *after* the
+// demux is a no-op on all 200 of those seeds. This second property drives the
+// same generator machinery with all four populated.
+//
+// DESIGN CHOICE — reference, not invariants. The decoration is a
+// set-and-order transform (which ids survive, where a folded id lands, what
+// label / state / seq it carries), and two of its steps — the never-clobber
+// rule and the `closed_streams` age-out — are "…and nothing else happened"
+// properties. A total comparison catches a stream that should NOT be there but
+// IS, and an order shift; a hand-listed invariant set only catches the
+// invariants someone thought to write down, and would additionally have had no
+// expected value to compare `entries` / `label` / `seq` against at all. The
+// drift risk is mitigated, not removed: `reference_decorated_mirror` shares no
+// code with `rebuild_streams` (an ordered `Vec` of shapes with an explicit
+// upsert, not an `IndexMap` mutated in place), and every decoration step has a
+// production mutation that this test is confirmed to catch.
+//
+// What it does NOT cover:
+//   * the fold *bodies*. `BackgroundShell::stream_entry` /
+//     `BackgroundAgent::stream_entry` are called by the reference too, so this
+//     test pins WHICH snapshot is folded and WHERE, not how it renders — that
+//     is `background_shell.rs` / `background_agent.rs`'s own unit tests.
+//   * the two `Utc::now()` reads. They are bracketed (see
+//     `assert_decorated_mirror`), not injected, so a change to the "observed X
+//     ago" bucketing is invisible here.
+//   * `closed_streams` keyed by a non-`Teammate` id. `close_stream` is only
+//     ever called with `StreamId::Teammate` in production, so generating a
+//     closed `Shell` id would pin behaviour outside the contract.
+//   * anything `cx`-shaped: notifications, persistence, the wire encoders.
+// ---------------------------------------------------------------------------
+
+/// A `Stream` flattened to plain comparable data — every field the mirror
+/// exposes, including the three (`kind`, `state`, `source`) that
+/// `assert_mirror_matches_reference` does not look at because the plain demux
+/// never varies them. The decoration does: the background-agent fold re-states
+/// an existing teammate stream and stamps `FileTail` on a fresh one.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct StreamShape {
+    id: crate::stream::StreamId,
+    kind: crate::stream::StreamKind,
+    label: SharedString,
+    state: crate::stream::StreamState,
+    source: crate::stream::StreamSource,
+    seq: u64,
+    entries: Vec<SessionEntry>,
+}
+
+#[cfg(test)]
+fn mirror_shape(session: &SolutionSession) -> Vec<StreamShape> {
+    session
+        .streams
+        .iter()
+        .map(|(id, stream)| StreamShape {
+            id: id.clone(),
+            kind: stream.kind,
+            label: stream.label.clone(),
+            state: stream.state.clone(),
+            source: stream.source.clone(),
+            seq: stream.seq,
+            entries: stream
+                .entries
+                .iter()
+                .map(|entry| (**entry).clone())
+                .collect(),
+        })
+        .collect()
+}
+
+/// Teammate ids re-tagged by an entry at or after the hydration watermark —
+/// the set that reopens a suppressed orphan.
+#[cfg(test)]
+fn streamed_anew(session: &SolutionSession) -> std::collections::HashSet<crate::stream::StreamId> {
+    session
+        .entries
+        .iter()
+        .skip(session.hydration_watermark)
+        .filter_map(|entry| entry.subagent_id.clone())
+        .map(crate::stream::StreamId::Teammate)
+        .collect()
+}
+
+/// Owned reference for the WHOLE mirror: `reference_demux` plus every
+/// decoration step, modelled independently of `rebuild_streams`.
+#[cfg(test)]
+fn reference_decorated_mirror(
+    session: &SolutionSession,
+    now: chrono::DateTime<Utc>,
+) -> Vec<StreamShape> {
+    use crate::stream::{StreamId, StreamKind, StreamSource, StreamState};
+
+    let mut shapes: Vec<StreamShape> = reference_demux(&session.entries)
+        .into_iter()
+        .map(|(id, label, _seq, entries)| StreamShape {
+            kind: match id {
+                StreamId::Main => StreamKind::Main,
+                StreamId::Teammate(_) => StreamKind::Teammate,
+                StreamId::Shell(_) => StreamKind::Shell,
+            },
+            id,
+            label,
+            state: StreamState::Live,
+            source: StreamSource::ParentThreadDemux,
+            seq: 0,
+            entries,
+        })
+        .collect();
+
+    // Closed streams drop out permanently.
+    shapes.retain(|shape| !session.closed_streams.contains_key(&shape.id));
+
+    // Hydration orphans drop out unless a post-watermark entry re-tags them.
+    let reopened = streamed_anew(session);
+    shapes.retain(|shape| {
+        !session.hydration_orphan_streams.contains(&shape.id) || reopened.contains(&shape.id)
+    });
+
+    // Running background shells fold in, in `background_shell_order`, after
+    // Main + teammates. Modelled as an upsert because the production fold is an
+    // `IndexMap::insert`: a repeated id replaces the value and keeps its slot.
+    for id in &session.background_shell_order {
+        let Some(shell) = session.background_shells.get(id) else {
+            continue;
+        };
+        if !matches!(
+            shell.state,
+            crate::background_shell::ShellRuntimeState::Running
+        ) {
+            continue;
+        }
+        let shape = StreamShape {
+            id: StreamId::Shell(id.clone()),
+            kind: StreamKind::Shell,
+            label: shell.stream_label(),
+            state: StreamState::Live,
+            source: StreamSource::FileTail(shell.output_path.clone()),
+            seq: 0,
+            entries: vec![shell.stream_entry(now)],
+        };
+        match shapes.iter_mut().find(|existing| existing.id == shape.id) {
+            Some(existing) => *existing = shape,
+            None => shapes.push(shape),
+        }
+    }
+
+    // Live background agents fold in as teammate streams.
+    for id in &session.background_agent_order {
+        let Some(agent) = session.background_agents.get(id) else {
+            continue;
+        };
+        if !agent.renders_stream() {
+            continue;
+        }
+        let Some(parent_toolu) = agent.parent_tool_use_id.clone() else {
+            continue;
+        };
+        let key = StreamId::Teammate(parent_toolu.clone());
+        if session.closed_streams.contains_key(&key) {
+            continue;
+        }
+        match shapes.iter_mut().find(|existing| existing.id == key) {
+            // Never clobber: only the liveness is the agent's to state.
+            Some(existing) => existing.state = agent.stream_state(),
+            None => shapes.push(StreamShape {
+                id: key,
+                kind: StreamKind::Teammate,
+                label: parent_toolu,
+                state: agent.stream_state(),
+                source: StreamSource::FileTail(agent.jsonl_path.clone()),
+                seq: 0,
+                entries: vec![agent.stream_entry(now)],
+            }),
+        }
+    }
+
+    // Teammate label enrichment, falling back to the raw toolu.
+    for shape in shapes.iter_mut() {
+        if let StreamId::Teammate(toolu) = &shape.id {
+            shape.label = session
+                .teammate_labels
+                .get(toolu)
+                .cloned()
+                .unwrap_or_else(|| toolu.clone());
+        }
+    }
+
+    // Per-stream seq = the stream's high-water mark on the change_seq axis.
+    for shape in shapes.iter_mut() {
+        shape.seq = shape
+            .entries
+            .iter()
+            .map(|entry| entry.mod_seq)
+            .max()
+            .unwrap_or(0);
+    }
+
+    shapes
+}
+
+/// Compare the mirror against the owned reference. `rebuild_streams` reads
+/// `Utc::now()` internally for the shell / agent fold bodies, so the reference
+/// is BRACKETED: `before` and `after` straddle the rebuild, the folded snapshot
+/// mtimes are old enough that the "observed X ago" formatter is at day
+/// granularity, and therefore one of the two brackets is exact. No tolerance is
+/// introduced — the comparison stays byte-for-byte.
+///
+/// Returns how many streams it compared, which the caller accumulates and
+/// asserts a floor on. That is not decoration: `-> usize` is what stops a
+/// future edit (or a mutation-testing probe) from turning this into an
+/// early-returning no-op that leaves the property green — a bare `return;`
+/// then fails to compile rather than passing silently.
+#[cfg(test)]
+#[must_use]
+fn assert_decorated_mirror(
+    session: &SolutionSession,
+    before: chrono::DateTime<Utc>,
+    after: chrono::DateTime<Utc>,
+    seed: u64,
+    step: &str,
+) -> usize {
+    let actual = mirror_shape(session);
+    let expected = {
+        let at_after = reference_decorated_mirror(session, after);
+        if actual == at_after {
+            at_after
+        } else {
+            reference_decorated_mirror(session, before)
+        }
+    };
+    let actual_ids: Vec<_> = actual.iter().map(|shape| shape.id.clone()).collect();
+    let expected_ids: Vec<_> = expected.iter().map(|shape| shape.id.clone()).collect();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "seed {seed} / {step}: the decorated mirror's stream ids/order diverged \
+         from the owned reference"
+    );
+    for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            actual.label, expected.label,
+            "seed {seed} / {step}: stream #{index} ({:?}) label diverged",
+            actual.id
+        );
+        assert_eq!(
+            actual.kind, expected.kind,
+            "seed {seed} / {step}: stream #{index} ({:?}) kind diverged",
+            actual.id
+        );
+        assert_eq!(
+            actual.state, expected.state,
+            "seed {seed} / {step}: stream #{index} ({:?}) state diverged",
+            actual.id
+        );
+        assert_eq!(
+            actual.source, expected.source,
+            "seed {seed} / {step}: stream #{index} ({:?}) source diverged",
+            actual.id
+        );
+        assert_eq!(
+            actual.seq, expected.seq,
+            "seed {seed} / {step}: stream #{index} ({:?}) seq diverged",
+            actual.id
+        );
+        assert_eq!(
+            actual.entries, expected.entries,
+            "seed {seed} / {step}: stream #{index} ({:?}) entries diverged",
+            actual.id
+        );
+    }
+    actual.len()
+}
+
+/// Anti-vacuity ledger. Every count is derived from the session's own state
+/// (plus `reference_demux`), NEVER from `session.streams` — so a mutation that
+/// breaks the decoration cannot also fake the evidence that the decoration was
+/// exercised, and a generator re-weight that stops producing one of these
+/// shapes fails the threshold instead of going quiet.
+#[cfg(test)]
+#[derive(Default, Debug)]
+struct DecorationCensus {
+    closed_removed: usize,
+    closed_removed_with_entries: usize,
+    orphans_suppressed: usize,
+    orphans_reopened: usize,
+    shells_folded: usize,
+    shells_terminal_skipped: usize,
+    shells_without_output: usize,
+    agents_folded_fresh: usize,
+    agents_folded_over_suppressed: usize,
+    agents_clobber_guarded: usize,
+    agents_aged_out: usize,
+    agents_terminal_skipped: usize,
+    labels_enriched: usize,
+    labels_fallback: usize,
+    seeds_visibly_decorated: usize,
+    /// Streams the reference comparison actually walked. Not a property of the
+    /// decoration — a liveness check on `assert_decorated_mirror` itself.
+    streams_compared: usize,
+}
+
+#[cfg(test)]
+impl DecorationCensus {
+    fn observe(&mut self, session: &SolutionSession) {
+        use crate::stream::StreamId;
+        let demuxed = reference_demux(&session.entries);
+        let reopened = streamed_anew(session);
+
+        let mut surviving: Vec<StreamId> = Vec::new();
+        let mut suppressed: Vec<StreamId> = Vec::new();
+        for (id, _, _, entries) in &demuxed {
+            if session.closed_streams.contains_key(id) {
+                self.closed_removed += 1;
+                if !entries.is_empty() {
+                    self.closed_removed_with_entries += 1;
+                }
+                suppressed.push(id.clone());
+                continue;
+            }
+            if session.hydration_orphan_streams.contains(id) {
+                if reopened.contains(id) {
+                    self.orphans_reopened += 1;
+                } else {
+                    self.orphans_suppressed += 1;
+                    suppressed.push(id.clone());
+                    continue;
+                }
+            }
+            surviving.push(id.clone());
+        }
+
+        for id in &session.background_shell_order {
+            let Some(shell) = session.background_shells.get(id) else {
+                continue;
+            };
+            if matches!(
+                shell.state,
+                crate::background_shell::ShellRuntimeState::Running
+            ) {
+                self.shells_folded += 1;
+                if shell.latest.is_none() {
+                    self.shells_without_output += 1;
+                }
+            } else {
+                self.shells_terminal_skipped += 1;
+            }
+        }
+
+        for id in &session.background_agent_order {
+            let Some(agent) = session.background_agents.get(id) else {
+                continue;
+            };
+            if !agent.renders_stream() {
+                self.agents_terminal_skipped += 1;
+                continue;
+            }
+            let Some(parent_toolu) = agent.parent_tool_use_id.clone() else {
+                continue;
+            };
+            let key = StreamId::Teammate(parent_toolu);
+            if session.closed_streams.contains_key(&key) {
+                self.agents_aged_out += 1;
+                continue;
+            }
+            if surviving.contains(&key) {
+                self.agents_clobber_guarded += 1;
+            } else {
+                self.agents_folded_fresh += 1;
+                if suppressed.contains(&key) {
+                    self.agents_folded_over_suppressed += 1;
+                }
+                surviving.push(key);
+            }
+        }
+
+        for id in &surviving {
+            if let StreamId::Teammate(toolu) = id {
+                if session.teammate_labels.contains_key(toolu) {
+                    self.labels_enriched += 1;
+                } else {
+                    self.labels_fallback += 1;
+                }
+            }
+        }
+
+        // Did the decoration change the mirror AT ALL on this seed? Without
+        // this, a generator that produced only inert decoration state would
+        // still satisfy every counter above while comparing two plain demuxes.
+        let decorated: Vec<StreamId> = surviving;
+        let bare: Vec<StreamId> = demuxed.iter().map(|(id, _, _, _)| id.clone()).collect();
+        let shell_folds = session
+            .background_shell_order
+            .iter()
+            .filter(|id| {
+                session.background_shells.get(*id).is_some_and(|shell| {
+                    matches!(
+                        shell.state,
+                        crate::background_shell::ShellRuntimeState::Running
+                    )
+                })
+            })
+            .count();
+        if decorated != bare || shell_folds > 0 {
+            self.seeds_visibly_decorated += 1;
+        }
+    }
+}
+
+/// Populate a session with a randomised transcript AND randomised decoration
+/// state. The toolu pool is shared with `random_entry`, so a generated
+/// `closed_streams` / orphan / agent-parent id genuinely collides with a demux
+/// stream most of the time; `toolu_d` never appears in a transcript, so an
+/// agent parented on it exercises the fresh-fold path.
+#[cfg(test)]
+fn decorate_random_session(rng: &mut Xorshift, session: &mut SolutionSession) {
+    use crate::stream::StreamId;
+    const TOOLUS: [&str; 4] = ["toolu_a", "toolu_b", "toolu_c", "toolu_d"];
+
+    let count = rng.below(18);
+    session.entries = (0..count)
+        .map(|index| random_entry(rng, index as u64 + 1))
+        .collect();
+
+    // Half the time exactly `entries.len()` — what `hydrate_streams_main_only`
+    // actually stamps, so every orphan is purely cold and stays collapsed.
+    // Otherwise anywhere in 0..=len, so an orphan's entries straddle the
+    // boundary and it reopens. Both sides of the watermark matter: the
+    // suppression and the reopen are different branches.
+    session.hydration_watermark = if rng.below(2) == 0 {
+        count
+    } else {
+        rng.below(count + 1)
+    };
+
+    for toolu in TOOLUS {
+        if rng.below(3) == 0 {
+            session
+                .hydration_orphan_streams
+                .insert(StreamId::Teammate(SharedString::from(toolu)));
+        }
+    }
+    for toolu in TOOLUS {
+        if rng.below(4) == 0 {
+            let id = StreamId::Teammate(SharedString::from(toolu));
+            // `close_stream`'s own invariant: a permanent Done-close drops the
+            // reopenable orphan record AND the durable label, so a session
+            // carrying both for one id is unreachable — don't generate one.
+            session.hydration_orphan_streams.remove(&id);
+            session
+                .closed_streams
+                .insert(id, SharedString::new_static("done"));
+        }
+    }
+    for toolu in TOOLUS {
+        let id = StreamId::Teammate(SharedString::from(toolu));
+        if !session.closed_streams.contains_key(&id) && rng.below(2) == 0 {
+            session.teammate_labels.insert(
+                SharedString::from(toolu),
+                SharedString::from(format!("Task: {toolu}")),
+            );
+        }
+    }
+
+    for index in 0..rng.below(3) {
+        let id = crate::background_shell::BackgroundShellId::new(format!("sh{index}"));
+        let state = match rng.below(5) {
+            0 => crate::background_shell::ShellRuntimeState::Exited(Some(0)),
+            1 => crate::background_shell::ShellRuntimeState::Killed,
+            _ => crate::background_shell::ShellRuntimeState::Running,
+        };
+        let latest = if rng.below(5) == 0 {
+            None
+        } else {
+            Some(crate::background_shell::BackgroundShellSnapshot {
+                // Distinct per shell — and old enough that the "observed X ago"
+                // formatter is at day granularity, which is what makes the
+                // bracketed reference above exact. A fold that picks the WRONG
+                // shell's snapshot shows up as a diverged `seq`.
+                mtime: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_600_000_000 + index as u64 * 86_400),
+                output_tail: SharedString::from(format!("out{index}\n")),
+            })
+        };
+        session.background_shells.insert(
+            id.clone(),
+            crate::background_shell::BackgroundShell {
+                id: id.clone(),
+                command: SharedString::from(format!("cargo test {index}")),
+                output_path: PathBuf::from(format!("/tmp/sh{index}.output")),
+                registered_at: Utc::now(),
+                latest,
+                last_offset: 0,
+                state,
+            },
+        );
+        session.background_shell_order.push(id);
+    }
+
+    for index in 0..rng.below(3) {
+        let id = crate::background_agent::BackgroundAgentId::new(format!("agent{index}"));
+        let parent_tool_use_id = if rng.below(6) == 0 {
+            None
+        } else {
+            Some(SharedString::from(TOOLUS[rng.below(4)]))
+        };
+        let killed = rng.below(6) == 0;
+        let latest = if rng.below(6) == 0 {
+            None
+        } else {
+            Some(crate::background_agent::BackgroundAgentSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_600_000_000 + index as u64 * 86_400),
+                activity_label: SharedString::from(format!("Bash: step {index}")),
+                stop_reason: if rng.below(4) == 0 {
+                    Some(SharedString::from("end_turn"))
+                } else {
+                    None
+                },
+                usage_limited: rng.below(8) == 0,
+            })
+        };
+        session.background_agents.insert(
+            id.clone(),
+            crate::background_agent::BackgroundAgent {
+                id: id.clone(),
+                jsonl_path: PathBuf::from(format!("/tmp/agent{index}.jsonl")),
+                registered_at: Utc::now(),
+                latest,
+                last_offset: 0,
+                parent_tool_use_id,
+                // Distinct per agent, on the change_seq axis — a fold that
+                // stamps the wrong agent's snapshot diverges on `seq`.
+                latest_seq: 900 + index as u64,
+                killed,
+            },
+        );
+        session.background_agent_order.push(id);
+    }
+}
+
+#[test]
+fn decorated_mirror_matches_an_owned_reference() {
+    let mut census = DecorationCensus::default();
+    for seed in 1..=300u64 {
+        let mut rng =
+            Xorshift((seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03) | 1);
+        let mut session = build_session();
+        decorate_random_session(&mut rng, &mut session);
+        census.observe(&session);
+        let flat_before: Vec<SessionEntry> = session
+            .entries
+            .iter()
+            .map(|entry| (**entry).clone())
+            .collect();
+
+        // Twice: the decoration must be idempotent too. The shell / agent folds
+        // are DERIVED, so a rebuild that also re-demuxes fresh entries must
+        // neither wipe them nor accumulate a second copy.
+        for pass in ["first", "second"] {
+            let before = Utc::now();
+            session.rebuild_streams();
+            let after = Utc::now();
+            census.streams_compared += assert_decorated_mirror(&session, before, after, seed, pass);
+            assert_eq!(
+                session
+                    .entries
+                    .iter()
+                    .map(|entry| (**entry).clone())
+                    .collect::<Vec<_>>(),
+                flat_before,
+                "seed {seed} / {pass} rebuild: wrote through into the flat transcript"
+            );
+        }
+
+        // A live in-place update (the `EntryUpdated` shape) on top of the
+        // decoration: the folds must survive it and the suppressions must not
+        // be re-evaluated into a different answer by the fresh demux.
+        if !session.entries.is_empty() {
+            let index = rng.below(session.entries.len());
+            session.entries[index] = random_entry(&mut rng, count_bound(&session) + 1);
+            let flat_expected: Vec<SessionEntry> = session
+                .entries
+                .iter()
+                .map(|entry| (**entry).clone())
+                .collect();
+            let before = Utc::now();
+            session.rebuild_streams();
+            let after = Utc::now();
+            census.streams_compared +=
+                assert_decorated_mirror(&session, before, after, seed, "after update");
+            assert_eq!(
+                session
+                    .entries
+                    .iter()
+                    .map(|entry| (**entry).clone())
+                    .collect::<Vec<_>>(),
+                flat_expected,
+                "seed {seed} / after update: wrote through into the flat transcript"
+            );
+        }
+    }
+
+    // Anti-vacuity. Thresholds are ~half the counts the committed generator
+    // actually produces, so an incidental re-weight has room to move while a
+    // category that stops being generated at all trips immediately. Each of
+    // these is a decoration branch: if its count is 0 the corresponding step is
+    // untested no matter what this test is called.
+    for (count, floor, what) in [
+        (
+            census.closed_removed,
+            85usize,
+            "closed streams removed from the mirror",
+        ),
+        (
+            census.closed_removed_with_entries,
+            85,
+            "closed streams that still had entries",
+        ),
+        (
+            census.orphans_suppressed,
+            50,
+            "hydration orphans left collapsed",
+        ),
+        (
+            census.orphans_reopened,
+            30,
+            "hydration orphans reopened by post-watermark activity",
+        ),
+        (census.shells_folded, 80, "running shells folded in"),
+        (
+            census.shells_terminal_skipped,
+            60,
+            "terminal shells auto-closed by the fold",
+        ),
+        (
+            census.shells_without_output,
+            18,
+            "running shells with no snapshot",
+        ),
+        (
+            census.agents_folded_fresh,
+            30,
+            "agents folded as a fresh stream",
+        ),
+        (
+            census.agents_folded_over_suppressed,
+            7,
+            "agents folded over a suppressed demux stream",
+        ),
+        (
+            census.agents_clobber_guarded,
+            35,
+            "agents that hit the never-clobber rule",
+        ),
+        (
+            census.agents_aged_out,
+            30,
+            "agents skipped by the closed-streams age-out",
+        ),
+        (
+            census.agents_terminal_skipped,
+            15,
+            "terminal agents skipped by the fold",
+        ),
+        (
+            census.labels_enriched,
+            110,
+            "teammate labels enriched from the map",
+        ),
+        (
+            census.labels_fallback,
+            115,
+            "teammate labels falling back to the toolu",
+        ),
+        (
+            census.seeds_visibly_decorated,
+            150,
+            "seeds where the decoration actually changed the mirror",
+        ),
+        (
+            census.streams_compared,
+            1_500,
+            "streams the reference comparison actually walked",
+        ),
+    ] {
+        assert!(
+            count >= floor,
+            "the generator produced only {count} of `{what}` over 300 seeds \
+             (floor {floor}) — that decoration step is barely exercised and this \
+             property test is close to vacuous for it. Full census: {census:?}"
+        );
+    }
+}
+
+/// Highest `mod_seq` the generator has handed out for this session, so an
+/// in-place update can advance past it the way the store's `EntryUpdated` arm
+/// does.
+#[cfg(test)]
+fn count_bound(session: &SolutionSession) -> u64 {
+    session
+        .entries
+        .iter()
+        .map(|entry| entry.mod_seq)
+        .max()
+        .unwrap_or(0)
+}
