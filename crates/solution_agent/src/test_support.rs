@@ -14,6 +14,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gpui::{App, AppContext, SharedString, Task};
 use util::ResultExt as _;
 
+/// The gate that holds [`MockAgentServer::connect`] pending, and the gate that
+/// holds [`MockConnection::prompt`] pending. Two newtypes over one
+/// `async_channel::Receiver<()>` because `MockAgentServer::configured` takes
+/// both, adjacently: as bare receivers a swapped pair type-checked and silently
+/// inverted which stage of the mock was held, which reads as a hang in whichever
+/// one the test was not driving. Swapping them is now a compile error at every
+/// call site at once.
+#[derive(Clone)]
+pub struct ConnectGate(pub async_channel::Receiver<()>);
+
+/// See [`ConnectGate`].
+#[derive(Clone)]
+pub struct PromptGate(pub async_channel::Receiver<()>);
+
 /// AgentConnection mock that returns a real `AcpThread` from `new_session`
 /// so `create_session` can complete without going through a real subprocess.
 ///
@@ -22,7 +36,7 @@ use util::ResultExt as _;
 /// gate before returning `Ok(EndTurn)`.
 pub struct MockConnection {
     next_session: Cell<u64>,
-    prompt_gate: parking_lot::Mutex<Option<async_channel::Receiver<()>>>,
+    prompt_gate: parking_lot::Mutex<Option<PromptGate>>,
     // Counts `cancel()` calls so tests can assert the store forwarded a stop
     // exactly once (and didn't double-forward on a repeated cancel).
     cancel_count: Arc<AtomicUsize>,
@@ -41,7 +55,7 @@ impl MockConnection {
     /// lost, which is how a server built with both a prompt gate and resume
     /// support quietly produced a connection that could not resume.
     pub fn configured(
-        prompt_gate: Option<async_channel::Receiver<()>>,
+        prompt_gate: Option<PromptGate>,
         cancel_count: Option<Arc<AtomicUsize>>,
         supports_resume: bool,
     ) -> Self {
@@ -64,7 +78,7 @@ impl MockConnection {
         Self::configured(None, None, true)
     }
 
-    pub fn with_prompt_gate(gate: async_channel::Receiver<()>) -> Self {
+    pub fn with_prompt_gate(gate: PromptGate) -> Self {
         Self::configured(Some(gate), None, false)
     }
 
@@ -175,7 +189,7 @@ impl acp_thread::AgentConnection for MockConnection {
             // The latter lets a test simulate "the in-flight turn errored
             // mid-flight" (e.g. for the rotation-race regression in
             // `send_message_blocks`).
-            Some(gate) => cx.spawn(async move |_| match gate.recv().await {
+            Some(gate) => cx.spawn(async move |_| match gate.0.recv().await {
                 Ok(()) => Ok(agent_client_protocol::schema::PromptResponse::new(
                     agent_client_protocol::schema::StopReason::EndTurn,
                 )),
@@ -201,9 +215,9 @@ impl acp_thread::AgentConnection for MockConnection {
 pub struct MockAgentServer {
     connect_count: Arc<AtomicUsize>,
     // Optional async gate to hold connect() pending until the test releases it.
-    gate: parking_lot::Mutex<Option<async_channel::Receiver<()>>>,
+    gate: parking_lot::Mutex<Option<ConnectGate>>,
     // Optional gate forwarded to the spawned `MockConnection::prompt`.
-    prompt_gate: parking_lot::Mutex<Option<async_channel::Receiver<()>>>,
+    prompt_gate: parking_lot::Mutex<Option<PromptGate>>,
     // Optional cancel counter forwarded to the spawned `MockConnection` so a
     // test can assert how many times the store forwarded `cancel()`.
     cancel_count: Option<Arc<AtomicUsize>>,
@@ -224,8 +238,8 @@ impl MockAgentServer {
     /// AND allow resume".
     pub fn configured(
         connect_count: Arc<AtomicUsize>,
-        gate: Option<async_channel::Receiver<()>>,
-        prompt_gate: Option<async_channel::Receiver<()>>,
+        gate: Option<ConnectGate>,
+        prompt_gate: Option<PromptGate>,
         cancel_count: Option<Arc<AtomicUsize>>,
         supports_resume: bool,
     ) -> Self {
@@ -242,14 +256,11 @@ impl MockAgentServer {
         Self::configured(connect_count, None, None, None, false)
     }
 
-    pub fn with_gate(connect_count: Arc<AtomicUsize>, gate: async_channel::Receiver<()>) -> Self {
+    pub fn with_gate(connect_count: Arc<AtomicUsize>, gate: ConnectGate) -> Self {
         Self::configured(connect_count, Some(gate), None, None, false)
     }
 
-    pub fn with_prompt_gate(
-        connect_count: Arc<AtomicUsize>,
-        prompt_gate: async_channel::Receiver<()>,
-    ) -> Self {
+    pub fn with_prompt_gate(connect_count: Arc<AtomicUsize>, prompt_gate: PromptGate) -> Self {
         Self::configured(connect_count, None, Some(prompt_gate), None, false)
     }
 
@@ -287,7 +298,7 @@ impl agent_servers::AgentServer for MockAgentServer {
         let supports_resume = self.supports_resume;
         cx.spawn(async move |_| {
             if let Some(gate) = gate {
-                gate.recv().await.log_err();
+                gate.0.recv().await.log_err();
             }
             // Every option forwarded, none of them mutually exclusive. This was
             // a priority `match` and it silently dropped the losers — a server

@@ -4,7 +4,7 @@ use super::common::*;
 use crate::adapter::AdapterRegistry;
 use crate::model::SessionState;
 use crate::store::*;
-use crate::test_support::{MockAgentServer, MockConnection};
+use crate::test_support::{ConnectGate, MockAgentServer, MockConnection, PromptGate};
 use chrono::Utc;
 use gpui::{Entity, SharedString, TestAppContext};
 use std::path::PathBuf;
@@ -253,7 +253,10 @@ async fn parallel_create_session_for_same_pair_spawns_only_once(cx: &mut TestApp
         store.update(cx, |store, _| {
             store.register_agent_server(
                 agent_id.clone(),
-                Rc::new(MockAgentServer::with_gate(connect_count.clone(), gate_rx)),
+                Rc::new(MockAgentServer::with_gate(
+                    connect_count.clone(),
+                    ConnectGate(gate_rx),
+                )),
             );
         });
     });
@@ -961,7 +964,7 @@ async fn send_message_starts_running_state_immediately(cx: &mut TestAppContext) 
                 agent_id.clone(),
                 Rc::new(MockAgentServer::with_prompt_gate(
                     connect_count.clone(),
-                    prompt_gate_rx,
+                    PromptGate(prompt_gate_rx),
                 )),
             );
         });
@@ -1638,7 +1641,7 @@ async fn late_send_error_is_dropped_when_session_was_reset(cx: &mut TestAppConte
                 agent_id.clone(),
                 Rc::new(MockAgentServer::with_prompt_gate(
                     connect_count.clone(),
-                    prompt_gate_rx,
+                    PromptGate(prompt_gate_rx),
                 )),
             );
         });

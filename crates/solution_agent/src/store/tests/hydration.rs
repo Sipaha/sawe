@@ -4,7 +4,7 @@ use super::common::*;
 use crate::adapter::AdapterRegistry;
 use crate::model::SessionState;
 use crate::store::*;
-use crate::test_support::{MockAgentServer, MockConnection};
+use crate::test_support::{MockAgentServer, MockConnection, PromptGate};
 use chrono::Utc;
 use gpui::{Entity, SharedString, TestAppContext};
 use std::path::PathBuf;
@@ -2610,7 +2610,7 @@ async fn mock_agent_server_composes_a_prompt_gate_with_resume_support(cx: &mut T
                 Rc::new(MockAgentServer::configured(
                     Arc::new(AtomicUsize::new(0)),
                     None,
-                    Some(prompt_rx),
+                    Some(PromptGate(prompt_rx)),
                     None,
                     true,
                 )),

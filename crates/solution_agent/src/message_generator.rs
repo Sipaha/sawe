@@ -341,7 +341,7 @@ mod tests {
                     agent_id.clone(),
                     Rc::new(MockAgentServer::with_prompt_gate(
                         connect_count.clone(),
-                        prompt_gate_rx,
+                        crate::test_support::PromptGate(prompt_gate_rx),
                     )),
                 );
             });
