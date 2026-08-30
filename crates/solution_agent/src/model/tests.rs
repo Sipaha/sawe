@@ -1688,9 +1688,12 @@ fn reference_decorated_mirror(
 
     // Running background shells fold in, in `background_shell_order`, after
     // Main + teammates. Production's fold is an `IndexMap::insert`, whose
-    // replace-in-place branch is unreachable — `demux` never emits a `Shell`
-    // key, and `background_shell_order` cannot hold a duplicate (registration
-    // in `teammate_reconciler` is guarded by a `contains_key` check). Modelled
+    // replace-in-place branch is unreachable: `demux` never emits a `Shell`
+    // key, and `background_shell_order` cannot hold a duplicate. It has exactly
+    // two writers — `teammate_reconciler.rs`'s registration, guarded by an
+    // `if !already` `contains_key` check, and `store.rs`'s
+    // `#[cfg(debug_assertions)] seed_cold_session`, unguarded but pushing one
+    // fixed id into a brand-new session — and both are duplicate-free. Modelled
     // as a plain append with that assumption ASSERTED rather than as an upsert
     // branch no seed can reach: untested reference code is exactly the drift
     // this reference exists to avoid.
@@ -1776,15 +1779,26 @@ fn reference_decorated_mirror(
     shapes
 }
 
-/// One field comparison, counted as it is made. Comparison and counting are
-/// the SAME statement on purpose: `assert_decorated_mirror`'s return value is
-/// the property's liveness evidence, so a mutation (or a refactor) that drops a
-/// comparison must also drop its count and break the
+/// One comparison, counted in the same function that performs it, so that a
+/// deleted CALL SITE also deletes its count and breaks the
 /// `fields == streams * FIELDS_PER_STREAM + calls` identity the test asserts.
-/// A counter incremented separately from the assert does not defend anything —
-/// it can be left behind by exactly the edit it is supposed to catch.
+///
+/// Note the exact scope of that claim, because a weaker version of it was wrong
+/// once already: it defends against a comparison being **dropped**, not against
+/// one being **neutered**. Deleting the `assert_eq!` below while leaving
+/// `*fields += 1` in place keeps every count and every floor intact and
+/// disables the whole property. No helper can be its own oracle — see the
+/// survivor-class note beside the identity assertion in
+/// `decorated_mirror_matches_an_owned_reference`.
+///
+/// Used directly ONLY for the whole-mirror ids/order comparison, where the two
+/// compared values must be materialised and so cannot come from a shared
+/// projection. That call is largely self-defending anyway: neuter it and a
+/// length mismatch stops panicking here, the `zip` below silently shortens, and
+/// `fields` falls below `streams * FIELDS_PER_STREAM + calls` — the identity
+/// catches it. Per-stream fields go through [`StreamComparison::field`].
 #[cfg(test)]
-fn compared<T: PartialEq + std::fmt::Debug>(
+fn compared<T: PartialEq + std::fmt::Debug + ?Sized>(
     fields: &mut usize,
     actual: &T,
     expected: &T,
@@ -1792,6 +1806,47 @@ fn compared<T: PartialEq + std::fmt::Debug>(
 ) {
     *fields += 1;
     assert_eq!(actual, expected, "{context}");
+}
+
+/// The two sides of ONE stream's comparison, bound once. Every field
+/// comparison is a method on it that names only a projection — never a side —
+/// so the six per-stream comparisons have no place to get a side wrong.
+///
+/// That is not stylistic. The six field comparisons used to be six
+/// near-identical blocks each naming both roots, which is exactly the shape
+/// where a copy-paste slip writes the same root twice: the comparison becomes
+/// `x == x`, every count and every floor stays green, and that field is dead
+/// forever. Review found it live (it disabled detection of the agent fold's
+/// dropped liveness re-state and of the whole label-enrichment step). Here the
+/// roots are named in exactly ONE place — the `zip` that builds `pair` — shared
+/// by all six fields, so the same slip disables all six at once instead of
+/// silently killing one.
+#[cfg(test)]
+struct StreamComparison<'a> {
+    fields: &'a mut usize,
+    pair: (&'a StreamShape, &'a StreamShape),
+    seed: u64,
+    step: &'a str,
+    index: usize,
+}
+
+#[cfg(test)]
+impl StreamComparison<'_> {
+    fn field<T>(&mut self, what: &str, project: impl for<'b> Fn(&'b StreamShape) -> &'b T)
+    where
+        T: PartialEq + std::fmt::Debug + ?Sized,
+    {
+        let (actual, expected) = self.pair;
+        compared(
+            self.fields,
+            project(actual),
+            project(expected),
+            format_args!(
+                "seed {} / {}: stream #{} ({:?}) {what} diverged",
+                self.seed, self.step, self.index, actual.id
+            ),
+        );
+    }
 }
 
 /// Field comparisons `assert_decorated_mirror` makes per compared stream.
@@ -1810,9 +1865,11 @@ const FIELDS_PER_STREAM: usize = 6;
 /// `fields == streams * FIELDS_PER_STREAM + calls`. That identity — not a bare
 /// floor — is what keeps this function honest: `streams` is taken from
 /// `actual.len()` OUTSIDE the loop while `fields` is only produced INSIDE it,
-/// so deleting the loop, or deleting one field's line, breaks the identity
+/// so deleting the loop, or deleting one field's CALL SITE, breaks the identity
 /// rather than degrading the property in silence. A non-`()` return type also
-/// makes a bare `return;` a compile error.
+/// makes a bare `return;` a compile error. What it does NOT defend against is a
+/// comparison that is neutered rather than dropped — see the survivor-class
+/// note beside the identity assertion.
 #[cfg(test)]
 #[must_use]
 fn assert_decorated_mirror(
@@ -1834,70 +1891,34 @@ fn assert_decorated_mirror(
     let mut fields = 0usize;
     let actual_ids: Vec<_> = actual.iter().map(|shape| shape.id.clone()).collect();
     let expected_ids: Vec<_> = expected.iter().map(|shape| shape.id.clone()).collect();
+    // Not `compared_by`: the two id vectors must be materialised, so no shared
+    // projection can produce both sides. See `compared`'s doc for why this one
+    // call site is nonetheless hard to neuter undetected.
     compared(
         &mut fields,
-        &actual_ids,
-        &expected_ids,
+        actual_ids.as_slice(),
+        expected_ids.as_slice(),
         format_args!(
             "seed {seed} / {step}: the decorated mirror's stream ids/order diverged \
              from the owned reference"
         ),
     );
-    for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-        compared(
-            &mut fields,
-            &actual.label,
-            &expected.label,
-            format_args!(
-                "seed {seed} / {step}: stream #{index} ({:?}) label diverged",
-                actual.id
-            ),
-        );
-        compared(
-            &mut fields,
-            &actual.kind,
-            &expected.kind,
-            format_args!(
-                "seed {seed} / {step}: stream #{index} ({:?}) kind diverged",
-                actual.id
-            ),
-        );
-        compared(
-            &mut fields,
-            &actual.state,
-            &expected.state,
-            format_args!(
-                "seed {seed} / {step}: stream #{index} ({:?}) state diverged",
-                actual.id
-            ),
-        );
-        compared(
-            &mut fields,
-            &actual.source,
-            &expected.source,
-            format_args!(
-                "seed {seed} / {step}: stream #{index} ({:?}) source diverged",
-                actual.id
-            ),
-        );
-        compared(
-            &mut fields,
-            &actual.seq,
-            &expected.seq,
-            format_args!(
-                "seed {seed} / {step}: stream #{index} ({:?}) seq diverged",
-                actual.id
-            ),
-        );
-        compared(
-            &mut fields,
-            &actual.entries,
-            &expected.entries,
-            format_args!(
-                "seed {seed} / {step}: stream #{index} ({:?}) entries diverged",
-                actual.id
-            ),
-        );
+    for (index, pair) in actual.iter().zip(expected.iter()).enumerate() {
+        // `pair` is threaded straight from the `zip` into the comparison — the
+        // one and only place either side is named.
+        let mut comparison = StreamComparison {
+            fields: &mut fields,
+            pair,
+            seed,
+            step,
+            index,
+        };
+        comparison.field("label", |shape| &shape.label);
+        comparison.field("kind", |shape| &shape.kind);
+        comparison.field("state", |shape| &shape.state);
+        comparison.field("source", |shape| &shape.source);
+        comparison.field("seq", |shape| &shape.seq);
+        comparison.field("entries", |shape| shape.entries.as_slice());
     }
     (actual.len(), fields)
 }
@@ -2330,12 +2351,24 @@ fn decorated_mirror_matches_an_owned_reference() {
     }
 
     // The comparison itself is live. `streams_compared` is taken from
-    // `actual.len()` outside `assert_decorated_mirror`'s comparison loop and
-    // `fields_compared` is produced only inside it, one increment per
-    // comparison in the same statement as the comparison — so dropping the loop
-    // (the property silently degrades to an ids/order check) or dropping any
-    // one field's line breaks this identity. Only an edit that deliberately
-    // fabricates a matching count survives it.
+    // `actual.len()` OUTSIDE `assert_decorated_mirror`'s comparison loop,
+    // `fields_compared` is produced only INSIDE it, and `comparison_calls` is
+    // written here, outside the function entirely — so dropping the loop (which
+    // would silently degrade the property to an ids/order check) or dropping
+    // any single field's call site breaks this identity.
+    //
+    // WHAT THIS DOES NOT BUY, stated as a class rather than as a list, because
+    // the list was twice believed complete and twice was not: no assertion can
+    // be its own oracle, so ANY edit that deletes or neuters a comparison while
+    // preserving the tally survives. Known members, cheapest first: delete the
+    // `assert_eq!` inside `compared` and keep its `*fields += 1`; pass the same
+    // root for both sides of a comparison (closed for the six per-stream fields
+    // by `StreamComparison::field`, which names no side, but still open at the
+    // single `zip` that binds `pair` and inside the helpers themselves);
+    // return a tally from `assert_decorated_mirror` engineered to satisfy this
+    // identity. The mechanism defends the property against ACCIDENT — a
+    // refactor that drops a loop or a line — and not against an edit that has
+    // read this comment.
     assert_eq!(
         census.fields_compared,
         census.streams_compared * FIELDS_PER_STREAM + census.comparison_calls,
