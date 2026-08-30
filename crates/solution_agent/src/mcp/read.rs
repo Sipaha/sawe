@@ -697,9 +697,14 @@ fn build_get_session_result(
 /// What a cold row cannot carry, and what is served instead: authorization
 /// options for an in-flight tool call (live-only side channel — none, so a
 /// `WaitingForConfirmation` entry arrives with an empty `options` list),
-/// `pending_messages` (in-memory queue — empty), live stream state (teammate
-/// streams are collapsed into Main by `hydrate_streams_main_only`, so `streams`
-/// is Main alone), `state` (`Idle`, the state a restored session really is in)
+/// `pending_messages` (in-memory queue — empty), live stream state (`streams`
+/// is Main alone: `hydrate_streams_main_only` records every non-Main stream as
+/// a hydration orphan and `rebuild_streams` `shift_remove`s it. Note the
+/// teammate-tagged entries are DROPPED, not merged into Main — `demux` routes
+/// them into the teammate stream and never into Main, so a cold session serves
+/// no teammate entry through any stream. Do not map a tagged flat index onto a
+/// Main-local position; there is no such position), `state` (`Idle`, the state
+/// a restored session really is in)
 /// and `max_tokens` (live-thread-only; `total_tokens` still comes from the
 /// persisted metadata column).
 async fn get_session_from_db(

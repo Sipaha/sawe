@@ -768,7 +768,16 @@ impl SolutionAgentStore {
                 // `entry_update_throttles` drops the previous `Task`,
                 // which cancels its inflight timer → only the latest
                 // debounce window's task survives to fire.
-                let key = (session_id, *idx);
+                // Key + emit on the GLOBAL entry index (`live_base + local`),
+                // not the thread-local one the event carries. The consumer
+                // (`build_message_appended_payload`) resolves it against
+                // `session.entries`, and the `NewEntry` arm above already emits
+                // a global index — so on a resumed session (`live_base > 0`) a
+                // local index here made the same wire event mean two different
+                // things depending on which arm produced it, and described the
+                // wrong entry on every streaming update.
+                let global_idx = session_entity.read(cx).live_base + *idx;
+                let key = (session_id, global_idx);
                 let now = std::time::Instant::now();
                 let existing_first_dirty_at = self
                     .entry_update_throttles
@@ -782,11 +791,11 @@ impl SolutionAgentStore {
                 if max_stale_breached {
                     self.entry_update_throttles.remove(&key);
                     cx.emit(SolutionAgentStoreEvent::SessionMessageAppended(
-                        session_id, *idx,
+                        session_id, global_idx,
                     ));
                 } else {
                     let first_dirty_at = existing_first_dirty_at.unwrap_or(now);
-                    let entry_index = *idx;
+                    let entry_index = global_idx;
                     let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(500))
@@ -812,8 +821,7 @@ impl SolutionAgentStore {
                 // Incremental EntryUpdated: reconvert only the changed entry and
                 // replace it in `session.entries`, preserving its `created_ms`
                 // (no restamp — the creation time is fixed at first append).
-                let cold_count = session_entity.read(cx).live_base;
-                let global_idx = cold_count + *idx;
+                // `global_idx` (= `live_base + *idx`) was computed above.
                 let updated_entry = {
                     let s = session_entity.read(cx);
                     let live = s.acp_thread().map(|t| t.read(cx).entries()).unwrap_or(&[]);

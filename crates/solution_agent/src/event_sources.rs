@@ -225,82 +225,107 @@ fn emit_event_notification(event: &SolutionAgentStoreEvent, cx: &mut App) {
 /// notification. Pure function (no side effects) so unit tests can
 /// assert wire shape without running an MCP server.
 ///
-/// When the session is closed or its `acp_thread` is gone (race
-/// between rotate / close and the queued notification), falls back
-/// to a minimal payload with just `session_id` + `entry_index` so the
-/// consumer can still bump its append counter and re-fetch.
+/// `flat_entry_index` is the position in `session.entries` — the flat,
+/// un-coalesced ingest mirror the store's event arms address. **The payload's
+/// `entry_index` is NOT that number.** It is the STREAM-LOCAL position, in the
+/// same space `get_session` / `get_session_changes` / `get_session_entry`
+/// serve, and it ships next to the `stream_id` it belongs to. That is
+/// load-bearing rather than tidy: the mobile client chains this notification
+/// straight into `get_session_entry(entry_index)` (R-5f diff streaming) and
+/// caches with `newTotalCount = entry.index + 1` against a stream-local
+/// `total_count`, so a flat index either lands on an already-rendered entry or
+/// — once the two RPCs agree — falls off the end of a shorter stream with an
+/// `entry_index_out_of_range`. `[main user, teammate assistant, main user]` is
+/// enough to produce it.
+///
+/// The stream-local position is computed by demultiplexing the transcript
+/// PREFIX that ends at this entry and taking that stream's resulting length.
+/// Re-using `stream::demux` is deliberate: the coalescing rule lives in
+/// `push_coalesced` alone and a re-derivation here would be a second copy of it
+/// to keep in sync. It is emphatically NOT a `mod_seq` search — an in-place
+/// `EntryUpdated` re-stamps `mod_seq`, so it is not monotonic across a stream.
+///
+/// Every field is read off `session.entries` / `session.streams`, never off the
+/// live `AcpThread`. The old code mixed the two and indexed the thread with a
+/// GLOBAL index, so on a resumed session (`live_base > 0`) the `role` and
+/// `preview` described a different entry than `created_ms` did.
+///
+/// Falls back to a minimal `session_id`-only payload when the session is gone,
+/// the index is out of range, or the entry belongs to a stream that is no
+/// longer in the mirror (an auto-closed teammate): in every one of those cases
+/// there is no stream-local index that would resolve, and shipping the flat one
+/// is precisely the bug above. A consumer must treat `entry_index` as optional
+/// and re-poll when it is absent.
 pub(crate) fn build_message_appended_payload(
     session_id: crate::model::SolutionSessionId,
-    entry_index: usize,
+    flat_entry_index: usize,
     cx: &App,
 ) -> serde_json::Value {
-    let role_preview_csid_created_ms = SolutionAgentStore::try_global(cx).and_then(|store| {
+    let resolved = SolutionAgentStore::try_global(cx).and_then(|store| {
         store.read_with(cx, |store, cx| {
             let session = store.session(session_id)?;
             let session_ref = session.read(cx);
-            let created_ms = session_ref
-                .entries
-                .get(entry_index)
-                .map(|e| e.created_ms)
-                .filter(|&ms| ms > 0);
-            let thread = session_ref.acp_thread()?;
-            let thread_ref = thread.read(cx);
-            let entry = thread_ref.entries().get(entry_index)?;
-            let role = match entry {
-                acp_thread::AgentThreadEntry::UserMessage(_) => "user",
-                acp_thread::AgentThreadEntry::AssistantMessage(_) => "assistant",
-                acp_thread::AgentThreadEntry::ToolCall(_) => "tool_call",
-                acp_thread::AgentThreadEntry::CompletedPlan(_) => "plan",
-                acp_thread::AgentThreadEntry::ContextCompaction(_) => "context_compaction",
-                acp_thread::AgentThreadEntry::SystemNote(_) => "system",
+            let flat_entry = session_ref.entries.get(flat_entry_index)?;
+            let stream_id = match &flat_entry.subagent_id {
+                None => crate::stream::StreamId::Main,
+                Some(toolu) => crate::stream::StreamId::Teammate(toolu.clone()),
             };
-            let preview = truncate_preview(&entry.to_markdown(cx), 200);
-            // Only user messages can carry originating-client send ids
-            // (stamped on each content block's `_meta` by the client).
-            // For other roles return an empty Vec; for users return
-            // every distinct id we find — a single id for the common
-            // one-shot send, multiple when the server-side queue merge
-            // rolled N originating bundles into one ACP message (see
-            // `client_send_ids_from_user_message`). Clients use the
-            // list to pop every contributing optimistic bubble.
-            let client_send_ids: Vec<i64> =
-                if let acp_thread::AgentThreadEntry::UserMessage(message) = entry {
-                    acp_thread::client_send_ids_from_user_message(message)
-                } else {
-                    Vec::new()
-                };
-            Some((role.to_string(), preview, client_send_ids, created_ms))
+            let prefix = crate::stream::demux(&session_ref.entries[..=flat_entry_index]);
+            // `- 1`: the prefix ends AT this entry, so the stream's length after
+            // demuxing it is one past this entry's own position. `demux` always
+            // inserts Main and creates a teammate stream on first sight of its
+            // tag, so the lookup can only miss if `entries` changed under us.
+            let index = prefix.get(&stream_id)?.entries.len().checked_sub(1)?;
+            // Describe the FULLY coalesced entry from the live mirror — byte-for
+            // -byte the one `get_session_entry { index, stream_id }` will serve
+            // when the client chains this notification into it. The prefix demux
+            // above answers WHERE, not WHAT: its last entry is missing any
+            // fragments that arrived after this one.
+            let entry = session_ref.streams.get(&stream_id)?.entries.get(index)?;
+            let role = crate::mcp::entry_role(&entry.kind);
+            let preview =
+                truncate_preview(&crate::mcp::session_entry_to_markdown(&entry.kind), 200);
+            // Only user messages can carry originating-client send ids (stamped
+            // on each content block's `_meta` by the client); other roles get an
+            // empty Vec. Read through the same `csids_from_blocks` every other
+            // surface uses, off the retained `acp::ContentBlock`s, so this no
+            // longer needs the live thread at all.
+            let client_send_ids = match &entry.kind {
+                crate::session_entry::SessionEntryKind::UserMessage { chunks, .. } => {
+                    acp_thread::csids_from_blocks(chunks)
+                }
+                _ => Vec::new(),
+            };
+            let created_ms = (entry.created_ms > 0).then_some(entry.created_ms);
+            Some((
+                crate::mcp::StreamIdDto::from_model(&stream_id),
+                index,
+                role,
+                preview,
+                client_send_ids,
+                created_ms,
+            ))
         })
     });
-    let (role_preview_csid, created_ms) = match role_preview_csid_created_ms {
-        Some((role, preview, csids, created_ms)) => (Some((role, preview, csids)), created_ms),
-        None => (None, None),
+    let Some((stream_id, index, role, preview, client_send_ids, created_ms)) = resolved else {
+        return json!({ "session_id": session_id.to_string() });
     };
-    let mut obj = match role_preview_csid {
-        Some((role, preview, csids)) if !csids.is_empty() => json!({
-            "session_id": session_id.to_string(),
-            "entry_index": entry_index,
-            "role": role,
-            "preview": preview,
-            // Back-compat alias for pre-R6h mobile builds that only
-            // know the singular field. Always the FIRST csid so the
-            // legacy "pop one" path keeps working.
-            "client_send_id": csids[0],
-            "client_send_ids": csids,
-        }),
-        Some((role, preview, _)) => json!({
-            "session_id": session_id.to_string(),
-            "entry_index": entry_index,
-            "role": role,
-            "preview": preview,
-        }),
-        None => json!({
-            "session_id": session_id.to_string(),
-            "entry_index": entry_index,
-        }),
-    };
+    let mut obj = json!({
+        "session_id": session_id.to_string(),
+        "entry_index": index,
+        "stream_id": stream_id,
+        "role": role,
+        "preview": preview,
+    });
+    if let Some(first) = client_send_ids.first() {
+        // Back-compat alias for pre-R6h mobile builds that only know the
+        // singular field. Always the FIRST csid so the legacy "pop one" path
+        // keeps working.
+        obj["client_send_id"] = json!(first);
+        obj["client_send_ids"] = json!(client_send_ids);
+    }
     if let Some(ms) = created_ms {
-        obj["created_ms"] = serde_json::json!(ms);
+        obj["created_ms"] = json!(ms);
     }
     obj
 }
@@ -472,8 +497,13 @@ mod tests {
         });
     }
 
+    /// The fallback payload is `session_id` ALONE. It used to echo the flat
+    /// index back, which is the one thing it must not do now that the client
+    /// chains `entry_index` into `get_session_entry`: an unresolvable entry has
+    /// no stream-local index, and shipping the flat one is the bug this whole
+    /// change is about.
     #[gpui::test]
-    async fn message_appended_payload_falls_back_when_thread_missing(cx: &mut TestAppContext) {
+    async fn message_appended_payload_falls_back_when_session_missing(cx: &mut TestAppContext) {
         let registry = Arc::new(AdapterRegistry::new());
         cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
 
@@ -481,10 +511,338 @@ mod tests {
             let payload =
                 build_message_appended_payload(crate::model::SolutionSessionId::new(), 7, cx);
             let obj = payload.as_object().expect("object");
-            assert_eq!(obj.get("entry_index").and_then(|v| v.as_u64()), Some(7));
+            assert_eq!(
+                obj.get("session_id").and_then(|v| v.as_str()).is_some(),
+                true
+            );
+            assert!(
+                obj.get("entry_index").is_none(),
+                "no flat index may leak into the fallback; got {obj:?}"
+            );
+            assert!(obj.get("stream_id").is_none());
             assert!(obj.get("role").is_none());
             assert!(obj.get("preview").is_none());
         });
+    }
+
+    // =============================================================
+    // The notification's `entry_index` is STREAM-LOCAL, and chains
+    // into `get_session_entry` — the mobile client's R-5f diff-
+    // streaming path (`docs/plans/2026-05-17-remote-control-R5f-
+    // client-rich-rendering.md`).
+    // =============================================================
+
+    fn assistant_entry(text: &str, toolu: Option<&str>) -> crate::session_entry::SessionEntry {
+        crate::session_entry::SessionEntry {
+            created_ms: 1_700_000_000_000,
+            mod_seq: 0,
+            subagent_id: toolu.map(|t| gpui::SharedString::from(t.to_string())),
+            kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                chunks: vec![crate::session_entry::AssistantChunk::Message(
+                    text.to_string(),
+                )],
+            },
+        }
+    }
+
+    fn user_entry(text: &str) -> crate::session_entry::SessionEntry {
+        crate::session_entry::SessionEntry {
+            created_ms: 1_700_000_000_000,
+            mod_seq: 0,
+            subagent_id: None,
+            kind: crate::session_entry::SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.to_string(),
+                chunks: vec![],
+            },
+        }
+    }
+
+    fn set_transcript(
+        session_id: crate::model::SolutionSessionId,
+        cx: &mut TestAppContext,
+        entries: Vec<crate::session_entry::SessionEntry>,
+    ) {
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).expect("session");
+            session.update(cx, |s, _| {
+                s.entries = entries;
+                s.rebuild_streams();
+            });
+        });
+    }
+
+    /// Follow the notification the way the deployed client does: take its
+    /// `stream_id` + `entry_index` verbatim and call `get_session_entry` with
+    /// them. Returns the served entry's `(index, markdown)`.
+    async fn chase_notification(
+        cx: &mut TestAppContext,
+        session_id: crate::model::SolutionSessionId,
+        payload: &serde_json::Value,
+    ) -> (usize, String) {
+        use context_server::listener::McpServerTool;
+        let stream_id: crate::mcp::StreamIdDto =
+            serde_json::from_value(payload["stream_id"].clone()).expect("stream_id round-trips");
+        let index = payload["entry_index"].as_u64().expect("entry_index") as usize;
+        let entry = crate::mcp::GetSessionEntryTool
+            .run(
+                crate::mcp::GetSessionEntryParams {
+                    session_id: session_id.to_string(),
+                    index,
+                    stream_id: Some(stream_id),
+                    include_images: false,
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!("the client chases entry_index {index} into get_session_entry: {err:#}")
+            })
+            .structured_content
+            .entry;
+        (
+            entry.index,
+            entry.markdown.expect("single-entry always has markdown"),
+        )
+    }
+
+    /// `[main user, teammate assistant, main user]` — an ordinary session that
+    /// dispatched one teammate. The third append is flat index 2 while Main
+    /// holds 2 entries, so the flat index the payload used to carry now falls
+    /// off the end of the stream the client renders.
+    #[gpui::test]
+    async fn message_appended_payload_is_stream_local_for_a_teammate_transcript(
+        cx: &mut TestAppContext,
+    ) {
+        let (session_id, _thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        set_transcript(
+            session_id,
+            cx,
+            vec![
+                user_entry("main question"),
+                assistant_entry("teammate work", Some("toolu_note_1")),
+                user_entry("main follow-up"),
+            ],
+        );
+
+        let payloads: Vec<serde_json::Value> = cx.update(|cx| {
+            (0..3)
+                .map(|flat| build_message_appended_payload(session_id, flat, cx))
+                .collect()
+        });
+
+        assert_eq!(payloads[0]["entry_index"].as_u64(), Some(0));
+        assert_eq!(
+            payloads[0]["stream_id"],
+            serde_json::json!({"type": "main"})
+        );
+        assert_eq!(payloads[0]["role"].as_str(), Some("user"));
+
+        assert_eq!(
+            payloads[1]["entry_index"].as_u64(),
+            Some(0),
+            "a teammate's first entry is index 0 of ITS stream, not 1 of the flat mirror"
+        );
+        assert_eq!(
+            payloads[1]["stream_id"],
+            serde_json::json!({"type": "teammate", "toolu": "toolu_note_1"})
+        );
+        assert_eq!(payloads[1]["role"].as_str(), Some("assistant"));
+
+        assert_eq!(
+            payloads[2]["entry_index"].as_u64(),
+            Some(1),
+            "the third append is Main index 1 — the flat index 2 is off the end of Main"
+        );
+        assert_eq!(
+            payloads[2]["stream_id"],
+            serde_json::json!({"type": "main"})
+        );
+
+        // And the whole point: every one of those chases cleanly into the RPC
+        // the client calls next, landing on the entry the payload previewed.
+        for (flat, expect) in [
+            (0usize, "main question"),
+            (1, "teammate work"),
+            (2, "main follow-up"),
+        ] {
+            let payload = payloads[flat].clone();
+            let (index, markdown) = chase_notification(cx, session_id, &payload).await;
+            assert_eq!(index, payload["entry_index"].as_u64().unwrap() as usize);
+            assert!(
+                markdown.contains(expect),
+                "flat {flat} previewed {:?} but get_session_entry served {markdown:?}",
+                payload["preview"]
+            );
+            let preview = payload["preview"].as_str().expect("preview");
+            assert!(
+                markdown.starts_with(preview.trim_end_matches('\u{2026}')),
+                "the payload's preview must be a prefix of the entry it points at; \
+                 preview={preview:?} markdown={markdown:?}"
+            );
+        }
+    }
+
+    /// Two consecutive assistant fragments are ONE stream entry, so the second
+    /// fragment's append must re-advertise the SAME index (with the merged
+    /// preview), not a new one.
+    #[gpui::test]
+    async fn message_appended_payload_reports_the_coalesced_entry(cx: &mut TestAppContext) {
+        let (session_id, _thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        set_transcript(
+            session_id,
+            cx,
+            vec![
+                assistant_entry("fragment a", None),
+                assistant_entry("fragment b", None),
+                user_entry("a question"),
+            ],
+        );
+
+        let payloads: Vec<serde_json::Value> = cx.update(|cx| {
+            (0..3)
+                .map(|flat| build_message_appended_payload(session_id, flat, cx))
+                .collect()
+        });
+
+        assert_eq!(payloads[0]["entry_index"].as_u64(), Some(0));
+        assert_eq!(
+            payloads[1]["entry_index"].as_u64(),
+            Some(0),
+            "the second fragment merged into the first entry — same index"
+        );
+        for flat in [0usize, 1] {
+            let preview = payloads[flat]["preview"].as_str().expect("preview");
+            assert!(
+                preview.contains("fragment a") && preview.contains("fragment b"),
+                "the preview describes the fully coalesced entry; got {preview:?}"
+            );
+        }
+        assert_eq!(
+            payloads[2]["entry_index"].as_u64(),
+            Some(1),
+            "the user message is index 1 of Main, not 2"
+        );
+
+        let payload = payloads[1].clone();
+        let (index, markdown) = chase_notification(cx, session_id, &payload).await;
+        assert_eq!(index, 0);
+        assert!(markdown.contains("fragment a") && markdown.contains("fragment b"));
+    }
+
+    /// A resumed session offsets the live thread's local indices by
+    /// `live_base`. The payload is built entirely from `session.entries` /
+    /// `session.streams` now, so the cold prefix is described correctly — the
+    /// old code indexed `acp_thread.entries()` with the GLOBAL index and
+    /// described a different entry, or none at all.
+    #[gpui::test]
+    async fn message_appended_payload_is_correct_across_a_live_base_offset(
+        cx: &mut TestAppContext,
+    ) {
+        let (session_id, acp_thread, _tmp) =
+            crate::store::tests::create_session_with_thread(cx).await;
+        // Two cold entries, then re-attach the thread so `live_base` = 2.
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).expect("session");
+            session.update(cx, |s, cx| {
+                s.entries = vec![
+                    user_entry("cold user"),
+                    assistant_entry("cold assistant", None),
+                ];
+                s.rebuild_streams();
+                s.set_acp_thread(Some(acp_thread.clone()), cx);
+            });
+        });
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).expect("session");
+            assert_eq!(session.read(cx).live_base, 2, "cold prefix length");
+        });
+
+        // One live append lands at global index 2 / local index 0.
+        cx.update(|cx| {
+            acp_thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(
+                    None,
+                    agent_client_protocol::schema::ContentBlock::Text(
+                        agent_client_protocol::schema::TextContent::new("live user".to_string()),
+                    ),
+                    cx,
+                );
+            });
+        });
+        cx.executor().run_until_parked();
+
+        let cold = cx.update(|cx| build_message_appended_payload(session_id, 1, cx));
+        assert_eq!(
+            cold["role"].as_str(),
+            Some("assistant"),
+            "flat 1 is the cold assistant; the live thread's entry 1 does not exist"
+        );
+        assert!(
+            cold["preview"]
+                .as_str()
+                .is_some_and(|p| p.contains("cold assistant")),
+            "got {:?}",
+            cold["preview"]
+        );
+        assert_eq!(cold["entry_index"].as_u64(), Some(1));
+
+        let live = cx.update(|cx| build_message_appended_payload(session_id, 2, cx));
+        assert_eq!(live["role"].as_str(), Some("user"));
+        assert!(
+            live["preview"]
+                .as_str()
+                .is_some_and(|p| p.contains("live user")),
+            "got {:?}",
+            live["preview"]
+        );
+        assert_eq!(live["entry_index"].as_u64(), Some(2));
+
+        let (index, markdown) = chase_notification(cx, session_id, &live).await;
+        assert_eq!(index, 2);
+        assert!(markdown.contains("live user"));
+    }
+
+    /// An entry whose teammate stream has been auto-closed sits in NO stream,
+    /// so there is no stream-local index to advertise: the payload degrades to
+    /// the `session_id`-only form rather than inventing one.
+    #[gpui::test]
+    async fn message_appended_payload_omits_the_index_for_a_streamless_entry(
+        cx: &mut TestAppContext,
+    ) {
+        let (session_id, _thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        set_transcript(
+            session_id,
+            cx,
+            vec![
+                user_entry("main question"),
+                assistant_entry("teammate work", Some("toolu_closed_1")),
+            ],
+        );
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).expect("session");
+            session.update(cx, |s, _| {
+                s.close_stream(
+                    crate::stream::StreamId::Teammate(gpui::SharedString::from("toolu_closed_1")),
+                    gpui::SharedString::from("done"),
+                );
+            });
+        });
+
+        let payload = cx.update(|cx| build_message_appended_payload(session_id, 1, cx));
+        assert!(
+            payload["entry_index"].is_null() && payload["stream_id"].is_null(),
+            "a streamless entry advertises no index; got {payload:?}"
+        );
+        assert!(payload["session_id"].as_str().is_some());
+        // Main is unaffected.
+        let main = cx.update(|cx| build_message_appended_payload(session_id, 0, cx));
+        assert_eq!(main["entry_index"].as_u64(), Some(0));
     }
 
     #[test]
@@ -715,6 +1073,10 @@ mod tests {
                 if let Some(e) = s.entries.get_mut(0) {
                     e.created_ms = NO_TIMESTAMP_MS;
                 }
+                // The payload is built from the coalesced `streams` mirror now,
+                // so a direct `entries` poke has to refresh it — production
+                // never mutates `entries` without a rebuild.
+                s.rebuild_streams();
             });
         });
         cx.update(|cx| {
