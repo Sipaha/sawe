@@ -24,7 +24,7 @@ whole-commit +/− totals and a changed-files tree; double-clicking a file opens
 that file's diff **for that commit** in the centre pane; a multi-row selection
 renders "N commits selected".
 
-**Seven backlog items also cleared:**
+**Nine backlog items also cleared:**
 
 - **`ctrl-\`` now leaves the caret in the band's active terminal.** It used to
   focus the `ConsolePanel`'s root handle, so typing after the hotkey went
@@ -53,6 +53,21 @@ renders "N commits selected".
   screenshots because the structured dump did not mention them.
 - **App quit now drains the entry-persist chain instead of cancelling it.**
   Quitting mid-turn silently truncated the tail of the conversation.
+- **The git graph persisted the wrong commit's sha.** `SerializableItem::serialize`
+  indexed `graph_data.commits` with a **view**-space index, so whenever the
+  synthetic "Local Changes" row was present it saved the *neighbour's* sha (the
+  oldest commit saved nothing; the synthetic row itself saved a phantom HEAD),
+  and restore re-anchored there. Narrow — file-history graphs with the toolbar
+  toggle on — but sticky, because that toggle is itself persisted. **The old
+  round-trip test agreed with the bug**: it never called `serialize`, it
+  hand-rolled the same buggy expression on both the write and the assert.
+- **A DAP `runInTerminal` terminal could land invisibly.** It is the *default*
+  launch path for the JS and Python adapters, and the adapter blocks on our
+  reply with no timeout. The always-present half of the bug was not the band but
+  the sub-pane: `ensure_pane_item` adds with `activate: false` and early-returns
+  on an existing tab, so a user who had rearranged their debug panes got the
+  terminal re-added behind another tab. Now revealed and selected — without
+  stealing focus.
 
 Everything is on `origin/main`. Working tree clean.
 
@@ -216,9 +231,6 @@ fix below).
    - The git graph's `0.13` Date-column fraction: every row truncates to
      `15 Nov 2023 06…` while Author is mostly whitespace. No horizontal scroll,
      no table min-width, and a ≥72px graph gutter floor.
-   - `SerializableItem::serialize` indexes `graph_data.commits` with the **view**
-     index and no `view_to_data_idx` — an off-by-one whenever the synthetic
-     "Local Changes" row is present.
    - Three keymap entries name `git_graph::{FocusNextTabStop,
      FocusPreviousTabStop, ScrollDown, ScrollUp}`, actions that exist nowhere.
    - No test drives `select_entry` under a live `Context<Workspace>` lease, so
