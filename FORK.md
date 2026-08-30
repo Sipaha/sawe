@@ -1669,9 +1669,12 @@ Why not build the nodes in `solutions`. It cannot: `solution_agent` depends on `
 Inverting the direction — the owner registers into the dump — is the only arrangement in which the node builder can see
 the state its own `render` sees. The alternative that was actually tried in this file's history and abandoned is worse:
 `build_title_bar_node` and `build_status_bar_node` both used to hand-synthesize children from whatever state
-`solutions` could reach, both drifted out of sync with what was painted, and both were stripped back to bare presence
-nodes with a comment saying a wrong child is worse than no child. The registry is how a row gets real children without
-re-acquiring that failure mode.
+`solutions` could reach. Only `build_title_bar_node` actually drifted: `TitleBar::render` replaced the project-info
+chain wholesale with the solution tab strip, and the dump went on reporting `SolutionSegment` / `ProjectName` /
+`Branch` until `1cc929c9f3` cut them. `build_status_bar_node`'s synthesis was cut in `3861a2adfa`, the same commit
+that deleted the status-bar item it described, so it never had the chance to diverge — and it is not a bare presence
+node either, it still reports `visible` from `Workspace::status_bar_visible`. Both carry a comment saying a wrong
+child is worse than no child. The registry is how a row gets real children without re-acquiring that failure mode.
 
 How to apply. Adding a row to the dump = add a `StructureSlot` variant, splice it at the right index in
 `build_workspace_node` (child order is the window's vertical order and agents read it that way), and register a
