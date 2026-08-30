@@ -1807,10 +1807,28 @@ How to apply:
   exposure `MultiWorkspace` still carries. What is at risk there is the `multi_workspace_state` KV blob — window chrome:
   active workspace, project groups, sidebar — not the pane layout in the `workspaces` table and not the session binding,
   which is a `background_spawn`; and with a dozen-plus eager, undebounced `serialize` call sites the pending delta is
-  seconds old at worst. Recorded, not fixed here. (One other hook is *conditionally* foreground-bound:
-  `LspStore::shutdown_server`'s `LanguageServerState::Starting { startup, .. } => startup.await` waits on a foreground
-  `cx.spawn`, so a quit while any language server is still starting burns the timeout. The `Running` arm is background
-  work and is fine.)
+  seconds old at worst. Recorded, not fixed here. (`LspStore::shutdown_server` was the second instance and is
+  **fixed**: its `LanguageServerState::Starting` arm used to unconditionally `await` a foreground `cx.spawn`ed
+  `startup`, so a quit while any language server was still starting burned the whole timeout and still shut nothing
+  down — `join_all` cannot resolve until every member does. It now splits that arm on `Task::is_ready()`. **A
+  still-pending startup is dropped, not awaited**, because when the only options are "await foreground work that cannot
+  run" and "drop it", dropping is strictly better: both produce zero shutdown effect and the same orphaned child
+  (`kill_on_drop` does not help — `Drop for LanguageServer` hands the kill to a *detached* background task that never
+  gets scheduled before the process exits), but only one of them costs the entire 200ms budget that every other quit
+  observer shares. **An already-finished startup is still awaited and still shut down**, because a finished task
+  resolves from its stored output with no scheduler involvement, so the blocked session cannot stall it, and
+  `LanguageServer::shutdown()` is background-driven; skipping it would have orphaned a fully initialized server. Mind
+  that `Task::is_ready()` is `CLOSED | COMPLETED`, not "completed successfully" — awaiting a closed-without-output task
+  panics — but no route to that state survives a normal `App::shutdown`, so the guard is sound. The `Running` arm is
+  background work and was always fine. Pinned by
+  `crates/project/tests/integration/lsp_store.rs::{test_quit_does_not_await_a_starting_language_server,
+  test_quit_shuts_down_a_language_server_whose_startup_finished}`, which block on the hook through
+  `cx.foreground_executor().block_with_timeout` — the same call `App::shutdown` makes — with the tick budget pinned via
+  `set_block_on_ticks`, because the `0..=1000` floor of zero polls documented below lets the block return without
+  polling the quit future at all, which it reports as *not completed*. The *non-quit* stop path
+  (`LspStore::shutdown_language_server`) legitimately still awaits `startup` against a 5s timer, because there the
+  foreground executor is alive. `MultiWorkspace::app_will_quit` is now the only remaining unconditionally
+  foreground-bound hook.)
 - **Foreground is not the default for durability work.** If a future captures no entity and its ordering is explicit,
   put it on the background executor; that is the difference between surviving a quit and not.
 - **A `TestAppContext` test can prove this**, because `TestScheduler` models the blocked-session rule. Issue the chain,
@@ -1832,3 +1850,19 @@ How to apply:
 - **The derived widths are cached against every input, not just the table width** (`ColumnWidthInputs`). The two measurements scale with `rem_size` and the UI font, and neither of those moves the table's width — so a width-only key stays satisfied across a font-size or theme change and the columns keep the *previous* font's sizing. That reproduces the exact truncation this entry is about (`14 May 202…`, `Firstname L…`), and nothing short of a resize repairs it, which makes it indistinguishable from the bug being unfixed. Keying on the derivation function's own arguments cannot go stale by construction; keying on what the measurement happens to read today has to be revisited whenever it reads something new.
 - **The header's `ElementId` seed must be an entity that outlives the columns.** `render_table_header`'s `entity_id` parameter only seeds the header cells' element ids, so it takes `table_interaction_state` (as `data_table`'s own call site does) rather than the column-widths entity, which is *replaced* on every re-derivation and would discard each cell's retained hover/active state on every resize. The entity swap is otherwise safe — nothing observes or subscribes to `RedistributableColumnsState` — with one narrow exception: between a divider's MouseDown and its first drag-move the preview still equals the initial widths, so a swap there is not gated out and the in-flight `DraggedColumn`'s `state_id` stops matching what `bind_redistributable_columns` guards on, killing that drag until the divider is re-grabbed.
 - **The table's width is measured by the view's own `on_children_prepainted`, not read off `cached_container_width`.** Both land during the draw, but nothing notifies when the cached value does, so after a window or band resize the table kept the *previous* width's shares until some unrelated event happened to redraw it — visible as a full-width layout squeezed into a half-width band. `GitGraph::observe_table_width` defers a notify out of the draw phase (gpui discards invalidation raised inside one, #62) and guards it on the width having actually changed, or it re-arms every frame and spins. Note that `Div::on_children_prepainted` holds a *single* listener, so the observer sits on a wrapper div outside the one `bind_redistributable_columns` claims.
+
+### 105. `solution_agent`'s read RPCs serve a closed session from a detached cold entity, and never by hydrating the store
+
+What: `solution_agent.get_session` and `solution_agent.get_session_changes` used to resolve only through `store.sessions`, so after a window close both returned `session_not_found` until something else re-hydrated the store — even though every row was still in the database. They now fall back to a shared `load_cold_session`, which rebuilds the session through `store::build_cold_session` (the *same* constructor `hydrate_all_for_solution` uses), reads the answer off it, and drops it.
+
+Why: the obvious alternative — call `hydrate_all_for_solution` the way `list_sessions` does — is wrong twice over. It needs a solution id the caller does not have, and it deliberately refuses rows with `closed_at` set, so it can never serve a session the *user* closed, which is the whole case. Mirroring `read_session_history`'s ad-hoc rows→blob→title fallback was rejected too: that path recovers only entries and a title, while `GetSessionResult` carries ten-plus metadata fields it never loads. Sharing hydration's own constructor is the reuse that cannot drift.
+
+**Both RPCs had to move together, and that is the load-bearing part.** Fixing only `get_session` created a worse failure than the one it fixed: a client would render a transcript served from the cold path, then hard-error on its first delta poll with the `(epoch, current_seq)` cursor that same call had just handed it. Any *third* read RPC that grows a cold path must go through `load_cold_session` for the same reason — so they all agree on whether a closed session exists and on the cursor they issue. `get_session_entry` is the known outstanding one.
+
+How to apply:
+- **A cold read is a pure read.** The entity is constructed, read and dropped; nothing is inserted into `store.sessions` or `by_solution`. That is what lets these RPCs serve a user-closed tab where `list_sessions` cannot, and it is asserted by test. Do not "optimise" it into a hydration.
+- **Serve absent fields as absences, never as guesses.** A cold session has no subprocess, so `state` is `Idle`, `max_tokens` is `None`, `pending_bundles` is empty, teammate streams collapse to Main, and an in-flight tool call's authorization options are empty. Three assertions pin the ones a future refactor could start filling with persisted-but-wrong values.
+- **Pin the cursor, not just self-consistency.** `epoch` and `mod_seq` are the wire contract. Tests that only compare a full load's cursor to a delta's own agree with each other under a renumbering or an epoch-policy change and stay green while every cached client cursor is forced through a spurious reset. Pin the literal values, and pin a *partial* delta (`since_seq` mid-transcript) — a max-preserving interior renumbering survives everything else.
+- **The legacy-blob branch advertises a different epoch than the live session did** (`0` → bump → `1`, ignoring the persisted column) because `build_cold_session` bumps whenever there are no entry rows. It is not a defect: the read persists nothing, so the bump is re-derived from the same persisted `0` every time and cannot compound; a desktop restore advertises the same `1`; and the population empties on first hydration. Cost is one forced client reload per pre-Phase-4 blob-only session.
+- **`total_count` is the stream's entry count, not the number of persisted rows** — adjacent legacy assistant lines coalesce into one entry. Pinned, not "fixed", because the desktop reads it the same way.
+- **Known cost, not yet paid down:** every cold call does four or five sequential round-trips on the single shared sqlite connection mutex and decodes the whole transcript on the foreground thread, and `CHANGED_ENTRIES_PAGE = 10` makes a client `B` entries behind page in `ceil(B/10)` back-to-back polls — each one a full re-read. On the maintainer's real database (29k rows, largest session 1,520 rows / 5.3 MB) a client 500 behind costs ~50 full re-reads. Folding `epoch`/`change_seq` into `select_metadata_by_id` removes two of the round-trips for free; a cold-specific page size attacks the cliff directly; a cache is the last resort and must not key on `change_seq`, which degenerates to `None` on exactly the legacy sessions whose decode is most expensive.
