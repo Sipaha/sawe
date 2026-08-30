@@ -2056,7 +2056,9 @@ mod tests {
     /// this path: `debugger_ui::session::running::handle_run_in_terminal`
     /// builds its own `TerminalView` and installs it via
     /// `ensure_pane_item(DebuggerPaneItem::Terminal)`, so it creates no
-    /// `ConsoleTab` and never calls `reveal_utility_section`.
+    /// `ConsoleTab`. It reveals through the mirror-image helper on the
+    /// debugger's side — `debugger_panel::reveal_debug_panel`, selecting
+    /// `UtilityKind::Debug` — so the two never fight over the section.
     #[gpui::test]
     async fn revealing_a_task_terminal_selects_the_terminal_kind(cx: &mut TestAppContext) {
         cx.executor().allow_parking();

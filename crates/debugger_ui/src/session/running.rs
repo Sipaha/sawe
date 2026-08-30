@@ -1169,11 +1169,11 @@ impl RunningState {
                 })?;
 
                 this.update_in(cx, |this, window, cx| {
-                    this.ensure_pane_item(DebuggerPaneItem::Terminal, window, cx);
                     this.debug_terminal.update(cx, |debug_terminal, cx| {
                         debug_terminal.terminal = Some(terminal_view);
                         cx.notify();
                     });
+                    this.reveal_debug_terminal(window, cx);
                 })?;
 
                 let exit_status = terminal
@@ -1333,11 +1333,11 @@ impl RunningState {
             })?;
 
             running.update_in(cx, |running, window, cx| {
-                running.ensure_pane_item(DebuggerPaneItem::Terminal, window, cx);
                 running.debug_terminal.update(cx, |debug_terminal, cx| {
                     debug_terminal.terminal = Some(terminal_view);
                     cx.notify();
                 });
+                running.reveal_debug_terminal(window, cx);
             })?;
 
             terminal.read_with(cx, |terminal, _| {
@@ -1439,6 +1439,53 @@ impl RunningState {
         pane.update(cx, |pane, cx| {
             pane.add_item_inner(sub_view, false, false, false, None, window, cx);
         })
+    }
+
+    /// Put the debug terminal somewhere the user can actually see it, after
+    /// something has been spawned into it: select the debugger in the
+    /// Solution band's utility section and make the Terminal sub-view the
+    /// active tab of whichever debug pane hosts it.
+    ///
+    /// Neither step moves focus. Both terminal-spawning paths reach here as
+    /// a direct consequence of the user pressing Run/Debug — the prelaunch
+    /// build task, and the DAP `runInTerminal` reverse request, which
+    /// arrives inside the launch handshake with the adapter blocked on our
+    /// reply — so this is not a background event that should stay quiet;
+    /// the sibling `SessionEvent::Stopped` arm has always revealed the
+    /// debugger unconditionally, and a launch is less surprising than a
+    /// breakpoint hit minutes later. Focus is the part that hurts when it
+    /// moves under a typing user, and the band deliberately separates
+    /// "show" from "show and focus", so this uses the show-only operation
+    /// that the status-bar buttons drive.
+    ///
+    /// `ensure_pane_item` alone is not enough for the tab: it adds the
+    /// sub-view with `activate: false`, and returns early when the tab
+    /// already exists — which the default layout guarantees — so on its own
+    /// a terminal can sit unselected behind another tab indefinitely.
+    fn reveal_debug_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::debugger_panel::reveal_debug_panel(workspace, cx);
+            })
+            .log_err();
+
+        self.ensure_pane_item(DebuggerPaneItem::Terminal, window, cx);
+
+        let terminal_tab = self.panes.panes().into_iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .position(|item| {
+                    item.act_as::<SubView>(cx)
+                        .is_some_and(|view| view.read(cx).kind == DebuggerPaneItem::Terminal)
+                })
+                .map(|index| (pane.clone(), index))
+        });
+        let Some((pane, index)) = terminal_tab else {
+            return;
+        };
+        pane.update(cx, |pane, cx| {
+            pane.activate_item(index, false, false, window, cx);
+        });
     }
 
     pub(crate) fn add_pane_item(
@@ -1640,6 +1687,24 @@ impl RunningState {
         pane.update(cx, |this, cx| {
             this.activate_item(variable_list_position, true, true, window, cx);
         });
+    }
+
+    /// The `DebuggerPaneItem` each debug pane currently has selected — what
+    /// the user is actually looking at. `pane_items_status` only answers
+    /// whether a tab exists *somewhere*, which is not the same question: a
+    /// tab can sit unselected behind another one in the same pane.
+    #[cfg(test)]
+    pub(crate) fn active_pane_items(&self, cx: &App) -> Vec<DebuggerPaneItem> {
+        self.panes
+            .panes()
+            .into_iter()
+            .filter_map(|pane| {
+                pane.read(cx)
+                    .active_item()?
+                    .act_as::<SubView>(cx)
+                    .map(|view| view.read(cx).kind)
+            })
+            .collect()
     }
 
     #[cfg(test)]

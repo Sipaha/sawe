@@ -386,6 +386,151 @@ async fn test_handle_successful_run_in_terminal_reverse_request(
         .unwrap();
 }
 
+/// A DAP `runInTerminal` request is the *default* launch path for the two
+/// most-used adapters — `dap_adapters::javascript` forces `console:
+/// externalTerminal` and `dap_adapters::python` forces `integratedTerminal`
+/// whenever the user did not pick one — and the adapter then blocks on our
+/// reply with no timeout. So the terminal it asks for is the debuggee's
+/// console on an ordinary Run/Debug, not an exotic corner, and it used to
+/// land where nobody could see it: `ensure_pane_item` adds the tab without
+/// selecting it, and nothing pointed the Solution band's utility section at
+/// the debugger, so a user whose band was showing the terminal (or was
+/// closed, as here) watched Run/Debug do visibly nothing.
+///
+/// Closing the Terminal tab up front reproduces the pane half: the re-added
+/// tab then arrives in a pane that already has a different tab selected,
+/// which is the state `ensure_pane_item` alone cannot fix.
+///
+/// Revealing must not move focus — that is the part that hurts when it
+/// happens under a typing user, and the band separates "show" from "show
+/// and focus" precisely so this path can take the former.
+#[gpui::test]
+async fn test_run_in_terminal_reveals_the_debug_terminal(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    use gpui::Focusable as _;
+    use solution_agent::solution_band::SolutionBand;
+    use workspace::UtilityKind;
+
+    // needed because the debugger launches a terminal which starts a background PTY
+    cx.executor().allow_parking();
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "main.rs": "First line\nSecond line",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+
+    let band = workspace
+        .update(cx, |multi, _window, cx| {
+            multi
+                .workspace()
+                .read(cx)
+                .solution_band_item()
+                .and_then(|item| item.downcast::<SolutionBand>().ok())
+                .expect("the test workspace installs a Solution band")
+        })
+        .unwrap();
+
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+    cx.run_until_parked();
+
+    let running = workspace
+        .update(cx, |workspace, _window, cx| {
+            let debug_panel = crate::tests::debug_panel(workspace, cx);
+            let session = debug_panel.read(cx).active_session().unwrap();
+            session.read(cx).running_state().clone()
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |_multi, window, cx| {
+            running.update(cx, |running, cx| {
+                running.remove_pane_item(DebuggerPaneItem::Terminal, window, cx);
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Deliberately after `start_debug_session`: `DebugPanel::register_session`
+    // already reveals the debugger (and focuses it) when the session
+    // registers, so pointing the band elsewhere beforehand would prove
+    // nothing. This is the state a user reaches by switching the band to the
+    // terminal while a slow launch is still handshaking, or by the time a
+    // second `runInTerminal` arrives later in the session.
+    band.update(cx, |band, cx| {
+        band.set_utility_kind(UtilityKind::Terminal, cx);
+        band.set_utility_visible(false, cx);
+    });
+
+    workspace
+        .update(cx, |_multi, _window, cx| {
+            assert!(
+                !running
+                    .read(cx)
+                    .active_pane_items(cx)
+                    .contains(&DebuggerPaneItem::Terminal),
+                "precondition: no debug pane is showing the terminal before the request"
+            );
+        })
+        .unwrap();
+
+    client
+        .fake_reverse_request::<RunInTerminal>(RunInTerminalRequestArguments {
+            kind: None,
+            title: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            args: vec![],
+            env: None,
+            args_can_be_interpreted_by_shell: None,
+        })
+        .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        band.read_with(cx, |band, cx| band.utility_kind(cx)),
+        UtilityKind::Debug,
+        "the terminal the adapter is blocked on must be the thing on screen, \
+         not whatever the band happened to be showing"
+    );
+    assert!(
+        band.read_with(cx, |band, cx| band.utility_visible(cx)),
+        "and the utility section has to be open at all"
+    );
+
+    workspace
+        .update(cx, |_multi, window, cx| {
+            assert!(running.read(cx).debug_terminal.read(cx).terminal.is_some());
+            assert!(
+                running
+                    .read(cx)
+                    .active_pane_items(cx)
+                    .contains(&DebuggerPaneItem::Terminal),
+                "the terminal tab must be selected in its pane; merely existing \
+                 behind another tab is still invisible"
+            );
+            assert!(
+                !running
+                    .read(cx)
+                    .debug_terminal
+                    .focus_handle(cx)
+                    .contains_focused(window, cx),
+                "revealing the debug terminal must not steal focus"
+            );
+        })
+        .unwrap();
+}
+
 #[gpui::test]
 async fn test_handle_start_debugging_request(
     executor: BackgroundExecutor,
