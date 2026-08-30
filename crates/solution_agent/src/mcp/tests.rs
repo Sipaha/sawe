@@ -2677,17 +2677,26 @@ async fn read_session_history_distinguishes_a_wiped_session_from_a_legacy_one(
         "legacy blob content must round-trip; got {:?}",
         sc.entries[0]
     );
-    // ANTI-VACUITY for all three title assertions in this test: they only
-    // distinguish the metadata row from the blob while the fixture's two copies
-    // DISAGREE. Read the divergence out of the fixture rather than trusting the
-    // literals to stay different.
-    let blob_title = serde_json::from_slice::<crate::store::PersistedSession>(&blob("x"))
-        .expect("fixture blob decodes")
-        .title;
-    assert_ne!(
-        blob_title, "legacy session",
-        "the fixture's blob title must differ from the metadata row's, or every \
-         title assertion here passes no matter which source is served"
+    // ANTI-VACUITY for this branch and for (1) above: both assert that a title
+    // came from the metadata row, which distinguishes nothing unless the blob
+    // ACTUALLY ON DISK says something else. Decoded from the stored bytes, not
+    // from a freshly-built fixture value — the two can drift, and it is the
+    // stored one the tool reads. (Branch (3) is not covered: a row-native session
+    // has no blob, so its title assertion rests on the row being the only source
+    // there is.)
+    let blob_title = serde_json::from_slice::<crate::store::PersistedSession>(
+        &db.load_blob(legacy_id)
+            .await
+            .expect("load blob")
+            .expect("fixture blob is on disk"),
+    )
+    .expect("fixture blob decodes")
+    .title;
+    assert!(
+        blob_title != "legacy session" && blob_title != "cleared session",
+        "the stored blob's title must differ from BOTH metadata-row titles this \
+         test asserts on, or those assertions pass no matter which source is \
+         served; got {blob_title:?}"
     );
     assert_eq!(
         sc.title, "legacy session",
@@ -4462,6 +4471,155 @@ async fn get_session_refuses_to_serve_an_undecodable_blob_as_empty(cx: &mut gpui
     assert_eq!(
         sc.total_count, 1,
         "the healthy control must serve its entry"
+    );
+}
+
+/// The scope of the refusal above, pinned rather than assumed: it is the COLD
+/// path only.
+///
+/// Every read RPC prefers the in-memory store, and `hydrate_all_for_solution`
+/// registers a session whose blob would not decode as an ordinary empty one. So
+/// for as long as the Solution is OPEN, `get_session` serves that corrupt
+/// session as an empty transcript and does not error — the same "corruption
+/// reported as emptiness" the cold path now refuses.
+///
+/// Pinned as a KNOWN LIMIT, not as desired behaviour. Two things make it
+/// tolerable and both are asserted here: the tools do not contradict each other
+/// in either regime, and the destructive half (a corrupt session being migrated
+/// into a permanently wiped one) is fixed in both. Closing it properly means the
+/// live session carrying the failure, which is a bigger change than a read
+/// guard; if that lands, this test is what tells you the behaviour moved.
+#[gpui::test]
+async fn an_open_solution_still_serves_a_corrupt_session_as_empty(cx: &mut gpui::TestAppContext) {
+    let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let executor = cx.executor();
+    let db = std::sync::Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = chrono::Utc::now();
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new("acp-corrupt-open"),
+        title: SharedString::from("corrupt session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    })
+    .await
+    .expect("save metadata");
+    let intact = serde_json::to_vec(&crate::store::PersistedSession {
+        title: "corrupt session".into(),
+        entry_summaries: vec!["a line the user still wants".into()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    let mut truncated = intact.clone();
+    truncated.truncate(intact.len() / 2);
+    assert!(
+        serde_json::from_slice::<crate::store::PersistedSession>(&truncated).is_err(),
+        "fixture must actually fail to decode, or this test proves nothing"
+    );
+    db.save_blob(session_id, truncated)
+        .await
+        .expect("save blob");
+
+    // COLD: refused, as the sibling test pins in detail.
+    GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("cold read refuses");
+
+    // Open the Solution. This is the ordinary desktop restore.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.hydrate_all_for_solution(solution_id, cx)
+        })
+    })
+    .await
+    .expect("restore");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(
+            SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(session_id)
+                .is_some(),
+            "the session must now be in memory, or this test is still measuring \
+             the cold path"
+        );
+    });
+
+    // HOT: served as empty, with no error. The known limit.
+    let sc = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                include_full_content: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect(
+            "KNOWN LIMIT: while the Solution is open the live store answers, and it \
+             holds the empty session hydration built",
+        )
+        .structured_content;
+    assert_eq!(
+        sc.total_count, 0,
+        "and it answers 'empty', not the transcript"
+    );
+
+    // The two mitigations, both load-bearing for calling this tolerable.
+    let history = ReadSessionHistoryTool
+        .run(
+            ReadSessionHistoryParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("the live path answers here too")
+        .structured_content;
+    assert_eq!(
+        history.source, "live",
+        "the tools must agree by taking the SAME path — one refusing while the \
+         other serves empty is the disagreement this whole task removed"
+    );
+    assert_eq!(history.total_entries, 0);
+    assert!(
+        db.load_blob(session_id).await.expect("load blob").is_some(),
+        "and the destructive half stays fixed in this regime: the restore left \
+         the bytes on disk"
+    );
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch"),
+        None,
+        "…and did not migrate the session into a permanently wiped one"
     );
 }
 

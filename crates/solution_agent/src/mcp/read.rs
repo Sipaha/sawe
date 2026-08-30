@@ -805,10 +805,22 @@ async fn load_cold_session(
     // from a session the user deliberately cleared, which is the same lie as
     // FORK.md #105 pointed the other way — and it is not even a partial read, since
     // the blob decodes whole or not at all, so there is nothing to salvage by
-    // continuing. This also makes `get_session` / `get_session_changes` agree with
-    // `read_session_history`, which has always propagated this decode error.
+    // continuing. This also makes `get_session` / `get_session_changes` /
+    // `get_session_entry` agree with `read_session_history`, which has always
+    // propagated this decode error.
     // Deliberately BEFORE the cache store: a failed build must not be handed to
     // the next poll as a valid reconstruction.
+    //
+    // SCOPE, because it is narrower than it reads: this is the COLD path. Every
+    // read RPC prefers the in-memory store, and `hydrate_all_for_solution`
+    // registers a corrupt session as an ordinary empty one — so while its
+    // Solution is OPEN, all four tools serve the same corrupt session as an empty
+    // transcript with no error at all. They still agree with each other in both
+    // regimes, and the destructive half (a corrupt session being MIGRATED into a
+    // permanently-wiped one) is fixed regardless of which regime you are in. What
+    // is not yet fixed is corruption being reported as emptiness on an open
+    // Solution; closing that means the live store carrying the failure, which is
+    // a bigger change than a read guard.
     if let Some(err) = build.undecodable_blob {
         return Err(err.context(format!(
             "session_unreadable: {session_id} has an archived transcript that cannot be decoded"
