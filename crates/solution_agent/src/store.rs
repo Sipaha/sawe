@@ -17,7 +17,7 @@ use util::ResultExt;
 use workspace::UtilityKind;
 
 use crate::adapter::AdapterRegistry;
-use crate::db::SolutionAgentDb;
+use crate::db::{EntryRow, SolutionAgentDb};
 use crate::metrics_emitter::MetricsEmitter;
 use crate::model::{
     AgentServerId, BandState, SessionContextCount, SessionState, SolutionSession,
@@ -307,11 +307,10 @@ pub struct SolutionAgentStore {
     /// (`persist_main_stream` / `persist_all_rows`). Each helper captures its
     /// plan synchronously (in event order) then chains its detached DB work
     /// behind the previous chain link (`prev.await` before touching the DB), so
-    /// the upsert + `delete_entries_from(main_len)` pairs apply in issue order.
-    /// Without this, GPUI's detached tasks have NO FIFO guarantee (a later
-    /// append's upsert can land before an earlier link's stale
-    /// `delete_entries_from` runs, silently deleting the just-written row —
-    /// phase-6b keystone bug). Stored as `Task<()>` so it stays alive across
+    /// the upsert + trim-to-`main_len` pairs apply in issue order. Without this,
+    /// GPUI's detached tasks have NO FIFO guarantee (a later append's upsert can
+    /// land before an earlier link's stale trim runs, silently deleting the
+    /// just-written row — phase-6b keystone bug). Stored as `Task<()>` so it stays alive across
     /// links.
     ///
     /// Because each link moves the PREVIOUS link into its own future, dropping
@@ -3719,24 +3718,42 @@ impl SolutionAgentStore {
         }
     }
 
-    /// Persist row tuple: `(idx, mod_seq, created_ms, subagent_id, payload)` in
-    /// the casts `upsert_entry` expects. An empty `payload` signals a serde
-    /// failure in `to_payload()` — callers MUST skip persisting it. As of phase
-    /// 6b the authoritative rows are the Main stream's entries, so `idx` is the
+    /// One persisted entry row in the casts the DB layer expects. As of phase 6b
+    /// the authoritative rows are the Main stream's entries, so `idx` is the
     /// entry's Main-LOCAL index and the persisted `subagent_id` is always `None`
     /// (Main entries carry no tag). The `subagent_id` column survives as
     /// vestigial for any legacy tagged rows still on disk.
-    fn entry_row_tuple(
-        idx: usize,
-        entry: &crate::session_entry::SessionEntry,
-    ) -> (i64, i64, i64, Option<String>, Vec<u8>) {
-        (
-            idx as i64,
-            entry.mod_seq as i64,
-            entry.created_ms,
-            entry.subagent_id.as_ref().map(|s| s.to_string()),
-            entry.to_payload(),
-        )
+    fn entry_row(idx: usize, entry: &crate::session_entry::SessionEntry) -> EntryRow {
+        EntryRow {
+            idx: idx as i64,
+            mod_seq: entry.mod_seq as i64,
+            created_ms: entry.created_ms,
+            subagent_id: entry.subagent_id.as_ref().map(|s| s.to_string()),
+            payload: entry.to_payload(),
+        }
+    }
+
+    /// An empty payload signals a serde failure in `SessionEntry::to_payload`;
+    /// writing it would replace a decodable row with an undecodable one. Dropped
+    /// here, synchronously with the rest of the plan, so that what the flush
+    /// carries into the chain is already exactly what it will execute.
+    fn drop_empty_payload_rows(
+        session_id: SolutionSessionId,
+        rows: Vec<EntryRow>,
+    ) -> Vec<EntryRow> {
+        rows.into_iter()
+            .filter(|row| {
+                if row.payload.is_empty() {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "skipping empty-payload upsert for session={session_id} idx={}",
+                        row.idx,
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect()
     }
 
     /// Drop every `entries_persist_chain` entry whose chain has already run to
@@ -3798,8 +3815,8 @@ impl SolutionAgentStore {
 
     /// Flush the WHOLE Main stream as rows: upsert every current
     /// `streams[StreamId::Main]` entry (keyed by Main-LOCAL index, subagent_id
-    /// always `None`), delete any stale trailing rows beyond the Main length, and
-    /// save the epoch. This is the path that handles clears/compactions and
+    /// always `None`) and delete any stale trailing rows beyond the Main length —
+    /// both in one `upsert_entries_and_trim` — then save the epoch. This is the path that handles clears/compactions and
     /// close — targeted upserts alone would leave orphaned idx>len rows that
     /// corrupt the next cold load. On an empty Main stream it degrades to
     /// "delete all rows + save epoch". Since it re-writes the entire Main stream
@@ -3825,7 +3842,7 @@ impl SolutionAgentStore {
             let rows: Vec<_> = main_entries
                 .iter()
                 .enumerate()
-                .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
+                .map(|(idx, entry)| Self::entry_row(idx, entry))
                 .collect();
             let len = main_entries.len() as i64;
             s.persisted_main_seq = main.map(|stream| stream.seq).unwrap_or(0);
@@ -3837,9 +3854,10 @@ impl SolutionAgentStore {
                 s.solution_id,
             )
         });
+        let rows = Self::drop_empty_payload_rows(session_id, rows);
         // Serialize behind this session's prior persist link (see
-        // `persist_main_stream`) — a full flush's `delete_entries_from(len)` must
-        // not race a concurrent incremental append's upsert.
+        // `persist_main_stream`) — a full flush's trailing trim must not race a
+        // concurrent incremental append's upsert.
         self.retire_finished_persist_chains();
         let prev = self
             .entries_persist_chain
@@ -3852,19 +3870,9 @@ impl SolutionAgentStore {
                 if let Some(prev) = prev {
                     prev.await;
                 }
-                for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
-                    if payload.is_empty() {
-                        log::warn!(
-                            target: "solution_agent::store",
-                            "skipping empty-payload upsert for session={session_id} idx={idx}",
-                        );
-                        continue;
-                    }
-                    db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
-                        .await
-                        .log_err();
-                }
-                db.delete_entries_from(session_id, len).await.log_err();
+                db.upsert_entries_and_trim(session_id, rows, len)
+                    .await
+                    .log_err();
                 db.save_epoch(session_id, epoch).await.log_err();
                 db.save_change_seq(session_id, change_seq).await.log_err();
                 finished.store(true, std::sync::atomic::Ordering::Release);
@@ -3883,8 +3891,8 @@ impl SolutionAgentStore {
     /// Incremental persist of the Main stream (phase 6b's persist authority).
     /// Reads `streams[StreamId::Main].entries` and upserts only the rows whose
     /// `mod_seq` exceeds `persisted_main_seq` (keyed by Main-LOCAL index,
-    /// subagent_id always `None`), then always `delete_entries_from(main_len)` to
-    /// trim any torn/teammate leftover rows past the Main tail. The Main length
+    /// subagent_id always `None`), always trimming any torn/teammate leftover
+    /// rows past the Main tail in the same `upsert_entries_and_trim` write. The Main length
     /// and the new watermark (`streams[Main].seq`) are captured — and
     /// `persisted_main_seq` advanced — SYNCHRONOUSLY before spawning the detached
     /// DB task, so a burst of ingest events each persist only their own delta and
@@ -3913,7 +3921,7 @@ impl SolutionAgentStore {
                 .iter()
                 .enumerate()
                 .filter(|(_, entry)| entry.mod_seq > old_watermark)
-                .map(|(idx, entry)| Self::entry_row_tuple(idx, entry))
+                .map(|(idx, entry)| Self::entry_row(idx, entry))
                 .collect();
             let main_len = main_entries.len() as i64;
             s.persisted_main_seq = watermark;
@@ -3925,17 +3933,17 @@ impl SolutionAgentStore {
                 s.solution_id,
             )
         });
+        let rows = Self::drop_empty_payload_rows(session_id, rows);
         // SERIALIZE behind this session's prior persist link: the plan above is
-        // captured in event order, but `delete_entries_from(main_len)` carries a
-        // point-in-time length — if a later append's upsert lands before an
+        // captured in event order, but the trim carries a point-in-time length — if a later append's upsert lands before an
         // earlier link's stale delete runs (detached tasks are NOT FIFO), the
         // just-appended row is deleted. Chaining `prev.await` first makes the
-        // upsert+delete pairs apply in issue order. This is also what makes a
+        // upsert+trim pairs apply in issue order. This is also what makes a
         // close→reopen safe: the reopened session re-keys the same
         // `SolutionSessionId`, so the close's drained flush is still under that
         // key and becomes THIS link's `prev` — without which the flush's stale
-        // `delete_entries_from` could land after the reopened session's first
-        // upsert and delete the user's new message.
+        // trim could land after the reopened session's first upsert and delete
+        // the user's new message.
         self.retire_finished_persist_chains();
         let prev = self
             .entries_persist_chain
@@ -3948,19 +3956,9 @@ impl SolutionAgentStore {
                 if let Some(prev) = prev {
                     prev.await;
                 }
-                for (idx, mod_seq, created_ms, subagent_id, payload) in rows {
-                    if payload.is_empty() {
-                        log::warn!(
-                            target: "solution_agent::store",
-                            "skipping empty-payload upsert for session={session_id} idx={idx}",
-                        );
-                        continue;
-                    }
-                    db.upsert_entry(session_id, idx, mod_seq, created_ms, subagent_id, payload)
-                        .await
-                        .log_err();
-                }
-                db.delete_entries_from(session_id, main_len).await.log_err();
+                db.upsert_entries_and_trim(session_id, rows, main_len)
+                    .await
+                    .log_err();
                 db.save_epoch(session_id, epoch).await.log_err();
                 db.save_change_seq(session_id, change_seq).await.log_err();
                 finished.store(true, std::sync::atomic::Ordering::Release);

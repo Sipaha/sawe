@@ -1563,14 +1563,16 @@ async fn close_then_reopen_orders_the_new_chain_behind_the_drained_flush(
 /// The same ordering, over a transcript long enough that the close flush cannot
 /// have finished by the time the reopen runs.
 ///
-/// `persist_all_rows` awaits one background round trip PER ROW, so a 200-entry
-/// chat's flush stays in flight across 200+ yields — comfortably longer than
-/// `reopen_closed_session`'s `db.reopen_session().await` plus
-/// `hydrate_all_for_solution().await`, which is why this is a real user-visible
-/// sequence ("close a long chat, reopen it, type") and not a synthetic
-/// same-tick race. The reopen here is separated from the close by real
-/// background round trips, so the ordering cannot be an artifact of everything
-/// happening inside one synchronous block.
+/// The reopen is separated from the close by real background round trips — five
+/// `load_entries` awaits standing in for `reopen_closed_session`'s own
+/// `db.reopen_session().await` plus `hydrate_all_for_solution().await` — so the
+/// ordering cannot be an artifact of everything happening inside one synchronous
+/// block, and this stays a real user-visible sequence ("close a long chat,
+/// reopen it, type") rather than a same-tick race. The 200 entries no longer
+/// stretch the flush across 200 yields (`upsert_entries_and_trim` writes the row
+/// set in one), but they still make its trailing trim a 200-row one — which is
+/// the value that deletes the new message the moment the chain stops ordering
+/// the two.
 #[gpui::test]
 async fn close_then_reopen_orders_a_long_flush_before_the_new_message(
     cx: &mut gpui::TestAppContext,
@@ -1840,5 +1842,170 @@ async fn purge_solution_after_soft_close_abandons_the_drained_chain(cx: &mut gpu
         db.load_entries(id).await.expect("load").is_empty(),
         "a solution purge must abandon the retained chains of its already \
          soft-closed sessions"
+    );
+}
+
+/// Fact 23 of the persist-chain plan, made measurable: a flush must cost a
+/// CONSTANT number of executor turns, not one per row.
+///
+/// The per-row `upsert_entry` spent an `executor.spawn` and a connection-lock
+/// acquisition on every row, so a flush's wall-clock width scaled with the
+/// transcript — and every gap between two of those round trips was a point where
+/// a reopen's `load_entries` could read a prefix of the flush and hydrate from
+/// it. Counting turns rather than timing anything is what makes the shrink an
+/// assertion instead of an anecdote: the number is deterministic, and under the
+/// old shape a 200-entry flush cost ~50x what a 4-entry one did.
+///
+/// `tick()` runs at most one task, so the loop below is "drain the executor,
+/// counting". Both sessions are flushed from the same quiesced store, so the
+/// two counts differ only by the write path under test.
+#[gpui::test]
+async fn a_flush_costs_the_same_executor_turns_at_any_size(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    const SMALL: u64 = 4;
+    const LARGE: u64 = 200;
+
+    let (store, seeded_id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let (db, sol) = store.update(cx, |store, cx| {
+        (
+            store.persistence().expect("persistence"),
+            store
+                .session(seeded_id)
+                .expect("session")
+                .read(cx)
+                .solution_id,
+        )
+    });
+
+    let message = |n: u64| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: format!("m{n}"),
+            chunks: vec![],
+        },
+    };
+
+    let small = SolutionSessionId::new();
+    let large = SolutionSessionId::new();
+    store.update(cx, |store, cx| {
+        for (id, count) in [(small, SMALL), (large, LARGE)] {
+            insert_cold_session(
+                id,
+                sol,
+                SharedString::from("claude-acp"),
+                None,
+                None,
+                store,
+                cx,
+            );
+            let session = store.session(id).expect("session");
+            session.update(cx, |s, cx| {
+                s.entries = (1..=count).map(message).collect();
+                s.rebuild_streams();
+                cx.notify();
+            });
+        }
+    });
+    cx.run_until_parked();
+
+    store.update(cx, |store, cx| store.persist_all_rows(small, cx));
+    let mut small_turns = 0usize;
+    while cx.executor().tick() {
+        small_turns += 1;
+    }
+
+    store.update(cx, |store, cx| store.persist_all_rows(large, cx));
+    let mut large_turns = 0usize;
+    while cx.executor().tick() {
+        large_turns += 1;
+    }
+
+    assert_eq!(
+        db.load_entries_blocking(large).expect("read").len() as u64,
+        LARGE,
+        "precondition: the large flush actually wrote its rows"
+    );
+    assert_eq!(
+        small_turns, large_turns,
+        "a {LARGE}-row flush must cost the same executor turns as a {SMALL}-row \
+         one ({small_turns} vs {large_turns}) — the whole row set plus its \
+         trailing trim is one round trip"
+    );
+}
+
+/// The same shrink stated as the property it buys, and the direct answer to the
+/// plan's fact 22: a reader that samples the table between every executor turn
+/// of a close flush must never catch it half-written.
+///
+/// This is fact 22's reproduction with its timing made exhaustive rather than
+/// lucky. Three stale rows on disk, forty entries in memory; the close drains
+/// its chain, and the table is read on the test's own thread after every single
+/// turn the executor takes. Under the per-row writer those samples counted
+/// 3, 4, 5 … 40, and a reopen landing on any of them hydrated a short transcript
+/// whose next persist trimmed the rest away for good. Now every reader takes the
+/// one lock the whole flush holds, so only two row sets exist to be seen.
+///
+/// What this does NOT claim: the window is closed. A reopen whose `load_entries`
+/// is ordered entirely BEFORE the flush still hydrates the pre-flush rows and
+/// still trims the tail afterwards. What batching removes is the torn middle —
+/// the reader now sees a consistent snapshot either way, and the interval in
+/// which it can see the stale one shrank from N round trips to one.
+#[gpui::test]
+async fn a_reader_never_observes_a_half_written_close_flush(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    const STALE_ROWS: i64 = 3;
+    const ENTRIES: u64 = 40;
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    for idx in 0..STALE_ROWS {
+        db.upsert_entry(id, idx, 0, 1_700_000_000_000 + idx, None, b"stale".to_vec())
+            .await
+            .expect("seed stale row");
+    }
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = (1..=ENTRIES)
+                .map(|n| SessionEntry {
+                    created_ms: 1_700_000_000_000 + n as i64,
+                    mod_seq: n,
+                    subagent_id: None,
+                    kind: SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: format!("m{n}"),
+                        chunks: vec![],
+                    },
+                })
+                .collect();
+            s.rebuild_streams();
+            cx.notify();
+        });
+        store.close_session(id, cx).expect("close_session");
+    });
+
+    let mut observed = std::collections::BTreeSet::new();
+    loop {
+        observed.insert(db.load_entries_blocking(id).expect("sample").len());
+        if !cx.executor().tick() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        observed.into_iter().collect::<Vec<_>>(),
+        vec![STALE_ROWS as usize, ENTRIES as usize],
+        "a reader sampling between every executor turn must only ever see the \
+         row set from before the flush or the one after it — a count in between \
+         is a torn read, and cold load turns it into a permanent truncation"
     );
 }

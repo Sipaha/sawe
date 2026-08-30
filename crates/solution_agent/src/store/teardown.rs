@@ -45,7 +45,7 @@ pub(crate) enum ChainDisposition {
     /// normal action and `hydrate_all_for_solution` re-keys the same
     /// `SolutionSessionId`; freeing the key (as a `.detach()` does) lets the
     /// reopened session build a second chain with nothing ordering it against
-    /// the first, so the close flush's `delete_entries_from(old_main_len)` can
+    /// the first, so the close flush's trailing trim to `old_main_len` can
     /// land after the new chain's tail upsert and delete the user's new message
     /// — the phase-6b keystone bug, reintroduced at the close/reopen seam.
     /// Keeping the chain in place makes it the reopened session's `prev` instead.
@@ -728,7 +728,7 @@ impl SolutionAgentStore {
         // The liveness gate is the same one `cold_close_solution` carries, for
         // the same reason — read the long note there before touching either.
         // Short version: an executed `persist_all_rows` is a full REWRITE
-        // (upsert Main at Main-local indices, then `delete_entries_from(main_len)`),
+        // (upsert Main at Main-local indices, then trim everything past it),
         // and on a legacy pre-6b row layout `entries.len() > main_len`, so it
         // deletes the teammate-tagged rows. That realign is defensible for a
         // session the user actually worked in; it is not defensible for one the

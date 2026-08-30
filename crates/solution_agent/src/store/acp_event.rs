@@ -654,7 +654,7 @@ impl SolutionAgentStore {
                 });
                 // Persist authority is `streams[Main]` (phase 6b): a rewind drops
                 // the removed rows and shrinks the coalesce survivor.
-                // `persist_main_stream` trims via `delete_entries_from(main_len)`
+                // `persist_main_stream` trims everything past `main_len`
                 // AND re-upserts the re-stamped survivor (its mod_seq now exceeds
                 // `persisted_main_seq`), keeping the persisted transcript in lockstep
                 // so a stale idx>=len row can't corrupt the next cold load.

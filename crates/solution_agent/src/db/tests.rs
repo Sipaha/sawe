@@ -810,6 +810,77 @@ async fn entry_upsert_same_idx_updates_in_place(cx: &mut gpui::TestAppContext) {
     assert_eq!(rows[0].payload, b"updated".to_vec());
 }
 
+/// The batched writer must be equivalent to "upsert each row, then
+/// `delete_entries_from(trim)`" — same rows in, same stale tail out — because it
+/// replaced exactly that sequence at both persist sites.
+#[gpui::test]
+async fn upsert_entries_and_trim_writes_every_row_and_drops_the_stale_tail(
+    cx: &mut gpui::TestAppContext,
+) {
+    let executor = cx.executor();
+    let db = SolutionAgentDb::open(executor).unwrap();
+
+    let session_id = SolutionSessionId::new();
+    for i in 0i64..5 {
+        db.upsert_entry(
+            session_id,
+            i,
+            i,
+            i * 100,
+            Some("legacy".into()),
+            b"stale".to_vec(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let rows: Vec<crate::db::EntryRow> = (0i64..2)
+        .map(|i| crate::db::EntryRow {
+            idx: i,
+            mod_seq: 100 + i,
+            created_ms: 7_000 + i,
+            subagent_id: None,
+            payload: vec![i as u8],
+        })
+        .collect();
+    db.upsert_entries_and_trim(session_id, rows, 2)
+        .await
+        .unwrap();
+
+    let rows = db.load_entries(session_id).await.unwrap();
+    assert_eq!(rows.len(), 2, "idx 2..4 must be trimmed by the same write");
+    assert_eq!(rows[0].mod_seq, 100);
+    assert_eq!(rows[0].payload, vec![0u8]);
+    assert_eq!(
+        rows[0].subagent_id, None,
+        "the batched upsert must overwrite every column, not just the payload"
+    );
+    assert_eq!(rows[1].mod_seq, 101);
+    assert_eq!(rows[1].created_ms, 7_001);
+}
+
+/// An empty row set still has to apply its trim: `persist_all_rows` on a cleared
+/// Main stream degrades to exactly that, and it is how a compaction erases the
+/// old transcript from disk.
+#[gpui::test]
+async fn upsert_entries_and_trim_with_no_rows_still_trims(cx: &mut gpui::TestAppContext) {
+    let executor = cx.executor();
+    let db = SolutionAgentDb::open(executor).unwrap();
+
+    let session_id = SolutionSessionId::new();
+    for i in 0i64..3 {
+        db.upsert_entry(session_id, i, i, i * 100, None, vec![i as u8])
+            .await
+            .unwrap();
+    }
+
+    db.upsert_entries_and_trim(session_id, Vec::new(), 0)
+        .await
+        .unwrap();
+
+    assert!(db.load_entries(session_id).await.unwrap().is_empty());
+}
+
 #[gpui::test]
 async fn delete_entries_from_leaves_earlier_rows(cx: &mut gpui::TestAppContext) {
     let executor = cx.executor();
