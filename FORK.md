@@ -486,6 +486,12 @@ How it works / how to apply: the body is rendered with `render_span((entry_idx, 
 
 How to apply: never read the parent `Workspace` entity during a panel's `new()` when `new` is invoked from `workspace.update_in` — defer it. See memory `gpui-panel-new-workspace-double-lease`.
 
+**Focus follow-up (commits `114e2b3e79`, `a90ade3341`, `5ac3b50703`, `63c3182eba`):** re-pointing the panel does not mutate the graph — it **drops the old `Entity<GitGraph>` and builds a new one**, and that has a focus consequence the paragraphs above do not cover. The dropped entity's focus handle leaves the dispatch tree, so the window's focus points at a dead id, `render`'s `is_focused` guard is false and its redirect into the graph cannot fire, and `Workspace`'s focus-lost listener then yanks focus out to the centre pane. The user's next arrow key scrolls a buffer instead of the commit list, and because `contains_focused` is false the tri-state hotkey spends a press re-focusing instead of hiding. `set_active_repo` therefore captures `contains_focused` **before** replacing the graph and re-focuses afterwards — onto the panel's OWN handle, not the new graph's, so `render` stays the single place that decides what inside the panel holds focus (with no repository there is nothing to redirect into, and focus correctly rests on the tracked container). Identical shape and reason to `console_panel::ConsolePanel::close_tab` (`2819c6b1bd`).
+
+The hazard predates the redirect, but it only became the *default* path once the graph got a way in from the keyboard: **`ctrl-alt-\`` = `git_graph::ToggleFocus`** (`assets/keymaps/default-{linux,macos,windows}.json`; the graph is de-docked into the Solution band and has no dock button, so this chord is its only hotkey — `ctrl-shift-g` was unavailable, it is `git_panel::ToggleFocus`). With a hotkey, "focus lives inside the graph" is the normal state, so the ejection became the normal outcome.
+
+How to apply: any panel that swaps out a child view it may be focused into has this bug. Capture `contains_focused` before the swap and re-home focus after it; a unit test that only asserts the new child exists will not catch it.
+
 ### 31. Supervisor decisions are re-checked at SEND time, not only at judge START — and known-stale verdicts interrupt the judge instead of running it to completion
 
 Every condition that gates the observer was historically evaluated ONLY at judge-**start** (`should_fire` / `tick_supervisor`). But an ephemeral judge turn runs for seconds→minutes; the world moves between fire and the verdict's delivery. So each gate is now **double-checked** — at start *and* at send — and the moment a condition makes an in-flight verdict useless, the judge is **interrupted** rather than left to finish and have its verdict dropped at the end.
@@ -1292,7 +1298,8 @@ have been a double border.
 
 Phase 2b gave the band's utility section three possible occupants (terminal, git graph, debugger) keyed by
 `workspace::UtilityKind`, but de-docking the git graph and the debugger deleted their dock buttons and gave the
-git graph *no* way in at all — it has no keybinding either. `solution_agent::utility_buttons::UtilityButtons`
+git graph *no* way in at all — it had no keybinding either at the time (it has one now, `ctrl-alt-\``;
+see decision 30). `solution_agent::utility_buttons::UtilityButtons`
 is the replacement affordance: three `IconButton`s in the status bar's left group.
 
 **It drives `SolutionBand`, not `SolutionAgentStore`.** The store only knows Solutions; a plain-folder window
