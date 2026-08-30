@@ -51,7 +51,10 @@ pub(crate) enum ChainDisposition {
     /// Keeping the chain in place makes it the reopened session's `prev` instead.
     /// The key is reclaimed by
     /// [`retire_finished_persist_chains`](SolutionAgentStore::retire_finished_persist_chains),
-    /// which only ever removes a chain that has already run.
+    /// which only ever removes a chain that has already run — or, if the app
+    /// quits first, by
+    /// [`flush_persist_chains_on_quit`](SolutionAgentStore::flush_persist_chains_on_quit),
+    /// which drains whatever is still keyed here inside GPUI's shutdown window.
     Drain,
     /// The session's rows are being DELETED (hard purge), so the queued writes
     /// must not land: drop the chain, cancelling it.

@@ -246,10 +246,14 @@ struct PersistChain {
     /// what makes retiring a chain safe: removing a link that has already run
     /// cannot reorder anything, while removing a live one cancels it.
     ///
-    /// The flag is set and the future returns within the same poll, and the
-    /// chain runs on the foreground executor — the same thread that reads the
-    /// flag — so no store code can observe `true` while the future still has
-    /// work left to do.
+    /// The chain runs on the BACKGROUND executor (see
+    /// [`SolutionAgentStore::flush_persist_chains_on_quit`] for why it has to),
+    /// so the flag is read from a different thread than the one that writes it
+    /// and the `Release`/`Acquire` pairing is what carries the guarantee: a
+    /// reader that sees `true` also sees every write the chain made, because the
+    /// store is the future's last act with nothing awaited after it. A reader
+    /// that sees a stale `false` only postpones the retirement of a spent key,
+    /// which costs nothing and can never cancel or reorder work.
     finished: Arc<std::sync::atomic::AtomicBool>,
     /// The owning solution. A soft-closed session is gone from `by_solution`, so
     /// this is the only way `purge_solution_fully` can find (and abandon) the
@@ -313,6 +317,15 @@ pub struct SolutionAgentStore {
     /// just-written row — phase-6b keystone bug). Stored as `Task<()>` so it stays alive across
     /// links.
     ///
+    /// The links are spawned on the BACKGROUND executor even though the store
+    /// itself is foreground-only. They can be, because a link captures no entity
+    /// (its rows, length, epoch and change_seq are snapshotted before the spawn
+    /// and `db` is an `Arc`) and its ordering comes from `prev.await` rather than
+    /// from executor FIFO. They MUST be, because the foreground executor stops
+    /// dead for the whole of `App::shutdown` — see
+    /// [`Self::flush_persist_chains_on_quit`], which is the only reason a quit
+    /// mid-turn no longer truncates the transcript.
+    ///
     /// Because each link moves the PREVIOUS link into its own future, dropping
     /// a session's entry cancels the ENTIRE chain, not just its last hop. So
     /// teardown must state what it wants: soft closes KEEP the chain here so
@@ -347,6 +360,10 @@ pub struct SolutionAgentStore {
     /// notifications do NOT trigger resync on the client.
     metrics_emitter: MetricsEmitter,
     _solution_subscription: Option<Subscription>,
+    /// Keeps the app-quit observer registered for the store's lifetime. See
+    /// [`Self::flush_persist_chains_on_quit`] for why quitting needs a hook at
+    /// all and why that hook can only await BACKGROUND work.
+    _quit_subscription: Subscription,
     /// 0.2 Hz (every 5s) healthcheck loop that drives `tick_background_agents`.
     /// Held so the timer cancels when the store is dropped.
     _bg_agents_tick: Option<Task<()>>,
@@ -846,6 +863,7 @@ impl SolutionAgentStore {
             teammate_watchers: TeammateWatchers::new(),
             metrics_emitter: MetricsEmitter::new(),
             _solution_subscription: solution_subscription,
+            _quit_subscription: cx.on_app_quit(Self::flush_persist_chains_on_quit),
             _bg_agents_tick: Some(bg_agents_tick),
             supervisor_states: HashMap::new(),
             judge_sessions: HashMap::new(),
@@ -3779,6 +3797,70 @@ impl SolutionAgentStore {
             .retain(|_, chain| !chain.is_finished());
     }
 
+    /// Await every retained entry-row write chain, so quitting the editor does
+    /// not cancel the tail of a conversation. Registered with `on_app_quit`.
+    ///
+    /// **GPUI's quit contract, which dictates the shape of this.** `App::shutdown`
+    /// calls each quit observer synchronously (entities and globals still alive,
+    /// windows not yet cleared), collects the futures they return, clears the
+    /// windows, sets `quitting`, and then BLOCKS the main thread on those futures
+    /// for at most `gpui::SHUTDOWN_TIMEOUT` (200ms) before the process exits. The
+    /// block goes through `LocalExecutor::block_with_timeout`, which passes the
+    /// FOREGROUND session id down to the scheduler — so for the whole quit window
+    /// that session counts as blocked and **no foreground runnable makes any
+    /// progress**. In production the main-thread channel simply stops being
+    /// drained (`LinuxDispatcher::dispatch_on_main_thread` only enqueues);
+    /// `TestScheduler::step` models the same rule by excluding runnables whose
+    /// session is in `blocked_sessions`. Background runnables keep running on
+    /// their own threads throughout.
+    ///
+    /// So a quit-time drain is possible only for work that is *not* on the
+    /// foreground executor: awaiting a foreground `Task` here would park until the
+    /// timeout, log `timed out waiting on app_will_quit`, and lose the write
+    /// anyway. That is the reason the persist chain is spawned with
+    /// `background_spawn` rather than `cx.spawn` — it captures no entity (rows,
+    /// length, epoch and change_seq are snapshotted before the spawn and `db` is
+    /// an `Arc`), so it never needed the main thread, and ordering comes from
+    /// `prev.await` rather than from executor FIFO.
+    ///
+    /// Draining is the whole fix, not a best effort: `persist_all_rows` /
+    /// `persist_main_stream` advance `persisted_main_seq` synchronously BEFORE
+    /// they spawn and every persist filters `mod_seq > watermark`, so a cancelled
+    /// link's rows are never re-picked by a later persist. The chain is also the
+    /// complete record of what is unwritten — there is no persist debounce, every
+    /// ingest event issues one — which is why this only drains and deliberately
+    /// does not re-derive a fresh flush from the live sessions. Re-deriving would
+    /// rewrite sessions the user never resumed, which is exactly what
+    /// `close_session`'s liveness gate exists to prevent.
+    ///
+    /// Taking the whole map is disposition-correct without a second check:
+    /// [`ChainDisposition::Abandon`](super::store::teardown) has already REMOVED a
+    /// purged session's chain before the purge issues its cascade DELETE, so
+    /// nothing still under a key here can resurrect rows for a deleted session.
+    /// Emptying the map cannot cancel anything either — the tasks are moved into
+    /// the returned future, which owns them until they finish.
+    fn flush_persist_chains_on_quit(
+        &mut self,
+        _cx: &mut Context<Self>,
+    ) -> impl Future<Output = ()> + use<> {
+        let pending: Vec<Task<()>> = std::mem::take(&mut self.entries_persist_chain)
+            .into_values()
+            .filter(|chain| !chain.is_finished())
+            .map(|chain| chain.task)
+            .collect();
+        async move {
+            if pending.is_empty() {
+                return;
+            }
+            log::info!(
+                target: "solution_agent::store",
+                "flushing {} in-flight entry-row write chain(s) on app quit",
+                pending.len(),
+            );
+            futures::future::join_all(pending).await;
+        }
+    }
+
     /// Take a session's chain out of the map and drop it, cancelling every link
     /// still queued behind sqlite. Only for callers that are DELETING the rows:
     /// a surviving link would re-insert entry rows for a session that no longer
@@ -3864,9 +3946,9 @@ impl SolutionAgentStore {
             .remove(&session_id)
             .map(|chain| chain.task);
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let task = cx.spawn({
+        let task = cx.background_spawn({
             let finished = finished.clone();
-            async move |_this, _cx: &mut AsyncApp| {
+            async move {
                 if let Some(prev) = prev {
                     prev.await;
                 }
@@ -3950,9 +4032,9 @@ impl SolutionAgentStore {
             .remove(&session_id)
             .map(|chain| chain.task);
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let task = cx.spawn({
+        let task = cx.background_spawn({
             let finished = finished.clone();
-            async move |_this, _cx: &mut AsyncApp| {
+            async move {
                 if let Some(prev) = prev {
                     prev.await;
                 }

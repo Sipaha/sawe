@@ -2022,3 +2022,154 @@ async fn a_reader_never_observes_a_half_written_close_flush(cx: &mut gpui::TestA
          truncation"
     );
 }
+
+/// Quitting the editor must FLUSH the in-flight entry-row writes, not drop them
+/// with the process. Before the app-quit hook there was none at all: the store
+/// global died with the process and every queued link was cancelled — silently
+/// and permanently, because the persist helpers advance `persisted_main_seq`
+/// synchronously before they spawn, so nothing re-picks those rows.
+///
+/// The test is only meaningful because `TestScheduler` models GPUI's real quit
+/// contract: `App::shutdown` blocks the main thread on the quit futures through
+/// the FOREGROUND executor's session, and `TestScheduler::step` excludes
+/// runnables whose session is blocked — exactly as the production main-thread
+/// channel stops being drained. So the executor is deliberately NOT pumped
+/// before `cx.quit()`: the chain has not started, and the only thing that can
+/// finish it is the quit hook awaiting background work.
+///
+/// `set_block_on_ticks` pins the tick budget the scheduler draws for a timed
+/// block (`1..=1000` by default, i.e. as few as one poll) so the drain is not
+/// randomly cut short; production's budget is `gpui::SHUTDOWN_TIMEOUT` of real
+/// wall clock, which a single batched write never approaches.
+#[gpui::test]
+async fn app_quit_flushes_the_in_flight_entry_row_chain(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    for idx in 0..3 {
+        db.upsert_entry(id, idx, 0, 1_700_000_000_000 + idx, None, b"stale".to_vec())
+            .await
+            .expect("seed stale row");
+    }
+
+    let message = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = vec![message(1, "alpha"), message(2, "bravo")];
+            s.rebuild_streams();
+            cx.notify();
+        });
+        // Two links, both issued while the executor is idle: the second owns the
+        // first, so quitting has to drain the whole chain, not just its tail.
+        store.persist_main_stream(id, cx);
+        store.persist_all_rows(id, cx);
+        assert!(
+            store.entries_persist_chain.contains_key(&id),
+            "fixture: the chain must still be queued when the app quits"
+        );
+    });
+
+    cx.executor().set_block_on_ticks(usize::MAX..=usize::MAX);
+    cx.quit();
+
+    let rows = db.load_entries_blocking(id).expect("load rows");
+    // A row the flush never reached still holds the seeded bytes, which do not
+    // decode — surface them as themselves so a failure reads as the row set that
+    // was found rather than as a serde panic.
+    let texts: Vec<String> = rows
+        .iter()
+        .map(
+            |row| match crate::session_entry::kind_from_payload(&row.payload) {
+                Ok(SessionEntryKind::UserMessage { content_md, .. }) => content_md,
+                Ok(other) => format!("{other:?}"),
+                Err(_) => String::from_utf8_lossy(&row.payload).into_owned(),
+            },
+        )
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["alpha".to_string(), "bravo".to_string()],
+        "quitting must flush the queued chain: idx 0..1 rewritten from the \
+         in-memory Main stream and the stale idx 2 trimmed"
+    );
+}
+
+/// The quit hook takes the WHOLE `entries_persist_chain` map, which is only
+/// disposition-correct because a hard purge has already REMOVED its chain
+/// (`ChainDisposition::Abandon`) before it issues the cascade DELETE. If the
+/// abandon ever degrades to "leave it keyed and just log", quitting resurrects
+/// entry rows for a session that no longer has a `solution_sessions` row —
+/// orphans no UI enumerates and no GC reaps.
+///
+/// Asserted on payloads rather than on an empty table, because the purge's own
+/// DELETE is background work that may or may not land inside the quit window:
+/// what must never appear is the abandoned flush's content. Deliberately no
+/// synchronous precondition on the map either — that is already pinned by
+/// `purge_after_soft_close_abandons_the_drained_chain`, and asserting it here
+/// would swallow the failure this test exists to produce.
+#[gpui::test]
+async fn app_quit_does_not_resurrect_an_abandoned_persist_chain(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    for idx in 0..3 {
+        db.upsert_entry(id, idx, 0, 1_700_000_000_000 + idx, None, b"stale".to_vec())
+            .await
+            .expect("seed stale row");
+    }
+
+    let message = |n: u64| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: "resurrected".into(),
+            chunks: vec![],
+        },
+    };
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = (1..=2).map(message).collect();
+            s.rebuild_streams();
+            cx.notify();
+        });
+        store.persist_main_stream(id, cx);
+        // Soft close retains the chain under its key; the purge then has to
+        // abandon it from the not-hydrated branch.
+        store.close_session(id, cx).expect("close_session");
+        store.purge_session_hard(id, None, cx);
+    });
+
+    cx.executor().set_block_on_ticks(usize::MAX..=usize::MAX);
+    cx.quit();
+
+    let rows = db.load_entries_blocking(id).expect("load rows");
+    assert!(
+        rows.iter().all(|row| row.payload == b"stale"),
+        "quitting must not write the abandoned chain's rows for a session the \
+         purge deleted; found {} row(s)",
+        rows.len(),
+    );
+}
