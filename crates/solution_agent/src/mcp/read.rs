@@ -21,10 +21,11 @@ use super::*;
 /// A constant rather than three string literals because it IS the wire contract:
 /// the entire value of the guard is that a client can bucket by prefix, and a
 /// typo in any one of the three files ONE condition under TWO classes depending
-/// on which RPC the client happened to ask. FORK.md #110 records that exact
-/// defect having shipped once already for this same tool pair, when
-/// `read_session_history` propagated a bare "decoding archived session <id>"
-/// while `get_session` said `session_unreadable`.
+/// on which RPC the client happened to ask. FORK.md **#105**'s last bullet
+/// records that exact defect having shipped once already for this same tool
+/// pair — `read_session_history` propagated a bare "decoding archived session
+/// <id>" while `get_session` said `session_unreadable` — closed by commit
+/// `bf80468184`.
 pub(crate) const SESSION_UNREADABLE: &str = "session_unreadable";
 
 /// The COLD half's message, shared by the two paths that raise it, so they

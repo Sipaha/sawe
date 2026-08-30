@@ -4640,12 +4640,12 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
     }
 
     // The COLD regime is pinned as COLD, mirroring the hot regime's own
-    // assertion below. Without this the two halves are only nominally different:
-    // `ListSessionsTool` already calls `hydrate_all_for_solution` on entry so the
-    // phone can see closed sessions, so the moment ANY of these four gains the
-    // same hydrate-on-demand — the obvious next mobile request — both loops
-    // quietly become hot, every assertion still passes, and the one property
-    // this test exists to measure stops being measured.
+    // assertion below. This copy is a LOCATOR, not the coverage: it runs once,
+    // before any tool call, so it catches only a future edit that hydrates
+    // earlier in this test body. It cannot see a TOOL that hydrates on entry —
+    // that hydration happens after this line, and the copy below the loops is
+    // what catches it. Do not read this as "the regime assertion guards
+    // hydrate-on-demand"; the placement is the whole difference.
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         let (corrupt, healthy) = store.read_with(cx, |store, _| {
@@ -4675,11 +4675,37 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
             err.contains("has an archived transcript that cannot be decoded"),
             "COLD {tool} must name the cause it actually established; got {err:?}"
         );
+        // …and the pairing in the other direction, so neither message can grow
+        // into the other's territory: a cold read is talking about the ARCHIVE,
+        // never about a session that "is open".
+        assert!(
+            !err.contains("is open, but its persisted transcript"),
+            "COLD {tool} must not borrow the hot message; got {err:?}"
+        );
     }
     for (tool, outcome) in read_all_four(healthy_id, cx).await {
         let served = outcome.unwrap_or_else(|err| panic!("COLD {tool} refused the control: {err}"));
         assert_eq!(served, 1, "COLD {tool} must serve the control's one entry");
     }
+
+    // Still cold AFTER the loops, and this copy is the actual coverage. If any
+    // of the four tools gains hydrate-on-demand — `ListSessionsTool` already
+    // calls `hydrate_all_for_solution` on entry so a headless phone can see
+    // closed sessions, so it is the obvious next mobile request — the loops
+    // above ran against a store that hydrated underneath them, and this fails
+    // directly, with no dependence on what any message happens to say. The
+    // pre-loop copy passes in that case; only this one does not.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let (corrupt, healthy) = store.read_with(cx, |store, _| {
+            (store.session(session_id), store.session(healthy_id))
+        });
+        assert!(
+            corrupt.is_none() && healthy.is_none(),
+            "the COLD loops must have left the store cold — a read tool hydrated \
+             on demand, so they were not measuring the cold path"
+        );
+    });
 
     // Open the Solution. This is the ordinary desktop restore.
     cx.update(|cx| {
