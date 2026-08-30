@@ -769,7 +769,7 @@ async fn load_cold_session(
         None
     };
     let change_seq = head.change_seq.map(|seq| seq as u64);
-    let session = cx.update(|cx| {
+    Ok(cx.update(|cx| {
         let (session, _migrating) = crate::store::build_cold_session(
             &head.meta,
             (!rows.is_empty()).then_some(rows),
@@ -779,11 +779,10 @@ async fn load_cold_session(
             head.meta.tab_order,
             cx,
         );
+        let entry_count = session.read(cx).entries.len();
+        ColdSessionCache::store(cx, session_id, head, session.clone(), entry_count);
         session
-    });
-    let entry_count = cx.update(|cx| session.read(cx).entries.len());
-    cx.update(|cx| ColdSessionCache::store(cx, session_id, head, session.clone(), entry_count));
-    Ok(session)
+    }))
 }
 
 // =====================================================================
