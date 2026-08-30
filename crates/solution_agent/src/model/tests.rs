@@ -1582,10 +1582,15 @@ fn rebuild_streams_work_does_not_scale_with_transcript_length() {
 // production mutation that this test is confirmed to catch.
 //
 // What it does NOT cover:
-//   * the fold *bodies*. `BackgroundShell::stream_entry` /
-//     `BackgroundAgent::stream_entry` are called by the reference too, so this
-//     test pins WHICH snapshot is folded and WHERE, not how it renders — that
-//     is `background_shell.rs` / `background_agent.rs`'s own unit tests.
+//   * five production helpers the reference DELEGATES to rather than
+//     re-deriving: `BackgroundShell::{stream_entry, stream_label}`,
+//     `BackgroundAgent::stream_entry`, and — note — `renders_stream()` and
+//     `stream_state()`, which are decision logic, not formatting. That is a
+//     deliberate narrowing, not an oversight: each has its own unit tests in
+//     `background_shell.rs` / `background_agent.rs`, and mutating the fold's
+//     CALL SITE (fold a terminal agent; drop the liveness re-state) is still
+//     caught here. What is NOT caught is a change inside those five. Do not
+//     read this property as covering them.
 //   * the two `Utc::now()` reads. They are bracketed (see
 //     `assert_decorated_mirror`), not injected, so a change to the "observed X
 //     ago" bucketing is invisible here.
@@ -1682,8 +1687,13 @@ fn reference_decorated_mirror(
     });
 
     // Running background shells fold in, in `background_shell_order`, after
-    // Main + teammates. Modelled as an upsert because the production fold is an
-    // `IndexMap::insert`: a repeated id replaces the value and keeps its slot.
+    // Main + teammates. Production's fold is an `IndexMap::insert`, whose
+    // replace-in-place branch is unreachable — `demux` never emits a `Shell`
+    // key, and `background_shell_order` cannot hold a duplicate (registration
+    // in `teammate_reconciler` is guarded by a `contains_key` check). Modelled
+    // as a plain append with that assumption ASSERTED rather than as an upsert
+    // branch no seed can reach: untested reference code is exactly the drift
+    // this reference exists to avoid.
     for id in &session.background_shell_order {
         let Some(shell) = session.background_shells.get(id) else {
             continue;
@@ -1703,10 +1713,13 @@ fn reference_decorated_mirror(
             seq: 0,
             entries: vec![shell.stream_entry(now)],
         };
-        match shapes.iter_mut().find(|existing| existing.id == shape.id) {
-            Some(existing) => *existing = shape,
-            None => shapes.push(shape),
-        }
+        assert!(
+            !shapes.iter().any(|existing| existing.id == shape.id),
+            "reference assumption broken: a shell fold collided with an \
+             existing stream ({:?}) — production would replace it in place",
+            shape.id
+        );
+        shapes.push(shape);
     }
 
     // Live background agents fold in as teammate streams.
@@ -1763,6 +1776,28 @@ fn reference_decorated_mirror(
     shapes
 }
 
+/// One field comparison, counted as it is made. Comparison and counting are
+/// the SAME statement on purpose: `assert_decorated_mirror`'s return value is
+/// the property's liveness evidence, so a mutation (or a refactor) that drops a
+/// comparison must also drop its count and break the
+/// `fields == streams * FIELDS_PER_STREAM + calls` identity the test asserts.
+/// A counter incremented separately from the assert does not defend anything —
+/// it can be left behind by exactly the edit it is supposed to catch.
+#[cfg(test)]
+fn compared<T: PartialEq + std::fmt::Debug>(
+    fields: &mut usize,
+    actual: &T,
+    expected: &T,
+    context: std::fmt::Arguments<'_>,
+) {
+    *fields += 1;
+    assert_eq!(actual, expected, "{context}");
+}
+
+/// Field comparisons `assert_decorated_mirror` makes per compared stream.
+#[cfg(test)]
+const FIELDS_PER_STREAM: usize = 6;
+
 /// Compare the mirror against the owned reference. `rebuild_streams` reads
 /// `Utc::now()` internally for the shell / agent fold bodies, so the reference
 /// is BRACKETED: `before` and `after` straddle the rebuild, the folded snapshot
@@ -1770,11 +1805,14 @@ fn reference_decorated_mirror(
 /// granularity, and therefore one of the two brackets is exact. No tolerance is
 /// introduced — the comparison stays byte-for-byte.
 ///
-/// Returns how many streams it compared, which the caller accumulates and
-/// asserts a floor on. That is not decoration: `-> usize` is what stops a
-/// future edit (or a mutation-testing probe) from turning this into an
-/// early-returning no-op that leaves the property green — a bare `return;`
-/// then fails to compile rather than passing silently.
+/// Returns `(streams compared, field comparisons performed)`. The caller
+/// accumulates both, plus its own call count, and asserts
+/// `fields == streams * FIELDS_PER_STREAM + calls`. That identity — not a bare
+/// floor — is what keeps this function honest: `streams` is taken from
+/// `actual.len()` OUTSIDE the loop while `fields` is only produced INSIDE it,
+/// so deleting the loop, or deleting one field's line, breaks the identity
+/// rather than degrading the property in silence. A non-`()` return type also
+/// makes a bare `return;` a compile error.
 #[cfg(test)]
 #[must_use]
 fn assert_decorated_mirror(
@@ -1783,7 +1821,7 @@ fn assert_decorated_mirror(
     after: chrono::DateTime<Utc>,
     seed: u64,
     step: &str,
-) -> usize {
+) -> (usize, usize) {
     let actual = mirror_shape(session);
     let expected = {
         let at_after = reference_decorated_mirror(session, after);
@@ -1793,46 +1831,75 @@ fn assert_decorated_mirror(
             reference_decorated_mirror(session, before)
         }
     };
+    let mut fields = 0usize;
     let actual_ids: Vec<_> = actual.iter().map(|shape| shape.id.clone()).collect();
     let expected_ids: Vec<_> = expected.iter().map(|shape| shape.id.clone()).collect();
-    assert_eq!(
-        actual_ids, expected_ids,
-        "seed {seed} / {step}: the decorated mirror's stream ids/order diverged \
-         from the owned reference"
+    compared(
+        &mut fields,
+        &actual_ids,
+        &expected_ids,
+        format_args!(
+            "seed {seed} / {step}: the decorated mirror's stream ids/order diverged \
+             from the owned reference"
+        ),
     );
     for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-        assert_eq!(
-            actual.label, expected.label,
-            "seed {seed} / {step}: stream #{index} ({:?}) label diverged",
-            actual.id
+        compared(
+            &mut fields,
+            &actual.label,
+            &expected.label,
+            format_args!(
+                "seed {seed} / {step}: stream #{index} ({:?}) label diverged",
+                actual.id
+            ),
         );
-        assert_eq!(
-            actual.kind, expected.kind,
-            "seed {seed} / {step}: stream #{index} ({:?}) kind diverged",
-            actual.id
+        compared(
+            &mut fields,
+            &actual.kind,
+            &expected.kind,
+            format_args!(
+                "seed {seed} / {step}: stream #{index} ({:?}) kind diverged",
+                actual.id
+            ),
         );
-        assert_eq!(
-            actual.state, expected.state,
-            "seed {seed} / {step}: stream #{index} ({:?}) state diverged",
-            actual.id
+        compared(
+            &mut fields,
+            &actual.state,
+            &expected.state,
+            format_args!(
+                "seed {seed} / {step}: stream #{index} ({:?}) state diverged",
+                actual.id
+            ),
         );
-        assert_eq!(
-            actual.source, expected.source,
-            "seed {seed} / {step}: stream #{index} ({:?}) source diverged",
-            actual.id
+        compared(
+            &mut fields,
+            &actual.source,
+            &expected.source,
+            format_args!(
+                "seed {seed} / {step}: stream #{index} ({:?}) source diverged",
+                actual.id
+            ),
         );
-        assert_eq!(
-            actual.seq, expected.seq,
-            "seed {seed} / {step}: stream #{index} ({:?}) seq diverged",
-            actual.id
+        compared(
+            &mut fields,
+            &actual.seq,
+            &expected.seq,
+            format_args!(
+                "seed {seed} / {step}: stream #{index} ({:?}) seq diverged",
+                actual.id
+            ),
         );
-        assert_eq!(
-            actual.entries, expected.entries,
-            "seed {seed} / {step}: stream #{index} ({:?}) entries diverged",
-            actual.id
+        compared(
+            &mut fields,
+            &actual.entries,
+            &expected.entries,
+            format_args!(
+                "seed {seed} / {step}: stream #{index} ({:?}) entries diverged",
+                actual.id
+            ),
         );
     }
-    actual.len()
+    (actual.len(), fields)
 }
 
 /// Anti-vacuity ledger. Every count is derived from the session's own state
@@ -1843,8 +1910,11 @@ fn assert_decorated_mirror(
 #[cfg(test)]
 #[derive(Default, Debug)]
 struct DecorationCensus {
+    /// Ids in `closed_streams` that the removal actually had to remove. A
+    /// demux teammate stream exists only because an entry tagged it, so every
+    /// one of these is also the brief's "closed while it still has entries"
+    /// case — a second counter for that would be the same number twice.
     closed_removed: usize,
-    closed_removed_with_entries: usize,
     orphans_suppressed: usize,
     orphans_reopened: usize,
     shells_folded: usize,
@@ -1858,9 +1928,15 @@ struct DecorationCensus {
     labels_enriched: usize,
     labels_fallback: usize,
     seeds_visibly_decorated: usize,
-    /// Streams the reference comparison actually walked. Not a property of the
-    /// decoration — a liveness check on `assert_decorated_mirror` itself.
+    /// Liveness evidence for `assert_decorated_mirror` itself, not a property
+    /// of the decoration. `comparison_calls` is counted by the test loop,
+    /// `streams_compared` by the assertion OUTSIDE its comparison loop and
+    /// `fields_compared` only INSIDE it, so the identity
+    /// `fields == streams * FIELDS_PER_STREAM + calls` cannot hold if the loop,
+    /// or any single field's comparison, is dropped.
+    comparison_calls: usize,
     streams_compared: usize,
+    fields_compared: usize,
 }
 
 #[cfg(test)]
@@ -1875,9 +1951,11 @@ impl DecorationCensus {
         for (id, _, _, entries) in &demuxed {
             if session.closed_streams.contains_key(id) {
                 self.closed_removed += 1;
-                if !entries.is_empty() {
-                    self.closed_removed_with_entries += 1;
-                }
+                assert!(
+                    !entries.is_empty(),
+                    "a demux teammate stream is only created BY an entry, so a \
+                     closed id present in the demux must have entries"
+                );
                 suppressed.push(id.clone());
                 continue;
             }
@@ -2124,7 +2202,10 @@ fn decorated_mirror_matches_an_owned_reference() {
             let before = Utc::now();
             session.rebuild_streams();
             let after = Utc::now();
-            census.streams_compared += assert_decorated_mirror(&session, before, after, seed, pass);
+            let (streams, fields) = assert_decorated_mirror(&session, before, after, seed, pass);
+            census.comparison_calls += 1;
+            census.streams_compared += streams;
+            census.fields_compared += fields;
             assert_eq!(
                 session
                     .entries
@@ -2150,8 +2231,11 @@ fn decorated_mirror_matches_an_owned_reference() {
             let before = Utc::now();
             session.rebuild_streams();
             let after = Utc::now();
-            census.streams_compared +=
+            let (streams, fields) =
                 assert_decorated_mirror(&session, before, after, seed, "after update");
+            census.comparison_calls += 1;
+            census.streams_compared += streams;
+            census.fields_compared += fields;
             assert_eq!(
                 session
                     .entries
@@ -2174,11 +2258,6 @@ fn decorated_mirror_matches_an_owned_reference() {
             census.closed_removed,
             85usize,
             "closed streams removed from the mirror",
-        ),
-        (
-            census.closed_removed_with_entries,
-            85,
-            "closed streams that still had entries",
         ),
         (
             census.orphans_suppressed,
@@ -2241,11 +2320,6 @@ fn decorated_mirror_matches_an_owned_reference() {
             150,
             "seeds where the decoration actually changed the mirror",
         ),
-        (
-            census.streams_compared,
-            1_500,
-            "streams the reference comparison actually walked",
-        ),
     ] {
         assert!(
             count >= floor,
@@ -2254,6 +2328,28 @@ fn decorated_mirror_matches_an_owned_reference() {
              property test is close to vacuous for it. Full census: {census:?}"
         );
     }
+
+    // The comparison itself is live. `streams_compared` is taken from
+    // `actual.len()` outside `assert_decorated_mirror`'s comparison loop and
+    // `fields_compared` is produced only inside it, one increment per
+    // comparison in the same statement as the comparison — so dropping the loop
+    // (the property silently degrades to an ids/order check) or dropping any
+    // one field's line breaks this identity. Only an edit that deliberately
+    // fabricates a matching count survives it.
+    assert_eq!(
+        census.fields_compared,
+        census.streams_compared * FIELDS_PER_STREAM + census.comparison_calls,
+        "the reference comparison did not perform one comparison per field per \
+         stream plus one ids/order comparison per call — a field comparison has \
+         been dropped. Full census: {census:?}"
+    );
+    assert!(
+        census.streams_compared >= 1_500 && census.comparison_calls >= 700,
+        "the comparison ran on too little: {} streams over {} calls. Full \
+         census: {census:?}",
+        census.streams_compared,
+        census.comparison_calls
+    );
 }
 
 /// Highest `mod_seq` the generator has handed out for this session, so an
