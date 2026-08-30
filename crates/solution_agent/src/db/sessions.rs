@@ -32,6 +32,21 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Load one session's metadata row by id, without knowing its solution.
+    /// `None` when the row is gone (hard-purged / never existed). Used by
+    /// `solution_agent.get_session`'s DB fallback to serve a session that is
+    /// no longer in memory.
+    pub fn load_metadata(
+        &self,
+        id: SolutionSessionId,
+    ) -> Task<Result<Option<SolutionSessionMetadata>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            select_metadata_by_id(&connection, id)
+        })
+    }
+
     pub fn save_blob(&self, id: SolutionSessionId, blob: Vec<u8>) -> Task<Result<()>> {
         let connection = self.connection.clone();
         self.executor.spawn(async move {
@@ -579,37 +594,33 @@ pub(crate) fn select_sessions_closed_before(
     Ok(out)
 }
 
-pub(crate) fn select_metadata_for_solution(
-    connection: &Connection,
-    solution_id: SolutionId,
-) -> Result<Vec<SolutionSessionMetadata>> {
-    // Same nested-tuple shape as the INSERT side — `sqlez::Column` only
-    // implements tuples up to size 10; we have 16 columns now (5 + 7 + 4).
-    let mut select = connection.select_bound::<i64, (
-        (String, i64, String, Arc<str>, String),
-        (
-            i64,
-            i64,
-            Option<String>,
-            Option<i64>,
-            i64,
-            Option<String>,
-            Option<String>,
-        ),
-        (Option<String>, Option<String>, Option<String>, Option<i64>),
-    )>(indoc! {"
-        SELECT id, solution_id, agent_id, acp_session_id, title,
-               created_at, last_activity_at, preview, total_tokens,
-               context_count, cwd, parent_session_id,
-               desired_model, desired_effort, cached_models, tab_order
-        FROM solution_sessions
-        WHERE solution_id = ?
-        ORDER BY last_activity_at DESC
-    "})?;
+/// The 16 metadata columns, in the order both `select_metadata_*` queries
+/// select them and `metadata_from_row` destructures them. Nested tuples
+/// because `sqlez::Column` only implements tuples up to size 10 (5 + 7 + 4).
+type MetadataRow = (
+    (String, i64, String, Arc<str>, String),
+    (
+        i64,
+        i64,
+        Option<String>,
+        Option<i64>,
+        i64,
+        Option<String>,
+        Option<String>,
+    ),
+    (Option<String>, Option<String>, Option<String>, Option<i64>),
+);
 
-    let rows = select(solution_id.0)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for (
+const METADATA_COLUMNS: &str = indoc! {"
+    SELECT id, solution_id, agent_id, acp_session_id, title,
+           created_at, last_activity_at, preview, total_tokens,
+           context_count, cwd, parent_session_id,
+           desired_model, desired_effort, cached_models, tab_order
+    FROM solution_sessions
+"};
+
+fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
+    let (
         (id, solution_id, agent_id, acp_session_id, title),
         (
             created_at,
@@ -621,54 +632,81 @@ pub(crate) fn select_metadata_for_solution(
             parent_session_id,
         ),
         (desired_model, desired_effort, cached_models_json, tab_order),
-    ) in rows
-    {
-        let id = SolutionSessionId::parse(&id)
-            .map_err(|e| anyhow!("invalid SolutionSessionId in db: {e}"))?;
-        let created_at = DateTime::<Utc>::from_timestamp_millis(created_at)
-            .ok_or_else(|| anyhow!("invalid created_at timestamp: {created_at}"))?;
-        let last_activity_at = DateTime::<Utc>::from_timestamp_millis(last_activity_at)
-            .ok_or_else(|| anyhow!("invalid last_activity_at timestamp: {last_activity_at}"))?;
-        // A dangling `parent_session_id` (parent later deleted) parses
-        // fine here — the dangling pointer is silently treated as
-        // top-level by the surfaces that read it (status row, MCP).
-        let parent_session_id = match parent_session_id {
-            Some(raw) => Some(
-                SolutionSessionId::parse(&raw)
-                    .map_err(|e| anyhow!("invalid parent_session_id in db: {e}"))?,
-            ),
-            None => None,
-        };
-        // Parse cached_models tolerantly: a corrupt JSON cell logs a warning
-        // and falls back to empty rather than failing the whole listing.
-        let cached_models: Vec<claude_native::ModelInfo> = cached_models_json
-            .and_then(|s| match serde_json::from_str(&s) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    log::warn!("invalid cached_models json for {id}: {e}");
-                    None
-                }
-            })
-            .unwrap_or_default();
+    ) = row;
+    let id = SolutionSessionId::parse(&id)
+        .map_err(|e| anyhow!("invalid SolutionSessionId in db: {e}"))?;
+    let created_at = DateTime::<Utc>::from_timestamp_millis(created_at)
+        .ok_or_else(|| anyhow!("invalid created_at timestamp: {created_at}"))?;
+    let last_activity_at = DateTime::<Utc>::from_timestamp_millis(last_activity_at)
+        .ok_or_else(|| anyhow!("invalid last_activity_at timestamp: {last_activity_at}"))?;
+    // A dangling `parent_session_id` (parent later deleted) parses
+    // fine here — the dangling pointer is silently treated as
+    // top-level by the surfaces that read it (status row, MCP).
+    let parent_session_id = match parent_session_id {
+        Some(raw) => Some(
+            SolutionSessionId::parse(&raw)
+                .map_err(|e| anyhow!("invalid parent_session_id in db: {e}"))?,
+        ),
+        None => None,
+    };
+    // Parse cached_models tolerantly: a corrupt JSON cell logs a warning
+    // and falls back to empty rather than failing the whole listing.
+    let cached_models: Vec<claude_native::ModelInfo> = cached_models_json
+        .and_then(|s| match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!("invalid cached_models json for {id}: {e}");
+                None
+            }
+        })
+        .unwrap_or_default();
 
-        out.push(SolutionSessionMetadata {
-            id,
-            solution_id: SolutionId(solution_id),
-            agent_id: SharedString::from(agent_id),
-            acp_session_id: acp::SessionId::new(acp_session_id),
-            title: SharedString::from(title),
-            created_at,
-            last_activity_at,
-            preview: preview.map(SharedString::from),
-            total_tokens: total_tokens.map(|t| t as u64),
-            context_count: context_count.max(1) as u32,
-            cwd: cwd.map(std::path::PathBuf::from).unwrap_or_default(),
-            parent_session_id,
-            desired_model,
-            desired_effort,
-            cached_models,
-            tab_order,
-        });
-    }
-    Ok(out)
+    Ok(SolutionSessionMetadata {
+        id,
+        solution_id: SolutionId(solution_id),
+        agent_id: SharedString::from(agent_id),
+        acp_session_id: acp::SessionId::new(acp_session_id),
+        title: SharedString::from(title),
+        created_at,
+        last_activity_at,
+        preview: preview.map(SharedString::from),
+        total_tokens: total_tokens.map(|t| t as u64),
+        context_count: context_count.max(1) as u32,
+        cwd: cwd.map(std::path::PathBuf::from).unwrap_or_default(),
+        parent_session_id,
+        desired_model,
+        desired_effort,
+        cached_models,
+        tab_order,
+    })
+}
+
+pub(crate) fn select_metadata_for_solution(
+    connection: &Connection,
+    solution_id: SolutionId,
+) -> Result<Vec<SolutionSessionMetadata>> {
+    let mut select = connection.select_bound::<i64, MetadataRow>(&format!(
+        "{METADATA_COLUMNS}WHERE solution_id = ? ORDER BY last_activity_at DESC"
+    ))?;
+    select(solution_id.0)?
+        .into_iter()
+        .map(metadata_from_row)
+        .collect()
+}
+
+/// The single-session counterpart of [`select_metadata_for_solution`], for
+/// callers that hold a session id but not the solution it belongs to (the
+/// `solution_agent.get_session` DB fallback). `None` when no row exists —
+/// including for a session that was hard-purged.
+pub(crate) fn select_metadata_by_id(
+    connection: &Connection,
+    id: SolutionSessionId,
+) -> Result<Option<SolutionSessionMetadata>> {
+    let mut select = connection
+        .select_bound::<String, MetadataRow>(&format!("{METADATA_COLUMNS}WHERE id = ? LIMIT 1"))?;
+    select(id.to_string())?
+        .into_iter()
+        .next()
+        .map(metadata_from_row)
+        .transpose()
 }

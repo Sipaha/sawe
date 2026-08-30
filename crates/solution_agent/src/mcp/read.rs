@@ -530,135 +530,19 @@ impl McpServerTool for GetSessionTool {
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
 
-        let result = cx.update(|cx| -> Result<GetSessionResult> {
+        // 1. In-memory path: the session is open — live, or cold-restored by
+        //    `hydrate_all_for_solution`. Freshest, and the only path that can
+        //    see live-only state (auth options, running streams).
+        let in_memory = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
-            let entity = store
-                .read_with(cx, |store, _| store.session(session_id))
-                .with_context(|| format!("session_not_found: {}", session_id))?;
-            let session = entity.read(cx);
-            // Phase 4 Task 5a: serve the transcript from the unified
-            // `session.entries` (Vec<SessionEntry>) — the same cold+live
-            // model the desktop renders and Phase 4 persists/loads as
-            // rows. `session.entries` is kept in lock-step with the live
-            // thread by the store's `NewEntry` handler, so live and cold
-            // sessions read identically.
-            //
-            // Authorization options for any in-flight WaitingForConfirmation
-            // tool call are not stored on `SessionEntry` (a side-channel,
-            // live-only concern); harvest them off the live thread (empty
-            // for cold sessions) and re-attach per tool-call id below.
-            let live_auth_options = live_auth_options_for_session(session, cx);
-            // Select the stream whose entries this call returns (decision #7:
-            // descriptors for ALL streams, entries for the SELECTED one).
-            // `None` ⇒ Main. A stream the client asked for that has since
-            // closed / never existed serves an empty transcript — the `streams`
-            // descriptor list below still reveals what streams actually exist.
-            //
-            // 6d-B: a `Shell(...)` stream_id is honoured — shells now ride the
-            // wire (v4) and appear in `build_streams_vec`, so a client can select
-            // one to page its output like any other stream.
-            let selected = input
-                .stream_id
-                .as_ref()
-                .map(StreamIdDto::to_model)
-                .unwrap_or(crate::stream::StreamId::Main);
-            let selected_stream = session.streams.get(&selected);
-            let (entries, total_count) = {
-                // R-6e: index-anchored slice. `after_index` /
-                // `before_index` are exclusive bounds and `count`
-                // takes the LAST n entries within the bound (so the
-                // common "show me the newest 50" query is just
-                // `count=50` with no bounds). Indices are STREAM-LOCAL
-                // (the enumerate position within the selected stream).
-                //
-                // We walk every entry (not just the kept ones) so
-                // `image_cursor` stays in lock-step with what a
-                // non-paginated call would have produced — that
-                // keeps `EntryImage.index` stable across paginated
-                // calls, which is the contract that lets the client
-                // rely on `spk-image://N` URLs in markdown. The cursor is
-                // PER-STREAM now (image index space is scoped to the
-                // selected stream), matching `spk-image://N` inside this
-                // stream's served markdown.
-                let after = input.after_index;
-                let before = input.before_index;
-                let stream_entries: &[crate::session_entry::SessionEntry] =
-                    selected_stream.map_or(&[][..], |s| s.entries.as_slice());
-                let mut image_cursor = 0usize;
-                let mut kept: Vec<EntrySummary> = Vec::new();
-                for (index, entry) in stream_entries.iter().enumerate() {
-                    let in_range =
-                        after.map_or(true, |a| index > a) && before.map_or(true, |b| index < b);
-                    if in_range {
-                        kept.push(summarize_entry(
-                            entry,
-                            index,
-                            input.include_full_content,
-                            input.include_images,
-                            &mut image_cursor,
-                            &live_auth_options,
-                        ));
-                    } else {
-                        image_cursor += count_images_in_entry(&entry.kind);
-                    }
-                }
-                // `total_count` = the selected stream's pre-window entry count.
-                let stream_total = stream_entries.len();
-                // Judge-frugal slice (user messages + lead context + the
-                // resting turn), applied before `count` so a tail window
-                // still tails the anchored slice.
-                if let Some(lead) = input.user_anchored_lead {
-                    apply_user_anchored_filter(&mut kept, lead, input.user_anchored_since_ms);
-                }
-                if let Some(n) = input.count {
-                    if kept.len() > n {
-                        // Take the last n. `EntrySummary.index`
-                        // preserves the stream-local position so the
-                        // client can still tell where it sits in
-                        // the stream timeline.
-                        let drop_count = kept.len() - n;
-                        kept.drain(..drop_count);
-                    }
-                }
-                (kept, stream_total)
-            };
-            let summary = session_summary(session, cx);
-            let pending_bundles = build_pending_bundle_summaries(session, cx);
-            // Pure-read delta-cursor seed (Phase 5): persistence of `change_seq`
-            // is *scheduled* before the matching section event (Task 5.1b); the
-            // detached write may land slightly later, but the `max()`-guarded
-            // UPDATE plus the deterministic restore seed absorb the residual
-            // crash/reorder window, so the issued cursor stays restart-safe.
-            let epoch = session.epoch;
-            // Per-stream cursor: seed `current_seq` from the SELECTED stream's own
-            // watermark (its `seq` = max entry mod_seq), not the global
-            // `change_seq`. This matches the same stream's descriptor `seq` in
-            // `streams` below AND the caught-up `current_seq` that
-            // `get_session_changes` hands out, so the client's per-stream cursor is
-            // uniform and monotonic (a global seed would start above the stream's
-            // watermark and then step DOWN on the first delta poll). 0 for a
-            // missing/empty selected stream.
-            let current_seq = selected_stream.map_or(0, |s| s.seq);
-            Ok(GetSessionResult {
-                id: summary.id,
-                solution_id: summary.solution_id,
-                agent_id: summary.agent_id,
-                title: summary.title,
-                state: summary.state,
-                created_at: summary.created_at,
-                last_activity_at: summary.last_activity_at,
-                total_tokens: summary.total_tokens,
-                max_tokens: summary.max_tokens,
-                parent_session_id: summary.parent_session_id,
-                cwd: summary.cwd,
-                entries,
-                total_count,
-                pending_bundles,
-                streams: build_streams_vec(session),
-                epoch,
-                current_seq,
-            })
-        })?;
+            let entity = store.read_with(cx, |store, _| store.session(session_id))?;
+            Some(build_get_session_result(entity.read(cx), &input, cx))
+        });
+        let result = match in_memory {
+            Some(result) => result,
+            // 2. Cold path: not in memory, but its rows may still be on disk.
+            None => get_session_from_db(session_id, &input, cx).await?,
+        };
 
         let title = result.title.clone();
         Ok(ToolResponse {
@@ -666,6 +550,197 @@ impl McpServerTool for GetSessionTool {
             structured_content: result,
         })
     }
+}
+
+/// Assemble the `get_session` payload for one session. Split out of the tool
+/// body so the in-memory path and the cold DB fallback below serve byte-for-byte
+/// the same shape — a cold session simply has no live thread, which the helpers
+/// this calls (`live_auth_options_for_session`, `build_pending_bundle_summaries`)
+/// already degrade to empty for.
+fn build_get_session_result(
+    session: &crate::model::SolutionSession,
+    input: &GetSessionParams,
+    cx: &App,
+) -> GetSessionResult {
+    // Phase 4 Task 5a: serve the transcript from the unified
+    // `session.entries` (Vec<SessionEntry>) — the same cold+live
+    // model the desktop renders and Phase 4 persists/loads as
+    // rows. `session.entries` is kept in lock-step with the live
+    // thread by the store's `NewEntry` handler, so live and cold
+    // sessions read identically.
+    //
+    // Authorization options for any in-flight WaitingForConfirmation
+    // tool call are not stored on `SessionEntry` (a side-channel,
+    // live-only concern); harvest them off the live thread (empty
+    // for cold sessions) and re-attach per tool-call id below.
+    let live_auth_options = live_auth_options_for_session(session, cx);
+    // Select the stream whose entries this call returns (decision #7:
+    // descriptors for ALL streams, entries for the SELECTED one).
+    // `None` ⇒ Main. A stream the client asked for that has since
+    // closed / never existed serves an empty transcript — the `streams`
+    // descriptor list below still reveals what streams actually exist.
+    //
+    // 6d-B: a `Shell(...)` stream_id is honoured — shells now ride the
+    // wire (v4) and appear in `build_streams_vec`, so a client can select
+    // one to page its output like any other stream.
+    let selected = input
+        .stream_id
+        .as_ref()
+        .map(StreamIdDto::to_model)
+        .unwrap_or(crate::stream::StreamId::Main);
+    let selected_stream = session.streams.get(&selected);
+    let (entries, total_count) = {
+        // R-6e: index-anchored slice. `after_index` /
+        // `before_index` are exclusive bounds and `count`
+        // takes the LAST n entries within the bound (so the
+        // common "show me the newest 50" query is just
+        // `count=50` with no bounds). Indices are STREAM-LOCAL
+        // (the enumerate position within the selected stream).
+        //
+        // We walk every entry (not just the kept ones) so
+        // `image_cursor` stays in lock-step with what a
+        // non-paginated call would have produced — that
+        // keeps `EntryImage.index` stable across paginated
+        // calls, which is the contract that lets the client
+        // rely on `spk-image://N` URLs in markdown. The cursor is
+        // PER-STREAM now (image index space is scoped to the
+        // selected stream), matching `spk-image://N` inside this
+        // stream's served markdown.
+        let after = input.after_index;
+        let before = input.before_index;
+        let stream_entries: &[crate::session_entry::SessionEntry] =
+            selected_stream.map_or(&[][..], |s| s.entries.as_slice());
+        let mut image_cursor = 0usize;
+        let mut kept: Vec<EntrySummary> = Vec::new();
+        for (index, entry) in stream_entries.iter().enumerate() {
+            let in_range = after.map_or(true, |a| index > a) && before.map_or(true, |b| index < b);
+            if in_range {
+                kept.push(summarize_entry(
+                    entry,
+                    index,
+                    input.include_full_content,
+                    input.include_images,
+                    &mut image_cursor,
+                    &live_auth_options,
+                ));
+            } else {
+                image_cursor += count_images_in_entry(&entry.kind);
+            }
+        }
+        // `total_count` = the selected stream's pre-window entry count.
+        let stream_total = stream_entries.len();
+        // Judge-frugal slice (user messages + lead context + the
+        // resting turn), applied before `count` so a tail window
+        // still tails the anchored slice.
+        if let Some(lead) = input.user_anchored_lead {
+            apply_user_anchored_filter(&mut kept, lead, input.user_anchored_since_ms);
+        }
+        if let Some(n) = input.count {
+            if kept.len() > n {
+                // Take the last n. `EntrySummary.index`
+                // preserves the stream-local position so the
+                // client can still tell where it sits in
+                // the stream timeline.
+                let drop_count = kept.len() - n;
+                kept.drain(..drop_count);
+            }
+        }
+        (kept, stream_total)
+    };
+    let summary = session_summary(session, cx);
+    let pending_bundles = build_pending_bundle_summaries(session, cx);
+    // Pure-read delta-cursor seed (Phase 5): persistence of `change_seq`
+    // is *scheduled* before the matching section event (Task 5.1b); the
+    // detached write may land slightly later, but the `max()`-guarded
+    // UPDATE plus the deterministic restore seed absorb the residual
+    // crash/reorder window, so the issued cursor stays restart-safe.
+    let epoch = session.epoch;
+    // Per-stream cursor: seed `current_seq` from the SELECTED stream's own
+    // watermark (its `seq` = max entry mod_seq), not the global
+    // `change_seq`. This matches the same stream's descriptor `seq` in
+    // `streams` below AND the caught-up `current_seq` that
+    // `get_session_changes` hands out, so the client's per-stream cursor is
+    // uniform and monotonic (a global seed would start above the stream's
+    // watermark and then step DOWN on the first delta poll). 0 for a
+    // missing/empty selected stream.
+    let current_seq = selected_stream.map_or(0, |s| s.seq);
+    GetSessionResult {
+        id: summary.id,
+        solution_id: summary.solution_id,
+        agent_id: summary.agent_id,
+        title: summary.title,
+        state: summary.state,
+        created_at: summary.created_at,
+        last_activity_at: summary.last_activity_at,
+        total_tokens: summary.total_tokens,
+        max_tokens: summary.max_tokens,
+        parent_session_id: summary.parent_session_id,
+        cwd: summary.cwd,
+        entries,
+        total_count,
+        pending_bundles,
+        streams: build_streams_vec(session),
+        epoch,
+        current_seq,
+    }
+}
+
+/// The `get_session` counterpart of `read_session_history`'s archive path: a
+/// session that is not in `store.sessions` (window closed, tab closed, or a
+/// headless client that never hydrated anything) is still fully described by
+/// its persisted rows. Reconstructs the cold session through the same
+/// `build_cold_session` the desktop restore uses, reads the result off it, and
+/// drops it — this stays a pure read, unlike `list_sessions`, which hydrates
+/// the store as a side effect and therefore refuses sessions the user closed.
+///
+/// What a cold row cannot carry, and what is served instead: authorization
+/// options for an in-flight tool call (live-only side channel — none, so a
+/// `WaitingForConfirmation` entry arrives with an empty `options` list),
+/// `pending_messages` (in-memory queue — empty), live stream state (teammate
+/// streams are collapsed into Main by `hydrate_streams_main_only`, so `streams`
+/// is Main alone), `state` (`Idle`, the state a restored session really is in)
+/// and `max_tokens` (live-thread-only; `total_tokens` still comes from the
+/// persisted metadata column).
+async fn get_session_from_db(
+    session_id: SolutionSessionId,
+    input: &GetSessionParams,
+    cx: &mut AsyncApp,
+) -> Result<GetSessionResult> {
+    let db = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.read_with(cx, |store, _| store.persistence())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "session_not_found: {session_id} is not open and no session database is attached"
+            )
+        })?;
+    let meta = db.load_metadata(session_id).await?.ok_or_else(|| {
+        anyhow!("session_not_found: {session_id} is neither open nor archived in the database")
+    })?;
+    let rows = db.load_entries(session_id).await?;
+    // The legacy blob is only consulted when the session has no entry rows —
+    // same precedence as hydration and `read_session_history`.
+    let blob = if rows.is_empty() {
+        db.load_blob(session_id).await?
+    } else {
+        None
+    };
+    let epoch = db.load_epoch(session_id).await?.unwrap_or(0);
+    let change_seq = db.load_change_seq(session_id).await?.map(|seq| seq as u64);
+    Ok(cx.update(|cx| {
+        let (session, _migrating) = crate::store::build_cold_session(
+            &meta,
+            (!rows.is_empty()).then_some(rows),
+            blob,
+            epoch,
+            change_seq,
+            meta.tab_order,
+            cx,
+        );
+        build_get_session_result(session.read(cx), input, cx)
+    }))
 }
 
 // =====================================================================

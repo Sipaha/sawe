@@ -767,7 +767,7 @@ pub(crate) use queue::summarize_blocks_for_log;
 // consumers of `PersistedSession`/`entries_from_rows`, and the
 // `store/tests/{hydration,model_catalog}.rs` buckets.
 pub use hydration::PersistedSession;
-pub(crate) use hydration::entries_from_rows;
+pub(crate) use hydration::{build_cold_session, entries_from_rows};
 use hydration::{extract_preview, unique_session_title};
 // Every store.rs caller of `cold_entries_from_persisted` moved into `hydration`;
 // only the `store/tests/hydration.rs` bucket still reaches it via

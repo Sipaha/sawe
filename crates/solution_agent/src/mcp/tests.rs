@@ -3420,3 +3420,180 @@ async fn create_session_in_a_member_less_solution_clears_the_member_guard(
         "expected the workspace-lookup error instead; got {msg:?}"
     );
 }
+
+/// `get_session` must serve a session that is no longer in `store.sessions`
+/// but whose metadata + entry rows are still in the DB — the state the store
+/// is left in after a window close (`cold_close_solution` evicts the entities
+/// and leaves the rows) or a closed tab. Before the fix the tool resolved
+/// only through the in-memory map and returned `session_not_found` until
+/// something else (`list_sessions`) happened to re-hydrate the store.
+///
+/// Same fixture shape as `read_session_history_closed_row_native_returns_entries`,
+/// whose archive path this mirrors.
+#[gpui::test]
+async fn get_session_closed_row_native_returns_session(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let executor = cx.executor();
+    let db = std::sync::Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let created = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let last_activity = chrono::Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new(format!("acp-{}", session_id.as_str())),
+        title: SharedString::from("closed row-native session"),
+        created_at: created,
+        last_activity_at: last_activity,
+        preview: None,
+        total_tokens: Some(4321),
+        context_count: 1,
+        cwd: std::path::PathBuf::from("/tmp/closed-session-cwd"),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: Some(0),
+    };
+    db.save_metadata(meta).await.expect("save metadata");
+
+    let user_entry = SessionEntry {
+        created_ms: 1_700_000_000_000,
+        mod_seq: 1,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: "hello from closed session".into(),
+            chunks: vec![fake_user_text_chunk("hello from closed session")],
+        },
+    };
+    let assistant_entry = SessionEntry {
+        created_ms: 1_700_000_000_001,
+        mod_seq: 2,
+        subagent_id: None,
+        kind: SessionEntryKind::AssistantMessage {
+            chunks: vec![crate::session_entry::AssistantChunk::Message(
+                "reply from closed session".into(),
+            )],
+        },
+    };
+    db.upsert_entry(
+        session_id,
+        0,
+        user_entry.mod_seq as i64,
+        user_entry.created_ms,
+        None,
+        user_entry.to_payload(),
+    )
+    .await
+    .expect("upsert user entry");
+    db.upsert_entry(
+        session_id,
+        1,
+        assistant_entry.mod_seq as i64,
+        assistant_entry.created_ms,
+        None,
+        assistant_entry.to_payload(),
+    )
+    .await
+    .expect("upsert assistant entry");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(
+            store.read(cx).session(session_id).is_none(),
+            "session must not be in memory for this test"
+        );
+    });
+
+    let result = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                include_full_content: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session must succeed for a closed session still in the database");
+
+    let sc = &result.structured_content;
+    assert_eq!(sc.id, session_id.to_string());
+    assert_eq!(sc.solution_id, solution_id.0, "metadata comes from the row");
+    assert_eq!(sc.agent_id, "mock-agent");
+    assert_eq!(sc.title, "closed row-native session");
+    assert_eq!(sc.created_at, created.timestamp_millis());
+    assert_eq!(sc.last_activity_at, last_activity.timestamp_millis());
+    assert_eq!(sc.total_tokens, Some(4321));
+    assert_eq!(sc.cwd.as_deref(), Some("/tmp/closed-session-cwd"));
+    assert_eq!(
+        sc.total_count, 2,
+        "both persisted rows must ride the transcript"
+    );
+    assert_eq!(sc.entries.len(), 2);
+    assert!(
+        sc.entries[0]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("hello from closed session")),
+        "user entry must round-trip; got {:?}",
+        sc.entries[0].markdown
+    );
+    assert!(
+        sc.entries[1]
+            .markdown
+            .as_deref()
+            .is_some_and(|md| md.contains("reply from closed session")),
+        "assistant entry must round-trip; got {:?}",
+        sc.entries[1].markdown
+    );
+    // A cold row has no live thread, so the live-only fields are served
+    // empty rather than wrong.
+    assert!(sc.pending_bundles.is_empty());
+    assert_eq!(
+        sc.streams.len(),
+        1,
+        "a cold session collapses to the Main stream only"
+    );
+
+    // The session is served WITHOUT being hydrated back into the store —
+    // `get_session` stays a pure read.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(
+            store.read(cx).session(session_id).is_none(),
+            "the DB fallback must not resurrect the session in memory"
+        );
+    });
+
+    // An id that is in neither memory nor the DB still errors, and says so.
+    let unknown = crate::model::SolutionSessionId::new();
+    let err = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: unknown.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("an unknown session id must still fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("session_not_found")
+            && msg.contains("neither open nor archived in the database"),
+        "the error must distinguish 'not open' from 'not in the db'; got {msg:?}"
+    );
+}

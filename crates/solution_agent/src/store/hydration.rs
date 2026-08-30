@@ -275,6 +275,95 @@ pub(crate) fn unique_session_title(
     SharedString::from(base.to_string())
 }
 
+/// Build the COLD (`acp_thread: None`) session entity described by `meta` and
+/// its persisted transcript — `rows` when the session is row-native, else the
+/// legacy `blob`. Returns the entity plus whether the legacy branch was taken
+/// (`migrating`), which is the caller's cue to schedule the row migration; the
+/// function itself performs no I/O and touches no store state, so a caller that
+/// only wants to *read* a persisted session can drop the entity afterwards.
+///
+/// Split out of `hydrate_all_for_solution` so `solution_agent.get_session`'s
+/// DB fallback reconstructs a closed session through the exact same code the
+/// desktop restore uses. Two constructions would drift, and every field this
+/// sets is one the wire serves (`session_summary` / `build_streams_vec`).
+pub(crate) fn build_cold_session(
+    meta: &SolutionSessionMetadata,
+    rows: Option<Vec<EntryRow>>,
+    blob: Option<Vec<u8>>,
+    epoch: i64,
+    restored_change_seq: Option<u64>,
+    tab_order: Option<i64>,
+    cx: &mut App,
+) -> (Entity<SolutionSession>, bool) {
+    let migrating = rows.is_none();
+    // Same precedence as `resume_session`: the metadata
+    // columns first, the legacy blob only as a fallback for
+    // rows written before those columns existed. Without this
+    // a cold tab's status row renders with no model and no
+    // effort until the user's first send re-derives them --
+    // which the band now puts on screen at every restart,
+    // since it reopens straight onto a cold session.
+    let mut restored_available_models = meta.cached_models.clone();
+    let mut restored_desired_model = meta.desired_model.clone();
+    let mut restored_desired_effort = meta.desired_effort.clone();
+    let entries = if let Some(rows) = rows {
+        entries_from_rows(rows)
+    } else {
+        let persisted =
+            blob.and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
+        if let Some(persisted) = persisted.as_ref() {
+            if restored_available_models.is_empty() {
+                restored_available_models = persisted.available_models.clone();
+            }
+            restored_desired_model =
+                restored_desired_model.or_else(|| persisted.desired_model.clone());
+            restored_desired_effort =
+                restored_desired_effort.or_else(|| persisted.desired_effort.clone());
+        }
+        let restored_created_ms = persisted
+            .as_ref()
+            .map(|p| p.entry_created_ms.clone())
+            .unwrap_or_default();
+        let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
+        crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, 0, cx)
+    };
+    let entity = cx.new(|_| {
+        let mut s = SolutionSession::new_idle(
+            meta.id,
+            meta.solution_id,
+            meta.agent_id.clone(),
+            meta.acp_session_id.clone(),
+        );
+        s.title = meta.title.clone();
+        s.created_at = meta.created_at;
+        s.last_activity_at = meta.last_activity_at;
+        s.context_count = meta.context_count;
+        s.cwd = meta.cwd.clone();
+        s.entries = entries;
+        // Rebuild the per-source `streams` mirror (phase 2c) —
+        // the desktop render reads it, and this cold-load path
+        // assigns `entries` directly. Without it a restored
+        // session renders blank. Collapse tagged rows to a
+        // Main-only view (no live thread here → teammates that
+        // finished before the restart stay closed).
+        s.hydrate_streams_main_only();
+        s.restore_change_seq(if migrating { None } else { restored_change_seq });
+        if migrating {
+            s.bump_epoch();
+        } else {
+            s.epoch = epoch as u64;
+        }
+        s.cached_total_tokens = meta.total_tokens;
+        s.parent_session_id = meta.parent_session_id;
+        s.tab_order = tab_order;
+        s.cached_models = restored_available_models;
+        s.desired_model = restored_desired_model;
+        s.desired_effort = restored_desired_effort;
+        s
+    });
+    (entity, migrating)
+}
+
 impl SolutionAgentStore {
     /// Resume a session from its persisted metadata: spawns / reuses the
     /// pooled connection and asks the agent to attach to the saved
@@ -1051,80 +1140,16 @@ impl SolutionAgentStore {
                     let restored_change_seq =
                         change_seq_per_session.get(&meta.id).copied().flatten();
                     let rows = rows_per_session.remove(&meta.id);
-                    let migrating = rows.is_none();
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
-                    // Same precedence as `resume_session`: the metadata
-                    // columns first, the legacy blob only as a fallback for
-                    // rows written before those columns existed. Without this
-                    // a cold tab's status row renders with no model and no
-                    // effort until the user's first send re-derives them --
-                    // which the band now puts on screen at every restart,
-                    // since it reopens straight onto a cold session.
-                    let mut restored_available_models = meta.cached_models.clone();
-                    let mut restored_desired_model = meta.desired_model.clone();
-                    let mut restored_desired_effort = meta.desired_effort.clone();
-                    let entries = if let Some(rows) = rows {
-                        entries_from_rows(rows)
-                    } else {
-                        let persisted = blobs.remove(&meta.id).and_then(|bytes| {
-                            serde_json::from_slice::<PersistedSession>(&bytes).ok()
-                        });
-                        if let Some(persisted) = persisted.as_ref() {
-                            if restored_available_models.is_empty() {
-                                restored_available_models = persisted.available_models.clone();
-                            }
-                            restored_desired_model =
-                                restored_desired_model.or_else(|| persisted.desired_model.clone());
-                            restored_desired_effort = restored_desired_effort
-                                .or_else(|| persisted.desired_effort.clone());
-                        }
-                        let restored_created_ms = persisted
-                            .as_ref()
-                            .map(|p| p.entry_created_ms.clone())
-                            .unwrap_or_default();
-                        let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
-                        crate::session_entry::rebuild_entries(
-                            &cold_entries,
-                            &[],
-                            &restored_created_ms,
-                            0,
-                            cx,
-                        )
-                    };
-                    let entity = cx.new(|_| {
-                        let mut s = SolutionSession::new_idle(
-                            meta.id,
-                            meta.solution_id,
-                            meta.agent_id.clone(),
-                            meta.acp_session_id.clone(),
-                        );
-                        s.title = meta.title.clone();
-                        s.created_at = meta.created_at;
-                        s.last_activity_at = meta.last_activity_at;
-                        s.context_count = meta.context_count;
-                        s.cwd = meta.cwd.clone();
-                        s.entries = entries;
-                        // Rebuild the per-source `streams` mirror (phase 2c) —
-                        // the desktop render reads it, and this cold-load path
-                        // assigns `entries` directly. Without it a restored
-                        // session renders blank. Collapse tagged rows to a
-                        // Main-only view (no live thread here → teammates that
-                        // finished before the restart stay closed).
-                        s.hydrate_streams_main_only();
-                        s.restore_change_seq(if migrating { None } else { restored_change_seq });
-                        if migrating {
-                            s.bump_epoch();
-                        } else {
-                            s.epoch = epoch as u64;
-                        }
-                        s.cached_total_tokens = meta.total_tokens;
-                        s.parent_session_id = meta.parent_session_id;
-                        s.tab_order = session_tab_order;
-                        s.cached_models = restored_available_models;
-                        s.desired_model = restored_desired_model;
-                        s.desired_effort = restored_desired_effort;
-                        s
-                    });
+                    let (entity, migrating) = build_cold_session(
+                        meta,
+                        rows,
+                        blobs.remove(&meta.id),
+                        epoch,
+                        restored_change_seq,
+                        session_tab_order,
+                        cx,
+                    );
                     // `by_solution` is populated in one pass after the loop —
                     // it has to be ordered by `tab_order`, which is only known
                     // once every session in this batch has been built.
