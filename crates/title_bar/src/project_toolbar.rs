@@ -3,6 +3,7 @@ use gpui::{
     Window, div, px,
 };
 use project::Project;
+use solutions::mcp::{StructureSlot, VisualNode, register_structure_provider};
 use solutions_ui::project_tab_strip::ProjectTabStrip;
 use ui::{
     ContextMenu, Divider, DividerColor, IconPosition, PopoverMenu, PopoverMenuHandle, Tooltip,
@@ -148,12 +149,58 @@ impl ProjectToolbar {
     /// the active member owns more than one repository (a member worktree that
     /// vendors its own git repo — e.g. a plugin with its own `.git`). With a
     /// single repo there is nothing to pick, so nothing renders at all.
-    fn render_repository_selector(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    /// The repository the selector would show, plus how many the active
+    /// member owns. `None` is exactly the case where the selector renders
+    /// nothing. Shared with `structure_node` so the dump cannot claim a
+    /// control the toolbar is not painting.
+    fn repository_selector_state(
+        &self,
+        cx: &App,
+    ) -> Option<(Entity<project::git_store::Repository>, usize)> {
         let repositories = solutions::active_member_repositories(&self.project, cx);
         if repositories.len() < 2 {
             return None;
         }
-        let current = Self::resolve_repository(&self.project, cx)?;
+        Some((
+            Self::resolve_repository(&self.project, cx)?,
+            repositories.len(),
+        ))
+    }
+
+    /// The branch widget's label and its `behind` count, or `None` when the
+    /// widget renders nothing. Shared with `structure_node` — see
+    /// `repository_selector_state`.
+    fn branch_summary(&self, cx: &App) -> Option<(SharedString, u32)> {
+        let repository = Self::resolve_repository(&self.project, cx)?;
+        let snapshot = repository.read(cx);
+        // Only the `behind` count is shown on the branch widget now; the
+        // `ahead` (unpushed) count moved to the dedicated Push button.
+        match &snapshot.branch {
+            Some(branch) => {
+                let behind = branch.tracking_status().map(|s| s.behind).unwrap_or(0);
+                Some((SharedString::from(branch.name().to_string()), behind))
+            }
+            // Detached HEAD: show short commit SHA, no upstream tracking indicators.
+            None => Some((snapshot.head_commit.as_ref().map(|c| c.short_sha())?, 0)),
+        }
+    }
+
+    /// The unpushed-commit count, or `None` when the Push button renders
+    /// nothing. Shared with `structure_node` — see `repository_selector_state`.
+    fn unpushed_commits(&self, cx: &App) -> Option<u32> {
+        let repository = Self::resolve_repository(&self.project, cx)?;
+        let ahead = repository
+            .read(cx)
+            .branch
+            .as_ref()
+            .and_then(|branch| branch.tracking_status())
+            .map(|status| status.ahead)
+            .unwrap_or(0);
+        (ahead > 0).then_some(ahead)
+    }
+
+    fn render_repository_selector(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (current, _) = self.repository_selector_state(cx)?;
         let current_path = current.read(cx).work_directory_abs_path.clone();
         let name = SharedString::from(
             current
@@ -238,21 +285,7 @@ impl ProjectToolbar {
     }
 
     fn render_branch_widget(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let repository = Self::resolve_repository(&self.project, cx)?;
-        let snapshot = repository.read(cx);
-        // Only the `behind` count is shown on the branch widget now; the
-        // `ahead` (unpushed) count moved to the dedicated Push button.
-        let (name, behind) = match &snapshot.branch {
-            Some(branch) => {
-                let behind = branch.tracking_status().map(|s| s.behind).unwrap_or(0);
-                (SharedString::from(branch.name().to_string()), behind)
-            }
-            None => {
-                // Detached HEAD: show short commit SHA, no upstream tracking indicators.
-                let sha = snapshot.head_commit.as_ref().map(|c| c.short_sha())?;
-                (sha, 0)
-            }
-        };
+        let (name, behind) = self.branch_summary(cx)?;
         let workspace_weak = self.workspace.clone();
         let project = self.project.clone();
         Some(
@@ -322,17 +355,7 @@ impl ProjectToolbar {
     /// on the branch-widget dropdown). Click dispatches `git::Push`, scoped to
     /// the git panel's active repository.
     fn render_push_button(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let repository = Self::resolve_repository(&self.project, cx)?;
-        let ahead = repository
-            .read(cx)
-            .branch
-            .as_ref()
-            .and_then(|branch| branch.tracking_status())
-            .map(|status| status.ahead)
-            .unwrap_or(0);
-        if ahead == 0 {
-            return None;
-        }
+        let ahead = self.unpushed_commits(cx)?;
         Some(
             ui::ButtonLike::new("push-trigger")
                 .child(
@@ -346,6 +369,97 @@ impl ProjectToolbar {
                     window.dispatch_action(Box::new(git::Push), cx);
                 }),
         )
+    }
+}
+
+/// Teach `workspace.dump_visual_structure` about the project-toolbar row.
+/// Called from `title_bar::init`. The dump lives in `solutions`, which
+/// cannot depend on this crate, and `Workspace::project_toolbar_item` is an
+/// `AnyView` — so only this crate can turn it back into something
+/// describable.
+pub fn register_toolbar_structure_provider(cx: &mut App) {
+    register_structure_provider(
+        cx,
+        StructureSlot::ProjectToolbar,
+        |workspace, window, cx| {
+            let toolbar = workspace
+                .project_toolbar_item()?
+                .downcast::<ProjectToolbar>()
+                .ok()?;
+            Some(toolbar.read(cx).structure_node(workspace, window, cx))
+        },
+    );
+}
+
+impl ProjectToolbar {
+    /// The toolbar's node for `workspace.dump_visual_structure`.
+    ///
+    /// Every child's `visible` is computed from the same helper `render`
+    /// gates that child on, so the dump cannot describe a control the
+    /// toolbar is not painting — the failure mode that made
+    /// `build_title_bar_node` and `build_status_bar_node` give up on
+    /// synthesizing children at all. Children are emitted in painted order,
+    /// left to right, including the ones currently hidden.
+    ///
+    /// `workspace` is the caller's already-borrowed `&Workspace` rather than
+    /// `self.workspace.upgrade()`: the dump holds that borrow across this
+    /// call.
+    pub fn structure_node(&self, workspace: &Workspace, window: &Window, cx: &App) -> VisualNode {
+        // Index order is fixed by `new`, which builds left / bottom / right.
+        let dock_sides = ["left", "bottom", "right"];
+        let mut children: Vec<VisualNode> = self
+            .dock_buttons
+            .iter()
+            .zip(dock_sides)
+            .map(|(buttons, side)| {
+                VisualNode::new(format!("DockButtons({side})"))
+                    .with_visible(buttons.read(cx).has_visible_buttons(window, cx))
+            })
+            .collect();
+
+        children.push(
+            VisualNode::new("ProjectTabStrip").with_visible(self.project_tab_strip.is_some()),
+        );
+        children.push(
+            VisualNode::new("UpdateButton")
+                .with_visible(Self::resolve_repository(&self.project, cx).is_some()),
+        );
+
+        let unpushed = self.unpushed_commits(cx);
+        children.push(
+            VisualNode::new("PushButton")
+                .with_visible(unpushed.is_some())
+                .with_attribute("ahead", unpushed.unwrap_or(0)),
+        );
+
+        let repository_selector = self.repository_selector_state(cx);
+        let mut selector_node =
+            VisualNode::new("RepositorySelector").with_visible(repository_selector.is_some());
+        if let Some((repository, count)) = repository_selector {
+            selector_node = selector_node
+                .with_label(repository.read(cx).display_name().trim_end_matches('/'))
+                .with_attribute("repository_count", count);
+        }
+        children.push(selector_node);
+
+        let branch = self.branch_summary(cx);
+        let mut branch_node = VisualNode::new("BranchWidget").with_visible(branch.is_some());
+        if let Some((name, behind)) = branch {
+            branch_node = branch_node
+                .with_label(name.to_string())
+                .with_attribute("behind", behind);
+        }
+        children.push(branch_node);
+
+        children.push(
+            VisualNode::new("RunConfigStrip")
+                .with_visible(workspace.run_config_strip().is_some())
+                // A type-erased `AnyView` slot: this crate can say whether one
+                // is installed, not what it paints.
+                .with_attribute("occupant_introspectable", false),
+        );
+
+        VisualNode::new("ProjectToolbar").with_children(children)
     }
 }
 
@@ -520,6 +634,128 @@ mod tests {
         workspace.update(cx, |workspace, cx| {
             cx.new(|cx| super::ProjectToolbar::new(workspace, None, cx))
         })
+    }
+
+    /// Like `toolbar_for`, but keeps the window context and the `Workspace`
+    /// entity: `structure_node` needs both a live `Window` (dock-button
+    /// visibility) and the caller's `&Workspace` (the run-config slot).
+    fn toolbar_in_window<'a>(
+        project: &Entity<Project>,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<super::ProjectToolbar>,
+        Entity<Workspace>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let toolbar = workspace.update(cx, |workspace, cx| {
+            cx.new(|cx| {
+                super::ProjectToolbar::new(workspace, Some(multi_workspace.downgrade()), cx)
+            })
+        });
+        (toolbar, workspace, cx)
+    }
+
+    fn kinds(node: &VisualNode) -> Vec<&str> {
+        node.children
+            .iter()
+            .map(|child| child.kind.as_str())
+            .collect()
+    }
+
+    fn child<'a>(node: &'a VisualNode, kind: &str) -> &'a VisualNode {
+        node.children
+            .iter()
+            .find(|child| child.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind:?} child in {:?}", kinds(node)))
+    }
+
+    /// The dump's answer to "what does the project-toolbar row contain".
+    /// Order is painted order, and every child is emitted whether or not it
+    /// is currently shown, so an agent can tell "hidden" from "gone".
+    #[gpui::test]
+    async fn the_toolbar_structure_node_lists_its_row_in_painted_order(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (project, _) = setup_solution_member("toolbar-structure", nested_repo_tree(), cx).await;
+
+        let (toolbar, workspace, cx) = toolbar_in_window(&project, cx);
+        toolbar.update(cx, |toolbar, cx| {
+            toolbar
+                .ensure_project_tab_strip(cx)
+                .expect("the window has a MultiWorkspace, so the strip builds")
+        });
+
+        let node = workspace.update_in(cx, |workspace, window, cx| {
+            toolbar.read(cx).structure_node(workspace, window, cx)
+        });
+
+        assert_eq!(node.kind, "ProjectToolbar");
+        assert_eq!(
+            kinds(&node),
+            vec![
+                "DockButtons(left)",
+                "DockButtons(bottom)",
+                "DockButtons(right)",
+                "ProjectTabStrip",
+                "UpdateButton",
+                "PushButton",
+                "RepositorySelector",
+                "BranchWidget",
+                "RunConfigStrip",
+            ]
+        );
+
+        assert!(child(&node, "ProjectTabStrip").visible);
+        assert!(
+            child(&node, "UpdateButton").visible,
+            "the member owns a repository, so the fetch+pull button renders"
+        );
+
+        let selector = child(&node, "RepositorySelector");
+        assert!(selector.visible, "the member owns a vendored repo as well");
+        assert_eq!(
+            selector.attributes.get("repository_count"),
+            Some(&serde_json::json!(2))
+        );
+
+        let branch = child(&node, "BranchWidget");
+        assert!(branch.visible);
+        assert_eq!(branch.label.as_deref(), Some("main"));
+
+        let run_config = child(&node, "RunConfigStrip");
+        assert!(
+            !run_config.visible,
+            "nothing installed the run-config slot in this test window"
+        );
+        assert_eq!(
+            run_config.attributes.get("occupant_introspectable"),
+            Some(&serde_json::json!(false)),
+            "the strip is an AnyView; the dump must say it cannot see inside"
+        );
+    }
+
+    /// The probe and `render` must gate on the same thing — a selector the
+    /// toolbar is not painting must not read as present.
+    #[gpui::test]
+    async fn the_structure_node_hides_the_selector_exactly_when_render_does(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (project, _) =
+            setup_solution_member("toolbar-structure-one-repo", single_repo_tree(), cx).await;
+
+        let (toolbar, workspace, cx) = toolbar_in_window(&project, cx);
+        let node = workspace.update_in(cx, |workspace, window, cx| {
+            toolbar.read(cx).structure_node(workspace, window, cx)
+        });
+        let rendered = toolbar.update(cx, |toolbar, cx| {
+            toolbar.render_repository_selector(cx).is_some()
+        });
+
+        assert!(!rendered);
+        assert_eq!(child(&node, "RepositorySelector").visible, rendered);
     }
 
     fn work_directory(

@@ -84,6 +84,8 @@ actions!(
 pub fn init(cx: &mut App) {
     platform_title_bar::PlatformTitleBar::init(cx);
 
+    project_toolbar::register_toolbar_structure_provider(cx);
+
     update_layout_action_filter(cx);
 
     cx.observe_global::<SettingsStore>(update_layout_action_filter)
