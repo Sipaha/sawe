@@ -4663,6 +4663,88 @@ async fn mod_seq_stamped_on_live_mutations(cx: &mut TestAppContext) {
     });
 }
 
+/// `AcpThreadEvent::EntryUpdated(idx)` carries a LOCAL index into the live
+/// thread, while the `NewEntry` arm emits `SessionMessageAppended` with a
+/// GLOBAL one (`live_base + local`). Emitting the raw local index here made the
+/// same wire event mean two different things on a resumed session, and pointed
+/// `build_message_appended_payload` at the wrong entry on every streaming
+/// update — the flat index it once shipped was not even consistently flat.
+#[gpui::test]
+async fn entry_updated_emits_the_global_entry_index(cx: &mut TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = (0..2)
+                .map(|i| SessionEntry {
+                    created_ms: 1_700_000_000_000 + i,
+                    mod_seq: 0,
+                    subagent_id: None,
+                    kind: SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: format!("cold {i}"),
+                        chunks: vec![],
+                    },
+                })
+                .collect();
+            s.rebuild_streams();
+            // Re-attach so `live_base` = entries.len() = 2.
+            s.set_acp_thread(Some(acp_thread.clone()), cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // One live entry: local index 0, global index 2.
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("live".to_string()),
+                ),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        assert_eq!(session.read(cx).live_base, 2, "cold prefix length");
+    });
+
+    let emitted = Rc::new(std::cell::RefCell::new(Vec::<usize>::new()));
+    let _subscription = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let emitted = emitted.clone();
+        cx.subscribe(&store, move |_store, event, _cx| {
+            if let SolutionAgentStoreEvent::SessionMessageAppended(id, idx) = event
+                && *id == session_id
+            {
+                emitted.borrow_mut().push(*idx);
+            }
+        })
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::EntryUpdated(0));
+        });
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(600));
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        *emitted.borrow(),
+        vec![2],
+        "EntryUpdated(local 0) on a session with live_base=2 must announce global index 2"
+    );
+}
+
 /// Fix 4: after cold-restore of a NON-EMPTY prefix, attaching a live thread
 /// sets `live_base` to the prefix length. A subsequent `NewEntry` must land
 /// at `entries[live_base]` (AFTER the cold prefix) and leave the cold prefix
