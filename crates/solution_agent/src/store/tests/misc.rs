@@ -6793,8 +6793,11 @@ async fn toggle_dialog_session_does_not_reopen_a_closed_remembered_session(
 ///
 /// A second solution's remembered entry is seeded and asserted intact, because
 /// `last_dialog_session` is one map shared by every solution: a drop written as
-/// `clear()` (or a `retain` on the wrong key) would pass every other assertion
-/// here while silently forgetting every OTHER solution's reopen target.
+/// a whole-map `clear()` would pass every other assertion here while silently
+/// forgetting every OTHER solution's reopen target. Note this pins the
+/// `clear()` shape only — a VALUE-keyed `retain(|_, remembered| *remembered
+/// != id)`, the shape `clear_active_dialog_for_session` uses, would still pass,
+/// since the other solution remembers a different session id.
 #[gpui::test]
 async fn toggle_dialog_session_drops_a_stale_remembered_id(cx: &mut TestAppContext) {
     let (solution_id, _tmp, agent_id, project) = setup_toggle_dialog_fixture(cx).await;
