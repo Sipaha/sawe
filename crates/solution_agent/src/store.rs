@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -267,6 +268,87 @@ impl PersistChain {
     }
 }
 
+/// Every session's [`PersistChain`], held behind a shared cell so that the
+/// app-quit hook can take them on its FIRST POLL instead of at the moment the
+/// quit observer runs.
+///
+/// **Why the indirection is load-bearing.** `App::shutdown` collects the quit
+/// observers' futures FIRST, and only then clears the windows and runs
+/// `flush_effects()`. That flush releases the `MultiWorkspace` entity, whose
+/// release observer marks its Solutions closed, which reaches
+/// [`SolutionAgentStore::cold_close_solution`] and issues one last
+/// `persist_all_rows`. A snapshot taken while the observer runs is therefore
+/// always one flush short; the block that polls the future starts after
+/// `flush_effects`, so a snapshot taken there is not.
+///
+/// A quit future cannot get back to the store any other way. `shutdown` takes
+/// `&mut App` and holds that borrow across the whole timed block, so an
+/// `AsyncApp::update` inside a quit future panics on the re-borrow. The same
+/// borrow is what makes taking the map from inside the future sound: while the
+/// main thread is in `shutdown` no store method can run, and the chain links
+/// themselves never touch this map — they only own their predecessor.
+///
+/// Nothing hands out a borrow that outlives a call, so the `RefCell` cannot be
+/// re-entered: keep it that way when adding methods here.
+#[derive(Clone, Default)]
+struct PersistChains(Rc<RefCell<HashMap<SolutionSessionId, PersistChain>>>);
+
+impl PersistChains {
+    fn retire_finished(&self) {
+        self.0.borrow_mut().retain(|_, chain| !chain.is_finished());
+    }
+
+    /// Take a session's chain out to become the next link's `prev`, handing the
+    /// caller ownership of the whole nested task.
+    fn take_link(&self, session_id: SolutionSessionId) -> Option<Task<()>> {
+        self.0
+            .borrow_mut()
+            .remove(&session_id)
+            .map(|chain| chain.task)
+    }
+
+    fn insert(&self, session_id: SolutionSessionId, chain: PersistChain) {
+        self.0.borrow_mut().insert(session_id, chain);
+    }
+
+    fn remove(&self, session_id: SolutionSessionId) -> Option<PersistChain> {
+        self.0.borrow_mut().remove(&session_id)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, session_id: SolutionSessionId) -> bool {
+        self.0.borrow().contains_key(&session_id)
+    }
+
+    #[cfg(test)]
+    fn is_finished(&self, session_id: SolutionSessionId) -> Option<bool> {
+        self.0
+            .borrow()
+            .get(&session_id)
+            .map(|chain| chain.is_finished())
+    }
+
+    fn session_ids_for_solution(&self, solution_id: SolutionId) -> Vec<SolutionSessionId> {
+        self.0
+            .borrow()
+            .iter()
+            .filter(|(_, chain)| chain.solution_id == solution_id)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Empty the map and hand back the links that have not run yet. Emptying
+    /// cannot cancel anything: the tasks are moved out to the caller, which owns
+    /// them until they finish.
+    fn take_unfinished(&self) -> Vec<Task<()>> {
+        std::mem::take(&mut *self.0.borrow_mut())
+            .into_values()
+            .filter(|chain| !chain.is_finished())
+            .map(|chain| chain.task)
+            .collect()
+    }
+}
+
 pub struct SolutionAgentStore {
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
@@ -337,7 +419,7 @@ pub struct SolutionAgentStore {
     /// persist must chain behind the close's flush rather than race it. That is
     /// why a drained chain stays under its key instead of being detached — see
     /// [`Self::retire_finished_persist_chains`] for how the key is reclaimed.
-    entries_persist_chain: HashMap<SolutionSessionId, PersistChain>,
+    entries_persist_chain: PersistChains,
     /// When the stuck-turn watchdog last auto-reconnected each session, as
     /// epoch-millis. A fresh `claude --resume` must re-ingest the whole
     /// transcript before it emits anything, and on a large context that easily
@@ -858,7 +940,7 @@ impl SolutionAgentStore {
             model_catalog: ModelCatalog::new(),
             focus_resolver: None,
             entry_update_throttles: HashMap::new(),
-            entries_persist_chain: HashMap::new(),
+            entries_persist_chain: PersistChains::default(),
             last_auto_reconnect_ms: HashMap::new(),
             teammate_watchers: TeammateWatchers::new(),
             metrics_emitter: MetricsEmitter::new(),
@@ -3793,8 +3875,7 @@ impl SolutionAgentStore {
     /// candidates are all unrelated to this map (`gc_orphan_members`) or take
     /// `&self` and could not mutate it anyway (the hydration paths).
     fn retire_finished_persist_chains(&mut self) {
-        self.entries_persist_chain
-            .retain(|_, chain| !chain.is_finished());
+        self.entries_persist_chain.retire_finished();
     }
 
     /// Await every retained entry-row write chain, so quitting the editor does
@@ -3839,16 +3920,20 @@ impl SolutionAgentStore {
     /// nothing still under a key here can resurrect rows for a deleted session.
     /// Emptying the map cannot cancel anything either — the tasks are moved into
     /// the returned future, which owns them until they finish.
+    ///
+    /// **The map is taken by the FUTURE, not by this function.** `shutdown` runs
+    /// the observers before it clears the windows and flushes effects, and that
+    /// flush lands one more `cold_close_solution` flush (see [`PersistChains`]);
+    /// snapshotting here would leave exactly that link unjoined. The `async move`
+    /// body does not run until `block_with_timeout` first polls it, which is
+    /// after the flush.
     fn flush_persist_chains_on_quit(
         &mut self,
         _cx: &mut Context<Self>,
     ) -> impl Future<Output = ()> + use<> {
-        let pending: Vec<Task<()>> = std::mem::take(&mut self.entries_persist_chain)
-            .into_values()
-            .filter(|chain| !chain.is_finished())
-            .map(|chain| chain.task)
-            .collect();
+        let chains = self.entries_persist_chain.clone();
         async move {
+            let pending = chains.take_unfinished();
             if pending.is_empty() {
                 return;
             }
@@ -3869,7 +3954,7 @@ impl SolutionAgentStore {
     /// advance `persisted_main_seq` synchronously before spawning, so no later
     /// persist re-picks those rows.
     fn abandon_persist_chain(&mut self, session_id: SolutionSessionId) {
-        if let Some(chain) = self.entries_persist_chain.remove(&session_id)
+        if let Some(chain) = self.entries_persist_chain.remove(session_id)
             && !chain.is_finished()
         {
             log::warn!(
@@ -3884,12 +3969,9 @@ impl SolutionAgentStore {
     /// `by_solution`, so the per-session purge loop never reaches them, but their
     /// drained chain can still be in flight).
     fn abandon_persist_chains_for_solution(&mut self, solution_id: SolutionId) {
-        let doomed: Vec<SolutionSessionId> = self
+        let doomed = self
             .entries_persist_chain
-            .iter()
-            .filter(|(_, chain)| chain.solution_id == solution_id)
-            .map(|(id, _)| *id)
-            .collect();
+            .session_ids_for_solution(solution_id);
         for id in doomed {
             self.abandon_persist_chain(id);
         }
@@ -3941,10 +4023,7 @@ impl SolutionAgentStore {
         // `persist_main_stream`) — a full flush's trailing trim must not race a
         // concurrent incremental append's upsert.
         self.retire_finished_persist_chains();
-        let prev = self
-            .entries_persist_chain
-            .remove(&session_id)
-            .map(|chain| chain.task);
+        let prev = self.entries_persist_chain.take_link(session_id);
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = cx.background_spawn({
             let finished = finished.clone();
@@ -4027,10 +4106,7 @@ impl SolutionAgentStore {
         // trim could land after the reopened session's first upsert and delete
         // the user's new message.
         self.retire_finished_persist_chains();
-        let prev = self
-            .entries_persist_chain
-            .remove(&session_id)
-            .map(|chain| chain.task);
+        let prev = self.entries_persist_chain.take_link(session_id);
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = cx.background_spawn({
             let finished = finished.clone();

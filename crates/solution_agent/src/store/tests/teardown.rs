@@ -637,7 +637,7 @@ async fn close_session_flushes_persist_chain_to_disk(cx: &mut gpui::TestAppConte
         store.persist_main_stream(id, cx);
         store.close_session(id, cx).expect("close_session");
         assert!(
-            store.entries_persist_chain.contains_key(&id),
+            store.entries_persist_chain.contains(id),
             "the drained chain must STAY under its key — the map owns it (so it \
              runs at all) and a reopen that re-keys this id has to find it as \
              its `prev`"
@@ -1457,7 +1457,7 @@ async fn cold_close_solution_flushes_persist_chain_to_disk(cx: &mut gpui::TestAp
 /// Three rows on disk and a three-entry transcript, closed and reopened with one
 /// new message appended. Ordered: four rows. Unordered: three, with the new
 /// message silently absent from disk and gone at the next cold load.
-#[gpui::test]
+#[gpui::test(iterations = 32)]
 async fn close_then_reopen_orders_the_new_chain_behind_the_drained_flush(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -1573,7 +1573,7 @@ async fn close_then_reopen_orders_the_new_chain_behind_the_drained_flush(
 /// set in one), but they still make its trailing trim a 200-row one — which is
 /// the value that deletes the new message the moment the chain stops ordering
 /// the two.
-#[gpui::test]
+#[gpui::test(iterations = 32)]
 async fn close_then_reopen_orders_a_long_flush_before_the_new_message(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -1705,7 +1705,7 @@ async fn a_finished_persist_chain_is_retired_from_the_map(cx: &mut gpui::TestApp
         // not been polled: the sweep must leave it alone.
         store.retire_finished_persist_chains();
         assert!(
-            store.entries_persist_chain.contains_key(&id),
+            store.entries_persist_chain.contains(id),
             "a chain still in flight must survive the sweep — reclaiming it \
              here would cancel the close flush instead of draining it"
         );
@@ -1714,15 +1714,12 @@ async fn a_finished_persist_chain_is_retired_from_the_map(cx: &mut gpui::TestApp
 
     store.update(cx, |store, _| {
         assert!(
-            store
-                .entries_persist_chain
-                .get(&id)
-                .is_some_and(|chain| chain.is_finished()),
+            store.entries_persist_chain.is_finished(id) == Some(true),
             "the drained chain must have run to completion and said so"
         );
         store.retire_finished_persist_chains();
         assert!(
-            !store.entries_persist_chain.contains_key(&id),
+            !store.entries_persist_chain.contains(id),
             "a spent chain must be reclaimed — otherwise the map grows one \
              entry per closed session for the process's lifetime"
         );
@@ -1781,7 +1778,7 @@ async fn purge_after_soft_close_abandons_the_drained_chain(cx: &mut gpui::TestAp
         // chain at all: nothing else removes this key (the sweep only reclaims
         // spent chains, and this one has not been polled yet).
         assert!(
-            !store.entries_persist_chain.contains_key(&id),
+            !store.entries_persist_chain.contains(id),
             "the purge must reach the retained chain of a session it can no \
              longer tear down through `teardown_session_runtime`"
         );
@@ -2038,8 +2035,12 @@ async fn a_reader_never_observes_a_half_written_close_flush(cx: &mut gpui::TestA
 /// finish it is the quit hook awaiting background work.
 ///
 /// `set_block_on_ticks` pins the tick budget the scheduler draws for a timed
-/// block (`1..=1000` by default, i.e. as few as one poll) so the drain is not
-/// randomly cut short; production's budget is `gpui::SHUTDOWN_TIMEOUT` of real
+/// block so the drain is not randomly cut short. Every `TestAppContext` gets
+/// that budget from `TestDispatcher::new`, which builds its config with
+/// `timeout_ticks: 0..=1000` — the FLOOR IS ZERO, i.e. `TestScheduler::block`
+/// can return without polling the quit future even once. (`1..=1000` is
+/// `TestSchedulerConfig::default()`, which nothing outside the scheduler crate's
+/// own tests reaches.) Production's budget is `gpui::SHUTDOWN_TIMEOUT` of real
 /// wall clock, which a single batched write never approaches.
 #[gpui::test]
 async fn app_quit_flushes_the_in_flight_entry_row_chain(cx: &mut gpui::TestAppContext) {
@@ -2079,7 +2080,7 @@ async fn app_quit_flushes_the_in_flight_entry_row_chain(cx: &mut gpui::TestAppCo
         store.persist_main_stream(id, cx);
         store.persist_all_rows(id, cx);
         assert!(
-            store.entries_persist_chain.contains_key(&id),
+            store.entries_persist_chain.contains(id),
             "fixture: the chain must still be queued when the app quits"
         );
     });
@@ -2172,4 +2173,114 @@ async fn app_quit_does_not_resurrect_an_abandoned_persist_chain(cx: &mut gpui::T
          purge deleted; found {} row(s)",
         rows.len(),
     );
+}
+
+/// The quit hook must join the flush that `App::shutdown`'s OWN `flush_effects`
+/// produces, not just the ones already queued when the observer ran.
+///
+/// `shutdown` collects the quit futures first, then clears the windows and
+/// flushes effects — and that flush releases the `MultiWorkspace`, whose release
+/// observer marks its Solutions closed and lands one final `cold_close_solution`
+/// → `persist_all_rows`. A hook that snapshots the chain map while the observer
+/// runs is always exactly that one flush short, and in the worst case (nothing
+/// else in flight) its future is Ready on the very first poll, so the process
+/// exits without the write getting a single background turn.
+///
+/// The fixture reproduces that shape without a window: a sentinel entity whose
+/// release observer issues the persist, dropped OUTSIDE any `cx.update` so the
+/// release is still pending when `shutdown` runs its flush. Nothing is queued
+/// before the quit, which is deliberately the worst case.
+#[gpui::test]
+async fn app_quit_flushes_a_chain_issued_during_shutdown(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+
+    let (id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let db = Arc::new(crate::db::SolutionAgentDb::open(cx.executor()).expect("open db"));
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    store.update(cx, |store, cx| store.set_persistence(db.clone(), cx));
+
+    for idx in 0..3 {
+        db.upsert_entry(id, idx, 0, 1_700_000_000_000 + idx, None, b"stale".to_vec())
+            .await
+            .expect("seed stale row");
+    }
+
+    let message = |n: u64, text: &str| SessionEntry {
+        created_ms: 1_700_000_000_000 + n as i64,
+        mod_seq: n,
+        subagent_id: None,
+        kind: SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks: vec![],
+        },
+    };
+
+    store.update(cx, |store, cx| {
+        let session = store.session(id).expect("session");
+        session.update(cx, |s, cx| {
+            s.entries = vec![message(1, "alpha"), message(2, "bravo")];
+            s.rebuild_streams();
+            cx.notify();
+        });
+    });
+
+    // The window's root view stands in for the `MultiWorkspace`: nothing releases
+    // it until `shutdown` itself clears the windows, so the persist it triggers
+    // is issued from shutdown's own `flush_effects` — after every quit observer
+    // has already run.
+    let window = cx.add_window(|_, _| QuitFlushRoot);
+    let root = window.root(cx).expect("root view");
+    cx.update(|cx| {
+        cx.observe_release(&root, {
+            let store = store.clone();
+            move |_, cx| {
+                store.update(cx, |store, cx| store.persist_all_rows(id, cx));
+            }
+        })
+        .detach();
+    });
+    drop(root);
+    assert!(
+        !store.read_with(cx, |store, _| store.entries_persist_chain.contains(id)),
+        "fixture: nothing may be queued before the quit — the point is that the \
+         only flush is the one shutdown's own flush_effects produces"
+    );
+
+    cx.executor().set_block_on_ticks(usize::MAX..=usize::MAX);
+    cx.quit();
+
+    let rows = db.load_entries_blocking(id).expect("load rows");
+    let texts: Vec<String> = rows
+        .iter()
+        .map(
+            |row| match crate::session_entry::kind_from_payload(&row.payload) {
+                Ok(SessionEntryKind::UserMessage { content_md, .. }) => content_md,
+                Ok(other) => format!("{other:?}"),
+                Err(_) => String::from_utf8_lossy(&row.payload).into_owned(),
+            },
+        )
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["alpha".to_string(), "bravo".to_string()],
+        "the chain issued during shutdown's own flush_effects must be drained \
+         too: idx 0..1 rewritten from the in-memory Main stream and the stale \
+         idx 2 trimmed"
+    );
+}
+
+/// Root view for `app_quit_flushes_a_chain_issued_during_shutdown`: it exists
+/// only to be released by `App::shutdown`'s `self.windows.clear()`, the way the
+/// real `MultiWorkspace` is.
+struct QuitFlushRoot;
+
+impl gpui::Render for QuitFlushRoot {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+    }
 }
