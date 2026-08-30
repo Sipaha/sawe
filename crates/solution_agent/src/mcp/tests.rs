@@ -2677,6 +2677,18 @@ async fn read_session_history_distinguishes_a_wiped_session_from_a_legacy_one(
         "legacy blob content must round-trip; got {:?}",
         sc.entries[0]
     );
+    // ANTI-VACUITY for all three title assertions in this test: they only
+    // distinguish the metadata row from the blob while the fixture's two copies
+    // DISAGREE. Read the divergence out of the fixture rather than trusting the
+    // literals to stay different.
+    let blob_title = serde_json::from_slice::<crate::store::PersistedSession>(&blob("x"))
+        .expect("fixture blob decodes")
+        .title;
+    assert_ne!(
+        blob_title, "legacy session",
+        "the fixture's blob title must differ from the metadata row's, or every \
+         title assertion here passes no matter which source is served"
+    );
     assert_eq!(
         sc.title, "legacy session",
         "even on the blob branch the title must come from the metadata row: the \
