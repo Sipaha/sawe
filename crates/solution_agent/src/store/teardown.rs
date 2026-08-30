@@ -445,8 +445,8 @@ impl SolutionAgentStore {
         // discarded flush was covering.
         //
         // Why the liveness gate. `persist_all_rows` is a full rewrite, not an
-        // append: it upserts the Main stream at Main-local indices and then
-        // `delete_entries_from(main_len)`. On a legacy pre-6b row layout
+        // append: it upserts the Main stream at Main-local indices and trims
+        // everything past it, in one write. On a legacy pre-6b row layout
         // `entries.len() > main_len` — teammate-tagged rows demux out of Main —
         // so an executed flush DELETES those teammate rows. That one-time
         // realign is defensible for a session the user actually worked in (cold

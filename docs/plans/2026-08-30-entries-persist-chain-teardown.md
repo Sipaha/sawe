@@ -101,6 +101,21 @@ A read-only recon pass answered the question that had blocked this item for two 
 
 24. **App quit loses everything in flight with no flush attempt at all.** There is no `on_app_quit` hook in `solution_agent`; the store global drops with the process. This is a *separate, larger* bug than the one this plan fixes — adding a quit-time drain is new scope (and the chain runs on the **foreground** executor, so a detached link needs the app to keep pumping, which quit does not). Recorded as a new pool item.
 
+25. **`solution_agent`'s database runs on sqlite's defaults — rollback journal, `synchronous=FULL`.** It opens with a bare
+    `Connection::open_file` under its own `Arc<Mutex<Connection>>` (`db.rs::open` → `open_connection`, which issues DDL
+    and nothing else), not through sqlez's `ThreadSafeConnection` — and that wrapper is the *only* place
+    `PRAGMA journal_mode=WAL` / `synchronous=NORMAL` are set (`crates/sqlez/src/thread_safe_connection.rs`). So every
+    write in this crate pays a full-sync rollback-journal commit, and a reader blocks on a writer instead of reading the
+    pre-write snapshot. The batching (fact 23) already cut this path's fsync traffic ~200x, which is why it is not
+    urgent; WAL is a separate and larger question (it changes the on-disk file set, and the single-`Mutex` access
+    discipline would want re-checking against WAL's concurrency model before claiming a benefit). **Recorded, not
+    attempted here.**
+
+26. **`drop_empty_payload_rows` is unpinned by any test.** It is the guard that keeps a serde failure in
+    `SessionEntry::to_payload` from replacing a decodable row with an undecodable one, it runs on both persist paths
+    (`store.rs`), and nothing asserts it — pre-existing, not introduced by the batching. A test would need to feed the
+    filter a row set containing an empty payload directly; it does not need a persist round trip.
+
 ---
 
 ## Rulings (binding)
@@ -153,4 +168,4 @@ fn teardown_session_runtime(&mut self, …, chain: ChainDisposition) -> …;
 - [x] Review follow-up: `a_finished_persist_chain_is_retired_from_the_map` asserts the NEGATIVE too — a chain still in flight survives the sweep — so an unconditional-retire mutation dies on that assertion by design rather than incidentally on the next one.
 - [x] Review follow-up: `purge_after_soft_close_abandons_the_drained_chain` was widened, not renamed. It now asserts synchronously off the map that the not-hydrated branch REACHED the chain, which holds at any depth; the `load_entries` check behind it keeps its one-link fixture and its doc says so, because fact 21 makes an all-depths row assertion false rather than stronger.
 - [x] Review follow-up: [`ChainDisposition::Abandon`]'s doc records that fact 21's partial cancellation also leaves the inner links unordered against anything new, and why that is unreachable today (a purged session id is never re-hydrated).
-- [x] Record facts 21-24 (orphan entry rows with no reaper; the torn read a reopen can still do; the batched `upsert_entries` that would shrink both windows; app quit) as open pool items with the recon detail, so the next session does not re-derive them.
+- [x] Record facts 21-26 (orphan entry rows with no reaper; the torn read a reopen can still do; the batched `upsert_entries` that would shrink both windows; app quit; the crate's non-WAL sqlite defaults; the untested `drop_empty_payload_rows`) as open pool items with the recon detail, so the next session does not re-derive them.

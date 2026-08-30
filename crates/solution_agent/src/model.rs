@@ -1025,8 +1025,9 @@ impl SolutionSession {
         // Main row's slot with a different entry and strand the stale row forever
         // (phase-6b keystone bug). Seed the watermark to 0 in that case so the
         // first persist re-writes the ENTIRE Main stream at Main-local indices and
-        // `delete_entries_from(Main.len)` trims the leftovers — a one-time realign
-        // that self-heals the legacy layout. When the counts match, the rows are
+        // the trim that rides in the same `upsert_entries_and_trim` write drops the
+        // leftovers past `Main.len` — a one-time realign that self-heals the legacy
+        // layout. When the counts match, the rows are
         // already Main-local (a clean 6b session, whose persisted rows ARE the
         // coalesced Main stream), so seed to Main.seq and skip the redundant
         // re-upsert. Keyed on the count (not `hydration_orphan_streams`, which is
