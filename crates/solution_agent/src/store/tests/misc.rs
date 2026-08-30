@@ -6778,3 +6778,81 @@ async fn toggle_dialog_session_does_not_reopen_a_closed_remembered_session(
         "persisted row must reflect the live session, never the dangling session_s"
     );
 }
+
+/// A remembered id that stops qualifying must be DROPPED from
+/// `last_dialog_session`, not merely skipped. `persist_tab_order` is the
+/// live path that produces this state: it NULLs `tab_order` on every session
+/// of the solution absent from the new order (what the close-tab affordance
+/// and the `workspace.close_session` RPC go through), which leaves the
+/// session in `store.sessions` — so `clear_active_dialog_for_session` never
+/// runs — while making `can_be_active_dialog` false. The single session here
+/// is deliberately the ONLY one, so the `first_tab_order_session` fallback
+/// finds nothing and `set_active_dialog_session` does not run: with the entry
+/// left in place the map keeps pointing at a session the hotkey can never
+/// reopen, and every later press re-does the same failed validation.
+#[gpui::test]
+async fn toggle_dialog_session_drops_a_stale_remembered_id(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, agent_id, project) = setup_toggle_dialog_fixture(cx).await;
+
+    let session_id = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session");
+
+    // Show it, so it becomes the remembered reopen target, then collapse the
+    // band — `last_dialog_session[solution] == session_id` survives that.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_active_dialog_session(solution_id, Some(session_id), cx);
+            store.set_active_dialog_session(solution_id, None, cx);
+        });
+    });
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.last_dialog_session.get(&solution_id),
+                Some(&session_id),
+                "sanity: showing then collapsing leaves the session remembered"
+            );
+        });
+    });
+
+    // Un-pin it from the strip. The session stays in memory, but
+    // `tab_order == None` makes it ineligible to be the active dialog.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.persist_tab_order(solution_id, Vec::new(), cx)
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.toggle_dialog_session(solution_id, cx));
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.last_dialog_session.get(&solution_id),
+                None,
+                "a remembered id that fails validation must be dropped from the map"
+            );
+            assert_eq!(
+                store.active_dialog_session(solution_id),
+                None,
+                "with no eligible session the hotkey stays a no-op"
+            );
+        });
+    });
+}

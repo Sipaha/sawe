@@ -1660,16 +1660,30 @@ impl SolutionAgentStore {
     /// id here silently falls through to the `tab_order` fallback instead
     /// of reopening on — or worse, persisting — a dead session (review
     /// fix-round 1, Critical).
+    ///
+    /// A remembered id that fails that validation is also DROPPED from
+    /// `last_dialog_session` rather than merely ignored, so the map does not
+    /// keep pointing at a session that can never be reopened again. Not every
+    /// way an id goes stale routes through `clear_active_dialog_for_session`:
+    /// `persist_tab_order` NULLs `tab_order` on every session of the solution
+    /// absent from the new order (the `workspace.close_session` /
+    /// close-tab path), which leaves the session in `self.sessions` but
+    /// makes `can_be_active_dialog` false — the map would otherwise hold that
+    /// id until the next `set_active_dialog_session` happened to overwrite it.
     pub fn toggle_dialog_session(&mut self, solution_id: SolutionId, cx: &mut Context<Self>) {
         if self.active_dialog_session(solution_id).is_some() {
             self.set_active_dialog_session(solution_id, None, cx);
             return;
         }
-        let remembered = self
-            .last_dialog_session
-            .get(&solution_id)
-            .copied()
-            .filter(|id| self.session_can_be_active_dialog(solution_id, *id, cx));
+        let remembered = self.last_dialog_session.get(&solution_id).copied();
+        let remembered = match remembered {
+            Some(id) if self.session_can_be_active_dialog(solution_id, id, cx) => Some(id),
+            Some(_) => {
+                self.last_dialog_session.remove(&solution_id);
+                None
+            }
+            None => None,
+        };
         let reopen_target = remembered.or_else(|| self.first_tab_order_session(solution_id, cx));
         if let Some(session_id) = reopen_target {
             self.set_active_dialog_session(solution_id, Some(session_id), cx);
@@ -1952,8 +1966,10 @@ impl SolutionAgentStore {
     /// Critical). `toggle_dialog_session` independently re-validates
     /// whatever it reads from `last_dialog_session` before using it, so
     /// this scrub is defense-in-depth, not the only thing standing between
-    /// the hotkey and a dangling id — but it is what keeps the map itself
-    /// honest for anything else that might read it later.
+    /// the hotkey and a dangling id — but it is what keeps the map honest
+    /// *eagerly*, at the moment the session goes away, for anything else that
+    /// reads it later. (`toggle_dialog_session` drops a stale entry too, but
+    /// only lazily, the next time the hotkey happens to be pressed.)
     fn clear_active_dialog_for_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
         self.last_dialog_session
             .retain(|_, remembered| *remembered != id);
