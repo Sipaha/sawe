@@ -2449,6 +2449,287 @@ async fn resume_of_an_undecodable_blob_leaves_the_row_recoverable(cx: &mut TestA
     });
 }
 
+/// F2, the destructive one: a transient entry-ROW read failure on reopen must
+/// not delete the transcript.
+///
+/// The shape is a session BORN row-native — rows, no blob, `epoch` NULL. When
+/// `load_entries` errors, `resume_session` used to take the failure as "no
+/// rows": `is_wiped_row_native(true, 0)` is false and there is no blob to
+/// decode, so `migrating` was true, and `persist_all_rows` flushed zero rows
+/// with `trim_from_idx = 0` — a `delete_entries_from_idx(id, 0)` over every row
+/// in the table. One sqlite hiccup during a History reopen and the conversation
+/// was gone, with nothing left to recover it from. Unlike the blob cases, this
+/// one does not merely hide the transcript; it removes it.
+#[gpui::test]
+async fn a_failed_row_read_on_reopen_does_not_delete_the_rows(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::with_resume_support(Arc::new(
+                    AtomicUsize::new(0),
+                ))),
+            );
+        });
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-rows"),
+        title: SharedString::from("row-native session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    db.save_metadata(meta.clone()).await.expect("save metadata");
+    for idx in 0..3i64 {
+        let entry = crate::session_entry::SessionEntry {
+            created_ms: 1_700_000_000_000 + idx,
+            mod_seq: (idx + 1) as u64,
+            subagent_id: None,
+            kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                chunks: vec![crate::session_entry::AssistantChunk::Message(
+                    format!("line {idx}").into(),
+                )],
+            },
+        };
+        db.upsert_entry(
+            session_id,
+            idx,
+            entry.mod_seq as i64,
+            entry.created_ms,
+            None,
+            entry.to_payload(),
+        )
+        .await
+        .expect("upsert entry");
+    }
+    // Born row-native: rows on disk, NO blob, epoch never written. That
+    // combination is what makes the failure destructive rather than merely
+    // misleading — with `epoch` NULL the wiped-session guard does not fire.
+    assert_eq!(
+        db.load_entries(session_id).await.expect("load rows").len(),
+        3,
+        "fixture must have rows to lose"
+    );
+    assert!(
+        db.load_blob(session_id).await.expect("load blob").is_none(),
+        "fixture must have no blob: the blob path is a different arm"
+    );
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch"),
+        None,
+        "fixture's epoch must be NULL, or `is_wiped_row_native` short-circuits \
+         the branch under test"
+    );
+
+    db.fail_next_entry_load();
+    let resumed = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.resume_session(meta.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("a failed row read must not fail the reopen");
+    assert_eq!(resumed, session_id);
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_entries(session_id)
+            .await
+            .expect("load rows after")
+            .len(),
+        3,
+        "a transient read failure must leave every row on disk — the migration \
+         it used to trigger trims from index 0 and deletes them all"
+    );
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch after"),
+        None,
+        "and it must not record the failure as a generation bump"
+    );
+
+    // The reopen is lossless, not merely non-destructive: close the tab and
+    // reopen it with a healthy read, and the transcript is all there.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.sessions.remove(&session_id);
+            store.by_solution.remove(&solution_id);
+        });
+    });
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.resume_session(meta, project, cx))
+    })
+    .await
+    .expect("second resume");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("re-resumed session")
+                .read_with(cx, |s, _| {
+                    assert_eq!(
+                        s.entries.len(),
+                        3,
+                        "every entry must come back on the retry"
+                    );
+                });
+        });
+    });
+}
+
+/// F1: a transient BLOB read failure is the same defect as an undecodable blob,
+/// and was left unjoined to the flag that guards it.
+///
+/// `load_blob` erroring produced `None`, which is byte-identical to "this
+/// session has no blob" — so `migrating` was true, `persist_all_rows` wrote zero
+/// rows and bumped the epoch, and "no rows + epoch > 0" is `is_wiped_row_native`'s
+/// definition of a `/clear`. One transient sqlite error during a History reopen
+/// permanently converted a legacy session into a wiped one, with the intact
+/// bytes still sitting in the column and nothing ever looking at them again.
+#[gpui::test]
+async fn a_failed_blob_read_on_reopen_does_not_wipe_the_session(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::with_resume_support(Arc::new(
+                    AtomicUsize::new(0),
+                ))),
+            );
+        });
+    });
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    let meta = crate::model::SolutionSessionMetadata {
+        id: session_id,
+        solution_id,
+        agent_id: agent_id.clone(),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-legacy"),
+        title: SharedString::from("legacy session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+    db.save_metadata(meta.clone()).await.expect("save metadata");
+    db.save_blob(
+        session_id,
+        serde_json::to_vec(&PersistedSession {
+            title: "legacy session".into(),
+            entry_summaries: vec!["a line the user still wants".to_string()],
+            ..Default::default()
+        })
+        .expect("encode blob"),
+    )
+    .await
+    .expect("save blob");
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch"),
+        None,
+        "fixture is un-migrated, so only this reopen can set the epoch"
+    );
+
+    db.fail_next_blob_load();
+    let resumed = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.resume_session(meta.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("a failed blob read must not fail the reopen");
+    assert_eq!(resumed, session_id);
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_epoch(session_id).await.expect("load epoch after"),
+        None,
+        "a failed READ must not be recorded as a generation the user asked for"
+    );
+    assert!(
+        db.load_blob(session_id).await.expect("load blob").is_some(),
+        "the bytes must still be there"
+    );
+
+    // And the next reopen — with the read succeeding — serves the transcript,
+    // which it cannot do if the failed one marked the row as wiped.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.sessions.remove(&session_id);
+            store.by_solution.remove(&solution_id);
+        });
+    });
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.resume_session(meta, project, cx))
+    })
+    .await
+    .expect("second resume");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(session_id)
+                .expect("re-resumed session")
+                .read_with(cx, |s, _| {
+                    assert_eq!(
+                        s.entries.len(),
+                        1,
+                        "the transcript must come back on the retry"
+                    );
+                });
+        });
+    });
+}
+
 /// The other side of the same predicate on the resume path: a genuinely
 /// un-migrated blob-only session (`epoch` never written, so NULL → 0) must
 /// still have its transcript restored when the user reopens it from History.

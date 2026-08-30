@@ -330,7 +330,12 @@ pub(crate) struct ColdSessionBuild {
     /// a deliberate wipe, so the still-intact bytes on disk would be permanently
     /// unreadable by every path — the corruption would become the truth.
     pub migrating: bool,
-    /// A legacy blob was present and could NOT be decoded. The entity is still
+    /// A legacy blob was present and could NOT be decoded. Decoding is the only
+    /// failure this function can observe — its `rows` and `blob` are already
+    /// loaded — but the rule the flag exists to enforce covers the reads too, and
+    /// a caller that performs them must apply it itself: `hydrate_all_for_solution`
+    /// by `?`-ing every load, `resume_session` by its own `transcript_unavailable`.
+    /// The entity is still
     /// built (metadata, title, epoch — everything but the transcript) so a caller
     /// that must show *something* can, but `session.entries` is EMPTY and is not
     /// this session's content: serving it unremarked reports data loss as a
@@ -744,6 +749,12 @@ impl SolutionAgentStore {
             // foreground thread; only load+deserialize the legacy transcript
             // blob when there are no rows yet (the fresh-entity branch below
             // then lazily migrates the blob to rows).
+            // Set by ANY failure to obtain this session's transcript — a row read
+            // that errored, a blob read that errored, a blob that would not
+            // decode. It is the guard on `migrating` below; see the block comment
+            // there for why the distinction from "there genuinely is no
+            // transcript" is the whole point.
+            let mut transcript_unavailable = false;
             let (preloaded_rows, preloaded_epoch, preloaded_change_seq) = {
                 let tasks = this.update(cx, |store, _| {
                     store.persistence().map(|db| {
@@ -757,9 +768,21 @@ impl SolutionAgentStore {
                 match tasks {
                     Some((rows_task, epoch_task, change_seq_task)) => {
                         let rows = rows_task.await.unwrap_or_else(|err| {
-                            log::warn!(
+                            // The most destructive of the three arms, because for a
+                            // BORN-row-native session (no blob, `epoch` NULL → 0)
+                            // an empty row set is not merely "nothing to migrate":
+                            // `is_wiped_row_native` is false, so `migrating` used
+                            // to be true, and `persist_all_rows` then flushed zero
+                            // rows with `trim_from_idx = 0` — a
+                            // `delete_entries_from_idx(id, 0)` that DELETES the
+                            // whole transcript. One transient sqlite read error on
+                            // reopen destroyed the conversation, permanently.
+                            transcript_unavailable = true;
+                            log::error!(
                                 target: "solution_agent::resume",
-                                "session={} entry-row load failed on reopen: {err}",
+                                "session={} entry-row load failed on reopen; \
+                                 reopening it EMPTY and leaving the rows on disk \
+                                 untouched: {err}",
                                 meta.id
                             );
                             Vec::new()
@@ -781,13 +804,6 @@ impl SolutionAgentStore {
             // also saves the read outright.
             let wiped_row_native =
                 is_wiped_row_native(preloaded_rows.is_empty(), preloaded_epoch);
-            // Set when a blob is on disk but cannot be decoded, which must
-            // suppress the migration below for the reason spelled out on
-            // `ColdSessionBuild::migrating`: migrating an unreadable blob writes
-            // zero rows and bumps the epoch, and the pair then reads as a wipe
-            // forever after. Distinct from "no blob at all", which migrates as
-            // before.
-            let mut blob_undecodable = false;
             let preloaded_persisted: Option<PersistedSession> = if !preloaded_rows.is_empty()
                 || wiped_row_native
             {
@@ -802,7 +818,7 @@ impl SolutionAgentStore {
                             match serde_json::from_slice::<PersistedSession>(&bytes) {
                                 Ok(p) => Some(p),
                                 Err(err) => {
-                                    blob_undecodable = true;
+                                    transcript_unavailable = true;
                                     log::error!(
                                         target: "solution_agent::resume",
                                         "session={} blob decode failed on reopen; \
@@ -814,11 +830,17 @@ impl SolutionAgentStore {
                                 }
                             }
                         }
+                        // `Ok(None)` is a session that genuinely has no blob, which
+                        // is NOT a failure: it migrates as before (there is simply
+                        // nothing to lose). Only the `Err` arm below is.
                         Ok(None) => None,
                         Err(err) => {
-                            log::warn!(
+                            transcript_unavailable = true;
+                            log::error!(
                                 target: "solution_agent::resume",
-                                "session={} blob load failed on reopen: {err}",
+                                "session={} blob load failed on reopen; reopening \
+                                 it EMPTY and leaving the bytes on disk untouched \
+                                 for recovery: {err}",
                                 meta.id
                             );
                             None
@@ -915,8 +937,19 @@ impl SolutionAgentStore {
                     // migrate it. Without that second condition, reopening a
                     // `/clear`ed tab from History repaints the erased
                     // conversation and drops the epoch from N to 1.
-                    let migrating =
-                        preloaded_rows.is_empty() && !wiped_row_native && !blob_undecodable;
+                    // `!transcript_unavailable` is load-bearing, not defensive.
+                    // "Migrating" means "the legacy transcript has been read and is
+                    // about to be rewritten as rows"; a failed READ produces the
+                    // same empty entry set as a session that has nothing to migrate,
+                    // and `persist_all_rows` then flushes ZERO rows and bumps the
+                    // epoch. That pair is `is_wiped_row_native`'s definition of a
+                    // deliberate `/clear`, so the failure would be recorded as the
+                    // user's own intent — and for a row-native session the trim
+                    // deletes the rows outright. NEVER derive this flag from
+                    // "rows absent" alone.
+                    let migrating = preloaded_rows.is_empty()
+                        && !wiped_row_native
+                        && !transcript_unavailable;
                     let entries = if !preloaded_rows.is_empty() {
                         entries_from_rows(preloaded_rows)
                     } else {
@@ -1206,6 +1239,17 @@ impl SolutionAgentStore {
             > = std::collections::HashMap::new();
             let mut blobs: std::collections::HashMap<SolutionSessionId, Vec<u8>> =
                 std::collections::HashMap::new();
+            // `?` on every read here, DELIBERATELY unlike `resume_session`, which
+            // logs a failed transcript read and reopens the tab empty. The two
+            // restore paths make opposite trades and both are right for where they
+            // sit: this one is the bulk restore of a whole Solution, running before
+            // any of these sessions is on screen, so aborting costs a retry and
+            // nothing else — whereas a `resume_session` is a tab the user just
+            // clicked, where failing the reopen would leave them with no session at
+            // all instead of an empty one they can close. The invariant they DO
+            // share is the one below: neither may treat a failed read as "no
+            // transcript" and migrate on the strength of it. Here that is free —
+            // `?` means a failed read never reaches `build_cold_session`.
             for meta in &to_hydrate {
                 let rows = db.load_entries(meta.id).await?;
                 let epoch = db.load_epoch(meta.id).await?.unwrap_or(0);

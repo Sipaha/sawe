@@ -64,9 +64,15 @@ impl SolutionAgentDb {
         let connection = self.connection.clone();
         #[cfg(any(test, feature = "test-support"))]
         let blob_load_count = self.blob_load_count.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let fail_next = self.fail_next_blob_load.clone();
         self.executor.spawn(async move {
             #[cfg(any(test, feature = "test-support"))]
             blob_load_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            #[cfg(any(test, feature = "test-support"))]
+            if fail_next.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                anyhow::bail!("injected blob read failure for {id}");
+            }
             let connection = connection.lock();
             select_blob(&connection, id)
         })

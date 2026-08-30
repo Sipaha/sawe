@@ -63,6 +63,19 @@ pub struct SolutionAgentDb {
     /// result is identical either way, since the blob would be discarded.
     #[cfg(any(test, feature = "test-support"))]
     blob_load_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// One-shot fault injection for [`Self::load_entries`] / [`Self::load_blob`]:
+    /// the next call fails as if sqlite had, then the flag clears itself.
+    ///
+    /// A transient read failure is not a corner case here — it is the input to
+    /// the most destructive branch in `resume_session`, where "the read failed"
+    /// used to be indistinguishable from "there is no transcript" and the
+    /// migration that follows DELETES rows. There is no way to produce that state
+    /// through the public API (a real failure needs a broken disk), so the only
+    /// alternative to injecting it is not testing it.
+    #[cfg(any(test, feature = "test-support"))]
+    fail_next_entry_load: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_next_blob_load: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct GlobalSolutionAgentDb(Shared<Task<Result<Arc<SolutionAgentDb>, Arc<anyhow::Error>>>>);
@@ -402,6 +415,10 @@ impl SolutionAgentDb {
             entry_load_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             blob_load_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next_entry_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next_blob_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -411,6 +428,22 @@ impl SolutionAgentDb {
     pub fn entry_load_count(&self) -> usize {
         self.entry_load_count
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Make the NEXT [`Self::load_entries`] fail as a broken disk would. One
+    /// shot: the call that fails clears the flag, so a test can assert the retry
+    /// after it succeeds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_entry_load(&self) {
+        self.fail_next_entry_load
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// [`Self::fail_next_entry_load`] for the legacy blob read.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_blob_load(&self) {
+        self.fail_next_blob_load
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Reads of a session's legacy blob served by [`Self::load_blob`] since this
