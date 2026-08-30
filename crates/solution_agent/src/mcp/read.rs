@@ -789,8 +789,8 @@ async fn load_cold_session(
         .map(|row| row.payload.len())
         .sum::<usize>()
         .saturating_add(blob.as_ref().map_or(0, |blob| blob.len()));
-    Ok(cx.update(|cx| {
-        let (session, _migrating) = crate::store::build_cold_session(
+    let build = cx.update(|cx| {
+        crate::store::build_cold_session(
             &head.meta,
             (!rows.is_empty()).then_some(rows),
             blob,
@@ -798,10 +798,27 @@ async fn load_cold_session(
             change_seq,
             head.meta.tab_order,
             cx,
-        );
+        )
+    });
+    // The transcript on disk exists and could not be read. Fail, rather than
+    // serve the empty entity this built: an empty answer here is indistinguishable
+    // from a session the user deliberately cleared, which is the same lie as
+    // FORK.md #105 pointed the other way — and it is not even a partial read, since
+    // the blob decodes whole or not at all, so there is nothing to salvage by
+    // continuing. This also makes `get_session` / `get_session_changes` agree with
+    // `read_session_history`, which has always propagated this decode error.
+    // Deliberately BEFORE the cache store: a failed build must not be handed to
+    // the next poll as a valid reconstruction.
+    if let Some(err) = build.undecodable_blob {
+        return Err(err.context(format!(
+            "session_unreadable: {session_id} has an archived transcript that cannot be decoded"
+        )));
+    }
+    let session = build.session;
+    cx.update(|cx| {
         ColdSessionCache::store(cx, session_id, head, session.clone(), payload_bytes);
-        session
-    }))
+    });
+    Ok(session)
 }
 
 // =====================================================================

@@ -320,12 +320,30 @@ pub(crate) fn is_wiped_row_native(rows_empty: bool, epoch: i64) -> bool {
     rows_empty && epoch > 0
 }
 
+/// What [`build_cold_session`] reconstructed, beyond the entity itself.
+pub(crate) struct ColdSessionBuild {
+    pub session: Entity<SolutionSession>,
+    /// The legacy blob branch was taken and the blob decoded — the caller's cue
+    /// to schedule the row migration. Never true alongside `undecodable_blob`:
+    /// migrating an undecodable blob would persist ZERO rows and bump the epoch,
+    /// and "no rows + epoch > 0" is exactly what [`is_wiped_row_native`] reads as
+    /// a deliberate wipe, so the still-intact bytes on disk would be permanently
+    /// unreadable by every path — the corruption would become the truth.
+    pub migrating: bool,
+    /// A legacy blob was present and could NOT be decoded. The entity is still
+    /// built (metadata, title, epoch — everything but the transcript) so a caller
+    /// that must show *something* can, but `session.entries` is EMPTY and is not
+    /// this session's content: serving it unremarked reports data loss as a
+    /// deliberately empty conversation. A caller answering a query about the
+    /// transcript should fail instead; see `mcp::read::load_cold_session`.
+    pub undecodable_blob: Option<anyhow::Error>,
+}
+
 /// Build the COLD (`acp_thread: None`) session entity described by `meta` and
 /// its persisted transcript — `rows` when the session is row-native, else the
-/// legacy `blob`. Returns the entity plus whether the legacy branch was taken
-/// (`migrating`), which is the caller's cue to schedule the row migration; the
-/// function itself performs no I/O and touches no store state, so a caller that
-/// only wants to *read* a persisted session can drop the entity afterwards.
+/// legacy `blob`. The function performs no I/O and touches no store state, so a
+/// caller that only wants to *read* a persisted session can drop the entity
+/// afterwards.
 ///
 /// Split out of `hydrate_all_for_solution` so `solution_agent.get_session`'s
 /// DB fallback reconstructs a closed session through the exact same code the
@@ -339,10 +357,10 @@ pub(crate) fn build_cold_session(
     restored_change_seq: Option<u64>,
     tab_order: Option<i64>,
     cx: &mut App,
-) -> (Entity<SolutionSession>, bool) {
+) -> ColdSessionBuild {
     let wiped_row_native = is_wiped_row_native(rows.is_none(), epoch);
     let blob = if wiped_row_native { None } else { blob };
-    let migrating = rows.is_none() && !wiped_row_native;
+    let mut undecodable_blob = None;
     // Same precedence as `resume_session`: the metadata
     // columns first, the legacy blob only as a fallback for
     // rows written before those columns existed. Without this
@@ -353,11 +371,24 @@ pub(crate) fn build_cold_session(
     let mut restored_available_models = meta.cached_models.clone();
     let mut restored_desired_model = meta.desired_model.clone();
     let mut restored_desired_effort = meta.desired_effort.clone();
+    let rows_absent = rows.is_none();
     let entries = if let Some(rows) = rows {
         entries_from_rows(rows)
     } else {
         let persisted =
-            blob.and_then(|bytes| serde_json::from_slice::<PersistedSession>(&bytes).ok());
+            blob.and_then(
+                |bytes| match serde_json::from_slice::<PersistedSession>(&bytes) {
+                    Ok(persisted) => Some(persisted),
+                    Err(err) => {
+                        undecodable_blob = Some(anyhow::Error::new(err).context(format!(
+                            "decoding archived session {} ({} blob bytes)",
+                            meta.id,
+                            bytes.len()
+                        )));
+                        None
+                    }
+                },
+            );
         if let Some(persisted) = persisted.as_ref() {
             if restored_available_models.is_empty() {
                 restored_available_models = persisted.available_models.clone();
@@ -374,6 +405,7 @@ pub(crate) fn build_cold_session(
         let (cold_entries, _) = cold_entries_from_persisted(persisted, cx);
         crate::session_entry::rebuild_entries(&cold_entries, &[], &restored_created_ms, 0, cx)
     };
+    let migrating = rows_absent && !wiped_row_native && undecodable_blob.is_none();
     let entity = cx.new(|_| {
         let mut s = SolutionSession::new_idle(
             meta.id,
@@ -408,7 +440,11 @@ pub(crate) fn build_cold_session(
         s.desired_effort = restored_desired_effort;
         s
     });
-    (entity, migrating)
+    ColdSessionBuild {
+        session: entity,
+        migrating,
+        undecodable_blob,
+    }
 }
 
 impl SolutionAgentStore {
@@ -745,6 +781,13 @@ impl SolutionAgentStore {
             // also saves the read outright.
             let wiped_row_native =
                 is_wiped_row_native(preloaded_rows.is_empty(), preloaded_epoch);
+            // Set when a blob is on disk but cannot be decoded, which must
+            // suppress the migration below for the reason spelled out on
+            // `ColdSessionBuild::migrating`: migrating an unreadable blob writes
+            // zero rows and bumps the epoch, and the pair then reads as a wipe
+            // forever after. Distinct from "no blob at all", which migrates as
+            // before.
+            let mut blob_undecodable = false;
             let preloaded_persisted: Option<PersistedSession> = if !preloaded_rows.is_empty()
                 || wiped_row_native
             {
@@ -759,9 +802,12 @@ impl SolutionAgentStore {
                             match serde_json::from_slice::<PersistedSession>(&bytes) {
                                 Ok(p) => Some(p),
                                 Err(err) => {
-                                    log::warn!(
+                                    blob_undecodable = true;
+                                    log::error!(
                                         target: "solution_agent::resume",
-                                        "session={} blob decode failed on reopen: {err}",
+                                        "session={} blob decode failed on reopen; \
+                                         reopening it EMPTY and leaving the bytes \
+                                         on disk untouched for recovery: {err}",
                                         meta.id
                                     );
                                     None
@@ -869,7 +915,8 @@ impl SolutionAgentStore {
                     // migrate it. Without that second condition, reopening a
                     // `/clear`ed tab from History repaints the erased
                     // conversation and drops the epoch from N to 1.
-                    let migrating = preloaded_rows.is_empty() && !wiped_row_native;
+                    let migrating =
+                        preloaded_rows.is_empty() && !wiped_row_native && !blob_undecodable;
                     let entries = if !preloaded_rows.is_empty() {
                         entries_from_rows(preloaded_rows)
                     } else {
@@ -1204,7 +1251,7 @@ impl SolutionAgentStore {
                         change_seq_per_session.get(&meta.id).copied().flatten();
                     let rows = rows_per_session.remove(&meta.id);
                     let session_tab_order = tab_order_map.get(&meta.id).copied();
-                    let (entity, migrating) = build_cold_session(
+                    let build = build_cold_session(
                         meta,
                         rows,
                         blobs.remove(&meta.id),
@@ -1213,6 +1260,22 @@ impl SolutionAgentStore {
                         session_tab_order,
                         cx,
                     );
+                    let (entity, migrating) = (build.session, build.migrating);
+                    // The restore keeps going: one corrupt transcript must not
+                    // cost the user every other session in the Solution, and the
+                    // row still has a title and a tab. What it must NOT do is
+                    // migrate — `build_cold_session` already declines that, and
+                    // this log is the only place the failure is visible, since
+                    // the session itself renders as an ordinary empty one.
+                    if let Some(err) = build.undecodable_blob {
+                        log::error!(
+                            target: "solution_agent::hydration",
+                            "session={} legacy transcript blob is undecodable; \
+                             restoring it EMPTY and leaving the bytes on disk \
+                             untouched for recovery: {err:#}",
+                            meta.id
+                        );
+                    }
                     // `by_solution` is populated in one pass after the loop —
                     // it has to be ordered by `tab_order`, which is only known
                     // once every session in this batch has been built.

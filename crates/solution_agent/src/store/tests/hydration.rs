@@ -1064,6 +1064,155 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         });
     });
 }
+/// A legacy blob that fails to decode must NOT be migrated, and the desktop
+/// restore must not fail over it.
+///
+/// The trap is that migration is what makes the corruption permanent. On a
+/// decode failure the entity is built with an empty transcript, so a `migrating`
+/// flag derived from "rows absent, not wiped" alone flushes ZERO rows and bumps
+/// the epoch — and "no rows + epoch > 0" is exactly what `is_wiped_row_native`
+/// reads as a deliberate `/clear`. The still-intact bytes on disk would then be
+/// suppressed by every read path forever after, so a blob that a later build (or
+/// a hand repair) could decode is instead thrown away by the first restore that
+/// could not.
+///
+/// The restore itself keeps going: the row still has a title and a tab, and one
+/// unreadable transcript must not cost the user every other session in the
+/// Solution. The MCP read path takes the opposite decision (it errors) — see
+/// `mcp::tests::get_session_refuses_to_serve_an_undecodable_blob_as_empty`.
+#[gpui::test]
+async fn an_undecodable_blob_is_not_migrated_away(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let id = crate::model::SolutionSessionId::new();
+    let now = Utc::now();
+    db.save_metadata(crate::model::SolutionSessionMetadata {
+        id,
+        solution_id,
+        agent_id: SharedString::from("claude-acp"),
+        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        title: SharedString::from("corrupt session"),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    })
+    .await
+    .expect("meta");
+
+    // Truncated JSON — the realistic corruption (a partial write), not random
+    // bytes. Intact prefix, so a repair is plausible; that is the whole point.
+    let intact = serde_json::to_vec(&PersistedSession {
+        title: "corrupt session".into(),
+        entry_summaries: vec!["a line the user still wants".to_string()],
+        ..Default::default()
+    })
+    .expect("encode blob");
+    let mut truncated = intact.clone();
+    truncated.truncate(intact.len() / 2);
+    assert!(
+        serde_json::from_slice::<PersistedSession>(&truncated).is_err(),
+        "fixture must actually fail to decode, or this test proves nothing"
+    );
+    db.save_blob(id, truncated).await.expect("blob");
+    assert_eq!(
+        db.load_epoch(id).await.expect("load epoch"),
+        None,
+        "precondition: an un-migrated session's epoch column is NULL"
+    );
+
+    let ordered = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
+        })
+        .await
+        .expect("a corrupt transcript must not fail the whole restore");
+    assert_eq!(
+        ordered,
+        vec![id],
+        "the session still exists — it has a metadata row and a tab"
+    );
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.session(id).expect("restored").read_with(cx, |s, _| {
+                assert!(s.entries.is_empty(), "nothing could be decoded");
+                assert_eq!(
+                    s.epoch, 0,
+                    "the migration bump must not fire for a blob that was never read"
+                );
+            });
+        });
+    });
+    // The migration, if one were scheduled, is spawned + detached.
+    cx.run_until_parked();
+
+    assert_eq!(
+        db.load_epoch(id).await.expect("load epoch after"),
+        None,
+        "no epoch may be written: with zero rows it would read as a deliberate wipe \
+         and permanently suppress the blob"
+    );
+    assert!(
+        db.load_entries(id).await.expect("load rows").is_empty(),
+        "nothing to migrate, so nothing may be written"
+    );
+    assert!(
+        db.load_blob(id).await.expect("load blob").is_some(),
+        "the bytes must be left on disk — they are the only copy of the transcript"
+    );
+
+    // What all of that buys: a repair still works. Restore the intact bytes and
+    // cold-load again; with the epoch bumped to 1 above, this session would be
+    // `is_wiped_row_native` and the blob would never be looked at again.
+    db.save_blob(id, intact).await.expect("repair blob");
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.sessions.remove(&id);
+            store.by_solution.remove(&solution_id);
+        });
+    });
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.hydrate_all_for_solution(solution_id, cx)
+        })
+    })
+    .await
+    .expect("restore 2");
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store
+                .session(id)
+                .expect("re-restored")
+                .read_with(cx, |s, _| {
+                    assert_eq!(
+                        s.entries.len(),
+                        1,
+                        "the repaired blob must come back — the failed restore must \
+                         not have marked the session as wiped"
+                    );
+                });
+        });
+    });
+}
 
 /// The production hydration path must seed the model/effort a cold tab's status
 /// row renders. It used to leave all three at their defaults, which was

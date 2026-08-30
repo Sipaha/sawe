@@ -4248,6 +4248,176 @@ async fn get_session_legacy_blob_closed_session_serves_bumped_epoch(cx: &mut gpu
     );
 }
 
+/// A legacy blob that does not decode is DATA LOSS, and both read tools must say
+/// so. `get_session` used to swallow the decode error (`build_cold_session` did
+/// `.ok()`) and serve an empty transcript, while `read_session_history`
+/// propagated it — so the same corrupt session read as "you cleared this" on one
+/// tool and as an error on the other.
+///
+/// "Empty" is the wrong half of that disagreement. It is the exact lie FORK.md
+/// #105 was about, pointed the other way: there a wiped session replayed a
+/// transcript that was gone, here a session whose transcript is still on disk
+/// reports itself as deliberately empty. And there is nothing to salvage by
+/// continuing — the blob is `serde_json::from_slice`d whole, so the choice is
+/// between an error and a fabricated empty conversation, never a partial read.
+///
+/// The desktop restore deliberately does NOT fail (pinned in
+/// `store::tests::hydration`): it keeps the tab, logs, and declines to migrate.
+#[gpui::test]
+async fn get_session_refuses_to_serve_an_undecodable_blob_as_empty(cx: &mut gpui::TestAppContext) {
+    let (solution_id, _tmp, _project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    let executor = cx.executor();
+    let db = std::sync::Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    let now = chrono::Utc::now();
+    let seed = |title: &'static str| crate::model::SolutionSessionMetadata {
+        id: crate::model::SolutionSessionId::new(),
+        solution_id,
+        agent_id: SharedString::from("mock-agent"),
+        acp_session_id: acp::SessionId::new("acp-x"),
+        title: SharedString::from(title),
+        created_at: now,
+        last_activity_at: now,
+        preview: None,
+        total_tokens: None,
+        context_count: 1,
+        cwd: std::path::PathBuf::new(),
+        parent_session_id: None,
+        desired_model: None,
+        desired_effort: None,
+        cached_models: vec![],
+        tab_order: None,
+    };
+
+    // Truncated JSON — the realistic corruption (a partial write), not random
+    // bytes. `epoch` is left NULL and no rows are written, so this is the
+    // un-migrated shape that reaches the blob at all.
+    let corrupt = seed("corrupt session");
+    let corrupt_id = corrupt.id;
+    db.save_metadata(corrupt).await.expect("save metadata");
+    let truncated = {
+        let mut bytes = serde_json::to_vec(&crate::store::PersistedSession {
+            title: "corrupt session".into(),
+            entry_summaries: vec!["a line the user still wants".into()],
+            ..Default::default()
+        })
+        .expect("encode blob");
+        bytes.truncate(bytes.len() / 2);
+        bytes
+    };
+    assert!(
+        serde_json::from_slice::<crate::store::PersistedSession>(&truncated).is_err(),
+        "fixture must actually fail to decode, or this test proves nothing"
+    );
+    db.save_blob(corrupt_id, truncated)
+        .await
+        .expect("save blob");
+
+    let err = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: corrupt_id.to_string(),
+                include_full_content: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("an undecodable transcript must not be served as an empty one");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("session_unreadable") && msg.contains("cannot be decoded"),
+        "the error must name the real failure, and must NOT be session_not_found \
+         (the row exists); got {msg:?}"
+    );
+
+    // The delta poll shares `load_cold_session`, so it must agree — a client that
+    // reset and re-polled must not find the corrupt session readable there.
+    let delta_err = GetSessionChangesTool
+        .run(
+            GetSessionChangesParams {
+                session_id: corrupt_id.to_string(),
+                since_seq: 0,
+                known_epoch: 0,
+                stream_id: None,
+                include_images: false,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("the delta poll must not serve what the full load refused");
+    assert!(
+        format!("{delta_err:#}").contains("session_unreadable"),
+        "get_session_changes must fail the same way; got {delta_err:#}"
+    );
+
+    // The tool that always propagated must still propagate — this is the half of
+    // the disagreement that was already right, and the assertion above is only
+    // "they agree" if this one holds.
+    let history_err = ReadSessionHistoryTool
+        .run(
+            ReadSessionHistoryParams {
+                session_id: corrupt_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("read_session_history must keep propagating the decode error");
+    assert!(
+        format!("{history_err:#}").contains("decoding archived session"),
+        "got {history_err:#}"
+    );
+
+    // A read must not "repair" the row by overwriting it: the bytes stay on disk,
+    // which is the only thing that makes a later recovery possible.
+    assert!(
+        db.load_blob(corrupt_id).await.expect("load blob").is_some(),
+        "the failed read must leave the corrupt bytes alone"
+    );
+
+    // ANTI-VACUITY: the same fixture with a DECODABLE blob is served, so the
+    // error above is caused by the corruption and not by the fixture missing
+    // something every cold read needs.
+    let healthy = seed("healthy session");
+    let healthy_id = healthy.id;
+    db.save_metadata(healthy).await.expect("save metadata");
+    db.save_blob(
+        healthy_id,
+        serde_json::to_vec(&crate::store::PersistedSession {
+            title: "healthy session".into(),
+            entry_summaries: vec!["a line the user still wants".into()],
+            ..Default::default()
+        })
+        .expect("encode blob"),
+    )
+    .await
+    .expect("save blob");
+    let sc = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: healthy_id.to_string(),
+                include_full_content: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("an intact legacy blob must still be served")
+        .structured_content;
+    assert_eq!(
+        sc.total_count, 1,
+        "the healthy control must serve its entry"
+    );
+}
+
 /// The same rows-absent branch, but for a session that is row-native and WIPED
 /// rather than un-migrated — the `/clear` half of the defect, on the cold read
 /// path, and the repair for sessions already broken by a build that kept the
