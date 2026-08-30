@@ -16,12 +16,16 @@ use util::ResultExt as _;
 /// integration tests to isolate the well-known socket from any live
 /// `sawe` instance running on the same machine. Without this,
 /// concurrent e2e tests would race the live editor's lock and clobber
-/// the user's `~/.config/sawe/mcp.{lock,sock}` files.
+/// the user's `~/.spk/sawe[-dev]/state/mcp.{lock,sock}` files.
 ///
 /// For end-to-end probe instances (running a real editor in parallel with the
-/// user's), use `script/run-mcp --runtime-dir DIR` instead — that overrides
-/// `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` so the editor's
-/// entire state (settings, db, mcp socket, …) lands in DIR.
+/// user's), use `script/run-mcp --runtime-dir DIR` instead — that sets
+/// `SAWE_HOME=DIR`, which is the only environment variable this fork's path
+/// chain reads (`paths::base_dir()` is `home_dir()/.spk/<channel>`), so the
+/// editor's entire state (settings, db, mcp socket, …) lands under
+/// `DIR/.spk/sawe[-dev]/`. The `XDG_*` variables isolate nothing here. The
+/// in-binary equivalent is `sawe --user-data-dir DIR`
+/// (`paths::set_custom_data_dir`), which repoints `base_dir` directly.
 static RUNTIME_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Pin the lock + socket paths to a test-owned directory. Must be called
