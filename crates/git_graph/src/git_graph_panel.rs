@@ -125,12 +125,28 @@ impl GitGraphPanel {
         if self.active_repo_id == repo_id {
             return;
         }
+        // Re-pointing the graph drops the `Entity<GitGraph>` that owns the
+        // focused handle, so that handle leaves the dispatch tree: the
+        // window's focus points at a dead id, `render`'s `is_focused` guard
+        // is false so the redirect cannot fire, and `Workspace`'s focus-lost
+        // listener then yanks focus out to the centre pane. The user's next
+        // arrow key would scroll a buffer, and `contains_focused` would be
+        // false, costing the tri-state an extra press. Re-home onto the
+        // panel's own handle rather than the new graph's so `render` stays
+        // the single place that decides what inside the panel holds focus
+        // (with no repository there is nothing to redirect into, and focus
+        // deliberately rests on the tracked container). Same shape, same
+        // reason as `console_panel::ConsolePanel::close_tab`.
+        let held_focus = self.focus_handle.contains_focused(window, cx);
         self.active_repo_id = repo_id;
         self.graph = repo_id.map(|id| {
             let git_store = self.git_store.clone();
             let workspace = self.workspace.clone();
             cx.new(|cx| GitGraph::new(id, git_store, workspace, None, window, cx))
         });
+        if held_focus {
+            self.focus_handle.focus(window, cx);
+        }
         cx.notify();
     }
 }
@@ -390,6 +406,80 @@ mod tests {
             !band.read_with(cx, |band, cx| band.utility_visible(cx)),
             "a second press on the focused graph still hides the section"
         );
+    }
+
+    /// Re-pointing the panel at another repository while it holds focus must
+    /// not eject focus. The old `Entity<GitGraph>` is dropped, so its handle
+    /// leaves the dispatch tree; without the re-home in `set_active_repo` the
+    /// window's focus points at a dead id, `Workspace`'s focus-lost listener
+    /// yanks focus to the centre pane, and the tri-state — which keys on
+    /// `contains_focused` — silently costs an extra press.
+    ///
+    /// The realistic trigger is a two-member Solution: press ctrl-alt-`,
+    /// arrow through commits, switch the active member
+    /// (`SolutionStoreEvent::ActiveMemberChanged` → `refresh_active_repo`),
+    /// and the next arrow key scrolls a buffer instead of the graph.
+    #[gpui::test]
+    async fn switching_repository_keeps_focus_in_the_graph(cx: &mut TestAppContext) {
+        let (window, panel, _band) = bootstrap_with_repositories(cx, 2).await;
+
+        toggle(&window, cx);
+        let first_graph = panel
+            .read_with(cx, |panel, _cx| panel.graph.clone())
+            .expect("two worktrees with a .git resolve a repository apiece");
+        window
+            .update(cx, |_workspace, window, cx| {
+                assert!(
+                    first_graph.focus_handle(cx).is_focused(window),
+                    "precondition: the hotkey put focus in the first graph"
+                );
+            })
+            .expect("window is open");
+
+        let other_repo_id = panel.read_with(cx, |panel, cx| {
+            panel
+                .git_store
+                .read(cx)
+                .repositories()
+                .keys()
+                .copied()
+                .find(|id| Some(*id) != panel.active_repo_id)
+                .expect("the second worktree's repository")
+        });
+        window
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.set_active_repo(Some(other_repo_id), window, cx)
+                });
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        let second_graph = panel
+            .read_with(cx, |panel, _cx| panel.graph.clone())
+            .expect("the panel re-pointed at the other repository");
+        assert_ne!(
+            second_graph.entity_id(),
+            first_graph.entity_id(),
+            "precondition: switching repository re-creates the inner graph"
+        );
+        window
+            .update(cx, |workspace, window, cx| {
+                assert!(
+                    second_graph.focus_handle(cx).is_focused(window),
+                    "focus must follow the graph across the switch"
+                );
+                assert!(
+                    !workspace.active_pane().focus_handle(cx).is_focused(window),
+                    "and must not have been ejected to the centre pane, where the \
+                     next arrow key would scroll a buffer"
+                );
+                assert!(
+                    panel.focus_handle(cx).contains_focused(window, cx),
+                    "or the next ctrl-alt-` focuses the graph instead of hiding it"
+                );
+            })
+            .expect("window is open");
     }
 
     fn toggle(window: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) {
