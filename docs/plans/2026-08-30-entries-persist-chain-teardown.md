@@ -109,7 +109,14 @@ A read-only recon pass answered the question that had blocked this item for two 
     ordering comes from `prev.await`, not executor FIFO, so the links moved to `cx.background_spawn` and a new
     `flush_persist_chains_on_quit` observer awaits every unfinished chain. It takes the whole map, which is
     disposition-correct for free because `Abandon` removes a purged session's chain before the purge's DELETE. It drains
-    only — it never re-derives a flush, so fact 15's gate is not undone. Original entry:
+    only — it never re-derives a flush, so fact 15's gate is not undone. **Review follow-up:** the hook took that map one
+    phase too early. `App::shutdown` collects the quit futures BEFORE `windows.clear()` + `flush_effects()`, and that
+    flush releases the `MultiWorkspace` → `mark_closed` → `cold_close_solution` → `persist_all_rows`, so the last flush
+    of the session landed in a map the hook had already emptied — and with nothing else in flight the future was Ready
+    on first poll, giving that write no background turn at all. Fixed by making `entries_persist_chain` a
+    `PersistChains` newtype over `Rc<RefCell<HashMap<…>>>` and having the `async move` body take the map on its FIRST
+    POLL (which happens after `flush_effects`); an `AsyncApp::update` there is impossible because `shutdown` holds
+    `&mut App` across the whole block, and that same borrow is what makes the deferred take sound. Original entry:
     **App quit loses everything in flight with no flush attempt at all.** There is no `on_app_quit` hook in `solution_agent`; the store global drops with the process. This is a *separate, larger* bug than the one this plan fixes — adding a quit-time drain is new scope (and the chain runs on the **foreground** executor, so a detached link needs the app to keep pumping, which quit does not). Recorded as a new pool item.
 
 25. **`solution_agent`'s database runs on sqlite's defaults — rollback journal, `synchronous=FULL`.** It opens with a bare
@@ -126,6 +133,43 @@ A read-only recon pass answered the question that had blocked this item for two 
     `SessionEntry::to_payload` from replacing a decodable row with an undecodable one, it runs on both persist paths
     (`store.rs`), and nothing asserts it — pre-existing, not introduced by the batching. A test would need to feed the
     filter a row set containing an empty payload directly; it does not need a persist round trip.
+
+27. **`save_epoch` / `save_change_seq` sit OUTSIDE `upsert_entries_and_trim`'s savepoint.** Each chain link is
+    `upsert_entries_and_trim(...).await` then `save_epoch(...).await` then `save_change_seq(...).await` — three separate
+    `executor.spawn` + connection-lock round trips (`db/entries.rs`), only the first of which is inside
+    `with_savepoint`. A link cancelled or timed out between them (an abandon, or `App::shutdown`'s 200ms expiring)
+    leaves the rows written and the persisted epoch / change_seq still at their previous values, i.e. rows AHEAD of the
+    epoch that describes them. **Pre-existing and identical on the base commit** — the batching folded the trim into the
+    savepoint, it did not widen it — and the observable cost is a stale epoch/change_seq rather than a torn row set.
+    Closing it means extending the savepoint to cover all three writes, which changes `upsert_entries_and_trim`'s
+    signature and the DB layer's one-op-per-task shape. **Recorded, not attempted.**
+
+28. **The residual `MultiWorkspace` quit exposure is a platform-initiated quit.** `MultiWorkspace::app_will_quit` awaits
+    `_serialize_task` (a `cx.spawn` whose body does `this.read_with` then `cx.update` — doubly foreground-bound) plus
+    `pending_removal_tasks`, so a pending one can only burn the 200ms. On the main route it is defended: `zed::quit`
+    `join_all`s `flush_serialization` + `take_pending_removal_tasks` on the FOREGROUND before `cx.quit()`, so both
+    vectors are empty by observer time; the other `cx.quit()` routes only fire with no `MultiWorkspace` window left
+    (dead weak handle → no-op). What is left is an OS logout / platform quit that bypasses `zed::quit`, losing at most
+    the `multi_workspace_state` KV blob (active workspace, project groups, sidebar — window chrome), not the
+    `workspaces` pane layout and not the session binding (`background_spawn`). With a dozen-plus eager, undebounced
+    `serialize` call sites the delta is seconds old. **Out of scope for this plan** (FORK.md 103 records the pattern);
+    the fix is either moving the KV write off the foreground or registering the pre-flush on the platform quit path.
+
+    Two neighbours found while confirming the count (14 `on_app_quit` registrations outside `gpui`, not 13), both out of
+    scope and both recorded so they are not re-derived:
+    - `LspStore::shutdown_server` is **conditionally** foreground-bound: `LanguageServerState::Starting { startup, .. }
+      => startup.await` waits on a foreground `cx.spawn` (`lsp_store.rs`, the `let startup = { … cx.spawn(…) }` block),
+      so a quit taken while any language server is still starting burns the 200ms. The `Running` arm awaits
+      `LanguageServer::shutdown`, which is driven by background `io_tasks`, and is sound.
+    - `Copilot::shutdown_language_server` never actually shuts the server down: it awaits
+      `async move { server.lsp.shutdown() }`, whose output is the `Option<impl Future>` that `LanguageServer::shutdown`
+      returns — dropped un-awaited, so the `shutdown`/`exit` exchange is never driven. Not a quit-window hang; a
+      correctness defect adjacent to this audit.
+
+29. ✅ **DONE** — the two `close_then_reopen_*` ordering tests now run `#[gpui::test(iterations = 32)]`. On the default
+    seed alone both passed with `prev.await` replaced by `prev.detach()`, i.e. the chain's core invariant was covered
+    only incidentally; at 32 seeds the same mutation dies on both (`["old","old","old"]` vs the expected 4 rows, and
+    200 vs 201). Cost is 0.95s for the pair.
 
 ---
 

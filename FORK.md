@@ -1763,6 +1763,22 @@ from a different thread than the one that sets it, which the existing `Release`/
 under a key can resurrect rows for a deleted session. Emptying the map cannot cancel anything either — the tasks are
 moved into the returned future, which owns them until they finish.
 
+**Why the map is taken on the future's FIRST POLL rather than when the observer runs.** `App::shutdown` collects the
+quit futures BEFORE it clears the windows and calls `flush_effects()` — and that flush is itself a persist site.
+Releasing the `MultiWorkspace` fires the `cx.observe_release` in `solutions::event_sources`, which reaches
+`SolutionStore::mark_closed` → `SolutionStoreEvent::Closed` → `SolutionAgentStore::cold_close_solution` →
+`persist_all_rows`. A hook that snapshots the chain map while the observer runs is therefore always exactly that one
+flush short, and in the common case (nothing else in flight) its future is Ready on the first poll, so the process exits
+without the write getting a single background turn. `entries_persist_chain` is consequently a `PersistChains` newtype
+over an `Rc<RefCell<HashMap<…>>>`: the observer clones the handle, and the `async move` body — which does not run until
+`block_with_timeout` first polls it, after `flush_effects` — is what takes the map. The future cannot reach the store
+any other way: `shutdown` holds `&mut App` across the whole timed block, so an `AsyncApp::update` inside a quit future
+panics on the re-borrow. That same borrow is what makes the deferred take sound — no store method can run while the main
+thread is inside `shutdown`, and the chain links never touch the map, they only own their predecessor. Pinned by
+`app_quit_flushes_a_chain_issued_during_shutdown`, whose fixture releases a window root view (the `MultiWorkspace`
+stand-in) from `shutdown`'s own `windows.clear()`; snapshotting at observer time leaves the rows `["stale","stale",
+"stale"]`.
+
 **What it deliberately does not do.** It drains; it does not re-derive a fresh flush from the live sessions. The chain
 is already the complete record of what is unwritten (there is no persist debounce — every ingest event issues a
 persist), so re-deriving would buy nothing and would rewrite sessions the user never resumed, which is exactly what
@@ -1771,12 +1787,30 @@ persist), so re-deriving would buy nothing and would rewrite sessions the user n
 How to apply:
 
 - **Establish the quit contract from the code before designing anything that has to survive quit.** "Register an
-  `on_app_quit` and await your work" is only half true: the answer depends entirely on which executor the work is on,
-  and the two existing in-tree examples disagree — `session::app_will_quit` awaits a `background_spawn` (sound), while
-  `MultiWorkspace::app_will_quit` awaits foreground `cx.spawn` tasks (it can only ever burn the 200ms timeout).
+  `on_app_quit` and await your work" is only half true: the answer depends entirely on which executor the work is on.
+  `session::app_will_quit` awaits `background_spawn` work and is sound. Of the 14 `on_app_quit` registrations outside
+  `gpui` itself, `MultiWorkspace::app_will_quit` is the only *unconditionally* foreground-bound one — it awaits `_serialize_task` plus `pending_removal_tasks`, and `serialize` is a
+  `cx.spawn` whose body does `this.read_with` and then `cx.update`, so if any of them is still pending the hook can only
+  burn the 200ms. **It is nonetheless defended, by an explicit foreground pre-flush on the main quit route:** `zed::quit`
+  collects `Workspace::flush_serialization`, `MultiWorkspace::take_pending_removal_tasks` and
+  `MultiWorkspace::flush_serialization`, `join_all`s them on the foreground, and only then calls `cx.quit()` — so both
+  vectors are already empty by the time the observer runs. The other `cx.quit()` routes fire only once no
+  `MultiWorkspace` window remains, where the weak handle is dead and the hook is a no-op. **That pre-flush is a
+  legitimate second pattern** and was an available alternative design for the persist chain; it was not taken because it
+  does not cover a platform-initiated quit (an OS logout that bypasses `zed::quit`), which is exactly the residual
+  exposure `MultiWorkspace` still carries. What is at risk there is the `multi_workspace_state` KV blob — window chrome:
+  active workspace, project groups, sidebar — not the pane layout in the `workspaces` table and not the session binding,
+  which is a `background_spawn`; and with a dozen-plus eager, undebounced `serialize` call sites the pending delta is
+  seconds old at worst. Recorded, not fixed here. (One other hook is *conditionally* foreground-bound:
+  `LspStore::shutdown_server`'s `LanguageServerState::Starting { startup, .. } => startup.await` waits on a foreground
+  `cx.spawn`, so a quit while any language server is still starting burns the timeout. The `Running` arm is background
+  work and is fine.)
 - **Foreground is not the default for durability work.** If a future captures no entity and its ordering is explicit,
   put it on the background executor; that is the difference between surviving a quit and not.
 - **A `TestAppContext` test can prove this**, because `TestScheduler` models the blocked-session rule. Issue the chain,
   do NOT `run_until_parked`, call `cx.quit()`, then read the rows with `load_entries_blocking`. Pin the tick budget with
-  `cx.executor().set_block_on_ticks(usize::MAX..=usize::MAX)` first — a timed block otherwise draws a random budget from
-  `1..=1000` ticks and the drain is randomly cut short.
+  `cx.executor().set_block_on_ticks(usize::MAX..=usize::MAX)` first — a timed block otherwise draws a random budget and
+  the drain is randomly cut short. The budget every `TestAppContext` actually draws from is `0..=1000`, hard-coded in
+  `TestDispatcher::new`: **the floor is zero polls**, so an unpinned test can quit without the future being polled at
+  all. (`TestSchedulerConfig::default()`'s `1..=1000` is reachable only from the scheduler crate's own tests — do not
+  quote it as gpui's budget.)
