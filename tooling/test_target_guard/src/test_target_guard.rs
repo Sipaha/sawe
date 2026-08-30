@@ -107,7 +107,10 @@ fn workspace_members(
             // on the next rerun but would not itself cause one. There are no
             // glob members today; if one is added, expect this package to
             // rebuild on any edit beneath the glob, since Cargo scans a watched
-            // directory recursively.
+            // directory recursively — and, if the glob's directory is missing
+            // entirely, to rebuild on every invocation, since Cargo reads a
+            // `rerun-if-changed` path that does not exist as always-changed.
+            // A workspace in that state fails in Cargo before it reaches here.
             let directory_path = workspace_root.join(prefix);
             watched.push(directory_path.clone());
             let Ok(directories) = fs::read_dir(&directory_path) else {
@@ -143,8 +146,8 @@ const TARGET_SECTIONS: [&str; 4] = ["bin", "example", "bench", "test"];
 /// their sources live in `benches/` and `examples/`, never under `src/`, so
 /// they cannot hide the failure mode this exists to catch. `[[bench]] test =
 /// false` is in particular the documented remedy for `cargo test --all-targets`
-/// trying to run a `harness = false` criterion bench, and this workspace has 11
-/// such benches across 9 packages.
+/// trying to run a `harness = false` criterion bench, and this workspace has 12
+/// such benches across 9 packages, every one of them `harness = false`.
 const REFUSED_TEST_FALSE_SECTIONS: [&str; 2] = ["bin", "test"];
 
 fn check_member(
@@ -218,8 +221,18 @@ fn check_member(
     for source_path in sources {
         // Propagated, not swallowed: a source this check cannot read is a
         // source it cannot clear, and failing open here would reintroduce the
-        // exact silence the guard exists to end.
-        let source = fs::read_to_string(&source_path)?;
+        // exact silence the guard exists to end. Named, because this is the one
+        // path whose message is not written by hand, and a bare
+        // `No such file or directory (os error 2)` tells a stranger nothing.
+        let source = fs::read_to_string(&source_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "reading {}: {error}",
+                    display_path(workspace_root, &source_path)
+                ),
+            )
+        })?;
         if let Some((line, marker)) = first_test_marker(&source) {
             offenders.push(format!(
                 "{}:{line} ({marker})",
@@ -307,9 +320,14 @@ fn collect_rust_sources(
 /// costs no recall here.
 ///
 /// What it still misses, by construction: an attribute that only *appears* to
-/// open one because it sits inside a raw string or a `/* */` block, and an
+/// open one because it sits inside a raw string or a `/* */` block; an
 /// unrecognised harness attribute (`#[rstest]`, `#[quickcheck]` — none are used
-/// in this workspace) outside any `cfg(test)`.
+/// in this workspace) outside any `cfg(test)`; and `#[cfg(not(not(test)))]`,
+/// since the negation stack does not fold double negation. It can also
+/// over-reach in one contrived way: a trailing comment holding an unbalanced
+/// `(` keeps [`join_attribute`] swallowing the lines that follow, so
+/// `#[cfg(unix)] // (` above `let a = test;` reports a hit. None of these
+/// shapes occurs in this workspace.
 pub fn first_test_marker(source: &str) -> Option<(usize, &'static str)> {
     let lines = source.lines().collect::<Vec<_>>();
     for (index, line) in lines.iter().enumerate() {
