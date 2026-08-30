@@ -1,7 +1,9 @@
+use std::collections::{BTreeMap, HashMap};
+
 use anyhow::Context as _;
 use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;
-use gpui::{App, AsyncApp};
+use gpui::{App, AsyncApp, Global, Window};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -50,14 +52,114 @@ impl<'de> Deserialize<'de> for DumpVisualStructureParams {
     }
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct VisualNode {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub visible: bool,
     pub focused: bool,
+    /// Facts about this node that do not fit `kind` / `label` / `visible` /
+    /// `focused` — geometry the user can drag (band height, divider ratio),
+    /// persisted toggles, and honesty markers such as
+    /// `occupant_introspectable: false` on a type-erased slot whose contents
+    /// this crate cannot reach. Sorted by key so a diff between two dumps is
+    /// stable, and omitted entirely when empty so nodes that predate this
+    /// field serialize exactly as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, serde_json::Value>,
     pub children: Vec<VisualNode>,
+}
+
+impl VisualNode {
+    /// A visible, unfocused, attribute-less node of `kind`. The three
+    /// crates that build nodes (`solutions`, `title_bar`, `solution_agent`)
+    /// all go through this so a new `VisualNode` field never has to be
+    /// spelled out at every construction site.
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            visible: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn with_visible(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+
+    pub fn with_focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    pub fn with_attribute(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.attributes.insert(key.to_string(), value.into());
+        self
+    }
+
+    pub fn with_children(mut self, children: Vec<VisualNode>) -> Self {
+        self.children = children;
+        self
+    }
+}
+
+/// Where in the workspace column a provider-contributed node is spliced.
+///
+/// The two rows below are painted from crates that `solutions` must not
+/// depend on: the project toolbar lives in `title_bar` (it reaches
+/// `solutions_ui` / `git_ui` / `run_config_ui`) and the Solution band lives
+/// in `solution_agent` (which depends on `solutions`). Both are parked on
+/// `Workspace` as a type-erased `AnyView`, so only the owning crate can
+/// downcast one back into something it can describe. Rather than have this
+/// module hand-synthesize children it cannot verify — the mistake
+/// `build_title_bar_node` and `build_status_bar_node` were stripped back to
+/// avoid — each owning crate registers a provider that builds its own node
+/// from the same state its `render` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StructureSlot {
+    /// The toolbar row directly below the title bar.
+    ProjectToolbar,
+    /// The full-width band between the project zone and the status bar.
+    SolutionBand,
+}
+
+type StructureProvider =
+    Box<dyn Fn(&workspace::Workspace, &Window, &App) -> Option<VisualNode> + 'static>;
+
+#[derive(Default)]
+struct StructureProviders(HashMap<StructureSlot, StructureProvider>);
+
+impl Global for StructureProviders {}
+
+/// Register the builder for `slot`. Called once from the owning crate's
+/// `init`; the provider itself is looked up per dump, so registration order
+/// against window construction does not matter. Registering a slot twice
+/// replaces the earlier provider.
+pub fn register_structure_provider(
+    cx: &mut App,
+    slot: StructureSlot,
+    provider: impl Fn(&workspace::Workspace, &Window, &App) -> Option<VisualNode> + 'static,
+) {
+    cx.default_global::<StructureProviders>()
+        .0
+        .insert(slot, Box::new(provider));
+}
+
+fn provided_node(
+    slot: StructureSlot,
+    workspace: &workspace::Workspace,
+    window: &Window,
+    cx: &App,
+) -> Option<VisualNode> {
+    let provider = cx.try_global::<StructureProviders>()?.0.get(&slot)?;
+    provider(workspace, window, cx)
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -186,7 +288,7 @@ fn build_visual_tree_for_window(
     let window_handle = handle.downcast::<workspace::MultiWorkspace>()?;
     window_handle
         .update(cx, |multi, window, cx| {
-            let tree = build_workspace_node(multi, cx);
+            let tree = build_workspace_node(multi, window, cx);
             let window_id = window.window_handle().window_id();
             let clickables = enrich_clickables(
                 workspace::mcp::clickables::enumerate_window_clickables(window_id, window),
@@ -245,13 +347,7 @@ fn enrich_clickables(
 /// no child at all (same reasoning as `build_status_bar_node` below). Use
 /// `workspace.screenshot` to see the bar's real contents.
 fn build_title_bar_node(_workspace: &workspace::Workspace, _cx: &App) -> VisualNode {
-    VisualNode {
-        kind: "TitleBar".to_string(),
-        label: None,
-        visible: true,
-        focused: false,
-        children: Vec::new(),
-    }
+    VisualNode::new("TitleBar")
 }
 
 /// Synthesize what the StatusBar would render for this workspace.
@@ -264,37 +360,41 @@ fn build_title_bar_node(_workspace: &workspace::Workspace, _cx: &App) -> VisualN
 /// a hand-written child that no longer matches what is painted is worse than
 /// no child at all. Use `workspace.screenshot` to see the bar's real contents.
 fn build_status_bar_node(workspace: &workspace::Workspace, cx: &App) -> VisualNode {
-    VisualNode {
-        kind: "StatusBar".to_string(),
-        label: None,
-        visible: workspace.status_bar_visible(cx),
-        focused: false,
-        children: Vec::new(),
-    }
+    VisualNode::new("StatusBar").with_visible(workspace.status_bar_visible(cx))
 }
 
-fn build_workspace_node(multi: &workspace::MultiWorkspace, cx: &App) -> VisualNode {
+fn build_workspace_node(
+    multi: &workspace::MultiWorkspace,
+    window: &Window,
+    cx: &App,
+) -> VisualNode {
     let workspace = multi.workspace().read(cx);
-    let mut children = vec![
-        build_title_bar_node(workspace, cx),
-        build_dock_node("left", workspace.left_dock(), cx),
-        build_pane_area_node(workspace, cx),
-        build_dock_node("right", workspace.right_dock(), cx),
-        build_dock_node("bottom", workspace.bottom_dock(), cx),
-        build_status_bar_node(workspace, cx),
-    ];
+    // Top-to-bottom in painted order, so a reader of the JSON can take the
+    // child order as the window's vertical order (docks aside).
+    let mut children = vec![build_title_bar_node(workspace, cx)];
+    children.extend(provided_node(
+        StructureSlot::ProjectToolbar,
+        workspace,
+        window,
+        cx,
+    ));
+    children.push(build_dock_node("left", workspace.left_dock(), cx));
+    children.push(build_pane_area_node(workspace, cx));
+    children.push(build_dock_node("right", workspace.right_dock(), cx));
+    children.push(build_dock_node("bottom", workspace.bottom_dock(), cx));
+    children.extend(provided_node(
+        StructureSlot::SolutionBand,
+        workspace,
+        window,
+        cx,
+    ));
+    children.push(build_status_bar_node(workspace, cx));
 
     if let Some(modal) = build_modal_node(workspace, cx) {
         children.push(modal);
     }
 
-    VisualNode {
-        kind: "Workspace".to_string(),
-        label: None,
-        visible: true,
-        focused: false,
-        children,
-    }
+    VisualNode::new("Workspace").with_children(children)
 }
 
 fn build_dock_node(side: &str, dock: &gpui::Entity<workspace::dock::Dock>, cx: &App) -> VisualNode {
@@ -304,21 +404,15 @@ fn build_dock_node(side: &str, dock: &gpui::Entity<workspace::dock::Dock>, cx: &
         .active_panel()
         .map(|panel| panel.persistent_name().to_string());
 
-    let panel_node = active_panel_label.map(|name| VisualNode {
-        kind: "Panel".to_string(),
-        label: Some(name),
-        visible: is_open,
-        focused: false,
-        children: Vec::new(),
+    let panel_node = active_panel_label.map(|name| {
+        VisualNode::new("Panel")
+            .with_label(name)
+            .with_visible(is_open)
     });
 
-    VisualNode {
-        kind: format!("Dock({side})"),
-        label: None,
-        visible: is_open,
-        focused: false,
-        children: panel_node.into_iter().collect(),
-    }
+    VisualNode::new(format!("Dock({side})"))
+        .with_visible(is_open)
+        .with_children(panel_node.into_iter().collect())
 }
 
 fn build_pane_area_node(workspace: &workspace::Workspace, cx: &App) -> VisualNode {
@@ -340,33 +434,19 @@ fn build_pane_area_node(workspace: &workspace::Workspace, cx: &App) -> VisualNod
                     let is_active = active_item_id
                         .map(|id| id == item.item_id())
                         .unwrap_or(false);
-                    VisualNode {
-                        kind: format!("Tab({label})"),
-                        label: Some(label),
-                        visible: true,
-                        focused: is_active,
-                        children: Vec::new(),
-                    }
+                    VisualNode::new(format!("Tab({label})"))
+                        .with_label(label)
+                        .with_focused(is_active)
                 })
                 .collect();
 
-            VisualNode {
-                kind: "Pane".to_string(),
-                label: None,
-                visible: true,
-                focused: pane_is_active,
-                children: tabs,
-            }
+            VisualNode::new("Pane")
+                .with_focused(pane_is_active)
+                .with_children(tabs)
         })
         .collect();
 
-    VisualNode {
-        kind: "PaneArea".to_string(),
-        label: None,
-        visible: true,
-        focused: false,
-        children: pane_children,
-    }
+    VisualNode::new("PaneArea").with_children(pane_children)
 }
 
 /// Surface the active modal as a `Modal(<kind>)` leaf so introspection
@@ -377,11 +457,130 @@ fn build_pane_area_node(workspace: &workspace::Workspace, cx: &App) -> VisualNod
 /// to `"Modal"`.
 fn build_modal_node(workspace: &workspace::Workspace, cx: &App) -> Option<VisualNode> {
     let kind = workspace.active_modal_kind(cx)?;
-    Some(VisualNode {
-        kind: format!("Modal({kind})"),
-        label: Some(kind.to_string()),
-        visible: true,
-        focused: true,
-        children: Vec::new(),
-    })
+    Some(
+        VisualNode::new(format!("Modal({kind})"))
+            .with_label(kind.to_string())
+            .with_focused(true),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::Project;
+    use workspace::MultiWorkspace;
+
+    fn child_kinds(tree: &VisualNode) -> Vec<&str> {
+        tree.children
+            .iter()
+            .map(|child| child.kind.as_str())
+            .collect()
+    }
+
+    async fn window_with_a_workspace(
+        cx: &mut TestAppContext,
+    ) -> gpui::WindowHandle<MultiWorkspace> {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let root = std::path::Path::new("/only");
+        fs.insert_tree(root, serde_json::json!({ "a.txt": "a" }))
+            .await;
+        let project = Project::test(fs, [root], cx).await;
+        cx.run_until_parked();
+        cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx))
+    }
+
+    /// Without a registered provider the column is exactly what it was before
+    /// the two slots existed — a fresh `solutions`-only test app registers
+    /// none, and the dump must not grow phantom rows in that case.
+    #[gpui::test]
+    async fn unfilled_slots_contribute_no_nodes(cx: &mut TestAppContext) {
+        let window = window_with_a_workspace(cx).await;
+        let (tree, _) = cx
+            .update(|cx| build_visual_tree_for_window(window.into(), cx))
+            .expect("tree for the window just created");
+
+        assert_eq!(
+            child_kinds(&tree),
+            vec![
+                "TitleBar",
+                "Dock(left)",
+                "PaneArea",
+                "Dock(right)",
+                "Dock(bottom)",
+                "StatusBar",
+            ]
+        );
+    }
+
+    /// The two slots splice where the rows are actually painted: the toolbar
+    /// directly under the title bar, the band directly above the status bar.
+    /// An agent reads the child order as the window's vertical order, so this
+    /// is load-bearing, not cosmetic.
+    #[gpui::test]
+    async fn registered_providers_splice_in_painted_order(cx: &mut TestAppContext) {
+        let window = window_with_a_workspace(cx).await;
+        cx.update(|cx| {
+            register_structure_provider(cx, StructureSlot::ProjectToolbar, |_, _, _| {
+                Some(VisualNode::new("ProjectToolbar"))
+            });
+            register_structure_provider(cx, StructureSlot::SolutionBand, |_, _, _| {
+                Some(VisualNode::new("SolutionBand"))
+            });
+        });
+
+        let (tree, _) = cx
+            .update(|cx| build_visual_tree_for_window(window.into(), cx))
+            .expect("tree for the window just created");
+
+        assert_eq!(
+            child_kinds(&tree),
+            vec![
+                "TitleBar",
+                "ProjectToolbar",
+                "Dock(left)",
+                "PaneArea",
+                "Dock(right)",
+                "Dock(bottom)",
+                "SolutionBand",
+                "StatusBar",
+            ]
+        );
+    }
+
+    /// A provider that answers `None` — the band's `AnyView` not installed in
+    /// this window, say — leaves no placeholder behind.
+    #[gpui::test]
+    async fn a_provider_returning_none_contributes_no_node(cx: &mut TestAppContext) {
+        let window = window_with_a_workspace(cx).await;
+        cx.update(|cx| {
+            register_structure_provider(cx, StructureSlot::SolutionBand, |_, _, _| None);
+        });
+
+        let (tree, _) = cx
+            .update(|cx| build_visual_tree_for_window(window.into(), cx))
+            .expect("tree for the window just created");
+
+        assert!(!child_kinds(&tree).contains(&"SolutionBand"));
+    }
+
+    /// `attributes` is skipped when empty, so every node that predates the
+    /// field serializes byte-for-byte as it used to.
+    #[gpui::test]
+    fn an_empty_attribute_bag_is_not_serialized(_cx: &mut TestAppContext) {
+        let json = serde_json::to_value(VisualNode::new("Pane")).expect("serialize");
+        assert!(json.get("attributes").is_none());
+
+        let json =
+            serde_json::to_value(VisualNode::new("SolutionBand").with_attribute("height", 320.0))
+                .expect("serialize");
+        assert_eq!(json["attributes"]["height"], serde_json::json!(320.0));
+    }
 }
