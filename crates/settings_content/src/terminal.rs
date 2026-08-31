@@ -525,23 +525,33 @@ pub enum ActivateScript {
 mod test {
     use serde_json::json;
 
-    use crate::{ProjectSettingsContent, Shell};
+    use crate::{MergeFromTrait as _, ProjectSettingsContent, Shell, WorkingDirectory};
 
     #[test]
-    #[ignore]
     fn test_project_settings() {
-        let project_content =
-            json!({"terminal": {"shell": {"program": "/bin/project"}}, "option_as_meta": true});
+        let user_content = json!({
+            "terminal": {
+                "shell": {"program": "/bin/user"},
+                "working_directory": "always_home",
+            }
+        });
+        let project_content = json!({"terminal": {"shell": {"program": "/bin/project"}}});
 
-        let _user_content =
-            json!({"terminal": {"shell": {"program": "/bin/user"}}, "option_as_meta": false});
-
+        let mut merged = serde_json::from_value::<ProjectSettingsContent>(user_content).unwrap();
         let project_settings =
             serde_json::from_value::<ProjectSettingsContent>(project_content).unwrap();
+        merged.merge_from(&project_settings);
 
+        let terminal = merged.terminal.unwrap();
         assert_eq!(
-            project_settings.terminal.unwrap().shell,
-            Some(Shell::Program("/bin/project".to_owned()))
+            terminal.shell,
+            Some(Shell::Program("/bin/project".to_owned())),
+            "the project layer must win for a key it sets"
+        );
+        assert_eq!(
+            terminal.working_directory,
+            Some(WorkingDirectory::AlwaysHome),
+            "merging must be per-field: keys the project layer omits keep the lower layer's value"
         );
     }
 }

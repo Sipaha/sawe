@@ -382,7 +382,6 @@ async fn test_terminal_tool_timeout_kills_handle(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-#[ignore]
 async fn test_terminal_tool_without_timeout_does_not_kill_handle(cx: &mut TestAppContext) {
     init_test(cx);
     always_allow_tools(cx);
