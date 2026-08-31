@@ -29,5 +29,12 @@ tracing.workspace = true
 util.workspace = true
 ztracing.workspace = true
 
+# The `#[cfg(test)]` module in `extension_lsp_adapter.rs` imports `util::test`,
+# which `util` gates behind `any(test, feature = "test-support")`. Nothing else in
+# this crate turned that feature on, so `cargo {test,clippy} -p language_extension
+# --all-targets` did not compile at all.
+[dev-dependencies]
+util = { workspace = true, features = ["test-support"] }
+
 [package.metadata.cargo-machete]
 ignored = ["tracing"]

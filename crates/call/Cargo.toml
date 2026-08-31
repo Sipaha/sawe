@@ -44,7 +44,14 @@ telemetry.workspace = true
 util.workspace = true
 workspace.workspace = true
 
+# The self dev-dependency keeps this crate's own `test-support` on whenever its
+# test target is built. `diagnostics.rs` mirrors `livekit_client`'s
+# `any(test, feature = "test-support")` switch to pick between the real `RtcStats`
+# and the mock one; the dev-dependency below forces `livekit_client` to the mock,
+# so without this line the two switches disagree and `cargo {test,clippy} -p call
+# --all-targets` does not compile at all.
 [dev-dependencies]
+call = { workspace = true, features = ["test-support"] }
 client = { workspace = true, features = ["test-support"] }
 collections = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }

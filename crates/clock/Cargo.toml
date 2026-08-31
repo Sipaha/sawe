@@ -19,3 +19,10 @@ test-support = ["dep:parking_lot"]
 parking_lot = { workspace = true, optional = true }
 serde.workspace = true
 smallvec.workspace = true
+
+# The self dev-dependency keeps this crate's own `test-support` on whenever its
+# test target is built, so the `#[cfg(any(test, feature = "test-support"))]`
+# `FakeSystemClock` and the optional `parking_lot` it needs stay in lockstep.
+# Without it, `cargo {test,clippy} -p clock --all-targets` does not compile at all.
+[dev-dependencies]
+clock = { workspace = true, features = ["test-support"] }
