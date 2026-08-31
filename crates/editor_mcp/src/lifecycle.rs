@@ -141,8 +141,32 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("mcp.sock")
 }
 
-struct ActiveServer {
+/// The single-instance flock, parked in the `App` the instant it is acquired
+/// and never dropped again while this process lives.
+///
+/// Deliberately NOT a field of [`ActiveServer`], which is where it used to
+/// live. `ActiveServer` is published at the *end* of the startup task in
+/// [`start_server`], so every `?` in that task dropped the guard and released
+/// the flock — while this process went on running and went on owning the
+/// editor's *other* single-instance gate, `data_dir()/zed-<channel>.sock`
+/// (bound in `main.rs` before `app.run`, long before this function is
+/// reached). From then until the editor was restarted, every `sawe <path>`
+/// probed a free lock (`handoff::probe_lock`), concluded no instance was
+/// running, took the `BecameCanonical` branch, then lost the socket gate to
+/// *this* process and exited having opened nothing. That is a persistent
+/// state, not a startup race, which is why the guard's lifetime has to be the
+/// process's and not the task's.
+///
+/// The flock is released by the kernel on process exit, so keeping it across a
+/// failed startup cannot strand a lock file: a crashed or killed editor still
+/// frees it.
+struct InstanceLock {
     _lock: SingleInstanceLock,
+}
+
+impl Global for InstanceLock {}
+
+struct ActiveServer {
     server: Entity<McpServer>,
     /// Solution-scoped tools split off the global catalog at startup. Cloned
     /// into each per-solution server created by [`open_solution_socket`].
@@ -524,13 +548,33 @@ pub fn start_server(cx: &mut App) -> Result<()> {
 
     cleanup_legacy_runtime_dir();
 
-    let lock = match SingleInstanceLock::acquire(&lock_path()) {
+    let lock_path = lock_path();
+    let lock = match SingleInstanceLock::acquire(&lock_path) {
         Ok(lock) => lock,
-        Err(err) => {
+        // A genuinely second instance. Expected, not a failure, and it must
+        // stay quiet: a deliberate second editor (Dev channel, `ZED_STATELESS`)
+        // would otherwise shout on every launch.
+        Err(err @ LockError::Busy { .. }) => {
             log::warn!("editor_mcp: not starting server — {err}");
             return Ok(());
         }
+        // Nothing to park: we never held the lock, so the guard-lifetime fix
+        // described on [`InstanceLock`] cannot help here. The end state is
+        // identical all the same — a live editor owning
+        // `data_dir()/zed-<channel>.sock` with no MCP server behind it — so it
+        // gets the same report, which is the only thing that distinguishes
+        // this from a normal launch.
+        Err(err @ LockError::Io(_)) => {
+            report_startup_failure(format_args!(
+                "could not take {}: {err}",
+                lock_path.display()
+            ));
+            return Ok(());
+        }
     };
+    // Park the guard NOW rather than at the end of the startup task below.
+    // See [`InstanceLock`] for what releasing it on a startup failure did.
+    cx.set_global(InstanceLock { _lock: lock });
 
     // We hold the single-instance lock, so no other editor process owns the
     // per-solution sockets: any slug-named dir under `solutions/` is a leftover
@@ -549,49 +593,78 @@ pub fn start_server(cx: &mut App) -> Result<()> {
     let server_task = McpServer::new(&async_cx);
 
     cx.spawn(async move |cx| {
-        let mut server = server_task.await.context("creating MCP server")?;
+        // The body is wrapped so its failure can be *reported* rather than
+        // only logged. `detach_and_log_err` put the sole record of a failed
+        // bind in `logs/sawe.log`, which is not where the person who is about
+        // to type `sawe <path>` is looking.
+        let outcome = async {
+            let mut server = server_task.await.context("creating MCP server")?;
 
-        // Apply tool registrations BEFORE publishing the well-known socket
-        // symlink. Otherwise a client connecting between symlink creation and
-        // registration application would see an empty `tools/list`.
-        for registration in drained {
-            registration(&mut server);
-        }
-
-        // McpServer binds its own socket inside a tempdir. Symlink the
-        // well-known path to it so clients can find us deterministically.
-        let actual_socket = server.socket_path().to_path_buf();
-        if actual_socket != sock {
-            std::fs::remove_file(&sock).log_err();
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&actual_socket, &sock).with_context(|| {
-                    format!("linking {} to {}", actual_socket.display(), sock.display())
-                })?;
+            // Apply tool registrations BEFORE publishing the well-known socket
+            // symlink. Otherwise a client connecting between symlink creation
+            // and registration application would see an empty `tools/list`.
+            for registration in drained {
+                registration(&mut server);
             }
-        }
 
-        // Split the solution-scoped tools off the global catalog: the global
-        // socket keeps only `GLOBAL_TOOLS`; the rest become a template cloned
-        // into each per-solution socket. SHARED_TOOLS stay on the global socket
-        // too but are additionally cloned into the template.
-        let mut scoped_template = server.split_off_tools(is_global_tool);
-        scoped_template.extend(server.export_tools(is_shared_tool));
+            // McpServer binds its own socket inside a tempdir. Symlink the
+            // well-known path to it so clients can find us deterministically.
+            let actual_socket = server.socket_path().to_path_buf();
+            if actual_socket != sock {
+                std::fs::remove_file(&sock).log_err();
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink(&actual_socket, &sock).with_context(|| {
+                        format!("linking {} to {}", actual_socket.display(), sock.display())
+                    })?;
+                }
+            }
 
-        cx.update(|cx| {
-            let server_entity = cx.new(|_| server);
-            cx.set_global(ActiveServer {
-                _lock: lock,
-                server: server_entity,
-                scoped_template,
-                solution_sockets: Rc::new(RefCell::new(HashMap::new())),
+            // Split the solution-scoped tools off the global catalog: the
+            // global socket keeps only `GLOBAL_TOOLS`; the rest become a
+            // template cloned into each per-solution socket. SHARED_TOOLS stay
+            // on the global socket too but are additionally cloned into the
+            // template.
+            let mut scoped_template = server.split_off_tools(is_global_tool);
+            scoped_template.extend(server.export_tools(is_shared_tool));
+
+            cx.update(|cx| {
+                let server_entity = cx.new(|_| server);
+                cx.set_global(ActiveServer {
+                    server: server_entity,
+                    scoped_template,
+                    solution_sockets: Rc::new(RefCell::new(HashMap::new())),
+                });
             });
-        });
-        anyhow::Ok(())
+            anyhow::Ok(())
+        }
+        .await;
+
+        if let Err(err) = outcome {
+            report_startup_failure(format_args!("{err:#}"));
+        }
     })
-    .detach_and_log_err(cx);
+    .detach();
 
     Ok(())
+}
+
+/// Report a failed MCP-server bind at the moment it happens, on the stream the
+/// user launched from as well as in the log.
+///
+/// The failure is not local to this crate: with no server bound, the editor
+/// keeps running and keeps owning `data_dir()/zed-<channel>.sock`, so every
+/// later `sawe <path>` from the user's shell loses that gate to this process
+/// and exits having opened nothing (`main.rs`, the `failed_single_instance_check`
+/// branch). Nothing else in the session mentions that the CLI integration is
+/// down, and the state does not clear until the editor is restarted — so this
+/// says so once, out loud, rather than only in `logs/sawe.log`.
+fn report_startup_failure(reason: impl std::fmt::Display) {
+    log::error!("editor_mcp: the MCP server did not start: {reason}");
+    eprintln!(
+        "sawe: the MCP server did not start ({reason}). Until this editor is \
+         restarted, `sawe <path>` will not be able to open files in it."
+    );
 }
 
 /// Open a per-solution MCP socket bound to `solution_id`, serving the
