@@ -45,6 +45,22 @@ fn agent_source() -> PathBuf {
 /// Copy the real DB aside and open the copy. Never opens `source` itself: a
 /// sqlez connection is read-write and would journal into the operator's live
 /// file.
+///
+/// **Copies the `-wal` sidecar too.** Both of these databases now run in WAL
+/// mode (`solution_agent::db::CONNECTION_PRAGMAS`, `db::DB_INITIALIZE_QUERY`),
+/// and in WAL the `.db` file alone is not the database: every commit since the
+/// last checkpoint lives only in `<name>-wal`. Copying the `.db` by itself
+/// therefore hands the rehearsal a silently *older* database than the operator
+/// has — the exact failure this migration dry-run exists to rule out, and one
+/// that would show up only as counts that look plausible.
+///
+/// `-shm` is deliberately NOT copied: it is a rebuildable index into the WAL
+/// (sqlite recreates it on open), and a `-shm` snapshotted at a different
+/// instant than the `-wal` is worse than none.
+///
+/// The copy is still not atomic against a live writer, and never was — under
+/// the old rollback journal a mid-transaction snapshot caught a `-journal` the
+/// same way. Run these with the editor closed, as the module header says.
 fn copy_aside(source: &Path, dir: &Path, file_name: &str) -> PathBuf {
     assert!(
         source.exists(),
@@ -53,7 +69,20 @@ fn copy_aside(source: &Path, dir: &Path, file_name: &str) -> PathBuf {
     );
     let copy = dir.join(file_name);
     std::fs::copy(source, &copy).expect("copy the real DB");
+    let wal = append_suffix(source, "-wal");
+    if wal.exists() {
+        std::fs::copy(&wal, append_suffix(&copy, "-wal")).expect("copy the real DB's -wal");
+    }
     copy
+}
+
+/// `path` with `suffix` appended to the whole file name (`x.db` → `x.db-wal`),
+/// which is how sqlite names its sidecars — `set_extension` would produce
+/// `x.-wal` instead.
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 /// Apply the full solutions migration list to a copy of the real solutions DB

@@ -39,6 +39,25 @@ rewrite() {
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# Both source DBs are read below with `?immutable=1`, which tells sqlite the
+# file cannot change and to IGNORE any -wal outright. Both of these databases
+# run in WAL mode (the workspace DB always has; the agent DB since FORK.md
+# #111), so a leftover -wal means every commit since the donor's last
+# checkpoint would be silently invisible to the export — rows that exist,
+# migrate to nothing, and are never reported missing. A clean shutdown
+# checkpoints and unlinks the -wal, so this only fires after a crash or a
+# SIGKILL; refuse rather than migrate a silently older database.
+require_no_wal() {
+    local db="$1"
+    [[ -f "$db" ]] || return 0
+    [[ -f "$db-wal" ]] || return 0
+    die "$db has an un-checkpointed write-ahead log ($db-wal).
+  The export reads it with immutable=1, which ignores the -wal, so migrating now
+  would silently drop every commit since the donor's last checkpoint.
+  Checkpoint it first (with the donor editor closed):
+      sqlite3 \"$db\" 'PRAGMA wal_checkpoint(TRUNCATE);'"
+}
+
 # ---- preconditions -------------------------------------------------------
 [[ -x "$SAWE_BIN" ]] || die "sawe binary not found: $SAWE_BIN (build: cargo build --bin sawe --profile release-fast)"
 pgrep -x spk-editor >/dev/null && die "spk-editor is running — close it first (it locks its DB)."
@@ -46,6 +65,8 @@ pgrep -x sawe       >/dev/null && die "sawe is running — close it first."
 command -v sqlite3 >/dev/null || die "sqlite3 not installed."
 # At least one of {source DB present, already-migrated DST} must hold.
 [[ -f "$SRC_DB" || -f "$DST_DB" ]] || die "neither source DB ($SRC_DB) nor migrated DB ($DST_DB) found."
+require_no_wal "$SRC_DB"
+require_no_wal "$SRC_AGENT"
 
 echo "Migration: $SRC -> $DST   (idempotent; safe to re-run)"
 if [[ "${1:-}" != "--yes" ]]; then
@@ -114,7 +135,17 @@ else
     sleep 2
     schema_ready || die "sawe did not create its schema ($DST_DB / $DST_AGENT)"
 fi
-rm -f "$DST_DB"-wal "$DST_DB"-shm "$DST_AGENT"-wal "$DST_AGENT"-shm
+# Fold the booted editor's WAL into the .db files and truncate it, rather than
+# deleting the sidecars: `kill $boot_pid` is a SIGTERM, and under WAL an
+# un-checkpointed -wal holds committed transactions — including, on a cold
+# profile, the schema that step 4 just created. `rm -f` would discard them.
+# A checkpoint is a no-op on a database that is not in WAL mode.
+for db in "$DST_DB" "$DST_AGENT"; do
+    if [[ -f "$db" ]]; then
+        sqlite3 "$db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null
+    fi
+done
+rm -f "$DST_DB"-shm "$DST_AGENT"-shm
 
 # ---- 5. import rows (upsert — safe to repeat) ----------------------------
 echo "[5/6] importing rows..."
