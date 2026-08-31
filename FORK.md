@@ -2112,15 +2112,17 @@ constructor in `crates/paths` and a line in the rebrand assertions — not a `fo
 at the call site. If you find yourself writing `paths::something_dir().join(format!(…))`
 in another crate, that is the bug this entry exists for.
 
-**One instance of the pattern is knowingly outstanding, and it is a condition on
-phase 4, not an exception to this rule.** `crates/remote_server/src/server.rs`
-composes `paths::temp_dir().join(format!("zed-remote-server-crash-handler-{pid}"))`
-and its `…-proxy-…` sibling — under the *remote host's* profile root, with a name
-phase 4 owns because renaming it has a compatibility consequence rather than being
-cosmetic. When phase 4 renames it, it must route both through a `paths` constructor
-covered by `caller_composed_names_are_ours`. If it renames them in place instead,
-this entry becomes a rule with a standing exception, which is the state it exists to
-end.
+**The one instance that was knowingly outstanding has been discharged, so this rule
+has no exception.** `crates/remote_server/src/server.rs` composed
+`paths::temp_dir().join(format!("zed-remote-server-crash-handler-{pid}"))` and its
+`…-proxy-…` sibling at the call site, deferred to phase 4 because the name family it
+belongs to carried a compatibility consequence. Phase 4 (#119) routed both through
+`paths::remote_server_crash_handler_socket` / `remote_server_proxy_crash_handler_socket`,
+and both are asserted by `caller_composed_names_are_ours`. The remote-server *binary*
+name went the same way in the same commit — `paths::remote_server_binary_name` /
+`remote_server_binary_prefix`, composed at three transports before — which is the
+stronger case, since unlike the crash sockets it lands in a directory shared with
+another product.
 
 Renamed at the same time and for the same reason, both ends in one commit: the
 `zed-cli://` ipc handshake url and its Windows sibling `zed-dock-action://`, and the
@@ -2130,8 +2132,8 @@ application on the machine, so a real Zed and this fork were reading and overwri
 one credential entry; it costs one re-authentication. None of the others can be known
 from outside this repo, so all are renames with no compatibility window. `.zed_server`
 / `.zed_wsl_server` and the `zed-remote-server-…` binary name are **not** in this set:
-they are visible to remote hosts, so they carry a real migration and are a separate
-task.
+they are visible to remote hosts, so they carry a real migration and were a separate
+task — #119.
 
 ### 118. The GitHub workflows are hand-maintained; `cargo xtask workflows` destroys the fork's CI policy
 
@@ -2172,3 +2174,25 @@ here. See FORK.md #118.` sits directly under the rebuild instruction in all 21 f
 If you are editing CI, edit the YAML. If a future change genuinely needs the
 generator, the fork's policy has to move into `tooling/xtask` first, and the numbers
 above are the checklist for what must survive.
+
+### 119. The remote-server directory and binary name are this fork's own — the one disown change that breaks compatibility with another installation
+
+What: a Sawe client uploads its remote server to **`~/.sawe_server/sawe-remote-server-<channel>-<version>`** on the remote host, not to `~/.zed_server/zed-remote-server-<channel>-<version>`. `paths::remote_server_dir_relative()` returns `.sawe_server`; the file name is composed by `paths::remote_server_binary_name()` (and `remote_server_binary_prefix()`, which the server's reaper strips). `remote_wsl_server_dir_relative()` and the `cleanup_old_binaries_wsl()` that was its only caller are gone.
+
+Why: this is the last shared namespace in the disown series and the only one with a real consequence. Every other rename (#115 `/usr/local/bin`, #116 `zed://`, #117 the on-disk runtime names) was either a name only we could see or a claim we simply stopped making. Here both products wrote **the same directory** on a machine neither owns, with **byte-identical file names** inside it, so:
+
+- a Sawe client would silently adopt a binary a real Zed had uploaded, and vice versa, whenever the channel and version strings happened to match;
+- worse, `cleanup_old_binaries()` runs *on the host* and deletes every `zed-remote-server-<channel>-*` whose version is older than its own and which no running process holds — so a Sawe server reaped a real Zed's binaries, and a real Zed's server reaped ours;
+- worst, `cleanup_old_binaries_wsl()` did an unconditional `remove_dir_all` of the whole `.zed_wsl_server` directory.
+
+The accepted cost is one re-upload per remote host, which the existing code performs by itself: the client's entire version negotiation is `<dst_path> version` returning zero, so a name that is not there simply reads as "no server binary" and the normal download/upload path runs. Nothing else had to change for that, because nothing else depends on the name.
+
+How to apply:
+
+- **The name is the version check.** The client never asks the server what it is; it runs the *expected path* with the `version` argument and looks only at the exit status (`ssh.rs`, `wsl.rs`, `docker.rs`). Neither the directory nor the binary name appears in any proto message, in the JSON log framing, or in `ProxyLaunchError`'s exit-code channel (90). The only magic string in the whole handshake is the Windows-only `ZED_SSH_CONNECTION_ESTABLISHED`, which the client echoes through `ssh` and reads back from its own stdout — both ends the same process, and it carries no path. So a rename cannot desynchronise a version check; it can only *fail* one, into the branch that re-uploads.
+- **Nothing is cleaned up on the remote host, deliberately.** The old `~/.zed_server` is left where it is. Its contents cannot be attributed: this fork's own earlier builds wrote binaries there under exactly the file names a real Zed writes, so "delete the stale ones" and "delete somebody else's editor" are the same operation. This is the phase-3 ruling from #115 applied to a directory instead of a symlink — nothing in this fork removes a path it cannot prove it created. The dead bytes are one binary per channel per version, and the user can remove the directory by hand.
+- **The one consequence of that: `cleanup_old_binaries_wsl` was deleted rather than renamed.** Renaming its target to `.sawe_wsl_server` would leave a `remove_dir_all` aimed at a directory no code in this fork writes — `wsl.rs` has used the *shared* `remote_server_dir_relative()` since upstream's own "remove this once 223 goes stable" marker — so it could never fire again. Keeping an inert `remove_dir_all` is worse than not having one. What it used to delete is now covered by the rule above: we do not touch `.zed_wsl_server`.
+- **`crates/auto_update`'s `"zed-remote-server"` is not ours and stays.** It is the *asset name in Zed Industries' release feed*, sent as a query parameter to `cloud.zed.dev` by `get_release_asset`; renaming it would ask their API for an asset that does not exist. Same category as #116 keeping `client::parse_zed_link`'s `<server_url>/channel/…` arm. It is also unreachable here, since `auto_update::init` is commented out, so both delegate methods that call it fail with "auto-update not initialized" — meaning this fork's live remote-server acquisition is the `ZED_BUILD_REMOTE_SERVER` build-from-source path, or a binary already present on the host.
+- **The release-*artifact* names in `.github/workflows` and `tooling/xtask/.../vars.rs` are a different name family and were left alone.** They are `zed-remote-server-linux-x86_64.gz` and friends, alongside `Zed-aarch64.dmg` and `zed-linux-x86_64.tar.gz` in the same `EXPECTED_ASSETS` list, while `script/bundle-{linux,mac,freebsd}` have emitted `sawe-*` since the phase-B rebrand — so that manifest is already wholly out of sync, for every artifact family, not just this one. Renaming one row of it fixes nothing, every job in `release.yml` / `release_nightly.yml` is gated on `github.repository_owner == 'zed-industries'` and cannot run here, and #118 forbids regenerating the YAML, so `vars.rs` and the 21 files must move together as one deliberate task. `script/bundle-windows.ps1` and `script/upload-nightly.ps1` *were* fixed: they are scripts a maintainer runs by hand, and they were simply the Windows arm the phase-B rename missed.
+
+Verification limit, recorded rather than papered over: **this machine has no remote host and no container runtime, so the SSH, WSL and Docker arms are code-verified only.** What was proven live is that the name is now produced correctly and that the guard sees it — the `paths` rebrand assertions cover `remote_server_dir_relative`, `remote_server_binary_name` (both the plain and `.exe` branches), `remote_server_binary_prefix` and both crash sockets, and each was shown to fail when the name is reverted. The end-to-end claim "an old host re-uploads instead of adopting the wrong binary" rests on the code path above, not on an observed connection.
