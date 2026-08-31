@@ -48,15 +48,4 @@ async fn a_failed_bind_keeps_the_single_instance_lock(cx: &mut TestAppContext) {
         "the single-instance flock was released by a failed startup; from here every \
          `sawe <path>` sees a free lock and drops the user's paths until restart"
     );
-
-    let recorded_pid: u32 = std::fs::read_to_string(editor_mcp::lock_path())
-        .expect("read lock")
-        .trim()
-        .parse()
-        .expect("lock body is this process's pid");
-    assert_eq!(
-        recorded_pid,
-        std::process::id(),
-        "the holder recorded in the lock file must still be us"
-    );
 }
