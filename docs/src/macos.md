@@ -48,34 +48,33 @@ Zed includes a command-line tool for opening files and projects from Terminal. T
 2. Open the command palette with `Cmd+Shift+P`
 3. Run {#action cli::InstallCliBinary}
 
-This creates a `zed` command in `/usr/local/bin`. You can then open files and folders:
+This creates a `sawe` command in `/usr/local/bin`. You can then open files and folders:
 
 ```sh
-zed .                    # Open current folder
-zed file.txt             # Open a file
-zed project/ file.txt    # Open a folder and a file
+sawe .                    # Open current folder
+sawe file.txt             # Open a file
+sawe project/ file.txt    # Open a folder and a file
 ```
 
 See the [CLI Reference](./reference/cli.md) for all available options.
 
 ## Uninstall
 
-1. Quit Zed if it's running
-2. Drag Zed from Applications to the Trash
+1. Quit Sawe if it's running
+2. Drag Sawe from Applications to the Trash
 3. Optionally, remove your settings and extensions:
 
 ```sh
-rm -rf ~/.config/zed
-rm -rf ~/Library/Application\ Support/Zed
-rm -rf ~/Library/Caches/Zed
-rm -rf ~/Library/Logs/Zed
-rm -rf ~/Library/Saved\ Application\ State/dev.zed.Zed.savedState
+rm -rf ~/.spk/sawe
+rm -rf ~/Library/Saved\ Application\ State/ru.sipaha.sawe.savedState
+rm -rf ~/Library/Caches/ru.sipaha.sawe
+rm -rf ~/Library/Preferences/ru.sipaha.sawe.plist
 ```
 
 If you installed the CLI, remove it with:
 
 ```sh
-rm /usr/local/bin/zed
+rm /usr/local/bin/sawe
 ```
 
 ## Troubleshooting
@@ -98,7 +97,7 @@ xattr -cr /Applications/Zed.app
 
 ### CLI command not found
 
-If the `zed` command isn't available after installation:
+If the `sawe` command isn't available after installation:
 
 1. Check that `/usr/local/bin` is in your PATH
 2. Try reinstalling the CLI via {#action cli::InstallCliBinary} in the command palette

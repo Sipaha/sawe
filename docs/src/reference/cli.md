@@ -128,10 +128,10 @@ zed --version
 
 ### `--uninstall`
 
-Uninstall Zed and remove all related files (macOS and Linux only):
+Uninstall Sawe and remove all related files (macOS and Linux only):
 
 ```sh
-zed --uninstall
+sawe --uninstall
 ```
 
 ### `--zed <PATH>`
