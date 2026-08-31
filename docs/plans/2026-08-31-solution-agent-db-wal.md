@@ -1,7 +1,35 @@
 # Plan — put the agent transcript database on WAL
 
-Status: in progress (2026-08-31)
+Status: **shipped** (2026-08-31) — FORK.md #111.
 Owner: autonomous supervisor session 2026-08-31b
+
+## What shipped, against this plan
+
+The ruling below stands unchanged; the implementer re-measured rather than
+inheriting the numbers, and confirmed the load-bearing input the plan flagged
+for verification.
+
+- **Step 0 (the premise) held.** `store::acp_event`'s `EntryUpdated` arm calls
+  `persist_main_stream` unconditionally, and nothing downstream coalesces: each
+  call captures its own row plan, advances `persisted_main_seq` synchronously,
+  and appends a `PersistChain` link that issues its own three transactions. The
+  500 ms/2 s `entry_update_throttles` debounce beside it governs only the MCP
+  `SessionMessageAppended` emit. So the streaming reveal rate *is* the persist
+  rate, and the headline is the operating point, not a worst-case bound.
+- **Re-measured on a fresh harness**, same fixture shape (108 sessions x 269
+  rows / 29,052 rows / 3.6 KiB payloads / 114.8 MiB), on a busier disk (fsync
+  17.9 ms rather than 7.3): **48.5 ms/event before, 0.135 ms/event after
+  (359x)**; write amplification 56.0 -> 12.9 KiB per 3.6 KiB row; full flush of
+  the largest real session shape 74.4 -> 8.1 ms. WAL+`FULL` measured 17.0
+  ms/event (2.9x) and still 1,062 ms of DB time per second of streaming, so the
+  `NORMAL` ruling below is unchanged.
+- **The pragmas are read back** from a real file database opened through
+  `open_at_path` (`db::tests::connection_pragmas_are_in_effect_on_a_file_database`),
+  not asserted as an executed SQL string. Every pragma but `foreign_keys` is
+  mutation-proven; `foreign_keys` is not, because this libsqlite3-sys build
+  defaults it on.
+- **All four sidecar sites closed**, plus one the plan did not name (the migrate
+  script's post-boot `rm -f …-wal`). See FORK.md #111.
 
 ## Problem
 
