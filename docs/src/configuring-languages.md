@@ -99,10 +99,7 @@ Zed simplifies language server management for users:
 
 1. Automatic Download: When you open a file with a matching file type, Zed automatically downloads the appropriate language server. Zed may prompt you to install an extension for known file types.
 
-2. Storage Location:
-
-   - macOS: `~/Library/Application Support/Zed/languages`
-   - Linux: `$XDG_DATA_HOME/zed/languages`, `$FLATPAK_XDG_DATA_HOME/zed/languages`, or `$HOME/.local/share/zed/languages`
+2. Storage Location: `~/.spk/sawe/data/languages`, on every platform.
 
 3. Automatic Updates: Zed keeps your language servers up-to-date, ensuring you always have the latest features and improvements.
 
@@ -281,7 +278,7 @@ You can toggle language server support globally or per-language:
   }
 ```
 
-This disables the language server for Markdown files, which can be useful for performance in large documentation projects. You can configure this globally in your `~/.config/zed/settings.json` or inside a `.zed/settings.json` in your project directory.
+This disables the language server for Markdown files, which can be useful for performance in large documentation projects. You can configure this globally in your `~/.spk/sawe/config/settings.json` or inside a `.zed/settings.json` in your project directory.
 
 ## Formatting and Linting
 
@@ -439,7 +436,7 @@ Change your theme:
 }
 ```
 
-Create custom themes by creating a JSON file in `~/.config/zed/themes/`. Zed will automatically detect and make available any themes in this directory.
+Create custom themes by creating a JSON file in `~/.spk/sawe/config/themes/`. Zed will automatically detect and make available any themes in this directory.
 
 ### Using Theme Extensions
 

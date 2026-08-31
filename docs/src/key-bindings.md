@@ -38,10 +38,7 @@ Anything that you end up doing on the keymap editor also gets reflected on the `
 
 ## User Keymaps
 
-The keymap file is stored in the following locations for each platform:
-
-- macOS/Linux: `~/.config/zed/keymap.json`
-- Windows: `~\AppData\Roaming\Zed/keymap.json`
+The keymap file is stored at `~/.spk/sawe/config/keymap.json`, on every platform.
 
 You can open the keymap with the {#action zed::OpenKeymapFile} action from the command palette.
 

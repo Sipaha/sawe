@@ -112,11 +112,7 @@ Use a custom directory for all user data (database, extensions, logs) instead of
 zed --user-data-dir ~/.zed-custom
 ```
 
-Default locations:
-
-- **macOS:** `~/Library/Application Support/Zed`
-- **Linux:** `$XDG_DATA_HOME/zed` (typically `~/.local/share/zed`)
-- **Windows:** `%LOCALAPPDATA%\Zed`
+Default location: `~/.spk/sawe`, on every platform.
 
 ### `-v`, `--version`
 

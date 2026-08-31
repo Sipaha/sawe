@@ -28,11 +28,7 @@ As you type in the search box, matching settings appear with descriptions and co
 
 Your user settings apply globally across all projects. Open the file with {#kb zed::OpenSettingsFile} or run {#action zed::OpenSettingsFile} from the command palette.
 
-The file is located at:
-
-- macOS: `~/.config/zed/settings.json`
-- Linux: `~/.config/zed/settings.json` (or `$XDG_CONFIG_HOME/zed/settings.json`)
-- Windows: `%APPDATA%\Zed\settings.json`
+The file is located at `~/.spk/sawe/config/settings.json`, on every platform.
 
 The syntax is JSON with support for `//` comments.
 

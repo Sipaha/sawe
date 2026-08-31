@@ -25,14 +25,10 @@ Often, a good first place to look when troubleshooting any issue in Zed is the Z
 You can review the most recent 1000 lines of the log by running the {#action zed::OpenLog} action from the command palette.
 If you want to view the full file, you can reveal it in your operating system's native file manager via {#action zed::RevealLogInFileManager} from the command palette.
 
-You'll find the Zed log in the respective location on each operating system:
-
-- macOS: `~/Library/Logs/Zed/Zed.log`
-- Windows: `C:\Users\YOU\AppData\Local\Zed\logs\Zed.log`
-- Linux: `~/.local/share/zed/logs/Zed.log` or `$XDG_DATA_HOME`
+You'll find the log at `~/.spk/sawe/logs/sawe.log`, on every operating system.
 
 > **Note:** In some cases, it might be useful to monitor the log live, such as when [developing a Zed extension](https://zed.dev/docs/extensions/developing-extensions).
-> Example: `tail -f ~/Library/Logs/Zed/Zed.log`
+> Example: `tail -f ~/.spk/sawe/logs/sawe.log`
 
 The log may contain enough context to help you debug the issue yourself, or you may find specific errors that are useful when filing a [GitHub issue](https://github.com/zed-industries/zed/issues/new/choose) or when talking to Zed staff in our [Discord server](https://zed.dev/community-links#forums-and-discussions).
 
@@ -63,11 +59,8 @@ Xcode Instruments (which comes bundled with your [Xcode](https://apps.apple.com/
 
 ## Startup and Workspace Issues
 
-Zed creates local SQLite databases to persist data relating to its workspace and your projects. These databases store, for instance, the tabs and panes you have open in a project, the scroll position of each open file, the list of all projects you've opened (for the recent projects modal picker), etc. You can find and explore these databases in the following locations:
-
-- macOS: `~/Library/Application Support/Zed/db`
-- Linux and FreeBSD: `~/.local/share/zed/db` (or within `XDG_DATA_HOME` or `FLATPAK_XDG_DATA_HOME`)
-- Windows: `%LOCALAPPDATA%\Zed\db`
+Zed creates local SQLite databases to persist data relating to its workspace and your projects. These databases store, for instance, the tabs and panes you have open in a project, the scroll position of each open file, the list of all projects you've opened (for the recent projects modal picker), etc. You can find and explore these databases in `~/.spk/sawe/data/db`, on every
+platform.
 
 The naming convention of these databases takes on the form of `0-<zed_channel>`:
 

@@ -171,7 +171,7 @@ ls ~/Library/Application\ Support/Zed/extensions/installed/
 On Linux:
 
 ```sh
-ls ~/.local/share/zed/extensions/installed
+ls ~/.spk/sawe/data/extensions/installed
 ```
 
 On Windows:
@@ -5676,7 +5676,7 @@ To preview and enable a settings profile, open the command palette via {#kb comm
 ## An example configuration:
 
 ```json [settings]
-// ~/.config/zed/settings.json
+// ~/.spk/sawe/config/settings.json
 {
   "theme": "cave-light",
   "tab_size": 2,

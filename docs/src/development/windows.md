@@ -248,7 +248,7 @@ For more information on this, please see [win32 docs](https://learn.microsoft.co
 Zed currently uses Vulkan as its graphics API on Windows. If Zed fails to launch, Vulkan is a common cause.
 
 You can check the Zed log at:
-`C:\Users\YOU\AppData\Local\Zed\logs\Zed.log`
+`%USERPROFILE%\.spk\sawe\logs\sawe.log`
 
 If you see messages like:
 

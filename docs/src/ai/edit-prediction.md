@@ -186,7 +186,7 @@ To disable edit predictions for specific directories or files, set this in your 
 ```json [settings]
 {
   "edit_predictions": {
-    "disabled_globs": ["~/.config/zed/settings.json"]
+    "disabled_globs": ["~/.spk/sawe/config/settings.json"]
   }
 }
 ```

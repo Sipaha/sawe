@@ -159,7 +159,7 @@ vkcube
 
 This should output a line describing your current graphics setup and show a rotating cube. If this does not work, you should be able to fix it by installing Vulkan compatible GPU drivers, however in some cases there is no Vulkan support yet.
 
-You can find out which graphics card Zed is using by looking in the Zed log (`~/.local/share/zed/logs/Zed.log`) for `Using GPU: ...`.
+You can find out which graphics card Zed is using by looking in the Zed log (`~/.spk/sawe/logs/sawe.log`) for `Using GPU: ...`.
 
 If you see errors like `ERROR_INITIALIZATION_FAILED` or `GPU Crashed` or `ERROR_SURFACE_LOST_KHR` then you may be able to work around this by installing different drivers for your GPU, or by selecting a different GPU to run on. (See [#14225](https://github.com/zed-industries/zed/issues/14225))
 
@@ -217,12 +217,12 @@ zed --system-specs
 
 will print the system specs to the terminal like so. It is strongly recommended to copy the output verbatim into the issue on GitHub, as it uses markdown formatting to ensure the output is readable.
 
-Additionally, it is extremely beneficial to provide the contents of your Zed log when reporting such issues. The log is usually located at `~/.local/share/zed/logs/Zed.log`. The recommended process for producing a helpful log file is as follows:
+Additionally, it is extremely beneficial to provide the contents of your Zed log when reporting such issues. The log is located at `~/.spk/sawe/logs/sawe.log`. The recommended process for producing a helpful log file is as follows:
 
 ```sh
-truncate -s 0 ~/.local/share/zed/logs/Zed.log # Clear the log file
+truncate -s 0 ~/.spk/sawe/logs/sawe.log # Clear the log file
 ZED_LOG=wgpu=info zed .
-cat ~/.local/share/zed/logs/Zed.log
+cat ~/.spk/sawe/logs/sawe.log
 # copy the output
 ```
 

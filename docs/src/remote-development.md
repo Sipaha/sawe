@@ -176,7 +176,7 @@ These ports also default to the `localhost` interface on the remote host. If you
 
 When opening a remote project there are three relevant settings locations:
 
-- The local Zed settings (in `~/.zed/settings.json` on macOS or `~/.config/zed/settings.json` on Linux) on your local machine.
+- The local Sawe settings (in `~/.spk/sawe/config/settings.json`) on your local machine.
 - The server Zed settings (in the same place) on the remote server.
 - The project settings (in `.zed/settings.json` or `.editorconfig` of your project)
 
@@ -204,7 +204,7 @@ export https_proxy="http://proxy.example.com:8080"
 export no_proxy="localhost,127.0.0.1"
 ```
 
-Alternatively, you can configure the proxy in the remote machine's `~/.config/zed/settings.json` (Linux) or `~/.zed/settings.json` (macOS):
+Alternatively, you can configure the proxy in the remote machine's `~/.spk/sawe/config/settings.json`:
 
 ```json
 {

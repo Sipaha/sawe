@@ -113,7 +113,7 @@ For example, [assets/themes/one/one.json](https://github.com/zed-industries/zed/
 
 ## Local Themes {#local-themes}
 
-Store new themes locally by placing them in the `~/.config/zed/themes` directory (macOS and Linux) or `%USERPROFILE%\AppData\Roaming\Zed\themes\` (Windows).
+Store new themes locally by placing them in the `~/.spk/sawe/config/themes` directory, on every platform.
 
 For example, to create a new theme called `my-cool-theme`, create a file called `my-cool-theme.json` in that directory.
 It will be available in the theme selector the next time Zed loads.

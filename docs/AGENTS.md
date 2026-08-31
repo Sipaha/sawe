@@ -282,17 +282,13 @@ When documenting rules/instructions for AI, note that Zed recognizes these files
 - `CLAUDE.md`
 - `GEMINI.md`
 
-### Settings File Locations
+### Settings File Location
 
-- macOS: `~/.config/zed/settings.json`
-- Linux: `~/.config/zed/settings.json`
-- Windows: `%AppData%\Zed\settings.json`
+`~/.spk/sawe/config/settings.json`, on every platform.
 
-### Keymap File Locations
+### Keymap File Location
 
-- macOS: `~/.config/zed/keymap.json`
-- Linux: `~/.config/zed/keymap.json`
-- Windows: `%AppData%\Zed\keymap.json`
+`~/.spk/sawe/config/keymap.json`, on every platform.
 
 ## Safety Constraints
 

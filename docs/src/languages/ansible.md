@@ -16,7 +16,7 @@ Support for Ansible in Zed is provided via a community-maintained [Ansible exten
 
 To avoid mishandling non-Ansible YAML files, the Ansible Language is not associated with any file extensions by default.
 
-To change this behavior, you can add a `"file_types"` section to Zed settings inside your project (`.zed/settings.json`) or your Zed user settings (`~/.config/zed/settings.json`) to match your folder/naming conventions. For example:
+To change this behavior, you can add a `"file_types"` section to Zed settings inside your project (`.zed/settings.json`) or your Sawe user settings (`~/.spk/sawe/config/settings.json`) to match your folder/naming conventions. For example:
 
 ```json [settings]
 {
