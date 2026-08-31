@@ -41,11 +41,6 @@ pub fn dir_name_kebab() -> &'static str {
     if use_dev_suffix() { "sawe-dev" } else { "sawe" }
 }
 
-/// PascalCase directory name (macOS / Windows). See `use_dev_suffix`.
-pub fn dir_name_pascal() -> &'static str {
-    if use_dev_suffix() { "Sawe-Dev" } else { "Sawe" }
-}
-
 /// A custom data directory override, set only by `set_custom_data_dir`.
 /// This is used to override the default data directory location.
 /// The directory will be created if it doesn't exist when set.
@@ -117,19 +112,27 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
 }
 
 /// Single root directory under which **all** profile state lives —
-/// config, data, cache, logs, solutions, the lot. We tuck everything
-/// into a hidden `~/.spk/` namespace so `~/` doesn't accumulate
-/// per-app dotfree folders, and so sibling SPK tools can colocate
-/// their own state under the same umbrella.
+/// config, data, cache, logs, the lot. We tuck everything into a
+/// hidden `~/.spk/` namespace so `~/` doesn't accumulate per-app
+/// dotfree folders, and so sibling SPK tools can colocate their own
+/// state under the same umbrella.
 ///
 /// Layout:
 ///   `~/.spk/sawe/` — release profile of this editor
 ///   `~/.spk/sawe-dev/` — debug profile of this editor
 ///   `~/.spk/<other-spk-tool>/` — sibling apps drop their state here
 ///
-/// Windows / macOS get the same single-folder layout (no native
-/// `Application Support` / `AppData` split) so the cleanup story
-/// stays one-line everywhere: `rm -rf ~/.spk/sawe[-dev]`.
+/// Windows and macOS get the same single-folder layout, with no native
+/// `Application Support` / `AppData` split — one root is what makes
+/// `SAWE_HOME` and `--user-data-dir` isolation a single redirect.
+///
+/// **There is no one-line cleanup, and this doc comment used to claim
+/// there was.** `rm -rf ~/.spk/sawe[-dev]` also deletes `ss/`, the
+/// Solutions root (`solutions::settings::default_root`), which holds
+/// the user's own project checkouts rather than anything this editor
+/// can regenerate. Removing profile state means naming the app-owned
+/// children — `config`, `data`, `state`, `cache`, `logs` — which is
+/// what `script/uninstall.sh` and `docs/src/uninstall.md` now do.
 pub fn base_dir() -> &'static PathBuf {
     static BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
     BASE_DIR.get_or_init(|| {
