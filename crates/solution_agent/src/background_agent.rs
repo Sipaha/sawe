@@ -987,6 +987,99 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // stream_entry — the derived Teammate stream's single body entry.
+    //
+    // This helper is DELEGATED to by `model::tests::reference_decorated_mirror`
+    // (it is pure formatting, so an owned reference would just re-type the
+    // `format!`), which means the 300-seed decorated property test is
+    // tautological for it: reordering the header fields there stays green. The
+    // tests below are that mutation's only oracle in the crate — keep them
+    // exact-equality on the header line, not `contains`.
+    // -----------------------------------------------------------------------
+
+    fn agent_with_snapshot(
+        killed: bool,
+        snapshot: Option<BackgroundAgentSnapshot>,
+    ) -> BackgroundAgent {
+        BackgroundAgent {
+            id: BackgroundAgentId::new("a30f92a688e431edc"),
+            jsonl_path: PathBuf::from("/tmp/agent.jsonl"),
+            registered_at: Utc::now(),
+            latest: snapshot,
+            last_offset: 0,
+            parent_tool_use_id: Some(SharedString::new_static("toolu_1")),
+            latest_seq: 42,
+            killed,
+        }
+    }
+
+    fn agent_snapshot(activity: &str, usage_limited: bool) -> BackgroundAgentSnapshot {
+        BackgroundAgentSnapshot {
+            mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+            activity_label: SharedString::from(activity.to_string()),
+            stop_reason: None,
+            usage_limited,
+        }
+    }
+
+    /// `now` three days after every snapshot's mtime, so `agent_relative_time`
+    /// is pinned at day granularity and the header line is exact.
+    fn three_days_later() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_600_000_000 + 3 * 86_400, 0)
+            .expect("a fixed in-range unix timestamp")
+    }
+
+    fn entry_text(entry: &SessionEntry) -> String {
+        let SessionEntryKind::AssistantMessage { chunks } = &entry.kind else {
+            panic!("expected AssistantMessage");
+        };
+        let AssistantChunk::Message(text) = &chunks[0] else {
+            panic!("expected a plain Message chunk");
+        };
+        text.clone()
+    }
+
+    #[test]
+    fn stream_entry_header_is_id_then_state_then_observed() {
+        let agent = agent_with_snapshot(false, Some(agent_snapshot("Bash: cargo test", false)));
+        let text = entry_text(&agent.stream_entry(three_days_later()));
+        let header = text.lines().next().expect("a header line");
+        assert_eq!(header, "Agent a30f92 · running · 3d ago");
+        assert_eq!(agent.stream_entry(three_days_later()).mod_seq, 42);
+        assert_eq!(
+            agent.stream_entry(three_days_later()).created_ms,
+            1_600_000_000_000
+        );
+    }
+
+    #[test]
+    fn stream_entry_header_state_label_tracks_killed_and_walled() {
+        let killed = agent_with_snapshot(true, Some(agent_snapshot("Bash: cargo test", false)));
+        assert_eq!(
+            entry_text(&killed.stream_entry(three_days_later()))
+                .lines()
+                .next(),
+            Some("Agent a30f92 · killed · 3d ago"),
+        );
+
+        let walled = agent_with_snapshot(false, Some(agent_snapshot("Bash: cargo test", true)));
+        assert_eq!(
+            entry_text(&walled.stream_entry(three_days_later()))
+                .lines()
+                .next(),
+            Some("Agent a30f92 · limit reached · 3d ago"),
+        );
+
+        let starting = agent_with_snapshot(false, None);
+        assert_eq!(
+            entry_text(&starting.stream_entry(three_days_later()))
+                .lines()
+                .next(),
+            Some("Agent a30f92 · running · no output yet"),
+        );
+    }
+
     #[test]
     fn parse_jsonl_snapshot_pause_turn_and_unknown_stops_are_not_terminal() {
         for reason in ["pause_turn", "something_new"] {

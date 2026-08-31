@@ -1583,15 +1583,33 @@ fn rebuild_streams_work_does_not_scale_with_transcript_length() {
 // production mutation that this test is confirmed to catch.
 //
 // What it does NOT cover:
-//   * five production helpers the reference DELEGATES to rather than
-//     re-deriving: `BackgroundShell::{stream_entry, stream_label}`,
-//     `BackgroundAgent::stream_entry`, and — note — `renders_stream()` and
-//     `stream_state()`, which are decision logic, not formatting. That is a
-//     deliberate narrowing, not an oversight: each has its own unit tests in
-//     `background_shell.rs` / `background_agent.rs`, and mutating the fold's
-//     CALL SITE (fold a terminal agent; drop the liveness re-state) is still
-//     caught here. What is NOT caught is a change inside those five. Do not
-//     read this property as covering them.
+//   * three production helpers the reference DELEGATES to rather than
+//     re-deriving: `BackgroundShell::{stream_label, stream_entry}` and
+//     `BackgroundAgent::stream_entry`. All three are pure FORMATTING — a
+//     `format!` over fields already in scope — so an independent reference
+//     would be a verbatim re-typing that pins the wording twice and detects
+//     nothing a `git diff` would not. This is a permanent, deliberate
+//     narrowing. Measured, not assumed: mutating each helper's body (the shell
+//     label's `·` separator; the shell entry's "running (stale)" wording; the
+//     agent entry header's field order) leaves this property GREEN, on every
+//     one of the 300 seeds. Each of the three IS backstopped by its own unit
+//     test in `background_shell.rs` / `background_agent.rs` — those three
+//     mutations fail there, and nowhere else. Do not read a green run of this
+//     property as covering any of the three.
+//
+//     The two DECISION-LOGIC helpers of the agent fold —
+//     `BackgroundAgent::{renders_stream, stream_state}` — are deliberately NOT
+//     delegated: `reference_renders_stream` / `reference_stream_state` re-derive
+//     both from the agent's `pub` fields, and `DecorationCensus::observe` uses
+//     the reference predicate too (a delegating census derives its own
+//     distribution from the code under test). Both were delegated once and both
+//     were provably tautological then: dropping the `killed` disjunct from
+//     `renders_stream`, or returning `Live` from `stream_state`'s killed arm,
+//     each left the ENTIRE crate green. They now fail here on a field/ids
+//     divergence.
+//
+//     Mutating the fold's CALL SITE (fold a terminal agent; drop the liveness
+//     re-state) is likewise caught here, on a real comparison.
 //   * the two `Utc::now()` reads. They are bracketed (see
 //     `assert_decorated_mirror`), not injected, so a change to the "observed X
 //     ago" bucketing is invisible here.
@@ -1650,6 +1668,53 @@ fn streamed_anew(session: &SolutionSession) -> std::collections::HashSet<crate::
         .filter_map(|entry| entry.subagent_id.clone())
         .map(crate::stream::StreamId::Teammate)
         .collect()
+}
+
+/// Owned model of [`crate::background_agent::BackgroundAgent::renders_stream`]
+/// — whether a background agent contributes a derived teammate stream at all.
+///
+/// Deliberately re-derived from the agent's `pub` fields instead of calling the
+/// production predicate (or its `hit_usage_limit` / `is_messageable` parts):
+/// this is decision logic, and a reference that delegates it makes the property
+/// tautological for the fold's existence guard. Measured, not assumed —
+/// dropping the `killed` disjunct from production used to leave the whole crate
+/// green.
+#[cfg(test)]
+fn reference_renders_stream(agent: &crate::background_agent::BackgroundAgent) -> bool {
+    let walled = agent
+        .latest
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.usage_limited);
+    let stopped = agent
+        .latest
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.stop_reason.is_some());
+    agent.killed || walled || !stopped
+}
+
+/// Owned model of [`crate::background_agent::BackgroundAgent::stream_state`] —
+/// killed outranks walled outranks live. Re-derived for the same reason as
+/// [`reference_renders_stream`]; the two `*_REASON` constants are shared data,
+/// but the branch that selects between them is this reference's own.
+#[cfg(test)]
+fn reference_stream_state(
+    agent: &crate::background_agent::BackgroundAgent,
+) -> crate::stream::StreamState {
+    if agent.killed {
+        crate::stream::StreamState::Done {
+            reason: crate::background_agent::KILLED_REASON,
+        }
+    } else if agent
+        .latest
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.usage_limited)
+    {
+        crate::stream::StreamState::Done {
+            reason: crate::background_agent::USAGE_LIMIT_REASON,
+        }
+    } else {
+        crate::stream::StreamState::Live
+    }
 }
 
 /// Owned reference for the WHOLE mirror: `reference_demux` plus every
@@ -1731,7 +1796,7 @@ fn reference_decorated_mirror(
         let Some(agent) = session.background_agents.get(id) else {
             continue;
         };
-        if !agent.renders_stream() {
+        if !reference_renders_stream(agent) {
             continue;
         }
         let Some(parent_toolu) = agent.parent_tool_use_id.clone() else {
@@ -1743,12 +1808,12 @@ fn reference_decorated_mirror(
         }
         match shapes.iter_mut().find(|existing| existing.id == key) {
             // Never clobber: only the liveness is the agent's to state.
-            Some(existing) => existing.state = agent.stream_state(),
+            Some(existing) => existing.state = reference_stream_state(agent),
             None => shapes.push(StreamShape {
                 id: key,
                 kind: StreamKind::Teammate,
                 label: parent_toolu,
-                state: agent.stream_state(),
+                state: reference_stream_state(agent),
                 source: StreamSource::FileTail(agent.jsonl_path.clone()),
                 seq: 0,
                 entries: vec![agent.stream_entry(now)],
@@ -2014,7 +2079,11 @@ impl DecorationCensus {
             let Some(agent) = session.background_agents.get(id) else {
                 continue;
             };
-            if !agent.renders_stream() {
+            // `reference_renders_stream`, not the production predicate: a
+            // census that delegates derives its distribution from the code
+            // under test, so a mutation that merely moves a cohort between
+            // buckets keeps every floor green.
+            if !reference_renders_stream(agent) {
                 self.agents_terminal_skipped += 1;
                 continue;
             }
