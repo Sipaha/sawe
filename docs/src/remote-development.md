@@ -222,7 +222,7 @@ Any prompts that SSH needs will be shown in the UI, so you can verify host keys,
 
 Once the master connection is established, Sawe will check to see if the remote server binary is present in `~/.sawe_server` on the remote, and that its version matches the current version of Sawe that you're using.
 
-If it is not there or the version mismatches, Zed will try to download the latest version. By default, it will download from `https://zed.dev` directly, but if you set: `{"upload_binary_over_ssh":true}` in your settings for that server, it will download the binary to your local machine and then upload it to the remote server.
+If it is not there or the version mismatches, Sawe has no binary to fetch for you. Both automatic paths — downloading on the remote host, and the `{"upload_binary_over_ssh":true}` variant that downloads locally and uploads — go through `auto_update`, which this fork disables, and they resolved against another product's release feed in any case. Supply the binary yourself, as below.
 
 If you'd like to maintain the server binary yourself you can: build it from this fork's source with `cargo build -p remote_server --release`. Upstream Zed's prebuilt remote server is not a substitute — this fork uploads its own directory and its own file names precisely so that the two products cannot be confused for one another on a shared host. Upload it to `~/.sawe_server/sawe-remote-server-{RELEASE_CHANNEL}-{VERSION}` on the server, for example `~/.sawe_server/sawe-remote-server-stable-0.217.3+stable.105.80433cb239e868271457ac376673a5f75bc4adb1`. The version must exactly match the version of Sawe itself you are using.
 

@@ -2193,6 +2193,34 @@ How to apply:
 - **Nothing is cleaned up on the remote host, deliberately.** The old `~/.zed_server` is left where it is. Its contents cannot be attributed: this fork's own earlier builds wrote binaries there under exactly the file names a real Zed writes, so "delete the stale ones" and "delete somebody else's editor" are the same operation. This is the phase-3 ruling from #115 applied to a directory instead of a symlink — nothing in this fork removes a path it cannot prove it created. The dead bytes are one binary per channel per version, and the user can remove the directory by hand.
 - **The one consequence of that: `cleanup_old_binaries_wsl` was deleted rather than renamed.** Renaming its target to `.sawe_wsl_server` would leave a `remove_dir_all` aimed at a directory no code in this fork writes — `wsl.rs` has used the *shared* `remote_server_dir_relative()` since upstream's own "remove this once 223 goes stable" marker — so it could never fire again. Keeping an inert `remove_dir_all` is worse than not having one. What it used to delete is now covered by the rule above: we do not touch `.zed_wsl_server`.
 - **`crates/auto_update`'s `"zed-remote-server"` is not ours and stays.** It is the *asset name in Zed Industries' release feed*, sent as a query parameter to `cloud.zed.dev` by `get_release_asset`; renaming it would ask their API for an asset that does not exist. Same category as #116 keeping `client::parse_zed_link`'s `<server_url>/channel/…` arm. It is also unreachable here, since `auto_update::init` is commented out, so both delegate methods that call it fail with "auto-update not initialized" — meaning this fork's live remote-server acquisition is the `ZED_BUILD_REMOTE_SERVER` build-from-source path, or a binary already present on the host.
-- **The release-*artifact* names in `.github/workflows` and `tooling/xtask/.../vars.rs` are a different name family and were left alone.** They are `zed-remote-server-linux-x86_64.gz` and friends, alongside `Zed-aarch64.dmg` and `zed-linux-x86_64.tar.gz` in the same `EXPECTED_ASSETS` list, while `script/bundle-{linux,mac,freebsd}` have emitted `sawe-*` since the phase-B rebrand — so that manifest is already wholly out of sync, for every artifact family, not just this one. Renaming one row of it fixes nothing, every job in `release.yml` / `release_nightly.yml` is gated on `github.repository_owner == 'zed-industries'` and cannot run here, and #118 forbids regenerating the YAML, so `vars.rs` and the 21 files must move together as one deliberate task. `script/bundle-windows.ps1` and `script/upload-nightly.ps1` *were* fixed: they are scripts a maintainer runs by hand, and they were simply the Windows arm the phase-B rename missed.
+- **The release-*artifact* names in `.github/workflows` and `tooling/xtask/.../vars.rs` are a different name family and were left alone.** They are `zed-remote-server-linux-x86_64.gz` and friends, alongside `Zed-aarch64.dmg` and `zed-linux-x86_64.tar.gz` in the same `EXPECTED_ASSETS` list, while `script/bundle-{linux,mac,freebsd}` have emitted `sawe-*` since the phase-B rebrand — so that manifest is already wholly out of sync, for every artifact family, not just this one. Renaming one row of it fixes nothing, and #118 forbids regenerating the YAML, so `vars.rs` and the 21 files must move together as one deliberate task. Be precise about the reach of that, because it is narrower than it looks: `release.yml` and `release_nightly.yml` gate every job on `github.repository_owner == 'zed-industries' || 'zed-extensions'` and so cannot run here at all, but **`run_bundling.yml` is not owner-gated** — it fires on a `run-bundling` pull-request label. It is nonetheless already broken on its own terms rather than broken by this change: it uploads `target/zed-linux-aarch64.tar.gz` with `if-no-files-found: error` against a `bundle-linux` that has emitted `sawe-*` since the phase-B rebrand. That is the out-of-sync manifest above, in action. `script/bundle-windows.ps1` and `script/upload-nightly.ps1` *were* fixed: they are scripts a maintainer runs by hand, and they were simply the Windows arm the phase-B rename missed.
 
-Verification limit, recorded rather than papered over: **this machine has no remote host and no container runtime, so the SSH, WSL and Docker arms are code-verified only.** What was proven live is that the name is now produced correctly and that the guard sees it — the `paths` rebrand assertions cover `remote_server_dir_relative`, `remote_server_binary_name` (both the plain and `.exe` branches), `remote_server_binary_prefix` and both crash sockets, and each was shown to fail when the name is reverted. The end-to-end claim "an old host re-uploads instead of adopting the wrong binary" rests on the code path above, not on an observed connection.
+**Verified live, against a real remote target.** Two `#[ignore]`d tests do it, and each
+asserts *both* halves of the claim — that our binary lands under our own directory and
+file name, **and that a neighbouring editor's upload is byte-for-byte untouched**, a
+decoy planted at `~/.zed_server/zed-remote-server-dev-build` whose digest is taken
+before connecting and again after. The second half is the one that matters: a client
+that merely puts its own binary in the right place can still clobber somebody else's on
+the way there, which is exactly what this code used to do.
+
+- `transport::docker::tests::docker_upload_uses_our_names_and_spares_the_neighbour`
+- `transport::ssh::live_tests::ssh_upload_uses_our_names_and_spares_the_neighbour`
+
+Both were run against a real container (`ubuntu:24.04`; the SSH one against an `sshd`
+inside it, reached on a published loopback port with a throwaway key and
+`UserKnownHostsFile=/dev/null`, so a container is a sufficient target and the
+operator's own `~/.ssh` is never read or written). Both pass, the uploaded binary runs
+(`version` → the build's own version), and the decoy is unchanged. Reverting
+`paths.rs` to the old names fails the path assertion in both, and — with that
+assertion neutralised so the later one is reached — fails the decoy assertion too, the
+digest moving to that of the 600 MB server binary: **the old code overwrote the
+neighbour's file in place.** Their doc comments carry the exact reproduction commands.
+
+Still code-verified only, and stated rather than glossed: the **WSL** arm (not
+exercisable off Windows), every **Windows** arm (the `.exe` branch of
+`remote_server_binary_name`, `extract_server_binary_windows`, `bundle-windows.ps1`,
+`upload-nightly.ps1`), and the host-side reaper **`cleanup_old_binaries()`**, which only
+runs inside a booted headless project — the live tests stop once the binary is in
+place. The reaper's prefix is pinned to the client's file name by a unit test, but
+"a Sawe server no longer deletes a Zed binary" is an argument from that pinning, not an
+observation.
