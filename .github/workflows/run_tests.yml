@@ -1,5 +1,6 @@
 # Generated from xtask::workflows::run_tests
 # Rebuild with `cargo xtask workflows`.
+# sawe: do NOT run that -- this file is hand-maintained here. See FORK.md #118.
 name: run_tests
 env:
   CARGO_TERM_COLOR: always

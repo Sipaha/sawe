@@ -1,5 +1,6 @@
 # Generated from xtask::workflows::extension_auto_bump
 # Rebuild with `cargo xtask workflows`.
+# sawe: do NOT run that -- this file is hand-maintained here. See FORK.md #118.
 name: extension_auto_bump
 on:
   workflow_dispatch:

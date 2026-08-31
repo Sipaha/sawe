@@ -1,5 +1,6 @@
 # Generated from xtask::workflows::deploy_nightly_docs
 # Rebuild with `cargo xtask workflows`.
+# sawe: do NOT run that -- this file is hand-maintained here. See FORK.md #118.
 name: deploy_nightly_docs
 on:
   push:

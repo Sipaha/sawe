@@ -1,5 +1,6 @@
 # Generated from xtask::workflows::bump_zed_version
 # Rebuild with `cargo xtask workflows`.
+# sawe: do NOT run that -- this file is hand-maintained here. See FORK.md #118.
 name: bump_zed_version
 on:
   workflow_dispatch:

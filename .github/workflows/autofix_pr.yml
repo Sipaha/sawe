@@ -1,5 +1,6 @@
 # Generated from xtask::workflows::autofix_pr
 # Rebuild with `cargo xtask workflows`.
+# sawe: do NOT run that -- this file is hand-maintained here. See FORK.md #118.
 name: autofix_pr
 run-name: 'autofix PR #${{ inputs.pr_number }}'
 on:

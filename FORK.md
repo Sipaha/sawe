@@ -167,6 +167,9 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/install_cli/src/install_cli_binary.rs`, `crates/install_cli/src/install_cli.rs`, `crates/install_cli/Cargo.toml` | **First local change (decision #115).** `File → Install CLI` targets `/usr/local/bin/sawe`, never removes an entry it cannot prove it created, and no longer registers a URL scheme. `register_zed_scheme.rs` (the `cli::RegisterZedScheme` palette action + `cx.register_url_scheme(ZED_URL_SCHEME)`) is **deleted**, along with the crate's `client` dependency, which existed only for that constant. | `install_cli` |
 
 | `crates/zed/src/zed/open_listener.rs`, `crates/zed/src/zed/open_url_modal.rs`, `crates/zed/src/zed/windows_only_instance.rs`, `crates/zed/src/main.rs`, `crates/cli/src/main.rs`, `crates/client/src/client.rs`, `crates/client/src/zed_urls.rs`, `crates/agent_skills/agent_skills.rs`, `crates/settings_ui/src/settings_ui.rs`, `crates/settings/src/settings_store.rs`, `crates/json_schema_store/src/json_schema_store.rs`, `crates/terminal/src/alacritty/hyperlinks.rs`, `crates/zed_actions/src/lib.rs`, `crates/project/src/lsp_store/json_language_server_ext.rs`, `assets/settings/default.json`, `tooling/xtask/src/tasks/workflows/run_tests.rs`, `docs/src/**` | **Decision #116.** `sawe://` is the URL scheme this fork parses and produces; `zed://` has no arm, no normalisation and no producer. Every routing arm, the settings **Copy Link**, the skill share link, the builtin-JSON-schema URI prefix (`sawe://schemas/`, which the JSON language server round-trips), the terminal hyperlink regex, the Open-URL modal placeholder and short-circuit, and both CLI/editor url classifiers moved together. | `zed` |
+| `crates/gpui_linux/src/linux/platform.rs` | **First local change (decision #117).** `KEYRING_LABEL` is `sawe-github-account`, not `zed-github-account`. The Secret Service keyring is an OS-wide namespace, so this was the one rebrand leftover that actually collided with a real Zed install rather than merely reading wrong. | rebrand |
+| `script/uninstall.sh` | Repointed at `paths::base_dir()` (`~/.spk/sawe`), which is the only directory the binary creates; it previously removed `~/.config/sawe`, `~/.local/share/sawe` and `~/Library/Application Support/Sawe`, none of which exist, so neither its per-channel cleanup nor its "keep your preferences?" prompt did anything. Never removes the root recursively — `ss/` under it is the Solutions root and holds the user's project checkouts. | rebrand |
+| `.github/workflows/*.yml` (21 generated files) | **Decision #118.** One line under the `cargo xtask workflows` rebuild instruction saying not to follow it: regenerating deletes `retag_release.yml`, strips 25 `if: false # sawe: not applicable` guards and restores 5 upstream triggers this fork narrowed to `workflow_dispatch:`. | build |
 
 Locked rebrand identifiers (display name, bundle ids, URL scheme, config dirs, etc.) — see `.rules` § "Locked rebrand identifiers". Changing any requires explicit approval — they're cross-referenced in spec docs.
 
@@ -2078,6 +2081,84 @@ How to apply:
 
 - **`zed-cli://` and `zed-dock-action://` are deliberately untouched here.** They are
   distinct prefixes, both ends ours, and they belong to the on-disk / internal-name
-  pass, not to the URL-scheme contract. So is `acp_thread`'s `MentionUri`, which is
-  `zed:///…` (empty authority): a self-consistent ACP resource-link namespace that is
-  persisted in thread history and never reaches `cx.open_url`.
+  pass, not to the URL-scheme contract — which is where they were renamed, see #117.
+  So is `acp_thread`'s `MentionUri`, which is `zed:///…` (empty authority): a
+  self-consistent ACP resource-link namespace that is persisted in thread history and
+  never reaches `cx.open_url`, and which therefore still awaits a migration or a
+  tolerant reader rather than a rename in place.
+
+### 117. A name the guarded crate does not spell is a name it cannot guard
+
+What: `crates/paths` has asserted since the rebrand that the directories it hands out
+name this fork and not the product it was forked from. `data_dir()` passed that
+assertion the whole time it contained `zed-<channel>.sock` — because only the parent
+was spelled in `paths`; the file name was appended by callers in `crates/cli`
+(`InstalledApp::launch`) and `crates/zed` (`listen_for_cli_connections`). Same shape
+for `zed-crash-handler-<pid>` under `temp_dir()`.
+
+Why: widening the assertion cannot fix this. It has no way to enumerate strings that
+other crates `join` onto its return values, and a lint that tried would be a
+grep over the workspace rather than a test. The fix has to remove the split, not
+police it, so the **construction moves into the guarded crate**:
+`paths::cli_ipc_socket_in(data_dir, release_channel)` and
+`paths::crash_handler_socket(pid)` compose the full names, both call sites go through
+them, and `rebrand_tests::caller_composed_names_are_ours` asserts on the result. The
+socket takes its data dir as an argument rather than calling `data_dir()` because
+`--user-data-dir` moves it and the editor the CLI wakes must be looked for under the
+same root.
+
+How to apply: any new runtime path whose *file name* this fork owns gets its
+constructor in `crates/paths` and a line in the rebrand assertions — not a `format!`
+at the call site. If you find yourself writing `paths::something_dir().join(format!(…))`
+in another crate, that is the bug this entry exists for.
+
+Renamed at the same time and for the same reason, both ends in one commit: the
+`zed-cli://` ipc handshake url and its Windows sibling `zed-dock-action://`, and the
+Linux keyring label `zed-github-account`. Only the last is a real collision rather
+than hygiene — the Secret Service keyring is a namespace shared with every
+application on the machine, so a real Zed and this fork were reading and overwriting
+one credential entry; it costs one re-authentication. None of the others can be known
+from outside this repo, so all are renames with no compatibility window. `.zed_server`
+/ `.zed_wsl_server` and the `zed-remote-server-…` binary name are **not** in this set:
+they are visible to remote hosts, so they carry a real migration and are a separate
+task.
+
+### 118. The GitHub workflows are hand-maintained; `cargo xtask workflows` destroys the fork's CI policy
+
+What: 21 files in `.github/workflows` still start with
+`# Generated from xtask::workflows::…` / ``# Rebuild with `cargo xtask workflows`.``.
+Following that instruction is destructive in this fork, and an implementer found it
+only by reading the regeneration diff before committing it. Verified against
+`tooling/xtask/src/tasks/workflows.rs`:
+
+- `remove_generated_workflows` deletes *every* file in `.github/workflows` whose
+  content starts with that preamble, then `run_workflows` re-emits 20. The 21st,
+  `retag_release.yml`, is deleted and never comes back: `retag_release.rs` still
+  exists in the generator's source directory but is neither declared as a `mod` nor
+  listed in `run_workflows`. (The 20 hand-written workflows without the preamble are
+  untouched.)
+- 25 of this fork's 41 `if: false # sawe: not applicable` job guards live in 10 of
+  those generated files and are stripped. The other 16 are in hand-written files and
+  survive.
+- 5 workflows whose triggers this fork narrowed to `workflow_dispatch:` get their
+  upstream triggers back — `run_tests` (`push` + `pull_request: '**'`),
+  `compliance_check` (weekly `schedule`), `deploy_collab` (`push` tag
+  `collab-production`), `publish_extension_cli` (`push` tag `extension-cli`) and
+  `extension_auto_bump` (`push`).
+
+So a single regeneration silently re-enables CI that CLAUDE.md's "What's disabled"
+table says is off, in a repo where those jobs would run against upstream's
+infrastructure.
+
+Why a comment rather than a fix: making the generator emit the fork's policy means
+porting 41 guards and 5 trigger narrowings into `tooling/xtask` as fork-local Rust,
+which buys nothing — nothing in this fork *adds* workflows, so the generator's only
+remaining job would be to reproduce a state we already have on disk. Deleting the
+generator instead would go past "disable, don't delete". The cheapest correct move is
+to make the file say so where the misleading instruction is read.
+
+How to apply: the line `# sawe: do NOT run that -- this file is hand-maintained
+here. See FORK.md #118.` sits directly under the rebuild instruction in all 21 files.
+If you are editing CI, edit the YAML. If a future change genuinely needs the
+generator, the fork's policy has to move into `tooling/xtask` first, and the numbers
+above are the checklist for what must survive.

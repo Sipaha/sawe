@@ -1,5 +1,6 @@
 # Generated from xtask::workflows::cherry_pick
 # Rebuild with `cargo xtask workflows`.
+# sawe: do NOT run that -- this file is hand-maintained here. See FORK.md #118.
 name: cherry_pick
 run-name: 'cherry_pick to ${{ inputs.channel }} #${{ inputs.pr_number }}'
 on:

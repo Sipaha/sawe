@@ -1,5 +1,6 @@
 # Generated from xtask::workflows::retag_release
 # Rebuild with `cargo xtask workflows`.
+# sawe: do NOT run that -- this file is hand-maintained here. See FORK.md #118.
 name: retag_release
 on:
   workflow_dispatch:
