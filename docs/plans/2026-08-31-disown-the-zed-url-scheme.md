@@ -109,6 +109,39 @@ close the `paths.rs:626/639` guard hole in the same change so the class cannot r
 `../bin/zed` this fork never ships, so it is already broken rather than merely
 misnamed.
 
+
+## Maintainer rulings, 2026-08-31 (widening the plan)
+
+**The non-intersection rule extends to everything, including `.zed_server`.**
+Verbatim: *"распространяется на все. это два разных продукта."* So the "preserved
+upstream identifier" carve-out in `.rules` §3 for `.zed_server` / `.zed_wsl_server`
+is withdrawn — they become this fork's own names, and with them the remote-server
+binary, which `ssh.rs:800`, `wsl.rs:182` and `docker.rs:196` currently spell
+`zed-remote-server-{channel}-{version}`, i.e. byte-identical to what upstream writes.
+
+*Consequence, accepted:* a Sawe client will no longer reuse a server binary uploaded
+by Zed, and vice versa — that is the point. A one-time re-upload to each remote host
+this fork already connects to is the whole migration cost.
+
+*Consequence, needing care:* `crates/acp_thread`'s `MentionUri` namespace uses
+`zed:///…` (empty authority, 19 sites) and is **persisted in thread history**.
+Renaming it needs a migration or a reader tolerant of both spellings, or old threads
+lose their mentions. That is its own task, not a rename-in-place.
+
+**`.rules` §3 is the side that is wrong about paths — correct the documentation.**
+Verbatim: *"По п.1 - правим документацию."* §3 locks `~/.config/sawe/` (Linux),
+`~/Library/Application Support/Sawe/` (macOS) and `%APPDATA%\Sawe\` (Windows);
+`paths::base_dir()` is `home_dir()/.spk/<channel-kebab>` on **every** platform
+(`crates/paths/src/paths.rs:133-141`), and its own doc comment says the
+`Application Support` / `AppData` split was removed deliberately. The single root is
+also what makes `SAWE_HOME` and `--user-data-dir` isolation work, which every
+agent-driven MCP check depends on. §3 is corrected to the code; the code does not move.
+
+*Follows immediately:* `script/uninstall.sh` deletes `~/.config/sawe`,
+`~/.local/share/sawe` and `~/Library/Application Support/Sawe` — none of which the
+binary creates — and never removes `~/.spk/sawe`, so "keep your preferences?" has no
+consequence either way. It is repointed at `base_dir()`.
+
 ## Phases
 
 1. **Contract.** Stop registering the `zed` scheme; remove the palette action and
@@ -119,9 +152,20 @@ misnamed.
    generation and parsing together; drop `zed://` from `is_url_scheme`; fix the
    "Open URL" placeholder so we stop suggesting the scheme we just disowned. **No**
    special branch for an incoming `zed://`.
-3. **Shared namespaces and on-disk names.** The keyring label; the Windows appx
-   identity, display name and verb; then rename the socket, the ipc handshake url
-   and the crash-handler socket, and close the `paths.rs` guard hole.
+3. **Identity and on-disk names.** Correct `.rules` §3 to the code; repoint
+   `script/uninstall.sh` at `base_dir()`; close the `paths.rs:626/639` guard hole
+   through which `zed-<channel>.sock` escapes today; rename that socket, the
+   `zed-cli://` ipc handshake url and the `zed-crash-handler-<pid>` socket; rename
+   the Linux keyring label `zed-github-account`.
+4. **The remote server.** `.zed_server` / `.zed_wsl_server` and the
+   `zed-remote-server-{channel}-{version}` binary name become ours. Verify against a
+   real remote target before and after, since this is the one change with a
+   compatibility consequence rather than a cosmetic one.
+5. **The long tails.** The Windows shell appx (`Name="ZedIndustries.Zed"`,
+   `<DisplayName>Zed</DisplayName>`, verb `OpenWithZed`, and an identity that does
+   not match what our own uninstaller removes — a live bug); and `MentionUri`'s
+   `zed:///` namespace, which needs a migration or a tolerant reader because it is
+   persisted in thread history.
 
 ## Verification
 
