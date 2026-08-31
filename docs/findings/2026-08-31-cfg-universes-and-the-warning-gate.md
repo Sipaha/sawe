@@ -107,6 +107,54 @@ The `project` line is needed for the same reason one level down:
 `#[cfg(feature = "test-support")]` alone, so with `remote/test-support` on and
 `project/test-support` off that match is non-exhaustive (E0004).
 
+## The sweep, and the one member left broken on purpose
+
+`cargo check -p <member> --all-targets` was afterwards run over **all 260
+workspace members**, one at a time. It found four more instances of the shape
+above, all fixed in `ce9fb1e327`: `clock`, `call` and `language_extension` take
+the self / dependency `test-support` dev-dep idiom, and `git_hosting_providers`
+is fixed one level up, in `git`'s own `test-support` feature list, so that every
+consumer of that feature gets it rather than just this one. Each is a row in
+FORK.md's touched-files table.
+
+A fifth member, **`component_preview`, still cannot compile standalone, and is
+left that way deliberately**:
+
+```
+error: 'wayland' or 'x11' feature must be enabled.   (x2)
+error: could not compile `zed-scap` (lib) due to 2 previous errors
+```
+
+This is not a `test-support` problem at all. `component_preview`'s only
+dev-dependency is `gpui_platform = { features = ["screen-capture"] }`;
+`screen-capture` fans out to `gpui_linux/screen-capture`, which pulls
+`zed-scap`, which requires one of `wayland` / `x11` — features `gpui_platform`
+exposes *separately* (`wayland = ["gpui_linux/wayland"]`, `x11 =
+["gpui_linux/x11"]`) and that `screen-capture` does not imply. Checked alone,
+the crate enables a capture backend with no display backend. It is the
+**reverse direction** of everything above: green in `cargo check --workspace
+--all-targets` purely because other members enable `x11` and `wayland`, i.e. a
+crate that compiles only because the workspace supplies a feature it never
+asked for.
+
+The consequence is the same as the mirror-image trap: `cargo clippy -p
+component_preview --all-targets -- -D warnings`, the per-crate gate
+`docs/workflow/supervisor-mode.md` § CHECKS tells every sub-agent to run,
+**cannot execute** on this member. Expect it, and read the exit code rather
+than the empty diagnostic list.
+
+Two candidate fixes, neither taken:
+
+- make `gpui_linux`'s `screen-capture` require a display backend on Linux —
+  the `git` treatment, fixing it for every consumer; or
+- add `"x11", "wayland"` to `component_preview`'s `gpui_platform`
+  dev-dependency — local, and leaves the next consumer to rediscover it.
+
+It was reported rather than fixed because the cause is a display-backend
+feature edge, not the `test-support` idiom: choosing between those two is a
+decision about `gpui_linux`'s feature contract, not a mechanical application of
+the fix above.
+
 ## What to do about it
 
 - The verification ritual already compiles the shipping universe — it just
@@ -115,8 +163,15 @@ The `project` line is needed for the same reason one level down:
   `cargo build --bin sawe` when a cheaper probe is wanted.
 - `cargo check --workspace` (no `--all-targets`) adds nothing: measured
   identical to the `--bin sawe` set.
-- **Not swept:** "package X's `--all-targets` build depends on package Y's
-  `test-support` being enabled by X's dev-deps" is a whole-workspace property,
-  and only the crates reachable from these five warnings were checked. A
-  `cargo check -p <member> --all-targets` sweep over every workspace member
-  would find any others, at roughly one full check per member.
+- **Swept once, not guarded.** "package X's `--all-targets` build depends on
+  package Y's `test-support` being enabled by X's dev-deps" is a whole-workspace
+  property; all 260 members were checked individually (see the section above),
+  so the tree is clean as of `ce9fb1e327` apart from `component_preview`. That
+  is a snapshot, not a check that reruns: a new crate, or a new
+  `#[cfg(any(test, feature = "test-support"))]` block in an existing one, can
+  reintroduce it and neither standing gate will notice. There is no cheap static
+  equivalent either, because the shape depends on how feature unification
+  resolves — the sweep costs roughly one full check per member.
+  `tooling/test_target_guard` catches a *sibling* instance of this family (a
+  `[lib] test = false` package whose `#[cfg(test)]` modules are never compiled)
+  but nothing about this one.
