@@ -1605,3 +1605,120 @@ async fn a_pre_migration_band_table_gains_utility_kind_on_open(cx: &mut gpui::Te
         "the migration must not disturb the row's persisted utility visibility"
     );
 }
+
+/// Pin the connection pragmas by READING THEM BACK from a real file database
+/// opened through the production path, not by asserting the SQL string ran.
+///
+/// This is the only place any of this is observable: [`SolutionAgentDb::open`]
+/// swaps in an in-memory connection under test cfgs, where `journal_mode`
+/// answers `memory` no matter what was asked for. So every other test in this
+/// file would stay green with `CONNECTION_PRAGMAS` deleted outright — which is
+/// exactly the silent regression this pins. `open_at_path` is the same
+/// `open_connection`, on a real file, in a tempdir.
+#[gpui::test]
+async fn connection_pragmas_are_in_effect_on_a_file_database(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("solution_agent.db");
+    let db = SolutionAgentDb::open_at_path(cx.executor(), &path).expect("open a file db");
+
+    let connection = db.connection.lock();
+    let journal_mode = connection
+        .select_row::<String>("PRAGMA journal_mode")
+        .expect("prepare journal_mode")()
+    .expect("read journal_mode");
+    let synchronous = connection
+        .select_row::<i64>("PRAGMA synchronous")
+        .expect("prepare synchronous")()
+    .expect("read synchronous");
+    let busy_timeout = connection
+        .select_row::<i64>("PRAGMA busy_timeout")
+        .expect("prepare busy_timeout")()
+    .expect("read busy_timeout");
+    let foreign_keys = connection
+        .select_row::<i64>("PRAGMA foreign_keys")
+        .expect("prepare foreign_keys")()
+    .expect("read foreign_keys");
+
+    assert_eq!(
+        journal_mode.as_deref(),
+        Some("wal"),
+        "the agent database must run in WAL; sqlite reports the mode that actually \
+         took effect, so a `delete` here means the pragma never ran"
+    );
+    assert_eq!(
+        synchronous,
+        Some(1),
+        "synchronous must be NORMAL (1). It is PER-CONNECTION and not stored in the \
+         file header, so unlike journal_mode it is re-established on every open — \
+         dropping the pragma silently returns the connection to FULL (2)"
+    );
+    assert_eq!(
+        busy_timeout,
+        Some(500),
+        "busy_timeout must be 500 ms. At sqlite's default of 0 an overlap with the \
+         second connection `solutions::path_migrations::apply_one` opens on this same \
+         file is an instant `database is locked` instead of a short wait"
+    );
+    // The one assertion here that is NOT mutation-tight, stated rather than
+    // hidden: deleting `PRAGMA foreign_keys=ON` from `CONNECTION_PRAGMAS`
+    // leaves this green, because this libsqlite3-sys build compiles with
+    // `SQLITE_DEFAULT_FOREIGN_KEYS=1` (verified by mutation, 2026-08-31). What
+    // it pins is the effective state, which is the property anything here would
+    // actually depend on — and it would catch a vendored-sqlite bump that
+    // flipped that default while the pragma was missing, which is the failure
+    // the explicit pragma exists to make impossible. It cannot catch removing
+    // the pragma while the default still saves us.
+    assert_eq!(
+        foreign_keys,
+        Some(1),
+        "foreign keys must be ON — explicitly, rather than by grace of a \
+         libsqlite3-sys compile flag"
+    );
+
+    // WAL is a file-format change, so the sidecar is the on-disk proof that the
+    // pragma took effect rather than merely being reported.
+    let wal = {
+        let mut name = path.into_os_string();
+        name.push("-wal");
+        std::path::PathBuf::from(name)
+    };
+    assert!(
+        wal.exists(),
+        "a WAL database writes a {} sidecar; anything that copies this database \
+         must checkpoint first or copy it too",
+        wal.display()
+    );
+}
+
+/// The in-memory connection the test cfgs swap into [`SolutionAgentDb::open`]
+/// answers `memory` to `PRAGMA journal_mode`, and that is not a failure.
+///
+/// Pinned because the tempting "assert the pragma worked" hardening in
+/// `open_connection` would turn every in-memory open — i.e. the whole rest of
+/// this crate's test suite, and any `test-support` consumer — into an error.
+#[gpui::test]
+async fn an_in_memory_connection_reports_memory_journal_mode_and_still_opens(
+    cx: &mut gpui::TestAppContext,
+) {
+    let db = SolutionAgentDb::open(cx.executor()).expect("an in-memory open must still succeed");
+
+    let connection = db.connection.lock();
+    let journal_mode = connection
+        .select_row::<String>("PRAGMA journal_mode")
+        .expect("prepare journal_mode")()
+    .expect("read journal_mode");
+    assert_eq!(
+        journal_mode.as_deref(),
+        Some("memory"),
+        "an in-memory database cannot be put in WAL; sqlite answers `memory` \
+         instead of erroring, which is why `open_connection` does not inspect it"
+    );
+
+    // The per-connection pragmas DO apply to an in-memory database, so the rest
+    // of the block is still meaningful there.
+    let busy_timeout = connection
+        .select_row::<i64>("PRAGMA busy_timeout")
+        .expect("prepare busy_timeout")()
+    .expect("read busy_timeout");
+    assert_eq!(busy_timeout, Some(500));
+}

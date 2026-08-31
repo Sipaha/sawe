@@ -84,6 +84,37 @@ struct GlobalSolutionAgentDb(Shared<Task<Result<Arc<SolutionAgentDb>, Arc<anyhow
 
 impl Global for GlobalSolutionAgentDb {}
 
+/// Pragmas issued on every connection this crate opens to the agent database.
+///
+/// The values are `db::CONNECTION_INITIALIZE_QUERY` + `db::DB_INITIALIZE_QUERY`
+/// (`crates/db/src/db.rs`) minus `case_sensitive_like`, which no query here
+/// depends on. Every other database in the editor has run these since upstream;
+/// until this block existed the agent database was the only one left on sqlite's
+/// defaults (`journal_mode=delete`, `synchronous=FULL`, `busy_timeout=0`). See
+/// FORK.md #111 for the measurement and the durability argument.
+///
+/// **`journal_mode` is stored in the file header; the other three are
+/// per-connection.** That asymmetry is the thing to remember when adding a
+/// connection: reopening picks WAL back up for free, but a connection that skips
+/// this block silently runs at `synchronous=FULL` and `busy_timeout=0`. It is
+/// why `solutions::path_migrations::apply_one`, which opens a *second*
+/// connection on this same file at startup, issues its own `busy_timeout`
+/// instead of inheriting one (it cannot call in here — `solutions` depends on
+/// `solution_agent` only as a dev-dependency, the reverse edge being the real
+/// one).
+///
+/// **A non-`wal` answer is not a failure.** `PRAGMA journal_mode` reports the
+/// mode that actually took effect rather than erroring, and the in-memory
+/// connection the test cfgs swap into [`SolutionAgentDb::open`] answers `memory`
+/// and stays there. Nothing here inspects the answer, so that case needs no
+/// special-casing — do not add an assertion that would turn it into one.
+const CONNECTION_PRAGMAS: &str = indoc! {"
+    PRAGMA journal_mode=WAL;
+    PRAGMA synchronous=NORMAL;
+    PRAGMA busy_timeout=500;
+    PRAGMA foreign_keys=ON;
+"};
+
 impl SolutionAgentDb {
     pub fn connect(cx: &mut App) -> Shared<Task<Result<Arc<SolutionAgentDb>, Arc<anyhow::Error>>>> {
         if cx.has_global::<GlobalSolutionAgentDb>() {
@@ -135,6 +166,15 @@ impl SolutionAgentDb {
     }
 
     fn open_connection(executor: BackgroundExecutor, connection: Connection) -> Result<Self> {
+        // Must run before the DDL below: `journal_mode` is a file-format change
+        // and is rejected while a transaction is open.
+        connection.exec(CONNECTION_PRAGMAS)?().map_err(|e| {
+            anyhow!(
+                "Failed to initialize solution_agent database pragmas: {}",
+                e
+            )
+        })?;
+
         connection.exec(indoc! {"
             CREATE TABLE IF NOT EXISTS solution_sessions (
                 id                TEXT PRIMARY KEY,

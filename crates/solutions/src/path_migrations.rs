@@ -907,13 +907,39 @@ impl ReconcileContext {
     }
 }
 
+/// Open the SECOND connection this process holds on `solution_agent.db`.
+///
+/// `SolutionAgentDb` owns the first one and puts the file in WAL
+/// (`solution_agent::db::CONNECTION_PRAGMAS`), but `synchronous`, `busy_timeout`
+/// and `foreign_keys` are per-connection, not stored in the file header — so
+/// this handle inherits none of them and would otherwise run at
+/// `busy_timeout=0`, where any overlap with the agent store's writer is an
+/// instant `code 5 "database is locked"` rather than a short wait. Measured on a
+/// production-scale fixture: 0 ms + error at `busy_timeout=0` against 209 ms +
+/// success at 500. The reconcile's failure path is "log it and retry on the next
+/// editor start" (`drain_and_apply_blocking`), so an avoidable instant failure
+/// costs the user a whole session's worth of stale paths.
+///
+/// `journal_mode` is deliberately NOT set here: it is a file-header property
+/// that `SolutionAgentDb` already establishes, and this connection is the
+/// short-lived one. The pragma values are duplicated rather than imported
+/// because the crate dependency runs the other way — `solution_agent` depends on
+/// `solutions`, and `solutions` takes `solution_agent` as a dev-dependency only.
+/// If they ever diverge, `solution_agent::db::CONNECTION_PRAGMAS` is the source
+/// of truth.
+fn open_agent_db(path: &str) -> Result<Connection> {
+    let connection = Connection::open_file(path);
+    connection.exec("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=500;")?()?;
+    Ok(connection)
+}
+
 /// Apply one recorded move. The app-database writes are funnelled through
 /// `ThreadSafeConnection::write` because the thread-local connection a plain
 /// deref hands out is deliberately **read-only** (`sqlez` serializes every write
 /// onto one worker thread), so the whole sequence runs inside that callback.
 pub fn apply_one(context: &ReconcileContext, rewrite: &PathRewrite) -> Result<()> {
     let agent = match context.agent_db_path.as_ref() {
-        Some(path) if path.exists() => Some(Connection::open_file(&path.to_string_lossy())),
+        Some(path) if path.exists() => Some(open_agent_db(&path.to_string_lossy())?),
         _ => None,
     };
     let claude_projects_dir = context.claude_projects_dir.clone();
