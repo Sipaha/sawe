@@ -5,7 +5,14 @@ Supersedes `findings/2026-08-31-session-handoff.md` for everything after
 blob bug, the destructive-rewrite class and the `rebuild_streams` performance work,
 all still shipped and untouched.
 
-**45 commits, all on `origin/main`. Working tree clean. No UI shipped.**
+**73 commits, all on `origin/main`. Working tree clean. No UI shipped.**
+
+The session had two halves. The first is the correctness-and-cost work below. The
+second began when the maintainer read a line in my summary — that `sawe://` had been
+made an alias of `zed://` — and reversed it: **`zed://` is a different product's
+contract and this fork disowns it.** Asked whether that extended to `.zed_server`,
+they answered *"распространяется на все. это два разных продукта."* That became a
+five-phase disown series, recorded separately below.
 
 That previous handoff said the actionable pool was drained — "every item this
 session identified has shipped; what is left either needs the maintainer or is
@@ -296,3 +303,95 @@ including after the full 30 s `READ_TIMEOUT`, while its 4 s sibling
 inherited and were preserved on purpose; FORK.md #114 now says so and warns that
 aligning them is an interface change. Whoever forwards arguments to
 `zed-<channel>.sock` should decide it, since forwarding removes the loss entirely.
+
+---
+
+# Part two — disowning Zed
+
+`docs/plans/2026-08-31-disown-the-zed-url-scheme.md` is the plan and carries the
+maintainer's rulings verbatim. FORK.md **#115-#119**.
+
+**The rule:** a user may have both editors installed and **they must not intersect
+in anything**.
+
+## What was actually intersecting
+
+- **`File → Install CLI` deleted a real Zed's CLI.** It targeted
+  `/usr/local/bin/zed` with an unconditional `remove_file` before symlinking,
+  escalating through `osascript` with admin privileges if that failed — live on
+  macOS, dead code on Linux. It also registered `zed://` with the OS
+  (`NSWorkspace.setDefaultApplication` on macOS ≥12), and the error was swallowed by
+  `.log_err()`, so the dialog appeared on no platform.
+- **`zed://` was accepted, promised in the help text, and registered as a desktop and
+  Windows URL handler — and `OpenRequest::parse` matched only `zed://` while the
+  fork's own `sawe://` was inert.** Disowning turned out to be free: `zed://extension/`,
+  the one arm that looked like it carried the *kept* zed.dev registry feature, has no
+  in-repo producer — extensions install over HTTP and never see a URL.
+- **Our uninstall documentation destroyed a real Zed**, instructing a Sawe user to
+  `rm -rf ~/Library/Application Support/Zed`, `~/Library/Caches/Zed` and
+  `/usr/local/bin/zed`. And `script/uninstall.sh` ran `rm -rf $HOME/.zed_server`
+  **on both platforms**.
+- **Both products wrote byte-identical filenames into one shared remote directory.**
+  `.zed_server` held `zed-remote-server-{channel}-{version}` from either client.
+
+## The three things that were worse than they looked
+
+1. **My own fix made an instruction more dangerous.** I ordered the uninstall docs
+   retargeted from `~/Library/Application Support/Zed` to `~/.spk/sawe` — and
+   `~/.spk/sawe/ss` holds the user's **Solution project checkouts**, including the
+   repository this fork is developed in. Two reviews passed it. Phase 3's implementer
+   caught it. The docs now name the five children (`config`, `data`, `state`,
+   `cache`, `logs`) and never the root, exactly as the script does, because
+   *"delete X but keep X/ss" is not an executable instruction.*
+2. **`.rules` §3 described directories the binary never creates.** It locked
+   `~/.config/sawe/`, `~/Library/Application Support/Sawe/` and `%APPDATA%\Sawe\`;
+   `paths::base_dir()` is `home_dir()/.spk/<channel>` on **every** platform. The
+   maintainer ruled *"правим документацию"* — the code stays, since the single root
+   is what makes `SAWE_HOME` / `--user-data-dir` isolation work, and every
+   agent-driven MCP check depends on that.
+3. **`cargo xtask workflows` is destructive in this fork.** An implementer ran it,
+   read the diff before committing, and refused: regeneration deletes
+   `retag_release.yml` and strips **25** `if: false # sawe: not applicable` guards
+   plus 5 `workflow_dispatch:` gates — silently re-enabling CI this fork deliberately
+   disabled. The files now say so under their own `# Rebuild with…` header. FORK.md #118.
+
+## The bar the last phase set
+
+Phase 4 renamed `.zed_server` → `.sawe_server` and the uploaded binary to
+`sawe-remote-server-…`. It proved the change against a **real `ubuntu:24.04`
+container**: seed a decoy `~/.zed_server/zed-remote-server-dev-build`, run the real
+upload path, confirm the client writes `~/.sawe_server/` and leaves the decoy
+byte-identical — **then revert `paths.rs` and run it again, watching the decoy's md5
+change.** It demonstrated the collision rather than arguing it.
+
+It was equally exact about what it could not prove: the **SSH** arm — the one users
+actually use — is code-verified only, because standing up `sshd` would mean touching
+the maintainer's system service and authorized keys. So are WSL, every Windows arm,
+and the host-side reaper.
+
+**Why the rename is safe:** the name is in no proto message and no handshake.
+*Version negotiation **is** the file name* — the client runs the expected path with
+`version` and reads only the exit status — so a rename can only fail into the
+re-upload branch, never desynchronise a check.
+
+## Still to do in this series
+
+- **Phase 5**: the Windows shell appx (`Name="ZedIndustries.Zed"`,
+  `<DisplayName>Zed</DisplayName>`, verb `OpenWithZed`, and an identity that does not
+  match what our own uninstaller removes — a live bug); and `MentionUri`'s `zed:///`
+  namespace in `crates/acp_thread`, which is **persisted in thread history** and so
+  needs a migration or a tolerant reader, not a rename in place.
+- **The `/tmp` family**: `zed-askpass*`, `zed-ssh-session*`, `zed-agent-terminal-*`,
+  and the macOS pasteboard types `zed-text-hash` / `zed-metadata` — that last pair a
+  shared-OS-namespace intersection of the same kind as the keyring label, which was
+  renamed. Search for **escaped, backslash and `$env:`-prefixed spellings**: an
+  escaped space in `Application\ Support` hid a live site for a whole round.
+- **The release-artifact name family** in `.github/workflows` and
+  `tooling/xtask/.../vars.rs`. Deliberately excluded: that manifest is already out of
+  sync for *every* artifact family (`EXPECTED_ASSETS` lists `Zed-aarch64.dmg` while
+  the bundle scripts emit `sawe-*`), every job is gated on
+  `repository_owner == 'zed-industries'`, and #118 forbids regeneration. It needs one
+  deliberate pass, not a row.
+- **`~/.zed_server` is still shared by design nowhere** — but per-project
+  `.zed/settings.json` was deliberately left, as a different pattern that does not
+  intersect an installed Zed's user config.
