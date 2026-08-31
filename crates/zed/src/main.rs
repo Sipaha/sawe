@@ -346,20 +346,33 @@ fn file_url_as_path(arg: &str) -> Option<PathBuf> {
 /// - arguments the hand-off cannot carry at all. Named rather than counted:
 ///   unlike the give-up exits, only a subset is lost, so the user has to know
 ///   which.
-/// - a `:line:column` suffix, dropped from a path that *was* opened. Carrying
-///   it would mean navigating an editor from
+/// - a `:line:column` suffix, dropped from a path that was handed off.
+///   Carrying it would mean navigating an editor from
 ///   `crates/workspace/src/mcp/handle_cli_args.rs`, and the navigation
 ///   (`recent_projects::navigate_to_positions`, which downcasts the opened item
 ///   to an `Editor`) sits *above* `workspace` in the crate graph. So this line
 ///   is the honest half of the fix and the position itself stays lost; see
-///   [`carry_path`] for what was fixed instead.
+///   [`carry_path`] for what was fixed instead. It claims only that the
+///   position was dropped: when the stripped path does not exist the running
+///   instance opens an empty window, so "opened at the start of the file"
+///   would have asserted more than this process knows.
 /// - the `zed-cli://<server>` ipc handshake, which is not the user's argument
 ///   at all: it is the socket `crates/cli` opened before it booted this
 ///   process, and the user's real request is on the far end of it. Listing that
 ///   url among "arguments NOT opened" told the user two untrue things — that
 ///   they had passed it, and that one argument was the extent of the damage.
-///   Nothing the `sawe` command asked for was opened, and because the CLI joins
-///   its receiver thread it waits for a reply this process never sends.
+///
+/// What that last line must NOT say is what happens to the `sawe` command
+/// next, because it differs per mode and this process cannot tell which it is
+/// in. Without `--foreground`, `crates/cli` fork/execs the editor through
+/// `boot_background` — `fork::close_fd` has already closed this process's
+/// stderr, so the line is not shown at all — and then blocks in
+/// `sender.join()` on a receiver still waiting in `server.accept()`, i.e. it
+/// hangs. With `--foreground` it is the opposite on both counts:
+/// `Command::status()` inherits stderr, so this line *is* what the user reads,
+/// and the `join` is never reached, so the command exits normally. A sentence
+/// about waiting would therefore have been false on the one CLI path where it
+/// is read.
 ///
 /// The exit code stays 0. A non-zero exit from this binary means "the running
 /// editor could not be reached, your work was not done" (FORK.md #114); folding
@@ -379,8 +392,8 @@ fn handoff_loss_report(handoff: &HandoffArgs) -> Vec<String> {
     }
     if !handoff.dropped_positions.is_empty() {
         lines.push(format!(
-            "sawe: the running instance cannot be given a cursor position — {} argument(s) \
-             opened at the start of the file instead: {}",
+            "sawe: the running instance cannot be given a cursor position — the `:line:column` \
+             was dropped from {} argument(s): {}",
             handoff.dropped_positions.len(),
             handoff.dropped_positions.join(", ")
         ));
@@ -388,8 +401,7 @@ fn handoff_loss_report(handoff: &HandoffArgs) -> Vec<String> {
     if !handoff.cli_handshakes.is_empty() {
         lines.push(
             "sawe: the `sawe` command that started this process opened a connection the running \
-             instance cannot answer — nothing it asked for was opened, and it will wait until \
-             interrupted."
+             instance cannot answer — nothing it asked for was opened."
                 .to_string(),
         );
     }
@@ -2928,9 +2940,9 @@ mod tests {
         assert_eq!(
             handoff_loss_report(&split),
             vec![
-                "sawe: the running instance cannot be given a cursor position — 2 argument(s) \
-                 opened at the start of the file instead: /tmp/sawe-taskr-absent.rs:3:2, \
-                 file:///tmp/sawe-taskr-absent.rs:12"
+                "sawe: the running instance cannot be given a cursor position — the \
+                 `:line:column` was dropped from 2 argument(s): \
+                 /tmp/sawe-taskr-absent.rs:3:2, file:///tmp/sawe-taskr-absent.rs:12"
             ],
             "the argument is named back as typed, file:// spelling included"
         );
@@ -2981,13 +2993,18 @@ mod tests {
             lines,
             vec![
                 "sawe: the `sawe` command that started this process opened a connection the \
-                 running instance cannot answer — nothing it asked for was opened, and it will \
-                 wait until interrupted."
+                 running instance cannot answer — nothing it asked for was opened."
             ]
         );
         assert!(
             !lines[0].contains("zed-cli://"),
             "the internal url must not be shown to a person"
+        );
+        assert!(
+            !lines[0].contains("wait"),
+            "whether the `sawe` command then hangs depends on --foreground, which this \
+             process cannot see; under --foreground it exits normally and this is the one \
+             CLI mode where the line is even visible"
         );
     }
 

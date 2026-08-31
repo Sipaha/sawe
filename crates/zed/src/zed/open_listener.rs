@@ -160,8 +160,13 @@ impl OpenRequest {
             }));
         }
 
-        for url in request.urls {
-            let url = normalize_fork_url_scheme(url);
+        for original_url in request.urls {
+            // The routing table below is written against `zed://`, so a
+            // `sawe://` url is rewritten before it is matched — but the
+            // diagnostic at the bottom must still echo what the user actually
+            // passed, or a mistyped `sawe://xyz` is reported as `zed://xyz`.
+            let rewritten = normalize_fork_url_scheme(&original_url);
+            let url = rewritten.as_deref().unwrap_or(original_url.as_str());
             if let Some(server_name) = url.strip_prefix("zed-cli://") {
                 this.kind = Some(OpenRequestKind::CliConnection(connect_to_cli(server_name)?));
             } else if let Some(action_index) = url.strip_prefix("zed-dock-action://") {
@@ -188,7 +193,7 @@ impl OpenRequest {
                     log::error!("Invalid session ID in URL: {}", session_id_str);
                 }
             } else if url.starts_with(agent_skills::SKILL_SHARE_LINK_PREFIX) {
-                this.parse_skill_install_url(&url)?
+                this.parse_skill_install_url(url)?
             } else if let Some(agent_path) = url.strip_prefix("zed://agent") {
                 this.parse_agent_url(agent_path)
             } else if url == "zed://" || url == "zed://open" || url == "zed://open/" {
@@ -208,8 +213,8 @@ impl OpenRequest {
             } else if let Some(commit_path) = url.strip_prefix("zed://git/commit/") {
                 this.parse_git_commit_url(commit_path)?
             } else if url.starts_with("ssh://") {
-                this.parse_ssh_file_path(&url, cx)?
-            } else if let Some(zed_link) = parse_zed_link(&url, cx) {
+                this.parse_ssh_file_path(url, cx)?
+            } else if let Some(zed_link) = parse_zed_link(url, cx) {
                 match zed_link {
                     ZedLink::Channel { channel_id } => {
                         this.join_channel = Some(channel_id);
@@ -222,7 +227,7 @@ impl OpenRequest {
                     }
                 }
             } else {
-                log::error!("unhandled url: {}", url);
+                log::error!("unhandled url: {}", original_url);
             }
         }
 
@@ -354,11 +359,13 @@ impl OpenRequest {
 /// `zed://` keeps working: it is a preserved upstream identifier and existing
 /// links use it. Only the two-slash form is rewritten, so a path argument that
 /// merely begins with `sawe` is untouched.
-fn normalize_fork_url_scheme(url: String) -> String {
-    if let Some(rest) = url.strip_prefix("sawe://") {
-        return format!("zed://{rest}");
-    }
-    url
+///
+/// Returns `None` when there was nothing to rewrite, so the caller keeps the
+/// spelling it was handed: the `unhandled url` diagnostic has to name the url
+/// the user passed, not the one this function invented for the matcher.
+fn normalize_fork_url_scheme(url: &str) -> Option<String> {
+    url.strip_prefix("sawe://")
+        .map(|rest| format!("zed://{rest}"))
 }
 
 fn parse_ssh_url(url: &str) -> Result<url::Url> {
@@ -1282,18 +1289,20 @@ mod tests {
     #[test]
     fn only_the_scheme_spelling_is_rewritten() {
         assert_eq!(
-            normalize_fork_url_scheme("sawe://settings".into()),
-            "zed://settings"
+            normalize_fork_url_scheme("sawe://settings").as_deref(),
+            Some("zed://settings")
         );
         assert_eq!(
-            normalize_fork_url_scheme("/home/me/sawe/src/main.rs".into()),
-            "/home/me/sawe/src/main.rs"
+            normalize_fork_url_scheme("/home/me/sawe/src/main.rs"),
+            None,
+            "a path that merely begins with the four letters is not rewritten"
         );
-        assert_eq!(normalize_fork_url_scheme("sawe.rs".into()), "sawe.rs");
+        assert_eq!(normalize_fork_url_scheme("sawe.rs"), None);
         assert_eq!(
-            normalize_fork_url_scheme("zed://settings".into()),
-            "zed://settings",
-            "the preserved upstream spelling passes through untouched"
+            normalize_fork_url_scheme("zed://settings"),
+            None,
+            "the preserved upstream spelling is left alone, so it is also what \
+             gets logged when it does not route"
         );
     }
 
