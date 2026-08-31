@@ -360,11 +360,6 @@ mod tests {
         result
     }
 
-    /// `sawe://` is this fork's registered URL scheme, and it was missing from
-    /// `URL_PREFIX`: the CLI classified `sawe://settings` as a *path*, ran it
-    /// through `parse_path_with_position` and sent the editor the absolute
-    /// path `$PWD/sawe://settings`. `zed://` is the disowned spelling and must
-    /// *not* be classified as a url this CLI forwards.
     /// The channel the uninstaller acts on is a contract between this binary
     /// and a shell script, and nothing but this test connects the two ends:
     /// a mismatch is silent and destructive, because the script's
@@ -385,6 +380,11 @@ mod tests {
         );
     }
 
+    /// `sawe://` is this fork's registered URL scheme, and it was missing from
+    /// `URL_PREFIX`: the CLI classified `sawe://settings` as a *path*, ran it
+    /// through `parse_path_with_position` and sent the editor the absolute
+    /// path `$PWD/sawe://settings`. `zed://` is the disowned spelling and must
+    /// *not* be classified as a url this CLI forwards.
     #[test]
     fn the_forks_own_url_scheme_is_classified_as_a_url() {
         assert!(is_url_argument("sawe://settings"));
