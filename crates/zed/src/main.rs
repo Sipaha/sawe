@@ -225,11 +225,16 @@ struct HandoffArgs {
 ///
 /// `file://` is the exception, and it is less a special case than a spelling:
 /// `OpenRequest::parse_file_path` turns such a URL into a path with one strip
-/// and one percent-decode and opens it exactly as this hand-off would.
-/// Carrying it is therefore parity with the canonical instance, not new
-/// behaviour — and it is the form the shipped desktop entry produces, since
-/// `Exec=` is `%U` (`script/bundle-linux`), so a file manager's "open with
-/// Sawe" arrives here as a URL and used to be dropped in silence.
+/// and one percent-decode and opens it exactly as this hand-off would. Carrying
+/// it is therefore parity with the canonical instance rather than new
+/// behaviour, and parity is the whole argument: the same argv must not open
+/// different files depending on whether another editor happened to be running.
+///
+/// It reaches here whenever this binary is invoked directly — a dev build, or
+/// the bundle's `libexec/sawe-bin`. Note that it does *not* arrive from the
+/// desktop entry: `Exec=` there is `bin/sawe`, which is `crates/cli`, and the
+/// CLI passes the editor only `zed-cli://<server>` in argv and sends the user's
+/// URLs over that IPC channel instead.
 fn split_handoff_args(paths_or_urls: &[String], diff_paths: &[String]) -> HandoffArgs {
     let mut paths = Vec::new();
     let mut unforwarded = Vec::new();
@@ -253,11 +258,17 @@ fn split_handoff_args(paths_or_urls: &[String], diff_paths: &[String]) -> Handof
 
 /// A `file://` URL as the path it denotes, or `None` if it is not one.
 ///
-/// Deliberately byte-for-byte the rule in `OpenRequest::parse_file_path`
+/// Deliberately the same *decoding* rule as `OpenRequest::parse_file_path`
 /// (strip the scheme, percent-decode, take the rest verbatim), including its
 /// treatment of an authority component: `file://host/p` yields the relative
-/// `host/p` there too. Diverging here would make the same URL open different
+/// `host/p` there too. Diverging there would make the same URL open different
 /// files depending on whether an instance happened to be running.
+///
+/// The one deliberate divergence is what happens when the decode *fails* — an
+/// escape that is not valid UTF-8, like `file:///tmp/%FF`. `parse_file_path`
+/// drops it and logs; here `None` sends it down the unforwarded branch, so the
+/// user is told it was not opened rather than left to notice. Reporting a loss
+/// is never the wrong call on this path.
 fn file_url_as_path(arg: &str) -> Option<PathBuf> {
     let file = arg.strip_prefix("file://")?;
     let decoded = urlencoding::decode(file).log_err()?;
@@ -2686,8 +2697,9 @@ mod tests {
 
     /// A `file://` URL is a path spelled differently, and the running instance
     /// opens it with `workspace::open_paths` exactly as it opens a path — so
-    /// it is carried, not reported. The desktop entry's `Exec=%U` makes this
-    /// the shape a file manager sends, which is why it must not be lost.
+    /// it is carried, not reported. Reaches this binary's argv whenever it is
+    /// invoked directly (a dev build, or the bundle's `libexec/sawe-bin`); the
+    /// desktop entry runs `crates/cli` instead, which never puts it in argv.
     #[test]
     fn a_file_url_is_carried_as_the_path_it_denotes() {
         let split = split_handoff_args(
@@ -2708,6 +2720,31 @@ mod tests {
         assert!(
             unforwarded_args_report(&split.unforwarded).is_empty(),
             "nothing was lost, so nothing is said"
+        );
+    }
+
+    /// A `file://` URL whose escapes do not decode is the one place this
+    /// deliberately parts company with `OpenRequest::parse_file_path`, which
+    /// drops it and logs. Here it must fall through to the unforwarded branch:
+    /// the user is told it was not opened instead of being left to notice.
+    #[test]
+    fn an_undecodable_file_url_is_reported_rather_than_dropped() {
+        let arg = "file:///tmp/%FF.txt".to_string();
+        let split = split_handoff_args(&[arg.clone()], &[]);
+        assert_eq!(
+            split,
+            HandoffArgs {
+                paths: Vec::new(),
+                unforwarded: vec![arg],
+            },
+            "an escape that is not valid UTF-8 must not be silently swallowed"
+        );
+        assert_eq!(
+            unforwarded_args_report(&split.unforwarded),
+            vec![
+                "sawe: the running instance opens paths only — 1 argument(s) were NOT opened: \
+                 file:///tmp/%FF.txt"
+            ]
         );
     }
 
