@@ -30,6 +30,7 @@ These came up multiple times during initial implementation. Each is **non-obviou
 - `Rc<dyn AgentConnection>` is `!Send`. `cx.background_executor().spawn(...)` won't compile when crossing the connection — use foreground `cx.spawn` instead. The pool lives on the foreground thread.
 - `SolutionSession.acp_thread` is `Option<Entity<AcpThread>>`, **not** `Entity<AcpThread>`. The lazy ACP `new_session` future means there's a real "session exists, thread not yet built" window.
 - `create_session(solution_id, agent_id, project, cx)` takes the `project` as a parameter (Plan B from spec). Pass the workspace's project — synthetic single-worktree projects per session were rejected as too coupled to `Arc<Client>` / `UserStore` / etc.
+- `SolutionSession::entries` / `Stream::entries` are `Vec<Arc<SessionEntry>>`, shared between a session and its per-stream mirrors (FORK.md #108). Mutate through `Arc::make_mut` — it forks when the mirror shares the entry and edits in place when it does not, so no aliased copy is ever corrupted. Never reach for `Arc::get_mut` on an entry: it returns `None` exactly when the mirror shares it, which silently drops the write instead of erroring.
 
 ## MCP
 
