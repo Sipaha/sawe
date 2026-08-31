@@ -15,6 +15,10 @@ use std::time::Duration;
 /// of silently breaking `sawe <path>` on a second launch.
 pub const HANDOFF_TOOL_NAME: &str = "editor.handle_cli_args";
 
+/// JSON-RPC id the handoff sends, and the id it must match a frame against
+/// before treating that frame as the reply.
+const HANDOFF_REQUEST_ID: i64 = 1;
+
 const RETRY_COUNT: u32 = 5;
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -93,7 +97,7 @@ pub fn try_handoff_to_existing_instance(paths: Vec<PathBuf>) -> Result<HandoffOu
                 Ok(mut stream) => {
                     let request = json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
+                        "id": HANDOFF_REQUEST_ID,
                         "method": "tools/call",
                         "params": {
                             "name": HANDOFF_TOOL_NAME,
@@ -109,23 +113,53 @@ pub fn try_handoff_to_existing_instance(paths: Vec<PathBuf>) -> Result<HandoffOu
                     bytes.push(b'\n');
                     stream.write_all(&bytes).await.context("send handoff")?;
 
-                    // Read until newline.
-                    let mut buffer = Vec::new();
-                    let mut byte = [0u8; 1];
-                    loop {
-                        match stream.read(&mut byte).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                if byte[0] == b'\n' {
-                                    break;
+                    // Read newline-delimited frames until the one carrying our
+                    // request id. `editor/notification` frames interleave with
+                    // responses on this socket and carry no `id` at all — and
+                    // opening a path makes the server emit `buffer_opened`
+                    // *before* the reply, so the very first frame is routinely
+                    // a notification. Parsing frame 1 blindly (what this used
+                    // to do) therefore failed with "missing
+                    // result.structuredContent" exactly when the handoff had
+                    // in fact worked, and only for paths not already open —
+                    // which is why it read as intermittent.
+                    let response = loop {
+                        let mut buffer = Vec::new();
+                        let mut byte = [0u8; 1];
+                        loop {
+                            match stream.read(&mut byte).await {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    if byte[0] == b'\n' {
+                                        break;
+                                    }
+                                    buffer.push(byte[0]);
                                 }
-                                buffer.push(byte[0]);
+                                Err(err) => return Err(err.into()),
                             }
-                            Err(err) => return Err(err.into()),
                         }
+                        if buffer.is_empty() {
+                            return Err(anyhow!(
+                                "existing instance closed the connection before replying"
+                            ));
+                        }
+                        let frame: serde_json::Value =
+                            serde_json::from_slice(&buffer).context("parse handoff response")?;
+                        if frame.get("id").and_then(|id| id.as_i64()) == Some(HANDOFF_REQUEST_ID) {
+                            break frame;
+                        }
+                    };
+                    // Surface a JSON-RPC error verbatim. "Tool not found"
+                    // here means `HANDOFF_TOOL_NAME` fell off the global
+                    // socket's catalog (see `lifecycle::GLOBAL_TOOLS`), which
+                    // the generic message below used to hide.
+                    if let Some(err) = response.get("error") {
+                        let message = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("(no message)");
+                        return Err(anyhow!("existing instance returned an error: {message}"));
                     }
-                    let response: serde_json::Value =
-                        serde_json::from_slice(&buffer).context("parse handoff response")?;
                     let structured = response
                         .get("result")
                         .and_then(|r| r.get("structuredContent"))
