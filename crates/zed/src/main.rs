@@ -353,9 +353,10 @@ fn file_url_as_path(arg: &str) -> Option<PathBuf> {
 ///   to an `Editor`) sits *above* `workspace` in the crate graph. So this line
 ///   is the honest half of the fix and the position itself stays lost; see
 ///   [`carry_path`] for what was fixed instead. It claims only that the
-///   position was dropped: when the stripped path does not exist the running
-///   instance opens an empty window, so "opened at the start of the file"
-///   would have asserted more than this process knows.
+///   position was dropped: when the stripped path does not exist no file is
+///   opened at all — measured, the running instance grows a second window of
+///   `kind: "folder"` rooted at that nonexistent path — so "opened at the
+///   start of the file" would have asserted more than this process knows.
 /// - the `zed-cli://<server>` ipc handshake, which is not the user's argument
 ///   at all: it is the socket `crates/cli` opened before it booted this
 ///   process, and the user's real request is on the far end of it. Listing that
@@ -373,6 +374,20 @@ fn file_url_as_path(arg: &str) -> Option<PathBuf> {
 /// and the `join` is never reached, so the command exits normally. A sentence
 /// about waiting would therefore have been false on the one CLI path where it
 /// is read.
+///
+/// What it *does* say about provenance — that the connection was opened by
+/// "the `sawe` command that started this process" — is deliberate, and was
+/// weighed against the third mode, direct invocation of this binary
+/// (`libexec/sawe-bin zed-cli://…`, a dev build), where there is no `sawe`
+/// command at all. Left as it stands: that mode has no user request to
+/// describe either, because a live `zed-cli://<server>` only ever comes from
+/// `crates/cli`. In the two modes anyone reaches by *using* the product the
+/// clause is exactly true, and naming the producer is the half of the sentence
+/// that explains why an argument the reader never typed is in their argv. Fed
+/// the url by hand, the whole sentence is hypothetical and its operative claim
+/// — nothing it asked for was opened — still holds. A mode-agnostic phrasing
+/// would buy accuracy in the synthetic case at the cost of precision in the
+/// two real ones.
 ///
 /// The exit code stays 0. A non-zero exit from this binary means "the running
 /// editor could not be reached, your work was not done" (FORK.md #114); folding
