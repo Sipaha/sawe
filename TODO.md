@@ -56,6 +56,14 @@ and the host-side `cleanup_old_binaries()` reaper are code-verified only.** The 
 recipes are in the doc comments of the two `#[ignore]`d tests in `crates/remote`;
 `crates/remote/src/transport/live_remote_support.rs` is the shared scaffolding.
 
+Since that run the scaffolding changed in ways that postdate it and are therefore
+code-verified only: the decoy digest is compared **before** the path assertion (the
+old order made the comparison unreachable under the very regression it was written
+for), and the SSH arm passes `-F /dev/null`. Also, **the target now needs a
+`.sawe-live-test-target` marker file** or the run aborts without touching it — these
+tests `rm -rf` two directories on the host the env vars name, and there was nothing
+stopping a typo from doing that to a real machine. Both recipes create the marker.
+
 ---
 
 ## B. Tests and gates
@@ -162,3 +170,33 @@ has no antecedent, or a false one; leave it when its antecedent is explicit and 
 ### E3. Per-project `.zed/settings.json` in the language docs
 Deliberately left. Different pattern from the user-level config directories, and not
 an intersection with an installed Zed's own configuration.
+
+---
+
+## F. Mobile client (`spk-editor-mobile`)
+
+Audited 2026-08-31 against the desktop wire: **no breakages**, full record in
+`docs/findings/2026-08-31-mobile-wire-audit.md`. Nothing here is urgent; all four are
+latent, i.e. they bite only when someone next touches the code in question.
+
+### F1. `RemoteClient.getSessionEntry` is dead code with a stale signature
+`core/.../RemoteClient.kt:535`. Zero call sites. It sends a Main-stream `index` with
+no `stream_id`, so whoever revives it for a teammate tab lands on the wrong entry or
+gets `entry_index_out_of_range`. Add `stream_id` before wiring it up.
+
+### F2. `RemoteClient.unsubscribe` would fail against the current desktop
+`core/.../RemoteClient.kt:513` sends `{kinds:[...]}`; `editor.unsubscribe` takes
+`subscription_id` and is `deny_unknown_fields`. Zero production call sites (one test).
+Fix or delete — do not leave it as a trap.
+
+### F3. `EntryRoleDto` has no `ContextCompaction` variant
+The desktop emits `context_compaction` (`crates/solution_agent/src/mcp/dto.rs:313`).
+The client's tolerant serializer maps it to `Unknown`, so a `/compact` marker renders
+as a generic plaque rather than failing — cosmetic, and it predates the sync point.
+
+### F4. The `LastSeenIndex` watermark is written and never read
+`getCached` and `readFromDisk` have no callers in `app/src/main`; only the three
+`recordIfNewer` writes and `primeFromDisk` run. Either an unread badge was removed
+and the writes were left, or it was never finished. Worth a decision, not a fix —
+and it is why the `entry_index` semantic change is currently inert. Also stale:
+`SessionDetailScreen.kt:205` still calls `agent_session_message_appended` "id-only".
