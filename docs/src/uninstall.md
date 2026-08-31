@@ -8,10 +8,11 @@ description: "This guide covers how to uninstall Sawe on different operating sys
 This guide covers how to uninstall Sawe on different operating systems.
 
 All of Sawe's own state lives under one directory, `~/.spk/sawe`, on every
-platform. One thing inside it is not Sawe's: `~/.spk/sawe/ss` is the Solutions
-root, holding the project checkouts of any Solution you created. The uninstaller
-never removes it, and neither should you unless you are certain you no longer
-need what is in it.
+platform, in five subdirectories: `config`, `data`, `state`, `cache` and `logs`.
+Removing user data below always means removing those five, never the directory
+that contains them — a sixth subdirectory, `~/.spk/sawe/ss`, is the Solutions
+root and holds the project checkouts of every Solution you created. Those are
+your files, not Sawe's, and no instruction on this page deletes them.
 
 ## macOS
 
@@ -31,7 +32,7 @@ To completely remove all Sawe configuration files and data:
 1. Open Finder
 2. Press `Cmd + Shift + G` to open "Go to Folder"
 3. Delete the following if they exist:
-   - `~/.spk/sawe` (keeping `~/.spk/sawe/ss` — see the note at the top of this page)
+   - `~/.spk/sawe/config`, `~/.spk/sawe/data`, `~/.spk/sawe/state`, `~/.spk/sawe/cache`, `~/.spk/sawe/logs`
    - `~/Library/Saved Application State/ru.sipaha.sawe.savedState`
    - `~/Library/Caches/ru.sipaha.sawe`
    - `~/Library/HTTPStorages/ru.sipaha.sawe`
@@ -73,7 +74,7 @@ If the uninstall command fails or Sawe was installed to a custom location, you c
 - Installation directory: `~/.local/sawe.app` (or your custom installation path)
 - Binary symlink: `~/.local/bin/sawe`
 - Desktop entry: `~/.local/share/applications/ru.sipaha.sawe.desktop`
-- Configuration and data: `~/.spk/sawe` (keeping `~/.spk/sawe/ss` — see the note at the top of this page)
+- Configuration and data: `~/.spk/sawe/config`, `~/.spk/sawe/data`, `~/.spk/sawe/state`, `~/.spk/sawe/cache` and `~/.spk/sawe/logs`
 
 ## Windows
 
@@ -97,8 +98,8 @@ Alternatively, you can:
 To completely remove all Sawe configuration files and data:
 
 1. Press `Windows key + R` to open Run
-2. Type `%USERPROFILE%\.spk` and press Enter
-3. Delete the `sawe` folder if it exists, keeping its `ss` subfolder — see the note at the top of this page
+2. Type `%USERPROFILE%\.spk\sawe` and press Enter
+3. Delete the `config`, `data`, `state`, `cache` and `logs` folders if they exist
 
 ## Troubleshooting
 
