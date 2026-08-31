@@ -32,3 +32,12 @@ theme_settings.workspace = true
 ui.workspace = true
 ui_input.workspace = true
 workspace.workspace = true
+
+# The self dev-dependency keeps this crate's own `test-support` on whenever its
+# test target is built, so the `Mock` match arm and `remote`'s `Mock` variant stay
+# in lockstep; `project/test-support` is needed for the same reason one level down.
+# Without both, `cargo {test,clippy} -p remote_connection --all-targets` does not
+# compile at all.
+[dev-dependencies]
+project = { workspace = true, features = ["test-support"] }
+remote_connection = { workspace = true, features = ["test-support"] }
