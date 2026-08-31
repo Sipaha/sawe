@@ -21,14 +21,29 @@ actions!(
 /// exactly one name in it and never touches anything else there.
 const CLI_LINK_PATH: &str = "/usr/local/bin/sawe";
 
-const LINUX_PROMPT_DETAIL: &str = "The CLI is installed alongside the app. If you used the official install script, add ~/.local/bin to your PATH to get the `sawe` command.\n\nIf you installed some other way, symlink the `cli` binary next to the app into a directory that is already on your PATH.";
+const LINUX_PROMPT_TITLE: &str = "CLI should already be installed";
+
+/// Shown only on Linux/FreeBSD, so it must describe *that* bundle: `script/bundle-linux`
+/// copies the CLI executable in as `bin/sawe` (not `bin/cli`, which only pre-0.139
+/// bundles had), and `script/install.sh` links exactly that into `~/.local/bin/sawe`.
+const LINUX_PROMPT_DETAIL: &str = "The CLI is installed alongside the app. If you used the official install script, add ~/.local/bin to your PATH to get the `sawe` command.\n\nIf you installed some other way, symlink `bin/sawe` from the installation directory into a directory that is already on your PATH.";
+
+const LINUX_PROMPT_BUTTON: &str = "OK";
+const INSTALL_ERROR_TITLE: &str = "Error installing sawe cli";
+const SYMLINK_ERROR_CONTEXT: &str = "error creating CLI symlink";
+const OSASCRIPT_ERROR: &str = "error running osascript";
+const NO_PARENT_ERROR: &str = "CLI symlink path has no parent directory";
 
 /// What is sitting at the path we want the CLI symlink to occupy.
 #[derive(Debug, PartialEq, Eq)]
 enum LinkPathState {
     /// Nothing is there, so the path is ours to create.
     Vacant,
-    /// A symlink to this build's CLI binary — one we created ourselves.
+    /// A symlink to this build's CLI binary — one we created ourselves. A
+    /// *dangling* link whose target still spells `cli_path` lands here too and
+    /// is reported as installed; `cli_path` is the running app's own auxiliary
+    /// executable, so a link to it that does not resolve is not reachable in
+    /// practice and is not worth a branch.
     AlreadyOurs,
     /// Something this fork did not create. Reported to the user, never removed.
     /// The payload completes the sentence "refusing to replace <path> because …".
@@ -81,9 +96,7 @@ async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<PathBuf> {
     // to create it. `ln -s`, never `ln -sf`: we established above that nothing
     // is at `link_path`, and the non-forcing form refuses to clobber an entry
     // that appeared in the meantime rather than deleting it.
-    let bin_dir_path = link_path
-        .parent()
-        .context("CLI symlink path has no parent directory")?;
+    let bin_dir_path = link_path.parent().context(NO_PARENT_ERROR)?;
     let status = smol::process::Command::new("/usr/bin/osascript")
         .args([
             "-e",
@@ -102,7 +115,7 @@ async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<PathBuf> {
         .output()
         .await?
         .status;
-    anyhow::ensure!(status.success(), "error running osascript");
+    anyhow::ensure!(status.success(), OSASCRIPT_ERROR);
     Ok(link_path.into())
 }
 
@@ -124,16 +137,16 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             let prompt = cx.prompt(
                 PromptLevel::Warning,
-                "CLI should already be installed",
+                LINUX_PROMPT_TITLE,
                 Some(LINUX_PROMPT_DETAIL),
-                &["OK"],
+                &[LINUX_PROMPT_BUTTON],
             );
             cx.background_spawn(prompt).detach();
             return Ok(());
         }
         let path = install_script(cx.deref())
             .await
-            .context("error creating CLI symlink")?;
+            .context(SYMLINK_ERROR_CONTEXT)?;
 
         workspace.update_in(cx, |workspace, _, cx| {
             struct InstalledSaweCli;
@@ -148,12 +161,13 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
         })?;
         Ok(())
     })
-    .detach_and_prompt_err("Error installing sawe cli", window, cx, |_, _, _| None);
+    .detach_and_prompt_err(INSTALL_ERROR_TITLE, window, cx, |_, _, _| None);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Action as _;
     use std::fs;
 
     /// Both a locked-identifier guard (CLAUDE.md §3 names the CLI binary `sawe`)
@@ -164,16 +178,71 @@ mod tests {
         assert_eq!(CLI_LINK_PATH, "/usr/local/bin/sawe");
     }
 
+    /// Every string this crate can put in front of a user. The refusal messages
+    /// are produced by running the real code path rather than restated here, so
+    /// the assertion cannot drift from what is actually shown. Interpolated
+    /// *paths* are the user's own words, not ours — this test therefore feeds it
+    /// only paths it controls, so any "zed" it finds came from our wording.
+    fn all_user_facing_text() -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli_path = dir.path().join("cli");
+        fs::write(&cli_path, b"cli").expect("write cli");
+
+        let foreign_link = dir.path().join("foreign");
+        std::os::unix::fs::symlink(dir.path().join("other-cli"), &foreign_link).expect("symlink");
+        let foreign_refusal = smol::block_on(install_symlink(&cli_path, &foreign_link))
+            .expect_err("foreign symlink must be refused")
+            .to_string();
+
+        let occupied = dir.path().join("occupied");
+        fs::write(&occupied, b"occupant").expect("write occupant");
+        let occupied_refusal = smol::block_on(install_symlink(&cli_path, &occupied))
+            .expect_err("occupied path must be refused")
+            .to_string();
+
+        vec![
+            InstallCliBinary::documentation()
+                .expect("the palette shows this action's doc comment")
+                .to_string(),
+            installed_toast_message(Path::new(CLI_LINK_PATH), "Sawe"),
+            foreign_refusal,
+            occupied_refusal,
+            LINUX_PROMPT_TITLE.to_string(),
+            LINUX_PROMPT_DETAIL.to_string(),
+            LINUX_PROMPT_BUTTON.to_string(),
+            INSTALL_ERROR_TITLE.to_string(),
+            SYMLINK_ERROR_CONTEXT.to_string(),
+            OSASCRIPT_ERROR.to_string(),
+            NO_PARENT_ERROR.to_string(),
+        ]
+    }
+
     #[test]
     fn user_facing_text_never_names_another_product() {
-        let toast = installed_toast_message(Path::new(CLI_LINK_PATH), "Sawe");
-        assert!(toast.contains("`sawe`"), "{toast}");
-        for text in [toast.as_str(), LINUX_PROMPT_DETAIL] {
+        for text in all_user_facing_text() {
             assert!(
                 !text.to_lowercase().contains("zed"),
                 "user-facing CLI text names another product: {text}"
             );
         }
+        assert!(installed_toast_message(Path::new(CLI_LINK_PATH), "Sawe").contains("`sawe`"));
+    }
+
+    /// The Linux/FreeBSD prompt is the only place this crate tells a user where
+    /// the CLI already is, and it is shown *only* there — so it has to describe
+    /// the Linux bundle, which ships the CLI executable as `bin/sawe`
+    /// (`script/bundle-linux`) and links that into `~/.local/bin/sawe`
+    /// (`script/install.sh`). It has never shipped a `bin/cli`.
+    #[test]
+    fn the_linux_prompt_names_a_file_the_linux_bundle_ships() {
+        assert!(
+            LINUX_PROMPT_DETAIL.contains("bin/sawe"),
+            "{LINUX_PROMPT_DETAIL}"
+        );
+        assert!(
+            !LINUX_PROMPT_DETAIL.contains("`cli`"),
+            "the Linux bundle has no `bin/cli`: {LINUX_PROMPT_DETAIL}"
+        );
     }
 
     #[test]
