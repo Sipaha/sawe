@@ -111,7 +111,9 @@ If Sawe was installed using the install script, it can be uninstalled by supplyi
 sawe --uninstall
 ```
 
-If there are no errors, the shell will then prompt you whether you'd like to keep your preferences or delete them. After making a choice, you should see a message that Sawe was successfully uninstalled. Your configuration and data in `~/.spk/sawe` are left in place either way; delete that directory too for a clean removal.
+If there are no errors, the shell will then prompt you whether you'd like to keep your preferences or delete them. After making a choice, you should see a message that Sawe was successfully uninstalled.
+
+Sawe keeps all of its state under one directory, `~/.spk/sawe`. The uninstaller removes this channel's database and CLI socket from it, and — once no Sawe installation remains — the `data`, `state`, `cache` and `logs` directories shared by all channels; `~/.spk/sawe/config` goes only if you answer no to the preferences prompt. It never removes `~/.spk/sawe/ss`, the Solutions root holding your project checkouts.
 
 In the case that the `sawe` shell command was not found in your PATH, you can try one of the following commands
 

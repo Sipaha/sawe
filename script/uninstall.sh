@@ -24,18 +24,63 @@ check_remaining_installations() {
     fi
 }
 
+# Mirror of `paths::base_dir()` -- `home_dir()/.spk/<dir_name_kebab()>` in
+# crates/paths/src/paths.rs. Every profile directory this editor writes hangs
+# off that single root on *every* platform: there is no `~/.config/sawe`, no
+# `~/Library/Application Support/Sawe` and no `%APPDATA%\Sawe`, which is why
+# the three paths this script used to remove were paths the binary had never
+# created, and why its "keep your preferences?" prompt had no effect either way.
+#
+# Only two environment variables move it, so only two are mirrored here:
+# `SAWE_HOME` is the sole override `util::paths::home_dir()` reads, and
+# `SAWE_DEV_DIRS` is the sole override of the `-dev` suffix (whose default is
+# off for the release builds this script uninstalls). If this disagrees with
+# the binary, we remove a directory nobody uses and leave the real one behind.
+profile_dir() {
+    dir="sawe"
+    case "$(printf '%s' "${SAWE_DEV_DIRS:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) dir="sawe-dev" ;;
+    esac
+    printf '%s/.spk/%s' "${SAWE_HOME:-$HOME}" "$dir"
+}
+
+# The only state under the profile root that belongs to *this* release channel:
+# its database scope (`db_path()` in crates/db -- `data/db/0-<channel>`, next to
+# a `0-global` scope shared by all channels) and the datagram socket the CLI
+# hands its arguments to (`paths::cli_ipc_socket_in`). Config, logs, cache and
+# state are shared by every channel installed for this user, so they can only go
+# once the last install does.
+remove_channel_state() {
+    base="$(profile_dir)"
+    rm -rf "$base/data/db/0-$db_suffix"
+    rm -f "$base/data/sawe-$channel.sock"
+}
+
+# Called only when no installation remains. Removes the profile root's
+# app-owned subdirectories by name rather than the root itself, because
+# `$base/ss` is the Solutions root (`solutions::settings::default_root`) and
+# holds the user's own project checkouts -- an uninstaller must not delete
+# source trees. `config` is left to prompt_remove_preferences.
+remove_shared_state() {
+    base="$(profile_dir)"
+    rm -rf "$base/data" "$base/state" "$base/cache" "$base/logs"
+}
+
 prompt_remove_preferences() {
     printf "Do you want to keep your sawe preferences? [Y/n] "
     read -r response
     case "$response" in
         [nN]|[nN][oO])
-            rm -rf "$HOME/.config/sawe"
+            rm -rf "$(profile_dir)/config"
             echo "Preferences removed."
             ;;
         *)
             echo "Preferences kept."
             ;;
     esac
+    # Tidy the root away if nothing is left in it, but never recursively: a
+    # surviving `ss/` (or a config the user chose to keep) must stay.
+    rmdir "$(profile_dir)" 2>/dev/null || true
 }
 
 main() {
@@ -97,15 +142,10 @@ linux() {
     # Remove the .desktop file
     rm -f "$HOME/.local/share/applications/${appid}.desktop"
 
-    # Remove the database directory for this channel
-    rm -rf "$HOME/.local/share/sawe/db/0-$db_suffix"
+    remove_channel_state
 
-    # Remove socket file
-    rm -f "$HOME/.local/share/sawe/sawe-$db_suffix.sock"
-
-    # Remove the entire sawe directory if no installations remain
     if check_remaining_installations; then
-        rm -rf "$HOME/.local/share/sawe"
+        remove_shared_state
         prompt_remove_preferences
     fi
 }
@@ -140,21 +180,22 @@ macos() {
     # Remove the binary symlink
     rm -f "$HOME/.local/bin/sawe"
 
-    # Remove the database directory for this channel
-    rm -rf "$HOME/Library/Application Support/Sawe/db/0-$db_suffix"
+    remove_channel_state
 
-    # Remove app-specific files and directories
+    # Remove the files macOS itself keeps for our bundle id. These are the only
+    # `~/Library` paths involved: `paths::logs_dir()` is `<profile>/logs`, not
+    # `~/Library/Logs/Sawe`, and there is no `~/Library/Application
+    # Support/Sawe`. `~/Library/Logs/DiagnosticReports` is deliberately absent
+    # too -- `paths::crashes_dir()` reads it, but it is the OS-wide crash log
+    # directory shared with every other application.
     rm -rf "$HOME/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments/$app_id.sfl"*
     rm -rf "$HOME/Library/Caches/$app_id"
     rm -rf "$HOME/Library/HTTPStorages/$app_id"
     rm -rf "$HOME/Library/Preferences/$app_id.plist"
     rm -rf "$HOME/Library/Saved Application State/$app_id.savedState"
 
-    # Remove the entire Sawe directory if no installations remain
     if check_remaining_installations; then
-        rm -rf "$HOME/Library/Application Support/Sawe"
-        rm -rf "$HOME/Library/Logs/Sawe"
-
+        remove_shared_state
         prompt_remove_preferences
     fi
 }

@@ -62,10 +62,13 @@ See the [CLI Reference](./reference/cli.md) for all available options.
 
 1. Quit Sawe if it's running
 2. Drag Sawe from Applications to the Trash
-3. Optionally, remove your settings and extensions:
+3. Optionally, remove your settings and extensions. `~/.spk/sawe` is where all of
+   Sawe's state lives, but `~/.spk/sawe/ss` inside it is the Solutions root
+   holding your own project checkouts — keep that unless you are certain you no
+   longer need what is in it:
 
 ```sh
-rm -rf ~/.spk/sawe
+rm -rf ~/.spk/sawe          # keep ~/.spk/sawe/ss if you use Solutions
 rm -rf ~/Library/Saved\ Application\ State/ru.sipaha.sawe.savedState
 rm -rf ~/Library/Caches/ru.sipaha.sawe
 rm -rf ~/Library/HTTPStorages/ru.sipaha.sawe
