@@ -71,11 +71,22 @@ Rules that still apply:
 - **Locked rebrand identifiers** (spec §3, change requires user approval):
   display name `Sawe` (Dock/About/title bar); CLI binary
   `sawe`; macOS bundle ids `ru.sipaha.sawe[-{preview,nightly,dev,debug}]`;
-  URL scheme `sawe://`; config dir `~/.config/sawe/` (Linux),
-  `~/Library/Application Support/Sawe/` (macOS — no space in path,
-  display name keeps space), `%APPDATA%\Sawe\` (Windows — no space in
-  path); GitHub `Sipaha/sawe`; attribution string `Fork of Zed by
-  Zed Industries, Inc., modified by Simonov Pavel`; per-project config
+  URL scheme `sawe://`; profile root `~/.spk/sawe/` — on **every**
+  platform, with no `~/.config`, `~/Library/Application Support/` or
+  `%APPDATA%` variant. `paths::base_dir()` is
+  `home_dir()/.spk/<dir_name_kebab()>`, i.e. `~/.spk/sawe/` for a release
+  build and `~/.spk/sawe-dev/` for a debug one (`SAWE_DEV_DIRS` overrides
+  the suffix in either direction), and everything hangs off it:
+  `config/`, `data/` (incl. `data/db/0-<channel>`), `state/`, `cache/`,
+  `logs/`, and `ss/` — the Solutions root, which holds the user's actual
+  project checkouts and is therefore **not** app state to be discarded.
+  The single root is the point, not an accident: it is what makes
+  `SAWE_HOME` and `--user-data-dir` isolation one redirect instead of
+  three, which every agent-driven MCP check depends on. `~/Library/…`
+  paths that do remain are the ones macOS itself creates for the bundle
+  id (`Caches`, `HTTPStorages`, `Preferences`, `Saved Application
+  State`), not ours to name. GitHub `Sipaha/sawe`; attribution string
+  `Fork of Zed by Zed Industries, Inc., modified by Simonov Pavel`; per-project config
   dir `.sawe/` (replacing upstream `.zed/`; `.zed_server` /
   `.zed_wsl_server` remain unchanged as preserved upstream identifiers).
   These are user-visible identity, not merge-friendliness — they don't
