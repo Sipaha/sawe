@@ -528,7 +528,7 @@ mod test {
     use crate::{MergeFromTrait as _, ProjectSettingsContent, Shell, WorkingDirectory};
 
     #[test]
-    fn test_project_settings() {
+    fn test_project_settings_merge_is_per_field() {
         let user_content = json!({
             "terminal": {
                 "shell": {"program": "/bin/user"},

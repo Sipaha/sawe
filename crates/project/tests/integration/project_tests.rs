@@ -11082,12 +11082,13 @@ async fn test_git_repository_status(cx: &mut gpui::TestAppContext) {
     });
 }
 
-// Disabled upstream as flaky in 4376eb8217. It still races: `diff_stat` is filled in
-// asynchronously, so the (empty) `a.txt` entry now arrives as `Some(0/0)` rather than
-// the asserted `None`. The postprocessing this test is named for -- nested repo
-// excluded, combined `DA` status -- does hold.
+// Disabled upstream as flaky in 4376eb8217, but here it fails deterministically. The test
+// awaits `git_scans_complete` and then parks, so the value it reads is settled, not raced:
+// `diff_stat` for the (empty) `a.txt` settles at `Some(0/0)`, not the asserted `None`. The
+// postprocessing this test is named for -- nested repo excluded, combined `DA` status --
+// does hold.
 #[gpui::test]
-#[ignore = "flaky: races the asynchronous diff_stat fill, which yields Some(0/0) instead of None"]
+#[ignore = "fails deterministically: diff_stat for an empty file settles at Some(0/0), not the asserted None"]
 async fn test_git_status_postprocessing(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     cx.executor().allow_parking();
