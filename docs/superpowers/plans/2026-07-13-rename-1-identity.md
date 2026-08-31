@@ -3382,6 +3382,15 @@ cp -v ~/.local/share/sawe/solution_agent/solution_agent.db ~/.local/share/sawe/s
 
 (Adjust the paths if `paths::data_dir()` resolves elsewhere on this machine — `script/run-mcp --debug` prints the resolved runtime dir on launch.)
 
+> **Note added 2026-08-31 (FORK.md #111), not part of this plan's history:** both
+> of these databases run in **WAL** mode, so the `cp` above copies a silently
+> *older* database — every commit since the last checkpoint lives only in
+> `<name>-wal`. Anyone reusing these commands must checkpoint first
+> (`sqlite3 <db> 'PRAGMA wal_checkpoint(TRUNCATE);'`) or copy `<db>-wal` as well;
+> never copy `-shm`. (The `~/.local/share/sawe/…` paths above never resolved in
+> this fork — the real data dir is `~/.spk/sawe/data/`, as the entry below
+> records — so a follower finds no file rather than a stale one.)
+
 Done on 2026-07-13: the real data dir is `~/.spk/sawe/data/`, and the pre-identity
 backups are `/tmp/db.sqlite.pre-identity-1783948879` /
 `/tmp/solution_agent.db.pre-identity-1783948879`. Move them somewhere durable
