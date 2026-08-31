@@ -2,6 +2,14 @@
 set -eu
 
 # Uninstalls sawe that was installed using the install.sh script
+#
+# Deliberately does NOT touch $HOME/.zed_server (upstream's uninstaller does).
+# `.zed_server` is a preserved shared identifier -- paths::remote_server_dir_relative()
+# returns it unchanged -- so a real Zed uses the same directory, and the binaries
+# inside it are named `zed-remote-server-<channel>-<version>` by both products, so
+# ours cannot even be told apart from theirs. It is also populated by *incoming*
+# remote connections rather than by installing this editor, so removing it would
+# delete another product's files that this install never created.
 
 check_remaining_installations() {
     platform="$(uname -s)"
@@ -100,8 +108,6 @@ linux() {
         rm -rf "$HOME/.local/share/sawe"
         prompt_remove_preferences
     fi
-
-    rm -rf $HOME/.zed_server
 }
 
 macos() {
@@ -151,8 +157,6 @@ macos() {
 
         prompt_remove_preferences
     fi
-
-    rm -rf $HOME/.zed_server
 }
 
 main "$@"

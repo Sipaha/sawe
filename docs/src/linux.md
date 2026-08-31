@@ -101,37 +101,37 @@ sed -i "s|Icon=zed|Icon=$HOME/.local/zed.app/share/icons/hicolor/512x512/apps/ze
 sed -i "s|Exec=zed|Exec=$HOME/.local/zed.app/bin/zed|g" ~/.local/share/applications/dev.zed.Zed.desktop
 ```
 
-## Uninstalling Zed
+## Uninstalling Sawe
 
 ### Standard Uninstall
 
-If Zed was installed using the default installation script, it can be uninstalled by supplying the `--uninstall` flag to the `zed` shell command
+If Sawe was installed using the install script, it can be uninstalled by supplying the `--uninstall` flag to the `sawe` shell command
 
 ```sh
-zed --uninstall
+sawe --uninstall
 ```
 
-If there are no errors, the shell will then prompt you whether you'd like to keep your preferences or delete them. After making a choice, you should see a message that Zed was successfully uninstalled.
+If there are no errors, the shell will then prompt you whether you'd like to keep your preferences or delete them. After making a choice, you should see a message that Sawe was successfully uninstalled. Your configuration and data in `~/.spk/sawe` are left in place either way; delete that directory too for a clean removal.
 
-In the case that the `zed` shell command was not found in your PATH, you can try one of the following commands
+In the case that the `sawe` shell command was not found in your PATH, you can try one of the following commands
 
 ```sh
-$HOME/.local/bin/zed --uninstall
+$HOME/.local/bin/sawe --uninstall
 ```
 
 or
 
 ```sh
-$HOME/.local/zed.app/bin.zed --uninstall
+$HOME/.local/sawe.app/bin/sawe --uninstall
 ```
 
-The first case might fail if a symlink was not properly established between `$HOME/.local/bin/zed` and `$HOME/.local/zed.app/bin.zed`. But the second case should work as long as Zed was installed to its default location.
+The first case might fail if a symlink was not properly established between `$HOME/.local/bin/sawe` and `$HOME/.local/sawe.app/bin/sawe`. But the second case should work as long as Sawe was installed to its default location.
 
-If Zed was installed to a different location, you must invoke the `zed` binary stored in that installation directory and pass the `--uninstall` flag to it in the same format as the previous commands.
+If Sawe was installed to a different location, you must invoke the `sawe` binary stored in that installation directory and pass the `--uninstall` flag to it in the same format as the previous commands.
 
 ### Package Manager
 
-If Zed was installed using a package manager, please consult the documentation for that package manager on how to uninstall a package.
+If Sawe was installed using a package manager, please consult the documentation for that package manager on how to uninstall a package.
 
 ## Troubleshooting
 

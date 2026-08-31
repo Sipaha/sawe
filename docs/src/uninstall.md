@@ -28,7 +28,9 @@ To completely remove all Sawe configuration files and data:
    - `~/.spk/sawe`
    - `~/Library/Saved Application State/ru.sipaha.sawe.savedState`
    - `~/Library/Caches/ru.sipaha.sawe`
+   - `~/Library/HTTPStorages/ru.sipaha.sawe`
    - `~/Library/Preferences/ru.sipaha.sawe.plist`
+   - `~/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments/ru.sipaha.sawe.sfl*`
 
 ## Linux
 
@@ -40,7 +42,7 @@ If Sawe was installed using the install script, run:
 sawe --uninstall
 ```
 
-You'll be prompted whether to keep or delete your preferences. After making a choice, you should see a message that Sawe was successfully uninstalled.
+If no other Sawe installation remains, you'll be asked whether to keep your preferences. After making a choice, you should see a message that Sawe was successfully uninstalled. That prompt does not cover your configuration and data: those live in `~/.spk/sawe`, which the uninstaller leaves in place. Delete it as well for a clean removal.
 
 If the `sawe` command is not found in your PATH, try:
 
@@ -54,7 +56,9 @@ or:
 $HOME/.local/sawe.app/bin/sawe --uninstall
 ```
 
-The uninstaller removes the installed application, not your configuration and data. Delete `~/.spk/sawe` as well for a clean removal.
+### Package Manager
+
+If you installed Sawe using a package manager (such as Flatpak, Snap, or a distribution-specific package manager), consult that package manager's documentation for uninstallation instructions.
 
 ### Manual Removal
 

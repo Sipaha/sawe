@@ -68,7 +68,9 @@ See the [CLI Reference](./reference/cli.md) for all available options.
 rm -rf ~/.spk/sawe
 rm -rf ~/Library/Saved\ Application\ State/ru.sipaha.sawe.savedState
 rm -rf ~/Library/Caches/ru.sipaha.sawe
+rm -rf ~/Library/HTTPStorages/ru.sipaha.sawe
 rm -rf ~/Library/Preferences/ru.sipaha.sawe.plist
+rm -rf ~/Library/Application\ Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments/ru.sipaha.sawe.sfl*
 ```
 
 If you installed the CLI, remove it with:
